@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A principal with write authority on a cargo repository now resolves
+  held versions in that repository's sparse index.** `cargo publish`
+  resolves each crate's intra-workspace dependencies through the index
+  even under `--no-verify`, so publishing a workspace into a hosted repo
+  with a quarantine window failed at the second crate — mid-chain, with
+  the earlier crates already uploaded and only yankable. This extends the
+  existing OCI push-then-sign hold exemption (ADR 0039 §10) to the cargo
+  index and records the generalised rule in **ADR 0055**: *a principal
+  that may write to a repository may resolve held metadata there; held
+  bytes never leave quarantine, for anyone.* Scope: `Quarantined` only
+  (`Rejected` / `ScanIndeterminate` stay hidden from every caller,
+  publisher included), metadata only (a held `.crate` is still `503` to
+  its own publisher), keyed on **granted** write authority rather than
+  the presented token's capability, and not applied to virtual
+  (aggregating) repositories. Nothing is released earlier and the
+  release predicate is unchanged. (#179)
+
+- **The cargo sparse-index route emits `Cache-Control: private,
+  no-store` and `Vary: Authorization`.** The served set now varies by
+  principal, so a shared cache or reverse proxy must not store one
+  caller's response and replay it to another. Unconditional — absent
+  directives permit heuristic caching, so conditioning the headers on the
+  hold-read having engaged would leave the ordinary responses cacheable
+  under the same URL key. (#179)
+
+- **Intra-workspace dependencies name the `hort-crates` registry.**
+  Without the key they are crates.io dependencies, which the release
+  job's `[source.crates-io] replace-with` sends to the read-only
+  aggregation index — a repository the release identity cannot publish
+  to, where the hold-read above correctly does not engage.
+  `.cargo/config.toml` declares the matching `[registries.hort-crates]`
+  index (cargo refuses to parse a manifest naming a registry it has no
+  index for), and the `publishable_manifests` guard asserts both halves
+  plus their agreement with each member's `publish` allow-list. (#179)
+
 ### Fixed
 
 - **CVSS v3.x base scores are now computed from OSV severity vectors.**
