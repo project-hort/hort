@@ -46,6 +46,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Hosted cargo index entries now carry the crate's real dependencies
+  and features.** Every hosted entry was synthesized with `deps: []` and
+  `features: {}` because the publish handler kept only `name`/`vers` from
+  cargo's publish body and discarded the rest. Cargo validates a feature
+  edge against the *index entry*, not the dependency's own manifest, so
+  publishing a workspace where one crate names a sibling's feature failed
+  with "package `hort-http-core` depends on `hort-app` with feature
+  `test-support` but `hort-app` does not have that feature" — which is
+  what broke `v0.11.0-beta.8` after five of six crates had uploaded. More
+  broadly, an entry claiming a crate has no dependencies hands any
+  consumer an unbuildable graph. The publish handler now parses the whole
+  metadata object and persists it in sparse-index shape (the publish
+  API's `version_req` becomes the index's `req`, a renamed dependency's
+  aliased name and original package name swap fields, and features using
+  the namespaced `dep:` or weak `pkg?/feat` syntax are split into
+  `features2` with `v: 2`), and the hosted index source serves it. The
+  served `cksum` remains the stored CAS digest — a publisher-supplied
+  checksum is neither trusted nor kept. A publish body whose metadata
+  cannot be parsed is now rejected rather than ingested as an entry that
+  silently claims no dependencies. Versions published before this change
+  have nothing stored and keep serving exactly as they did; republishing
+  is what fills them in. A cargo publish now also produces an SBOM with
+  the crate's declared dependencies as components. (#188)
+
 - **A crates publish that fails partway can now be re-run.** An upload is
   irreversible — a published version can be yanked, never replaced — so a
   release that broke on the third crate left the first two in the registry
