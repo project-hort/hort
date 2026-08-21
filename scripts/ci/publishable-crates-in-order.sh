@@ -6,11 +6,19 @@
 # Usage: scripts/ci/publishable-crates-in-order.sh [workspace-root]
 #   (default: the repo root inferred from this script's location)
 #
-# Prints one crate directory per line, relative to the workspace root, in
-# an order where every crate's intra-workspace dependencies come before it
-# — the order `cargo publish` requires, since each crate resolves its
-# dependencies through the registry and a dependency has to be indexed
-# before its dependent is uploaded.
+# Prints one tab-separated `directory<TAB>name<TAB>version` record per
+# crate — directory relative to the workspace root — in an order where
+# every crate's intra-workspace dependencies come before it: the order
+# `cargo publish` requires, since each crate resolves its dependencies
+# through the registry and a dependency has to be indexed before its
+# dependent is uploaded.
+#
+# Name and version ride along because the caller needs them to address the
+# crate in the registry index, and this script already holds them: they
+# come out of the single `cargo metadata` read below. The alternative —
+# the caller re-deriving them per crate — is either another cargo
+# invocation each, or guessing the package name from its directory name,
+# which is a convention rather than a rule.
 #
 # The set is whatever `[package] publish` says: a member is published
 # unless its manifest sets `publish = false`. Nothing here is
@@ -41,7 +49,7 @@ if [[ ! -f "${root}/Cargo.toml" ]]; then
 fi
 
 # One record per workspace member:
-#   <name> <TAB> <dir-relative-to-root> <TAB> <published:0|1> <TAB> <space-separated intra-workspace deps>
+#   <name> <TAB> <dir-relative-to-root> <TAB> <version> <TAB> <published:0|1> <TAB> <space-separated intra-workspace deps>
 #
 # Dev-dependencies are excluded: cargo drops a path-only dev dependency
 # from the published manifest entirely, so it constrains neither the set
@@ -56,6 +64,7 @@ members="$(
       | [
           $pkg.name,
           ($pkg.manifest_path | sub("^" + $root; "") | sub("/Cargo\\.toml$"; "")),
+          $pkg.version,
           (if $pkg.publish == [] then "0" else "1" end),
           ([ $pkg.dependencies[]
              | select(.kind != "dev")
@@ -67,9 +76,10 @@ members="$(
     '
 )"
 
-declare -A dir_of published_of deps_of
-while IFS=$'\t' read -r name dir published deps; do
+declare -A dir_of version_of published_of deps_of
+while IFS=$'\t' read -r name dir version published deps; do
   dir_of["${name}"]="${dir}"
+  version_of["${name}"]="${version}"
   published_of["${name}"]="${published}"
   deps_of["${name}"]="${deps}"
 done <<< "${members}"
@@ -129,7 +139,7 @@ while [[ ${#remaining[@]} -gt 0 ]]; do
 
   for name in "${ready[@]}"; do
     emitted["${name}"]=1
-    echo "${dir_of[${name}]}"
+    printf '%s\t%s\t%s\n' "${dir_of[${name}]}" "${name}" "${version_of[${name}]}"
   done
 
   next=()
