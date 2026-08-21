@@ -1458,7 +1458,17 @@ quality:site-build:
     - platform
   image: quay.io/buildah/stable:v1.43
   variables:
-    STORAGE_DRIVER: vfs
+    # No STORAGE_DRIVER here on purpose: the runner owns the container store,
+    # so the runner picks the driver. The `platform` tag above pins these jobs
+    # to the in-cluster runner, which mounts a storage.conf selecting overlay
+    # and shares one persistent store across all projects on the node.
+    #
+    # This used to say `vfs`, which overrode that storage.conf — and vfs makes
+    # a full rootfs copy per layer instead of a copy-on-write diff. Together
+    # with BUILDAH_LAYERS below, our builds grew a 1.25 TB private tree that
+    # the platform's nightly prune could not even see (it only ever cleans the
+    # driver its own storage.conf names), so it kept reporting success while
+    # the node's disk filled up. See clusters/platform#6.
     BUILDAH_FORMAT: docker
     BUILDAH_ISOLATION: chroot
     BUILDAH_LAYERS: "true"
@@ -1557,7 +1567,6 @@ build-images:hort-server:
 
       # Dynamic OCI labels (title + license are baked into the Dockerfile).
       buildah bud \
-        --storage-driver=$STORAGE_DRIVER \
         --format=$BUILDAH_FORMAT \
         --isolation=$BUILDAH_ISOLATION \
         --cache-ttl=168h \
@@ -1570,11 +1579,11 @@ build-images:hort-server:
         -f docker/Dockerfile.hort-server \
         .
 
-      buildah push --digestfile /tmp/digest --storage-driver=$STORAGE_DRIVER "${IMAGE}:${VERSION_TAG}"
+      buildah push --digestfile /tmp/digest "${IMAGE}:${VERSION_TAG}"
       DIGEST=$(cat /tmp/digest)
 
       if [ "${PUSH_LATEST}" = "true" ]; then
-        buildah push --storage-driver=$STORAGE_DRIVER "${IMAGE}:latest"
+        buildah push "${IMAGE}:latest"
       fi
 
       sh ${CI_PROJECT_DIR}/.gitlab/ci/cosign-sign.sh "${IMAGE}" "${DIGEST}"
@@ -1654,7 +1663,6 @@ build-images:hort-worker:
       fi
 
       buildah bud \
-        --storage-driver=$STORAGE_DRIVER \
         --format=$BUILDAH_FORMAT \
         --isolation=$BUILDAH_ISOLATION \
         --cache-ttl=168h \
@@ -1667,11 +1675,11 @@ build-images:hort-worker:
         -f docker/Dockerfile.worker \
         .
 
-      buildah push --digestfile /tmp/digest --storage-driver=$STORAGE_DRIVER "${IMAGE}:${VERSION_TAG}"
+      buildah push --digestfile /tmp/digest "${IMAGE}:${VERSION_TAG}"
       DIGEST=$(cat /tmp/digest)
 
       if [ "${PUSH_LATEST}" = "true" ]; then
-        buildah push --storage-driver=$STORAGE_DRIVER "${IMAGE}:latest"
+        buildah push "${IMAGE}:latest"
       fi
 
       sh ${CI_PROJECT_DIR}/.gitlab/ci/cosign-sign.sh "${IMAGE}" "${DIGEST}"
