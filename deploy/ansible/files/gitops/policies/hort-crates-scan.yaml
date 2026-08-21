@@ -23,11 +23,20 @@ spec:
   # elsewhere, by `cargo audit` and `cargo deny` against the workspace
   # `Cargo.lock`, which see the fully resolved graph.
   #
-  # Backends stay enabled so a verdict is still recorded per artifact; they
-  # gate nothing while the window is zero. quarantineDuration is a gitops
-  # field (restart-to-apply), NOT a deployment env var.
+  # scanBackends is EMPTY, completing the ADR 0034 Class A posture. "Scan as
+  # a record" proved false at a zero window: permissive mode still transitions
+  # a bad verdict straight to Rejected (ADR 0007), and a Rejected version is
+  # hidden from every caller — so a post-publish finding un-publishes the
+  # crate out from under the release chain. The findings themselves were
+  # false positives besides: cargo SBOM components carry range-floor versions
+  # from the publish body (a dep declared as "1" scans as version 1), so osv
+  # matches advisories long fixed in the actually-resolved versions. The
+  # dependency closure of first-party crates is gated where the resolved
+  # graph is visible: cargo audit + cargo deny in CI against the workspace
+  # lockfile. quarantineDuration is a gitops field (restart-to-apply), NOT a
+  # deployment env var.
   quarantineDuration: 0s
   requireApproval: false
   provenanceMode: off
-  scanBackends: ["osv"]
+  scanBackends: []
   licensePolicy: {}
