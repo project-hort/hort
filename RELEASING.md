@@ -233,6 +233,9 @@ git checkout -b chore/release-X.Y.Z origin/develop
 git commit -am "chore(release): X.Y.Z"
 git push -u origin chore/release-X.Y.Z
 # open the PROMOTION MR targeting `main`; put `Closes #… #…` in the body
+# BEFORE approving the publish gate: the registry-version precondition
+# below applies to the final exactly as to a beta — see §"Precondition:
+# the registry must already run any feature the publish needs".
 #   (issues auto-close only on merges to the default branch, main); preserve
 #   the merge commit (do NOT squash the promotion MR)
 # after it merges, tag the MAIN MERGE COMMIT:
@@ -259,6 +262,37 @@ git push github-public vX.Y.Z                        # tag → ghcr publish + Gi
 This mirrors the `github-public` sync already documented for the beta track
 above. `:latest` moves here, and only here, because only a stable tag clears
 `docker-publish.yml`'s `!contains(github.ref, '-')` guard.
+
+### Precondition: the registry must already run any feature the publish needs
+
+hort publishes its own crates to a hort instance, so the publish path can
+depend on registry behaviour that ships *in the release being made* — the
+write-authorized index metadata serving is the worked example: `v0.11.0-beta.8`
+and `v0.11.0-beta.9` both failed at `hort-http-core` because the running
+server predated the fix its publish relied on.
+
+Before approving the crates-publish gate, confirm `registry.hort.rs` runs a
+build containing every registry feature this release's publish depends on:
+
+```bash
+ssh <registry-host> hort-server --version   # what actually runs
+git tag --contains <feature-sha>            # which releases carry the feature
+```
+
+The running version is **not derivable from this repository**: the native
+deploy (`site-native.yml` / `hort_binaries`) takes `hort_version` on the
+command line and deliberately pins nothing in `group_vars`. Two places that
+look like they answer it but do not: `hort_version=latest` resolves GitHub's
+`/releases/latest`, which **excludes prereleases** (it lags every beta by a
+full cycle); and the `hort_server_image`/`hort_worker_image` `:latest` pins in
+`group_vars/all.yml` belong to the **podman** playbook, not to this host.
+
+If the feature's first tag is newer than what the host reports, the publish
+cannot work — and the failure looks exactly like the feature being broken.
+Deploy first, then approve the gate; the release workflow's
+`environment: release` approval is the window that makes the ordering
+possible (`Create Release` finishes before the gate, so the binaries to
+deploy already exist while the publish waits).
 
 ## Crates publish: warm the vetted index before tagging
 
