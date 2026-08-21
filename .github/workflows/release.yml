@@ -401,37 +401,35 @@ jobs:
       #
       # The sleep between publishes covers sparse-index propagation only — the
       # hort index-serve path is synchronous, so an uploaded crate is typically
-      # in the index within 1–2 s. It does NOT cover the hosted repo's
-      # quarantine window: hort-crates carries a ScanPolicy observation period,
-      # and the index it serves omits a crate that has not cleared it. Every
-      # publish after the first resolves its just-uploaded siblings (cargo does
-      # that even under --no-verify), so that window, not this sleep, is what
+      # in the index within 1–2 s. It does NOT cover a hosted repo's quarantine
+      # window: where a ScanPolicy sets a non-zero observation period, the
+      # index it serves omits a crate that has not cleared it. Every publish
+      # after the first resolves its just-uploaded siblings (cargo does that
+      # even under --no-verify), so that window, not this sleep, is what
       # decides whether the chain can resolve them.
+      #
+      # Resumability. A publish that fails partway leaves the crates it did
+      # upload in the index, immutable and unwithdrawable; cargo then refuses
+      # to republish any of them, so a re-run of the same tag used to die at
+      # the first one and the remaining crates could never ship at that
+      # version. scripts/ci/publish-crates.sh checks each crate against the
+      # index BEFORE its attempt and skips the ones already there — never on
+      # cargo's exit status afterwards, which cannot distinguish "refused to
+      # republish" from "the upload failed". Its module comment carries the
+      # full argument.
+      #
+      # The loop lives in that script rather than here so the constraint can
+      # be tested: scripts/test-crate-version-in-index.sh drives it against a
+      # fixture index with a stub cargo, and asserts both that already-present
+      # crates are skipped and that a failing publish still aborts the run.
       - name: Publish hort crates to hort-crates (derived dependency order)
         env:
           SQLX_OFFLINE: "true"
-        run: |
-          set -euo pipefail
-
-          publish_crate() {
-            local crate_path="$1"
-            echo "Publishing ${crate_path} ..."
-            cargo publish \
-              --no-verify \
-              --registry hort-crates \
-              --manifest-path "${crate_path}/Cargo.toml"
-            # Allow the sparse index to propagate the new entry before the next
-            # dependent crate's publish resolves it.
-            sleep 10
-          }
-
-          order="$(scripts/ci/publishable-crates-in-order.sh)"
-          echo "Publish order (derived from the workspace manifests):"
-          echo "${order}" | sed 's/^/  /'
-
-          while read -r crate_path; do
-            publish_crate "${crate_path}"
-          done <<< "${order}"
+          # The publishing identity's own token: hort serves a write-granted
+          # principal a wider index view than an anonymous reader (ADR 0055),
+          # and the skip check has to see what cargo will see.
+          HORT_TOKEN: ${{ steps.hortauth.outputs.token }}
+        run: scripts/ci/publish-crates.sh https://registry.hort.rs hort-crates
 
   # ════════════════════════════════════════════════════════════════════════════
   # CREATE RELEASE

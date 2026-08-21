@@ -1391,6 +1391,24 @@ quality:fail2ban-regex-test:
   script:
     - bash scripts/test-fail2ban-regex.sh
 
+# Publish-time registry index check. Same shape as the two jobs above:
+# plain bash, lightweight image, no network. The check decides whether a
+# crate is already published and must be skipped, so it runs exactly once
+# per release and a defect in it is otherwise found during one — where the
+# two costs are a silently missing crate in a shipped release, or another
+# burned version number. jq parses the NDJSON index fixtures; cargo is
+# absent here, so the order-script assertion self-skips.
+quality:crates-index-check-test:
+  stage: quality
+  image: debian:13-slim
+  needs: []
+  <<: *rules-code-changed
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq --no-install-recommends jq
+  script:
+    - bash scripts/test-crate-version-in-index.sh
+
 # project-hort.de static site (issue #78): builds site/dist/ and runs the
 # link-check that fails the build on any broken internal link or heading
 # anchor. Output is an artifact for manual review only — never committed

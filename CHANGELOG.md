@@ -46,6 +46,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A crates publish that fails partway can now be re-run.** An upload is
+  irreversible — a published version can be yanked, never replaced — so a
+  release that broke on the third crate left the first two in the registry
+  and cargo refused to republish them, killing the re-run at crate one.
+  Every crate that never uploaded was then unshippable at that version and
+  the whole tag had to be abandoned, which is what happened to
+  `v0.11.0-beta.7`. The release job now checks each crate against the
+  registry index *before* its attempt and skips the ones already there,
+  logging each skip by name and version. The check is an index lookup, never
+  an interpretation of cargo's exit status: after cargo has run, "refused to
+  republish" and "the upload failed" are the same non-zero, so a loop that
+  continued past it would ship a release with crates silently missing. Any
+  genuine publish failure still aborts the release. (#186)
+
 - **CVSS v3.x base scores are now computed from OSV severity vectors.**
   OSV frequently delivers severity as a bare vector with no
   pre-computed number — RustSec advisories almost always do. Severity

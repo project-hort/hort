@@ -31,6 +31,10 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/ci/lib-cargo-sparse-index.sh
+source "${script_dir}/lib-cargo-sparse-index.sh"
+
 if [[ $# -lt 2 ]]; then
   echo "usage: $(basename "$0") <hort-base-url> <repo-key>  (bearer via \$HORT_TOKEN)" >&2
   exit 2
@@ -51,26 +55,10 @@ cut -d' ' -f1 "${locked_file}" | sort -u > "${tmpdir}/names.txt"
 name_count=$(wc -l < "${tmpdir}/names.txt")
 echo "Locked registry deps: ${locked_count} (${name_count} distinct names)" >&2
 
-# Cargo sparse-index prefix rule (lowercased name):
-#   1 char  -> 1/{n}
-#   2 chars -> 2/{n}
-#   3 chars -> 3/{n[0]}/{n}
-#   else    -> {n[0:2]}/{n[2:4]}/{n}
-prefix_path() {
-  local n len
-  n=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
-  len=${#n}
-  if [ "${len}" -eq 1 ]; then
-    printf '1/%s' "${n}"
-  elif [ "${len}" -eq 2 ]; then
-    printf '2/%s' "${n}"
-  elif [ "${len}" -eq 3 ]; then
-    printf '3/%s/%s' "${n:0:1}" "${n}"
-  else
-    printf '%s/%s/%s' "${n:0:2}" "${n:2:2}" "${n}"
-  fi
-}
-export -f prefix_path
+# The sparse-index prefix rule lives in lib-cargo-sparse-index.sh, shared
+# with the publish-time index check. `export -f` carries it into the `xargs
+# bash -c` subshells below, which do not inherit it by sourcing.
+export -f cargo_sparse_index_path
 
 # One GET per distinct name, bounded parallelism. A non-200 (or a curl
 # failure) is recorded as an empty served set — fail closed, since an index
@@ -79,7 +67,7 @@ export -f prefix_path
 fetch_one() {
   local name path outfile status
   name="$1"
-  path="$(prefix_path "${name}")"
+  path="$(cargo_sparse_index_path "${name}")"
   outfile="${tmpdir}/served/${name}"
   status=$(curl -sS -o "${outfile}" -w '%{http_code}' \
     -H "Authorization: Bearer ${HORT_TOKEN}" \
