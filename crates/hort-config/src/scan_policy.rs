@@ -15,7 +15,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, SeverityThreshold, SignerIdentityPattern,
+    NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold, SignerIdentityPattern,
 };
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +103,15 @@ pub struct ScanPolicySpec {
     /// (OSV `unmaintained` / `unsound` / `notice`) never block.
     #[serde(default = "default_negligible_action")]
     pub negligible_action: String,
+    /// What a blocking scan verdict does to the artifact
+    /// (`reject | record`). Validated via [`ScanEnforcement::FromStr`] in
+    /// [`validate_scan_policy`]. Defaults to `reject` when omitted — the
+    /// behaviour of every policy that predates the field, so an existing
+    /// tree needs no migration. `record` publishes with findings: the
+    /// scan runs, the findings and the `PolicyEvaluated(Fail)` verdict
+    /// are persisted, and the artifact is not rejected.
+    #[serde(default = "default_enforcement")]
+    pub enforcement: String,
 }
 
 /// Out-of-the-box `scanBackends` default when the YAML omits the
@@ -158,6 +167,13 @@ fn default_rescan_interval_hours() -> i32 {
 /// advisories through. Mirrors [`NegligibleAction::default`].
 fn default_negligible_action() -> String {
     NegligibleAction::default().to_string()
+}
+
+/// Out-of-the-box `enforcement` default when the YAML omits the field:
+/// `reject`, the enforcing default every pre-existing policy behaves as.
+/// Mirrors [`ScanEnforcement::default`].
+fn default_enforcement() -> String {
+    ScanEnforcement::default().to_string()
 }
 
 /// Parse one `ScanPolicy` envelope.
@@ -267,6 +283,23 @@ pub fn validate_scan_policy(env: &Envelope<ScanPolicySpec>) -> Vec<ValidationErr
             field: "spec.negligibleAction",
             got: env.spec.negligible_action.clone(),
             expected: vec!["ignore", "warn", "block"],
+        });
+    }
+
+    // `enforcement` parses via the domain enum. An unknown value is a
+    // typed reject naming the field and the two valid values — mirrors
+    // `provenanceMode` / `negligibleAction`. The knob is enforced at
+    // runtime by `hort_domain::policy::scan::evaluate_scan_result` and by
+    // the re-evaluation decision point, so accepting an unparseable value
+    // here — or silently defaulting it to `reject` — would be an
+    // accepted-but-inert footgun (ADR 0015): an operator who typo'd
+    // `enforcement: recrod` would believe publication proceeds while
+    // artifacts are being rejected.
+    if ScanEnforcement::from_str(&env.spec.enforcement).is_err() {
+        errors.push(ValidationError::UnknownEnumValue {
+            field: "spec.enforcement",
+            got: env.spec.enforcement.clone(),
+            expected: vec!["reject", "record"],
         });
     }
 
@@ -645,6 +678,84 @@ mod tests {
             ValidationError::UnknownEnumValue { field, got, .. }
                 if *field == "spec.negligibleAction" && got == "nuke"
         )));
+    }
+
+    // `enforcement` round-trip + default + validation.
+    #[test]
+    fn parse_round_trips_explicit_enforcement_record() {
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  enforcement: record
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("with-enforcement", body).as_bytes()).unwrap();
+        assert_eq!(env.spec.enforcement, "record");
+        assert!(validate_scan_policy(&env).is_empty());
+    }
+
+    #[test]
+    fn parse_omitted_enforcement_defaults_to_reject() {
+        // Zero-migration guarantee: an existing policy file that never
+        // mentions `enforcement` parses to the enforcing default, so the
+        // whole deployed tree keeps behaving exactly as it does today.
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("default-enforcement", body).as_bytes()).unwrap();
+        assert_eq!(env.spec.enforcement, "reject");
+        assert!(validate_scan_policy(&env).is_empty());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_enforcement() {
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  enforcement: audit
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("p", body).as_bytes()).unwrap();
+        let errors = validate_scan_policy(&env);
+        assert!(errors.iter().any(|e| matches!(
+            e,
+            ValidationError::UnknownEnumValue { field, got, expected }
+                if *field == "spec.enforcement"
+                    && got == "audit"
+                    && *expected == vec!["reject", "record"]
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_near_miss_enforcement_typo() {
+        // The footgun this rejection exists for: a typo that silently
+        // defaulted to `reject` would leave the operator believing
+        // publication proceeds while artifacts are being rejected.
+        let body = "
+  scope: global
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: false
+  enforcement: recrod
+  licensePolicy: {}
+";
+        let env = parse_scan_policy(&p(), yaml("p", body).as_bytes()).unwrap();
+        let errors = validate_scan_policy(&env);
+        assert!(
+            errors.iter().any(|e| {
+                let s = e.to_string();
+                s.contains("enforcement") && s.contains("recrod")
+            }),
+            "a near-miss enforcement value must reject loudly: {errors:?}"
+        );
     }
 
     // `rescanIntervalHours` round-trip + default + validation.

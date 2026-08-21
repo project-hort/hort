@@ -2535,7 +2535,9 @@ intentionally NOT operator-tunable.
 | `hort_scan_queue_depth` | gauge | (none) | rows | — |
 | `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout` |
 | `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
-| `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error}` |
+| `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error, payload_unavailable}` |
+| `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable, hosted_only}` |
+| `hort_sbom_components_skipped_total` | counter | `format` | — | — (the skip count rides the counter's value) |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
 | `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
 
@@ -2549,6 +2551,11 @@ Source of truth for the result enums:
   `hort_advisory_hydration_total.result`.
 - `hort_app::metrics::SbomExtractionResult` for
   `hort_sbom_extraction_total.result`.
+- `hort_app::metrics::SbomResolutionResult` for
+  `hort_sbom_resolution_total.result`. Its three payload-derived arms are
+  lifted from `hort_domain::ports::format_handler::SbomResolution` (the
+  handler-side vocabulary) via `From`; the remaining three are outcomes only
+  the orchestrator can observe.
 
 Adding a variant to any of those enums requires updating this catalog
 in the same change.
@@ -2658,16 +2665,78 @@ a `cache_miss`; a successful batch landed every prepared component
 into the cache for next time).
 
 **`hort_sbom_extraction_total.result` semantics** (closed taxonomy of
-3; emitted by `ScanOrchestrationUseCase::try_extract_sbom`):
+4; emitted by `ScanOrchestrationUseCase::try_extract_sbom`, once per
+scan-time SBOM extraction attempt) — *did a BOM come out*:
 
-- `success` — `FormatHandler::extract_sbom` returned `Ok(Some(sbom))`.
+- `success` — the handler returned `Ok(Some(sbom))`.
 - `unsupported_format` — handler returned `Ok(None)` (the
-  `FormatHandler` default impl, used by Helm/Conda/Hex/Pub/Generic).
+  `FormatHandler` default impl, used by Helm/Conda/Hex/Pub/Generic), or
+  no handler is registered for the format.
   Distinct from `parse_error` so the catalog can split "format does
   not produce an SBOM" from "format would produce an SBOM but the
   payload was malformed".
-- `parse_error` — handler returned `Err(_)`. Tracing carries the
-  underlying parse error; the metric only carries the result label.
+- `parse_error` — handler returned `Err(_)`, or its extraction task did
+  not complete. Tracing carries the underlying error; the metric only
+  carries the result label.
+- `payload_unavailable` — the handler derives its SBOM from the
+  artifact's stored payload (`FormatHandler::payload_sbom() ==
+  Some(_)`) and the CAS read failed, so no dispatch happened. Distinct
+  from `parse_error`: nothing was wrong with the artifact, the registry
+  could not reach its own bytes — an infrastructure signal, not a
+  content one.
+
+**`hort_sbom_resolution_total.result` semantics** (closed taxonomy of
+6; same emitter, same one-tick-per-attempt cadence) — *what the
+component versions mean*. The two counters are orthogonal and both fire
+on every attempt: `hort_sbom_extraction_total` says whether a BOM was
+produced, this one says on what basis:
+
+- `resolved` — the payload yielded a resolved-dependency document
+  (cargo's embedded `Cargo.lock`) and the closure walk succeeded: every
+  component carries the exact version the artifact was built against, so
+  a finding against one is real.
+- `no_lockfile` — the payload carried no resolved-dependency document.
+  Expected and truthful (nothing forces a publisher to embed one), but
+  the BOM is **subject-only**: the artifact itself is scanned and its
+  dependencies are not. The declared-range fallback is deliberately not
+  used — a range floor is not a version anything was built with.
+- `unusable_lockfile` — a resolved-dependency document was present but
+  could not be used (unparseable, over a parser cap, not a
+  self-consistent resolve), or the extraction failed before reaching
+  one. Also the arm for a handler `Err`. BOM is subject-only.
+- `payload_unavailable` — pairs with the extraction counter's arm of the
+  same name.
+- `not_applicable` — the format does not derive its SBOM from the
+  payload (npm, PyPI, and every opaque format), or no handler is
+  registered. Not a degradation: there is no resolved-dependency
+  document to look for.
+- `hosted_only` — the format *does* derive its SBOM from the payload,
+  but the artifact's repository is not `Hosted`, so the payload path was
+  declined and the scan used the metadata-only BOM. Deliberate policy,
+  not a failure: an embedded lockfile is the authenticated publisher's
+  own build witness only on a hosted publish; on a proxied third-party
+  library it is the upstream author's dev-time resolve, which consumers
+  re-resolve and never run. `Staging` and `Virtual` land here with
+  `Proxy`. The extraction counter still reports what came out of the
+  metadata path, so `hosted_only` never means "no BOM".
+
+Operator reading: `resolved / (resolved + no_lockfile +
+unusable_lockfile)` per format is the share of scans that examined
+dependencies at all. A registry whose cargo scans are mostly
+`no_lockfile` is not being scanned in the way its operator thinks it is,
+and no finding count would reveal that. `no_lockfile` moving is a
+publisher-population fact; `unusable_lockfile` moving is ours;
+`hosted_only` is a repository-topology fact — it is the expected value
+for a pull-through cache, and a surprise on a repository the operator
+believes is hosted.
+
+**`hort_sbom_components_skipped_total`** counts dependencies a resolved
+closure walked *through* but could not emit, for having no registry
+coordinates (path- and git-sourced lockfile entries) — an advisory
+database has nothing to say about them. The count rides the **counter's
+value**, never a label: it is unbounded, so a per-value label series
+would be a cardinality hazard, and a log field alone would not
+aggregate. Silent when nothing was skipped.
 
 The `format` label uses `ArtifactCoords.format.as_str()` (lowercase
 short name: `npm`, `pypi`, `cargo`, `maven`, `oci`, …) so the label
@@ -2751,7 +2820,9 @@ Cardinality:
 - `hort_scan_queue_depth`: 1 series (no labels).
 - `hort_advisory_query_total`: 6 result values → 6 series.
 - `hort_advisory_hydration_total`: 3 result values → 3 series.
-- `hort_sbom_extraction_total`: ~15 formats × 3 results → 45 series.
+- `hort_sbom_extraction_total`: ~15 formats × 4 results → 60 series.
+- `hort_sbom_resolution_total`: ~15 formats × 6 results → 90 series.
+- `hort_sbom_components_skipped_total`: ~15 formats → 15 series.
 - `hort_artifact_became_vulnerable_total`: ≤10k repositories × 4
   severities × 2 ingest_source → 80k series ceiling. Honours the
   `METRICS_INCLUDE_REPOSITORY_LABEL=false` toggle — when disabled,
@@ -3360,7 +3431,7 @@ Source: `hort-http-admin-tasks::handlers::invoke` constants
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_policy_evaluation_total` | counter | `decision_point`, `result` | — | `decision_point ∈ {scan_result, promotion, re_evaluation, curation, curation_retroactive}`; `result ∈ {pass, warn, require_approval, block, reject, still_rejected, reset_to_quarantined, reset_to_released, retro_warn, retro_block, no_change}` |
+| `hort_policy_evaluation_total` | counter | `decision_point`, `result` | — | `decision_point ∈ {scan_result, promotion, re_evaluation, curation, curation_retroactive}`; `result ∈ {pass, warn, require_approval, block, reject, findings_recorded, still_rejected, reset_to_quarantined, reset_to_released, retro_warn, retro_block, no_change}` |
 | `hort_policy_violations_total` | counter | `decision_point`, `rule` | — | `rule ∈ {cve-severity-threshold, license-compliance, license-policy-shape, require-signature, max-artifact-age, curation-block, curation-warn}` |
 
 Emitted by the application-layer use cases that evaluate policy at
@@ -3374,7 +3445,12 @@ policy evaluation gate:
 - `scan_result` — emitted by
   [`QuarantineUseCase::record_scan_result`](../crates/hort-app/src/use_cases/quarantine_use_case.rs)
   on every scan-completion. Result values it can carry: `pass` (clean),
-  `reject` (above-threshold finding not cleared by an exclusion).
+  `reject` (above-threshold finding not cleared by an exclusion, under
+  the default `enforcement: reject`), `findings_recorded` (the same
+  above-threshold verdict under `enforcement: record` — the violations
+  are persisted and counted on `hort_policy_violations_total` exactly as
+  on a reject, but the artifact is not rejected). `findings_recorded` is
+  emitted by no other decision point.
 - `promotion` — emitted by
   [`PromotionUseCase::evaluate_and_promote`](../crates/hort-app/src/use_cases/promotion_use_case.rs).
   Result values: `pass` (Allow), `warn` (Warn — promotes with audit),
@@ -3429,11 +3505,11 @@ for `pass` / `no_change` outcomes (no violations).
   by curation and curation_retroactive decision points.
 
 Cardinality:
-- `hort_policy_evaluation_total`: 5 decision points × ~11 result values
-  = 55 series ceiling. Most decision points only emit a subset of the
+- `hort_policy_evaluation_total`: 5 decision points × ~12 result values
+  = 60 series ceiling. Most decision points only emit a subset of the
   result enum (e.g. `still_rejected` only on `re_evaluation`,
-  `retro_warn` only on `curation_retroactive`); effective deployment
-  cardinality is ~25 series.
+  `retro_warn` only on `curation_retroactive`, `findings_recorded` only
+  on `scan_result`); effective deployment cardinality is ~26 series.
 - `hort_policy_violations_total`: 5 × 7 = 35 series ceiling. Effective
   cardinality is lower because most `(decision_point, rule)`
   combinations never fire (e.g. `decision_point=curation,

@@ -23,6 +23,28 @@ default branch (`main`) — a final release's promotion MR closes every
 issue whose fix already rested in `ready-for-staging` or `in-uat`, often
 many at once. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
 
+### Enforcement mode
+
+A `ScanPolicy` field (`enforcement: reject | record`) deciding what a
+**blocking scan verdict does** to the artifact — as distinct from the
+knobs that decide *which* findings are blocking (`severityThreshold`,
+`licensePolicy`, `negligibleAction`). Under `reject` (the default, and
+the behaviour of any policy that omits the field) a blocking verdict
+transitions the artifact to `Rejected`. Under `record` the scan still
+runs and the findings, the per-finding rows and the
+`PolicyEvaluated(Fail)` verdict are all persisted exactly as they would
+be under `reject` — only the `ArtifactRejected` transition is withheld,
+so publication proceeds and blocking at retrieval is left to a later,
+explicit policy tightening. `record` un-gates the **scan** axis alone:
+provenance, curation and the observation window are unaffected, and a
+recorded verdict releases under its own `ScanRecorded` authority rather
+than a widened `ScanSucceeded`. Changing the field re-judges the
+existing population in both directions. See
+[ADR 0007](adr/0007-fail-closed-quarantine-release-predicate.md) and
+[ADR 0041](adr/0041-continuous-scan-policy-enforcement.md), and
+[declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
+`kind: ScanPolicy`.
+
 ### Global grant
 
 A `PermissionGrant` whose `spec.repository` field is omitted, so it

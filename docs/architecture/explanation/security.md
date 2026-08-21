@@ -364,10 +364,11 @@ pattern and the optimistic-concurrency guarantee.
 > `ScanIndeterminate` state holds artifacts whose scan never
 > succeeded. The timer sweep derives its release authority from the
 > artifact's own stream and resolved policy (a successful
-> `ScanCompleted` → `ScanSucceeded`, or a `scan_backends: []` policy
-> → `ScanWaived`); a candidate with neither gets no authority and the
-> predicate refuses it, so timer-driven release skips it —
-> fail-closed by construction.
+> `ScanCompleted` → `ScanSucceeded`, a `scan_backends: []` policy
+> → `ScanWaived`, or a scanned artifact under an
+> `enforcement: record` policy → `ScanRecorded`); a candidate with
+> none of them gets no authority and the predicate refuses it, so
+> timer-driven release skips it — fail-closed by construction.
 
 The operator-facing how-to is at
 [../how-to/declare-gitops-config.md](../how-to/declare-gitops-config.md).

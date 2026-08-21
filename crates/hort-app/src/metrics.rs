@@ -1962,6 +1962,13 @@ pub enum PolicyEvaluationResult {
     Block,
     /// Scan-result or promotion evaluator returned `Reject`.
     Reject,
+    /// Scan-result evaluator computed a blocking verdict under a policy
+    /// that declares `enforcement: record` — the violations are
+    /// persisted (`PolicyEvaluated(Fail)` + the per-finding rows) but the
+    /// artifact is NOT rejected. Distinct from both `pass` (which would
+    /// hide over-threshold findings behind a happy-path label) and
+    /// `reject` (which would over-report blocked publications).
+    FindingsRecorded,
     /// Re-evaluation pass: the artifact's blocking findings remain
     /// after the new exclusion. No state transition.
     StillRejected,
@@ -1991,6 +1998,7 @@ impl PolicyEvaluationResult {
             Self::RequireApproval => "require_approval",
             Self::Block => "block",
             Self::Reject => "reject",
+            Self::FindingsRecorded => "findings_recorded",
             Self::StillRejected => "still_rejected",
             Self::ResetToQuarantined => "reset_to_quarantined",
             Self::ResetToReleased => "reset_to_released",
@@ -2624,8 +2632,12 @@ pub fn emit_advisory_hydration(result: AdvisoryHydrationResult) {
 }
 
 /// Outcome label of `hort_sbom_extraction_total`. Closed
-/// taxonomy of 3 — `FormatHandler::extract_sbom` lands on exactly one
+/// taxonomy of 4 — SBOM extraction lands on exactly one
 /// per dispatch.
+///
+/// Answers "did this scan get an SBOM at all". Its sibling
+/// [`SbomResolutionResult`] answers the orthogonal question "on what
+/// basis were the components derived"; both fire once per dispatch.
 ///
 /// String values are normative — they appear verbatim in
 /// `docs/metrics-catalog.md`.
@@ -2640,6 +2652,12 @@ pub enum SbomExtractionResult {
     /// Handler returned `Err(_)` — the format would normally produce
     /// an SBOM but the payload was malformed.
     ParseError,
+    /// The handler consumes the artifact's stored payload and the read
+    /// from CAS failed, so no dispatch happened. Distinct from
+    /// `parse_error`: nothing was wrong with the artifact, the registry
+    /// could not reach its own bytes — an infrastructure signal, not a
+    /// content one.
+    PayloadUnavailable,
 }
 
 impl SbomExtractionResult {
@@ -2650,12 +2668,13 @@ impl SbomExtractionResult {
             Self::Success => "success",
             Self::UnsupportedFormat => "unsupported_format",
             Self::ParseError => "parse_error",
+            Self::PayloadUnavailable => "payload_unavailable",
         }
     }
 }
 
 /// Emit `hort_sbom_extraction_total{format, result}` once per
-/// `FormatHandler::extract_sbom` dispatch.
+/// scan-time SBOM extraction attempt.
 pub fn emit_sbom_extraction(format: &str, result: SbomExtractionResult) {
     metrics::counter!(
         "hort_sbom_extraction_total",
@@ -2663,6 +2682,120 @@ pub fn emit_sbom_extraction(format: &str, result: SbomExtractionResult) {
         labels::RESULT => result.as_str(),
     )
     .increment(1);
+}
+
+/// Outcome label of `hort_sbom_resolution_total`. Closed taxonomy of 6 —
+/// exactly one per scan-time SBOM extraction attempt.
+///
+/// Where [`SbomExtractionResult`] says whether an SBOM came out,
+/// this says **what its component versions mean**. The distinction is
+/// operationally load-bearing: a `resolved` BOM names the versions the
+/// artifact was actually built against, so a finding against it is real;
+/// every other value means the scan fell back to a subject-only BOM and
+/// the artifact's dependencies were not examined at all. A registry
+/// whose cargo scans are mostly `no_lockfile` is not being scanned in the
+/// way its operator thinks it is, and no other signal says so.
+///
+/// String values are normative — they appear verbatim in
+/// `docs/metrics-catalog.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SbomResolutionResult {
+    /// The payload yielded a resolved-dependency document and the
+    /// closure walk succeeded: every component carries an exact version.
+    Resolved,
+    /// The payload carried no resolved-dependency document. Expected and
+    /// truthful — nothing forces a publisher to embed one — but the BOM
+    /// is subject-only.
+    NoLockfile,
+    /// The payload carried a resolved-dependency document that could not
+    /// be used (unparseable, over a parser cap, not a self-consistent
+    /// resolve), or the extraction failed before reaching one. Also the
+    /// arm for a handler that returned `Err`. The BOM is subject-only.
+    UnusableLockfile,
+    /// The read from CAS failed, so the payload never reached the
+    /// handler. Pairs with
+    /// [`SbomExtractionResult::PayloadUnavailable`].
+    PayloadUnavailable,
+    /// The format does not derive its SBOM from the payload
+    /// (`FormatHandler::payload_sbom() == None`) — npm, PyPI, and every
+    /// opaque format. Not a degradation: there is no resolved-dependency
+    /// document to look for.
+    NotApplicable,
+    /// The format *does* derive its SBOM from the payload, but the
+    /// artifact's repository is not `Hosted`, so the payload path was
+    /// not taken and the scan used the metadata-only BOM. Deliberate
+    /// policy, not a failure: an embedded lockfile is only the
+    /// authenticated publisher's own build witness on a hosted publish;
+    /// on a proxied third-party library it is the upstream author's
+    /// dev-time resolve, which no consumer ever runs.
+    ///
+    /// Split from [`Self::NotApplicable`] because the two are
+    /// operationally different and would otherwise collide on the same
+    /// `format` label: `not_applicable` says "there is nothing to look
+    /// for", `hosted_only` says "there is, and this repository class
+    /// deliberately does not look". A cargo registry whose scans are all
+    /// `hosted_only` when its operator believes those repositories are
+    /// hosted is a misconfiguration no other series reveals.
+    HostedOnly,
+}
+
+impl SbomResolutionResult {
+    /// Wire string. Catalog rule: must match `docs/metrics-catalog.md`
+    /// exactly.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Resolved => "resolved",
+            Self::NoLockfile => "no_lockfile",
+            Self::UnusableLockfile => "unusable_lockfile",
+            Self::PayloadUnavailable => "payload_unavailable",
+            Self::NotApplicable => "not_applicable",
+            Self::HostedOnly => "hosted_only",
+        }
+    }
+}
+
+/// The handler-side vocabulary (3 arms — what a format handler can
+/// observe) lifted into the emitting layer's vocabulary (6 arms — the
+/// handler's three plus the three only the orchestrator can see). The
+/// domain stays free of metric concerns; the mapping lives here, with
+/// the counter.
+impl From<hort_domain::ports::format_handler::SbomResolution> for SbomResolutionResult {
+    fn from(resolution: hort_domain::ports::format_handler::SbomResolution) -> Self {
+        use hort_domain::ports::format_handler::SbomResolution;
+        match resolution {
+            SbomResolution::Resolved => Self::Resolved,
+            SbomResolution::NoLockfile => Self::NoLockfile,
+            SbomResolution::UnusableLockfile => Self::UnusableLockfile,
+        }
+    }
+}
+
+/// Emit `hort_sbom_resolution_total{format, result}` once per scan-time
+/// SBOM extraction attempt.
+pub fn emit_sbom_resolution(format: &str, result: SbomResolutionResult) {
+    metrics::counter!(
+        "hort_sbom_resolution_total",
+        labels::FORMAT => format.to_string(),
+        labels::RESULT => result.as_str(),
+    )
+    .increment(1);
+}
+
+/// Add `count` to `hort_sbom_components_skipped_total{format}` — the
+/// dependencies a resolved closure walked through but could not emit,
+/// for having no registry coordinates (path- and git-sourced entries).
+///
+/// A **counter carrying the count**, not a label carrying it: the value
+/// is unbounded, so a per-value label series would be a cardinality
+/// hazard, and a log field alone would not aggregate. Operators need the
+/// rate — a rise means BOMs are quietly getting thinner, which no
+/// finding count would reveal.
+pub fn emit_sbom_components_skipped(format: &str, count: u64) {
+    metrics::counter!(
+        "hort_sbom_components_skipped_total",
+        labels::FORMAT => format.to_string(),
+    )
+    .increment(count);
 }
 
 /// Emit `hort_artifact_became_vulnerable_total{repository, severity,
@@ -2767,10 +2900,27 @@ pub fn register_scan_metrics() {
     describe_counter!(
         "hort_sbom_extraction_total",
         Unit::Count,
-        "FormatHandler::extract_sbom dispatches, by `format` and `result` \
-         (success / unsupported_format / parse_error)"
+        "scan-time SBOM extraction attempts, by `format` and `result` \
+         (success / unsupported_format / parse_error / payload_unavailable)"
     );
     let _ = counter!("hort_sbom_extraction_total");
+
+    describe_counter!(
+        "hort_sbom_resolution_total",
+        Unit::Count,
+        "scan-time SBOM extraction attempts, by `format` and how the components \
+         were derived (`result`: resolved / no_lockfile / unusable_lockfile / \
+         payload_unavailable / not_applicable)"
+    );
+    let _ = counter!("hort_sbom_resolution_total");
+
+    describe_counter!(
+        "hort_sbom_components_skipped_total",
+        Unit::Count,
+        "dependencies a resolved closure walked through but could not emit for \
+         having no registry coordinates (path- and git-sourced entries), by `format`"
+    );
+    let _ = counter!("hort_sbom_components_skipped_total");
 
     describe_counter!(
         "hort_artifact_became_vulnerable_total",
@@ -5394,6 +5544,12 @@ mod tests {
     }
 
     #[test]
+    fn policy_evaluation_result_findings_recorded_as_str() {
+        use super::PolicyEvaluationResult as R;
+        assert_eq!(R::FindingsRecorded.as_str(), "findings_recorded");
+    }
+
+    #[test]
     fn policy_evaluation_result_still_rejected_as_str() {
         use super::PolicyEvaluationResult as R;
         assert_eq!(R::StillRejected.as_str(), "still_rejected");
@@ -5438,6 +5594,7 @@ mod tests {
             R::RequireApproval,
             R::Block,
             R::Reject,
+            R::FindingsRecorded,
             R::StillRejected,
             R::ResetToQuarantined,
             R::ResetToReleased,
@@ -6836,6 +6993,8 @@ mod tests {
             "hort_scan_queue_depth",
             "hort_advisory_query_total",
             "hort_sbom_extraction_total",
+            "hort_sbom_resolution_total",
+            "hort_sbom_components_skipped_total",
             "hort_artifact_became_vulnerable_total",
             "hort_scan_record_outcome_failures_total",
         ];

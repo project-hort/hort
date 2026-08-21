@@ -2126,6 +2126,7 @@ fn policy_field_clone_eq_serde() {
         PolicyField::ScanBackends,
         PolicyField::RescanIntervalHours,
         PolicyField::NegligibleAction,
+        PolicyField::Enforcement,
     ];
     for field in fields {
         let cloned = field.clone();
@@ -2136,7 +2137,7 @@ fn policy_field_clone_eq_serde() {
     }
 }
 
-/// ADR 0041 Item 3: exactly the three scan-release-gate fields are
+/// ADR 0041 Item 3: exactly the four scan-release-gate fields are
 /// gate-affecting; every other `PolicyField` is not. Pins both arms of
 /// the closed match in `PolicyField::is_gate_affecting` so a future
 /// variant (which fails to compile against the closed match) forces a
@@ -2144,10 +2145,14 @@ fn policy_field_clone_eq_serde() {
 /// existing field is a red test.
 #[test]
 fn policy_field_is_gate_affecting_is_exactly_the_scan_gate_fields() {
-    // Gate-affecting: the three fields `evaluate_scan_result` reads.
+    // Gate-affecting: the four fields `evaluate_scan_result` reads.
     assert!(PolicyField::SeverityThreshold.is_gate_affecting());
     assert!(PolicyField::LicensePolicy.is_gate_affecting());
     assert!(PolicyField::NegligibleAction.is_gate_affecting());
+    // `enforcement` flips whether a blocking verdict holds the artifact
+    // at all — gate-affecting in both directions (a tighten that skipped
+    // re-derivation would be fail-open).
+    assert!(PolicyField::Enforcement.is_gate_affecting());
 
     // Not gate-affecting: identity / timer / promotion / provenance /
     // age / scanner-selection / rescan-cadence fields.

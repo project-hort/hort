@@ -137,7 +137,8 @@ Five invariants, each preserving a foundation:
 Gate-affecting `ScanPolicy` mutations run a bounded re-evaluation pass over the
 policy's in-scope population: `add_exclusion` (already), `remove_exclusion`,
 `update_policy` for the gate fields (severity thresholds, blocked classes,
-`negligible_action`), and `reactivate_policy`. The pass generalises today's
+`negligible_action`, and — since the field was added — `enforcement`), and
+`reactivate_policy`. The pass generalises today's
 `list_rejected_for_policy` (un-reject only) to the full active set
 (`Rejected` **and** `Released` / `Quarantined` scanned artifacts).
 
@@ -161,6 +162,9 @@ policy's in-scope population: `add_exclusion` (already), `remove_exclusion`,
 | Opt-in | Interaction | Disposition |
 |---|---|---|
 | `scan_backends: []` (ScanWaived) | Re-evaluation reads stored findings; it invokes **no** scanner. Waiver-released artifacts have no findings → untouched. | No interaction — and the prior draft's "refuse when no backend" guard is **dropped** as unnecessary. |
+| `enforcement: record` (added 2026-08-21) | The mode decides whether a blocking verdict may hold the artifact; it is applied to the same `action` the CVE + negligible evaluators compute, in **both** the initial-scan evaluator and the re-evaluation decision point. `record → reject` re-derives and re-holds; `reject → record` un-rejects via authority #5. It un-gates the **scan** axis only: invariant #6's provenance and curation conjuncts, the rejection-reason eligibility guard, and the observation window are all unchanged, and a `record`-mode artifact releases through the distinct `ScanRecorded` authority (ADR 0007 amendment), never by widening `ScanSucceeded`. | **Composes** — it is precisely a gate-affecting field, which is why it is wired into `PolicyField::is_gate_affecting`. A `record` field that changed the gate without triggering re-derivation would be a fresh instance of the fail-open gap this ADR closed. |
+| `enforcement: record` × `scan_backends: []` | Vacuous, not dangerous: with no scanner there are no findings, so there is no verdict to record or enforce — exactly as `severityThreshold` and `negligibleAction` are already vacuous under a waiver. No new collapse, no apply-time rejection. | No interaction. |
+| `enforcement: record` × `trust_upstream_publish_time` | The combination shortens *latency to release*, not the gate: `record` alone already declares the scan verdict non-gating, so a collapsed window adds no relaxation the operator has not already made explicitly. The scan still runs and its evidence is still recorded, so the ADR 0041 tighten direction can re-hold the whole population at any time. | No collapse of an invariant that either opt-in preserved alone. |
 | `trust_upstream_publish_time` | Anchors the quarantine *deadline*. Re-evaluation re-derives the *verdict*, not the timer; tightening re-holds independent of the deadline. | No interaction. |
 | `provenance_mode: Required` | The release gate must be `scan ∧ provenance` (∧ curation). **The reused `re_evaluate` path does NOT check provenance today** (`artifact.rs` checks only status + deadline), and the existing post-exclusion pass already releases provenance/curation-rejected artifacts whose scan passes (invariant #6). | **Must be *made* to compose** — new composition logic that also fixes a pre-existing fail-open; not free reuse. |
 
