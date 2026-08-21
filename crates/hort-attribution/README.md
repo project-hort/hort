@@ -28,6 +28,11 @@ three shipped binaries.
 - `write_stdout_or_exit(s: &str) -> ExitCode` — a SIGPIPE-safe stdout
   writer (Rust ignores SIGPIPE and `unsafe` is workspace-forbidden, so this
   swallows `BrokenPipe` into a clean exit rather than panicking).
+- `write_to_or_exit<W: Write>(w: &mut W, s: &str) -> ExitCode` — the same
+  behaviour against any sink; `write_stdout_or_exit` is `write_to_or_exit`
+  fixed to `io::stdout()`. Each binary's `run()` stays on the stdout form;
+  a sibling `run_to` form takes the writer so tests can assert on an
+  in-memory sink instead of writing to the real stdout.
 
 ## Rules
 

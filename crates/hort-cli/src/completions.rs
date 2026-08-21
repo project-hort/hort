@@ -140,11 +140,20 @@ pub struct CompletionsArgs {
 /// control. Buffering first lets the single write to stdout go through
 /// `hort_attribution::write_stdout_or_exit`, which exits cleanly instead.
 pub fn run(args: &CompletionsArgs) -> std::process::ExitCode {
+    run_to(&mut std::io::stdout(), args)
+}
+
+/// Generic-sink form of [`run`]: same generate-then-write behaviour against
+/// any [`std::io::Write`], so tests can assert on the written script's
+/// content instead of dumping the full generated completion script — which
+/// grows with every subcommand added, unlike the licence texts — to the
+/// real stdout on every test run.
+fn run_to<W: std::io::Write>(w: &mut W, args: &CompletionsArgs) -> std::process::ExitCode {
     let mut cmd = Cli::command();
     let mut buf = Vec::new();
     clap_complete::generate(args.shell, &mut cmd, "hort-cli", &mut buf);
     let script = String::from_utf8(buf).expect("clap_complete output is valid UTF-8");
-    hort_attribution::write_stdout_or_exit(&script)
+    hort_attribution::write_to_or_exit(w, &script)
 }
 
 #[cfg(test)]
@@ -178,11 +187,15 @@ mod tests {
         // Exercises the buffer-then-write path in `run` itself (the
         // `script_for` helper above duplicates the `generate` call but
         // never invokes `run`, so this is the only test that covers it).
-        let code = run(&CompletionsArgs { shell: Shell::Bash });
+        let mut buf: Vec<u8> = Vec::new();
+        let code = run_to(&mut buf, &CompletionsArgs { shell: Shell::Bash });
         assert_eq!(
             format!("{code:?}"),
             format!("{:?}", std::process::ExitCode::SUCCESS)
         );
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.is_empty(), "completion script must not be empty");
+        assert!(out.contains("list-versions"), "must complete list-versions");
     }
 
     #[tokio::test]
