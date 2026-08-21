@@ -36,8 +36,12 @@ The pipeline has three stages with sharply separated knowledge:
   that fetches and parses the upstream document, hydrating each
   upstream version with hort's known quarantine status via
   `ArtifactUseCase::package_version_status` (e.g. `ProxyNpmSource`
-  in the same module). Sources know where versions come from; they
-  apply no policy.
+  in the same module). A hosted source whose wire document carries
+  more than the artifact row holds joins the stored format metadata
+  in through `ArtifactUseCase::batch_metadata` — one batched read for
+  the whole version set — as PyPI does for `requires-python` and
+  cargo does for each version's `deps` / `features`. Sources know
+  where versions come from; they apply no policy.
 - A **filter pipeline** drops entries. Filters implement
   `IndexFilter` (`crates/hort-app/src/use_cases/index_serve.rs`) and
   operate only on the spine fields described below — they are pure

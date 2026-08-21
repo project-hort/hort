@@ -73,6 +73,7 @@ use hort_formats::cargo::CargoFormatHandler;
 use hort_http_core::context::AppContext;
 
 use crate::index_cache::IndexFetchError;
+use crate::publish_metadata::StoredIndexFields;
 
 /// Output of one [`IndexSource::fetch`] call.
 ///
@@ -121,11 +122,19 @@ pub(crate) trait IndexSource: Send + Sync {
 /// [`ArtifactUseCase::list_by_raw_name_visible`] (the
 /// per-resource-visibility-enforcing anti-enumeration entry point).
 /// Each Artifact row becomes one [`VersionEntry`] whose
-/// `payload.Cargo` carries the hosted-emission NDJSON-line fields:
+/// `payload.Cargo` carries the hosted-emission NDJSON-line fields.
+///
+/// The artifact row is authoritative for identity and integrity:
 /// `name` from `Artifact.name` (drift-resilience pin), `vers` from
-/// `Artifact.version`, `cksum` from `Artifact.sha256_checksum`,
-/// `deps = []`, `features = {}`, `yanked = false`, `links / rust_version
-/// / v / features2 = None`.
+/// `Artifact.version`, `cksum` from `Artifact.sha256_checksum` (the
+/// CAS hash — never a publisher-supplied digest), `yanked = false`.
+/// The dependency-graph fields — `deps`, `features`, `features2`,
+/// `v`, `links`, `rust_version` — come from the metadata the publish
+/// handler persisted, joined in via
+/// [`ArtifactUseCase::batch_metadata`]. A version with no stored
+/// metadata (ingested before publish captured it, or written by a
+/// non-publish path such as a seed import) keeps serving the entry it
+/// always served: empty `deps` / `features`, no `v` / `features2`.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct HostedCargoSource;
 
@@ -158,12 +167,31 @@ impl IndexSource for HostedCargoSource {
         let truncated = artifact_list.truncated;
         let artifacts = artifact_list.items;
 
+        // One batched read for the whole version set — never a
+        // per-version round-trip. Every id was authz'd by
+        // `list_by_raw_name_visible` above, which is the precondition
+        // `batch_metadata` documents. Goes through the use case
+        // because `ctx.artifact_metadata` is off-limits to format
+        // crates (ADR 0008).
+        let ids: Vec<uuid::Uuid> = artifacts.iter().map(|a| a.id).collect();
+        let metadata_rows = ctx.artifact_use_case.batch_metadata(&ids).await?;
+
         let mut entries = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
             // Versionless rows are not part of the sparse-index; skip.
             let Some(version) = artifact.version.clone() else {
                 continue;
             };
+            // `load_full_metadata` is the strategy-agnostic read: the
+            // cargo handler stores inline, so this resolves to the
+            // row's own JSON with no CAS round-trip, and it stays
+            // correct if the format ever adopts the blob-spilling
+            // strategy.
+            let stored = match metadata_rows.get(&artifact.id) {
+                Some(row) => ctx.artifact_use_case.load_full_metadata(row).await?,
+                None => serde_json::Value::Null,
+            };
+            let index_fields = StoredIndexFields::from_stored(&stored);
             let payload = CargoVersionPayload {
                 // Drift-resilience: use the STORED name, not the
                 // re-normalised request parameter. Under drift this
@@ -173,13 +201,13 @@ impl IndexSource for HostedCargoSource {
                 name_as_published: artifact.name.clone(),
                 vers: version.clone(),
                 cksum: artifact.sha256_checksum.to_string(),
-                deps: serde_json::json!([]),
-                features: serde_json::json!({}),
+                deps: index_fields.deps,
+                features: index_fields.features,
                 yanked: false,
-                links: None,
-                rust_version: None,
-                v: None,
-                features2: None,
+                links: index_fields.links,
+                rust_version: index_fields.rust_version,
+                v: index_fields.v,
+                features2: index_fields.features2,
             };
             entries.push(VersionEntry {
                 version,

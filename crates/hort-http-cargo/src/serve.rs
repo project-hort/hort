@@ -1257,6 +1257,222 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Stored publish metadata in the served entry.
+    //
+    // The hosted entry's dependency graph comes from the metadata the
+    // publish handler persisted. Without it every hosted entry claims
+    // `deps: []` / `features: {}`, and cargo — which validates a
+    // feature edge against the INDEX entry, not the dependency's own
+    // manifest — refuses to package a crate that names a sibling's
+    // feature.
+    // -----------------------------------------------------------------
+
+    /// The publish body of a crate whose only feature uses the
+    /// namespaced-dependency syntax — the shape that must reach the
+    /// wire as `features2` + `v: 2`.
+    const HORT_APP_PUBLISH_BODY: &str = r#"{
+        "name": "hort-app",
+        "vers": "0.11.0",
+        "deps": [
+            {
+                "name": "hort-domain",
+                "version_req": "=0.11.0",
+                "features": [],
+                "optional": false,
+                "default_features": true,
+                "target": null,
+                "kind": "normal",
+                "registry": null,
+                "explicit_name_in_toml": null
+            },
+            {
+                "name": "metrics-util",
+                "version_req": "^0.16",
+                "features": [],
+                "optional": true,
+                "default_features": true,
+                "target": null,
+                "kind": "normal",
+                "registry": null,
+                "explicit_name_in_toml": null
+            }
+        ],
+        "features": {
+            "default": [],
+            "test-support": ["dep:metrics-util"]
+        },
+        "links": null,
+        "rust_version": "1.94",
+        "cksum": "a-publisher-supplied-digest-that-must-be-ignored"
+    }"#;
+
+    /// Seed the metadata row a cargo publish of `publish_body` writes.
+    fn insert_publish_metadata(
+        mocks: &hort_http_core::test_support::MockPorts,
+        artifact_id: Uuid,
+        publish_body: &str,
+    ) {
+        let parsed: crate::publish_metadata::PublishMetadata =
+            serde_json::from_str(publish_body).expect("fixture publish body parses");
+        mocks
+            .artifact_metadata
+            .insert(hort_domain::entities::artifact::ArtifactMetadata {
+                artifact_id,
+                format: RepositoryFormat::Cargo,
+                metadata: parsed.to_index_metadata(),
+                metadata_blob: None,
+                properties: serde_json::Value::Null,
+            });
+    }
+
+    /// Serve `crate_name` from a hosted repo and return the one served
+    /// NDJSON line.
+    async fn single_served_line(
+        ctx: &Arc<AppContext>,
+        repo_key: &str,
+        crate_name: &str,
+    ) -> serde_json::Value {
+        let res = serve_index_unified(ctx, repo_key, crate_name, None)
+            .await
+            .unwrap_or_else(|_| panic!("hosted serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let mut lines = parse_lines(&body);
+        assert_eq!(lines.len(), 1, "one seeded version → one served line");
+        lines.remove(0)
+    }
+
+    #[tokio::test]
+    async fn hosted_entry_carries_stored_deps_in_index_shape() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "hort-app",
+            "0.11.0",
+            1,
+            QuarantineStatus::Released,
+        );
+        insert_publish_metadata(&mocks, artifact.id, HORT_APP_PUBLISH_BODY);
+
+        let line = single_served_line(&ctx, "cargo-test", "hort-app").await;
+
+        assert_eq!(
+            line["deps"],
+            serde_json::json!([
+                {
+                    "name": "hort-domain",
+                    "req": "=0.11.0",
+                    "features": [],
+                    "optional": false,
+                    "default_features": true,
+                    "target": null,
+                    "kind": "normal",
+                    "registry": null,
+                    "package": null,
+                },
+                {
+                    "name": "metrics-util",
+                    "req": "^0.16",
+                    "features": [],
+                    "optional": true,
+                    "default_features": true,
+                    "target": null,
+                    "kind": "normal",
+                    "registry": null,
+                    "package": null,
+                },
+            ]),
+            "served deps carry the index schema (`req`, `package`), not the publish schema"
+        );
+        assert_eq!(line["rust_version"], "1.94");
+        assert!(line["links"].is_null());
+        assert_eq!(
+            line["cksum"],
+            artifact.sha256_checksum.to_string(),
+            "the CAS hash is the served checksum — never the publisher-supplied one"
+        );
+        assert_eq!(line["yanked"], false);
+        assert_eq!(line["name"], "hort-app");
+        assert_eq!(line["vers"], "0.11.0");
+    }
+
+    /// The `v0.11.0-beta.8` publish failure, pinned: `hort-http-core`
+    /// declares `hort-app/test-support`, and cargo validates that edge
+    /// against `hort-app`'s served index entry. The entry must carry
+    /// the feature — in `features2`, because it names a dependency
+    /// with the `dep:` syntax — and announce the schema version that
+    /// tells a client to merge the two maps.
+    #[tokio::test]
+    async fn hosted_entry_splits_namespaced_features_into_features2() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "hort-app",
+            "0.11.0",
+            1,
+            QuarantineStatus::Released,
+        );
+        insert_publish_metadata(&mocks, artifact.id, HORT_APP_PUBLISH_BODY);
+
+        let line = single_served_line(&ctx, "cargo-test", "hort-app").await;
+
+        assert_eq!(
+            line["features"],
+            serde_json::json!({"default": []}),
+            "plain features stay in `features`"
+        );
+        assert_eq!(
+            line["features2"],
+            serde_json::json!({"test-support": ["dep:metrics-util"]}),
+            "a `dep:`-syntax feature is served in `features2`"
+        );
+        assert_eq!(line["v"], 2, "`features2` requires the v2 schema marker");
+    }
+
+    /// Versions ingested before publish captured metadata — and rows
+    /// written by non-publish paths, whose document has none of these
+    /// keys — keep serving exactly the entry they served before.
+    #[tokio::test]
+    async fn hosted_entry_without_stored_metadata_serves_the_pre_metadata_shape() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "hort-app",
+            "0.11.0",
+            1,
+            QuarantineStatus::Released,
+        );
+
+        let line = single_served_line(&ctx, "cargo-test", "hort-app").await;
+
+        assert_eq!(
+            line,
+            serde_json::json!({
+                "name": "hort-app",
+                "vers": "0.11.0",
+                "deps": [],
+                "cksum": artifact.sha256_checksum.to_string(),
+                "features": {},
+                "yanked": false,
+                "links": null,
+                "rust_version": null,
+            }),
+            "a version with no stored metadata serves the pre-metadata entry verbatim"
+        );
+    }
+
     #[tokio::test]
     async fn virtual_with_no_matching_versions_is_404() {
         let (ctx, mocks) = build_mock_ctx(handle());

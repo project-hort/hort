@@ -19,7 +19,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Extension, Router};
 use chrono::Utc;
-use serde::Deserialize;
 
 use hort_app::use_cases::repository_access::AccessLevel;
 use hort_domain::entities::artifact::QuarantineStatus;
@@ -37,6 +36,8 @@ use hort_http_core::error::ApiError;
 use hort_http_core::limits::{BoundedPath, CARGO_PUBLISH_BODY_LIMIT};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 use hort_http_core::middleware::trust::RequestTrust;
+
+use crate::publish_metadata::PublishMetadata;
 
 // Upstream pull-through orchestrator. Wired to the route layer in the
 // download handler; declared here so the module + its tests are
@@ -60,6 +61,10 @@ pub mod index_cache;
 // `HostedCargoSource` / `ProxyCargoSource` impls; `serve` is the
 // unified handler dispatch hop.
 pub(crate) mod index_source;
+// Publish-body ⇄ sparse-index-entry translation. Owns both halves of
+// the stored-metadata contract: what `publish` persists and what the
+// hosted `IndexSource` reads back.
+pub(crate) mod publish_metadata;
 pub(crate) mod serve;
 
 /// Build the Cargo route tree with the default publish body limit.
@@ -631,15 +636,6 @@ async fn cargo_member_coord_fetch(
 // PUT /{repo_key}/api/v1/crates/new
 // ---------------------------------------------------------------------------
 
-/// Only the fields we need from the cargo publish metadata JSON. Cargo sends
-/// many more — ignored by `serde(default)` elsewhere, implicit here because
-/// extra fields are allowed unless `deny_unknown_fields` is set.
-#[derive(Deserialize)]
-struct PublishMetadata {
-    name: String,
-    vers: String,
-}
-
 async fn publish(
     State(ctx): State<Arc<AppContext>>,
     BoundedPath(repo_key): BoundedPath<String>,
@@ -680,6 +676,12 @@ async fn publish(
 
     let (metadata_bytes, crate_bytes) = parse_publish_body(&body)?;
 
+    // The WHOLE metadata object is parsed, not just `name`/`vers`: the
+    // served sparse-index entry is built from the publish body's
+    // `deps` / `features` / `links` / `rust_version`, so a body whose
+    // metadata cannot be understood must fail the publish here rather
+    // than be ingested as an entry that silently claims the crate has
+    // no dependencies and no features.
     let metadata: PublishMetadata = serde_json::from_slice(metadata_bytes)
         .map_err(|e| validation_error(&format!("invalid publish metadata JSON: {e}")))?;
 
@@ -693,6 +695,10 @@ async fn publish(
         .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
     hort_formats::cargo::validate_cargo_version(&metadata.vers)
         .map_err(|e| ApiError::from(hort_app::error::AppError::Domain(e)))?;
+
+    // Project the publish body onto the sparse-index entry document
+    // before the name/version fields are consumed below.
+    let payload_metadata = metadata.to_index_metadata();
 
     let handler = CargoFormatHandler;
     let raw_name = metadata.name.clone();
@@ -737,10 +743,11 @@ async fn publish(
                 actor,
                 legacy_sha1: None, // cargo's cksum IS the SHA-256 storage hash
                 legacy_md5: None,
-                // Cargo sparse-index metadata (`PublishMetadata` — features,
-                // deps, yanked) extraction is deferred until the index read
-                // path consumes it.
-                payload_metadata: serde_json::Value::Null,
+                // The publish body in sparse-index entry shape: what
+                // the hosted index source serves back per version, and
+                // what `CargoFormatHandler::extract_sbom` reads to
+                // derive the crate's declared dependencies.
+                payload_metadata,
             },
             stream,
             // Reuse the handler instantiated earlier for `normalize_name`
@@ -840,6 +847,9 @@ mod tests {
         /// Curation-gate seed handle for the
         /// `publish_curation_block_returns_403` test.
         curation_rules: Arc<hort_app::use_cases::test_support::MockCurationRuleRepository>,
+        /// Read-back handle for what a publish persisted as the
+        /// artifact's format metadata.
+        artifact_metadata: Arc<hort_app::use_cases::test_support::MockArtifactMetadataRepository>,
     }
 
     fn harness() -> TestHarness {
@@ -860,6 +870,7 @@ mod tests {
             repositories: mocks.repositories,
             storage: mocks.storage,
             curation_rules: mocks.curation_rules,
+            artifact_metadata: mocks.artifact_metadata,
         }
     }
 
@@ -2331,6 +2342,65 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
+    /// The persist half of the index metadata contract: a publish
+    /// writes the body's dependency graph onto the artifact in index
+    /// shape, so the hosted index source has something real to serve
+    /// and the scanner has something real to extract an SBOM from.
+    #[tokio::test]
+    async fn publish_persists_the_body_in_index_shape() {
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let router = router(h.ctx.clone());
+
+        let metadata = br#"{
+            "name":"mycrate",
+            "vers":"0.1.0",
+            "deps":[{"name":"serde","version_req":"^1.0","kind":"normal"}],
+            "features":{"extras":["dep:serde"]},
+            "cksum":"a-publisher-supplied-digest-that-must-be-ignored"
+        }"#;
+        let body = build_publish_body(metadata, b"fake crate tarball content");
+
+        let res = router
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let artifact = h
+            .artifacts
+            .snapshot_all()
+            .into_iter()
+            .find(|a| a.name == "mycrate")
+            .expect("publish stored the artifact");
+        use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
+        let stored = h
+            .artifact_metadata
+            .find_by_artifact_id(artifact.id)
+            .await
+            .unwrap()
+            .expect("publish stored a metadata row")
+            .metadata;
+
+        assert_eq!(
+            stored["deps"][0]["req"], "^1.0",
+            "the publish body's `version_req` is stored as the index's `req`"
+        );
+        assert_eq!(
+            stored["features2"],
+            serde_json::json!({"extras": ["dep:serde"]})
+        );
+        assert_eq!(stored["v"], 2);
+        assert!(
+            stored.get("cksum").is_none(),
+            "a publisher-supplied checksum is never persisted"
+        );
+    }
+
     #[tokio::test]
     async fn publish_to_virtual_repo_is_rejected() {
         // Virtual repos are read-only aggregators (ADR 0031): a publish must
@@ -3188,6 +3258,7 @@ mod tests {
                 repositories: h.repositories,
                 storage: h.storage,
                 curation_rules: h.curation_rules,
+                artifact_metadata: h.artifact_metadata,
             }
         }
 
@@ -3352,6 +3423,7 @@ mod tests {
                 repositories: h.repositories,
                 storage: h.storage,
                 curation_rules: h.curation_rules,
+                artifact_metadata: h.artifact_metadata,
             }
         }
 
@@ -3642,6 +3714,7 @@ mod tests {
                 repositories: base.repositories,
                 storage: base.storage,
                 curation_rules: base.curation_rules,
+                artifact_metadata: base.artifact_metadata,
             };
 
             let repo = insert_private_repo(&h, "private-cargo");
