@@ -28,6 +28,22 @@ Authority hierarchy (highest to lowest):
 
 Nothing gets gold-plated beyond what was asked.
 
+**There is no release pressure and there are no deadlines — ever.** The goal
+is the most stable, architecturally cleanest software; schedule is never an
+argument for or against a design. Design compromises are not made; a design
+smell is a no-go, not a trade-off. Corollaries: a felt urgency is
+self-generated and is itself a signal to stop and look for the governing
+concept; pre-releases are free and unlimited, so burning one is never a cost
+worth a shortcut; a red gate means the work is not done, whatever it holds up.
+
+**Before designing any new mechanism, knob, or exemption: find the standing
+decision that already governs the problem class** (start at
+`docs/adr/0000-historical-decisions-index.md`). Every spec that introduces
+one carries a "Governing decisions" line naming what was found — or
+explicitly "none". If a standing decision covers the case, the default is to
+apply or amend that decision, not to build around it; complexity added to
+avoid touching an ADR is a smell, not a kindness.
+
 **Deviations from the design require an "objectively better" case, not a "defensible" one.** The design wins by default. An implementation that does not match the design (a plan document, an initiative backlog item, an explicit "mirror X" instruction, or established codebase precedent) must declare the deviation in its PR / commit body AND justify why the chosen alternative is *concretely* better — not merely possible, not merely arguable. "Defensible," "plausible," and "I can construct an argument for it" are hedges, not verdicts; if that is all you can say, follow the design. See CLAUDE.md → *Implementation Discipline — when to deviate from the design* for the full criterion and worked examples.
 
 Primary design objectives (in priority order):
