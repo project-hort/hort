@@ -6,14 +6,27 @@ spec:
   scope:
     repository: hort-crates
   severityThreshold: high
-  # First-party hosted repo (own published crates) — SCANNED (osv) for advisories
-  # in the crates' dependency closure. Small 1h observation window (humantime) so
-  # a `cargo publish` from release CI is fetchable quickly, vs the proxies' 1-day
-  # ramp. quarantineDuration is a gitops field (restart-to-apply), NOT a
-  # deployment env var. Block bar `high`, matching the proxies: a high+ advisory
-  # HOLDS the crate (recorded AND blocked). We control the Cargo.toml, so the fix
-  # is to bump the flagged dependency (as with quinn-proto) before publishing.
-  quarantineDuration: 1h
+  # First-party hosted repo (hort's own published crates). Permissive ingest:
+  # a zero observation window means a published crate is servable immediately
+  # and a scan verdict over the block bar transitions it to Rejected
+  # afterwards, rather than withholding every crate up front (ADR 0007). This
+  # matches the Class A posture in ADR 0034 — first-party artifacts are built
+  # and signed by the same operator, and the quarantine gate exists to contain
+  # *upstream* contamination.
+  #
+  # A window here cannot buy what it looks like it buys. Cargo SBOM extraction
+  # is a pure function over the metadata captured at ingest, and the publish
+  # path stores none, so the SBOM is subject-only: osv is asked about
+  # `pkg:cargo/<our-crate>@<version>` and nothing else. No advisory exists for
+  # a first-party crate, so the verdict is Clean by construction — the
+  # dependency closure is never examined. That closure is gated properly
+  # elsewhere, by `cargo audit` and `cargo deny` against the workspace
+  # `Cargo.lock`, which see the fully resolved graph.
+  #
+  # Backends stay enabled so a verdict is still recorded per artifact; they
+  # gate nothing while the window is zero. quarantineDuration is a gitops
+  # field (restart-to-apply), NOT a deployment env var.
+  quarantineDuration: 0s
   requireApproval: false
   provenanceMode: off
   scanBackends: ["osv"]
