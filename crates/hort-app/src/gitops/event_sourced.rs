@@ -63,8 +63,8 @@ use hort_config::exclusion::ExclusionSpec;
 use hort_config::scan_policy::{ScanPolicySpec, SignerIdentitySpec};
 use hort_config::scope::ScopeSpec;
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
-    SignerIdentityPattern,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::events::{
     DomainEvent, ExclusionAdded, ExclusionRemoved, PolicyCreated, PolicyField, PolicyScope,
@@ -198,6 +198,7 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
         let desired_provenance_identities =
             parse_provenance_identities(&desired.spec.provenance_identities);
         let desired_negligible_action = parse_negligible_action(&desired.spec.negligible_action);
+        let desired_enforcement = parse_scan_enforcement(&desired.spec.enforcement);
 
         match projection {
             None => {
@@ -220,6 +221,7 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                     &desired.spec.scan_backends,
                     desired.spec.rescan_interval_hours,
                     &desired_negligible_action,
+                    &desired_enforcement,
                 );
                 vec![DomainEvent::PolicyCreated(PolicyCreated {
                     policy_id,
@@ -384,6 +386,20 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                             proj.negligible_action.to_string(),
                         ),
                         new_value: serde_json::Value::String(desired_negligible_action.to_string()),
+                    }));
+                }
+
+                // -- Enforcement --
+                // Lowercase wire strings on the payload. A change in
+                // EITHER direction is gate-affecting: `record` → `reject`
+                // re-derives and re-holds the now-non-compliant
+                // population, `reject` → `record` un-rejects it.
+                if proj.enforcement != desired_enforcement {
+                    events.push(DomainEvent::PolicyUpdated(PolicyUpdated {
+                        policy_id: pid,
+                        field: PolicyField::Enforcement,
+                        previous_value: serde_json::Value::String(proj.enforcement.to_string()),
+                        new_value: serde_json::Value::String(desired_enforcement.to_string()),
                     }));
                 }
 
@@ -566,6 +582,7 @@ fn build_config_snapshot(
     scan_backends: &[String],
     rescan_interval_hours: i32,
     negligible_action: &NegligibleAction,
+    enforcement: &ScanEnforcement,
 ) -> serde_json::Value {
     serde_json::json!({
         "name": name,
@@ -582,6 +599,7 @@ fn build_config_snapshot(
         "scan_backends": scan_backends,
         "rescan_interval_hours": rescan_interval_hours,
         "negligible_action": negligible_action.to_string(),
+        "enforcement": enforcement.to_string(),
     })
 }
 
@@ -605,6 +623,19 @@ fn parse_negligible_action(s: &str) -> NegligibleAction {
     NegligibleAction::from_str(s).unwrap_or_else(|err| {
         panic!(
             "INVARIANT: negligible action '{s}' must have been validated by \
+             hort_config::scan_policy::validate_scan_policy before reaching the \
+             applier (parse error: {err})"
+        )
+    })
+}
+
+/// Map the validated `enforcement` wire string into the domain enum.
+/// `hort-config`'s `validate_scan_policy` ran first, so a parse failure
+/// here is a bypassed-validator programming error.
+fn parse_scan_enforcement(s: &str) -> ScanEnforcement {
+    ScanEnforcement::from_str(s).unwrap_or_else(|err| {
+        panic!(
+            "INVARIANT: scan enforcement '{s}' must have been validated by \
              hort_config::scan_policy::validate_scan_policy before reaching the \
              applier (parse error: {err})"
         )
@@ -718,6 +749,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: "ignore".into(),
+            enforcement: "reject".into(),
         }
     }
 
@@ -742,6 +774,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 7,
             created_at: now,
             updated_at: now,
@@ -1802,6 +1835,7 @@ mod tests {
             &["trivy".to_string(), "osv".to_string()],
             48,
             &NegligibleAction::Block,
+            &ScanEnforcement::Record,
         );
         for key in [
             "name",
@@ -1817,6 +1851,7 @@ mod tests {
             "scan_backends",
             "rescan_interval_hours",
             "negligible_action",
+            "enforcement",
         ] {
             assert!(snap.get(key).is_some(), "missing key {key}");
         }
@@ -1834,6 +1869,9 @@ mod tests {
         );
         // negligible_action surfaces as the lowercase wire string.
         assert_eq!(snap["negligible_action"], "block");
+        // enforcement likewise — the snapshot is the operator-visible
+        // record of what the policy said at creation time.
+        assert_eq!(snap["enforcement"], "record");
     }
 
     #[test]
@@ -1858,5 +1896,48 @@ mod tests {
         assert_eq!(updated.len(), 1, "exactly one NegligibleAction event");
         assert_eq!(updated[0].previous_value, serde_json::json!("ignore"));
         assert_eq!(updated[0].new_value, serde_json::json!("block"));
+    }
+
+    #[test]
+    fn scan_policy_enforcement_change_emits_one_event() {
+        let policy_id = Uuid::new_v4();
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let mut spec = baseline_spec();
+        spec.enforcement = "record".into();
+        let events = applier.diff(
+            &policy_envelope(spec),
+            Some(&baseline_projection(policy_id)),
+        );
+        let updated: Vec<&PolicyUpdated> = events
+            .iter()
+            .filter_map(|e| match e {
+                DomainEvent::PolicyUpdated(p) if p.field == PolicyField::Enforcement => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updated.len(), 1, "exactly one Enforcement event");
+        assert_eq!(updated[0].previous_value, serde_json::json!("reject"));
+        assert_eq!(updated[0].new_value, serde_json::json!("record"));
+        // Gate-affecting in both directions — this is what drives the
+        // ADR 0041 re-evaluation enqueue on the apply path.
+        assert!(updated[0].field.is_gate_affecting());
+    }
+
+    #[test]
+    fn scan_policy_unchanged_enforcement_emits_no_event() {
+        // The baseline projection and the baseline spec both carry the
+        // default `reject`; an apply that does not touch the field must
+        // not emit an event (and therefore must not enqueue a
+        // re-evaluation pass over the whole population).
+        let policy_id = Uuid::new_v4();
+        let applier = ScanPolicyApplier::new(HashMap::new());
+        let events = applier.diff(
+            &policy_envelope(baseline_spec()),
+            Some(&baseline_projection(policy_id)),
+        );
+        assert!(!events.iter().any(|e| matches!(
+            e,
+            DomainEvent::PolicyUpdated(p) if p.field == PolicyField::Enforcement
+        )));
     }
 }

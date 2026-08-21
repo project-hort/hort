@@ -300,6 +300,120 @@ pub trait VersionDiscovery: Send + Sync {
     ) -> DomainResult<String>;
 }
 
+// ---------------------------------------------------------------------------
+// PayloadSbom capability group
+// ---------------------------------------------------------------------------
+
+/// How a [`PayloadSbom`] extraction derived the SBOM it returned.
+///
+/// The three arms are not interchangeable and must not be collapsed:
+/// "the artifact carries no resolved-dependency document" and "it
+/// carries one that cannot be trusted to describe what was built" are
+/// different facts about the artifact, and only the caller can decide
+/// what posture each deserves. The scan orchestrator maps them onto
+/// distinct metric label values so an operator can tell a registry full
+/// of lockfile-less artifacts from one whose lockfiles are failing to
+/// parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SbomResolution {
+    /// The payload yielded a resolved-dependency document and the
+    /// closure walk succeeded — every component in
+    /// [`PayloadSbomExtraction::sbom`] carries an exact version.
+    Resolved,
+    /// The payload carried no resolved-dependency document. An expected,
+    /// truthful state (nothing forces a publisher to embed one), not a
+    /// failure.
+    NoLockfile,
+    /// The payload carried a resolved-dependency document that could not
+    /// be used — unparseable, over a parser cap, or not a self-consistent
+    /// resolve — or the extraction itself failed before reaching one.
+    UnusableLockfile,
+}
+
+/// What a [`PayloadSbom::extract_sbom_from_payload`] call produced.
+///
+/// `sbom` follows [`FormatHandler::extract_sbom`]'s convention: `None`
+/// for a payload the handler cannot describe at all, `Some` otherwise —
+/// including the subject-only BOM a handler returns when it could not
+/// resolve a component list. `resolution` says which of those happened;
+/// a caller that only reads `sbom` cannot tell a resolved closure from a
+/// degraded fallback, which is exactly the distinction an operator needs.
+///
+/// `skipped_non_registry` counts reachable dependencies that were
+/// traversed but not emitted because they carry no registry coordinates
+/// (path- and git-sourced entries) — an advisory database has nothing to
+/// say about them. It is a **count, never a metric label**: the value is
+/// unbounded, and a per-value label series would be a cardinality
+/// hazard. The emitting layer folds it into a counter's value.
+#[derive(Debug)]
+pub struct PayloadSbomExtraction {
+    /// The extracted BOM, or `None` when the handler can say nothing
+    /// about this payload.
+    pub sbom: Option<Sbom>,
+    /// How `sbom`'s component list was derived.
+    pub resolution: SbomResolution,
+    /// Reachable dependencies skipped for having no registry
+    /// coordinates. Zero when `resolution` is not
+    /// [`SbomResolution::Resolved`].
+    pub skipped_non_registry: usize,
+}
+
+/// Deriving an SBOM from the artifact's **stored payload** — the
+/// **PayloadSbom** capability group (ADR 0005).
+///
+/// [`FormatHandler::extract_sbom`] builds its component list from
+/// `format_metadata`: the *declared* dependency table, whose versions are
+/// the publisher's ranges. A range floor (`serde = "1"` scanned as
+/// version `1`) matches advisories that the actually-built `serde 1.0.x`
+/// never had, so a release verdict computed from it reports findings
+/// against code no consumer ever compiles. A format whose artifact
+/// embeds its own **resolved** dependency document — cargo's
+/// `Cargo.lock` — can name every dependency at the exact version that
+/// was built, but only by reading the payload.
+///
+/// This group is that capability. It is a separate trait behind
+/// [`FormatHandler::payload_sbom`] rather than another defaulted method
+/// on [`FormatHandler`] for two reasons:
+///
+/// - **The caller must know before it opens I/O.** Streaming an artifact
+///   out of CAS costs a storage round-trip per scan, and the scan
+///   orchestrator runs over every format. `payload_sbom() == None` is
+///   what lets it skip that read entirely — a question it must be able
+///   to answer without having already paid for the answer.
+/// - **A defaulted no-op would be indistinguishable from
+///   "not yet implemented"** — the exact failure ADR 0005's
+///   `VersionDiscovery` realisation was extracted to close. Structural
+///   non-participation keeps the declaration honest.
+///
+/// **Streaming contract (ADR 0026).** `payload` is a
+/// [`PayloadAccess`] — the orchestrator hands over
+/// [`PayloadAccess::ReadStream`] wrapping the CAS read, so the artifact
+/// never lands in a whole-body buffer on the way to the handler.
+/// Implementations enforce their own input caps.
+pub trait PayloadSbom: Send + Sync {
+    /// Build the SBOM from `payload`, reporting how the component list
+    /// was derived.
+    ///
+    /// `format_metadata` is still available and still useful — cargo
+    /// reads the stored registry-index `deps` out of it to learn which
+    /// first-hop edges are dev-only, information the lockfile itself
+    /// does not carry.
+    ///
+    /// **Fail-soft is the implementation's job, not the caller's.** SBOM
+    /// enrichment is not release authority (ADR 0007's fail-closed rule
+    /// governs the latter), so a handler that cannot resolve a closure
+    /// SHOULD degrade to a subject-only BOM with the matching
+    /// [`SbomResolution`] rather than return `Err`. `Err` is reserved
+    /// for a handler that cannot produce any BOM at all; the caller
+    /// treats it as "no SBOM for this scan".
+    fn extract_sbom_from_payload(
+        &self,
+        coords: &ArtifactCoords,
+        format_metadata: &serde_json::Value,
+        payload: PayloadAccess<'_>,
+    ) -> DomainResult<PayloadSbomExtraction>;
+}
+
 /// Outbound port for format-specific artifact parsing.
 ///
 /// Synchronous and stateless — a pure strategy pattern, not an I/O port.
@@ -607,6 +721,24 @@ pub trait FormatHandler: Send + Sync {
     ) -> DomainResult<Option<Sbom>> {
         let _ = (coords, format_metadata, payload);
         Ok(None)
+    }
+
+    /// `Some` iff this format declares the [`PayloadSbom`] capability
+    /// group — deriving the SBOM's components from the artifact's own
+    /// stored bytes rather than from `format_metadata`. Default `None`.
+    ///
+    /// Same accessor shape, and the same reasoning, as
+    /// [`version_discovery`](Self::version_discovery): the declaration
+    /// and the implementation are one fact, so `None` cannot lie about
+    /// participation. Here the accessor carries a second, operational
+    /// duty — the scan orchestrator asks it **before** opening any
+    /// storage I/O, so a format that does not consume the payload never
+    /// costs a CAS read per scan.
+    ///
+    /// Cargo returns `Some(self)`; every other format inherits this
+    /// default.
+    fn payload_sbom(&self) -> Option<&dyn PayloadSbom> {
+        None
     }
 
     /// Extract the wheel's `<dist-info>/METADATA` file bytes
@@ -1019,6 +1151,43 @@ mod tests {
         let payload = PayloadAccess::Bytes(b"sentinel");
         let result = DefaultsOnlyHandler.extract_sbom(&coords, &metadata, payload);
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn default_payload_sbom_declares_non_participation() {
+        // `None` is the honest answer, not a placeholder: a handler that
+        // does not derive its SBOM from the payload must be
+        // distinguishable from one whose payload support is unwritten.
+        // The scan orchestrator reads this BEFORE opening any storage
+        // I/O, so a wrong `Some` here would cost a CAS read per scan for
+        // every format that inherits the default.
+        assert!(DefaultsOnlyHandler.payload_sbom().is_none());
+    }
+
+    #[test]
+    fn sbom_resolution_arms_are_distinct() {
+        // The three arms exist precisely so a caller can tell them apart;
+        // an accidental collapse (e.g. deriving `PartialEq` on a
+        // future single-field wrapper) would silently merge "no lockfile"
+        // into "unusable lockfile" at the metric.
+        assert_ne!(SbomResolution::Resolved, SbomResolution::NoLockfile);
+        assert_ne!(SbomResolution::NoLockfile, SbomResolution::UnusableLockfile);
+        assert_ne!(SbomResolution::UnusableLockfile, SbomResolution::Resolved);
+    }
+
+    #[test]
+    fn payload_sbom_extraction_debug_does_not_leak_component_data() {
+        // `Debug` on the extraction is logged on the degradation paths;
+        // it must stay safe to print. The arms and the skip count are the
+        // operator-relevant facts.
+        let extraction = PayloadSbomExtraction {
+            sbom: None,
+            resolution: SbomResolution::NoLockfile,
+            skipped_non_registry: 3,
+        };
+        let rendered = format!("{extraction:?}");
+        assert!(rendered.contains("NoLockfile"), "{rendered}");
+        assert!(rendered.contains('3'), "{rendered}");
     }
 
     // -------------------------------------------------------------------

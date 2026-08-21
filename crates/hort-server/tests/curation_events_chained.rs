@@ -109,7 +109,9 @@ use hort_app::use_cases::test_support::{
 };
 use hort_app::use_cases::CallerPrivileges;
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
-use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
+use hort_domain::entities::scan_policy::{
+    NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+};
 use hort_domain::error::DomainResult;
 use hort_domain::events::Actor;
 use hort_domain::events::PolicyScope;
@@ -354,6 +356,7 @@ fn sample_create_policy_command() -> CreatePolicyCommand {
         scan_backends: vec!["trivy".into()],
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
+        enforcement: ScanEnforcement::Reject,
     }
 }
 

@@ -61,6 +61,16 @@ manifest, and the `.crate` download is the layer blob. The same principal is
 mid-write to the same repository, and needs the same metadata resolution to
 finish the write it already started.
 
+**Update (2026-08-21) — the cargo half's scan posture moved; the rule did
+not.** `hort-crates` now scans in record mode over resolved-version SBOMs
+([ADR 0056](0056-resolved-component-sboms-from-payload.md), [ADR
+0034](0034-public-dogfood-deployment.md)'s Class A amendment), so a scan verdict
+on a first-party crate records findings instead of holding or rejecting it. That
+narrows *when* a publisher meets a held sibling on this particular repository;
+it changes nothing about the rule decided here, which keys on granted write
+authority and `Quarantined` status alone and is deliberately not tied to any
+one deployment's policy. The OCI half (ADR 0039 §10) is untouched.
+
 **Measured, not assumed.** Against the live registry, using a real released
 crate and an isolated `CARGO_HOME`, `cargo generate-lockfile` and `cargo
 package --no-verify` each resolved the dependency through the index and fetched

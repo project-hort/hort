@@ -7,36 +7,50 @@ spec:
     repository: hort-crates
   severityThreshold: high
   # First-party hosted repo (hort's own published crates). Permissive ingest:
-  # a zero observation window means a published crate is servable immediately
-  # and a scan verdict over the block bar transitions it to Rejected
-  # afterwards, rather than withholding every crate up front (ADR 0007). This
-  # matches the Class A posture in ADR 0034 — first-party artifacts are built
-  # and signed by the same operator, and the quarantine gate exists to contain
-  # *upstream* contamination.
+  # a zero observation window means a published crate is servable immediately,
+  # rather than withholding every crate up front (ADR 0007). This matches the
+  # Class A posture in ADR 0034 — first-party artifacts are built and signed by
+  # the same operator, and the quarantine gate exists to contain *upstream*
+  # contamination.
   #
-  # A window here cannot buy what it looks like it buys. Cargo SBOM extraction
-  # is a pure function over the metadata captured at ingest, and the publish
-  # path stores none, so the SBOM is subject-only: osv is asked about
-  # `pkg:cargo/<our-crate>@<version>` and nothing else. No advisory exists for
-  # a first-party crate, so the verdict is Clean by construction — the
-  # dependency closure is never examined. That closure is gated properly
-  # elsewhere, by `cargo audit` and `cargo deny` against the workspace
-  # `Cargo.lock`, which see the fully resolved graph.
+  # The posture, stated plainly: the registry computes a real verdict over the
+  # crate's real dependency closure, records it, and gates nothing at publish.
   #
-  # scanBackends is EMPTY, completing the ADR 0034 Class A posture. "Scan as
-  # a record" proved false at a zero window: permissive mode still transitions
-  # a bad verdict straight to Rejected (ADR 0007), and a Rejected version is
-  # hidden from every caller — so a post-publish finding un-publishes the
-  # crate out from under the release chain. The findings themselves were
-  # false positives besides: cargo SBOM components carry range-floor versions
-  # from the publish body (a dep declared as "1" scans as version 1), so osv
-  # matches advisories long fixed in the actually-resolved versions. The
-  # dependency closure of first-party crates is gated where the resolved
-  # graph is visible: cargo audit + cargo deny in CI against the workspace
-  # lockfile. quarantineDuration is a gitops field (restart-to-apply), NOT a
-  # deployment env var.
+  # It computes a real verdict because a published `.crate` embeds its own
+  # `Cargo.lock` — the crate's own re-resolve, written by `cargo package` — and
+  # the scan reads it out of the stored payload. Every SBOM component therefore
+  # carries the exact version the crate was built against, so `osv` is asked
+  # about the versions that actually ship. This is what makes scanning worth
+  # doing here at all: the earlier metadata-only SBOM named the declared
+  # range's floor (a dep declared as "1" scanned as version 1), which matched
+  # advisories long fixed in the resolved version — false positives with gate
+  # power. That path is gone, not re-tuned. See the resolved-component SBOM
+  # ADR (0056).
+  #
+  # It gates nothing because `enforcement: record` withholds the transition,
+  # not the evidence: the findings, the `PolicyEvaluated(Fail)` verdict and the
+  # per-finding rows are written exactly as under `reject`, and no
+  # `ArtifactRejected` follows. A finding therefore cannot un-publish a crate
+  # out from under the release chain — the failure mode that made the earlier
+  # "scan as a record" attempt untenable at a zero window, where a bad verdict
+  # went straight to Rejected and hid the version from every caller.
+  #
+  # Blocking at retrieval stays available and stays explicit: flipping this
+  # field to `reject` re-derives every in-scope artifact's verdict from its
+  # stored findings and re-holds the non-compliant ones (ADR 0041), so
+  # tightening is an operator decision with a known blast radius, not a
+  # surprise from a scanner update.
+  #
+  # Independently of this policy, the dependency closure of first-party crates
+  # is also gated in CI by `cargo audit` + `cargo deny` against the workspace
+  # lockfile. That gate sees the whole workspace resolve; this one sees what
+  # each published crate actually ships. They answer different questions.
+  #
+  # quarantineDuration is a gitops field (restart-to-apply), NOT a deployment
+  # env var.
   quarantineDuration: 0s
   requireApproval: false
   provenanceMode: off
-  scanBackends: []
+  scanBackends: ["osv"]
+  enforcement: record
   licensePolicy: {}

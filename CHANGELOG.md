@@ -7,7 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ScanPolicy` gained `enforcement: reject | record`** — a per-policy
+  choice of what a blocking scan verdict *does*, orthogonal to the
+  knobs that decide which findings are blocking (`severityThreshold`,
+  `licensePolicy`, `negligibleAction`). Under the default `reject` —
+  which an omitted field parses to, so no existing policy file needs an
+  edit — nothing changes. Under `record` the scan still runs, the
+  per-finding rows, the findings blob and the `PolicyEvaluated(Fail)`
+  verdict are still written, and the artifact is **not** rejected:
+  publication proceeds with findings, leaving retrieval-time blocking to
+  the consuming policy. Every API and metrics surface reports the
+  violations identically in both modes; the scan-result evaluation log
+  line and the `hort_policy_evaluation_total{result}` label name which
+  enforcement applied (`findings_recorded` vs `reject`), so an operator
+  never has to infer it. Because a `record`-mode artifact's own
+  `ScanCompleted` carries findings, it releases through a new, distinct
+  `ScanRecorded` release authority rather than a widened
+  `ScanSucceeded` — the release is auditable as "released with recorded,
+  over-threshold findings", and the authority carries the same
+  provenance precondition as the other timer authorities, so `record`
+  un-gates the scan axis only (an unverified artifact under
+  `provenanceMode: required`, an artifact matched by an active curation
+  rule, and an artifact that was never scanned at all are all still
+  held). Changing the field re-judges the existing population in both
+  directions and without re-running a scanner: `record` → `reject`
+  re-derives every in-scope artifact's verdict from its stored findings
+  and re-holds the now-non-compliant ones, `reject` → `record`
+  un-rejects the scan-rejected population while preserving the
+  remaining observation window. An unknown value is an apply-time
+  rejection naming the field and both valid values. (#191)
+
 ### Changed
+
+- **Scans of hosted cargo crates now compute their verdict from the
+  versions the crate was actually built against.** A published `.crate`
+  embeds its own `Cargo.lock`; scan orchestration streams the stored
+  artifact out of CAS and the cargo handler walks that lockfile's
+  closure, so every SBOM component carries an exact resolved version
+  instead of the declared range's floor (`serde = "1"` was scanned as
+  version `1`, matching advisories that the built `serde 1.0.x` never
+  had). A crate whose payload carries **no** lockfile now yields a
+  subject-only SBOM — the crate itself is still scanned, but the
+  range-floor dependency list is no longer produced at all, because it
+  cannot feed an honest verdict. A lockfile that is present but unusable
+  is reported distinctly from one that is absent. Extraction happens at
+  scan time from the payload, which makes it **retroactive**: a rescan of
+  an already-published artifact produces resolved components with no
+  backfill and no ingest-path change. Dev-only dependency subtrees are
+  excluded using the `kind` information in the stored index metadata —
+  consumers never compile them. Formats that do not derive their SBOM
+  from the payload (npm, PyPI, every opaque format) are unchanged and do
+  not pay for a CAS read. **Proxied, virtual and staging repositories are
+  unchanged too**: only a hosted publish's lockfile is the authenticated
+  publisher's own build witness, whereas a proxied library's is the
+  upstream author's dev-time resolve that consumers re-resolve and never
+  run — findings against it would carry gate power over a crate every
+  consumer would resolve safely. Those scans keep the metadata-only SBOM
+  they had before, and cost no CAS read. (#191)
 
 - **A principal with write authority on a cargo repository now resolves
   held versions in that repository's sparse index.** `cargo publish`
@@ -199,6 +257,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the carve-out decision. (#161)
 
 ### Added
+
+- **`hort_sbom_resolution_total{format, result}`** — how each scan's SBOM
+  components were derived (`resolved` / `no_lockfile` /
+  `unusable_lockfile` / `payload_unavailable` / `not_applicable` /
+  `hosted_only`),
+  alongside the existing `hort_sbom_extraction_total`, which gains a
+  `payload_unavailable` result. `resolved / (resolved + no_lockfile +
+  unusable_lockfile)` is the share of scans that examined dependencies at
+  all — a registry scanning subjects only was previously indistinguishable
+  from one scanning everything. **`hort_sbom_components_skipped_total{format}`**
+  counts dependencies a resolved closure traversed but could not emit for
+  having no registry coordinates (path- and git-sourced entries). (#191)
 
 - **OCI membership-edge backfill.** The `oci-membership-edge-backfill`
   admin task repairs OCI image-manifest rows ingested before the

@@ -11,6 +11,18 @@
 //! into a [`ReEvaluationOutcome`] that honours quarantine invariant 3
 //! (the time hold is preserved on a clean re-evaluation).
 //!
+//! ## Enforcement mode
+//!
+//! A blocking verdict holds the artifact only under
+//! [`ScanEnforcement::Reject`]. Under [`ScanEnforcement::Record`] the same
+//! verdict is recorded but never enforced, so a policy loosened
+//! `reject → record` clears a previously-scan-rejected artifact here
+//! (release authority #5, exactly as adding an exclusion does). The
+//! enforcement check is applied to the SAME `action` the CVE + negligible
+//! evaluators produce, so this decision point and
+//! [`crate::policy::evaluate_scan_result`] cannot disagree about which
+//! verdicts block.
+//!
 //! Pure domain — zero I/O, zero `tracing`. The application caller is
 //! responsible for loading the artifact's last `ScanCompleted` summary,
 //! the resolved policy + exclusion set, and translating the outcome
@@ -43,7 +55,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::entities::artifact::Artifact;
-use crate::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
+use crate::entities::scan_policy::{ExclusionProjection, ScanEnforcement, ScanPolicyProjection};
 use crate::events::SeveritySummary;
 use crate::types::{ArtifactCoords, Finding};
 
@@ -174,13 +186,27 @@ pub fn decide_rejected_transition(
         post_exclusion_summary.negligible,
     );
     let (action, _violations) = accumulator.into_outcome();
-    match action {
-        PolicyAction::Block => ReEvaluationOutcome::StillRejected,
-        PolicyAction::Warn | PolicyAction::Allow => match quarantine_deadline {
-            Some(deadline) if deadline > now => ReEvaluationOutcome::ResetToQuarantined,
-            // `deadline <= now` OR `None` — time hold elapsed or never set.
-            _ => ReEvaluationOutcome::ResetToReleased,
-        },
+
+    // Mirror the initial scan's Step 5: the resolved `enforcement`
+    // decides whether a blocking verdict may hold the artifact at all.
+    // Under `record` a `Block` is recorded, never enforced — so a policy
+    // loosened `reject → record` clears the rejection here, exactly as an
+    // exclusion that drops the last blocking finding does, and the
+    // artifact leaves `Rejected` through release authority #5. The two
+    // enforcement branches share the same computed `action`, so the
+    // loosen and tighten directions cannot disagree about the verdict.
+    let enforcement = policy
+        .map(|p| p.enforcement)
+        .unwrap_or_else(DefaultPolicy::enforcement);
+    let blocks =
+        matches!(action, PolicyAction::Block) && matches!(enforcement, ScanEnforcement::Reject);
+    if blocks {
+        return ReEvaluationOutcome::StillRejected;
+    }
+    match quarantine_deadline {
+        Some(deadline) if deadline > now => ReEvaluationOutcome::ResetToQuarantined,
+        // `deadline <= now` OR `None` — time hold elapsed or never set.
+        _ => ReEvaluationOutcome::ResetToReleased,
     }
 }
 
@@ -255,6 +281,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),
@@ -421,6 +448,132 @@ mod tests {
             ts(2_000_000),
         );
         assert_eq!(outcome, ReEvaluationOutcome::ResetToReleased);
+    }
+
+    // -- Enforcement mode (the ADR 0041 loosen direction) --------------------
+
+    fn projection_with_enforcement(
+        threshold: SeverityThreshold,
+        enforcement: ScanEnforcement,
+    ) -> ScanPolicyProjection {
+        ScanPolicyProjection {
+            enforcement,
+            ..projection(threshold)
+        }
+    }
+
+    #[test]
+    fn record_enforcement_un_rejects_a_still_blocking_artifact() {
+        // The loosen direction: a scan-rejected artifact
+        // whose findings STILL cross the threshold is cleared purely by
+        // flipping `enforcement` to `record` — no exclusion, no rescan.
+        // The elapsed deadline lands it on Released (release authority
+        // #5).
+        let artifact = rejected_artifact("xz-utils");
+        let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-REAL", SeverityThreshold::Critical)];
+        let policy = projection_with_enforcement(SeverityThreshold::High, ScanEnforcement::Record);
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary,
+            Some(&findings),
+            Some(&policy),
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::ResetToReleased);
+    }
+
+    #[test]
+    fn record_enforcement_respects_the_remaining_time_hold() {
+        // Loosening the enforcement mode removes the scan block, NOT the
+        // observation window (ADR 0007 / quarantine invariant 3) — a
+        // still-future deadline returns the artifact to Quarantined.
+        let artifact = rejected_artifact("xz-utils");
+        let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-REAL", SeverityThreshold::Critical)];
+        let policy = projection_with_enforcement(SeverityThreshold::High, ScanEnforcement::Record);
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary,
+            Some(&findings),
+            Some(&policy),
+            &[],
+            Some(ts(2_000_000)),
+            ts(1_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::ResetToQuarantined);
+    }
+
+    #[test]
+    fn reject_enforcement_keeps_a_blocking_artifact_rejected() {
+        // The complement of the two tests above: the same artifact under
+        // the default mode stays rejected. This is what the tighten
+        // direction (`record → reject`) re-derives.
+        let artifact = rejected_artifact("xz-utils");
+        let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-REAL", SeverityThreshold::Critical)];
+        let policy = projection_with_enforcement(SeverityThreshold::High, ScanEnforcement::Reject);
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary,
+            Some(&findings),
+            Some(&policy),
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
+    }
+
+    #[test]
+    fn record_enforcement_also_clears_a_negligible_block() {
+        // Enforcement sits AFTER the negligible lane, so it clears a
+        // `negligibleAction: block` rejection too — the two knobs
+        // compose rather than one shadowing the other.
+        let artifact = rejected_artifact("proc-macro-error2");
+        let summary = SeveritySummary {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 1,
+        };
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let policy = ScanPolicyProjection {
+            enforcement: ScanEnforcement::Record,
+            ..projection_with_negligible(SeverityThreshold::High, NegligibleAction::Block)
+        };
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary,
+            Some(&findings),
+            Some(&policy),
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::ResetToReleased);
+    }
+
+    #[test]
+    fn absent_policy_defaults_to_reject_enforcement() {
+        // No resolved policy ⇒ `DefaultPolicy::enforcement()` ⇒ Reject:
+        // the un-configured repo still enforces its critical block.
+        let artifact = rejected_artifact("xz-utils");
+        let summary = summary(1, 0, 0, 0);
+        let findings = vec![finding("CVE-REAL", SeverityThreshold::Critical)];
+        let outcome = decide_rejected_transition(
+            &artifact,
+            &summary,
+            Some(&findings),
+            None,
+            &[],
+            Some(ts(1_000_000)),
+            ts(2_000_000),
+        );
+        assert_eq!(outcome, ReEvaluationOutcome::StillRejected);
     }
 
     // -- ReEvaluationOutcome derives -----------------------------------------

@@ -2685,7 +2685,8 @@ mod visibility_extension_tests {
         duration_secs: i64,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
 
@@ -2705,6 +2706,7 @@ mod visibility_extension_tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

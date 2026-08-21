@@ -566,8 +566,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::scan_policy::{
-        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection,
-        SeverityThreshold,
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
+        ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::{
         system_actor, Actor, ApprovalDecision, DomainEvent, PolicyResult, PolicyScope,
@@ -632,6 +632,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

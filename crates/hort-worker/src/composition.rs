@@ -514,6 +514,12 @@ pub async fn build_app_context(
         repositories.clone(),
         policy_projections.clone(),
         advisory.clone(),
+        // Same CAS the Trivy adapter reads at scan time. Formats whose
+        // handler declares `payload_sbom` (cargo) stream their stored
+        // bytes through it to build a resolved-version SBOM, and only
+        // for artifacts in a hosted repository; every other scan never
+        // touches it.
+        storage.clone(),
         scanners_map,
         // Clone so the SeedImportUseCase below can consume the same
         // handler set. The `Arc<dyn FormatHandler>` values are cheap

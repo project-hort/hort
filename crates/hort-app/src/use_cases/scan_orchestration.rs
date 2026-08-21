@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
+use hort_domain::entities::repository::RepositoryType;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::DomainError;
 use hort_domain::policy::scan::DefaultPolicy;
@@ -46,13 +47,15 @@ use hort_domain::ports::jobs_repository::{JobsRepository, ScanJob};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scanner::{ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER};
+use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{severity_label, ArtifactCoords, Finding, PayloadAccess, Sbom};
 
 use crate::error::AppResult;
 use crate::metrics::{
-    emit_sbom_extraction, emit_scan_failure, emit_scan_findings, emit_scan_jobs,
-    emit_scan_terminal, observe_scan_duration, SbomExtractionResult, ScanFailureResult,
-    ScanJobsResult, ScanTerminalResult,
+    emit_sbom_components_skipped, emit_sbom_extraction, emit_sbom_resolution, emit_scan_failure,
+    emit_scan_findings, emit_scan_jobs, emit_scan_terminal, observe_scan_duration,
+    SbomExtractionResult, SbomResolutionResult, ScanFailureResult, ScanJobsResult,
+    ScanTerminalResult,
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
@@ -168,6 +171,18 @@ pub enum ScanRunOutcome {
     Failed(String),
 }
 
+/// The artifact's repository row, reduced to the two facts the SBOM
+/// step reads off it. Resolved once per scan by
+/// [`ScanOrchestrationUseCase::subject_for_artifact`].
+struct ScanSubject {
+    coords: ArtifactCoords,
+    /// Decides whether the payload-closure SBOM path applies — see
+    /// [`ScanOrchestrationUseCase::try_extract_sbom`] for why the
+    /// answer depends on the repository class rather than the format
+    /// alone.
+    repo_type: RepositoryType,
+}
+
 // ---------------------------------------------------------------------------
 // Use case
 // ---------------------------------------------------------------------------
@@ -187,6 +202,14 @@ pub struct ScanOrchestrationUseCase {
     repositories: Arc<dyn RepositoryRepository>,
     policy_projections: Arc<dyn PolicyProjectionRepository>,
     advisory: Arc<dyn AdvisoryPort>,
+    /// CAS handle for the scan-time payload read. Only formats that
+    /// declare `FormatHandler::payload_sbom`, in a `Hosted` repository,
+    /// reach it — every other scan costs no storage round-trip. Wired to
+    /// the same CAS the Trivy
+    /// adapter reads from (which has streamed artifact bytes at scan
+    /// time since it shipped; this field puts the SBOM path on the same
+    /// footing).
+    storage: Arc<dyn StoragePort>,
     scanners: HashMap<String, Arc<dyn ScannerPort>>,
     handlers: HashMap<String, Arc<dyn FormatHandler>>,
     quarantine: Arc<QuarantineUseCase>,
@@ -202,6 +225,7 @@ impl ScanOrchestrationUseCase {
         repositories: Arc<dyn RepositoryRepository>,
         policy_projections: Arc<dyn PolicyProjectionRepository>,
         advisory: Arc<dyn AdvisoryPort>,
+        storage: Arc<dyn StoragePort>,
         scanners: HashMap<String, Arc<dyn ScannerPort>>,
         handlers: HashMap<String, Arc<dyn FormatHandler>>,
         quarantine: Arc<QuarantineUseCase>,
@@ -214,6 +238,7 @@ impl ScanOrchestrationUseCase {
             repositories,
             policy_projections,
             advisory,
+            storage,
             scanners,
             handlers,
             quarantine,
@@ -298,8 +323,10 @@ impl ScanOrchestrationUseCase {
         }
 
         // Step 3-5: extract SBOM via the format handler (best-effort).
-        let coords = self.coords_for_artifact(&artifact).await?;
-        let sbom = self.try_extract_sbom(&coords, &job.format).await;
+        let subject = self.subject_for_artifact(&artifact).await?;
+        let sbom = self
+            .try_extract_sbom(&artifact, &subject, &job.format)
+            .await;
 
         // Step 6: pre-scan advisory enrichment (best-effort).
         //
@@ -620,19 +647,94 @@ impl ScanOrchestrationUseCase {
     // Helpers
     // -----------------------------------------------------------------
 
-    async fn try_extract_sbom(&self, coords: &ArtifactCoords, format_key: &str) -> Option<Sbom> {
-        // `hort_sbom_extraction_total{format, result}`
-        // ticks once per dispatch. The `unsupported_format` arm covers
-        // both "no handler registered for this format" (early return
-        // below) and "handler returned `Ok(None)`" — both surface to
-        // operators as "this format does not produce an SBOM" with no
-        // actionable distinction; we use a single label for the
-        // observable.
+    /// Extract the scan's SBOM, reading the artifact's stored payload
+    /// when — and only when — the format handler declares it derives its
+    /// components from the payload
+    /// (`FormatHandler::payload_sbom() == Some(_)`) **and** the artifact
+    /// lives in a [`RepositoryType::Hosted`] repository.
+    ///
+    /// # Why the repository class gates the payload path
+    ///
+    /// An archive like a `.crate` does not contain its dependencies'
+    /// code, so a finding derived from its embedded lockfile is a claim
+    /// about code that is **not in the artifact** — unlike a container
+    /// image, where the scanner reads the vulnerable bytes themselves.
+    /// The evidentiary weight of that claim depends on who wrote the
+    /// lockfile:
+    ///
+    /// - **Hosted** — the lockfile is the authenticated publisher's own
+    ///   build witness. Holding their release gate to it is the point:
+    ///   they resolved those versions, they shipped them.
+    /// - **Proxy / virtual / staging** — the lockfile is the upstream
+    ///   author's dev-time resolve. Consumers of a library re-resolve
+    ///   and never run it, so a stale upstream resolve would carry gate
+    ///   power (the shipped default is `enforcement: reject`) over a
+    ///   crate every consumer would resolve safely — the
+    ///   false-positive-with-gate-power class this path exists to
+    ///   remove, reintroduced on the other face.
+    ///
+    /// The known counter-nuance, deliberately left open rather than
+    /// decided here: a **binary** crate installed with
+    /// `cargo install --locked` really does run its embedded resolve,
+    /// so for bins the upstream signal is real — but bin and lib cannot
+    /// be told apart cheaply at scan time.
+    ///
+    /// Note that `Staging` is excluded even though
+    /// [`RepositoryType::is_hosted`] counts it as upload-accepting: the
+    /// gate is a literal `Hosted` match, not that predicate.
+    ///
+    /// Two counters fire exactly once per call and answer different
+    /// questions: `hort_sbom_extraction_total{format, result}` — did a
+    /// BOM come out — and `hort_sbom_resolution_total{format, result}` —
+    /// on what basis were its component versions derived. The
+    /// `unsupported_format` arm of the first covers both "no handler
+    /// registered for this format" and "handler returned `Ok(None)`":
+    /// both surface to operators as "this format does not produce an
+    /// SBOM" with no actionable distinction. The second's `hosted_only`
+    /// arm is the gate above firing.
+    ///
+    /// **Fail-soft.** Nothing here can fail the scan run. A storage read
+    /// that fails degrades to the same no-SBOM path a format with no
+    /// handler takes, with the metric saying which happened. ADR 0007's
+    /// fail-closed rule governs release *authority*; SBOM enrichment is
+    /// not authority, and letting a CAS hiccup abort a scan would trade a
+    /// thinner BOM for no scan at all.
+    async fn try_extract_sbom(
+        &self,
+        artifact: &Artifact,
+        subject: &ScanSubject,
+        format_key: &str,
+    ) -> Option<Sbom> {
         let Some(handler) = self.handlers.get(format_key) else {
             emit_sbom_extraction(format_key, SbomExtractionResult::UnsupportedFormat);
+            emit_sbom_resolution(format_key, SbomResolutionResult::NotApplicable);
             return None;
         };
-        match handler.extract_sbom(coords, &coords.metadata, PayloadAccess::Bytes(&[])) {
+
+        let resolution = if handler.payload_sbom().is_none() {
+            // Metadata-only format — there is no resolved-dependency
+            // document to look for in the first place.
+            SbomResolutionResult::NotApplicable
+        } else if matches!(subject.repo_type, RepositoryType::Hosted) {
+            let handler = Arc::clone(handler);
+            return self
+                .extract_sbom_from_stored_payload(handler, artifact, &subject.coords, format_key)
+                .await;
+        } else {
+            SbomResolutionResult::HostedOnly
+        };
+
+        // The metadata-only path — reached by a format that never
+        // consumes the payload, and by a payload-consuming format whose
+        // repository class the gate above turned away. Unchanged from
+        // before the payload path existed: no storage read, and the
+        // empty-payload call the handlers have always ignored.
+        emit_sbom_resolution(format_key, resolution);
+        match handler.extract_sbom(
+            &subject.coords,
+            &subject.coords.metadata,
+            PayloadAccess::Bytes(&[]),
+        ) {
             Ok(Some(sbom)) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::Success);
                 Some(sbom)
@@ -653,7 +755,106 @@ impl ScanOrchestrationUseCase {
         }
     }
 
-    async fn coords_for_artifact(&self, artifact: &Artifact) -> AppResult<ArtifactCoords> {
+    /// Stream the artifact's stored bytes out of CAS and hand them to the
+    /// handler's [`PayloadSbom`](hort_domain::ports::format_handler::PayloadSbom)
+    /// implementation.
+    ///
+    /// **The payload never lands in a buffer here (ADR 0026).**
+    /// `StoragePort::get` yields an `AsyncRead`; `SyncIoBridge` adapts it
+    /// to the synchronous `std::io::Read` the format port speaks, and the
+    /// whole extraction runs on a blocking thread — so the bytes flow CAS
+    /// → bridge → the handler's archive walk with only the handler's own
+    /// documented caps in the path. `spawn_blocking` is mandatory rather
+    /// than incidental: the bridge parks the calling thread on runtime
+    /// I/O, and the extraction itself (gunzip, tar scan, TOML parse) is
+    /// CPU-bound work that has no business on an async worker thread.
+    async fn extract_sbom_from_stored_payload(
+        &self,
+        handler: Arc<dyn FormatHandler>,
+        artifact: &Artifact,
+        coords: &ArtifactCoords,
+        format_key: &str,
+    ) -> Option<Sbom> {
+        let stream = match self.storage.get(&artifact.sha256_checksum).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!(
+                    artifact_id = %artifact.id,
+                    format_key,
+                    error = %e,
+                    "stored payload unreadable; proceeding with no SBOM",
+                );
+                emit_sbom_extraction(format_key, SbomExtractionResult::PayloadUnavailable);
+                emit_sbom_resolution(format_key, SbomResolutionResult::PayloadUnavailable);
+                return None;
+            }
+        };
+
+        let bridge = tokio_util::io::SyncIoBridge::new(stream);
+        let coords_owned = coords.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            // Re-asked inside the closure because the capability is
+            // borrowed from `handler` and cannot cross the thread
+            // boundary on its own. The caller established it is `Some`.
+            let Some(payload_sbom) = handler.payload_sbom() else {
+                return Err(DomainError::Invariant(
+                    "format handler withdrew its PayloadSbom capability between calls".to_string(),
+                ));
+            };
+            payload_sbom.extract_sbom_from_payload(
+                &coords_owned,
+                &coords_owned.metadata,
+                PayloadAccess::ReadStream(Box::new(bridge)),
+            )
+        })
+        .await;
+
+        // A handler error and a panicked extraction task are the same
+        // fact to an operator — the payload was reachable and no usable
+        // component list came out of it — so they are normalised to one
+        // reason string and share one degradation arm.
+        let extraction = match joined {
+            Ok(inner) => inner.map_err(|e| e.to_string()),
+            Err(join) => Err(format!("extraction task did not complete: {join}")),
+        };
+        let extraction = match extraction {
+            Ok(extraction) => extraction,
+            Err(reason) => {
+                tracing::warn!(
+                    artifact_id = %artifact.id,
+                    format_key,
+                    reason,
+                    "payload SBOM extraction produced nothing usable; proceeding with no SBOM",
+                );
+                emit_sbom_extraction(format_key, SbomExtractionResult::ParseError);
+                emit_sbom_resolution(format_key, SbomResolutionResult::UnusableLockfile);
+                return None;
+            }
+        };
+
+        emit_sbom_resolution(format_key, extraction.resolution.into());
+        if extraction.skipped_non_registry > 0 {
+            emit_sbom_components_skipped(format_key, extraction.skipped_non_registry as u64);
+        }
+        match extraction.sbom {
+            Some(sbom) => {
+                emit_sbom_extraction(format_key, SbomExtractionResult::Success);
+                Some(sbom)
+            }
+            None => {
+                emit_sbom_extraction(format_key, SbomExtractionResult::UnsupportedFormat);
+                None
+            }
+        }
+    }
+
+    /// Everything the SBOM step needs off the artifact's repository row,
+    /// resolved in the single `find_by_id` this path already pays for:
+    /// the coords a format handler speaks, plus the repository class
+    /// that decides whether the payload-closure path applies at all.
+    /// Reading the type here rather than re-querying keeps the scan at
+    /// one repository lookup.
+    async fn subject_for_artifact(&self, artifact: &Artifact) -> AppResult<ScanSubject> {
         let repo = self.repositories.find_by_id(artifact.repository_id).await?;
         // `format_metadata` on `extract_sbom` is the
         // JSON the format handler extracted at ingest time. The
@@ -669,13 +870,16 @@ impl ScanOrchestrationUseCase {
             .await?
             .map(|row| row.metadata)
             .unwrap_or(serde_json::Value::Null);
-        Ok(ArtifactCoords {
-            name: artifact.name.clone(),
-            name_as_published: artifact.name_as_published.clone(),
-            version: artifact.version.clone(),
-            path: artifact.path.clone(),
-            format: repo.format,
-            metadata,
+        Ok(ScanSubject {
+            coords: ArtifactCoords {
+                name: artifact.name.clone(),
+                name_as_published: artifact.name_as_published.clone(),
+                version: artifact.version.clone(),
+                path: artifact.path.clone(),
+                format: repo.format,
+                metadata,
+            },
+            repo_type: repo.repo_type,
         })
     }
 

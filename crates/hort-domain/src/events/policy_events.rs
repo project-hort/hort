@@ -84,6 +84,10 @@ pub enum PolicyField {
     /// payloads are the lowercase `NegligibleAction` wire strings
     /// (`ignore` / `warn` / `block`).
     NegligibleAction,
+    /// `enforcement` changed. The `previous_value` / `new_value` payloads
+    /// are the lowercase `ScanEnforcement` wire strings
+    /// (`reject` / `record`).
+    Enforcement,
 }
 
 impl PolicyField {
@@ -94,13 +98,24 @@ impl PolicyField {
     /// The continuous-enforcement pass re-derives each artifact's verdict
     /// by re-running the pure scan evaluator (`evaluate_scan_result`)
     /// over the artifact's **stored findings** under the bumped policy.
-    /// That evaluator reads exactly three policy fields:
+    /// That evaluator reads exactly four policy fields:
     /// `severity_threshold` (the blocked-severity bar), `license_policy`
-    /// (the blocked-license classes), and `negligible_action` (how
-    /// informational / negligible findings steer the decision). A change
-    /// to any of those three can flip a stored-findings verdict and so is
-    /// gate-affecting; the ADR's enumeration ("severity thresholds,
-    /// blocked classes, `negligible_action`") is exactly this set.
+    /// (the blocked-license classes), `negligible_action` (how
+    /// informational / negligible findings steer the decision), and
+    /// `enforcement` (whether a blocking verdict rejects the artifact or
+    /// is merely recorded). A change to any of those four can flip a
+    /// stored-findings verdict and so is gate-affecting; the ADR's
+    /// enumeration ("severity thresholds, blocked classes,
+    /// `negligible_action`") plus the enforcement mode is exactly this
+    /// set.
+    ///
+    /// `Enforcement` is gate-affecting in **both** directions and that is
+    /// the whole point of the field being wired here: tightening
+    /// `record → reject` must re-derive and re-hold the now-non-compliant
+    /// population (a tighten that skipped re-derivation would be
+    /// fail-OPEN — the exact gap ADR 0041 closed), and loosening
+    /// `reject → record` must un-reject through authority #5 rather than
+    /// stranding the population `Rejected` forever.
     ///
     /// Every other field is **not** scan-gate-affecting:
     /// - `Name` / `Scope` — identity / matching, not the verdict
@@ -135,7 +150,10 @@ impl PolicyField {
     #[must_use]
     pub const fn is_gate_affecting(&self) -> bool {
         match self {
-            Self::SeverityThreshold | Self::LicensePolicy | Self::NegligibleAction => true,
+            Self::SeverityThreshold
+            | Self::LicensePolicy
+            | Self::NegligibleAction
+            | Self::Enforcement => true,
             Self::Name
             | Self::Scope
             | Self::QuarantineDuration

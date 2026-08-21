@@ -216,7 +216,9 @@ mod tests {
     use crate::entities::repository::{
         IndexMode, PrefetchPolicy, ReplicationPriority, RepositoryFormat, RepositoryType,
     };
-    use crate::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
+    use crate::entities::scan_policy::{
+        NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+    };
     use crate::events::PolicyScope;
     use crate::types::ContentHash;
     use chrono::TimeZone;
@@ -299,6 +301,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),

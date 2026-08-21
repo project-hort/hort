@@ -20,6 +20,13 @@
 #   (g) Virtual cargo aggregation (SHIPPED, ADR 0031): a consumer resolving
 #       entirely against cargo-virtual. Runs by default; set
 #       HORT_DOGFOOD_VIRTUAL_READY=0 to opt out.
+#   (h) hort-crates record-mode scanning (ADR 0056 + ADR 0034 Class A): a
+#       two-crate workspace whose first crate's lockfile pins a version with a
+#       live advisory publishes 2/2 (the second names the first's feature, so
+#       it resolves through the index), the scanned artifact is NOT rejected
+#       (`enforcement: record`), the SBOM carries the dependency at its exact
+#       locked version (not the declared range's floor), and the finding is
+#       queryable afterwards.
 #
 # Preflight probes skip cleanly (exit 77) if the dogfood repos are not
 # present (compose stack uses example-config, not the ansible gitops tree;
@@ -548,6 +555,234 @@ else
     log "  The cargo virtual serve-path aggregation is shipped (ADR 0031);"
     log "  this leg runs by default. Opt out only against an older server."
 fi
+
+# ---------------------------------------------------------------------------
+# (h) Record-mode resolved-version scanning on hort-crates.
+#
+# hort-crates runs `scanBackends: ["osv"]` with `enforcement: record`. Two
+# claims, and they are independent:
+#
+#   1. Publishing is not gated. A two-crate workspace publishes 2/2 even
+#      though the first crate's lockfile pins a version with a live advisory.
+#      Under `enforcement: reject` the scan verdict would transition crate A
+#      to Rejected, hiding it from the index — and crate B's publish, which
+#      resolves A through that index (and names one of A's features, so a
+#      degraded index entry is not enough either), would fail mid-chain.
+#   2. The verdict is real and recorded. The SBOM the verdict was computed
+#      over names the dependency at its EXACT resolved version, read from the
+#      `Cargo.lock` the published `.crate` embeds — not the declared range's
+#      floor — and the resulting finding is queryable afterwards.
+#
+# The two assertions are deliberately separate: the `sbom_components` check
+# proves the resolved-version path end to end without depending on any
+# advisory database, so if the OSV leg goes quiet the failure names which
+# half broke. The advisory pinned below is the one external fact this
+# scenario depends on; if it is ever withdrawn, repin RECORD_VULN_* rather
+# than deleting the assertion.
+# ---------------------------------------------------------------------------
+log ""
+log "--- (h) hort-crates record-mode scan over a resolved-version SBOM"
+
+# A dependency with a long-standing RustSec advisory and NO dependencies of
+# its own, so the resolved closure stays two packages wide.
+RECORD_VULN_CRATE="rustc-serialize"
+RECORD_VULN_VERSION="0.3.24"
+
+RECORD_DIR="$(mktemp -d)"
+# Extend the existing cleanup rather than replacing it — WORK_DIR is still
+# live (section (g) may have left the shell inside it).
+trap 'rm -rf "$WORK_DIR" "$RECORD_DIR"' EXIT
+
+RECORD_LIB="hort-dogfood-lockdep"
+RECORD_CONSUMER="hort-dogfood-lockdep-consumer"
+RECORD_VERSION="0.1.0-record.$(date +%s).$$"
+
+mkdir -p "$RECORD_DIR/lib/src" "$RECORD_DIR/consumer/src" "$RECORD_DIR/.cargo"
+
+# A genuine cargo workspace. This is the shape the premise rests on: one
+# workspace lockfile at the root, and `cargo package` re-resolving each member
+# ALONE when it packages it, so the `.crate` carries that member's own resolve
+# rather than the workspace-wide one (ADR 0056).
+cat > "$RECORD_DIR/Cargo.toml" << 'EOF'
+[workspace]
+members = ["lib", "consumer"]
+resolver = "2"
+EOF
+
+# Crate A — the one whose lockfile pins the advisory version. The dependency
+# is declared as a plain crates.io dep (NO `registry` key) so `cargo publish`
+# accepts it; `[source.crates-io]` replacement below redirects the resolve
+# through hort, exactly as the real release CI does (ADR 0055).
+cat > "$RECORD_DIR/lib/Cargo.toml" << EOF
+[package]
+name = "${RECORD_LIB}"
+version = "${RECORD_VERSION}"
+edition = "2021"
+description = "Dogfood record-mode scan fixture (lockfile pins an advisory version)"
+license = "MIT"
+
+[lib]
+name = "hort_dogfood_lockdep"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hort-dogfood-lockdep"
+path = "src/main.rs"
+
+[features]
+# Crate B names this feature — a published index entry that lost its feature
+# map would fail B's resolve, so this is load-bearing, not decoration.
+extra = []
+
+[dependencies]
+${RECORD_VULN_CRATE} = "=${RECORD_VULN_VERSION}"
+EOF
+
+cat > "$RECORD_DIR/lib/src/lib.rs" << 'EOF'
+pub fn lockdep() -> &'static str { "lockdep" }
+EOF
+
+# A binary target as well as the lib. Crate B consumes the lib; the bin is
+# belt-and-braces for the one premise this whole section rests on — that the
+# packaged `.crate` embeds a `Cargo.lock`. Cargo includes the lockfile for
+# every package on current toolchains, and includes it unconditionally for
+# packages with a binary target, so a crate carrying both cannot lose it to a
+# toolchain difference on the instance under test.
+cat > "$RECORD_DIR/lib/src/main.rs" << 'EOF'
+fn main() { println!("{}", hort_dogfood_lockdep::lockdep()); }
+EOF
+
+# Crate B — depends on A AND names A's feature.
+cat > "$RECORD_DIR/consumer/Cargo.toml" << EOF
+[package]
+name = "${RECORD_CONSUMER}"
+version = "${RECORD_VERSION}"
+edition = "2021"
+description = "Dogfood record-mode scan fixture (names crate A's feature)"
+license = "MIT"
+
+[dependencies]
+${RECORD_LIB} = { version = "=${RECORD_VERSION}", registry = "hort-crates", features = ["extra"] }
+EOF
+
+cat > "$RECORD_DIR/consumer/src/lib.rs" << 'EOF'
+pub fn consume() -> &'static str { hort_dogfood_lockdep::lockdep() }
+EOF
+
+
+# Registry + source config. `[source.crates-io] replace-with` keeps the
+# advisory dependency a *crates.io* dependency as far as `cargo publish` is
+# concerned while resolving it through hort's own aggregation.
+cat > "$RECORD_DIR/.cargo/config.toml" << EOF
+[registries.hort-crates]
+index = "sparse+${HORT_CRATES_URL}/"
+
+[registries.cargo-virtual]
+index = "sparse+${CARGO_VIRTUAL_URL}/"
+
+[source.crates-io]
+replace-with = "hort-cargo-virtual"
+
+[source.hort-cargo-virtual]
+registry = "sparse+${CARGO_VIRTUAL_URL}/"
+EOF
+
+export CARGO_REGISTRIES_HORT_CRATES_TOKEN="Bearer $ADMIN_TOKEN"
+export CARGO_REGISTRIES_CARGO_VIRTUAL_TOKEN="Bearer $ADMIN_TOKEN"
+
+# ---- (h1) publish crate A, then crate B: both must succeed ----
+RECORD_PUBLISHED=0
+
+cd "$RECORD_DIR/lib" || { fail "(h) cd into record lib dir" "$RECORD_DIR/lib"; summary; }
+RECORD_LOG_A="$(mktemp)"
+if cargo publish --registry hort-crates --allow-dirty --no-verify > "$RECORD_LOG_A" 2>&1; then
+    pass "(h1) publish 1/2: ${RECORD_LIB}@${RECORD_VERSION} -> hort-crates"
+    RECORD_PUBLISHED=$(( RECORD_PUBLISHED + 1 ))
+else
+    fail "(h1) publish 1/2 of the record-mode workspace" \
+        "cargo publish exited non-zero; last lines: $(tail -5 "$RECORD_LOG_A")"
+fi
+rm -f "$RECORD_LOG_A"
+
+if [ "$RECORD_PUBLISHED" = "1" ]; then
+    cd "$RECORD_DIR/consumer" || { fail "(h) cd into record consumer dir" "$RECORD_DIR/consumer"; summary; }
+    RECORD_LOG_B="$(mktemp)"
+    if cargo publish --registry hort-crates --allow-dirty --no-verify > "$RECORD_LOG_B" 2>&1; then
+        pass "(h1) publish 2/2: ${RECORD_CONSUMER} resolved ${RECORD_LIB}'s feature through the index"
+        RECORD_PUBLISHED=$(( RECORD_PUBLISHED + 1 ))
+    else
+        fail "(h1) publish 2/2 of the record-mode workspace" \
+            "cargo publish exited non-zero — crate A may have been gated by its own scan verdict; last lines: $(tail -5 "$RECORD_LOG_B")"
+    fi
+    rm -f "$RECORD_LOG_B"
+else
+    # Publish 1/2 already recorded its own failure; a second FAIL for the
+    # same cause would inflate the count without adding information.
+    log "  (h1) publish 2/2 not attempted — publish 1/2 failed, reported above"
+fi
+cd "$RECORD_DIR" || true
+
+# ---- (h2) the recorded verdict ----
+if [ "$RECORD_PUBLISHED" = "2" ]; then
+    RECORD_ARTIFACT_ID="$(psql_one "SELECT id FROM artifacts WHERE name = '${RECORD_LIB}' AND version = '${RECORD_VERSION}' LIMIT 1;")"
+    if [ -z "$RECORD_ARTIFACT_ID" ]; then
+        fail "(h2) locate published artifact via psql" \
+            "${RECORD_LIB}@${RECORD_VERSION} absent from the artifacts table after a successful publish"
+    else
+        log "  crate A artifact id=${RECORD_ARTIFACT_ID}"
+
+        # The scan is asynchronous (worker + osv). Wait for it to land.
+        if bounded_poll \
+                "scan completed for ${RECORD_ARTIFACT_ID}" \
+                180 \
+                "[ -n \"\$(psql_one \"SELECT last_scan_at FROM artifacts WHERE id = '${RECORD_ARTIFACT_ID}' AND last_scan_at IS NOT NULL;\")\" ]" \
+                5; then
+            pass "(h2) scan completed for crate A (artifacts.last_scan_at set)"
+
+            # (i) record mode: the verdict must NOT have transitioned the
+            # artifact. This is the assertion that indicts `enforcement`.
+            RECORD_STATUS="$(psql_one "SELECT COALESCE(quarantine_status::text, 'null') FROM artifacts WHERE id = '${RECORD_ARTIFACT_ID}';")"
+            if [ "$RECORD_STATUS" = "rejected" ]; then
+                fail "(h2) crate A must not be rejected under enforcement: record" \
+                    "quarantine_status='rejected' — the policy is enforcing, not recording"
+            else
+                pass "(h2) crate A quarantine_status='${RECORD_STATUS}' (not rejected — verdict recorded, not enforced)"
+            fi
+
+            # (ii) resolved-version SBOM: the component carries the EXACT
+            # locked version. A range-floor component would read
+            # `pkg:cargo/<crate>@0.3` or similar, so the `=` match is the
+            # whole point of the assertion.
+            RESOLVED_PURL="pkg:cargo/${RECORD_VULN_CRATE}@${RECORD_VULN_VERSION}"
+            SBOM_HIT="$(psql_one "SELECT count(*) FROM sbom_components WHERE artifact_id = '${RECORD_ARTIFACT_ID}' AND purl = '${RESOLVED_PURL}';")"
+            if [ "${SBOM_HIT:-0}" -ge 1 ]; then
+                pass "(h2) SBOM carries the resolved component ${RESOLVED_PURL}"
+            else
+                ACTUAL_PURLS="$(psql_one "SELECT string_agg(purl, ' ') FROM sbom_components WHERE artifact_id = '${RECORD_ARTIFACT_ID}';" || true)"
+                fail "(h2) SBOM must carry ${RESOLVED_PURL} at its exact locked version" \
+                    "components were: ${ACTUAL_PURLS:-<none>} — a range-floor or subject-only BOM means the embedded Cargo.lock was not read"
+            fi
+
+            # (iii) the finding is queryable. Recorded, not enforced — the
+            # rows land exactly as they would under `reject`.
+            FINDING_HIT="$(psql_one "SELECT count(*) FROM scan_findings WHERE artifact_id = '${RECORD_ARTIFACT_ID}' AND purl = '${RESOLVED_PURL}';")"
+            if [ "${FINDING_HIT:-0}" -ge 1 ]; then
+                FINDING_IDS="$(psql_one "SELECT string_agg(DISTINCT vulnerability_id, ',') FROM scan_findings WHERE artifact_id = '${RECORD_ARTIFACT_ID}' AND purl = '${RESOLVED_PURL}';" || true)"
+                pass "(h2) recorded finding is queryable for ${RESOLVED_PURL} (${FINDING_IDS:-?})"
+            else
+                fail "(h2) a recorded finding must be queryable for ${RESOLVED_PURL}" \
+                    "no scan_findings row — either osv returned nothing for this purl (repin RECORD_VULN_CRATE/VERSION) or the findings were not persisted"
+            fi
+        else
+            fail "(h2) scan did not complete for crate A within 180s" \
+                "artifacts.last_scan_at still NULL — is a worker with the osv backend running against this instance?"
+        fi
+    fi
+else
+    log "  (h2) skipped: the publish chain did not complete, already reported above"
+fi
+
+cd "$WORK_DIR" || true
 
 # ---------------------------------------------------------------------------
 summary

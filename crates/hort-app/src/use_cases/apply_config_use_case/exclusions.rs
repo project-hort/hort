@@ -132,7 +132,8 @@ mod tests {
     use super::*;
     use crate::use_cases::apply_config_use_case::tests::*;
     use hort_domain::entities::scan_policy::{
-        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection,
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
+        ScanPolicyProjection,
     };
 
     // ===================================================================
@@ -184,6 +185,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: now,
             updated_at: now,
@@ -240,6 +242,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: now,
             updated_at: now,

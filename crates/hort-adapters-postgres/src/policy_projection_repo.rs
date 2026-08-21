@@ -23,8 +23,8 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
-    SignerIdentityPattern,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::PolicyScope;
@@ -128,6 +128,18 @@ fn row_to_projection(row: &sqlx::postgres::PgRow) -> DomainResult<ScanPolicyProj
             "policy_projections.negligible_action does not decode to NegligibleAction: {e}"
         ))
     })?;
+    // `enforcement` is a CHECK-constrained text column decoded via the
+    // domain `FromStr`. The column is `text NOT NULL DEFAULT 'reject'`,
+    // so any row written before this column existed surfaces as Reject —
+    // the pre-knob behaviour, which is what every such row was written
+    // under. A value outside the two variants is a corrupt-row invariant
+    // violation.
+    let enforcement_str: String = row.try_get("enforcement").map_err(|e| map_row_err(&e))?;
+    let enforcement = ScanEnforcement::from_str(&enforcement_str).map_err(|e| {
+        DomainError::Invariant(format!(
+            "policy_projections.enforcement does not decode to ScanEnforcement: {e}"
+        ))
+    })?;
     let stream_version_i64: i64 = row.try_get("stream_version").map_err(|e| map_row_err(&e))?;
     let stream_version = u64::try_from(stream_version_i64).map_err(|_| {
         DomainError::Invariant(format!(
@@ -152,6 +164,7 @@ fn row_to_projection(row: &sqlx::postgres::PgRow) -> DomainResult<ScanPolicyProj
         scan_backends,
         rescan_interval_hours,
         negligible_action,
+        enforcement,
         stream_version,
         created_at,
         updated_at,
@@ -220,7 +233,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_mode, provenance_backends,
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
-                          rescan_interval_hours, negligible_action,
+                          rescan_interval_hours, negligible_action, enforcement,
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE policy_id = $1"#,
@@ -246,7 +259,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_mode, provenance_backends,
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
-                          rescan_interval_hours, negligible_action,
+                          rescan_interval_hours, negligible_action, enforcement,
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE name = $1 AND archived = false"#,
@@ -276,7 +289,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_mode, provenance_backends,
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
-                          rescan_interval_hours, negligible_action,
+                          rescan_interval_hours, negligible_action, enforcement,
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE name = $1"#,
@@ -298,7 +311,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_mode, provenance_backends,
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
-                          rescan_interval_hours, negligible_action,
+                          rescan_interval_hours, negligible_action, enforcement,
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE archived = false
@@ -364,6 +377,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
         let scan_backends = projection.scan_backends.clone();
         let rescan_interval_hours = projection.rescan_interval_hours;
         let negligible_action = projection.negligible_action.to_string();
+        let enforcement = projection.enforcement.to_string();
         let raw_version = projection.stream_version;
         let Ok(stream_version) = i64::try_from(raw_version) else {
             return Box::pin(async move {
@@ -389,10 +403,10 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                        provenance_identities, max_artifact_age_secs,
                        license_policy, archived, scan_backends,
                        rescan_interval_hours, stream_version,
-                       created_at, updated_at, negligible_action
+                       created_at, updated_at, negligible_action, enforcement
                    ) VALUES (
                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                       $16, $17, $18
+                       $16, $17, $18, $19
                    )
                    ON CONFLICT (policy_id) DO UPDATE SET
                        name                     = EXCLUDED.name,
@@ -409,6 +423,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                        scan_backends            = EXCLUDED.scan_backends,
                        rescan_interval_hours    = EXCLUDED.rescan_interval_hours,
                        negligible_action        = EXCLUDED.negligible_action,
+                       enforcement              = EXCLUDED.enforcement,
                        stream_version           = EXCLUDED.stream_version,
                        updated_at               = EXCLUDED.updated_at"#,
             )
@@ -430,6 +445,7 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
             .bind(created_at)
             .bind(updated_at)
             .bind(&negligible_action)
+            .bind(&enforcement)
             .execute(&self.pool)
             .await
             .map_err(|e| map_query_err(&e, "upsert"))?;
@@ -590,6 +606,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: version,
             created_at: now,
             updated_at: now,
@@ -956,6 +973,69 @@ mod tests {
         repo.upsert(&p).await.expect("upsert warn");
         let fetched = repo.find_by_id(id).await.expect("find").expect("row");
         assert_eq!(fetched.negligible_action, NegligibleAction::Warn);
+    }
+
+    // Round-trip `enforcement` (text column, CHECK-constrained) through
+    // the DB. The default makes a row written before the column existed
+    // read back as Reject — the enforcing, pre-knob behaviour every such
+    // row was written under.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn upsert_and_find_by_id_round_trip_enforcement() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool);
+
+        let id = Uuid::new_v4();
+        let mut p = sample_projection(id, &format!("enf-{}", id.simple()), 1);
+        assert_eq!(p.enforcement, ScanEnforcement::Reject);
+        repo.upsert(&p).await.expect("upsert reject");
+        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
+        assert_eq!(fetched.enforcement, ScanEnforcement::Reject);
+
+        // Flip to Record and confirm the non-default round-trips — both
+        // through the INSERT bind and the ON CONFLICT DO UPDATE arm.
+        p.enforcement = ScanEnforcement::Record;
+        p.stream_version = 2;
+        repo.upsert(&p).await.expect("upsert record");
+        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
+        assert_eq!(fetched.enforcement, ScanEnforcement::Record);
+
+        // And back — the update arm must not be one-way.
+        p.enforcement = ScanEnforcement::Reject;
+        p.stream_version = 3;
+        repo.upsert(&p).await.expect("upsert reject again");
+        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
+        assert_eq!(fetched.enforcement, ScanEnforcement::Reject);
+    }
+
+    /// The column's CHECK constraint is the storage-layer backstop for
+    /// the two wire values — it holds regardless of which writer reaches
+    /// the table (the apply-time validator is the first gate, not the
+    /// only one).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn enforcement_check_constraint_rejects_an_unknown_value() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgPolicyProjectionRepository::new(pool.clone());
+        let id = Uuid::new_v4();
+        let p = sample_projection(id, &format!("enf-chk-{}", id.simple()), 1);
+        repo.upsert(&p).await.expect("upsert");
+
+        let err =
+            sqlx::query("UPDATE policy_projections SET enforcement = $1 WHERE policy_id = $2")
+                .bind("audit")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .expect_err("an out-of-taxonomy enforcement value must violate the CHECK");
+        assert!(
+            err.to_string().contains("enforcement"),
+            "the constraint violation should name the column: {err}"
+        );
     }
 
     #[tokio::test]

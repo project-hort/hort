@@ -118,6 +118,7 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 // offline validator), not duplicated here.
 use crate::provenance::{
     negligible_action_from_spec, provenance_identities_from_spec, provenance_mode_from_spec,
+    scan_enforcement_from_spec,
 };
 use hort_domain::entities::service_account::{
     backing_username, FallbackRotation, FederatedIdentity, SecretFormat, ServiceAccount,
@@ -1586,6 +1587,10 @@ fn create_command_from_spec(
         // hort-config validated the wire value (parses to one of
         // ignore/warn/block) before this site.
         negligible_action: negligible_action_from_spec(&env.spec.negligible_action),
+        // `enforcement` flows from YAML to the create command.
+        // hort-config validated the wire value (parses to reject/record)
+        // before this site.
+        enforcement: scan_enforcement_from_spec(&env.spec.enforcement),
     }
 }
 
@@ -1633,6 +1638,9 @@ fn update_command_from_diff(
         negligible_action: FieldChange::Set(negligible_action_from_spec(
             &env.spec.negligible_action,
         )),
+        // Flow enforcement through. Same argument: per-field same-value
+        // skip in `update_policy`.
+        enforcement: FieldChange::Set(scan_enforcement_from_spec(&env.spec.enforcement)),
     }
 }
 
@@ -1730,7 +1738,7 @@ mod tests {
     // Test-only — the provenance mappers live in `crate::provenance`;
     // these types are referenced only by the fixtures.
     use hort_config::scan_policy::SignerIdentitySpec;
-    use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode};
+    use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, ScanEnforcement};
 
     use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{MockCall, MockRepositoryRepository};
@@ -2477,6 +2485,7 @@ mod tests {
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
+                enforcement: "reject".into(),
             },
         }
     }
@@ -5308,6 +5317,7 @@ mod tests {
                 scan_backends: backends.into_iter().map(str::to_string).collect(),
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
+                enforcement: "reject".into(),
             },
         }
     }
@@ -5341,6 +5351,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 3,
             created_at: now,
             updated_at: now,
@@ -6237,6 +6248,7 @@ mod tests {
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
+                enforcement: "reject".into(),
             },
         }
     }
@@ -6269,6 +6281,7 @@ mod tests {
                 scan_backends: vec!["trivy".to_string()],
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
+                enforcement: "reject".into(),
             },
         }
     }
@@ -6720,6 +6733,7 @@ mod tests {
                 scan_backends: backends.into_iter().map(str::to_string).collect(),
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
+                enforcement: "reject".into(),
             },
         }
     }

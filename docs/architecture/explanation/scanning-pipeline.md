@@ -180,6 +180,35 @@ projection replace, the artifact's state transition, the
 `repo_security_scores` delta, and the event batch. There is no state
 in which the event log says one thing and a projection says another.
 
+### What the verdict does: `enforcement: reject | record`
+
+`record_scan_result` computes the verdict through the one pure
+evaluator (`evaluate_scan_result`) and then does what the resolved
+policy's `enforcement` says. Under the default `reject`, a blocking
+verdict commits the reject triple (`ScanCompleted` +
+`PolicyEvaluated(Fail)` + `ArtifactRejected`). Under `record`, the
+same evidence and the same audit event commit — the findings blob, the
+per-finding rows and `PolicyEvaluated(Fail, violations)` are all
+written identically — and the `ArtifactRejected` is withheld: the
+artifact's quarantine status is untouched by the verdict.
+
+That is deliberately the *only* difference. The enforcement branch
+lives at the last step of the evaluator, after every rule has run, so
+the recorded verdict is byte-identical across the two modes; the
+tighten and loosen directions of continuous enforcement
+([ADR 0041](../../adr/0041-continuous-scan-policy-enforcement.md))
+therefore re-derive exactly the verdict the initial scan computed.
+
+The consequence for release is that a `record`-mode artifact's own
+latest `ScanCompleted` is dirty, so it cannot carry the
+`ScanSucceeded` authority. It releases through the distinct
+`ScanRecorded` authority instead
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)),
+which requires that a `ScanCompleted` exist on the artifact's stream —
+`record` un-gates the *verdict*, never the *observation*, so a
+never-scanned artifact is still held — and which carries the same
+provenance AND-precondition as the other timer authorities.
+
 ### Hash-referenced findings
 
 `ScanCompleted` (`crates/hort-domain/src/events/artifact_events.rs`)

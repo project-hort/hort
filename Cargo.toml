@@ -388,7 +388,13 @@ serde_urlencoded = "0.7"
 
 # Async streams
 futures = "0.3"
-tokio-util = { version = "0.7", features = ["io", "rt"] }
+# `io-util` is what carries `SyncIoBridge`, the adapter that lets an
+# `AsyncRead` (a CAS read) feed a synchronous `std::io::Read` port — the
+# `FormatHandler` payload methods are sync by design, and the scan path
+# streams stored artifacts through them without buffering. It activates
+# `tokio/io-util`, which `tokio`'s `full` feature already enables, so it
+# pulls no new crate into the graph.
+tokio-util = { version = "0.7", features = ["io", "io-util", "rt"] }
 tokio-stream = "0.1"
 bytes = "1.5"
 

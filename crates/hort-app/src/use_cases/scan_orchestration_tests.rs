@@ -26,14 +26,16 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+    NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
     Actor, DomainEvent, PersistedEvent, PolicyScope, ScanCompleted, SeveritySummary, StreamId,
 };
 use hort_domain::ports::advisory::AdvisoryPort;
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::format_handler::{
+    FormatHandler, PayloadSbom, PayloadSbomExtraction, SbomResolution,
+};
 use hort_domain::ports::jobs_repository::{JobStatus, JobsRepository, ScanJob, TriggerSource};
 use hort_domain::ports::scanner::ScannerPort;
 use hort_domain::ports::BoxFuture;
@@ -415,6 +417,7 @@ fn make_uc_with_policy_repo_and_handlers(
         repositories.clone(),
         policy_projections.clone(),
         advisory,
+        storage.clone(),
         scanners,
         handlers,
         quarantine,
@@ -454,6 +457,7 @@ fn seed_global_policy(scan_backends: Vec<String>) -> ScanPolicyProjection {
         scan_backends,
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
+        enforcement: ScanEnforcement::Reject,
         stream_version: 0,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -1591,6 +1595,7 @@ fn make_uc_with_lifecycle(
         repositories.clone(),
         policy_projections,
         Arc::new(MockAdvisory::ok(vec![])),
+        storage.clone(),
         HashMap::new(),
         HashMap::new(),
         quarantine,
@@ -1829,7 +1834,7 @@ async fn record_outcome_path_a_single_batch_after_item_12() {
 }
 
 // ===========================================================================
-// `coords_for_artifact` must carry `ArtifactMetadata.metadata` so
+// `subject_for_artifact` must carry `ArtifactMetadata.metadata` so
 // Tier-A handlers (npm/PyPI/Cargo) can produce a non-empty SBOM. The
 // previous implementation hard-coded `Value::Null`, which made every
 // SBOM-driven scanner (OSV-scanner, the OSV `AdvisoryPort` query)
@@ -1938,7 +1943,7 @@ impl AdvisoryPort for RecordingAdvisory {
 
 /// Seed an artifact + its repository with a known repository_id, plus
 /// an `ArtifactMetadata` row with the supplied JSON. The repo's
-/// `format` is set to `Npm` so the orchestrator's `coords_for_artifact`
+/// `format` is set to `Npm` so the orchestrator's `subject_for_artifact`
 /// produces `coords.format == "npm"` and the registered npm handler is
 /// dispatched.
 fn seed_npm_artifact_with_metadata(
@@ -1969,7 +1974,7 @@ fn seed_npm_artifact_with_metadata(
 
 #[tokio::test]
 async fn try_extract_sbom_returns_non_empty_sbom_for_npm_metadata() {
-    // Regression guard. With `coords_for_artifact` hardcoded to
+    // Regression guard. With `subject_for_artifact` hardcoded to
     // `Value::Null`, the npm-shaped handler hits its early return
     // and the SBOM has zero components. With the fix, the metadata
     // row's `metadata` JSON flows through to the handler and we get
@@ -2011,9 +2016,9 @@ async fn try_extract_sbom_returns_non_empty_sbom_for_npm_metadata() {
 }
 
 #[tokio::test]
-async fn coords_for_artifact_uses_value_null_when_metadata_row_absent() {
+async fn subject_for_artifact_uses_value_null_when_metadata_row_absent() {
     // Defensive — when the metadata row is absent (proxied fetch
-    // with no parsed body, etc.), `coords_for_artifact` must keep
+    // with no parsed body, etc.), `subject_for_artifact` must keep
     // `Value::Null` and fall through. The handler then returns its
     // empty-shape SBOM and the scan continues. This is a legitimate
     // v1 case, NOT a bug.
@@ -2026,7 +2031,11 @@ async fn coords_for_artifact_uses_value_null_when_metadata_row_absent() {
     let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
     let artifact = artifacts.find_by_id(artifact_id).await.expect("artifact");
 
-    let coords = uc.coords_for_artifact(&artifact).await.expect("coords");
+    let coords = uc
+        .subject_for_artifact(&artifact)
+        .await
+        .expect("subject")
+        .coords;
     assert!(
         coords.metadata.is_null(),
         "absent metadata row must produce Value::Null coords.metadata; got: {}",
@@ -2035,7 +2044,7 @@ async fn coords_for_artifact_uses_value_null_when_metadata_row_absent() {
 }
 
 #[tokio::test]
-async fn coords_for_artifact_propagates_metadata_when_present() {
+async fn subject_for_artifact_propagates_metadata_when_present() {
     // The metadata row's JSON must show up verbatim on
     // `coords.metadata`. This is the load-bearing assertion the
     // `try_extract_sbom_*_npm_metadata` test hangs on; pin it
@@ -2056,7 +2065,11 @@ async fn coords_for_artifact_propagates_metadata_when_present() {
         seed_npm_artifact_with_metadata(&artifacts, &repositories, &metadata_repo, payload.clone());
     let artifact = artifacts.find_by_id(artifact_id).await.expect("artifact");
 
-    let coords = uc.coords_for_artifact(&artifact).await.expect("coords");
+    let coords = uc
+        .subject_for_artifact(&artifact)
+        .await
+        .expect("subject")
+        .coords;
     assert_eq!(
         coords.metadata, payload,
         "coords.metadata must equal the seeded ArtifactMetadata.metadata"
@@ -2137,6 +2150,703 @@ async fn claim_pending_returns_jobs_repository_response() {
 // helper to drive an async block under a recorder and return the
 // snapshot for assertion.
 // ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Payload-derived (resolved-version) SBOM — orchestration wiring
+// ---------------------------------------------------------------------------
+
+/// Test double mirroring `CargoFormatHandler`'s `PayloadSbom` shape: it
+/// derives its components from the artifact's stored bytes, not from
+/// `format_metadata`.
+///
+/// The payload grammar is deliberately trivial — `RESOLVED:<name>@<ver>,…`
+/// with an optional `;skipped=<n>` suffix, `NOLOCK`, `BROKEN`, `BOOM` —
+/// because what is under test here is the *orchestration*: does the
+/// artifact's stored payload reach the handler as a stream, and does each
+/// outcome land on the right metric and the right degradation. The real
+/// archive walk is `hort-formats`' concern and is covered there.
+///
+/// Lives here rather than in `test_support.rs` for the same reason
+/// `NpmShapedSbomHandler` does: `hort-formats` is unavailable to
+/// `hort-app` — that is the layering boundary.
+struct PayloadShapedSbomHandler {
+    /// Exactly the bytes the handler read, so a test can prove the
+    /// artifact's *stored* content (not a placeholder) reached it.
+    seen_payload: Mutex<Option<Vec<u8>>>,
+    /// Whether [`FormatHandler::payload_sbom`] answers `Some`. A `false`
+    /// double is how the defensive "capability withdrawn between the
+    /// caller's check and the extraction" arm is reached without a
+    /// handler that mutates itself.
+    declares_capability: bool,
+}
+
+impl Default for PayloadShapedSbomHandler {
+    fn default() -> Self {
+        Self {
+            seen_payload: Mutex::new(None),
+            declares_capability: true,
+        }
+    }
+}
+
+impl FormatHandler for PayloadShapedSbomHandler {
+    fn format_key(&self) -> &str {
+        "cargo"
+    }
+    fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+        unimplemented!("not needed for these tests")
+    }
+    fn normalize_name(&self, name: &str) -> String {
+        name.to_string()
+    }
+    /// Metadata-only extraction still exists for this format's non-scan
+    /// callers, and still emits declared-range components. The scan path
+    /// must never reach it.
+    fn extract_sbom(
+        &self,
+        _coords: &ArtifactCoords,
+        _format_metadata: &serde_json::Value,
+        _payload: PayloadAccess<'_>,
+    ) -> DomainResult<Option<Sbom>> {
+        Ok(Some(Sbom {
+            subject: None,
+            components: vec![component("pkg:cargo/declared@1")],
+        }))
+    }
+    fn payload_sbom(&self) -> Option<&dyn PayloadSbom> {
+        self.declares_capability.then_some(self as &dyn PayloadSbom)
+    }
+}
+
+impl PayloadSbom for PayloadShapedSbomHandler {
+    fn extract_sbom_from_payload(
+        &self,
+        coords: &ArtifactCoords,
+        _format_metadata: &serde_json::Value,
+        payload: PayloadAccess<'_>,
+    ) -> DomainResult<PayloadSbomExtraction> {
+        let mut buf = Vec::new();
+        match payload {
+            PayloadAccess::Bytes(b) => buf.extend_from_slice(b),
+            PayloadAccess::ReadStream(mut r) => {
+                std::io::Read::read_to_end(&mut r, &mut buf)
+                    .map_err(|e| DomainError::Invariant(format!("payload read: {e}")))?;
+            }
+        }
+        *self.seen_payload.lock().unwrap() = Some(buf.clone());
+
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let subject = component(&format!("pkg:cargo/{}@1.0.0", coords.name));
+        let subject_only = |resolution| PayloadSbomExtraction {
+            sbom: Some(Sbom {
+                subject: Some(subject.clone()),
+                components: vec![],
+            }),
+            resolution,
+            skipped_non_registry: 0,
+        };
+
+        if text == "BOOM" {
+            return Err(DomainError::Validation("payload handler exploded".into()));
+        }
+        if text == "PANIC" {
+            panic!("payload handler panicked");
+        }
+        if text == "NOSBOM" {
+            // A handler that can say nothing at all about this payload —
+            // the `Ok(None)` shape `extract_sbom` already allows.
+            return Ok(PayloadSbomExtraction {
+                sbom: None,
+                resolution: SbomResolution::NoLockfile,
+                skipped_non_registry: 0,
+            });
+        }
+        if text == "NOLOCK" {
+            return Ok(subject_only(SbomResolution::NoLockfile));
+        }
+        let Some(rest) = text.strip_prefix("RESOLVED:") else {
+            return Ok(subject_only(SbomResolution::UnusableLockfile));
+        };
+        let (list, skipped) = match rest.split_once(";skipped=") {
+            Some((list, n)) => (list, n.parse::<usize>().unwrap_or(0)),
+            None => (rest, 0),
+        };
+        Ok(PayloadSbomExtraction {
+            sbom: Some(Sbom {
+                subject: Some(subject),
+                components: list
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|spec| component(&format!("pkg:cargo/{spec}")))
+                    .collect(),
+            }),
+            resolution: SbomResolution::Resolved,
+            skipped_non_registry: skipped,
+        })
+    }
+}
+
+/// An `SbomComponent` from a `pkg:cargo/<name>@<version>` PURL.
+fn component(purl: &str) -> SbomComponent {
+    let (name, version) = purl
+        .trim_start_matches("pkg:cargo/")
+        .split_once('@')
+        .map_or((purl, None), |(n, v)| (n, Some(v.to_string())));
+    SbomComponent {
+        purl: purl.to_string(),
+        name: name.to_string(),
+        version,
+        ecosystem: Ecosystem::Cargo,
+        licenses: vec![],
+        direct_dependency: false,
+    }
+}
+
+/// Seed a cargo artifact whose stored CAS content is `payload`, with the
+/// artifact row's `sha256_checksum` pointing at it — the only handle the
+/// orchestrator has on the bytes. The repository is `Hosted`, the one
+/// class whose artifacts take the payload path.
+///
+/// `metadata_json` is the stored `ArtifactMetadata.metadata` row (the
+/// registry-index document). Note what is deliberately absent: no
+/// resolved-dependency document is stored anywhere. Everything the scan
+/// needs is derived at scan time from the payload, which is what makes
+/// the behaviour retroactive for already-published artifacts.
+async fn seed_cargo_artifact_with_payload(
+    artifacts: &Arc<MockArtifactRepository>,
+    repositories: &Arc<MockRepositoryRepository>,
+    artifact_metadata: &Arc<MockArtifactMetadataRepository>,
+    storage: &Arc<MockStoragePort>,
+    payload: &[u8],
+    metadata_json: serde_json::Value,
+) -> Uuid {
+    seed_cargo_artifact_in_repo_type(
+        RepositoryType::Hosted,
+        artifacts,
+        repositories,
+        artifact_metadata,
+        storage,
+        payload,
+        metadata_json,
+    )
+    .await
+}
+
+/// As [`seed_cargo_artifact_with_payload`], with the repository class
+/// chosen by the caller — the input the payload-path gate reads.
+#[allow(clippy::too_many_arguments)]
+async fn seed_cargo_artifact_in_repo_type(
+    repo_type: RepositoryType,
+    artifacts: &Arc<MockArtifactRepository>,
+    repositories: &Arc<MockRepositoryRepository>,
+    artifact_metadata: &Arc<MockArtifactMetadataRepository>,
+    storage: &Arc<MockStoragePort>,
+    payload: &[u8],
+    metadata_json: serde_json::Value,
+) -> Uuid {
+    use hort_domain::entities::artifact::ArtifactMetadata as DomainArtifactMetadata;
+    use hort_domain::entities::repository::RepositoryFormat;
+    use hort_domain::ports::storage::StoragePort as _;
+
+    let stored = storage
+        .put(Box::new(std::io::Cursor::new(payload.to_vec())))
+        .await
+        .expect("seed CAS content");
+
+    let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+    artifact.sha256_checksum = stored.hash;
+    artifact.name = "demo".into();
+    artifact.name_as_published = "demo".into();
+    artifact.version = Some("1.0.0".into());
+    let mut repo = sample_repository();
+    repo.id = artifact.repository_id;
+    repo.format = RepositoryFormat::Cargo;
+    repo.repo_type = repo_type;
+    let id = artifact.id;
+    artifacts.insert(artifact);
+    repositories.insert(repo);
+    artifact_metadata.insert(DomainArtifactMetadata {
+        artifact_id: id,
+        format: RepositoryFormat::Cargo,
+        metadata: metadata_json,
+        metadata_blob: None,
+        properties: serde_json::json!({}),
+    });
+    id
+}
+
+/// `run_scan` on a cargo job whose artifact stores `payload` in a hosted
+/// repository, returning the components the advisory port was queried
+/// with plus the handler double (so a test can inspect what it read).
+async fn run_cargo_payload_scan(
+    payload: &[u8],
+) -> (
+    Vec<SbomComponent>,
+    Arc<PayloadShapedSbomHandler>,
+    Arc<MockStoragePort>,
+) {
+    run_cargo_scan_in_repo_type(RepositoryType::Hosted, payload).await
+}
+
+/// As [`run_cargo_payload_scan`], with the repository class chosen by
+/// the caller.
+async fn run_cargo_scan_in_repo_type(
+    repo_type: RepositoryType,
+    payload: &[u8],
+) -> (
+    Vec<SbomComponent>,
+    Arc<PayloadShapedSbomHandler>,
+    Arc<MockStoragePort>,
+) {
+    let handler = Arc::new(PayloadShapedSbomHandler::default());
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("cargo".into(), handler.clone());
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert(
+        "trivy".into(),
+        Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+    );
+    let advisory = Arc::new(RecordingAdvisory::new());
+    let advisory_port: Arc<dyn AdvisoryPort> = advisory.clone();
+
+    let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+        make_uc_full(vec!["trivy".into()], scanners, advisory_port, handlers);
+    let artifact_id = seed_cargo_artifact_in_repo_type(
+        repo_type,
+        &artifacts,
+        &repositories,
+        &metadata_repo,
+        &storage,
+        payload,
+        serde_json::json!({"name": "demo", "vers": "1.0.0", "deps": [
+            {"name": "serde", "req": "^1", "kind": "normal"}
+        ]}),
+    )
+    .await;
+    let mut job = sample_scan_job(artifact_id, 1);
+    job.format = "cargo".into();
+
+    uc.run_scan(&job).await.expect("run_scan");
+    let queried = advisory.last_components().unwrap_or_default();
+    (queried, handler, storage)
+}
+
+#[tokio::test]
+async fn payload_scan_streams_the_artifacts_own_stored_bytes_to_the_handler() {
+    // The wiring under test: the orchestrator resolves the artifact row's
+    // `sha256_checksum` against CAS and streams exactly those bytes into
+    // the handler's payload slot.
+    let payload = b"RESOLVED:serde@1.0.200,serde_derive@1.0.200";
+    let (queried, handler, storage) = run_cargo_payload_scan(payload).await;
+
+    assert_eq!(
+        handler.seen_payload.lock().unwrap().as_deref(),
+        Some(&payload[..]),
+        "the handler must receive the artifact's stored content verbatim"
+    );
+    assert_eq!(storage.get_call_count(), 1, "exactly one CAS read per scan");
+
+    // Advisory enrichment covers subject + components, so the resolved
+    // components are what a verdict is computed from.
+    let purls: Vec<&str> = queried.iter().map(|c| c.purl.as_str()).collect();
+    assert!(purls.contains(&"pkg:cargo/serde@1.0.200"));
+    assert!(purls.contains(&"pkg:cargo/serde_derive@1.0.200"));
+    assert!(
+        !purls.contains(&"pkg:cargo/declared@1"),
+        "the scan path must not fall back to the metadata-only branch"
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_is_retroactive_for_an_artifact_with_no_stored_resolved_data() {
+    // The retroactivity property. The seeded artifact has exactly what an
+    // artifact published before this change has: CAS content and a
+    // registry-index metadata row. No resolved-dependency document was
+    // stored at ingest, and none is stored now — a rescan derives the
+    // resolved components from the payload alone. This is what dissolves
+    // the backfill question for the already-published population.
+    let (queried, _handler, _storage) = run_cargo_payload_scan(b"RESOLVED:serde@1.0.200").await;
+
+    let resolved: Vec<&SbomComponent> = queried.iter().filter(|c| c.name == "serde").collect();
+    assert_eq!(resolved.len(), 1, "queried: {queried:?}");
+    assert_eq!(
+        resolved[0].version.as_deref(),
+        Some("1.0.200"),
+        "an exact resolved version, not the declared `^1` floor"
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_without_a_lockfile_queries_the_subject_alone() {
+    // Subject-only means the crate itself is still scanned; what must not
+    // happen is range-floor dependency components reaching the verdict.
+    let (queried, _handler, _storage) = run_cargo_payload_scan(b"NOLOCK").await;
+    assert_eq!(
+        queried.iter().map(|c| c.purl.as_str()).collect::<Vec<_>>(),
+        vec!["pkg:cargo/demo@1.0.0"],
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_survives_a_handler_error_with_no_sbom() {
+    // A handler `Err` degrades to the no-SBOM arm — the scan still runs
+    // its backends. SBOM enrichment is not release authority.
+    let handler = Arc::new(PayloadShapedSbomHandler::default());
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("cargo".into(), handler.clone());
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert(
+        "trivy".into(),
+        Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+    );
+    let advisory = Arc::new(RecordingAdvisory::new());
+    let advisory_port: Arc<dyn AdvisoryPort> = advisory.clone();
+
+    let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+        make_uc_full(vec!["trivy".into()], scanners, advisory_port, handlers);
+    let artifact_id = seed_cargo_artifact_with_payload(
+        &artifacts,
+        &repositories,
+        &metadata_repo,
+        &storage,
+        b"BOOM",
+        serde_json::Value::Null,
+    )
+    .await;
+    let mut job = sample_scan_job(artifact_id, 1);
+    job.format = "cargo".into();
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan must not fail");
+    assert!(
+        matches!(outcome, ScanRunOutcome::Completed { sbom: None, .. }),
+        "a failed SBOM extraction leaves the scan completed with no SBOM: {outcome:?}"
+    );
+    assert!(
+        advisory.last_components().is_none(),
+        "with no SBOM there is nothing to enrich, so the advisory port is never queried"
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_survives_an_unreadable_stored_payload() {
+    // A CAS read failure must not fail the scan differently from the
+    // missing-SBOM path that already existed: the backends still run and
+    // the job still completes. Trading a thinner BOM for no scan at all
+    // would be the wrong direction.
+    let handler = Arc::new(PayloadShapedSbomHandler::default());
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("cargo".into(), handler.clone());
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert(
+        "trivy".into(),
+        Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+    );
+
+    let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+        make_uc_full(
+            vec!["trivy".into()],
+            scanners,
+            Arc::new(MockAdvisory::ok(vec![])),
+            handlers,
+        );
+    let artifact_id = seed_cargo_artifact_with_payload(
+        &artifacts,
+        &repositories,
+        &metadata_repo,
+        &storage,
+        b"RESOLVED:serde@1.0.200",
+        serde_json::Value::Null,
+    )
+    .await;
+    let artifact = artifacts.find_by_id(artifact_id).await.expect("artifact");
+    storage.fail_get_persistent(artifact.sha256_checksum.clone());
+
+    let mut job = sample_scan_job(artifact_id, 1);
+    job.format = "cargo".into();
+    let outcome = uc.run_scan(&job).await.expect("run_scan must not fail");
+
+    assert!(
+        matches!(outcome, ScanRunOutcome::Completed { sbom: None, .. }),
+        "an unreadable payload degrades to the no-SBOM arm: {outcome:?}"
+    );
+    assert!(
+        handler.seen_payload.lock().unwrap().is_none(),
+        "the handler is never dispatched when the payload cannot be read"
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_in_a_proxy_repo_never_pays_for_a_cas_read() {
+    // The gate's cost half. A proxied cargo artifact's embedded lockfile
+    // is the upstream author's dev-time resolve, which no consumer of the
+    // library ever runs — so the registry must not stream the payload out
+    // of CAS to read it. `payload_sbom()` still answers `Some` for cargo;
+    // the repository class is what turns the read away, and it does so
+    // before the storage handle is touched at all.
+    let (_queried, handler, storage) =
+        run_cargo_scan_in_repo_type(RepositoryType::Proxy, b"RESOLVED:serde@1.0.200").await;
+
+    assert_eq!(
+        storage.get_call_count(),
+        0,
+        "a proxied cargo artifact must not read CAS for its SBOM"
+    );
+    assert!(
+        handler.seen_payload.lock().unwrap().is_none(),
+        "the payload capability is never dispatched for a non-hosted repository"
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_in_a_proxy_repo_produces_the_pre_payload_metadata_sbom() {
+    // The gate's behaviour half: a proxied cargo scan is byte-identical
+    // to what it produced before the payload path existed — the
+    // handler's metadata-only `extract_sbom`, declared-range components
+    // and all. This arm must not change: findings against an upstream
+    // author's stale resolve would carry gate power (the shipped
+    // `enforcement: reject` default) over a crate every consumer would
+    // resolve safely.
+    let (queried, _handler, _storage) =
+        run_cargo_scan_in_repo_type(RepositoryType::Proxy, b"RESOLVED:serde@1.0.200").await;
+
+    assert_eq!(
+        queried.iter().map(|c| c.purl.as_str()).collect::<Vec<_>>(),
+        vec!["pkg:cargo/declared@1"],
+        "the proxy path must be exactly the metadata-only SBOM"
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_is_gated_off_for_every_non_hosted_repository_class() {
+    // `Staging` is gated off with `Proxy` and `Virtual` even though
+    // `RepositoryType::is_hosted()` counts it as upload-accepting — the
+    // gate is a literal `Hosted` match, and this test is what stops a
+    // future edit from "simplifying" it into that predicate. Widening
+    // the gate to staging is a policy decision about which publishes a
+    // lockfile may gate, not a helper rename.
+    for repo_type in [
+        RepositoryType::Proxy,
+        RepositoryType::Virtual,
+        RepositoryType::Staging,
+    ] {
+        let (queried, handler, storage) =
+            run_cargo_scan_in_repo_type(repo_type, b"RESOLVED:serde@1.0.200").await;
+        assert_eq!(
+            storage.get_call_count(),
+            0,
+            "{repo_type:?} must not read CAS for its SBOM"
+        );
+        assert!(
+            handler.seen_payload.lock().unwrap().is_none(),
+            "{repo_type:?} must not dispatch the payload capability"
+        );
+        assert_eq!(
+            queried.iter().map(|c| c.purl.as_str()).collect::<Vec<_>>(),
+            vec!["pkg:cargo/declared@1"],
+            "{repo_type:?} must take the metadata-only path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn payload_scan_in_a_hosted_repo_still_resolves_from_the_payload() {
+    // The gate's other side, pinned next to the negative cases so a
+    // change that over-tightens it fails here rather than silently
+    // turning every cargo scan into a subject-only one.
+    let (queried, handler, storage) =
+        run_cargo_scan_in_repo_type(RepositoryType::Hosted, b"RESOLVED:serde@1.0.200").await;
+
+    assert_eq!(storage.get_call_count(), 1);
+    assert!(handler.seen_payload.lock().unwrap().is_some());
+    assert!(queried.iter().any(|c| c.purl == "pkg:cargo/serde@1.0.200"));
+}
+
+#[tokio::test]
+async fn metadata_only_format_never_pays_for_a_cas_read() {
+    // The declaration is load-bearing for cost, not just for correctness:
+    // npm's SBOM comes from stored metadata, so a scan of an npm artifact
+    // must not touch CAS at all — and its component list must be exactly
+    // what it was before the payload path existed.
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("npm".into(), Arc::new(NpmShapedSbomHandler));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert(
+        "trivy".into(),
+        Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+    );
+    let advisory = Arc::new(RecordingAdvisory::new());
+    let advisory_port: Arc<dyn AdvisoryPort> = advisory.clone();
+
+    let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+        make_uc_full(vec!["trivy".into()], scanners, advisory_port, handlers);
+    let artifact_id = seed_npm_artifact_with_metadata(
+        &artifacts,
+        &repositories,
+        &metadata_repo,
+        serde_json::json!({"dependencies": {"lodash": "^4.17.21"}}),
+    );
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.run_scan(&job).await.expect("run_scan");
+
+    assert_eq!(
+        storage.get_call_count(),
+        0,
+        "a format that does not derive its SBOM from the payload must not read CAS"
+    );
+    let queried = advisory.last_components().expect("advisory queried");
+    assert_eq!(
+        queried.iter().map(|c| c.purl.as_str()).collect::<Vec<_>>(),
+        vec!["pkg:npm/lodash@4.17.21"],
+        "the metadata-shape SBOM is byte-identical to what it was before"
+    );
+}
+
+/// Metadata-only handler whose `extract_sbom` outcome is chosen by the
+/// test — the two non-happy arms of the pre-payload path
+/// (`Ok(None)` = opaque format, `Err` = malformed metadata).
+struct MetadataOutcomeHandler {
+    fail: bool,
+}
+
+impl FormatHandler for MetadataOutcomeHandler {
+    fn format_key(&self) -> &str {
+        "npm"
+    }
+    fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+        unimplemented!("not needed for these tests")
+    }
+    fn normalize_name(&self, name: &str) -> String {
+        name.to_string()
+    }
+    fn extract_sbom(
+        &self,
+        _coords: &ArtifactCoords,
+        _format_metadata: &serde_json::Value,
+        _payload: PayloadAccess<'_>,
+    ) -> DomainResult<Option<Sbom>> {
+        if self.fail {
+            Err(DomainError::Validation("unparseable metadata".into()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Run a scan whose only registered handler is a metadata-only double
+/// with the requested outcome, returning the resulting `ScanRunOutcome`.
+async fn run_metadata_outcome_scan(fail: bool) -> ScanRunOutcome {
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("npm".into(), Arc::new(MetadataOutcomeHandler { fail }));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert(
+        "trivy".into(),
+        Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+    );
+
+    let (uc, _jobs, _events, _storage, artifacts, repositories, _policy, _metadata) = make_uc_full(
+        vec!["trivy".into()],
+        scanners,
+        Arc::new(MockAdvisory::ok(vec![])),
+        handlers,
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+    uc.run_scan(&job).await.expect("run_scan")
+}
+
+#[tokio::test]
+async fn metadata_only_handler_returning_none_completes_the_scan_without_an_sbom() {
+    // The opaque-format arm: `Ok(None)` is a normal answer, not a
+    // failure, and the backends still run.
+    let outcome = run_metadata_outcome_scan(false).await;
+    assert!(
+        matches!(outcome, ScanRunOutcome::Completed { sbom: None, .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn metadata_only_handler_error_completes_the_scan_without_an_sbom() {
+    // Same degradation for a handler `Err` — unchanged from before the
+    // payload path existed, and pinned here because that arm previously
+    // had no test.
+    let outcome = run_metadata_outcome_scan(true).await;
+    assert!(
+        matches!(outcome, ScanRunOutcome::Completed { sbom: None, .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_survives_a_panicking_extraction_task() {
+    // The extraction runs on a blocking thread; a panic there must
+    // surface as "no SBOM", not as a poisoned scan. A publisher-supplied
+    // payload is the input, so this arm is reachable in principle from
+    // untrusted bytes.
+    let (queried, _handler, _storage) = run_cargo_payload_scan(b"PANIC").await;
+    assert!(
+        queried.is_empty(),
+        "a panicked extraction yields no SBOM to enrich: {queried:?}"
+    );
+}
+
+#[tokio::test]
+async fn payload_scan_handler_that_produces_no_bom_at_all_is_unsupported_format() {
+    // `sbom: None` from the payload path means the handler can say
+    // nothing about this payload — the same observable as an opaque
+    // format, and distinct from a failure.
+    let (queried, handler, _storage) = run_cargo_payload_scan(b"NOSBOM").await;
+    assert!(queried.is_empty(), "{queried:?}");
+    assert!(
+        handler.seen_payload.lock().unwrap().is_some(),
+        "the handler was still dispatched"
+    );
+}
+
+#[tokio::test]
+async fn payload_extraction_degrades_when_the_capability_is_not_declared() {
+    // Defensive arm: `extract_sbom_from_stored_payload` is only ever called
+    // after the caller has seen `payload_sbom() == Some(_)`. If that ever
+    // stops holding, the helper must degrade to no-SBOM rather than
+    // unwrap a `None` — a scan is not worth a panic in a worker.
+    let handler = Arc::new(PayloadShapedSbomHandler {
+        declares_capability: false,
+        ..Default::default()
+    });
+    let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+        make_uc_full(
+            vec!["trivy".into()],
+            HashMap::new(),
+            Arc::new(MockAdvisory::ok(vec![])),
+            HashMap::new(),
+        );
+    let artifact_id = seed_cargo_artifact_with_payload(
+        &artifacts,
+        &repositories,
+        &metadata_repo,
+        &storage,
+        b"RESOLVED:serde@1.0.200",
+        serde_json::Value::Null,
+    )
+    .await;
+    let artifact = artifacts.find_by_id(artifact_id).await.expect("artifact");
+    let coords = uc
+        .subject_for_artifact(&artifact)
+        .await
+        .expect("subject")
+        .coords;
+
+    let sbom = uc
+        .extract_sbom_from_stored_payload(handler.clone(), &artifact, &coords, "cargo")
+        .await;
+
+    assert!(sbom.is_none(), "no SBOM, no panic");
+    assert!(
+        handler.seen_payload.lock().unwrap().is_none(),
+        "the extraction is never attempted without the capability"
+    );
+}
 
 mod metrics_emission_tests {
     use super::*;
@@ -2901,11 +3611,8 @@ mod metrics_emission_tests {
 
         let config = ScanOrchestrationConfig::defaults_for_worker("test-worker");
         let artifact_metadata = Arc::new(MockArtifactMetadataRepository::new());
-        // `storage` is no longer threaded through the orchestrator;
-        // the consumer (`QuarantineUseCase`) owns the CAS write site.
-        let _ = storage;
-        // `events` is no longer held by the orchestrator either;
-        // the consumer owns the event-store reads.
+        // `events` is not held by the orchestrator; the consumer owns
+        // the event-store reads.
         let _ = events;
         ScanOrchestrationUseCase::new(
             jobs,
@@ -2914,10 +3621,293 @@ mod metrics_emission_tests {
             repositories,
             policy_projections,
             Arc::new(MockAdvisory::ok(vec![])),
+            storage,
             HashMap::new(),
             HashMap::new(),
             quarantine,
             config,
         )
+    }
+
+    // ---------------------------------------------------------------
+    // hort_sbom_resolution_total / hort_sbom_components_skipped_total
+    // ---------------------------------------------------------------
+
+    /// The `result` label value of the single `hort_sbom_resolution_total`
+    /// series a scan of `payload` produced.
+    fn resolution_label(payload: &'static [u8]) -> String {
+        let snap = capture_async_metrics(move || {
+            Box::pin(async move {
+                let _ = run_cargo_payload_scan(payload).await;
+            })
+        });
+        for candidate in [
+            "resolved",
+            "no_lockfile",
+            "unusable_lockfile",
+            "payload_unavailable",
+            "not_applicable",
+            "hosted_only",
+        ] {
+            let hit = find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&candidate)
+            });
+            if hit.is_some() {
+                return candidate.to_string();
+            }
+        }
+        panic!("hort_sbom_resolution_total{{format=cargo}} did not fire");
+    }
+
+    #[test]
+    fn hort_sbom_resolution_total_distinguishes_every_payload_outcome() {
+        // The whole point of the counter: an operator can tell a registry
+        // whose crates resolve cleanly from one that is silently scanning
+        // subjects only — and, among the latter, tell "publishers ship no
+        // lockfile" from "our extraction is failing on them". Collapsing
+        // any two of these would hide a real regression behind a normal
+        // one.
+        assert_eq!(resolution_label(b"RESOLVED:serde@1.0.200"), "resolved");
+        assert_eq!(resolution_label(b"NOLOCK"), "no_lockfile");
+        assert_eq!(resolution_label(b"not a crate at all"), "unusable_lockfile");
+        assert_eq!(
+            resolution_label(b"BOOM"),
+            "unusable_lockfile",
+            "a handler error is the same fact to an operator: the payload was \
+             reachable and no usable component list came out of it"
+        );
+    }
+
+    #[test]
+    fn hort_sbom_extraction_total_and_resolution_both_fire_once_per_scan() {
+        // The two counters answer different questions and must stay
+        // aligned: one scan, one tick on each.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ = run_cargo_payload_scan(b"RESOLVED:serde@1.0.200").await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_extraction_total", |labels| {
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"success")
+            }),
+            Some(1),
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"resolved")
+            }),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn hort_sbom_components_skipped_total_carries_the_count_not_a_label() {
+        // The skip count is unbounded, so it rides the counter's *value*.
+        // A label per distinct count would be a cardinality hazard, and a
+        // log line alone would not aggregate — an operator needs the rate
+        // to see BOMs quietly getting thinner.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ = run_cargo_payload_scan(b"RESOLVED:serde@1.0.200;skipped=3").await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_components_skipped_total", |labels| {
+                labels.get("format") == Some(&"cargo")
+            }),
+            Some(3),
+        );
+        let has_count_label = snap.iter().any(|(key, _, _, _)| {
+            key.key().name() == "hort_sbom_components_skipped_total"
+                && key.key().labels().any(|l| l.key() == "count")
+        });
+        assert!(!has_count_label, "the count must never become a label");
+    }
+
+    #[test]
+    fn hort_sbom_components_skipped_total_stays_silent_when_nothing_was_skipped() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ = run_cargo_payload_scan(b"RESOLVED:serde@1.0.200").await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_components_skipped_total", |_| true),
+            None,
+        );
+    }
+
+    #[test]
+    fn hort_sbom_metrics_report_an_unreadable_payload_as_infrastructure_not_content() {
+        // A CAS read failure is not a malformed artifact. Both counters
+        // say `payload_unavailable` so an operator chasing a spike lands
+        // on storage, not on publishers.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let handler = Arc::new(PayloadShapedSbomHandler::default());
+                let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+                handlers.insert("cargo".into(), handler);
+                let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+                scanners.insert(
+                    "trivy".into(),
+                    Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+                );
+
+                let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+                    make_uc_full(
+                        vec!["trivy".into()],
+                        scanners,
+                        Arc::new(MockAdvisory::ok(vec![])),
+                        handlers,
+                    );
+                let artifact_id = seed_cargo_artifact_with_payload(
+                    &artifacts,
+                    &repositories,
+                    &metadata_repo,
+                    &storage,
+                    b"RESOLVED:serde@1.0.200",
+                    serde_json::Value::Null,
+                )
+                .await;
+                let artifact = artifacts.find_by_id(artifact_id).await.expect("artifact");
+                storage.fail_get_persistent(artifact.sha256_checksum.clone());
+                let mut job = sample_scan_job(artifact_id, 1);
+                job.format = "cargo".into();
+                let _ = uc.run_scan(&job).await.expect("run_scan");
+            })
+        });
+        for metric in ["hort_sbom_extraction_total", "hort_sbom_resolution_total"] {
+            assert_eq!(
+                find_counter(&snap, metric, |labels| {
+                    labels.get("format") == Some(&"cargo")
+                        && labels.get("result") == Some(&"payload_unavailable")
+                }),
+                Some(1),
+                "{metric} must report payload_unavailable",
+            );
+        }
+    }
+
+    #[test]
+    fn hort_sbom_resolution_total_fires_not_applicable_for_a_metadata_only_format() {
+        // Not a degradation — npm has no resolved-dependency document to
+        // look for. The label exists so `resolved / total` is a meaningful
+        // ratio per format rather than a mystery gap.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+                handlers.insert("npm".into(), Arc::new(NpmShapedSbomHandler));
+                let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+                scanners.insert(
+                    "trivy".into(),
+                    Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+                );
+
+                let (uc, _jobs, _events, _storage, artifacts, repositories, _policy, metadata_repo) =
+                    make_uc_full(
+                        vec!["trivy".into()],
+                        scanners,
+                        Arc::new(MockAdvisory::ok(vec![])),
+                        handlers,
+                    );
+                let artifact_id = seed_npm_artifact_with_metadata(
+                    &artifacts,
+                    &repositories,
+                    &metadata_repo,
+                    serde_json::json!({"dependencies": {"lodash": "^4.17.21"}}),
+                );
+                let job = sample_scan_job(artifact_id, 1);
+                let _ = uc.run_scan(&job).await.expect("run_scan");
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"npm")
+                    && labels.get("result") == Some(&"not_applicable")
+            }),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn hort_sbom_resolution_total_fires_not_applicable_when_no_handler_registered() {
+        // The unregistered-format arm returns before any capability can be
+        // asked about, so the resolution counter still gets its one tick —
+        // otherwise a scan would be invisible on this series.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let (uc, _jobs, _events, _storage, artifacts, repositories, _policy) = make_uc(
+                    vec!["trivy".into()],
+                    HashMap::new(),
+                    Arc::new(MockAdvisory::ok(vec![])),
+                );
+                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let job = sample_scan_job(artifact_id, 1);
+                let _ = uc.run_scan(&job).await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"npm")
+                    && labels.get("result") == Some(&"not_applicable")
+            }),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn hort_sbom_resolution_total_fires_hosted_only_for_a_non_hosted_repository() {
+        // The gated-off case gets its own label rather than sharing
+        // `not_applicable`. Sharing would collide on the same `format`
+        // label with two facts an operator must be able to separate:
+        // "cargo has no handler registered" and "cargo has one, and this
+        // repository class deliberately does not use its payload path".
+        // A cargo registry whose scans are all `hosted_only` when its
+        // operator believes those repositories are hosted has a
+        // misconfiguration no other series would reveal.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ =
+                    run_cargo_scan_in_repo_type(RepositoryType::Proxy, b"RESOLVED:serde@1.0.200")
+                        .await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"cargo")
+                    && labels.get("result") == Some(&"hosted_only")
+            }),
+            Some(1),
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"cargo")
+                    && labels.get("result") == Some(&"not_applicable")
+            }),
+            None,
+            "the gated-off case must not also tick not_applicable"
+        );
+    }
+
+    #[test]
+    fn hort_sbom_extraction_total_still_reports_the_metadata_bom_when_gated_off() {
+        // The two counters stay orthogonal across the gate: resolution
+        // says the payload path was declined, extraction says a BOM
+        // still came out — the metadata one. An operator reading
+        // `hosted_only` must not conclude the scan produced nothing.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ =
+                    run_cargo_scan_in_repo_type(RepositoryType::Proxy, b"RESOLVED:serde@1.0.200")
+                        .await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_extraction_total", |labels| {
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"success")
+            }),
+            Some(1),
+        );
     }
 }

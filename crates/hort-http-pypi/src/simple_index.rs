@@ -698,9 +698,10 @@ async fn project_body(
 /// the hot serve path, which never reads the mirror (it renders the
 /// cached projection). The mirror reader is read into a buffer here and
 /// projected via `Cursor`: the sync `MetadataProjector`
-/// (`R: std::io::Read`) cannot take an `AsyncRead` directly, and
-/// `tokio-util`'s `SyncIoBridge` needs the `io-util` feature (not enabled
-/// workspace-wide). A transient buffer on this cold outage path is
+/// (`R: std::io::Read`) cannot take an `AsyncRead` directly.
+/// (`tokio-util`'s `SyncIoBridge` would stream it instead, at the cost of
+/// a `spawn_blocking` hop this path has no reason to pay.)
+/// A transient buffer on this cold outage path is
 /// acceptable — PyPI simple-index bodies are ~110 KB (JSON) to a few MB
 /// (HTML fallback, still far under the 2 MiB HTML-arm cap in the common
 /// case).

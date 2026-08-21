@@ -213,6 +213,79 @@ impl FromStr for NegligibleAction {
 }
 
 // ---------------------------------------------------------------------------
+// ScanEnforcement
+// ---------------------------------------------------------------------------
+
+/// Per-policy steering of **what the scan verdict does** to the artifact.
+///
+/// Orthogonal to every knob that decides *whether* a finding is
+/// enforcement-worthy ([`SeverityThreshold`], the license policy,
+/// [`NegligibleAction`]): those compute the verdict, this decides what the
+/// verdict is allowed to do. The scan always runs, the findings are always
+/// persisted, and the verdict is always computed and recorded — under
+/// [`Record`](Self::Record) it simply does not transition the artifact.
+///
+/// - [`Reject`](Self::Reject) — **the default**, and the behaviour of every
+///   policy that predates this field. A blocking verdict rejects the
+///   artifact (`PolicyEvaluated(Fail)` + `ArtifactRejected`); downloads are
+///   blocked by the `Rejected` status.
+/// - [`Record`](Self::Record) — a blocking verdict is *recorded, not
+///   enforced*: the `PolicyEvaluated(Fail)` audit event and the per-finding
+///   rows are written exactly as under `Reject`, but no `ArtifactRejected`
+///   is emitted and the artifact's quarantine status is untouched.
+///   Publication proceeds; blocking at retrieval is left to the consuming
+///   policy. Because the artifact's own `ScanCompleted` is dirty, the
+///   `ScanSucceeded` release authority is *not* constructible for it — a
+///   `Record`-mode scope releases through the distinct
+///   `ReleaseAuthorization::ScanRecorded` authority instead, which carries
+///   the same provenance AND-precondition as the other timer arms
+///   (ADR 0007).
+///
+/// A policy tightened `Record → Reject` re-derives every in-scope
+/// artifact's verdict from its stored findings and re-holds the
+/// now-non-compliant population; loosened `Reject → Record` it un-rejects
+/// them through release authority #5 — both directions ride the ADR 0041
+/// continuous-enforcement pass, which is why
+/// [`PolicyField::Enforcement`](crate::events::PolicyField::Enforcement) is
+/// gate-affecting.
+///
+/// Lowercase wire-form on parse and display (mirrors [`SeverityThreshold`],
+/// [`ProvenanceMode`] and [`NegligibleAction`]) so the YAML, JSON, and SQL
+/// surfaces share one spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum ScanEnforcement {
+    /// Default — a blocking verdict rejects the artifact.
+    #[default]
+    Reject,
+    /// A blocking verdict is recorded (findings + `PolicyEvaluated(Fail)`)
+    /// but never transitions the artifact.
+    Record,
+}
+
+impl fmt::Display for ScanEnforcement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reject => f.write_str("reject"),
+            Self::Record => f.write_str("record"),
+        }
+    }
+}
+
+impl FromStr for ScanEnforcement {
+    type Err = DomainError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "reject" => Ok(Self::Reject),
+            "record" => Ok(Self::Record),
+            _ => Err(DomainError::Validation(format!(
+                "unknown scan enforcement: {s}"
+            ))),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SignerIdentityPattern (ADR 0027)
 // ---------------------------------------------------------------------------
 
@@ -451,6 +524,14 @@ pub struct ScanPolicyProjection {
     /// violation; `Block` rejects the artifact. Consumed by
     /// [`crate::policy::scan::evaluate_scan_result`] (NOT inert).
     pub negligible_action: NegligibleAction,
+    /// What a blocking scan verdict does to the artifact. Default
+    /// [`ScanEnforcement::Reject`] — the pre-existing behaviour of every
+    /// policy. Under [`ScanEnforcement::Record`] the verdict is computed
+    /// and audited but never transitions the artifact. Consumed by
+    /// [`crate::policy::scan::evaluate_scan_result`] and by the
+    /// re-evaluation decision point
+    /// [`crate::policy::decide_rejected_transition`] (NOT inert).
+    pub enforcement: ScanEnforcement,
     /// Last appended position on the per-policy event stream. Drives
     /// optimistic-concurrency on the next event append.
     pub stream_version: u64,
@@ -766,6 +847,66 @@ mod tests {
         }
     }
 
+    // ---- ScanEnforcement ----
+
+    #[test]
+    fn scan_enforcement_default_is_reject() {
+        // The load-bearing default: a policy that never mentions
+        // `enforcement` behaves exactly as it did before the field
+        // existed — a blocking verdict rejects. A flip here would
+        // silently un-gate every deployed scope.
+        assert_eq!(ScanEnforcement::default(), ScanEnforcement::Reject);
+    }
+
+    #[test]
+    fn scan_enforcement_round_trips_every_variant() {
+        for (variant, wire) in [
+            (ScanEnforcement::Reject, "reject"),
+            (ScanEnforcement::Record, "record"),
+        ] {
+            assert_eq!(variant.to_string(), wire);
+            assert_eq!(ScanEnforcement::from_str(wire).expect("parse"), variant);
+        }
+    }
+
+    #[test]
+    fn scan_enforcement_parse_is_case_insensitive() {
+        assert_eq!(
+            ScanEnforcement::from_str("REJECT").expect("parse"),
+            ScanEnforcement::Reject
+        );
+        assert_eq!(
+            ScanEnforcement::from_str("Record").expect("parse"),
+            ScanEnforcement::Record
+        );
+    }
+
+    #[test]
+    fn scan_enforcement_parse_unknown_is_validation_error() {
+        let err = ScanEnforcement::from_str("audit").expect_err("unknown enforcement must reject");
+        match err {
+            DomainError::Validation(msg) => {
+                assert!(msg.contains("audit"), "msg should echo input: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scan_enforcement_parse_empty_is_validation_error() {
+        let err = ScanEnforcement::from_str("").expect_err("empty must reject");
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn scan_enforcement_serde_round_trips() {
+        for e in [ScanEnforcement::Reject, ScanEnforcement::Record] {
+            let json = serde_json::to_string(&e).expect("serialize");
+            let back: ScanEnforcement = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(e, back);
+        }
+    }
+
     // ---- ScanPolicyProjection clone/eq/Serialize ----
 
     fn sample_projection() -> ScanPolicyProjection {
@@ -789,6 +930,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 7,
             created_at: now,
             updated_at: now,
@@ -905,6 +1047,30 @@ mod tests {
         let a = sample_projection();
         let mut b = a.clone();
         b.negligible_action = NegligibleAction::Warn;
+        assert_ne!(a, b);
+    }
+
+    // `enforcement` field round-trips through serde and participates in
+    // equality. Default Reject.
+    #[test]
+    fn scan_policy_projection_enforcement_serialises_under_snake_case_key() {
+        let mut p = sample_projection();
+        p.enforcement = ScanEnforcement::Record;
+        let json = serde_json::to_string(&p).expect("serialize");
+        assert!(
+            json.contains("\"enforcement\":\"Record\""),
+            "enforcement must surface under snake_case key: {json}"
+        );
+    }
+
+    #[test]
+    fn scan_policy_projection_enforcement_change_breaks_equality() {
+        // Load-bearing for the gitops diff: `update_policy` emits a
+        // `PolicyUpdated` only when the projection value actually
+        // differs, so equality must see this field.
+        let a = sample_projection();
+        let mut b = a.clone();
+        b.enforcement = ScanEnforcement::Record;
         assert_ne!(a, b);
     }
 
