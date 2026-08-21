@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-22
+
 ### Added
 
 - **`ScanPolicy` gained `enforcement: reject | record`** — a per-policy
@@ -38,6 +40,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   un-rejects the scan-rejected population while preserving the
   remaining observation window. An unknown value is an apply-time
   rejection naming the field and both valid values. (#191)
+
+- **`hort_sbom_resolution_total{format, result}`** — how each scan's SBOM
+  components were derived (`resolved` / `no_lockfile` /
+  `unusable_lockfile` / `payload_unavailable` / `not_applicable` /
+  `hosted_only`),
+  alongside the existing `hort_sbom_extraction_total`, which gains a
+  `payload_unavailable` result. `resolved / (resolved + no_lockfile +
+  unusable_lockfile)` is the share of scans that examined dependencies at
+  all — a registry scanning subjects only was previously indistinguishable
+  from one scanning everything. **`hort_sbom_components_skipped_total{format}`**
+  counts dependencies a resolved closure traversed but could not emit for
+  having no registry coordinates (path- and git-sourced entries). (#191)
+
+- **OCI membership-edge backfill.** The `oci-membership-edge-backfill`
+  admin task repairs OCI image-manifest rows ingested before the
+  pull-through path registered their `content_references` config/layer
+  edges, restoring GC keepalive for blobs referenced only by such a row.
+  One-shot, manually invoked, idempotent; reports rows scanned/repaired,
+  edges written, and skips by reason. (#162)
+
+- **Curator-invokable per-artifact re-evaluation.**
+  `POST /api/v1/admin/curation/quarantine/:artifact_id/reevaluate` and
+  `hort-cli curation reevaluate <artifact-id>` let a curator recompute a
+  `Rejected` artifact's verdict from its stored findings under the
+  currently active policy — no policy mutation, no forced outcome. (#152)
+
+- **Maven artifacts can be prefetch-warmed.** The per-format prefetch
+  dispatch implemented leaf pulls for PyPI, Cargo and npm and
+  short-circuited everything else as "no compose-style download URL".
+  For Maven that rationale was inverted — its layout
+  (`{group-path}/{artifact}/{version}/{filename}`) is the most
+  composable download URL in the system — so the only way to start a
+  Maven quarantine clock was a build failing on first contact. Maven
+  GAVs now warm through the same verified two-leg pull as the other
+  leaf formats. (#153)
+
+- **Chart: bootstrap service-account identities are a values-driven
+  list.** The `svc-token-bootstrap` Job was hardwired to one identity
+  (`cronjob-tasks`, `admin_task_invoke`) writing one Secret, so any
+  further bootstrap identity needed a manual in-pod mint plus a
+  hand-created Secret — unreproducible on rebuild, and dependent on a
+  Secret name that RBAC `resourceNames` rules bind to. The Job now
+  iterates `scheduledTasks.svcTokens`, minting every listed permission
+  per identity (effective authority is cap ∩ grants, so a
+  one-permission mint silently strands sibling grants) and writing each
+  to its declared `secretName`. Per-identity idempotence keeps today's
+  semantics, and an empty `secretName` resolves to the existing default
+  — existing installs need no values change. (#155)
 
 ### Changed
 
@@ -101,6 +151,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index (cargo refuses to parse a manifest naming a registry it has no
   index for), and the `publishable_manifests` guard asserts both halves
   plus their agreement with each member's `publish` allow-list. (#179)
+
+- **BREAKING (operators): the server and worker Deployment selectors now
+  carry an `app.kubernetes.io/component` discriminator.** Previously both
+  Deployments' `spec.selector.matchLabels` matched each other's pods, so
+  the `hort-server` Service could route to worker pods and a PodDisruption
+  Budget could count the wrong workload. `spec.selector` is immutable
+  after create, so **`helm upgrade` fails against an existing release**
+  with a `spec.selector is immutable` error. This is a one-time step per
+  install; a fresh install needs no action. The chart README documents
+  three migration paths — delete-then-upgrade, `--cascade=orphan`
+  re-adoption for zero-downtime-sensitive installs, and a suspend/resume
+  sequence for Flux-managed installs. (#159)
+
+- **The quarantine window is now anchored on the earliest defensible
+  evidence of the content's age**, not on whichever code path happened
+  to mint the repository row. The anchor is the minimum over the ingest
+  instant, hort's own earliest observation of that exact content in any
+  of its repositories (derived live, no new schema), a trusted upstream
+  publish time from *this* repository's own mapping, and the
+  referenced-tree-descendant carve-out. Both minting paths share one
+  derivation, so a pull-through coalesce no longer yields different
+  windows depending on which caller won the dedup race, and content hort
+  has already held for a while is no longer re-held for a full window on
+  registration into a second repository. An upstream claim observed
+  through another repository's mapping never shortens this repository's
+  window. Release authority is unchanged — an artifact still needs its
+  own `ScanSucceeded` / `ScanWaived` (ADR 0054, ADR 0007). (#163)
+
+- **The zero-window quarantine carve-out now applies on the registration
+  path as well as on ingest.** A referenced-tree descendant registered by
+  content hash previously got a full quarantine window even though its
+  parent's carve-out already applied to the same content, so the two
+  minting paths disagreed about the same artifact. Both paths now share
+  the carve-out decision. (#161)
 
 ### Fixed
 
@@ -219,92 +303,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identities impossible without over-granting. The new optional
   `--repository <name>` checks each permission against that exact
   scope; omitting it keeps today's global check. (#156)
-
-### Changed
-
-- **BREAKING (operators): the server and worker Deployment selectors now
-  carry an `app.kubernetes.io/component` discriminator.** Previously both
-  Deployments' `spec.selector.matchLabels` matched each other's pods, so
-  the `hort-server` Service could route to worker pods and a PodDisruption
-  Budget could count the wrong workload. `spec.selector` is immutable
-  after create, so **`helm upgrade` fails against an existing release**
-  with a `spec.selector is immutable` error. This is a one-time step per
-  install; a fresh install needs no action. The chart README documents
-  three migration paths — delete-then-upgrade, `--cascade=orphan`
-  re-adoption for zero-downtime-sensitive installs, and a suspend/resume
-  sequence for Flux-managed installs. (#159)
-
-- **The quarantine window is now anchored on the earliest defensible
-  evidence of the content's age**, not on whichever code path happened
-  to mint the repository row. The anchor is the minimum over the ingest
-  instant, hort's own earliest observation of that exact content in any
-  of its repositories (derived live, no new schema), a trusted upstream
-  publish time from *this* repository's own mapping, and the
-  referenced-tree-descendant carve-out. Both minting paths share one
-  derivation, so a pull-through coalesce no longer yields different
-  windows depending on which caller won the dedup race, and content hort
-  has already held for a while is no longer re-held for a full window on
-  registration into a second repository. An upstream claim observed
-  through another repository's mapping never shortens this repository's
-  window. Release authority is unchanged — an artifact still needs its
-  own `ScanSucceeded` / `ScanWaived` (ADR 0054, ADR 0007). (#163)
-
-- **The zero-window quarantine carve-out now applies on the registration
-  path as well as on ingest.** A referenced-tree descendant registered by
-  content hash previously got a full quarantine window even though its
-  parent's carve-out already applied to the same content, so the two
-  minting paths disagreed about the same artifact. Both paths now share
-  the carve-out decision. (#161)
-
-### Added
-
-- **`hort_sbom_resolution_total{format, result}`** — how each scan's SBOM
-  components were derived (`resolved` / `no_lockfile` /
-  `unusable_lockfile` / `payload_unavailable` / `not_applicable` /
-  `hosted_only`),
-  alongside the existing `hort_sbom_extraction_total`, which gains a
-  `payload_unavailable` result. `resolved / (resolved + no_lockfile +
-  unusable_lockfile)` is the share of scans that examined dependencies at
-  all — a registry scanning subjects only was previously indistinguishable
-  from one scanning everything. **`hort_sbom_components_skipped_total{format}`**
-  counts dependencies a resolved closure traversed but could not emit for
-  having no registry coordinates (path- and git-sourced entries). (#191)
-
-- **OCI membership-edge backfill.** The `oci-membership-edge-backfill`
-  admin task repairs OCI image-manifest rows ingested before the
-  pull-through path registered their `content_references` config/layer
-  edges, restoring GC keepalive for blobs referenced only by such a row.
-  One-shot, manually invoked, idempotent; reports rows scanned/repaired,
-  edges written, and skips by reason. (#162)
-
-- **Curator-invokable per-artifact re-evaluation.**
-  `POST /api/v1/admin/curation/quarantine/:artifact_id/reevaluate` and
-  `hort-cli curation reevaluate <artifact-id>` let a curator recompute a
-  `Rejected` artifact's verdict from its stored findings under the
-  currently active policy — no policy mutation, no forced outcome. (#152)
-
-- **Maven artifacts can be prefetch-warmed.** The per-format prefetch
-  dispatch implemented leaf pulls for PyPI, Cargo and npm and
-  short-circuited everything else as "no compose-style download URL".
-  For Maven that rationale was inverted — its layout
-  (`{group-path}/{artifact}/{version}/{filename}`) is the most
-  composable download URL in the system — so the only way to start a
-  Maven quarantine clock was a build failing on first contact. Maven
-  GAVs now warm through the same verified two-leg pull as the other
-  leaf formats. (#153)
-
-- **Chart: bootstrap service-account identities are a values-driven
-  list.** The `svc-token-bootstrap` Job was hardwired to one identity
-  (`cronjob-tasks`, `admin_task_invoke`) writing one Secret, so any
-  further bootstrap identity needed a manual in-pod mint plus a
-  hand-created Secret — unreproducible on rebuild, and dependent on a
-  Secret name that RBAC `resourceNames` rules bind to. The Job now
-  iterates `scheduledTasks.svcTokens`, minting every listed permission
-  per identity (effective authority is cap ∩ grants, so a
-  one-permission mint silently strands sibling grants) and writing each
-  to its declared `secretName`. Per-identity idempotence keeps today's
-  semantics, and an empty `secretName` resolves to the existing default
-  — existing installs need no values change. (#155)
 
 ## [0.10.0] - 2026-08-09
 
