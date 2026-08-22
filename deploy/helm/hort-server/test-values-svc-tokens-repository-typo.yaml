@@ -1,0 +1,40 @@
+# Strict-schema regression fixture: a mistyped scheduledTasks.svcTokens[]
+# key (`repositroy` instead of `repository`). Mirrors
+# test-values-strict-schema-typo.yaml's shape but isolated to this one
+# nested array-item key, so it fails independently of the other typo
+# classes that fixture covers. `additionalProperties: false` on the
+# svcTokens item schema must reject this at `helm template`, not
+# silently drop the key and mint a global-scope token the operator
+# believed was repository-scoped.
+#
+# This file is strictly for local helm lint/template smoke tests — it
+# is not a production values file.
+
+scheduledTasks:
+  adminTasksEnabled: true
+  svcTokens:
+    - name: uat-smoke
+      permissions:
+        - read
+      repositroy: maven-proxy
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

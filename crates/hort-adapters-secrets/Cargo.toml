@@ -4,12 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort secret-resolution adapters (env-var, mounted-file, dispatch)"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 
 tokio    = { workspace = true, features = ["fs", "rt"] }
 tracing  = { workspace = true }

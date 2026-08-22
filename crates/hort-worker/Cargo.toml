@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort v2 worker binary — multi-kind job dispatcher (scan, cron-rescan-tick, advisory-watch-tick, staging-sweep, noop)"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
@@ -14,28 +16,28 @@ path = "src/main.rs"
 
 [dependencies]
 # Domain + application layers — same shared core as hort-server.
-hort-domain                    = { path = "../hort-domain" }
-hort-app                       = { path = "../hort-app" }
+hort-domain                    = { workspace = true }
+hort-app                       = { workspace = true }
 # hort's license text + generated third-party attribution, embedded at
 # compile time. Backs the `license` / `attribution` subcommands
 # (`src/license.rs`, `src/attribution.rs`).
-hort-attribution               = { path = "../hort-attribution" }
+hort-attribution               = { workspace = true }
 
 # Adapter layer — explicitly diverges from hort-server: this binary
 # pulls in the scanner + advisory adapters, hort-server does not. The
 # per-format HTTP crates (`hort-http-*`) are ABSENT here — the worker
 # is not an HTTP edge.
-hort-adapters-postgres         = { path = "../hort-adapters-postgres" }
-hort-adapters-storage          = { path = "../hort-adapters-storage" }
+hort-adapters-postgres         = { workspace = true }
+hort-adapters-storage          = { workspace = true }
 # Checkpoint read+write adapter (Object-Lock anchored,
 # Ed25519-signed). The worker registers the
 # EventstoreCheckpointHandler which composes both halves.
-hort-adapters-checkpoint-anchor = { path = "../hort-adapters-checkpoint-anchor" }
-hort-adapters-ephemeral-memory = { path = "../hort-adapters-ephemeral-memory" }
-hort-adapters-ephemeral-redis  = { path = "../hort-adapters-ephemeral-redis" }
-hort-adapters-scanner-trivy    = { path = "../hort-adapters-scanner-trivy" }
-hort-adapters-scanner-osv      = { path = "../hort-adapters-scanner-osv" }
-hort-adapters-advisory-osv     = { path = "../hort-adapters-advisory-osv" }
+hort-adapters-checkpoint-anchor = { workspace = true }
+hort-adapters-ephemeral-memory = { workspace = true }
+hort-adapters-ephemeral-redis  = { workspace = true }
+hort-adapters-scanner-trivy    = { workspace = true }
+hort-adapters-scanner-osv      = { workspace = true }
+hort-adapters-advisory-osv     = { workspace = true }
 # The cosign/Sigstore ProvenancePort adapter is wired into hort-worker
 # ONLY (NOT hort-server). hort-server activates the `{"oci"}`
 # capable-format set as plain data and never depends on this crate
@@ -45,29 +47,29 @@ hort-adapters-advisory-osv     = { path = "../hort-adapters-advisory-osv" }
 # reqwest 0.13 is the single version everywhere now — just a plain
 # crate-graph isolation (the sigstore/cosign verification stack has no
 # reason to link into the server binary).
-hort-adapters-provenance-sigstore = { path = "../hort-adapters-provenance-sigstore" }
+hort-adapters-provenance-sigstore = { workspace = true }
 # Keyed (pinned-public-key) cosign verifier — the `cosign-key` ProvenancePort
 # (ADR 0039). Minimal p256 surface, not the sigstore PKI crate.
-hort-adapters-provenance-cosign-key = { path = "../hort-adapters-provenance-cosign-key" }
+hort-adapters-provenance-cosign-key = { workspace = true }
 # `KubernetesSecretWriterImpl` for the ServiceAccountRotationHandler.
 # Optional at runtime — the worker logs and skips registration when
 # `kube::Client::try_default()` fails (no kubeconfig, not in-cluster),
 # so non-k8s deployments keep working.
-hort-adapters-kubernetes       = { path = "../hort-adapters-kubernetes" }
+hort-adapters-kubernetes       = { workspace = true }
 # The scan orchestrator instantiates handlers via this crate's concrete
 # `*FormatHandler` types, mirroring the `cli::reconcile_groups` pattern
 # in hort-server.
-hort-formats                   = { path = "../hort-formats" }
+hort-formats                   = { workspace = true }
 # The PrefetchTickHandler walks upstream catalogs via HttpUpstreamProxy.
 # The proxy resolves authenticated upstreams via SecretPort; the prefetch
 # tick targets the Anonymous catch-all mapping (npm/cargo/pypi public
 # registries), but the adapter still requires a SecretPort instance so
 # the dispatch (DispatchSecretPort) is wired with the same env+file shape
 # hort-server uses.
-hort-adapters-secrets          = { path = "../hort-adapters-secrets" }
-hort-adapters-upstream-http    = { path = "../hort-adapters-upstream-http" }
+hort-adapters-secrets          = { workspace = true }
+hort-adapters-upstream-http    = { workspace = true }
 # Extra-CA bundle parsing (mirrors the hort-server boot path, ADR 0010).
-hort-config                    = { path = "../hort-config" }
+hort-config                    = { workspace = true }
 
 anyhow                       = { workspace = true }
 # Minimal internal-only `GET /metrics` listener. The worker is not an

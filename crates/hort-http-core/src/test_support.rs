@@ -846,7 +846,7 @@ pub struct MockPorts {
 pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectionRepository) {
     use chrono::Utc;
     use hort_domain::entities::scan_policy::{
-        NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+        NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::PolicyScope;
     let now = Utc::now();
@@ -866,6 +866,7 @@ pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectio
         scan_backends: vec!["trivy".to_string()],
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
+        enforcement: ScanEnforcement::Reject,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -1231,6 +1232,8 @@ pub fn build_mock_ctx_with_label_flag(
         // curation emission sites can resolve repository keys for the
         // `hort_curation_decisions_total{repository}` label.
         repository_access_use_case.clone(),
+        curation_rules.clone(),
+        storage.clone(),
     ));
 
     // `PolicyUseCase` wired with the same ports
@@ -1291,6 +1294,11 @@ pub fn build_mock_ctx_with_label_flag(
         discovery_rbac.clone(),
         policy_projections.clone(),
     ));
+    let virtual_resolution_use_case = Arc::new(VirtualResolutionUseCase::new(
+        repositories.clone(),
+        repository_access_use_case.clone(),
+    ));
+
     let self_service_prefetch_use_case = Arc::new(SelfServicePrefetchUseCase::new(
         repositories.clone(),
         artifacts.clone(),
@@ -1298,11 +1306,7 @@ pub fn build_mock_ctx_with_label_flag(
         upstream_metadata.clone(),
         jobs.clone(),
         discovery_rbac.clone(),
-    ));
-
-    let virtual_resolution_use_case = Arc::new(VirtualResolutionUseCase::new(
-        repositories.clone(),
-        repository_access_use_case.clone(),
+        virtual_resolution_use_case.clone(),
     ));
 
     let mut ctx_inner = AppContext {

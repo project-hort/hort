@@ -16,6 +16,10 @@
 //!   --justification <text>` →
 //!   POST `/api/v1/admin/curation/block-versions`
 //!   (bulk-by-version-list curator block; continue-on-error).
+//! - `reevaluate <artifact_id>` →
+//!   POST `/api/v1/admin/curation/quarantine/:artifact_id/reevaluate`
+//!   (recompute a `Rejected` artifact's verdict from stored findings
+//!   under the active policy; no request body).
 //! - `exclude-finding --policy <id> --cve <id> --justification <text>` →
 //!   POST `/api/v1/admin/policies/:policy_id/exclusions`
 //!   (policy-scoped CVE exclusion).
@@ -57,6 +61,7 @@ pub mod decisions;
 pub mod exclude_finding;
 pub mod exclusions;
 pub mod queue;
+pub mod reevaluate;
 pub mod unexclude_finding;
 pub mod waive;
 
@@ -95,6 +100,15 @@ pub enum CurationCommand {
     /// continue-on-error). See module-level docs for the
     /// rationale on the sub-subcommand split vs the original design.
     Block(block::BlockArgs),
+
+    /// Recompute a `Rejected` artifact's verdict from its stored
+    /// findings under the currently active policy.
+    ///
+    /// No policy mutation, no forced outcome — the recompute delegates
+    /// to the same domain derivation the policy-mutation pass uses.
+    /// Idempotent: re-invoking on an unchanged `still_rejected` verdict
+    /// returns the same envelope again, no repeated events.
+    Reevaluate(reevaluate::ReevaluateArgs),
 
     /// Exclude a CVE finding for a scan policy.
     ///
@@ -173,6 +187,9 @@ pub async fn run(
         }
         CurationCommand::Block(block_args) => {
             block::run(client, block_args, output).await?;
+        }
+        CurationCommand::Reevaluate(reevaluate_args) => {
+            reevaluate::run(client, reevaluate_args, output).await?;
         }
         CurationCommand::ExcludeFinding(exclude_args) => {
             exclude_finding::run(client, exclude_args, output).await?;

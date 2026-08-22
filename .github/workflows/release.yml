@@ -376,46 +376,60 @@ jobs:
 
           echo "Vetted-index preflight OK — ${locked_count} locked deps all served by ${CARGO_SOURCE_REPO}."
 
-      # Publish in dependency order. hort-domain has no intra-workspace deps so
-      # it goes first; each subsequent crate may depend on earlier entries.
+      # The set and the order both come from the manifests, via
+      # scripts/ci/publishable-crates-in-order.sh — a member is published
+      # unless it sets `publish = false`, and the order is a topological sort
+      # of the intra-workspace edges between the published crates. The
+      # previous hand-maintained list drifted from the graph it claimed to
+      # describe (it published hort-app before hort-config, which hort-app
+      # depends on) and nothing caught it, because nothing else read it.
+      #
+      # The published set includes the in-memory EphemeralStore adapter. It is
+      # not a test fixture: it is the default backend — both binaries take it
+      # as an ordinary (not dev-) dependency and select it whenever
+      # HORT_EPHEMERAL_STORE_BACKEND is unset or `memory` — and hort-http-core
+      # keeps it as an optional dependency that the published manifest
+      # retains. Publishing hort-http-core without it fails at resolve time,
+      # so the two ship together. The script rejects that class of hole
+      # up front rather than discovering it mid-release, when earlier crates
+      # are already uploaded and can only be yanked.
+      #
       # --no-verify: required for a path-dep workspace (path deps are not yet
       # available on the registry when the pre-publish build check runs; the CI
       # build already verified correctness). --registry hort-crates: targets the
       # hosted first-party registry, not the default crates.io.
       #
-      # The sleep between publishes gives the sparse-index time to propagate the
-      # newly-published crate before the next publish resolves its dependency.
-      # 10 s is conservative; the hort index-serve path is synchronous so the
-      # entry is typically available within 1–2 s of the upload completing.
-      - name: Publish hort crates to hort-crates (dependency order)
+      # The sleep between publishes covers sparse-index propagation only — the
+      # hort index-serve path is synchronous, so an uploaded crate is typically
+      # in the index within 1–2 s. It does NOT cover a hosted repo's quarantine
+      # window: where a ScanPolicy sets a non-zero observation period, the
+      # index it serves omits a crate that has not cleared it. Every publish
+      # after the first resolves its just-uploaded siblings (cargo does that
+      # even under --no-verify), so that window, not this sleep, is what
+      # decides whether the chain can resolve them.
+      #
+      # Resumability. A publish that fails partway leaves the crates it did
+      # upload in the index, immutable and unwithdrawable; cargo then refuses
+      # to republish any of them, so a re-run of the same tag used to die at
+      # the first one and the remaining crates could never ship at that
+      # version. scripts/ci/publish-crates.sh checks each crate against the
+      # index BEFORE its attempt and skips the ones already there — never on
+      # cargo's exit status afterwards, which cannot distinguish "refused to
+      # republish" from "the upload failed". Its module comment carries the
+      # full argument.
+      #
+      # The loop lives in that script rather than here so the constraint can
+      # be tested: scripts/test-crate-version-in-index.sh drives it against a
+      # fixture index with a stub cargo, and asserts both that already-present
+      # crates are skipped and that a failing publish still aborts the run.
+      - name: Publish hort crates to hort-crates (derived dependency order)
         env:
           SQLX_OFFLINE: "true"
-        run: |
-          set -euo pipefail
-
-          publish_crate() {
-            local crate_path="$1"
-            echo "Publishing ${crate_path} ..."
-            cargo publish \
-              --no-verify \
-              --registry hort-crates \
-              --manifest-path "${crate_path}/Cargo.toml"
-            # Allow the sparse index to propagate the new entry before the next
-            # dependent crate's publish resolves it.
-            sleep 10
-          }
-
-          # Topological order: leaf deps first, binaries last.
-          # hort-domain: no intra-workspace deps
-          publish_crate crates/hort-domain
-          # hort-app: depends on hort-domain
-          publish_crate crates/hort-app
-          # hort-config: depends on hort-domain + hort-app
-          publish_crate crates/hort-config
-          # hort-http-core: depends on hort-domain + hort-app
-          publish_crate crates/hort-http-core
-          # hort-formats: depends on hort-domain + hort-app
-          publish_crate crates/hort-formats
+          # The publishing identity's own token: hort serves a write-granted
+          # principal a wider index view than an anonymous reader (ADR 0055),
+          # and the skip check has to see what cargo will see.
+          HORT_TOKEN: ${{ steps.hortauth.outputs.token }}
+        run: scripts/ci/publish-crates.sh https://registry.hort.rs hort-crates
 
   # ════════════════════════════════════════════════════════════════════════════
   # CREATE RELEASE

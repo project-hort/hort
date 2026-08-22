@@ -899,6 +899,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: hort_domain::entities::scan_policy::NegligibleAction::Ignore,
+            enforcement: hort_domain::entities::scan_policy::ScanEnforcement::Reject,
             stream_version: 1,
             created_at: now,
             updated_at: now,
@@ -1878,6 +1879,16 @@ mod tests {
             })
         }
         fn find_pypi_wheels_without_kind(
+            &self,
+            _k: &str,
+            _l: u32,
+        ) -> hort_domain::ports::BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<Vec<hort_domain::entities::artifact::Artifact>>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn find_oci_image_manifests_without_kind(
             &self,
             _k: &str,
             _l: u32,

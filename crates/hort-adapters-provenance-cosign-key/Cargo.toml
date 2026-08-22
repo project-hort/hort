@@ -4,12 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort outbound adapter — keyed (pinned-public-key) cosign provenance verifier (ProvenancePort impl), ADR 0039"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 # Adapter-layer observability (which fail-closed branch a keyed rejection took;

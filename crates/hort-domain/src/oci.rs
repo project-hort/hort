@@ -293,6 +293,42 @@ struct OciBlobDescriptor {
 /// non-object JSON is [`DomainError::Validation`] — the same error shape
 /// [`sigstore_bundle_layers`] produces.
 pub fn manifest_blob_digests(manifest_json: &[u8]) -> DomainResult<Vec<ContentHash>> {
+    Ok(manifest_blob_refs(manifest_json)?
+        .into_iter()
+        .map(|r| r.hash)
+        .collect())
+}
+
+/// Which single-image-manifest descriptor a [`ManifestBlobRef`] came from —
+/// the `content_references.kind` discriminator the OCI membership-edge
+/// writers (the manifest-PUT path and the pull-through register-only path)
+/// key their row on: `"oci_config"` for [`Config`](Self::Config),
+/// `"oci_layer"` for [`Layer`](Self::Layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestBlobRole {
+    Config,
+    Layer,
+}
+
+/// One config/layer descriptor resolved from a single-image manifest —
+/// the CAS hash plus which descriptor it came from. [`manifest_blob_digests`]
+/// collapses this to a flat hash list for the provenance cascade, which
+/// treats config and layers uniformly; a consumer that must write a
+/// per-role `content_references` edge (config vs. layer) needs the role
+/// alongside the hash, which position-in-list alone cannot reliably encode
+/// once a malformed descriptor is skipped ahead of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestBlobRef {
+    pub hash: ContentHash,
+    pub role: ManifestBlobRole,
+}
+
+/// Returns every blob a **single-image manifest** references, tagged with
+/// which descriptor it came from — the role-preserving counterpart of
+/// [`manifest_blob_digests`], which this function now implements. Same
+/// parse, same cap, same skip/error posture (see that function's doc);
+/// order is config first, then layers in manifest order.
+pub fn manifest_blob_refs(manifest_json: &[u8]) -> DomainResult<Vec<ManifestBlobRef>> {
     let manifest: OciManifestBlobRefs = serde_json::from_slice(manifest_json)
         .map_err(|e| DomainError::Validation(format!("not a valid OCI manifest: {e}")))?;
 
@@ -303,12 +339,26 @@ pub fn manifest_blob_digests(manifest_json: &[u8]) -> DomainResult<Vec<ContentHa
         )));
     }
 
-    Ok(manifest
-        .config
-        .iter()
-        .chain(manifest.layers.iter())
-        .filter_map(|d| d.digest.as_deref().and_then(parse_sha256_digest))
-        .collect())
+    let config_ref = manifest.config.iter().filter_map(|d| {
+        d.digest
+            .as_deref()
+            .and_then(parse_sha256_digest)
+            .map(|hash| ManifestBlobRef {
+                hash,
+                role: ManifestBlobRole::Config,
+            })
+    });
+    let layer_refs = manifest.layers.iter().filter_map(|d| {
+        d.digest
+            .as_deref()
+            .and_then(parse_sha256_digest)
+            .map(|hash| ManifestBlobRef {
+                hash,
+                role: ManifestBlobRole::Layer,
+            })
+    });
+
+    Ok(config_ref.chain(layer_refs).collect())
 }
 
 /// Minimal OCI image-index projection — only the `manifests[]` child
@@ -1073,6 +1123,62 @@ mod tests {
     #[test]
     fn manifest_blob_digests_non_object_json_is_validation_error() {
         let err = manifest_blob_digests(b"[1, 2, 3]").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ----------------------------------------------------------------
+    // manifest_blob_refs (role-tagged sibling of manifest_blob_digests)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn manifest_blob_refs_tags_config_and_layers() {
+        let (hc, ha, hb) = (hex64('c'), hex64('a'), hex64('b'));
+        let m = manifest(&serde_json::json!({
+            "config": { "digest": format!("sha256:{hc}") },
+            "layers": [
+                { "digest": format!("sha256:{ha}") },
+                { "digest": format!("sha256:{hb}") }
+            ]
+        }));
+        let got = manifest_blob_refs(&m).expect("valid manifest");
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].role, ManifestBlobRole::Config);
+        assert_eq!(got[0].hash.as_ref(), hc.as_str());
+        assert_eq!(got[1].role, ManifestBlobRole::Layer);
+        assert_eq!(got[1].hash.as_ref(), ha.as_str());
+        assert_eq!(got[2].role, ManifestBlobRole::Layer);
+        assert_eq!(got[2].hash.as_ref(), hb.as_str());
+    }
+
+    #[test]
+    fn manifest_blob_refs_skips_malformed_descriptor_without_shifting_roles() {
+        // The config digest is malformed (skipped); both layers are
+        // well-formed. The surviving entries must still be tagged Layer,
+        // not have the first surviving hash misread as Config by
+        // position — this is the case `manifest_blob_digests`'s flat
+        // hash list cannot express.
+        let (ha, hb) = (hex64('a'), hex64('b'));
+        let m = manifest(&serde_json::json!({
+            "config": { "digest": "sha256:not-valid-hex" },
+            "layers": [
+                { "digest": format!("sha256:{ha}") },
+                { "digest": format!("sha256:{hb}") }
+            ]
+        }));
+        let got = manifest_blob_refs(&m).expect("valid manifest");
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|r| r.role == ManifestBlobRole::Layer));
+        assert_eq!(got[0].hash.as_ref(), ha.as_str());
+        assert_eq!(got[1].hash.as_ref(), hb.as_str());
+    }
+
+    #[test]
+    fn manifest_blob_refs_over_cap_is_rejected() {
+        let over_layers: Vec<serde_json::Value> = (0..=MAX_MANIFEST_BLOBS)
+            .map(|i| serde_json::json!({ "digest": format!("sha256:{i:064x}") }))
+            .collect();
+        let over = manifest(&serde_json::json!({ "layers": over_layers }));
+        let err = manifest_blob_refs(&over).unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
 

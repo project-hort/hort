@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort domain layer — pure Rust, zero I/O"
+# Published to the hort-crates registry. The allow-list is affirmative on
+# purpose: an absent `publish` key means "any registry", which would let a
+# new member join the published set silently and would let a stray
+# `cargo publish` push this crate to crates.io.
+publish = ["hort-crates"]
 
 [lints]
 workspace = true

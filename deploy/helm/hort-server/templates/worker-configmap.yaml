@@ -48,6 +48,7 @@ data:
   HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE: {{ .Values.worker.provenance.cosign.publicKeysFile | quote }}
   {{- end }}
   HORT_ADVISORY_OSV_API_URL: {{ .Values.worker.advisory.osvUrl | quote }}
+  HORT_ADVISORY_OSV_VULNS_URL: {{ .Values.worker.advisory.osvVulnsUrl | quote }}
   HORT_SCANNER_POLL_INTERVAL_SECS: {{ .Values.worker.scanner.pollIntervalSecs | quote }}
   HORT_SCANNER_BATCH_SIZE: {{ .Values.worker.scanner.batchSize | quote }}
   HORT_SCANNER_MAX_ATTEMPTS: {{ .Values.worker.scanner.maxAttempts | quote }}

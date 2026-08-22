@@ -155,7 +155,7 @@ pub fn evaluate_promotion(
     // across to the repository repository to resolve the real format
     // here. The exclusion filter only consults `coords.name` (see
     // `exclusion::filter_excluded_findings`), so the sentinel is
-    // safe. The same approach is used by `re_evaluate_after_exclusion`.
+    // safe. The same approach is used by `decide_rejected_transition`.
     let coords = ArtifactCoords {
         name: artifact.name.clone(),
         name_as_published: artifact.name_as_published.clone(),
@@ -216,7 +216,9 @@ mod tests {
     use crate::entities::repository::{
         IndexMode, PrefetchPolicy, ReplicationPriority, RepositoryFormat, RepositoryType,
     };
-    use crate::entities::scan_policy::{NegligibleAction, ProvenanceMode, SeverityThreshold};
+    use crate::entities::scan_policy::{
+        NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+    };
     use crate::events::PolicyScope;
     use crate::types::ContentHash;
     use chrono::TimeZone;
@@ -299,6 +301,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),

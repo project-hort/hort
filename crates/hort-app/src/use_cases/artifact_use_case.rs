@@ -43,6 +43,14 @@ struct DownloadAuditGate {
     events: Arc<EventStorePublisher>,
 }
 
+/// Read granularity for [`ArtifactUseCase::read_content_for_projection`].
+/// 64 KiB is the same chunk the worker-side bounded CAS re-read uses —
+/// large enough that the syscall count stays negligible for the
+/// kilobyte-scale documents this path reads, small enough that the
+/// over-ceiling check trips before the buffer grows far past the
+/// caller's limit.
+const PROJECTION_READ_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Application use case for artifact read, download, and delete operations.
 pub struct ArtifactUseCase {
     artifacts: Arc<dyn ArtifactRepository>,
@@ -784,6 +792,74 @@ impl ArtifactUseCase {
             "held manifest served under write-authorized hold-read",
         );
         Ok((artifact, stream))
+    }
+
+    /// Read an artifact's CAS bytes into memory to rebuild a **derived
+    /// projection** from them.
+    ///
+    /// This is NOT a serve path and must never become one. It is
+    /// deliberately status-agnostic — a `Quarantined` artifact's own
+    /// membership projection has to be derivable while the hold is in
+    /// force, and the hold is about who may receive the *bytes*, not
+    /// about whether hort may compute its own index over them. The
+    /// bytes returned here are consumed by a parser inside the process
+    /// and never streamed to a caller; the two paths that DO put bytes
+    /// on the wire stay [`Self::download`] (refuses a non-downloadable
+    /// artifact, emits the opt-in `ArtifactDownloaded` audit event) and
+    /// [`Self::download_hold_read`] (the narrow ADR 0039 §10
+    /// write-authorized hold-read exemption). Neither is a substitute
+    /// here: `download` refuses every held artifact, and
+    /// `download_hold_read` refuses every artifact that is *not* held —
+    /// so a projection rebuild that must work in both states can use
+    /// neither, and reusing the latter would also emit its
+    /// hold-read-served audit line for a read that served nobody.
+    ///
+    /// The caller today is the OCI pull-through's post-coalesce
+    /// membership-edge registration: a coalesced follower that registers
+    /// its own per-repo manifest row from an already-CAS-resident hash
+    /// never held the manifest bytes, yet that row's
+    /// `content_references` edges must exist exactly as the ingesting
+    /// leg's do — so it re-derives them from the authoritative CAS
+    /// content.
+    ///
+    /// `max_bytes` is a hard ceiling the caller sets from its own
+    /// format's shape: exceeding it is a `Validation` error, never an
+    /// unbounded allocation, so a corrupted multi-GB blob mis-typed as
+    /// a small document cannot exhaust process memory. Mirrors the
+    /// bounded CAS re-read the `prefetch-dependencies` task handler
+    /// performs for the same reason.
+    #[tracing::instrument(skip(self))]
+    pub async fn read_content_for_projection(
+        &self,
+        artifact_id: Uuid,
+        max_bytes: usize,
+    ) -> AppResult<Vec<u8>> {
+        let artifact = self.artifacts.find_by_id(artifact_id).await?;
+        let mut stream = self
+            .storage
+            .get(&artifact.sha256_checksum)
+            .await
+            .map_err(|e| AppError::Storage(e.to_string()))?;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; PROJECTION_READ_CHUNK_BYTES];
+        loop {
+            let n = stream.read(&mut chunk).await.map_err(|e| {
+                AppError::Storage(format!(
+                    "projection re-read of artifact {artifact_id} failed mid-stream: {e}"
+                ))
+            })?;
+            if n == 0 {
+                break;
+            }
+            if buf.len() + n > max_bytes {
+                return Err(AppError::Domain(DomainError::Validation(format!(
+                    "artifact {artifact_id} content exceeds the {max_bytes}-byte projection \
+                     re-read ceiling; refusing to buffer it"
+                ))));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        Ok(buf)
     }
 
     /// Visible variant of [`Self::list_by_raw_name_limited`]. Resolves
@@ -1745,6 +1821,13 @@ mod tests {
         ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn find_oci_image_manifests_without_kind(
+            &self,
+            _kind: &str,
+            _limit: u32,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     /// `download`'s `find_by_id` error classification has two arms:
@@ -2289,6 +2372,159 @@ mod tests {
             "expected AppError::Storage for missing blob, got: {err:?}"
         );
     }
+
+    // -- read_content_for_projection -----------------------------------------
+
+    /// Wire a use case whose CAS holds `content` under the artifact's
+    /// checksum, returning `(use case, artifact id, content hash)`.
+    fn projection_harness(
+        status: QuarantineStatus,
+        content: Vec<u8>,
+    ) -> (ArtifactUseCase, Uuid, ContentHash) {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repositories = Arc::new(MockRepositoryRepository::new());
+
+        let repo = sample_repository();
+        let repo_id = repo.id;
+        repositories.insert(repo);
+
+        let mut artifact = sample_artifact_in_repo(repo_id);
+        artifact.quarantine_status = status;
+        if matches!(status, QuarantineStatus::Quarantined) {
+            artifact.quarantine_window_start = Some(Utc::now());
+        }
+        let artifact_id = artifact.id;
+        let hash = artifact.sha256_checksum.clone();
+        storage.insert_content(hash.clone(), content);
+        artifacts.insert(artifact);
+
+        (
+            ArtifactUseCase::new(artifacts, storage, repositories, true),
+            artifact_id,
+            hash,
+        )
+    }
+
+    /// The whole point of the method: a HELD artifact's bytes are
+    /// readable for an internal projection rebuild. `download` refuses
+    /// this artifact outright and `download_hold_read` would emit its
+    /// hold-read-served audit line, so neither can stand in here.
+    #[tokio::test]
+    async fn read_content_for_projection_reads_a_quarantined_artifact() {
+        let (uc, id, _) = projection_harness(QuarantineStatus::Quarantined, b"held bytes".to_vec());
+        let bytes = uc.read_content_for_projection(id, 1024).await.unwrap();
+        assert_eq!(bytes, b"held bytes");
+    }
+
+    /// …and a released one too — the method is status-agnostic by
+    /// design, because the caller must work in both states.
+    #[tokio::test]
+    async fn read_content_for_projection_reads_a_released_artifact() {
+        let (uc, id, _) = projection_harness(QuarantineStatus::Released, b"free bytes".to_vec());
+        let bytes = uc.read_content_for_projection(id, 1024).await.unwrap();
+        assert_eq!(bytes, b"free bytes");
+    }
+
+    /// Multi-chunk read: content larger than one 64 KiB read granule is
+    /// accumulated whole, not just its first chunk.
+    #[tokio::test]
+    async fn read_content_for_projection_accumulates_across_chunks() {
+        let content = vec![b'x'; PROJECTION_READ_CHUNK_BYTES * 2 + 7];
+        let (uc, id, _) = projection_harness(QuarantineStatus::None, content.clone());
+        let bytes = uc
+            .read_content_for_projection(id, content.len())
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), content.len());
+        assert_eq!(bytes, content);
+    }
+
+    /// The ceiling is a refusal, never a truncation: a caller that got
+    /// `Ok` must be able to trust it holds the WHOLE document, or a
+    /// parser downstream would silently derive a projection from a
+    /// prefix.
+    #[tokio::test]
+    async fn read_content_for_projection_refuses_content_over_the_ceiling() {
+        let (uc, id, _) = projection_harness(QuarantineStatus::None, vec![b'y'; 4096]);
+        let err = uc
+            .read_content_for_projection(id, 1024)
+            .await
+            .expect_err("over-ceiling content must be refused");
+        assert!(
+            err.to_string().contains("1024-byte projection re-read"),
+            "error must name the ceiling it tripped; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_content_for_projection_propagates_a_missing_artifact() {
+        let (uc, _, _) = projection_harness(QuarantineStatus::None, b"unused".to_vec());
+        let err = uc
+            .read_content_for_projection(Uuid::new_v4(), 1024)
+            .await
+            .expect_err("an unknown artifact id must not resolve");
+        assert!(
+            matches!(err, AppError::Domain(DomainError::NotFound { .. })),
+            "expected NotFound, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_content_for_projection_propagates_a_cas_open_failure() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repositories = Arc::new(MockRepositoryRepository::new());
+        let repo = sample_repository();
+        let repo_id = repo.id;
+        repositories.insert(repo);
+        let artifact = sample_artifact_in_repo(repo_id);
+        let artifact_id = artifact.id;
+        let hash = artifact.sha256_checksum.clone();
+        artifacts.insert(artifact);
+        storage.fail_get_persistent(hash);
+
+        let uc = ArtifactUseCase::new(artifacts, storage, repositories, true);
+        let err = uc
+            .read_content_for_projection(artifact_id, 1024)
+            .await
+            .expect_err("a CAS open failure must surface");
+        assert!(
+            matches!(err, AppError::Storage(_)),
+            "expected a Storage error, got: {err}"
+        );
+    }
+
+    /// A stream that errors partway must NOT yield the bytes read so
+    /// far — same reasoning as the ceiling: a partial document parses
+    /// into a wrong projection rather than no projection.
+    #[tokio::test]
+    async fn read_content_for_projection_propagates_a_mid_stream_failure() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repositories = Arc::new(MockRepositoryRepository::new());
+        let repo = sample_repository();
+        let repo_id = repo.id;
+        repositories.insert(repo);
+        let artifact = sample_artifact_in_repo(repo_id);
+        let id = artifact.id;
+        let hash = artifact.sha256_checksum.clone();
+        artifacts.insert(artifact);
+        storage.insert_content(hash.clone(), b"whole document".to_vec());
+        // The mock's truncating reader emits the prefix and then errors
+        // — the shape a tampered CAS blob produces.
+        storage.fail_next_get_truncated(hash, b"whole".to_vec());
+
+        let uc = ArtifactUseCase::new(artifacts, storage, repositories, true);
+        let err = uc
+            .read_content_for_projection(id, 1024)
+            .await
+            .expect_err("a mid-stream read failure must surface");
+        assert!(
+            err.to_string().contains("failed mid-stream"),
+            "error must identify the mid-stream failure; got: {err}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -2449,7 +2685,8 @@ mod visibility_extension_tests {
         duration_secs: i64,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
 
@@ -2469,6 +2706,7 @@ mod visibility_extension_tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -2931,6 +3169,14 @@ mod visibility_extension_tests {
                 Box::pin(async { Ok(Vec::new()) })
             }
             fn find_pypi_wheels_without_kind(
+                &self,
+                _kind: &str,
+                _limit: u32,
+            ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<Vec<Artifact>>>
+            {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn find_oci_image_manifests_without_kind(
                 &self,
                 _kind: &str,
                 _limit: u32,

@@ -576,6 +576,7 @@ spec:
   requireApproval: true
   provenanceMode: verify_if_present   # optional; off | verify_if_present | required
   negligibleAction: ignore      # optional; ignore | warn | block — informational (unmaintained/unsound) advisory handling; default ignore
+  enforcement: reject           # optional; reject | record — what a blocking verdict DOES; default reject
   maxArtifactAge: 90d           # optional humantime
   licensePolicy:                # optional JSON; defaults to no license policy when omitted
     allowed: [Apache-2.0, MIT]
@@ -600,6 +601,56 @@ spec:
 
 **Idempotency:** reapply with no YAML change emits zero events and
 no projection writes. The `unchanged` counter ticks instead.
+
+#### `enforcement: reject | record` — what a blocking verdict *does*
+
+`severityThreshold`, `licensePolicy` and `negligibleAction` decide
+**which** findings are enforcement-worthy. `enforcement` decides what
+the resulting verdict is allowed to **do**:
+
+| Value | The scan | The findings | The verdict | The artifact |
+|---|---|---|---|---|
+| `reject` (default) | runs | persisted | `PolicyEvaluated(Fail)` | transitions to `Rejected`; downloads blocked |
+| `record` | runs | persisted | `PolicyEvaluated(Fail)` | **untouched** — publication proceeds |
+
+Omitting the field parses to `reject`, which is the behaviour of every
+policy written before the field existed — an existing tree needs no
+edit. An unknown value is an apply-time rejection naming the field and
+both valid values (a typo must never silently fall back to either
+mode).
+
+`record` is for the "publish proceeds with findings; blocking at
+retrieval is the consuming policy's job" posture. It is **not** a way
+to stop scanning — use `scanBackends: []` for that — and it is **not**
+a way to hide findings: the per-finding rows, the findings blob and
+the `PolicyEvaluated(Fail)` audit event are written exactly as under
+`reject`, so every API and metrics surface reports the violations
+identically. What changes is the absence of the `ArtifactRejected`
+transition.
+
+Because a `record`-mode artifact's own `ScanCompleted` carries
+findings, it cannot release through the `ScanSucceeded` authority; it
+releases through the distinct `ScanRecorded` authority instead, which
+is visible on the release log line (`authority=scan_recorded`). Every
+other release conjunct is unchanged: `record` un-gates the **scan**
+axis only, so `provenanceMode: required` still holds an unverified
+artifact, an active curation rule still blocks, and the observation
+window still applies.
+
+**Changing the field re-judges the existing population**
+(ADR 0041), in both directions and asynchronously:
+
+- `record` → `reject` re-derives every in-scope artifact's verdict from
+  its **stored** findings and re-holds the now-non-compliant ones
+  (including already-`Released` ones — future downloads are blocked;
+  already-served bytes cannot be recalled);
+- `reject` → `record` un-rejects the scan-rejected population through
+  release authority #5 (policy re-evaluation). The remaining
+  observation window is preserved — loosening removes the scan block,
+  not the time hold.
+
+No scanner is re-run in either direction; both re-read the stored
+evidence.
 
 **Hosted-repo recommendation — `quarantineDuration: 0s` is the
 documented opt-out for "publish + immediately install" flows.**
@@ -741,6 +792,72 @@ The knob exists for registry-of-registries layouts (it obsoletes
 URL-rewriting sidecars): when one registry mounts another's content
 under a path prefix, the prefix belongs in declarative config, not in
 a proxy rewrite layer.
+
+### `kind: UpstreamMapping` — `spec.trustUpstreamPublishTime`
+
+`spec.trustUpstreamPublishTime: bool` (default `false`) admits this
+upstream's asserted publish time as an **optional second source** for
+the quarantine-window anchor.
+
+The quarantine window is a proxy for elapsed *ecosystem exposure* — the
+assumption that content available in the world for the window's
+duration has had the ecosystem's scanners, advisories and researchers
+looking at it. So the anchor is the **earliest defensible evidence of
+the content's age**: the minimum over the applicable sources
+([ADR 0054](../../adr/0054-content-level-age-evidence-anchors-quarantine.md)).
+
+**The primary source needs no opt-in and is always in play**: the
+earliest moment hort itself observed those exact bytes, in any of its
+own repositories. That is an observation hort generates, not a claim by
+a third party, so it cannot be backdated — the most an attacker
+achieves by influencing it is making hort see the content *earlier*,
+which requires the content to genuinely have existed that much earlier,
+during which the ecosystem had precisely the exposure the window stands
+in for. It is also structurally conservative: hort cannot observe
+content before it is published, so first-seen is always a *late*
+estimate of real publication.
+
+Two operator-visible consequences of the primary source, both intended:
+
+- Content hort saw long ago and is now registering into a **second**
+  repository can land with a zero-length window. It has already had its
+  ecosystem exposure; holding it another full window adds no observation
+  the world has not already had.
+- Content whose last row is purged and which is later re-fetched loses
+  its original age evidence and re-anchors at the new ingest — the
+  evidence is derived from the artifact rows, not stored separately. The
+  resulting window is *longer* than the truth requires, never shorter.
+
+**What this flag adds** is `upstream_published_at` — an *assertion by
+the upstream* — to that same minimum. It can therefore only move the
+anchor earlier, never later, and a claimed publish time after the
+ingest instant is clamped away (physically impossible). It is opt-in
+because it is the one attacker-influenceable input: a claimed *ancient*
+publish time is bounded nowhere and collapses the window immediately.
+Freshly uploaded malware carrying forged old metadata is exactly the
+case the opt-in exists to bound — enable it only for upstreams whose
+metadata you are willing to treat as true. The case it exists for is a
+high-latency mirror of already-aged content, where hort's own first
+observation is far later than real publication.
+
+**It is per-mapping, and it does not transit repositories.** A value
+observed through one repository's mapping never shortens another
+repository's window. Without that scoping, a repository proxying an
+untrusted mirror could shorten the window of one proxying the genuine
+upstream — the collapse pattern
+[ADR 0016](../../adr/0016-cross-opt-in-interaction-matrix.md) exists to
+prevent.
+
+**Cross-opt-in constraint.** Combining `trustUpstreamPublishTime: true`
+with an empty `scanBackends` is rejected at apply time
+(`trust_upstream_publish_time_requires_scan_backends`): together they
+collapse the observation window to sweep-tick latency with no scan
+behind it. `hort-server validate-config` catches this offline.
+
+The window is a **timer, never an authority**: release still requires
+this artifact's own `ScanSucceeded` / `ScanWaived`
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)),
+whatever the anchor resolves to.
 
 ---
 

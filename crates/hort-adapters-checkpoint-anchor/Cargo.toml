@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort CheckpointAnchorPort read adapter — S3 Object-Lock anchored, ed25519-signed event-chain checkpoints (ADR 0002)"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
@@ -11,7 +13,7 @@ workspace = true
 [dependencies]
 # The outbound port + the pure `Checkpoint` value type this adapter
 # produces (ADR 0002 + ADR 0004). Zero-I/O domain boundary.
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 # NOTE: this crate is store-agnostic — it takes an injected
 # `Arc<dyn ObjectStore>` and depends only on `hort-domain` + crypto +
 # `object_store`. The composition root (`hort-server`'s `build_anchor`)

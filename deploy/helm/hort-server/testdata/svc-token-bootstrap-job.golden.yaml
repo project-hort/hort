@@ -1,0 +1,137 @@
+---
+# Source: hort-server/templates/svc-token-bootstrap-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: hort-server-svc-token-bootstrap
+  labels:
+    helm.sh/chart: hort-server-0.11.0-dev
+    app.kubernetes.io/name: hort-server
+    app.kubernetes.io/instance: hort-server
+    app.kubernetes.io/version: "0.11.0-dev"
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: hort-server
+    hort-server.io/job: svc-token-bootstrap
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  # Auto-clean 5 minutes after the Job completes (success or failure).
+  # The k8s audit log and operator tooling retain the run history;
+  # the Job object itself is just "did it finish".
+  ttlSecondsAfterFinished: 300
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hort-server
+        app.kubernetes.io/instance: hort-server
+        hort-server.io/job: svc-token-bootstrap
+    spec:
+      serviceAccountName: hort-server-svc-bootstrap
+      restartPolicy: Never
+      securityContext:
+        fsGroup: 65532
+        runAsGroup: 65532
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      volumes:
+        - name: bootstrap-token
+          # medium: Memory keeps the plaintext off-disk. The volume
+          # lifetime is the Pod lifetime — removed when the Job Pod completes.
+          emptyDir:
+            medium: Memory
+        - name: tmp
+          emptyDir: {}
+      initContainers:
+        - name: issue-token
+          image: "ghcr.io/project-hort/hort-server:0.11.0-dev"
+          imagePullPolicy: IfNotPresent
+          # Write the plaintext token to the shared emptyDir.
+          # --output=file:<path> creates the file with mode 0600.
+          args:
+            - admin
+            - issue-svc-token
+            - --name=cronjob-tasks
+            - --permission=admin_task_invoke
+            - --output=file:/run/bootstrap/token
+            # Fail the hook loudly if the `cronjob-tasks` SA has no live
+            # `admin_task_invoke` grant, instead of minting a token that
+            # every admin-task CronJob then 403s on at run time. The grant
+            # is operator-declared gitops (see the `adminTasksEnabled`
+            # comment in values.yaml) — this chart never provisions it.
+            - --require-authority
+          env:
+            # Canonical HORT_DATABASE_URL (the binary falls back to bare
+            # DATABASE_URL for sqlx-cli / Tier-2 / 12-factor). The
+            # admin-secret reference is unchanged.
+            - name: HORT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: "hort-admin-db-secret"
+                  key: "DATABASE_URL"
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: bootstrap-token
+              mountPath: /run/bootstrap
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: write-secret
+          # bitnamilegacy/kubectl includes bash, making the idempotent apply
+          # pipeline possible without a shell in the hort-server image.
+          # Pin the minor version to the cluster's API compatibility window;
+          # operators override via scheduledTasks.svcTokenKubectlImage. Default lives in
+          # `bitnamilegacy/*` — see the docstring comment at the top of this
+          # file for the Bitnami repackaging context.
+          image: "bitnamilegacy/kubectl:1.30"
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Tolerate the idempotent issue-svc-token skip path.
+              #
+              # issue-svc-token exits 0 WITHOUT writing the output file when the
+              # token row already exists in the database and --rotate was not
+              # passed (admin.rs:282-294 — the plaintext is hashed in the DB and
+              # cannot be re-emitted). On routine helm upgrades that's the
+              # common case: the token was minted at first install, the Secret
+              # was created at first install, and there is nothing to do.
+              #
+              # Without this branch, the post-upgrade hook fails on every
+              # subsequent upgrade with "no such file or directory".
+              set -eu
+              SECRET=hort-server-svc-token
+              if [ ! -f /run/bootstrap/token ]; then
+                if kubectl get secret "$SECRET" >/dev/null 2>&1; then
+                  echo "info: token row exists in DB and Secret '$SECRET' exists in cluster; nothing to do"
+                  exit 0
+                fi
+                echo "error: token row exists in DB but no token file was written AND Secret '$SECRET' does not exist in cluster" >&2
+                echo "       The plaintext is lost (hashed in DB). Recover via:" >&2
+                echo "         helm upgrade ... --set scheduledTasks.rotateSvcToken=true" >&2
+                echo "       which forces issue-svc-token to revoke the old row + mint a new one." >&2
+                exit 1
+              fi
+              kubectl create secret generic "$SECRET" \
+                --from-file=token=/run/bootstrap/token \
+                --dry-run=client -o yaml | kubectl apply -f -
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: bootstrap-token
+              mountPath: /run/bootstrap
+              readOnly: true

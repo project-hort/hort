@@ -107,7 +107,7 @@ members = [
 exclude = ["tools/*"]
 
 [workspace.package]
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 # MSRV — kept in sync with `.clippy.toml` (`msrv = "1.94.0"`) and with
 # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` default (asserted
@@ -135,6 +135,104 @@ unsafe_code = "forbid"
 unused_qualifications = "warn"
 
 [workspace.dependencies]
+# ── Intra-workspace crates ─────────────────────────────────────────────────
+#
+# Every intra-workspace dependency is declared here once with `path`,
+# `version` AND `registry`; members inherit it
+# (`hort-domain = { workspace = true }`).
+# `cargo package` / `cargo publish` strip `path` from the manifest they
+# upload and resolve the dependency through the registry instead, so a
+# path-only declaration is rejected outright:
+#
+#     all dependencies must have a version requirement specified when
+#     packaging. dependency `hort-domain` does not specify a version
+#
+# The requirement is an EXACT pin (`=`) equal to `[workspace.package]
+# version` above. Every crate here carries that single version and is
+# released in lockstep, so a caret range would advertise a cross-version
+# compatibility that is never built or tested. A static requirement does
+# not work either: semver orders pre-releases lexically, so `0.11.0-beta.4`
+# sorts BELOW `0.11.0-dev` and a beta build would fail to satisfy its own
+# workspace requirement. A release cut therefore rewrites the marker above
+# and these requirements together — the two carry the identical version
+# literal, so one substitution over this file covers both. It must skip
+# comment lines (`sed -i '/^#/!s/…/…/g'`): this block quotes the current
+# version twice for illustration, and a global rewrite would silently
+# rewrite the example and the quoted error message too.
+#
+# The exact pin is also what makes that lockstep structural rather than
+# procedural. Bump `[workspace.package] version` alone and cargo refuses
+# to resolve the workspace at all ("failed to select a version for the
+# requirement `hort-config = \"=0.11.0-dev\"`"), so a half-applied bump
+# cannot build, let alone reach a tag. A caret requirement would keep
+# resolving happily against the stale lower bound and publish manifests
+# pointing at the previous release.
+# `crates/hort-server/tests/publishable_manifests.rs` covers what cargo
+# does not: a requirement edited to some other still-satisfiable form, and
+# a member that reintroduces a path-only declaration.
+#
+# `registry` names where the published requirement resolves. Without it
+# the requirement is a crates.io one, and the release job runs under
+# `[source.crates-io] replace-with = "hort"` (the read-only aggregation
+# index) — cargo would search for the just-uploaded sibling in a
+# repository the release identity cannot publish to, and the chain would
+# fail at the second crate with the first already uploaded and only
+# yankable. `--registry` on the command line does not change that:
+# replacement is decided per dependency, from this manifest. An
+# explicit-registry dependency is exempt from source replacement.
+#
+# The key is also load-bearing for the ordinary build: cargo refuses to
+# parse a manifest naming a registry it has no index for, so
+# `.cargo/config.toml` declares `[registries.hort-crates]`. Declaring it
+# does not fetch it — `path` still resolves local source, and only
+# `cargo publish` / `cargo package` reach the URL.
+#
+# `[dev-dependencies]` are the deliberate exception and must stay path-only
+# — never `workspace = true` here. Cargo DROPS a path-only dev dependency
+# from the published manifest entirely, but KEEPS one that carries a
+# version and then requires it to resolve on the registry. Inheriting a
+# version would turn every test-only edge into a publish-time dependency,
+# including edges onto crates that are not published at all. The same guard
+# test asserts that direction too.
+hort-domain = { path = "crates/hort-domain", version = "=0.11.0", registry = "hort-crates" }
+hort-config = { path = "crates/hort-config", version = "=0.11.0", registry = "hort-crates" }
+hort-app = { path = "crates/hort-app", version = "=0.11.0", registry = "hort-crates" }
+hort-attribution = { path = "crates/hort-attribution", version = "=0.11.0", registry = "hort-crates" }
+hort-net-egress = { path = "crates/hort-net-egress", version = "=0.11.0", registry = "hort-crates" }
+# Format handling
+hort-formats = { path = "crates/hort-formats", version = "=0.11.0", registry = "hort-crates" }
+hort-formats-upstream = { path = "crates/hort-formats-upstream", version = "=0.11.0", registry = "hort-crates" }
+# Inbound HTTP
+hort-http-core = { path = "crates/hort-http-core", version = "=0.11.0", registry = "hort-crates" }
+hort-http-cargo = { path = "crates/hort-http-cargo", version = "=0.11.0", registry = "hort-crates" }
+hort-http-npm = { path = "crates/hort-http-npm", version = "=0.11.0", registry = "hort-crates" }
+hort-http-pypi = { path = "crates/hort-http-pypi", version = "=0.11.0", registry = "hort-crates" }
+hort-http-oci = { path = "crates/hort-http-oci", version = "=0.11.0", registry = "hort-crates" }
+hort-http-maven = { path = "crates/hort-http-maven", version = "=0.11.0", registry = "hort-crates" }
+hort-http-admin-security = { path = "crates/hort-http-admin-security", version = "=0.11.0", registry = "hort-crates" }
+hort-http-admin-tasks = { path = "crates/hort-http-admin-tasks", version = "=0.11.0", registry = "hort-crates" }
+hort-http-subscriptions = { path = "crates/hort-http-subscriptions", version = "=0.11.0", registry = "hort-crates" }
+hort-http-discovery = { path = "crates/hort-http-discovery", version = "=0.11.0", registry = "hort-crates" }
+hort-http-events = { path = "crates/hort-http-events", version = "=0.11.0", registry = "hort-crates" }
+# Outbound adapters
+hort-adapters-advisory-osv = { path = "crates/hort-adapters-advisory-osv", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-checkpoint-anchor = { path = "crates/hort-adapters-checkpoint-anchor", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-ephemeral-memory = { path = "crates/hort-adapters-ephemeral-memory", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-ephemeral-redis = { path = "crates/hort-adapters-ephemeral-redis", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-kubernetes = { path = "crates/hort-adapters-kubernetes", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-oidc = { path = "crates/hort-adapters-oidc", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-postgres = { path = "crates/hort-adapters-postgres", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-provenance-cosign-key = { path = "crates/hort-adapters-provenance-cosign-key", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-provenance-sigstore = { path = "crates/hort-adapters-provenance-sigstore", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-scanner-osv = { path = "crates/hort-adapters-scanner-osv", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-scanner-trivy = { path = "crates/hort-adapters-scanner-trivy", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-secrets = { path = "crates/hort-adapters-secrets", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-storage = { path = "crates/hort-adapters-storage", version = "=0.11.0", registry = "hort-crates" }
+hort-adapters-upstream-http = { path = "crates/hort-adapters-upstream-http", version = "=0.11.0", registry = "hort-crates" }
+# Event notifiers
+hort-notifier-nats = { path = "crates/hort-notifier-nats", version = "=0.11.0", registry = "hort-crates" }
+hort-notifier-webhook = { path = "crates/hort-notifier-webhook", version = "=0.11.0", registry = "hort-crates" }
+
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }
 
@@ -290,7 +388,13 @@ serde_urlencoded = "0.7"
 
 # Async streams
 futures = "0.3"
-tokio-util = { version = "0.7", features = ["io", "rt"] }
+# `io-util` is what carries `SyncIoBridge`, the adapter that lets an
+# `AsyncRead` (a CAS read) feed a synchronous `std::io::Read` port — the
+# `FormatHandler` payload methods are sync by design, and the scan path
+# streams stored artifacts through them without buffering. It activates
+# `tokio/io-util`, which `tokio`'s `full` feature already enables, so it
+# pulls no new crate into the graph.
+tokio-util = { version = "0.7", features = ["io", "io-util", "rt"] }
 tokio-stream = "0.1"
 bytes = "1.5"
 
@@ -443,6 +547,15 @@ async-nats = { version = "0.50", default-features = false }
 # Workspace-pinned so future adapters that need real-broker fixtures
 # (e.g. a future Kafka relay) share the version.
 testcontainers = "0.27"
+
+# RustSec-maintained CVSS v3.x vector parser/scorer. Consumers:
+# `hort-adapters-scanner-osv` and `hort-adapters-advisory-osv` compute a
+# base score from an OSV `severity[].score` vector when no pre-computed
+# numeric severity is present. All three default features (`std`, `v3`,
+# `v4`) must stay enabled — `cvss` 2.2.0's `v3` module references the `v4`
+# module unconditionally regardless of feature selection, so disabling
+# `v4` fails to compile even though only `v3::Base` is used here.
+cvss = "2.2.0"
 
 # Strip release binaries to shrink the container image. The unstripped
 # `hort-server` binary carries debug symbols (~80 MB); stripping symbols

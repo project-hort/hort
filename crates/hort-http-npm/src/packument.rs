@@ -516,11 +516,11 @@ pub async fn fetch_raw_with_cache(
 /// reads the mirror (it renders the cached projection). The mirror
 /// reader is read into a buffer here and projected via `Cursor`: the
 /// sync `MetadataProjector` (`R: std::io::Read`) cannot take an
-/// `AsyncRead` directly, and `tokio-util`'s `SyncIoBridge` needs the
-/// `io-util` feature (not enabled workspace-wide). A transient buffer on
-/// this cold outage path is acceptable — it mirrors what the
-/// pre-amendment stale fallback already held; the hot-path memory bound
-/// (the point of the amendment) is unaffected.
+/// `AsyncRead` directly. A transient buffer on this cold outage path is
+/// acceptable — it mirrors what the pre-amendment stale fallback already
+/// held; the hot-path memory bound (the point of the amendment) is
+/// unaffected. (`tokio-util`'s `SyncIoBridge` would stream it instead,
+/// at the cost of a `spawn_blocking` hop this path has no reason to pay.)
 async fn project_from_mirror(
     mut reader: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
     per_version_object_max_bytes: u64,

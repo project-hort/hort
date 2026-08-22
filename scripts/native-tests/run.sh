@@ -8,6 +8,9 @@
 #   (default 4) — hort-worker replica count. Scan concurrency is 1 per replica
 #   by design; replicas are the scaling axis so serial trivy runtime stays off
 #   the release critical path.
+# Env (compose mode): HORT_E2E_FAIL_LOG_LINES (default 2000) — per-service
+#   line bound on the hort-server / hort-worker log dump emitted for a FAILED
+#   scenario, so a CI failure carries its own server-side diagnosis.
 # Env (opt-out, default unset = build as today): HORT_E2E_SKIP_BUILD=1 skips
 #   building the test-client image and drops `--build` from `compose up`,
 #   for the case where HORT_SERVER_IMAGE / HORT_WORKER_IMAGE / the test-client
@@ -47,8 +50,10 @@ scenario_requires() { sed -n 's/^# requires:[[:space:]]*//p' "$1" | head -1; }
 
 # quarantine reason -> the `# quarantine:` line if present. A quarantined scenario
 # is reported QUARANTINED and NOT run, and does NOT fail the gate — for a scenario
-# whose own assertions are known-wrong/under-rework so it can't gate CI yet (e.g.
-# proxy/pull-dedup). Remove the header once the scenario is fixed.
+# whose own assertions are known-wrong/under-rework so it can't gate CI yet.
+# It is a temporary state with a named owner, never a resting place: an
+# unexpiring quarantine means that scenario's coverage silently does not exist.
+# Remove the header once the scenario is fixed.
 scenario_quarantine() { sed -n 's/^# quarantine:[[:space:]]*//p' "$1" | head -1; }
 
 # What the chosen mode provides (egress probed at run time in Task 5).
@@ -223,6 +228,48 @@ SCALE_ARGS=(); [ "$NEED_WORKER" = 1 ] && SCALE_ARGS=(--scale "hort-worker=${HORT
 wait_running() { local svc="$1" t="${2:-180}"; local d=$(( $(now)+t )); until docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" ps --status running --services 2>/dev/null | grep -qx "$svc"; do [ "$(now)" -ge "$d" ] && return 1; sleep 2; done; }
 
 STARTED=0
+
+# Bounded, delimited server-side log dump for a scenario that FAILED.
+#
+# A CI failure must carry its own diagnosis. A scenario assertion can only
+# report the state it can observe from outside (an HTTP code, a row count);
+# it can never say WHICH server-side code path produced that state, and the
+# stack is torn down by the EXIT trap moments later, so a failure observed
+# only in CI is otherwise unreproducible from its own output. Dumping the
+# services' logs at the moment of failure is what turns "count=0" into
+# "count=0, and here is the request that wrote the row".
+#
+# FAIL only. A pass or a self-skip prints nothing new — the pass-path
+# output stays byte-identical — because logs attached to green runs are
+# noise that trains readers to scroll past the block that matters. Bounded
+# per service so a wedged service that logged for an hour cannot bury the
+# summary at the end of the run.
+#
+# Compose mode only: in external mode the services belong to whoever runs
+# the target stack, and this runner has no compose project to read them
+# from. `--keep` is orthogonal — it governs teardown, not output.
+FAIL_LOG_LINES="${HORT_E2E_FAIL_LOG_LINES:-2000}"
+dump_failure_logs() {
+  local scenario="$1" svc
+  [ "$HORT_MODE" = "compose" ] || return 0
+  [ "$STARTED" = 1 ] || return 0
+  for svc in hort-server hort-worker; do
+    # hort-worker only exists when the worker profile was brought up; asking
+    # compose for a profile-inactive service's logs is a hard error, not an
+    # empty result.
+    if [ "$svc" = "hort-worker" ] && [ "$NEED_WORKER" != 1 ]; then
+      continue
+    fi
+    echo ""
+    echo "----- FAIL LOGS BEGIN [$scenario] $svc (last ${FAIL_LOG_LINES} lines) -----"
+    if ! docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" logs \
+           --no-color --tail "$FAIL_LOG_LINES" "$svc" 2>&1 | tail -n "$FAIL_LOG_LINES"; then
+      echo "(could not read $svc logs)"
+    fi
+    echo "----- FAIL LOGS END [$scenario] $svc -----"
+  done
+}
+
 # Profile-aware teardown: a worker started under --profile worker is only
 # reliably removed when the same profile is on the `down` (otherwise it lingers).
 cleanup() { [ "$STARTED" = 1 ] && [ "$KEEP" = 0 ] && docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" down -v --remove-orphans || true; }
@@ -314,11 +361,27 @@ run_one() {  # group name path
   # provenance scenario switches to the /v2/auth token dance under
   # `native-tokens`). External mode: set it in the environment to match the
   # external stack's posture.
+  # HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS: forwarded verbatim (empty when the
+  # operator has not set it, so the scenario falls back to the same default the
+  # server parses). The coalescing scenario times its drive against that
+  # window; forwarding the variable under its real name means an operator who
+  # retunes the server can point the scenario at the same value instead of
+  # editing an assertion.
+  # HORT_E2E_MODE: the runner's own --hort selector, forwarded verbatim.
+  # General capability, not a one-scenario hack: any scenario whose fixture
+  # premise only holds on a stack the runner owns (a coldness assertion, a
+  # row-count expectation) can read this to fail hard under compose — where a
+  # violation means a dirty fixture `compose down -v` clears — but skip with a
+  # diagnostic under external, where the same violation is a permanent red on
+  # someone else's long-lived instance. A scenario that does not read it is
+  # unaffected.
   docker run --rm --add-host=host.docker.internal:host-gateway "${NET_ARGS[@]}" \
     -e HORT_URL="$IN_HORT" -e KEYCLOAK_URL="$IN_KC" -e METRICS_URL="$IN_METRICS" \
     -e METRICS_TOKEN="$IN_METRICS_TOKEN" \
     -e HORT_DB_DSN="$DB_DSN" \
+    -e HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS="${HORT_PULL_DEDUP_LEADER_LOCK_TTL_SECS:-}" \
     -e HORT_COMPOSE_OVERLAYS="${OVERLAYS[*]:-${HORT_COMPOSE_OVERLAYS:-}}" \
+    -e HORT_E2E_MODE="$HORT_MODE" \
     -v "$SCRIPT_DIR":/work:ro -e FIXTURES=/work/fixtures \
     "$IMAGE" bash "/work/$rel"
 }
@@ -340,7 +403,13 @@ while IFS=$'\t' read -r group name path reqs; do
   echo ">>> $group/$name"; rc=0; run_one "$group" "$name" "$path" || rc=$?
   # 0=pass, 77=scenario self-skip (the `skip` helper), anything else=fail (incl.
   # a tool crash exiting 2, which must NOT be mistaken for a skip).
-  case "$rc" in 0) PASS+=("$group/$name");; 77) SKIPPED+=("$group/$name (skipped)");; *) FAILED+=("$group/$name");; esac
+  case "$rc" in
+    0)  PASS+=("$group/$name");;
+    77) SKIPPED+=("$group/$name (skipped)");;
+    # Dump BEFORE the next scenario runs and long before the EXIT trap tears
+    # the stack down, so the logs belong unambiguously to this scenario.
+    *)  FAILED+=("$group/$name"); dump_failure_logs "$group/$name";;
+  esac
 done < <(selected)
 
 echo ""; echo "PASS=${#PASS[@]} FAIL=${#FAILED[@]} SKIP=${#SKIPPED[@]} QUARANTINED=${#QUARANTINED[@]}"

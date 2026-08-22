@@ -123,6 +123,10 @@ pub const KEYSPACE_REGISTRY: &[(&str, EphemeralKeyspaceClass)] = &[
     // forces a re-fetch from `api.osv.dev`, which is the correct
     // fallback. Source: `crates/hort-adapters-advisory-osv/src/cache.rs`
     // (`build_cache_key` prefixes every entry with `advisory:osv:`).
+    // Two sub-namespaces share this entry: bare
+    // `advisory:osv:<hash(eco,name,version)>` for per-component finding
+    // lists, and `advisory:osv:vuln:<hash(id,modified)>` for hydrated
+    // full advisory records.
     ("advisory:osv:", EphemeralKeyspaceClass::Evictable),
     // Pull-through dedup locks + status records (`PullDedup` Layer B).
     ("pulldedup:", EphemeralKeyspaceClass::Evictable),

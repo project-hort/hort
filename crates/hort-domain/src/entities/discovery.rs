@@ -272,6 +272,14 @@ pub enum PrefetchItemError {
     /// violation as a network error). Sanitised — no internal detail
     /// (table names, SQL) reaches the wire.
     Internal,
+    /// The target has no catch-all (`path_prefix == ""`) upstream mapping
+    /// capable of proxying this format — a hosted-only repo, or a virtual
+    /// repo none of whose members can proxy. Distinct from
+    /// [`Self::UpstreamNotFound`] (upstream reachable but 404'd this
+    /// package): here there is no upstream configured at all, so retrying
+    /// can never succeed without an operator config change. Rejected at
+    /// POST time — never enqueued to be silently absorbed at execution.
+    NoUpstreamMapping,
 }
 
 // ---------------------------------------------------------------------------
@@ -713,6 +721,16 @@ mod tests {
         assert_eq!(
             serde_json::to_value(e).unwrap(),
             serde_json::json!("parse_error")
+        );
+    }
+
+    #[test]
+    fn prefetch_item_error_no_upstream_mapping_arm() {
+        let e = PrefetchItemError::NoUpstreamMapping;
+        assert_eq!(e, e);
+        assert_eq!(
+            serde_json::to_value(e).unwrap(),
+            serde_json::json!("no_upstream_mapping")
         );
     }
 

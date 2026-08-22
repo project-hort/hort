@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort license text + generated third-party attribution, embedded at compile time"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true

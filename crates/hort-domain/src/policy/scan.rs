@@ -32,12 +32,24 @@
 //!    [`ViolationsAccumulator::collect_with_policy_action`] using its
 //!    returned [`PolicyAction`].
 //! 5. `accumulator.into_outcome()` produces
-//!    `(action, violations)`. `Block` → [`ScanOutcome::Reject`];
-//!    anything else → [`ScanOutcome::Clean`]. `Warn` outcomes do not
-//!    block in the scan path — the v1 scan result is binary
-//!    (clean or rejected); `Warn` violations would surface as
-//!    [`crate::events::PolicyEvaluated`] entries on a future
+//!    `(action, violations)`. `Block` → [`ScanOutcome::Reject`] under
+//!    `enforcement = reject` and [`ScanOutcome::FindingsRecorded`] under
+//!    `enforcement = record`; anything else → [`ScanOutcome::Clean`].
+//!    `Warn` outcomes do not block in the scan path — a `Warn`-only
+//!    result is clean regardless of enforcement; `Warn` violations would
+//!    surface as [`crate::events::PolicyEvaluated`] entries on a future
 //!    enhancement but do not affect quarantine state today.
+//!
+//! ## Enforcement mode
+//!
+//! [`ScanEnforcement`] is the last step, and only the last step: every
+//! rule above runs identically in both modes, so the *verdict* (which
+//! violations fired, at what severity) is mode-independent and the
+//! recorded audit trail is byte-identical. `record` changes only what the
+//! caller is told to do with a blocking verdict — record it, do not
+//! transition. Keeping the branch here rather than in the caller is what
+//! makes the tighten/loosen re-evaluation directions (ADR 0041) fall out
+//! of the same single evaluator both other callers already use.
 //!
 //! ## License-input shape note
 //!
@@ -56,7 +68,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::entities::scan_policy::{
-    ExclusionProjection, NegligibleAction, ScanPolicyProjection, SeverityThreshold,
+    ExclusionProjection, NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use crate::events::PolicyViolation;
 use crate::types::{ArtifactCoords, Finding};
@@ -74,10 +86,10 @@ pub const NEGLIGIBLE_RULE: &str = "negligible-advisory";
 
 /// Outcome of evaluating a scan result against the active policy.
 ///
-/// Binary by design in v1 — the `QuarantineUseCase::record_scan_result`
-/// path emits either a clean [`crate::events::ScanCompleted`] or the
-/// reject triple (`ScanCompleted` + `PolicyEvaluated(Fail)` +
-/// `ArtifactRejected`). Future enhancements that surface `Warn`
+/// Three-valued: the two enforcement-worthy verdicts a `Block` can
+/// produce ([`Reject`](Self::Reject) / [`FindingsRecorded`](Self::FindingsRecorded),
+/// selected by the policy's [`ScanEnforcement`]) plus
+/// [`Clean`](Self::Clean). Future enhancements that surface `Warn`
 /// outcomes through `PolicyEvaluated(Pass, violations)` extend this
 /// enum rather than reinterpreting `Clean`.
 ///
@@ -91,9 +103,22 @@ pub enum ScanOutcome {
     /// time-based sweep handles release per quarantine invariant 2.
     Clean,
     /// Scan produced findings that the active policy (or default)
-    /// blocks. Caller emits `PolicyEvaluated(Fail, violations)` +
-    /// `ArtifactRejected`.
+    /// blocks, under `enforcement = reject`. Caller emits
+    /// `PolicyEvaluated(Fail, violations)` + `ArtifactRejected`.
     Reject(Vec<PolicyViolation>),
+    /// Scan produced the SAME blocking violations as
+    /// [`Reject`](Self::Reject), but the active policy declares
+    /// `enforcement = record`: the caller emits
+    /// `PolicyEvaluated(Fail, violations)` and persists the findings
+    /// exactly as it would on a reject, and emits **no**
+    /// `ArtifactRejected` — the artifact's quarantine status is
+    /// untouched by the verdict.
+    ///
+    /// Distinct from `Clean` because the audit trail, the metrics and the
+    /// operator-facing log line must say which of the two happened: an
+    /// operator reading a clean evaluation must never be looking at a
+    /// scope that recorded over-threshold findings.
+    FindingsRecorded(Vec<PolicyViolation>),
 }
 
 /// Default-policy fallback used when the artifact's repository has no
@@ -178,6 +203,17 @@ impl DefaultPolicy {
     /// explicit `negligibleAction:`.
     pub const fn negligible_action() -> NegligibleAction {
         NegligibleAction::Ignore
+    }
+
+    /// Default `enforcement` when no operator `ScanPolicy` is configured
+    /// for a repo.
+    ///
+    /// Returns [`ScanEnforcement::Reject`] — an unconfigured repo blocks
+    /// on a critical finding (see [`Self::block_on_critical`]) and that
+    /// block is enforced. Non-enforcement is an explicit operator
+    /// declaration (`enforcement: record`), never a fallback.
+    pub const fn enforcement() -> ScanEnforcement {
+        ScanEnforcement::Reject
     }
 }
 
@@ -278,14 +314,23 @@ pub fn evaluate_scan_result(
         filtered.remaining.negligible,
     );
 
-    // Step 5 — translate accumulator outcome into ScanOutcome.
+    // Step 5 — translate accumulator outcome into ScanOutcome. The
+    // enforcement mode selects between the two blocking-verdict
+    // variants; it never suppresses a violation, so both carry the
+    // identical `violations` list.
+    let enforcement = policy
+        .map(|p| p.enforcement)
+        .unwrap_or_else(DefaultPolicy::enforcement);
     let (action, violations) = accumulator.into_outcome();
     match action {
-        PolicyAction::Block => ScanOutcome::Reject(violations),
-        // `Warn` and `Allow` are both Clean for the v1 scan path. See
-        // module rustdoc — a `Warn` outcome with violations would
+        PolicyAction::Block => match enforcement {
+            ScanEnforcement::Reject => ScanOutcome::Reject(violations),
+            ScanEnforcement::Record => ScanOutcome::FindingsRecorded(violations),
+        },
+        // `Warn` and `Allow` are both Clean in either enforcement mode.
+        // See module rustdoc — a `Warn` outcome with violations would
         // surface through `PolicyEvaluated(Pass, violations)` on a
-        // future enhancement; today the scan-result path is binary.
+        // future enhancement; today a non-blocking result is clean.
         PolicyAction::Warn | PolicyAction::Allow => ScanOutcome::Clean,
     }
 }
@@ -293,7 +338,7 @@ pub fn evaluate_scan_result(
 /// Feeds the `negligible_action` enforcement step into a shared
 /// [`ViolationsAccumulator`]. Single source of the negligible-lane
 /// decision for both [`evaluate_scan_result`] (initial scan) and
-/// [`crate::policy::re_evaluate_after_exclusion`] (exclusion-triggered
+/// [`crate::policy::decide_rejected_transition`] (exclusion-triggered
 /// re-evaluation) so the two paths cannot diverge.
 ///
 /// Keyed on the resolved `negligible_action`:
@@ -360,7 +405,9 @@ fn has_license_policy(value: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use crate::entities::repository::RepositoryFormat;
-    use crate::entities::scan_policy::{ExclusionProjection, NegligibleAction, ProvenanceMode};
+    use crate::entities::scan_policy::{
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
+    };
     use crate::events::PolicyScope;
     use chrono::TimeZone;
     use uuid::Uuid;
@@ -453,6 +500,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),
@@ -676,7 +724,7 @@ mod tests {
                 assert_eq!(violations[0].rule, super::super::cve::RULE);
                 assert_eq!(violations[0].severity, SeverityThreshold::Critical);
             }
-            ScanOutcome::Clean => panic!("expected Reject"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -697,7 +745,7 @@ mod tests {
                 assert_eq!(violations.len(), 1);
                 assert_eq!(violations[0].severity, SeverityThreshold::Critical);
             }
-            ScanOutcome::Clean => panic!("expected Reject"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -717,7 +765,7 @@ mod tests {
                 assert_eq!(violations.len(), 1);
                 assert_eq!(violations[0].severity, SeverityThreshold::High);
             }
-            ScanOutcome::Clean => panic!("expected Reject"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -743,7 +791,7 @@ mod tests {
         let r = evaluate_scan_result(&coords("any"), &critical, None, &exs, now);
         match r {
             ScanOutcome::Reject(v) => assert_eq!(v.len(), 1),
-            ScanOutcome::Clean => panic!("expected Reject"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -818,7 +866,7 @@ mod tests {
                 assert!(rules.contains(&super::super::cve::RULE));
                 assert!(rules.contains(&super::super::license::RULE_SHAPE));
             }
-            ScanOutcome::Clean => panic!("expected Reject"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -871,7 +919,7 @@ mod tests {
                 // The violation carries the negligible count in details.
                 assert_eq!(violations[0].details["negligible_count"], 1);
             }
-            ScanOutcome::Clean => panic!("expected Reject under Block"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -907,7 +955,7 @@ mod tests {
                 assert_eq!(violations.len(), 1);
                 assert_eq!(violations[0].rule, super::super::cve::RULE);
             }
-            ScanOutcome::Clean => panic!("expected Reject from the scored Critical"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -928,7 +976,7 @@ mod tests {
                 assert!(rules.contains(&super::super::cve::RULE));
                 assert!(rules.contains(&NEGLIGIBLE_RULE));
             }
-            ScanOutcome::Clean => panic!("expected Reject"),
+            other => panic!("expected Reject, got {other:?}"),
         }
     }
 
@@ -945,6 +993,151 @@ mod tests {
             ScanOutcome::Clean,
             "excluded informational finding must be gone before negligible_action is consulted"
         );
+    }
+
+    // ---- evaluate_scan_result: enforcement mode ----
+
+    fn projection_with_enforcement(enforcement: ScanEnforcement) -> ScanPolicyProjection {
+        let mut p = projection(SeverityThreshold::Critical, serde_json::Value::Null);
+        p.enforcement = enforcement;
+        p
+    }
+
+    #[test]
+    fn default_policy_enforcement_is_reject() {
+        // The no-policy path enforces. Non-enforcement is an explicit
+        // operator declaration, never a fallback.
+        assert_eq!(DefaultPolicy::enforcement(), ScanEnforcement::Reject);
+    }
+
+    #[test]
+    fn blocking_verdict_under_record_returns_findings_recorded() {
+        // Same critical finding that rejects under the default mode;
+        // under `record` the verdict is computed and the violations are
+        // returned for the audit trail, but the caller is told to record
+        // rather than reject.
+        let policy = projection_with_enforcement(ScanEnforcement::Record);
+        let r = evaluate_scan_result(
+            &coords("any"),
+            &findings(1, 0, 0, 0),
+            Some(&policy),
+            &[],
+            ts(0),
+        );
+        match r {
+            ScanOutcome::FindingsRecorded(violations) => {
+                assert_eq!(violations.len(), 1);
+                assert_eq!(violations[0].rule, super::super::cve::RULE);
+                assert_eq!(violations[0].severity, SeverityThreshold::Critical);
+            }
+            other => panic!("expected FindingsRecorded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_and_reject_produce_identical_violations() {
+        // The enforcement knob must never change the *verdict* — only
+        // what the caller does with it. Two evaluations over the same
+        // findings under the two modes must carry byte-identical
+        // violation lists, which is what makes the ADR 0041 tighten
+        // direction re-derive the exact rejection the loosen direction
+        // cleared.
+        let findings = vec![
+            finding("CVE-CRIT", SeverityThreshold::Critical),
+            informational_finding("RUSTSEC-2026-0173"),
+        ];
+        let mut reject_policy = projection_with_enforcement(ScanEnforcement::Reject);
+        reject_policy.negligible_action = NegligibleAction::Block;
+        let mut record_policy = projection_with_enforcement(ScanEnforcement::Record);
+        record_policy.negligible_action = NegligibleAction::Block;
+
+        let rejected =
+            evaluate_scan_result(&coords("any"), &findings, Some(&reject_policy), &[], ts(0));
+        let recorded =
+            evaluate_scan_result(&coords("any"), &findings, Some(&record_policy), &[], ts(0));
+        match (rejected, recorded) {
+            (ScanOutcome::Reject(a), ScanOutcome::FindingsRecorded(b)) => {
+                assert_eq!(a, b, "record must not alter the computed violations");
+                assert_eq!(a.len(), 2);
+            }
+            other => panic!("expected (Reject, FindingsRecorded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clean_verdict_under_record_is_still_clean() {
+        // `record` only re-routes a BLOCK. A below-threshold result is
+        // `Clean` in both modes — it must not be mislabelled as
+        // "findings recorded" (which would report violations that never
+        // fired).
+        let policy = projection_with_enforcement(ScanEnforcement::Record);
+        let r = evaluate_scan_result(
+            &coords("any"),
+            &findings(0, 1, 0, 0),
+            Some(&policy),
+            &[],
+            ts(0),
+        );
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    #[test]
+    fn warn_only_verdict_under_record_is_clean_not_recorded() {
+        // A `Warn`-escalated license-shape violation never reaches the
+        // `Block` arm, so enforcement never sees it — Clean in both
+        // modes.
+        let mut policy = projection_with_enforcement(ScanEnforcement::Record);
+        policy.license_policy = serde_json::json!("not-a-policy");
+        let r = evaluate_scan_result(&coords("any"), &no_findings(), Some(&policy), &[], ts(0));
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    #[test]
+    fn excluded_finding_under_record_is_clean_not_recorded() {
+        // Exclusions run BEFORE enforcement (step 1), so an excluded
+        // finding produces no violation to record at all — the outcome
+        // is Clean, not an empty `FindingsRecorded`.
+        let policy = projection_with_enforcement(ScanEnforcement::Record);
+        let critical = vec![finding("CVE-A", SeverityThreshold::Critical)];
+        let exs = vec![exclusion(1, "CVE-A", None, None)];
+        let r = evaluate_scan_result(&coords("xz-utils"), &critical, Some(&policy), &exs, ts(0));
+        assert_eq!(r, ScanOutcome::Clean);
+    }
+
+    #[test]
+    fn negligible_block_under_record_returns_findings_recorded() {
+        // The negligible lane composes with enforcement the same way the
+        // scored lane does: `negligibleAction: block` computes a blocking
+        // violation, `enforcement: record` records rather than rejects.
+        let mut policy = projection_with_enforcement(ScanEnforcement::Record);
+        policy.negligible_action = NegligibleAction::Block;
+        let findings = vec![informational_finding("RUSTSEC-2026-0173")];
+        let r = evaluate_scan_result(&coords("any"), &findings, Some(&policy), &[], ts(0));
+        match r {
+            ScanOutcome::FindingsRecorded(violations) => {
+                assert_eq!(violations.len(), 1);
+                assert_eq!(violations[0].rule, NEGLIGIBLE_RULE);
+            }
+            other => panic!("expected FindingsRecorded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_reject_enforcement_matches_absent_policy_behaviour() {
+        // Zero-migration guarantee: `enforcement: reject` (the default a
+        // missing YAML field parses to) is exactly today's behaviour.
+        let policy = projection_with_enforcement(ScanEnforcement::Reject);
+        let with_policy = evaluate_scan_result(
+            &coords("any"),
+            &findings(1, 0, 0, 0),
+            Some(&policy),
+            &[],
+            ts(0),
+        );
+        let no_policy =
+            evaluate_scan_result(&coords("any"), &findings(1, 0, 0, 0), None, &[], ts(0));
+        assert!(matches!(with_policy, ScanOutcome::Reject(_)));
+        assert!(matches!(no_policy, ScanOutcome::Reject(_)));
     }
 
     // ---- ScanOutcome derives ----
@@ -966,15 +1159,25 @@ mod tests {
         assert_eq!(r1, r2);
 
         assert_ne!(ScanOutcome::Clean, ScanOutcome::Reject(vec![]));
+        // `FindingsRecorded` is a DISTINCT verdict from both — a caller
+        // matching on `Reject` must never see a recorded outcome and
+        // vice versa.
+        assert_ne!(
+            ScanOutcome::Reject(vec![]),
+            ScanOutcome::FindingsRecorded(vec![])
+        );
+        assert_ne!(ScanOutcome::Clean, ScanOutcome::FindingsRecorded(vec![]));
     }
 
     #[test]
     fn scan_outcome_debug_formats() {
         // Defence-in-depth: derive(Debug) must compile and produce
-        // non-empty output for both variants.
+        // non-empty output for every variant.
         let s = format!("{:?}", ScanOutcome::Clean);
         assert!(s.contains("Clean"));
         let s = format!("{:?}", ScanOutcome::Reject(vec![]));
         assert!(s.contains("Reject"));
+        let s = format!("{:?}", ScanOutcome::FindingsRecorded(vec![]));
+        assert!(s.contains("FindingsRecorded"));
     }
 }

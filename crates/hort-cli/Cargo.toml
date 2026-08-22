@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort command-line client"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
@@ -18,7 +20,7 @@ path = "src/main.rs"
 # own, so adding it does not touch hort-cli's isolation guarantee (no
 # hort-domain / hort-app / hort-adapters-* in the dep graph) — see that
 # crate's Cargo.toml. Backs the `license` / `attribution` subcommands.
-hort-attribution = { path = "../hort-attribution" }
+hort-attribution = { workspace = true }
 # HTTP client — pure HTTP, no DSN, no hort-domain / hort-app / hort-adapters-* deps.
 reqwest    = { workspace = true, features = ["rustls", "json", "form"] }
 clap       = { workspace = true, features = ["derive", "env"] }

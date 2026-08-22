@@ -72,13 +72,30 @@ repository classes.
 - `hort-crates` — hort's own published crates (`cargo publish` from the release
   CI). World-readable fetch; push restricted to `gha-release`.
 
-Both carry a `*-permissive` ScanPolicy (`scanBackends: []`,
-`quarantineDuration: 0s`). This is sound: first-party artifacts are built and
-signed by the same operator; the quarantine gate protects against *upstream*
-supply-chain contamination, not self-published first-party code. The ADR 0016
-cross-opt-in collapse (`trust_upstream_publish_time = true` × `scan_backends:
-[]`) cannot arise here because `trust_upstream_publish_time` is irrelevant to
-hosted repos — there is no upstream clock to trust.
+**Identity is the write gate on this class**, not the scan: push is restricted
+to the `gha-release` ServiceAccount. First-party artifacts are built and signed
+by the same operator, and the quarantine gate exists to contain *upstream*
+supply-chain contamination, not self-published first-party code — so the
+observation window on this class is short or zero, and the scan posture is a
+per-repository judgement rather than a class-wide one:
+
+- **`hort-crates` — record-mode resolved-version scanning** (amended
+  2026-08-21, below). `scanBackends: ["osv"]`, `enforcement: record`,
+  `quarantineDuration: 0s`. The registry computes a real verdict over the
+  crate's real dependency closure — read from the `Cargo.lock` the published
+  `.crate` embeds ([ADR 0056](0056-resolved-component-sboms-from-payload.md)) —
+  records it, and gates nothing at publish.
+- **`hort-oci` — scanned and enforcing; unchanged by that amendment.**
+  `scanBackends: ["trivy"]` with the default `enforcement`, and a 1 h window.
+  A container image is scanned by reading its own bytes, so it never had the
+  imprecision the cargo path did, and a held image degrades only this showcase
+  face (ghcr.io is the canonical distribution). The resolved-component work is a
+  cargo-format decision and gives no reason to revisit this.
+
+The ADR 0016 cross-opt-in collapse (`trust_upstream_publish_time = true` ×
+`scan_backends: []`) cannot arise on either repository because
+`trust_upstream_publish_time` is irrelevant to hosted repos — there is no
+upstream clock to trust.
 
 **Class B — upstream dependency proxies, `isPublic: false` (authenticated ingest
 + read, quarantined + scanned).**
@@ -202,6 +219,56 @@ tokens are auditable: `issue-svc-token` rows, and waivers emit attributed
 (`crates/hort-server/src/gitops_boot.rs` — restart-to-apply). The `gitops`
 Ansible role syncs the tree and restarts the server; the two operator tokens are
 runtime `issue-svc-token` mints, not gitops resources.
+
+### Class A scanning: record-mode resolved-version verdicts on `hort-crates` (amended 2026-08-21)
+
+The original Class A posture was `scanBackends: []` on both repositories — no
+scan at all. The reasoning had two parts, and only one of them survives.
+
+The part that survives: **a scan verdict must not be able to un-publish a
+first-party crate.** At a zero window a blocking verdict transitions straight to
+`Rejected`, and a `Rejected` version is hidden from every caller — so a
+post-publish finding pulls a crate out from under the release chain that is
+already consuming it. That is a release-chain outage caused by the registry.
+
+The part that does not: **"a scan here cannot buy what it looks like it buys."**
+That was true of the SBOM the cargo handler could produce at the time — derived
+from the publish body's *declared* dependency ranges, so `serde = "1"` was
+scanned as version `1` and matched advisories fixed years earlier. Those
+range-floor false positives, arriving with gate power, are what actually forced
+scanning off. They are gone: the SBOM is now read from the `Cargo.lock` the
+published `.crate` embeds, so every component names the exact version the crate
+was built against ([ADR 0056](0056-resolved-component-sboms-from-payload.md)).
+
+With the imprecision removed, the remaining objection is entirely about
+*enforcement*, and enforcement is now a policy field rather than a property of
+scanning. `hort-crates` therefore runs `scanBackends: ["osv"]` with
+`enforcement: record`: the scan runs, the findings and the
+`PolicyEvaluated(Fail)` verdict are persisted exactly as they would be under
+`reject`, and no `ArtifactRejected` follows — publication proceeds, and the
+release chain cannot be broken by a scanner update. The vocabulary and the
+release authority a recorded verdict releases under are
+[ADR 0007](0007-fail-closed-quarantine-release-predicate.md); the
+re-derivation that a later tightening triggers is
+[ADR 0041](0041-continuous-scan-policy-enforcement.md). Neither is restated
+here.
+
+**Identity remains the write gate.** Nothing above grants or removes authority:
+`gha-release` is still the only principal that may push to `hort-crates`, and
+the scan is an observation about what it pushed, not a second gate on whether
+it may.
+
+**Blocking at retrieval stays available, and stays explicit.** Flipping the
+field to `reject` re-derives every in-scope artifact's verdict from its stored
+findings and re-holds the non-compliant ones — an operator decision with a
+known blast radius, made once, rather than a surprise from an advisory-database
+update.
+
+**`hort-oci` is unchanged.** It already scans (`scanBackends: ["trivy"]`) and
+already enforces, over a 1 h window — a container scan reads the artifact's own
+bytes, so it never carried the range-floor imprecision this amendment removes
+from the cargo path. Nothing here gives a new reason to revisit that posture;
+when one appears it is its own amendment.
 
 ### Scan posture and the warming model
 

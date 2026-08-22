@@ -4,13 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort OIDC IdentityProvider adapter — validates IdP-issued JWTs via JWKS"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-config     = { path = "../hort-config" }
-hort-domain     = { path = "../hort-domain" }
+hort-config     = { workspace = true }
+hort-domain     = { workspace = true }
 
 # The multi-issuer federation validator decodes the JWT payload WITHOUT
 # signature trust to extract the `iss` claim before issuer lookup.

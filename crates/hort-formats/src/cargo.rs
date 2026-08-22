@@ -4,6 +4,10 @@ pub mod config;
 // `hort_app::use_cases::index_serve` and is re-exported through
 // `index::CargoVersionPayload`. See explanation/index-construction.md.
 pub mod index;
+// Streaming `Cargo.lock` extraction from a `.crate` plus the pure
+// per-crate resolved-dependency closure walk that turns the lockfile into
+// exact-version SBOM components.
+pub mod lockfile;
 // Cargo sparse-index NDJSON streaming projector (see ADR 0026).
 pub mod projection;
 
@@ -11,7 +15,10 @@ use std::io::BufRead as _;
 
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::format_handler::{DependencySpec, FormatHandler, VersionDiscovery};
+use hort_domain::ports::format_handler::{
+    DependencySpec, FormatHandler, PayloadSbom, PayloadSbomExtraction, SbomResolution,
+    VersionDiscovery,
+};
 use hort_domain::ports::upstream_proxy::CountingReader;
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
@@ -446,8 +453,25 @@ impl FormatHandler for CargoFormatHandler {
         Some(self)
     }
 
+    /// `Some(self)` — cargo implements [`PayloadSbom`]. A published
+    /// `.crate` embeds its own `Cargo.lock`, so the scan path can name
+    /// every dependency at the exact version that was built instead of
+    /// at the declared range's floor. See the impl block below.
+    fn payload_sbom(&self) -> Option<&dyn PayloadSbom> {
+        Some(self)
+    }
+
     /// Extract a deterministic SBOM from the cargo metadata the handler
     /// captured at ingest. Pure function — does not read `payload`.
+    ///
+    /// **Declared ranges, not resolved versions.** The components this
+    /// produces carry the *floor* of each declared range (`serde = "1"`
+    /// becomes version `1`), which is the right answer for the callers
+    /// that have only metadata to work with — the index/publish paths —
+    /// and the wrong one for a vulnerability verdict. The scan path does
+    /// not use this method: it goes through
+    /// [`PayloadSbom::extract_sbom_from_payload`] below, which reads the
+    /// artifact's embedded lockfile.
     ///
     /// Recognises both shapes:
     /// - **Registry-index / publish-body shape:** the JSON object with a
@@ -556,6 +580,177 @@ impl FormatHandler for CargoFormatHandler {
             subject: Some(subject),
             components,
         }))
+    }
+}
+
+/// cargo's [`PayloadSbom`] participation — the SBOM the **scan** path
+/// uses.
+///
+/// A published `.crate` embeds a `Cargo.lock` recording the exact
+/// version cargo resolved every dependency to. Walking the published
+/// crate's closure in that file yields components a vulnerability
+/// scanner can match honestly; the declared-range components
+/// [`FormatHandler::extract_sbom`] produces cannot be matched honestly at
+/// all, because a range floor is not a version anything was ever built
+/// with.
+///
+/// **Three outcomes, three postures.** The lockfile is either usable, or
+/// absent, or present-and-broken, and the extraction never conflates
+/// them:
+///
+/// | Payload | Components | [`SbomResolution`] |
+/// |---|---|---|
+/// | lockfile walks cleanly | resolved, exact versions | `Resolved` |
+/// | no lockfile in the archive | none — subject only | `NoLockfile` |
+/// | lockfile unreadable/inconsistent, or the archive is | none — subject only | `UnusableLockfile` |
+///
+/// **The absent-lockfile arm is subject-only, never declared-deps.**
+/// Falling back to the range-floor component list would put components
+/// into a BOM that feed a release verdict while naming versions nothing
+/// was built with — the false-positive source this whole path exists to
+/// remove. A subject-only BOM still scans the crate itself, which is the
+/// honest floor when its dependency resolve is unknown.
+///
+/// **Every failure is soft.** No arm returns `Err`: a corrupt or hostile
+/// archive degrades to subject-only with `UnusableLockfile` and a
+/// `warn`, because SBOM enrichment is not release authority and a
+/// publisher-controlled byte sequence must not be able to abort a scan.
+impl PayloadSbom for CargoFormatHandler {
+    fn extract_sbom_from_payload(
+        &self,
+        coords: &ArtifactCoords,
+        format_metadata: &serde_json::Value,
+        payload: PayloadAccess<'_>,
+    ) -> DomainResult<PayloadSbomExtraction> {
+        let licenses = extract_cargo_license_list(format_metadata);
+        let subject = build_subject_component(
+            coords,
+            Ecosystem::Cargo,
+            "pkg:cargo/",
+            &coords.name,
+            licenses,
+        );
+
+        // The lockfile walk starts at the published crate's own
+        // `[[package]]` node, which is identified by name AND exact
+        // version. Without a version there is no way to pick the right
+        // node, so a lockfile that is present is still unusable *to us* —
+        // reported as such rather than silently walking the wrong resolve.
+        let Some(version) = coords.version.clone() else {
+            tracing::warn!(
+                crate_name = %coords.name,
+                "cargo SBOM: coords carry no version; cannot anchor the lockfile resolve root",
+            );
+            return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
+        };
+
+        let mut stream;
+        let mut slice;
+        let content: &mut dyn std::io::Read = match payload {
+            PayloadAccess::Bytes(b) => {
+                slice = b;
+                &mut slice
+            }
+            PayloadAccess::ReadStream(r) => {
+                stream = r;
+                &mut stream
+            }
+        };
+
+        let lockfile_bytes = match lockfile::extract_lockfile_bytes(content) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => return Ok(subject_only(subject, SbomResolution::NoLockfile)),
+            Err(e) => {
+                tracing::warn!(
+                    crate_name = %coords.name,
+                    version = %version,
+                    error = %e,
+                    "cargo SBOM: lockfile extraction failed; falling back to a subject-only BOM",
+                );
+                return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
+            }
+        };
+
+        let parsed = match lockfile::CargoLockfile::parse(&lockfile_bytes) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    crate_name = %coords.name,
+                    version = %version,
+                    error = %e,
+                    "cargo SBOM: embedded Cargo.lock is unparseable; falling back to a subject-only BOM",
+                );
+                return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
+            }
+        };
+
+        // Lockfile edges carry no dependency kind, so the root's dev-only
+        // subtree is indistinguishable from the rest inside the file. The
+        // stored registry-index metadata does carry `kind`, and
+        // `non_dev_first_hop` projects it into the set of first-hop names
+        // worth walking. `None` (no index metadata stored) keeps the
+        // unfiltered over-approximation — wider than the truth, never
+        // narrower.
+        let first_hop = lockfile::non_dev_first_hop(format_metadata);
+        let closure = match parsed.resolve_closure(&coords.name, &version, first_hop.as_ref()) {
+            Ok(closure) => closure,
+            Err(e) => {
+                tracing::warn!(
+                    crate_name = %coords.name,
+                    version = %version,
+                    error = %e,
+                    "cargo SBOM: embedded Cargo.lock is not a self-consistent resolve; \
+                     falling back to a subject-only BOM",
+                );
+                return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
+            }
+        };
+
+        let components = closure
+            .components
+            .into_iter()
+            .map(|resolved| SbomComponent {
+                purl: format!("pkg:cargo/{}@{}", resolved.name, resolved.version),
+                // A first-hop edge the published crate declares itself is
+                // direct; everything the walk reached through another
+                // package is not. Without index metadata there is no
+                // declaration to compare against and nothing is claimed.
+                direct_dependency: first_hop
+                    .as_ref()
+                    .is_some_and(|declared| declared.contains(&resolved.name)),
+                name: resolved.name,
+                version: Some(resolved.version),
+                ecosystem: Ecosystem::Cargo,
+                // Deliberately empty: the lockfile records no license, and
+                // the subject's own SPDX expression describes the
+                // published crate, not the third-party code it resolves.
+                // Copying it onto every dependency would assert a licence
+                // fact nothing in the payload supports.
+                licenses: Vec::new(),
+            })
+            .collect();
+
+        Ok(PayloadSbomExtraction {
+            sbom: Some(Sbom {
+                subject: Some(subject),
+                components,
+            }),
+            resolution: SbomResolution::Resolved,
+            skipped_non_registry: closure.skipped_non_registry,
+        })
+    }
+}
+
+/// A BOM that names the artifact under scan and claims nothing about its
+/// dependencies — the honest degradation whenever the resolve is unknown.
+fn subject_only(subject: SbomComponent, resolution: SbomResolution) -> PayloadSbomExtraction {
+    PayloadSbomExtraction {
+        sbom: Some(Sbom {
+            subject: Some(subject),
+            components: Vec::new(),
+        }),
+        resolution,
+        skipped_non_registry: 0,
     }
 }
 
@@ -866,12 +1061,29 @@ fn cargo_toml_version_from_value(value: &serde_json::Value) -> Option<String> {
 /// (`{dir}/vendor/x/Cargo.toml`, `{dir}/Cargo.toml.orig`, …) are NOT
 /// matched. A leading `./` (some tar writers prefix paths) is tolerated.
 fn is_top_level_cargo_toml(path: &str) -> bool {
+    is_top_level_entry(path, "Cargo.toml")
+}
+
+/// Whether `path` names `file_name` directly inside the archive's single
+/// top-level directory — the shape every `.crate` member shares.
+///
+/// Generalised out of the manifest predicate so the lockfile walk
+/// ([`lockfile::extract_lockfile_bytes`]) matches its own entry by the
+/// same rule. A trailing-name match alone would also accept
+/// `{dir}/Cargo.toml.orig`; requiring the `/` boundary and a single
+/// segment before it rejects that, and rejects nested copies
+/// (`{dir}/vendor/x/Cargo.toml`) and a bare root-level file. A leading
+/// `./` (some tar writers prefix paths) is tolerated.
+fn is_top_level_entry(path: &str, file_name: &str) -> bool {
     let path = path.strip_prefix("./").unwrap_or(path);
-    let Some(dir) = path.strip_suffix("/Cargo.toml") else {
+    let Some(dir) = path
+        .strip_suffix(file_name)
+        .and_then(|dir| dir.strip_suffix('/'))
+    else {
         return false;
     };
-    // Exactly one segment before `/Cargo.toml`: a non-empty `{dir}` with no
-    // further `/`.
+    // Exactly one segment before the file name: a non-empty `{dir}` with
+    // no further `/`.
     !dir.is_empty() && !dir.contains('/')
 }
 
@@ -2404,6 +2616,420 @@ version = "1.0.0"
         assert_eq!(
             url,
             "http://internal-mirror.example.com/crates/serde/1.0.0/download"
+        );
+    }
+
+    // -- PayloadSbom: the scan path's resolved-version SBOM -------------------
+
+    /// A minimal but complete resolve for `demo 0.1.0`, covering every
+    /// case the closure walk distinguishes: a transitive chain
+    /// (`serde → serde_derive`), a build-dependency (`cc`), a
+    /// dev-dependency with its own subtree (`proptest → rand`), and a
+    /// path-sourced sibling that is skipped but still traversed to reach
+    /// the registry package behind it (`sibling → shared`).
+    const DEMO_LOCKFILE: &str = r#"# This file is automatically @generated by Cargo.
+version = 4
+
+[[package]]
+name = "demo"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "proptest",
+ "serde",
+ "sibling",
+]
+
+[[package]]
+name = "cc"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ccsum"
+
+[[package]]
+name = "proptest"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "propsum"
+dependencies = [
+ "rand",
+]
+
+[[package]]
+name = "rand"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "randsum"
+
+[[package]]
+name = "serde"
+version = "1.0.200"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "serdesum"
+dependencies = [
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.200"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "sdsum"
+
+[[package]]
+name = "shared"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "sharedsum"
+
+[[package]]
+name = "sibling"
+version = "0.1.0"
+dependencies = [
+ "shared",
+]
+"#;
+
+    /// `demo`'s stored registry-index metadata. Its `deps[].kind` is the
+    /// only place the dev/normal boundary exists — the lockfile does not
+    /// carry it. `req` values are ranges on purpose: they are what the
+    /// metadata-only branch would emit as versions, and what the resolved
+    /// branch must never fall back to.
+    fn demo_index_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "name": "demo",
+            "vers": "0.1.0",
+            "license": "MIT",
+            "deps": [
+                { "name": "serde",    "req": "^1",   "kind": "normal" },
+                { "name": "cc",       "req": "1",    "kind": "build" },
+                { "name": "proptest", "req": "1",    "kind": "dev" },
+                { "name": "sibling",  "req": "0.1",  "kind": "normal" },
+            ],
+        })
+    }
+
+    /// A `.crate`-shaped archive carrying `lock` as its top-level
+    /// `Cargo.lock`, in the position cargo writes it (sorted path order
+    /// puts the lockfile ahead of the manifest).
+    fn crate_with_lockfile(lock: &str) -> Vec<u8> {
+        make_tar_gz(&[
+            ("demo-0.1.0/Cargo.lock", lock.as_bytes()),
+            ("demo-0.1.0/Cargo.toml", b"[package]\nname = \"demo\"\n"),
+        ])
+    }
+
+    /// `{name}@{version}` for each emitted component, in emit order.
+    fn component_ids(sbom: &Sbom) -> Vec<String> {
+        sbom.components
+            .iter()
+            .map(|c| format!("{}@{}", c.name, c.version.clone().unwrap_or_default()))
+            .collect()
+    }
+
+    fn resolved_from(payload: &[u8], metadata: &serde_json::Value) -> PayloadSbomExtraction {
+        handler()
+            .extract_sbom_from_payload(
+                &sbom_coords("demo", "0.1.0"),
+                metadata,
+                PayloadAccess::Bytes(payload),
+            )
+            .expect("payload SBOM extraction never returns Err")
+    }
+
+    #[test]
+    fn payload_sbom_emits_the_closure_at_exact_lockfile_versions() {
+        let archive = crate_with_lockfile(DEMO_LOCKFILE);
+        let extraction = resolved_from(&archive, &demo_index_metadata());
+
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        let sbom = extraction.sbom.expect("resolved BOM");
+
+        // The dev-only subtree (`proptest`, `rand`) is gone — the index
+        // seed removed it. `cc` (build) stays: consumers compile it.
+        assert_eq!(
+            component_ids(&sbom),
+            vec![
+                "cc@1.2.0",
+                "serde@1.0.200",
+                "serde_derive@1.0.200",
+                "shared@1.0.0",
+            ],
+        );
+        // Exact versions, never the `^1` / `0.1` range floors the
+        // metadata-only branch would have produced.
+        assert!(
+            sbom.components
+                .iter()
+                .all(|c| c.version.as_deref().is_some_and(|v| v.contains('.'))),
+            "every resolved component carries an exact version"
+        );
+        assert_eq!(
+            sbom.components[1].purl, "pkg:cargo/serde@1.0.200",
+            "purl carries the resolved version"
+        );
+        // `sibling` is path-sourced: traversed (so `shared` is reached)
+        // but not emitted, and counted.
+        assert_eq!(extraction.skipped_non_registry, 1);
+    }
+
+    #[test]
+    fn payload_sbom_marks_declared_first_hop_edges_as_direct() {
+        let archive = crate_with_lockfile(DEMO_LOCKFILE);
+        let sbom = resolved_from(&archive, &demo_index_metadata())
+            .sbom
+            .expect("resolved BOM");
+
+        let direct: Vec<&str> = sbom
+            .components
+            .iter()
+            .filter(|c| c.direct_dependency)
+            .map(|c| c.name.as_str())
+            .collect();
+        // `serde` and `cc` are declared by `demo` itself; `serde_derive`
+        // and `shared` were only reached through another package.
+        assert_eq!(direct, vec!["cc", "serde"]);
+    }
+
+    #[test]
+    fn payload_sbom_resolved_components_claim_no_licenses() {
+        // The lockfile records no licence, and the subject's SPDX
+        // expression describes the published crate — not the third-party
+        // code it resolves. Copying it down would assert a licence fact
+        // nothing in the payload supports.
+        let archive = crate_with_lockfile(DEMO_LOCKFILE);
+        let sbom = resolved_from(&archive, &demo_index_metadata())
+            .sbom
+            .expect("resolved BOM");
+
+        assert!(sbom.components.iter().all(|c| c.licenses.is_empty()));
+        assert_eq!(
+            sbom.subject.expect("subject").licenses,
+            vec!["MIT".to_string()],
+            "the subject still carries the published crate's own licence"
+        );
+    }
+
+    #[test]
+    fn payload_sbom_without_index_metadata_keeps_the_unfiltered_closure() {
+        // No stored index metadata means no `kind` information, so the
+        // dev subtree cannot be excluded. The walk over-approximates
+        // (wider than the truth, never narrower) rather than guessing,
+        // and claims nothing about which edges are direct.
+        let archive = crate_with_lockfile(DEMO_LOCKFILE);
+        let extraction = resolved_from(&archive, &serde_json::Value::Null);
+
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        let sbom = extraction.sbom.expect("resolved BOM");
+        assert!(component_ids(&sbom).contains(&"proptest@1.5.0".to_string()));
+        assert!(component_ids(&sbom).contains(&"rand@0.8.5".to_string()));
+        assert!(
+            sbom.components.iter().all(|c| !c.direct_dependency),
+            "with no declaration to compare against, directness is not claimed"
+        );
+    }
+
+    #[test]
+    fn payload_sbom_absent_lockfile_is_subject_only_not_declared_deps() {
+        // The load-bearing case. `demo`'s metadata declares `serde = "^1"`;
+        // the metadata-only branch would turn that into a component at
+        // version `1`, which no build ever used and which matches
+        // advisories against a version that never shipped. A `.crate`
+        // with no lockfile must produce a BOM naming only the artifact
+        // under scan.
+        let filler = vec![b'\x5a'; 4 * 1024];
+        let archive = make_tar_gz(&[
+            ("demo-0.1.0/Cargo.toml", b"[package]\nname = \"demo\"\n"),
+            ("demo-0.1.0/src/lib.rs", b"// code"),
+            ("demo-0.1.0/src/data.bin", &incompressible_bytes(8 * 1024)),
+            ("demo-0.1.0/src/more.bin", &filler),
+        ]);
+        let extraction = resolved_from(&archive, &demo_index_metadata());
+
+        assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
+        assert_eq!(extraction.skipped_non_registry, 0);
+        let sbom = extraction.sbom.expect("subject-only BOM");
+        assert!(
+            sbom.components.is_empty(),
+            "no range-floor components may reach a scan verdict, got {:?}",
+            component_ids(&sbom)
+        );
+        assert_eq!(
+            sbom.subject.expect("subject").purl,
+            "pkg:cargo/demo@0.1.0",
+            "the crate itself is still scanned"
+        );
+    }
+
+    #[test]
+    fn payload_sbom_unusable_lockfile_arms_are_distinct_from_absence() {
+        // Three different ways the payload can carry a lockfile that
+        // cannot be trusted to describe what was built. All degrade to
+        // subject-only, and all report `UnusableLockfile` — never
+        // `NoLockfile`, which would claim the archive had nothing in it.
+        let cases: [(&str, Vec<u8>); 3] = [
+            (
+                "not valid TOML",
+                crate_with_lockfile("[[package]\nthis = is = not = toml"),
+            ),
+            (
+                "no entry for the published crate",
+                crate_with_lockfile(
+                    "version = 4\n\n[[package]]\nname = \"other\"\nversion = \"9.9.9\"\n",
+                ),
+            ),
+            (
+                // A declared edge (so the non-dev seed keeps it) naming a
+                // package the file does not contain — cargo never writes
+                // such a resolve, so the file cannot describe a build.
+                "an edge naming a package the file does not contain",
+                crate_with_lockfile(
+                    "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n\
+                     dependencies = [\n \"serde\",\n]\n",
+                ),
+            ),
+        ];
+
+        for (label, archive) in cases {
+            let extraction = resolved_from(&archive, &demo_index_metadata());
+            assert_eq!(
+                extraction.resolution,
+                SbomResolution::UnusableLockfile,
+                "case: {label}"
+            );
+            let sbom = extraction.sbom.expect("subject-only BOM");
+            assert!(sbom.components.is_empty(), "case: {label}");
+            assert!(sbom.subject.is_some(), "case: {label}");
+        }
+    }
+
+    #[test]
+    fn payload_sbom_degrades_softly_when_the_payload_is_not_an_archive() {
+        // A publisher-controlled byte sequence must not be able to abort
+        // a scan: SBOM enrichment is not release authority, so even a
+        // payload that is not a `.crate` at all yields a subject-only BOM
+        // rather than an `Err`.
+        let extraction = resolved_from(b"this is not a gzip-tar .crate", &demo_index_metadata());
+        assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
+        assert!(extraction
+            .sbom
+            .expect("subject-only BOM")
+            .components
+            .is_empty());
+    }
+
+    #[test]
+    fn payload_sbom_versionless_coords_cannot_anchor_the_resolve_root() {
+        // The root node is identified by name AND exact version. Without
+        // a version any lockfile present is unusable *to us* — reported
+        // as such rather than silently walking some other version's
+        // resolve.
+        let coords = ArtifactCoords {
+            version: None,
+            ..sbom_coords("demo", "0.1.0")
+        };
+        let extraction = handler()
+            .extract_sbom_from_payload(
+                &coords,
+                &demo_index_metadata(),
+                PayloadAccess::Bytes(&crate_with_lockfile(DEMO_LOCKFILE)),
+            )
+            .expect("never Err");
+        assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
+    }
+
+    #[test]
+    fn payload_sbom_reads_the_streaming_payload_variant() {
+        // The scan orchestrator hands over `PayloadAccess::ReadStream`
+        // (a bridge over the CAS read), never `Bytes` — pin that the
+        // handler consumes it identically.
+        let archive = crate_with_lockfile(DEMO_LOCKFILE);
+        let stream = std::io::Cursor::new(archive.clone());
+        let streamed = handler()
+            .extract_sbom_from_payload(
+                &sbom_coords("demo", "0.1.0"),
+                &demo_index_metadata(),
+                PayloadAccess::ReadStream(Box::new(stream)),
+            )
+            .expect("never Err");
+        let buffered = resolved_from(&archive, &demo_index_metadata());
+
+        assert_eq!(streamed.resolution, buffered.resolution);
+        assert_eq!(
+            component_ids(&streamed.sbom.expect("BOM")),
+            component_ids(&buffered.sbom.expect("BOM")),
+        );
+    }
+
+    #[test]
+    fn payload_sbom_capability_is_declared_by_cargo_alone() {
+        // The declaration is what lets the scan orchestrator skip a CAS
+        // read for every other format; `None` must stay the honest answer
+        // for handlers that do not read the payload.
+        assert!(
+            handler().payload_sbom().is_some(),
+            "cargo derives its scan SBOM from the payload"
+        );
+        assert!(
+            crate::npm::NpmFormatHandler.payload_sbom().is_none(),
+            "npm's SBOM comes from stored metadata; it must not cost a CAS read"
+        );
+        assert!(
+            crate::pypi::PyPiFormatHandler.payload_sbom().is_none(),
+            "PyPI's SBOM comes from stored metadata; it must not cost a CAS read"
+        );
+    }
+
+    #[test]
+    fn metadata_only_extract_sbom_still_emits_declared_range_components() {
+        // The proxy / index-metadata callers keep the declared-deps
+        // branch: `extract_sbom` is untouched by the payload path, and
+        // regressing it would break the SBOM the publish path renders.
+        let sbom = handler()
+            .extract_sbom(
+                &sbom_coords("demo", "0.1.0"),
+                &demo_index_metadata(),
+                PayloadAccess::Bytes(&crate_with_lockfile(DEMO_LOCKFILE)),
+            )
+            .expect("Ok")
+            .expect("Some");
+        assert_eq!(
+            component_ids(&sbom),
+            vec!["serde@1", "cc@1", "proptest@1", "sibling@0.1"],
+            "extract_sbom reads metadata only — it must ignore the payload entirely"
+        );
+    }
+
+    /// `len` bytes deflate cannot shrink, from a fixed seed so fixtures
+    /// are byte-identical run to run. `archive_bounds` caps decompressed
+    /// output at ten times the *compressed* input, so a fixture padded
+    /// with compressible filler trips the ratio guard long before a real
+    /// `.crate` would.
+    fn incompressible_bytes(len: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extract_dependency_specs_rejects_an_artifact_over_the_compressed_cap() {
+        // Sibling of the lockfile walk's cap test: the reader is bounded
+        // before anything is decompressed, so an oversized artifact is
+        // refused rather than buffered whole. Zeros are fine — the cap is
+        // on the compressed input and nothing gets as far as inflating.
+        let mut oversized = std::io::Cursor::new(vec![0u8; CARGO_CRATE_MAX_BYTES + 1]);
+        let err = handler()
+            .extract_dependency_specs(&mut oversized)
+            .unwrap_err();
+        assert!(
+            matches!(err, DomainError::Validation(ref m) if m.contains("cargo crate max is")),
+            "{err:?}"
         );
     }
 }

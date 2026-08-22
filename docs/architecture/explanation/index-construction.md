@@ -36,8 +36,12 @@ The pipeline has three stages with sharply separated knowledge:
   that fetches and parses the upstream document, hydrating each
   upstream version with hort's known quarantine status via
   `ArtifactUseCase::package_version_status` (e.g. `ProxyNpmSource`
-  in the same module). Sources know where versions come from; they
-  apply no policy.
+  in the same module). A hosted source whose wire document carries
+  more than the artifact row holds joins the stored format metadata
+  in through `ArtifactUseCase::batch_metadata` — one batched read for
+  the whole version set — as PyPI does for `requires-python` and
+  cargo does for each version's `deps` / `features`. Sources know
+  where versions come from; they apply no policy.
 - A **filter pipeline** drops entries. Filters implement
   `IndexFilter` (`crates/hort-app/src/use_cases/index_serve.rs`) and
   operate only on the spine fields described below — they are pure
@@ -79,7 +83,7 @@ same order (`crates/hort-http-npm/src/serve.rs`,
 
 ```rust
 let filters: Vec<Arc<dyn IndexFilter>> = vec![
-    Arc::new(NonServableStatusFilter),
+    Arc::new(NonServableStatusFilter::default()),
     Arc::new(IndexModeFilter::new(repo.index_mode)),
 ];
 ```
@@ -87,13 +91,36 @@ let filters: Vec<Arc<dyn IndexFilter>> = vec![
 `NonServableStatusFilter`
 (`crates/hort-app/src/use_cases/index_filters.rs`) is universal: it
 drops every entry whose status is `Quarantined`, `Rejected`, or
-`ScanIndeterminate`, unconditionally — regardless of repository
-type, regardless of index mode. This is the filter that makes a
-re-scan verdict visible at the resolution layer: when a scan
-transitions a long-served hosted artifact to `Rejected`, the version
-disappears from the index on the next serve, on every format. An
-end-to-end test pins this per format
+`ScanIndeterminate` — regardless of repository type, regardless of
+index mode. This is the filter that makes a re-scan verdict visible at
+the resolution layer: when a scan transitions a long-served hosted
+artifact to `Rejected`, the version disappears from the index on the
+next serve, on every format. An end-to-end test pins this per format
 (`crates/hort-server/tests/rescan_rejection_visibility.rs`).
+
+### The one caller-dependent column
+
+Both filters take a `HeldVisibility`, and the pipeline above is the
+`Hidden` (ordinary reader's) construction every format composes by
+default. The cargo serve handler is the one site that may construct
+the pipeline with `HeldVisibility::WriteAuthorized` instead: a
+principal holding *granted* write authority on a hosted repository
+resolves that repository's `Quarantined` versions, because a publisher
+has to resolve the sibling it just uploaded before the hold clears
+([ADR 0055](../../adr/0055-write-authorized-hold-read-generalised.md),
+generalising [ADR 0039](../../adr/0039-keyed-provenance-verification.md)
+§10 from the OCI manifest path).
+
+The exemption moves exactly one column of the truth tables below —
+`Some(Quarantined)` — and only for that caller. `Rejected` and
+`ScanIndeterminate` are terminal verdicts and stay dropped for
+everyone; the never-ingested column stays the mode's own decision; a
+virtual (aggregating) read keeps the ordinary view, because a grant on
+the aggregator is not authority over the member the entry lives in;
+and the *content* paths carry no exemption at all, so held bytes stay
+`503` to every caller including the publisher. Because the cargo
+index's served set therefore depends on identity, that route emits
+`Cache-Control: private, no-store` and `Vary: Authorization`.
 
 `IndexModeFilter` then makes the mode-specific decision about the
 "never ingested" tier — and only that tier (its truth table is in the
@@ -102,10 +129,13 @@ end-to-end test pins this per format
 The ordering convention is `[universal, mode-specific,
 operator-defined]`, and the universal filter holding the first slot
 is what makes the no-data-leak property independent of everything
-behind it. Because `NonServableStatusFilter` is unconditional and
-runs ahead of any mode- or operator-shaped filtering, no downstream
-filter — present or future — ever sees a non-servable entry, so no
-mode value and no future operator-exclusion filter can re-admit one.
+behind it. Because `NonServableStatusFilter` runs ahead of any mode- or
+operator-shaped filtering, no downstream filter — present or future —
+ever sees an entry that is non-servable *to this caller*, so no mode
+value and no future operator-exclusion filter can re-admit one. The
+hold-read above does not weaken that: it is decided at pipeline
+construction, in the handler, from the caller's authority — never by a
+filter re-admitting an entry an earlier filter dropped.
 With today's two filters the result happens to be order-independent
 (both drop known-non-servable entries; only the never-ingested column
 differs between modes, and the universal filter never touches it),
@@ -135,7 +165,9 @@ The bounded part is what the mode can *add*: the additive set under
 `IncludePending` is exactly the `Unknown` tier — upstream-advertised,
 never-ingested versions — and never `Quarantined`, `Rejected`, or
 `ScanIndeterminate` ones, because the universal filter has already
-removed those before the mode filter runs. That bound is why the
+removed those before the mode filter runs. The mode is not what the
+hold-read widens either: the exemption is the caller's authority, is
+identical under both modes, and `IncludePending` grants it to nobody. That bound is why the
 mode's interactions with the other release-gate-influencing opt-ins
 (`trust_upstream_publish_time`, `scan_backends: []`) are documented
 as benign in the cross-opt-in interaction matrix

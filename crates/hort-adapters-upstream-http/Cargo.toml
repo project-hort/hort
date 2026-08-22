@@ -4,20 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort outbound adapter — HTTP-based pull-through upstream proxy"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain      = { path = "../hort-domain" }
-hort-app         = { path = "../hort-app" }
-hort-config      = { path = "../hort-config" }
+hort-domain      = { workspace = true }
+hort-app         = { workspace = true }
+hort-config      = { workspace = true }
 # The `is_routable` routability classifier (SSRF defence — see
 # `docs/architecture/explanation/security.md`) lives in `hort-net-egress`
 # so the OIDC adapter can share the same predicate. The connect-time
 # `GuardedDnsResolver` and `build_egress_redirect_policy` builder are
 # retired; the routability classifier is the only export consumed here.
-hort-net-egress  = { path = "../hort-net-egress" }
+hort-net-egress  = { workspace = true }
 
 reqwest    = { workspace = true }
 tokio      = { workspace = true }

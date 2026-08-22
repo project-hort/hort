@@ -1,7 +1,7 @@
 # 0007 — Fail-closed quarantine release predicate
 
 - **Status:** Accepted
-- **Enforced by:** the background sweep releases an artifact only when `quarantine_until <= now()` **AND** the application layer can supply a recognised release authority; the predicate accepts exactly five `(reason, authority)` pairs and denies every other. The predicate is implemented in `Artifact::release` (`crates/hort-domain/src/entities/artifact.rs`) with exhaustive per-authority tests; the architect anti-pattern *scanner clean → immediate release* is a review hard-block.
+- **Enforced by:** the background sweep releases an artifact only when `quarantine_until <= now()` **AND** the application layer can supply a recognised release authority; the predicate accepts exactly six `(reason, authority)` pairs (five as originally decided, plus `ScanRecorded` — see the 2026-08-21 amendment) and denies every other. The predicate is implemented in `Artifact::release` (`crates/hort-domain/src/entities/artifact.rs`) with exhaustive per-authority tests; the architect anti-pattern *scanner clean → immediate release* is a review hard-block.
 - **Supersedes:** —
 
 ## Context
@@ -14,13 +14,14 @@ Quarantine is the observation window that lets a scan run and lets a malicious p
 
 Downloads are blocked while `quarantine_status = 'quarantined'`, regardless of the timestamp — the **status** is the gate, the **timestamp** is only the sweep's candidacy filter.
 
-The background sweep transitions an artifact to `released` only when `quarantine_until <= now()` **AND** a release authority is available. The release predicate accepts **exactly five authorities** and denies every other `(reason, authority)` pair:
+The background sweep transitions an artifact to `released` only when `quarantine_until <= now()` **AND** a release authority is available. The release predicate accepts **exactly five authorities** (six as of the 2026-08-21 `ScanRecorded` amendment below) and denies every other `(reason, authority)` pair:
 
 1. `ScanSucceeded` — a successful `ScanCompleted` on the artifact stream.
 2. `ScanWaived` — the resolved `ScanPolicy` declares `scan_backends: []`.
 3. `AdminOverride` — explicit admin release.
 4. `CuratorWaiver` — curator waive (`Quarantined`-state only).
 5. `PolicyReEvaluation` — post-exclusion policy re-evaluation.
+6. `ScanRecorded` — the artifact was scanned and the resolved `ScanPolicy` declares `enforcement: record` (added by the 2026-08-21 amendment below; not part of the original five).
 
 `ScanCompleted(clean)` does **not** clear `quarantine_until` or set `released`. `ScanCompleted(findings)` immediately sets `rejected` (time never reverses this). A scan job that exhausts retries fails closed — see the exhaustion split below.
 
@@ -106,6 +107,62 @@ regular upload per the spec, with no handler-level special case. A
 `Quarantined` source stays mountable on purpose: the target copy is itself
 quarantined and scanned under the rule above, so no unscanned bytes serve,
 and refusing it would break legitimate mid-window mounts for no gain.
+
+### A sixth authority: `ScanRecorded` under `enforcement: record` (amended 2026-08-21)
+
+`ScanPolicy` gained an `enforcement: reject | record` mode. Under `record`
+the scan still runs, the findings and the `PolicyEvaluated(Fail)` verdict are
+still persisted, and the artifact is **not** rejected — the operator has
+declared that a scan verdict does not gate publication for that scope
+("publish proceeds with findings; blocking at retrieval is the consuming
+policy's job").
+
+That declaration cannot be honoured without a release authority. Such an
+artifact's own latest `ScanCompleted` carries `finding_count > 0`, so
+authority 1 is by construction unavailable to it; with no authority the
+artifact stays `Quarantined` and 503s forever — the operator's opt-in would
+be inert (ADR 0015). The predicate therefore accepts a **sixth** authority:
+
+6. `ScanRecorded` — the artifact was scanned, and its resolved `ScanPolicy`
+   declares `enforcement: record`.
+
+**Why a new variant rather than widening an existing one.** Both
+alternatives were considered and are worse, for the same reason:
+
+- *Widening `ScanSucceeded`* would make the "latest verdict, not mere
+  presence" clause above (`finding_count == 0`) conditional on a policy
+  field — softening a defence-in-depth hardening — and would stamp
+  `authority = scan_succeeded` on a release of an artifact that did not
+  pass, destroying the audit trail's ability to distinguish the two.
+- *Reusing `ScanWaived`* would assert the operator declared the scope
+  un-scanned, which is precisely what did **not** happen here: the scan ran
+  and its evidence exists.
+
+A distinct token keeps "released with recorded, over-threshold findings"
+queryable, and leaves all five existing arms byte-identical. This is the
+"adding any new release path means adding an authority to the enumerated
+predicate, with its own guard" consequence below, applied as written.
+
+**Its guard, and what it does not relax.** `ScanRecorded` is constructible
+only by the application layer, from two verified facts: a `ScanCompleted`
+exists on the artifact's own stream with **no later `ArtifactRejected`**, and
+the resolved policy's `enforcement` is `record`. The `ScanCompleted`-must-
+exist clause is load-bearing — it keeps the second impossible failure mode
+from *Context* (a never-successfully-scanned artifact releasing on the timer
+alone) true under `record` as well: the mode un-gates the *verdict*, never
+the *observation*. It pairs only with `ReleaseReason::Timer` and carries the
+**same** provenance AND-precondition as authorities 1 and 2, so a `Required`
+-mode artifact with `Pending` clearance still does not release; the curation
+conjunct and the observation window are likewise untouched. `record` un-gates
+exactly one axis.
+
+Per the bounded-await corollary below, the read-path candidacy gates were
+re-validated against this authority: they consult `quarantine_status` and the
+provenance clearance only, so a `record`-mode artifact is a wait candidate on
+the same terms as a clean-scan one, and the inline fast-path release in
+`record_scan_result` mints `ScanRecorded` (not `ScanSucceeded`) for it — the
+same token the sweep's `resolve_release_authority` would mint for the same
+artifact.
 
 ### Read-path bounded-await pattern (issue #65, amended 2026-07-20)
 

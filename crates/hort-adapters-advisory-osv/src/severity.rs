@@ -4,15 +4,17 @@
 //! The OSV `vulns[]` entry exposes severity in two shapes:
 //!
 //! 1. A `severity` array of CVSS vectors (preferred, machine-readable).
-//!    The vector encodes a `CVSS:<version>/AV:.../AC:.../...` tail; the
-//!    full numeric base score requires a CVSS calculator. **For v1 we
-//!    skip the per-vuln drill-down** — `querybatch` does not return
-//!    base scores in-line, so the score fed to this mapper comes from
-//!    `database_specific.severity` (a string label) when present, else
-//!    `Medium` as the documented default.
+//!    When a vector parses as a CVSS v3.0/v3.1 Base Metric Group, its
+//!    base score is computed directly via the `cvss` crate. `querybatch`
+//!    does not always return a full Base Metric Group inline (temporal
+//!    metrics mixed in, a CVSS v2/v4 vector, or the array simply absent),
+//!    in which case this source contributes nothing and the mapper falls
+//!    through to the next source.
 //! 2. A `database_specific.severity` string label like `"HIGH"`, `"7.5"`,
 //!    or `"7.5 HIGH"`. We accept either a parseable float or a known
-//!    label.
+//!    label. Used when no `severity[].score` vector computed a score.
+//!
+//! Neither source present → `Medium` as the documented default.
 //!
 //! | Numeric score | Threshold |
 //! |---|---|
@@ -23,7 +25,10 @@
 //! | otherwise           | (string fallback, else `Medium`) |
 //!
 //! Boundary tests cover each band edge in both directions (just-above /
-//! exactly-at).
+//! exactly-at). Bands are textually mirrored in
+//! `hort-adapters-scanner-osv::severity` — the two adapter crates share
+//! no dependency edge, so the banding logic is duplicated rather than
+//! extracted.
 
 use hort_domain::entities::scan_policy::SeverityThreshold;
 
@@ -51,6 +56,19 @@ pub(crate) fn cvss_score_to_severity(score: f32) -> Option<SeverityThreshold> {
         // falls back to `Medium`.
         None
     }
+}
+
+/// Parse a CVSS v3.0/v3.1 vector string (e.g.
+/// `"CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"`) and compute its base
+/// score per the CVSS v3.1 specification, section 5. Returns `None` for
+/// anything the `cvss` crate cannot parse as a v3.0/v3.1 Base Metric
+/// Group — a CVSS v2 or v4 vector, a vector carrying Temporal or
+/// Environmental metrics alongside the Base group, or malformed input.
+/// This is the preferred severity source; the caller falls back to
+/// `database_specific.severity` when it returns `None`.
+pub(crate) fn cvss_vector_base_score(vector: &str) -> Option<f32> {
+    let base: cvss::v3::Base = vector.trim().parse().ok()?;
+    Some(base.score().value() as f32)
 }
 
 /// Map an OSV severity label string to a [`SeverityThreshold`].
@@ -183,6 +201,48 @@ mod tests {
     fn infinity_score_is_none() {
         assert_eq!(cvss_score_to_severity(f32::INFINITY), None);
         assert_eq!(cvss_score_to_severity(f32::NEG_INFINITY), None);
+    }
+
+    // ------- cvss_vector_base_score ------------------------------------------
+
+    #[test]
+    fn cvss_vector_base_score_computes_marvin_advisory() {
+        // RUSTSEC-2023-0071 (the Marvin timing-oracle advisory on the `rsa`
+        // crate), verified against api.osv.dev. The CVSS 3.1 spec bands this
+        // vector's base score to 5.9 — Medium.
+        assert_eq!(
+            cvss_vector_base_score("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+            Some(5.9)
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_bands_to_critical_at_or_above_9() {
+        assert_eq!(
+            cvss_vector_base_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_bands_below_4_to_low() {
+        assert_eq!(
+            cvss_vector_base_score("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N"),
+            Some(1.8)
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_returns_none_for_malformed_vector() {
+        assert_eq!(cvss_vector_base_score("CVSS:3.1/GARBAGE"), None);
+    }
+
+    #[test]
+    fn cvss_vector_base_score_returns_none_for_cvss_v2() {
+        assert_eq!(
+            cvss_vector_base_score("CVSS:2.0/AV:N/AC:L/Au:N/C:C/I:C/A:C"),
+            None
+        );
     }
 
     // ------- label_to_severity — well-known labels --------------------------

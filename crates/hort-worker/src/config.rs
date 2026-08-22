@@ -168,6 +168,14 @@ pub struct WorkerConfig {
     /// `advisory_osv_url` (the per-component `querybatch` endpoint).
     /// Default: `https://osv-vulnerabilities.storage.googleapis.com`.
     pub advisory_osv_bulk_url: String,
+    /// Base URL of the OSV single-record endpoint. `querybatch` returns
+    /// only `id` + `modified` per advisory, so each id is resolved
+    /// against `<advisory_osv_vulns_url>/<id>` to recover the CVSS
+    /// vector before severity is derived. Distinct from
+    /// `advisory_osv_url`; both live on `api.osv.dev` by default but a
+    /// mirror may serve them from different paths.
+    /// Default: `https://api.osv.dev/v1/vulns`.
+    pub advisory_osv_vulns_url: String,
     /// Comma-parsed list of ecosystem labels the advisory-watch tick pulls
     /// per invocation. Each entry must match an OSV bulk-archive path
     /// segment verbatim. `None` means "use the adapter's default
@@ -301,6 +309,7 @@ impl std::fmt::Debug for WorkerConfig {
             provenance_cosign_public_keys_file,
             advisory_osv_url,
             advisory_osv_bulk_url,
+            advisory_osv_vulns_url,
             advisory_watch_ecosystems,
             stateful_upload_staging_dir,
             poll_interval,
@@ -340,6 +349,7 @@ impl std::fmt::Debug for WorkerConfig {
             )
             .field("advisory_osv_url", advisory_osv_url)
             .field("advisory_osv_bulk_url", advisory_osv_bulk_url)
+            .field("advisory_osv_vulns_url", advisory_osv_vulns_url)
             .field("advisory_watch_ecosystems", advisory_watch_ecosystems)
             .field("stateful_upload_staging_dir", stateful_upload_staging_dir)
             .field("poll_interval", poll_interval)
@@ -472,6 +482,10 @@ impl WorkerConfig {
             "HORT_ADVISORY_OSV_BULK_URL",
             "https://osv-vulnerabilities.storage.googleapis.com",
         );
+        let advisory_osv_vulns_url = env_or(
+            "HORT_ADVISORY_OSV_VULNS_URL",
+            "https://api.osv.dev/v1/vulns",
+        );
         // When the env var is unset, pass `None` so the OSV adapter
         // falls back to its built-in eight-ecosystem default (which uses
         // the OSV-canonical labels `crates.io` / `Packagist`).
@@ -585,6 +599,7 @@ impl WorkerConfig {
             provenance_cosign_public_keys_file,
             advisory_osv_url,
             advisory_osv_bulk_url,
+            advisory_osv_vulns_url,
             advisory_watch_ecosystems,
             stateful_upload_staging_dir,
             poll_interval,
@@ -965,6 +980,7 @@ mod tests {
         "HORT_PROVENANCE_COSIGN_PUBLIC_KEYS_FILE",
         "HORT_ADVISORY_OSV_API_URL",
         "HORT_ADVISORY_OSV_BULK_URL",
+        "HORT_ADVISORY_OSV_VULNS_URL",
         "HORT_ADVISORY_WATCH_ECOSYSTEMS",
         "HORT_STATEFUL_UPLOAD_STAGING_DIR",
         "HORT_SCANNER_POLL_INTERVAL_SECS",
@@ -1038,6 +1054,7 @@ mod tests {
             cfg.advisory_osv_bulk_url,
             "https://osv-vulnerabilities.storage.googleapis.com",
         );
+        assert_eq!(cfg.advisory_osv_vulns_url, "https://api.osv.dev/v1/vulns");
         assert!(
             cfg.advisory_watch_ecosystems.is_none(),
             "unset HORT_ADVISORY_WATCH_ECOSYSTEMS must propagate as None so the OSV adapter \
@@ -1263,6 +1280,24 @@ mod tests {
         assert_eq!(
             cfg.advisory_osv_bulk_url,
             "https://internal-osv-mirror.example.com",
+        );
+    }
+
+    #[test]
+    fn advisory_osv_vulns_url_override_lands_on_field() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var(
+            "HORT_ADVISORY_OSV_VULNS_URL",
+            "https://internal-osv-mirror.example.com/v1/vulns",
+        );
+
+        let cfg = WorkerConfig::from_env().expect("parses with vulns url override");
+        assert_eq!(
+            cfg.advisory_osv_vulns_url,
+            "https://internal-osv-mirror.example.com/v1/vulns",
         );
     }
 

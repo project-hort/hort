@@ -1,0 +1,22 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: gitlab-ci-prefetch-crates-proxy
+spec:
+  # Per-repo serviceAccount-subject grant: gitlab-ci may prefetch the
+  # crates-proxy MEMBER directly. Sibling of
+  # gitlab-ci-prefetch-cargo-virtual.yaml, needed because a prefetch POST
+  # against the virtual repo enqueues jobs that no-op in the
+  # no-catch-all-upstream-mapping branch (a virtual repo has no upstream
+  # mapping; see PrefetchIngestHandler) — only the member actually fetches.
+  # The read half of SelfServicePrefetchUseCase's Read ∧ Prefetch gate is
+  # covered by the existing gitlab-ci-read-crates-proxy.yaml.
+  #
+  # Used by running a pipeline with HORT_CARGO_SOURCE_REPO=crates-proxy so
+  # prefetch:warm targets the member. Interim until the member-aware
+  # enqueue lands; then the cargo-virtual grant suffices again.
+  subject:
+    kind: serviceAccount
+    name: gitlab-ci
+  permission: prefetch
+  repository: crates-proxy

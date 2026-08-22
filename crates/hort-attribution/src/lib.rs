@@ -93,10 +93,15 @@ pub fn render_attribution(format: AttributionFormat) -> &'static str {
 /// error is swallowed into a clean `ExitCode::SUCCESS`. Any other write
 /// error still panics, same as `print!` today.
 pub fn write_stdout_or_exit(s: &str) -> ExitCode {
-    write_or_exit(&mut io::stdout(), s)
+    write_to_or_exit(&mut io::stdout(), s)
 }
 
-fn write_or_exit<W: Write>(w: &mut W, s: &str) -> ExitCode {
+/// Generic-sink form of [`write_stdout_or_exit`]: same BrokenPipe-to-clean-exit
+/// behaviour, against any [`Write`] rather than a hardcoded `io::stdout()`.
+/// Every `run()` in the CLI/server/worker binaries funnels through this so
+/// their tests can assert on an in-memory sink's bytes instead of writing an
+/// unbounded document to the real stdout every test run.
+pub fn write_to_or_exit<W: Write>(w: &mut W, s: &str) -> ExitCode {
     match w.write_all(s.as_bytes()).and_then(|()| w.flush()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
@@ -196,35 +201,35 @@ mod tests {
     }
 
     #[test]
-    fn write_or_exit_writes_full_content_and_succeeds() {
+    fn write_to_or_exit_writes_full_content_and_succeeds() {
         let mut buf: Vec<u8> = Vec::new();
-        let code = write_or_exit(&mut buf, "hello, world");
+        let code = write_to_or_exit(&mut buf, "hello, world");
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(buf, b"hello, world");
     }
 
     #[test]
-    fn write_or_exit_swallows_broken_pipe_into_clean_success() {
+    fn write_to_or_exit_swallows_broken_pipe_into_clean_success() {
         let mut w = BrokenPipeWriter;
         // Must not panic — a `BrokenPipe` write error means the consumer
         // already got all the bytes it wanted (e.g. `| head`), not a
         // failure.
-        let code = write_or_exit(&mut w, "hello");
+        let code = write_to_or_exit(&mut w, "hello");
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }
 
     #[test]
     #[should_panic(expected = "failed printing to stdout")]
-    fn write_or_exit_panics_on_non_broken_pipe_error() {
+    fn write_to_or_exit_panics_on_non_broken_pipe_error() {
         let mut w = OtherErrorWriter;
-        let _ = write_or_exit(&mut w, "hello");
+        let _ = write_to_or_exit(&mut w, "hello");
     }
 
     #[test]
     fn write_stdout_or_exit_writes_to_real_stdout_and_succeeds() {
         // Exercises the public `io::stdout()`-backed entry point itself
-        // (every other test above drives the private, injectable
-        // `write_or_exit` so it can simulate `BrokenPipe`/other errors).
+        // (every other test above drives the public, injectable
+        // `write_to_or_exit` so it can simulate `BrokenPipe`/other errors).
         let code = write_stdout_or_exit("coverage exercise for write_stdout_or_exit\n");
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
     }

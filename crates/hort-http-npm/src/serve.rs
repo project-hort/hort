@@ -168,7 +168,7 @@ pub(crate) async fn serve_packument_unified(
     // Future operator-exclusion filters append at the end of this list.
     let upstream_count = output.entries.len();
     let filters: Vec<Arc<dyn IndexFilter>> = vec![
-        Arc::new(NonServableStatusFilter),
+        Arc::new(NonServableStatusFilter::default()),
         Arc::new(IndexModeFilter::new(repo.index_mode)),
     ];
     let filtered: Vec<VersionEntry> = filters.iter().fold(output.entries, |acc, f| f.apply(acc));

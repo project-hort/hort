@@ -44,7 +44,7 @@ use hort_app::use_cases::test_support::sample_repository;
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::entities::scan_policy::{
-    NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+    NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::events::PolicyScope;
 use hort_domain::types::ContentHash;
@@ -101,6 +101,7 @@ fn quarantining_policy(repo_id: Uuid) -> ScanPolicyProjection {
         scan_backends: vec!["trivy".to_string()],
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
+        enforcement: ScanEnforcement::Reject,
         stream_version: 0,
         created_at: now,
         updated_at: now,

@@ -135,7 +135,7 @@ use hort_domain::entities::discovery::{
     RejectedItem, RejectionReason,
 };
 use hort_domain::entities::rbac::Permission;
-use hort_domain::entities::repository::{Repository, RepositoryFormat};
+use hort_domain::entities::repository::{Repository, RepositoryFormat, RepositoryType};
 use hort_domain::error::DomainError;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::jobs_repository::JobsRepository;
@@ -143,6 +143,7 @@ use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::{
     RepositoryUpstreamMapping, RepositoryUpstreamMappingRepository,
 };
+use uuid::Uuid;
 
 use crate::error::{AppError, AppResult};
 use crate::metrics::{
@@ -154,6 +155,7 @@ use crate::rbac::RbacEvaluator;
 use crate::use_cases::index_serve_filter::{
     CargoSemverOrdering, NpmSemverOrdering, Pep440Ordering, VersionOrdering,
 };
+use crate::use_cases::virtual_resolution::VirtualResolutionUseCase;
 
 // Exact wording propagated verbatim to the client via
 // `AppError::Domain(DomainError::Validation(_))`. Mirrors the constant
@@ -217,6 +219,11 @@ pub struct SelfServicePrefetchUseCase {
     upstream_metadata: Arc<dyn UpstreamMetadataPort>,
     jobs: Arc<dyn JobsRepository>,
     rbac: Arc<ArcSwap<RbacEvaluator>>,
+    /// Virtual-member resolution (ADR 0031). A `type: virtual` target's
+    /// held-check walks its members in this priority order instead of
+    /// querying the virtual's own id (a virtual repo owns no artifacts or
+    /// upstream mapping of its own).
+    virtual_resolution: Arc<VirtualResolutionUseCase>,
 }
 
 impl SelfServicePrefetchUseCase {
@@ -229,6 +236,7 @@ impl SelfServicePrefetchUseCase {
         upstream_metadata: Arc<dyn UpstreamMetadataPort>,
         jobs: Arc<dyn JobsRepository>,
         rbac: Arc<ArcSwap<RbacEvaluator>>,
+        virtual_resolution: Arc<VirtualResolutionUseCase>,
     ) -> Self {
         Self {
             repositories,
@@ -237,6 +245,7 @@ impl SelfServicePrefetchUseCase {
             upstream_metadata,
             jobs,
             rbac,
+            virtual_resolution,
         }
     }
 
@@ -352,22 +361,62 @@ impl SelfServicePrefetchUseCase {
             )));
         }
 
-        // -------- Resolve upstream mapping (catch-all) -------
+        // -------- Resolve virtual members (ADR 0031 priority order) --
         //
-        // The mapping resolver mirrors `discovery_use_case` and every
-        // other repo-scoped proxy call site: pick the catch-all
-        // (`path_prefix == ""`) mapping if present. A hosted-only repo
+        // Empty for a non-virtual repo — the single-repo path below
+        // queries `repository.id` directly and needs no member list. A
+        // virtual repo owns no artifacts and no upstream mapping of its
+        // own; every held-check and upstream-capability lookup below
+        // walks its members instead.
+        let is_virtual = matches!(repository.repo_type, RepositoryType::Virtual);
+        let members: Vec<Repository> = if is_virtual {
+            self.virtual_resolution
+                .resolve_members(&repository, Some(caller))
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        // -------- Resolve the enqueue target + its catch-all mapping --
+        //
+        // Non-virtual: the repo's own catch-all (`path_prefix == ""`)
+        // mapping, exactly as before (mirrors `discovery_use_case` and
+        // every other repo-scoped proxy call site). A hosted-only repo
         // (no mapping) cannot resolve `version = None`, so per-item
         // version resolution surfaces that case as a `failed` /
-        // `UpstreamNotFound` entry; an explicit version still gets
-        // pre-flight-checked + planned.
-        let mapping_opt = self
-            .upstream_mappings
-            .list_for_repository(repository.id)
-            .await
-            .map_err(AppError::Domain)?
-            .into_iter()
-            .find(|m| m.path_prefix.is_empty());
+        // `UpstreamNotFound` entry below; an explicit version still gets
+        // pre-flight-checked, then rejected at the enqueue step (never
+        // discovered later, silently, by the leaf handler).
+        //
+        // Virtual: the first member (priority order) that has a
+        // catch-all mapping — the member that would actually serve the
+        // fetch. `None` for either shape means no upstream is configured
+        // to warm through this target at all.
+        let resolved_target: Option<(Uuid, RepositoryUpstreamMapping)> = if is_virtual {
+            let mut found = None;
+            for member in &members {
+                if let Some(m) = self
+                    .upstream_mappings
+                    .list_for_repository(member.id)
+                    .await
+                    .map_err(AppError::Domain)?
+                    .into_iter()
+                    .find(|m| m.path_prefix.is_empty())
+                {
+                    found = Some((member.id, m));
+                    break;
+                }
+            }
+            found
+        } else {
+            self.upstream_mappings
+                .list_for_repository(repository.id)
+                .await
+                .map_err(AppError::Domain)?
+                .into_iter()
+                .find(|m| m.path_prefix.is_empty())
+                .map(|m| (repository.id, m))
+        };
 
         // Per-format ordering for the "pick latest" path (version = None
         // resolves to the newest upstream-advertised version). The
@@ -392,7 +441,9 @@ impl SelfServicePrefetchUseCase {
                 &repository,
                 &format_label,
                 &repository_label,
-                &mapping_opt,
+                is_virtual,
+                &members,
+                &resolved_target,
                 ordering,
                 item,
                 &mut outcome,
@@ -426,7 +477,9 @@ impl SelfServicePrefetchUseCase {
         repository: &Repository,
         format_label: &str,
         repository_label: &str,
-        mapping_opt: &Option<RepositoryUpstreamMapping>,
+        is_virtual: bool,
+        members: &[Repository],
+        resolved_target: &Option<(Uuid, RepositoryUpstreamMapping)>,
         ordering: Option<&(dyn VersionOrdering + Sync)>,
         item: PrefetchRequestItem,
         outcome: &mut PrefetchOutcome,
@@ -442,7 +495,7 @@ impl SelfServicePrefetchUseCase {
             None => {
                 // Latest-upstream path requires a mapping AND a
                 // successful list_versions call AND a non-empty result.
-                let Some(mapping) = mapping_opt.as_ref() else {
+                let Some((_, mapping)) = resolved_target.as_ref() else {
                     // Hosted-only repo with `version = None` cannot
                     // resolve a latest — surface as a "not found"
                     // failure (no upstream catalog to consult).
@@ -541,60 +594,103 @@ impl SelfServicePrefetchUseCase {
         };
 
         // ----- Pre-flight against HORT's held set ---
-        let held_status = match self
-            .artifacts
-            .package_version_status(repository.id, &item.package)
-            .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                // Infrastructure error from the artifacts port —
-                // surface as a `failed` envelope entry rather than
-                // aborting the batch (continue-on-error contract).
-                // H7: AK-side infrastructure failure → `Internal`, NOT
-                // `network_error`. The old defensive fold mislabelled a
-                // server-side `package_version_status` fault as a network
-                // error, sending operators chasing egress/DNS.
-                tracing::warn!(
-                    repository = %repository.key,
-                    package = %item.package,
-                    error = %err,
-                    "self-service prefetch: package_version_status failed; surfaced as Internal",
-                );
-                outcome.failed.push(FailedItem {
-                    coords: coords_resolved,
-                    error: PrefetchItemError::Internal,
-                });
-                emit_prefetch_self_service(
-                    format_label,
-                    repository_label,
-                    PrefetchSelfServiceResult::Internal,
-                );
-                return;
+        //
+        // Virtual: member-aware — walk `members` in ADR 0031 priority
+        // order and use the FIRST member that has any record of this
+        // exact version (member precedence: a higher-priority member's
+        // row — even a `QuarantineStatus::None` one — wins outright over
+        // a lower-priority member's absence; mirrors the first-
+        // authoritative walk `VirtualResolutionUseCase::resolve_download`
+        // uses for the download path). `None` means no member holds any
+        // record of the version — a candidate for enqueue.
+        //
+        // Non-virtual: the existing single-repo query.
+        let held_match: Option<QuarantineStatus> = if is_virtual {
+            match self
+                .member_package_version_status(members, &item.package, &resolved_version)
+                .await
+            {
+                Ok(status) => status,
+                Err(err) => {
+                    tracing::warn!(
+                        repository = %repository.key,
+                        package = %item.package,
+                        error = %err,
+                        "self-service prefetch: member-aware package_version_status failed; \
+                         surfaced as Internal",
+                    );
+                    outcome.failed.push(FailedItem {
+                        coords: coords_resolved,
+                        error: PrefetchItemError::Internal,
+                    });
+                    emit_prefetch_self_service(
+                        format_label,
+                        repository_label,
+                        PrefetchSelfServiceResult::Internal,
+                    );
+                    return;
+                }
             }
+        } else {
+            let held_status = match self
+                .artifacts
+                .package_version_status(repository.id, &item.package)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    // Infrastructure error from the artifacts port —
+                    // surface as a `failed` envelope entry rather than
+                    // aborting the batch (continue-on-error contract).
+                    // H7: AK-side infrastructure failure → `Internal`, NOT
+                    // `network_error`. The old defensive fold mislabelled a
+                    // server-side `package_version_status` fault as a network
+                    // error, sending operators chasing egress/DNS.
+                    tracing::warn!(
+                        repository = %repository.key,
+                        package = %item.package,
+                        error = %err,
+                        "self-service prefetch: package_version_status failed; surfaced as Internal",
+                    );
+                    outcome.failed.push(FailedItem {
+                        coords: coords_resolved,
+                        error: PrefetchItemError::Internal,
+                    });
+                    emit_prefetch_self_service(
+                        format_label,
+                        repository_label,
+                        PrefetchSelfServiceResult::Internal,
+                    );
+                    return;
+                }
+            };
+            held_status
+                .iter()
+                .find(|(v, _, _)| v == &resolved_version)
+                .map(|(_, status, _)| *status)
         };
-
-        let held_match = held_status
-            .iter()
-            .find(|(v, _, _)| v == &resolved_version)
-            .map(|(_, status, _)| *status);
 
         if let Some(status) = held_match {
             match status {
-                // `Released` and `Quarantined` (incl. the read-time
+                // `Released`, `Quarantined` (incl. the read-time
                 // `QuarantinedAwaitingRelease` derivation, which the
-                // projection returns as plain `Quarantined`) mean the
-                // artifact is locally ingested and already covered →
-                // `skipped_already_held`.
-                //
-                // `None` is deliberately NOT folded here. For a PROXY,
-                // `package_version_status` returns `None` for versions
-                // that are known upstream but NOT locally ingested — those
-                // are exactly what self-service prefetch must warm, so
-                // `None` falls through to the enqueue below. (The old code
-                // mistook proxy `None` for an un-quarantined *hosted*
-                // upload and skipped every upstream version.)
-                QuarantineStatus::Released | QuarantineStatus::Quarantined => {
+                // projection returns as plain `Quarantined`), and `None`
+                // all fold here: `package_version_status` reads only the
+                // `artifacts` table, whose `checksum_sha256` /
+                // `storage_key` columns are NOT NULL, so ANY row this
+                // projection returns — regardless of `quarantine_status`
+                // — asserts locally-ingested content. Ingested-or-not and
+                // quarantine-lifecycle are two different dimensions:
+                // row-presence answers the former, `status` only the
+                // latter. A `None` row is content with no quarantine
+                // lifecycle (a pure Sigstore-bundle referrer, or an
+                // ingest with no matching scan policy) — already held,
+                // never re-pulled. "Known upstream, not yet ingested" is
+                // the row-ABSENT case (`held_match` is `None` at the
+                // caller, handled below the match, not here).
+                QuarantineStatus::Released
+                | QuarantineStatus::Quarantined
+                | QuarantineStatus::None => {
                     outcome.skipped_already_held.push(coords_resolved);
                     // Skipped items do NOT tick a per-item result —
                     // the `result` label set does not have a `skipped`
@@ -603,9 +699,6 @@ impl SelfServicePrefetchUseCase {
                     // not in the metric.)
                     return;
                 }
-                // Known upstream, not locally held → fall through to the
-                // enqueue below (H6).
-                QuarantineStatus::None => {}
                 QuarantineStatus::Rejected => {
                     outcome.rejected_packages.push(RejectedItem {
                         coords: coords_resolved,
@@ -632,6 +725,31 @@ impl SelfServicePrefetchUseCase {
                 }
             }
         }
+
+        // ----- Reject if there is no upstream-capable target ---------
+        //
+        // The version=None resolution branch above already caught the
+        // no-mapping case for a repo with no explicit version request
+        // (`UpstreamNotFound`, before any held-check). This is the
+        // complementary guard for the two paths that reach here with
+        // `resolved_target = None`: an EXPLICIT version against a
+        // mapping-less direct repo, or a virtual repo none of whose
+        // members can proxy.
+        // Both reasons collapse to the same shape: prevention at
+        // enqueue time, never a silent `short_circuited` discovered
+        // later by the leaf handler.
+        let Some((enqueue_repository_id, _)) = resolved_target else {
+            outcome.failed.push(FailedItem {
+                coords: coords_resolved,
+                error: PrefetchItemError::NoUpstreamMapping,
+            });
+            emit_prefetch_self_service(
+                format_label,
+                repository_label,
+                PrefetchSelfServiceResult::NoUpstreamMapping,
+            );
+            return;
+        };
 
         // ----- Enqueue directly --------------------------------------
         //
@@ -674,7 +792,7 @@ impl SelfServicePrefetchUseCase {
         // children (an unexpectedly high `self_service` rate is a
         // runaway operator, not a runaway cascade).
         let params = serde_json::json!({
-            "repository_id": repository.id,
+            "repository_id": enqueue_repository_id,
             "package": item.package,
             "version": resolved_version,
         });
@@ -749,6 +867,36 @@ impl SelfServicePrefetchUseCase {
                 );
             }
         }
+    }
+
+    /// Member-aware held-check (ADR 0031 aggregation order — see
+    /// [`VirtualResolutionUseCase::resolve_members`]). Walks `members`
+    /// (priority order, highest first) and returns the FIRST member's
+    /// status for `resolved_version`: a lower-priority member's absence
+    /// never overrides a higher-priority member's row, even a
+    /// `QuarantineStatus::None` one — mirrors the first-authoritative
+    /// walk `VirtualResolutionUseCase::resolve_download` uses for the
+    /// download-serve path, applied to the held-status coordinate
+    /// instead of a download URL. `Ok(None)` means no member holds any
+    /// record of this exact version — a candidate for enqueue. Any
+    /// member's port error propagates (the caller surfaces it as a
+    /// per-item `Internal` failure).
+    async fn member_package_version_status(
+        &self,
+        members: &[Repository],
+        package: &str,
+        resolved_version: &str,
+    ) -> hort_domain::error::DomainResult<Option<QuarantineStatus>> {
+        for member in members {
+            let rows = self
+                .artifacts
+                .package_version_status(member.id, package)
+                .await?;
+            if let Some((_, status, _)) = rows.iter().find(|(v, _, _)| v == resolved_version) {
+                return Ok(Some(*status));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -852,6 +1000,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::task_handlers::prefetch_ingest::PrefetchParams;
+    use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{
         sample_repository, MockArtifactRepository, MockJobsRepository, MockRepositoryRepository,
         MockRepositoryUpstreamMappingRepository, MockUpstreamMetadataPort,
@@ -896,6 +1045,13 @@ mod tests {
         r
     }
 
+    fn maven_repo() -> Repository {
+        let mut r = sample_repository();
+        r.format = RepositoryFormat::Maven;
+        r.is_public = false;
+        r
+    }
+
     fn pypi_repo() -> Repository {
         let mut r = sample_repository();
         r.format = RepositoryFormat::Pypi;
@@ -903,6 +1059,25 @@ mod tests {
         r.prefetch_policy.enabled = true;
         r.prefetch_policy.depth = 4;
         r.prefetch_policy.triggers = vec![PrefetchTrigger::TransitiveDeps];
+        r
+    }
+
+    fn virtual_repo() -> Repository {
+        let mut r = sample_repository();
+        r.format = RepositoryFormat::Npm;
+        r.repo_type = RepositoryType::Virtual;
+        r.is_public = false;
+        r
+    }
+
+    /// A `Proxy`-typed member repo (as opposed to `virtual_repo()`'s
+    /// default `Hosted`), for tests that pin the "direct POST against a
+    /// proxy member behaves exactly as today" regression.
+    fn proxy_member_repo() -> Repository {
+        let mut r = sample_repository();
+        r.format = RepositoryFormat::Npm;
+        r.repo_type = RepositoryType::Proxy;
+        r.is_public = false;
         r
     }
 
@@ -958,30 +1133,67 @@ mod tests {
 
     struct Harness {
         uc: SelfServicePrefetchUseCase,
+        repositories: Arc<MockRepositoryRepository>,
         artifacts: Arc<MockArtifactRepository>,
         mappings: Arc<MockRepositoryUpstreamMappingRepository>,
         upstream: Arc<MockUpstreamMetadataPort>,
         jobs: Arc<MockJobsRepository>,
     }
 
+    /// Build a `VirtualResolutionUseCase` over `repos` with anti-
+    /// enumeration disabled — every wired member is visible. Member
+    /// Read-visibility is not under test anywhere in this module; the
+    /// top-level RBAC gate (Gate 2, on the virtual repo itself) is what
+    /// every test here exercises via its own `evaluator` argument, so a
+    /// second, independent per-member Read gate would be redundant
+    /// complexity with no invariant of its own to pin.
+    fn virtual_resolution_for(
+        repos: Arc<MockRepositoryRepository>,
+    ) -> Arc<VirtualResolutionUseCase> {
+        let repository_access = Arc::new(RepositoryAccessUseCase::new(
+            repos.clone() as Arc<dyn RepositoryRepository>,
+            RbacAccess::Disabled,
+            true,
+        ));
+        Arc::new(VirtualResolutionUseCase::new(
+            repos as Arc<dyn RepositoryRepository>,
+            repository_access,
+        ))
+    }
+
     fn wire(repo: Repository, evaluator: RbacEvaluator) -> Harness {
-        let repos = Arc::new(MockRepositoryRepository::new());
-        repos.insert(repo);
+        wire_with_repos(vec![repo], evaluator)
+    }
+
+    /// Like [`wire`], but inserts every repo in `repos` up front — for
+    /// virtual-repo tests that need the virtual root PLUS its members
+    /// visible to the same `MockRepositoryRepository`. Member ordering
+    /// (ADR 0031 priority) is seeded separately via
+    /// `MockRepositoryRepository::seed_virtual_member`, called by the
+    /// test after `wire_with_repos` returns.
+    fn wire_with_repos(repos: Vec<Repository>, evaluator: RbacEvaluator) -> Harness {
+        let repositories = Arc::new(MockRepositoryRepository::new());
+        for repo in repos {
+            repositories.insert(repo);
+        }
         let artifacts = Arc::new(MockArtifactRepository::new());
         let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
         let upstream = Arc::new(MockUpstreamMetadataPort::new());
         let jobs = Arc::new(MockJobsRepository::new());
         let rbac = Arc::new(ArcSwap::from_pointee(evaluator));
+        let virtual_resolution = virtual_resolution_for(repositories.clone());
         let uc = SelfServicePrefetchUseCase::new(
-            repos.clone(),
+            repositories.clone(),
             artifacts.clone(),
             mappings.clone(),
             upstream.clone(),
             jobs.clone(),
             rbac,
+            virtual_resolution,
         );
         Harness {
             uc,
+            repositories,
             artifacts,
             mappings,
             upstream,
@@ -1632,7 +1844,7 @@ mod tests {
     }
 
     // ============================================================
-    // Already-held buckets (three states fold together)
+    // Already-held buckets (Released / Quarantined / None fold together)
     // ============================================================
 
     #[test]
@@ -1662,6 +1874,43 @@ mod tests {
         });
         // Skipped is not a `result` label — verify no per-item
         // success tick.
+        assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
+    }
+
+    /// The truthful-envelope property, pinned for Maven specifically:
+    /// a re-POST of an already-warmed GAV — pinned version,
+    /// colon-joined `groupId:artifactId` package — must classify as
+    /// `skipped_already_held`, not re-enqueue a `prefetch` leaf-ingest row.
+    /// This is the SAME generic pre-flight (`package_version_status`) every
+    /// other format already exercises above; the point of this pin is that
+    /// it works unchanged for Maven's `groupId:artifactId` package shape
+    /// once the Maven leaf-ingest dispatch arm exists.
+    #[test]
+    fn maven_gav_already_held_released_skips_on_repost() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = maven_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                h.artifacts.seed_package_version_status(
+                    repo_id,
+                    "com.example:foo",
+                    vec![("1.0".into(), QuarantineStatus::Released)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome = h
+                    .uc
+                    .enqueue_self_service(&key, vec![item("com.example:foo", Some("1.0"))], &actor)
+                    .await
+                    .expect("ok");
+                assert!(outcome.enqueued_job_ids.is_empty());
+                assert_eq!(outcome.skipped_already_held.len(), 1);
+                assert_eq!(outcome.skipped_already_held[0].package, "com.example:foo");
+                assert!(h.jobs.enqueue_calls().is_empty());
+            })
+        });
         assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
     }
 
@@ -1700,16 +1949,58 @@ mod tests {
     }
 
     #[test]
-    fn none_status_known_upstream_is_enqueued_not_skipped() {
-        // H6 (secondary): for a PROXY, `package_version_status` returns
-        // `QuarantineStatus::None` for versions that are known upstream
-        // but NOT locally ingested (the same projection that backs the
-        // packument serve — discovery reads this `None` as "unknown").
-        // Self-service prefetch must ENQUEUE these (that is the whole
-        // point — warm them), NOT bucket them as `skipped_already_held`.
-        // The old behaviour mistook proxy `None` for an un-quarantined
-        // *hosted* upload. Only Released / Quarantined (actually locally
-        // held) skip.
+    fn absent_row_known_upstream_is_enqueued_not_skipped() {
+        // `package_version_status` returns a row ONLY for locally
+        // ingested content (the adapter reads `artifacts`, whose
+        // `checksum_sha256` / `storage_key` columns are NOT NULL — a
+        // returned row asserts ingested content, regardless of its
+        // `quarantine_status`). "Known upstream, not yet ingested" is
+        // therefore the row-ABSENT case, not any particular status
+        // value: seed no row at all for this version. Self-service
+        // prefetch must ENQUEUE it (that is the whole point — warm real
+        // upstream versions that have never been pulled), not bucket it
+        // as `skipped_already_held`.
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                // Deliberately no `seed_package_version_status` call —
+                // the mock's default is an empty projection, i.e. no
+                // row for this (package, version) coordinate.
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&key, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(
+                    outcome.enqueued_job_ids.len(),
+                    1,
+                    "row-absent (known-upstream, never ingested) must enqueue"
+                );
+                assert!(outcome.skipped_already_held.is_empty());
+                assert!(outcome.rejected_packages.is_empty());
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn none_status_row_is_ingested_content_and_skips() {
+        // `package_version_status`'s adapter reads only `artifacts`
+        // rows, whose content columns (`checksum_sha256`,
+        // `storage_key`) are NOT NULL — so ANY returned row, including
+        // one with `QuarantineStatus::None` (a pure Sigstore-bundle
+        // referrer, or an ingest with no matching scan policy), is
+        // locally-ingested content with no quarantine lifecycle. It
+        // must classify held (`skipped_already_held`), the same as
+        // Released/Quarantined, and must NOT be re-pulled from upstream
+        // on every re-POST.
         let snap = capture(|| {
             Box::pin(async {
                 let repo = npm_repo();
@@ -1727,19 +2018,14 @@ mod tests {
                     h.uc.enqueue_self_service(&key, vec![item("p", Some("1.0.0"))], &actor)
                         .await
                         .expect("ok");
-                assert_eq!(
-                    outcome.enqueued_job_ids.len(),
-                    1,
-                    "proxy None (known-upstream, not locally held) must enqueue"
-                );
-                assert!(outcome.skipped_already_held.is_empty());
+                assert!(outcome.enqueued_job_ids.is_empty());
+                assert_eq!(outcome.skipped_already_held.len(), 1);
+                assert_eq!(outcome.skipped_already_held[0].package, "p");
                 assert!(outcome.rejected_packages.is_empty());
+                assert!(h.jobs.enqueue_calls().is_empty());
             })
         });
-        assert_eq!(
-            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
-            Some(1)
-        );
+        assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
     }
 
     #[test]
@@ -2199,6 +2485,78 @@ mod tests {
         );
     }
 
+    /// Envelope truthfulness across the two "not enqueued" shapes that
+    /// share no visible status distinction from the caller's point of
+    /// view: a held `None`-row and a rejected row. Paired with a
+    /// genuinely absent row to pin that ONLY absence enqueues.
+    #[test]
+    fn mixed_batch_none_row_absent_and_rejected_partition_correctly() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                // p_held_none: a row exists with status None → skip.
+                h.artifacts.seed_package_version_status(
+                    repo_id,
+                    "p_held_none",
+                    vec![("1.0.0".into(), QuarantineStatus::None)],
+                );
+                // p_absent: deliberately no row at all → enqueue.
+                // p_rejected: a row exists with status Rejected → reject.
+                h.artifacts.seed_package_version_status(
+                    repo_id,
+                    "p_rejected",
+                    vec![("1.0.0".into(), QuarantineStatus::Rejected)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(
+                        &key,
+                        vec![
+                            item("p_held_none", Some("1.0.0")),
+                            item("p_absent", Some("1.0.0")),
+                            item("p_rejected", Some("1.0.0")),
+                        ],
+                        &actor,
+                    )
+                    .await
+                    .expect("ok");
+                assert_eq!(
+                    outcome.enqueued_job_ids.len(),
+                    1,
+                    "only the absent row enqueues"
+                );
+                assert_eq!(
+                    outcome.skipped_already_held.len(),
+                    1,
+                    "the None-row classifies held"
+                );
+                assert_eq!(outcome.rejected_packages.len(), 1, "1 rejected");
+                assert_eq!(outcome.failed.len(), 0);
+                assert_eq!(outcome.skipped_already_held[0].package, "p_held_none");
+                assert_eq!(
+                    outcome.rejected_packages[0].reason,
+                    RejectionReason::ScanRejected
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "rejected_version"
+            ),
+            Some(1)
+        );
+    }
+
     // ============================================================
     // Artifacts port error path — propagates per item
     // ============================================================
@@ -2361,6 +2719,16 @@ mod tests {
         > {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn find_oci_image_manifests_without_kind(
+            &self,
+            _k: &str,
+            _l: u32,
+        ) -> hort_domain::ports::BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<Vec<hort_domain::entities::artifact::Artifact>>,
+        > {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[test]
@@ -2380,8 +2748,15 @@ mod tests {
                 let rbac = Arc::new(ArcSwap::from_pointee(evaluator_with_read_and_prefetch(
                     "dev", repo_id,
                 )));
+                let virtual_resolution = virtual_resolution_for(repos.clone());
                 let uc = SelfServicePrefetchUseCase::new(
-                    repos, artifacts, mappings, upstream, jobs, rbac,
+                    repos,
+                    artifacts,
+                    mappings,
+                    upstream,
+                    jobs,
+                    rbac,
+                    virtual_resolution,
                 );
                 let actor = caller_cli_session(&["dev"]);
                 let outcome = uc
@@ -2434,6 +2809,7 @@ mod tests {
                 let rbac = Arc::new(ArcSwap::from_pointee(evaluator_with_read_and_prefetch(
                     "dev", repo_id,
                 )));
+                let virtual_resolution = virtual_resolution_for(repos.clone());
                 let uc = SelfServicePrefetchUseCase::new(
                     repos,
                     artifacts as Arc<dyn ArtifactRepository>,
@@ -2441,6 +2817,7 @@ mod tests {
                     upstream,
                     jobs,
                     rbac,
+                    virtual_resolution,
                 );
                 let actor = caller_cli_session(&["dev"]);
                 // `version: None` forces the "pick latest" path that
@@ -2572,6 +2949,10 @@ mod tests {
                 "rejected_version",
             ),
             (PrefetchSelfServiceResult::Internal, "internal"),
+            (
+                PrefetchSelfServiceResult::NoUpstreamMapping,
+                "no_upstream_mapping",
+            ),
         ];
         for (variant, expected) in pairs {
             assert_eq!(variant.as_str(), expected);
@@ -2670,6 +3051,10 @@ mod tests {
                 PrefetchItemError::Internal,
                 PrefetchSelfServiceResult::Internal,
             ),
+            (
+                PrefetchItemError::NoUpstreamMapping,
+                PrefetchSelfServiceResult::NoUpstreamMapping,
+            ),
         ];
         for (item_err, expected) in pairs {
             assert_eq!(
@@ -2710,6 +3095,487 @@ mod tests {
                     calls[0].1["version"].as_str(),
                     Some("2.0.0"),
                     "PEP 440: 2.0.0 outranks 2.0.0a1",
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+    }
+
+    // ============================================================
+    // Virtual repos — member-aware held-check + enqueue-into-member
+    // (ADR 0031 aggregation order)
+    // ============================================================
+
+    #[test]
+    fn virtual_held_in_member_skips() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let member = proxy_member_repo();
+                let member_id = member.id;
+                let h = wire_with_repos(
+                    vec![vroot, member],
+                    evaluator_with_read_and_prefetch("dev", vroot_id),
+                );
+                h.repositories.seed_virtual_member(vroot_id, member_id);
+                h.mappings.upsert(mapping(member_id)).await.unwrap();
+                h.artifacts.seed_package_version_status(
+                    member_id,
+                    "p",
+                    vec![("1.0.0".into(), QuarantineStatus::Released)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert!(outcome.enqueued_job_ids.is_empty());
+                assert_eq!(outcome.skipped_already_held.len(), 1);
+                assert!(h.jobs.enqueue_calls().is_empty());
+            })
+        });
+        assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
+    }
+
+    #[test]
+    fn virtual_rejected_in_member_surfaces_scan_rejected() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let member = proxy_member_repo();
+                let member_id = member.id;
+                let h = wire_with_repos(
+                    vec![vroot, member],
+                    evaluator_with_read_and_prefetch("dev", vroot_id),
+                );
+                h.repositories.seed_virtual_member(vroot_id, member_id);
+                h.mappings.upsert(mapping(member_id)).await.unwrap();
+                h.artifacts.seed_package_version_status(
+                    member_id,
+                    "p",
+                    vec![("1.0.0".into(), QuarantineStatus::Rejected)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(outcome.rejected_packages.len(), 1);
+                assert_eq!(
+                    outcome.rejected_packages[0].reason,
+                    RejectionReason::ScanRejected
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "rejected_version"
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn virtual_indeterminate_in_member_surfaces_scan_indeterminate() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let member = proxy_member_repo();
+                let member_id = member.id;
+                let h = wire_with_repos(
+                    vec![vroot, member],
+                    evaluator_with_read_and_prefetch("dev", vroot_id),
+                );
+                h.repositories.seed_virtual_member(vroot_id, member_id);
+                h.mappings.upsert(mapping(member_id)).await.unwrap();
+                h.artifacts.seed_package_version_status(
+                    member_id,
+                    "p",
+                    vec![("1.0.0".into(), QuarantineStatus::ScanIndeterminate)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(outcome.rejected_packages.len(), 1);
+                assert_eq!(
+                    outcome.rejected_packages[0].reason,
+                    RejectionReason::ScanIndeterminate
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "rejected_version"
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn virtual_missing_everywhere_enqueues_into_proxy_members_id() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let member = proxy_member_repo();
+                let member_id = member.id;
+                let h = wire_with_repos(
+                    vec![vroot, member],
+                    evaluator_with_read_and_prefetch("dev", vroot_id),
+                );
+                h.repositories.seed_virtual_member(vroot_id, member_id);
+                h.mappings.upsert(mapping(member_id)).await.unwrap();
+                // No held status seeded anywhere — unknown to every member.
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(outcome.enqueued_job_ids.len(), 1);
+                let calls = h.jobs.enqueue_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(
+                    calls[0].1["repository_id"].as_str(),
+                    Some(member_id.to_string().as_str()),
+                    "enqueue targets the MEMBER holding the catch-all mapping, not the virtual root",
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn virtual_no_upstream_capable_member_rejects_zero_enqueues() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let member = proxy_member_repo();
+                let member_id = member.id;
+                let h = wire_with_repos(
+                    vec![vroot, member],
+                    evaluator_with_read_and_prefetch("dev", vroot_id),
+                );
+                h.repositories.seed_virtual_member(vroot_id, member_id);
+                // Deliberately no catch-all mapping seeded on the member —
+                // no upstream-capable member in the virtual at all.
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert!(outcome.enqueued_job_ids.is_empty());
+                assert_eq!(outcome.failed.len(), 1);
+                assert_eq!(
+                    outcome.failed[0].error,
+                    PrefetchItemError::NoUpstreamMapping
+                );
+                assert!(h.jobs.enqueue_calls().is_empty());
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "no_upstream_mapping"
+            ),
+            Some(1)
+        );
+    }
+
+    /// Member precedence (ADR 0031 aggregation order): the first-ordered
+    /// member's row — even a `QuarantineStatus::None` one — wins
+    /// classification outright over a lower-ordered member's absence. A
+    /// naive "walk until any member has a row, else enqueue" implementation
+    /// might keep walking past the primary's `None`-row looking for a
+    /// "real" status and land on the secondary's absence; the correct
+    /// implementation stops at the first row it finds — a row is content,
+    /// regardless of which member holds it or what its status is — and
+    /// classifies held.
+    #[test]
+    fn virtual_member_precedence_first_ordered_member_none_row_wins_over_lower_priority_absence() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let primary = proxy_member_repo();
+                let primary_id = primary.id;
+                let secondary = proxy_member_repo();
+                let secondary_id = secondary.id;
+                let h = wire_with_repos(
+                    vec![vroot, primary, secondary],
+                    evaluator_with_read_and_prefetch("dev", vroot_id),
+                );
+                // Priority order: primary first, secondary second.
+                h.repositories.seed_virtual_member(vroot_id, primary_id);
+                h.repositories.seed_virtual_member(vroot_id, secondary_id);
+                // No upstream mapping seeded on either member: irrelevant
+                // here — the held-check short-circuits before the enqueue
+                // path would need one.
+                // Primary (higher priority) has a row for this version with
+                // status None — ingested content with no quarantine
+                // lifecycle.
+                h.artifacts.seed_package_version_status(
+                    primary_id,
+                    "p",
+                    vec![("1.0.0".into(), QuarantineStatus::None)],
+                );
+                // Secondary (lower priority) has NO row at all for this
+                // version — deliberately not seeded.
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert!(
+                    outcome.enqueued_job_ids.is_empty(),
+                    "the primary member's None-row wins outright; the secondary's absence \
+                     must not retroactively enqueue the item"
+                );
+                assert_eq!(outcome.skipped_already_held.len(), 1);
+            })
+        });
+        assert!(counter_value(&snap, "hort_prefetch_self_service_total", "success").is_none());
+    }
+
+    /// Complement of the precedence test above: the first-ordered member
+    /// has NO row at all (absence, not a `None`-status row) — the walk
+    /// must continue to the next member and classify by ITS status.
+    #[test]
+    fn virtual_member_precedence_continues_past_absent_first_member() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let primary = proxy_member_repo();
+                let primary_id = primary.id;
+                let secondary = proxy_member_repo();
+                let secondary_id = secondary.id;
+                let h = wire_with_repos(
+                    vec![vroot, primary, secondary],
+                    evaluator_with_read_and_prefetch("dev", vroot_id),
+                );
+                h.repositories.seed_virtual_member(vroot_id, primary_id);
+                h.repositories.seed_virtual_member(vroot_id, secondary_id);
+                h.mappings.upsert(mapping(secondary_id)).await.unwrap();
+                // Primary: no row at all for "p" — absent, not `None`.
+                // Secondary: Rejected.
+                h.artifacts.seed_package_version_status(
+                    secondary_id,
+                    "p",
+                    vec![("1.0.0".into(), QuarantineStatus::Rejected)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&vkey, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(outcome.rejected_packages.len(), 1);
+                assert_eq!(
+                    outcome.rejected_packages[0].reason,
+                    RejectionReason::ScanRejected
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "rejected_version"
+            ),
+            Some(1)
+        );
+    }
+
+    /// Envelope truthfulness end-to-end for a virtual repo: a partial
+    /// batch (some already held, some missing) enqueues EXACTLY the
+    /// missing subset — never the held items, never zero.
+    #[test]
+    fn virtual_envelope_truthfulness_partial_batch_enqueues_exactly_missing_subset() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let vroot = virtual_repo();
+                let vroot_id = vroot.id;
+                let vkey = vroot.key.clone();
+                let member = proxy_member_repo();
+                let member_id = member.id;
+                let h = wire_with_repos(
+                    vec![vroot, member],
+                    evaluator_with_read_and_prefetch("dev", vroot_id),
+                );
+                h.repositories.seed_virtual_member(vroot_id, member_id);
+                h.mappings.upsert(mapping(member_id)).await.unwrap();
+                h.artifacts.seed_package_version_status(
+                    member_id,
+                    "held_a",
+                    vec![("1.0.0".into(), QuarantineStatus::Released)],
+                );
+                h.artifacts.seed_package_version_status(
+                    member_id,
+                    "held_b",
+                    vec![("1.0.0".into(), QuarantineStatus::Released)],
+                );
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(
+                        &vkey,
+                        vec![
+                            item("held_a", Some("1.0.0")),
+                            item("held_b", Some("1.0.0")),
+                            item("missing", Some("1.0.0")),
+                        ],
+                        &actor,
+                    )
+                    .await
+                    .expect("ok");
+                assert_eq!(
+                    outcome.skipped_already_held.len(),
+                    2,
+                    "both held items skip"
+                );
+                assert_eq!(
+                    outcome.enqueued_job_ids.len(),
+                    1,
+                    "exactly the missing item enqueues"
+                );
+                let calls = h.jobs.enqueue_calls();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].1["package"].as_str(), Some("missing"));
+            })
+        });
+        assert_eq!(
+            counter_value(&snap, "hort_prefetch_self_service_total", "success"),
+            Some(1)
+        );
+    }
+
+    /// Envelope truthfulness, full-held end: every item already held →
+    /// `skipped ≈ N, enqueued: 0` — no job rows at all.
+    #[tokio::test]
+    async fn virtual_envelope_truthfulness_full_held_set_enqueues_nothing() {
+        let vroot = virtual_repo();
+        let vroot_id = vroot.id;
+        let vkey = vroot.key.clone();
+        let member = proxy_member_repo();
+        let member_id = member.id;
+        let h = wire_with_repos(
+            vec![vroot, member],
+            evaluator_with_read_and_prefetch("dev", vroot_id),
+        );
+        h.repositories.seed_virtual_member(vroot_id, member_id);
+        h.mappings.upsert(mapping(member_id)).await.unwrap();
+        h.artifacts.seed_package_version_status(
+            member_id,
+            "a",
+            vec![("1.0.0".into(), QuarantineStatus::Released)],
+        );
+        h.artifacts.seed_package_version_status(
+            member_id,
+            "b",
+            vec![("1.0.0".into(), QuarantineStatus::Quarantined)],
+        );
+        let actor = caller_cli_session(&["dev"]);
+        let outcome =
+            h.uc.enqueue_self_service(
+                &vkey,
+                vec![item("a", Some("1.0.0")), item("b", Some("1.0.0"))],
+                &actor,
+            )
+            .await
+            .expect("ok");
+        assert_eq!(outcome.skipped_already_held.len(), 2);
+        assert!(outcome.enqueued_job_ids.is_empty());
+        assert!(h.jobs.enqueue_calls().is_empty());
+    }
+
+    // ============================================================
+    // Direct POST to a mapping-less repo — rejected at POST time,
+    // never silently absorbed at execution
+    // ============================================================
+
+    #[test]
+    fn direct_post_explicit_version_no_mapping_rejects_at_post_time() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = npm_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                // No mapping seeded — hosted-only repo, explicit version
+                // (NOT the `version=None` path, which already has its own
+                // pinned `UpstreamNotFound` regression above).
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&key, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert!(outcome.enqueued_job_ids.is_empty());
+                assert_eq!(outcome.failed.len(), 1);
+                assert_eq!(
+                    outcome.failed[0].error,
+                    PrefetchItemError::NoUpstreamMapping
+                );
+                assert!(
+                    h.jobs.enqueue_calls().is_empty(),
+                    "rejected at POST time — never reaches the jobs port"
+                );
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_prefetch_self_service_total",
+                "no_upstream_mapping"
+            ),
+            Some(1)
+        );
+    }
+
+    /// Hard constraint regression pin: a direct POST against a `Proxy`-
+    /// typed repo that DOES have a catch-all mapping behaves exactly as
+    /// today — unaffected by the mapping-less-rejection guard above.
+    #[test]
+    fn direct_post_proxy_member_with_mapping_unaffected_by_no_upstream_mapping_guard() {
+        let snap = capture(|| {
+            Box::pin(async {
+                let repo = proxy_member_repo();
+                let repo_id = repo.id;
+                let key = repo.key.clone();
+                let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+                h.mappings.upsert(mapping(repo_id)).await.unwrap();
+                let actor = caller_cli_session(&["dev"]);
+                let outcome =
+                    h.uc.enqueue_self_service(&key, vec![item("p", Some("1.0.0"))], &actor)
+                        .await
+                        .expect("ok");
+                assert_eq!(outcome.enqueued_job_ids.len(), 1);
+                assert!(outcome.failed.is_empty());
+                let calls = h.jobs.enqueue_calls();
+                assert_eq!(
+                    calls[0].1["repository_id"].as_str(),
+                    Some(repo_id.to_string().as_str()),
                 );
             })
         });

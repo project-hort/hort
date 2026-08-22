@@ -24,8 +24,8 @@
 #   (hort-admins -> admin ClaimMapping).
 #
 # Token minting:
-#   maintainer-dev     — read permission  → /run/secrets/hort-dev.token
-#   maintainer-curator — curate permission → /run/secrets/hort-curator.token
+#   maintainer-dev     — read + prefetch + write permission → /run/secrets/hort-dev.token
+#   maintainer-curator — curate permission                  → /run/secrets/hort-curator.token
 #
 #   Both tokens are idempotent (exit 0, no reissue) unless --rotate is passed.
 #   Tokens must be stored in Ansible Vault / the maintainer's secret store after
@@ -225,13 +225,27 @@
 # idempotent: if the named token already exists the command exits 0 without
 # rotation.  Pass --rotate to replace an existing token.
 #
-# These tokens are non-admin (read / curate). `issue-svc-token` rejects
-# `--permission=admin` and requires the matching gitops SA to already exist
-# (declared under files/gitops/auth/service-accounts/, applied above).
+# These tokens are non-admin (read / prefetch / write / curate).
+# `issue-svc-token` rejects `--permission=admin` and requires the matching
+# gitops SA to already exist (declared under
+# files/gitops/auth/service-accounts/, applied above).
 #
 # Tokens are written to /run/secrets/ (tmpfs, cleared on reboot) and must be
 # retrieved from there and stored in Ansible Vault / the operator's secret
 # store immediately after provisioning.
+#
+# maintainer-dev must carry every permission its grants back it for (read,
+# prefetch, write — see auth/grants/maintainer-dev-*.yaml): a mint narrower
+# than the declared authority makes an operation the grants allow fail at
+# request time with no signal at apply time. Because the mint is idempotent
+# by name, this task only reaches that width on a host where no
+# `maintainer-dev` token exists yet; a host minted before the permission set
+# last widened keeps its narrower token across any number of further plays.
+# That is intentional — an unguarded --rotate here would instead reissue on
+# every run and invalidate a token still in active use. Bringing an
+# already-provisioned host's width up to date is a deliberate, one-time
+# operator action — see
+# docs/architecture/how-to/mint-operator-tokens-without-idp.md §3.
 
 - name: Ensure /run/secrets directory exists
   ansible.builtin.file:
@@ -241,12 +255,14 @@
     group: root
     mode: "0700"
 
-- name: Issue maintainer-dev service-account token (read permission)
+- name: Issue maintainer-dev service-account token (read + prefetch + write permission)
   ansible.builtin.command:
     cmd: >-
       {{ gitops_admin_cmd }} issue-svc-token
       --name maintainer-dev
       --permission read
+      --permission prefetch
+      --permission write
       --output file:/run/secrets/hort-dev.token
   environment: "{{ gitops_admin_env }}"
   changed_when: true

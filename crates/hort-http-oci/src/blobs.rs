@@ -4168,7 +4168,8 @@ mod tests {
         repo_id: Uuid,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         let now = Utc::now();
@@ -4188,6 +4189,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: now,
             updated_at: now,
@@ -4579,7 +4581,8 @@ mod tests {
         repo_id: Uuid,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         let now = Utc::now();
@@ -4599,6 +4602,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version: 0,
             created_at: now,
             updated_at: now,

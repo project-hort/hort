@@ -19,6 +19,12 @@ WORKDIR /src
 # crates/hort-server/src/migrate.rs) embeds the SQL files at compile time;
 # the COPY destination must match the macro path (resolves to /src/migrations).
 COPY Cargo.toml Cargo.lock ./
+# `.cargo/config.toml` declares the `hort-crates` registry that every
+# intra-workspace dependency names. Cargo refuses to PARSE a manifest
+# naming a registry it has no index declaration for, so without this the
+# build fails before it compiles anything. `path` still resolves locally —
+# declaring an index does not fetch it.
+COPY .cargo ./.cargo
 COPY crates ./crates
 COPY migrations ./migrations
 # hort-server depends on hort-attribution, which embeds these workspace-root

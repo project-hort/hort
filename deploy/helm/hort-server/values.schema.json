@@ -855,8 +855,48 @@
           "type": "string"
         },
         "rotateSvcToken": {
-          "description": "When true, force-rotate the cronjob-tasks svc-token on the next helm upgrade. Replaces the pre-078 `cronJobs.rotateSvcToken`. Default false.",
+          "description": "When true, force-rotate EVERY entry in `svcTokens` on the next helm upgrade (OR'd with each entry's own `rotate`). Replaces the pre-078 `cronJobs.rotateSvcToken`. Default false.",
           "type": "boolean"
+        },
+        "svcTokens": {
+          "description": "List of service-account identities the svc-token-bootstrap Job mints and mounts as Secrets. Default ships exactly the single pre-list identity (`cronjob-tasks`, empty secretName) so an untouched install renders byte-identical to before this list existed.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": {
+                "description": "Logical identity name, passed to `issue-svc-token --name`. Derives the gitops-created `sa:<name>` backing user.",
+                "type": "string",
+                "minLength": 1
+              },
+              "permissions": {
+                "description": "Permissions minted via repeated `--permission` flags. Each must be backed by a live PermissionGrant for this identity AT THIS ENTRY'S SCOPE (global grant when `repository` is unset, matching-repository or global grant when it is set) or the mint fails loud (`--require-authority`).",
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "default": ["admin_task_invoke"]
+              },
+              "repository": {
+                "description": "Optional: scope the minted token to a single repository by its `key`. The cap carries `repository_ids: [<repo_id>]` instead of the default global `null`, and `--require-authority` (if set) checks the declared permissions at this repository (a global grant also satisfies it). Omit for a global-scope identity — unchanged, byte-compatible default.",
+                "type": "string",
+                "minLength": 1
+              },
+              "secretName": {
+                "description": "Cluster Secret this identity's token is written to; also the bootstrap Role's `resourceNames` anchor. Empty resolves to `<fullname>-svc-token` for the first list entry, `<fullname>-svc-token-<name>` for later entries.",
+                "type": "string"
+              },
+              "rotate": {
+                "description": "Force-rotate JUST this entry on the next upgrade. OR'd with the global `scheduledTasks.rotateSvcToken` switch. Default false.",
+                "type": "boolean",
+                "default": false
+              }
+            }
+          },
+          "default": [
+            {"name": "cronjob-tasks", "permissions": ["admin_task_invoke"], "secretName": "", "rotate": false}
+          ]
         },
         "scrub": {
           "description": "executionPath: dsn-direct. CAS integrity scrub CronJob. `actionOnMismatch` is also read by the main Deployment, so it is load-bearing even when disabled.",
@@ -1109,7 +1149,12 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "osvUrl": {"type": "string", "minLength": 1}
+            "osvUrl": {"type": "string", "minLength": 1},
+            "osvVulnsUrl": {
+              "description": "OSV.dev single-record endpoint, source of the CVSS vector severity derivation reads. Mirror-coupled with osvUrl: pointing osvUrl at an internal mirror while this stays on the public default makes severity derivation depend on egress to api.osv.dev, and without that egress every advisory degrades to Critical.",
+              "type": "string",
+              "minLength": 1
+            }
           }
         },
         "provenance": {

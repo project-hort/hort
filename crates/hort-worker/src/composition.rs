@@ -76,12 +76,12 @@ use hort_app::task_dispatcher::TaskDispatcher;
 use hort_app::task_handlers::eventstore_checkpoint::BackfillBaselineConfig;
 use hort_app::task_handlers::{
     AdvisoryWatchTickHandler, CronRescanTickHandler, EventStoreArchiveHandler,
-    EventstoreCheckpointHandler, NoopTaskHandler, PrefetchDependenciesHandler,
-    PrefetchIngestHandler, PrefetchRowRetentionSweepHandler, PrefetchTickHandler,
-    ProvenanceVerifyHandler, QuarantineReleaseSweepHandler, ReplaySeenPruneHandler,
-    RetentionEvaluateHandler, RetentionPurgeHandler, ScanTaskHandler, ScannerRegistryPruneHandler,
-    SeedImportHandler, ServiceAccountRotationHandler, StagingSweepHandler,
-    WheelMetadataBackfillHandler,
+    EventstoreCheckpointHandler, NoopTaskHandler, OciMembershipEdgeBackfillHandler,
+    PrefetchDependenciesHandler, PrefetchIngestHandler, PrefetchRowRetentionSweepHandler,
+    PrefetchTickHandler, ProvenanceVerifyHandler, QuarantineReleaseSweepHandler,
+    ReplaySeenPruneHandler, RetentionEvaluateHandler, RetentionPurgeHandler, ScanTaskHandler,
+    ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
+    StagingSweepHandler, WheelMetadataBackfillHandler,
 };
 use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
 // IngestUseCase + ArtifactGroupUseCase are the dep subtree the worker
@@ -137,6 +137,7 @@ use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::user_repository::UserRepository;
 use hort_formats::cargo::CargoFormatHandler;
+use hort_formats::maven::MavenFormatHandler;
 use hort_formats::npm::NpmFormatHandler;
 use hort_formats::oci::OciFormatHandler;
 use hort_formats::pypi::PyPiFormatHandler;
@@ -339,6 +340,7 @@ pub async fn build_app_context(
         // — see `OsvAdvisoryConfig::default`).
         let mut acfg = OsvAdvisoryConfig {
             osv_batch_url: cfg.advisory_osv_url.clone(),
+            osv_vulns_url: cfg.advisory_osv_vulns_url.clone(),
             bulk_url: cfg.advisory_osv_bulk_url.clone(),
             ..OsvAdvisoryConfig::default()
         };
@@ -449,12 +451,25 @@ pub async fn build_app_context(
     //    `Arc<dyn FormatHandler>`s are cheap to clone; the `.clone()` at
     //    the orchestration call site preserves single-instance semantics
     //    for the scan path while handing a second handle to seed-import.
+    //
+    //    `maven` participates here too: it has no `VersionDiscovery`
+    //    (no ordering, no upstream-metadata fan-out), so the auto-trigger
+    //    tick and the transitive-dependency cascade both fall through
+    //    their `handler.version_discovery()` guard and no-op for Maven
+    //    repos exactly as they already do for a registered handler with
+    //    no `VersionDiscovery` impl — a case both handlers have dedicated
+    //    coverage for. The leaf-ingest `PrefetchIngestHandler` below is
+    //    the consumer that actually needs the registration: without it,
+    //    the self-service prefetch endpoint's `prefetch` leaf-ingest rows
+    //    for a Maven repo short-circuit as "no FormatHandler registered"
+    //    before ever reaching the Maven pull-through arm.
     // -----------------------------------------------------------------
     let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
     handlers.insert("pypi".into(), Arc::new(PyPiFormatHandler));
     handlers.insert("cargo".into(), Arc::new(CargoFormatHandler));
     handlers.insert("npm".into(), Arc::new(NpmFormatHandler));
     handlers.insert("oci".into(), Arc::new(OciFormatHandler));
+    handlers.insert("maven".into(), Arc::new(MavenFormatHandler));
 
     // -----------------------------------------------------------------
     // 8. QuarantineUseCase — the consumer of the orchestrator's
@@ -499,6 +514,12 @@ pub async fn build_app_context(
         repositories.clone(),
         policy_projections.clone(),
         advisory.clone(),
+        // Same CAS the Trivy adapter reads at scan time. Formats whose
+        // handler declares `payload_sbom` (cargo) stream their stored
+        // bytes through it to build a resolved-version SBOM, and only
+        // for artifacts in a hosted repository; every other scan never
+        // touches it.
+        storage.clone(),
         scanners_map,
         // Clone so the SeedImportUseCase below can consume the same
         // handler set. The `Arc<dyn FormatHandler>` values are cheap
@@ -849,6 +870,48 @@ pub async fn build_app_context(
             content_references.clone(),
             storage.clone(),
             pypi_handler_for_backfill,
+        )),
+        1, // single-active — see rationale above
+    );
+
+    // -----------------------------------------------------------------
+    // 12.e.quater Register the OciMembershipEdgeBackfillHandler (kind
+    //             `oci-membership-edge-backfill`).
+    //
+    //             One-shot retrofit for OCI single-image manifest rows
+    //             minted before the write path registered
+    //             `content_references` membership edges on every
+    //             manifest PUT/pull-through. Walks
+    //             `artifacts.path LIKE 'manifests/sha256:%'` (image-
+    //             typed only) with no `oci_config` row; per row: stream
+    //             the manifest from CAS → invoke
+    //             `extract_oci_manifest_blob_refs` → insert the missing
+    //             `oci_config`/`oci_layer` edges. Resumable by
+    //             construction.
+    //
+    //             Unconditional registration: the handler only needs
+    //             ports already wired (artifacts, storage,
+    //             content_references, OCI FormatHandler). No CronJob —
+    //             deliberately (see the handler's module doc); manual
+    //             admin-tasks invocation only.
+    //
+    //             Concurrency = 1 — single-active. Mirrors
+    //             `wheel-metadata-backfill` posture.
+    // -----------------------------------------------------------------
+    let oci_handler_for_backfill: Arc<dyn FormatHandler> = handlers
+        .get("oci")
+        .expect(
+            "hort-worker composition: `oci` FormatHandler must be registered for \
+             OciMembershipEdgeBackfillHandler (it is the only format that produces \
+             OCI manifest membership edges)",
+        )
+        .clone();
+    dispatcher.register(
+        Arc::new(OciMembershipEdgeBackfillHandler::new(
+            artifacts.clone(),
+            content_references.clone(),
+            storage.clone(),
+            oci_handler_for_backfill,
         )),
         1, // single-active — see rationale above
     );

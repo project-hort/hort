@@ -1,0 +1,16 @@
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  # The repository envelope's `spec.proxy.upstreamUrl` is validator-only; this
+  # is the envelope that populates the `repository_upstream_mappings` row the
+  # npm pull-through path's UpstreamResolver actually reads. Without it every
+  # pull-through fetch 404s.
+  name: npm-dedup-leader-e2e
+spec:
+  repository: npm-dedup-leader-e2e
+  # Empty pathPrefix → catch-all single-upstream mapping; the npm
+  # orchestrator passes "" as the prefix on every resolve() call.
+  pathPrefix: ""
+  upstreamUrl: https://registry.npmjs.org
+  auth:
+    type: anonymous

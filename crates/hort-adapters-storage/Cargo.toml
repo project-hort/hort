@@ -4,13 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort storage backend implementations (CAS — filesystem, S3, GCS, Azure)"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain  = { path = "../hort-domain" }
-hort-config  = { path = "../hort-config" }
+hort-domain  = { workspace = true }
+hort-config  = { workspace = true }
 
 tokio        = { workspace = true }
 tokio-util   = { workspace = true }

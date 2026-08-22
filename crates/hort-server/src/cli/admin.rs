@@ -44,7 +44,8 @@ use uuid::Uuid;
 
 use hort_adapters_postgres::{
     api_token_repo::PgApiTokenRepository, event_store::PgEventStore,
-    permission_grant_repo::PgPermissionGrantRepository, user_repo::PgUserRepository,
+    permission_grant_repo::PgPermissionGrantRepository, repository_repo::PgRepositoryRepository,
+    user_repo::PgUserRepository,
 };
 use hort_app::event_store_publisher::EventStorePublisher;
 use hort_app::rbac::RbacEvaluator;
@@ -60,6 +61,7 @@ use hort_domain::events::ApiActor;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
 use hort_domain::ports::event_store::EventStore;
 use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
+use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::types::PageRequest;
 
@@ -177,6 +179,19 @@ pub struct IssueSvcTokenArgs {
     /// at every CronJob tick (issue #21).
     #[arg(long, default_value_t = false)]
     pub require_authority: bool,
+
+    /// Scope the minted token to a single repository by its `key`.
+    ///
+    /// Omit for a global-scope token (today's behaviour, byte-compatible:
+    /// the cap carries `repository_ids = None`). With this flag, the name
+    /// is resolved to a repository id before any DB write — an unknown
+    /// name fails loudly — and the minted cap carries
+    /// `repository_ids = [<repo_id>]`. With `--require-authority`, the
+    /// preflight also checks each declared permission AT this scope
+    /// (a global grant still satisfies it, since global authority
+    /// encompasses every repository scope).
+    #[arg(long)]
+    pub repository: Option<String>,
 }
 
 /// Arguments to `admin bootstrap-session`.
@@ -276,19 +291,25 @@ fn resolve_svc_user(found: Option<User>, username: &str, svc_name: &str) -> anyh
     }
 }
 
-/// Evaluator-backed authority check for `--require-authority` (design §4,
-/// issue #21).
+/// Evaluator-backed authority check for `--require-authority`.
 ///
 /// Verifies each permission in `permissions` is backed by a live grant on
-/// `svc_user_id` at **global** scope (`repository_id = None`), using
+/// `svc_user_id` at `scope` — `None` for **global** scope (today's
+/// unchanged behaviour), `Some((repo_id, repo_name))` to check the SAME
+/// scope the minted token will be capped to — using
 /// [`RbacEvaluator::authorize_granted`] — the SAME grants-leg-only
 /// evaluation the runtime already uses for the quarantine hold-exemption
 /// basis (ADR 0039 §10), rather than a hand-rolled grants query that
-/// could drift from the request-time gate. `authorize_granted` ignores
-/// `token_cap` entirely, which is exactly right here: the probe principal
-/// built below always carries `token_cap: None`, so there is no cap leg
-/// that could mask a missing grant — the decision is 100% the grants
-/// leg.
+/// could drift from the request-time gate. Passing `Some(repo_id)` as the
+/// evaluator's scope reuses the runtime's own global-⊇-repo semantics
+/// (`RbacEvaluator::user_grants_authorize` treats a grant with
+/// `repository_id: None` as matching every scope), so a global grant
+/// backs a repo-scoped preflight exactly as it backs a repo-scoped
+/// request at runtime — no separate "global also satisfies" branch
+/// needed here. `authorize_granted` ignores `token_cap` entirely, which
+/// is exactly right here: the probe principal built below always carries
+/// `token_cap: None`, so there is no cap leg that could mask a missing
+/// grant — the decision is 100% the grants leg.
 ///
 /// A service-account principal carries no claims (service accounts are
 /// strictly non-admin and never resolve IdP groups), so only a
@@ -309,6 +330,7 @@ fn check_require_authority(
     svc_name: &str,
     svc_user_id: Uuid,
     permissions: &[Permission],
+    scope: Option<(Uuid, &str)>,
 ) -> anyhow::Result<()> {
     // A probe principal with no claims and no token cap: the shape a
     // service account's own identity carries. `authorize_granted` reads
@@ -324,44 +346,75 @@ fn check_require_authority(
         issued_at: chrono::Utc::now(),
         token_cap: None,
     };
+    let repository_id = scope.map(|(id, _)| id);
     let unbacked: Vec<Permission> = permissions
         .iter()
         .copied()
-        .filter(|&p| !evaluator.authorize_granted(&principal, p, None))
+        .filter(|&p| !evaluator.authorize_granted(&principal, p, repository_id))
         .collect();
     if unbacked.is_empty() {
         return Ok(());
     }
-    anyhow::bail!(unbacked_authority_message(svc_name, &unbacked));
+    anyhow::bail!(unbacked_authority_message(
+        svc_name,
+        &unbacked,
+        scope.map(|(_, name)| name)
+    ));
 }
 
-/// Render the `--require-authority` preflight failure message (design §4).
+/// Render the `--require-authority` preflight failure message.
 ///
 /// Names every unbacked declared permission in one message (not just the
 /// first) and prints a copy-paste `PermissionGrant` YAML block per
 /// permission, so an operator fixes all of them in a single gitops apply
-/// pass. Pure string formatting — no I/O — so it is unit-testable
-/// without a live grant set.
+/// pass. `repository_name` is `None` for the global check (message shape
+/// unchanged from before scope-awareness) or `Some(name)` to name the
+/// checked repository inline and add the matching `repository: <name>`
+/// line to each YAML block — never the global form when a scope was
+/// actually checked. Pure string formatting — no I/O — so it is
+/// unit-testable without a live grant set.
 ///
 /// `unbacked` is expected non-empty; the sole caller
 /// ([`check_require_authority`]) only invokes this after confirming that.
-fn unbacked_authority_message(svc_name: &str, unbacked: &[Permission]) -> String {
+fn unbacked_authority_message(
+    svc_name: &str,
+    unbacked: &[Permission],
+    repository_name: Option<&str>,
+) -> String {
+    let scope_suffix = match repository_name {
+        Some(r) => format!(" (repository: {r})"),
+        None => String::new(),
+    };
     let names: Vec<String> = unbacked.iter().map(ToString::to_string).collect();
     let mut msg = format!(
-        "service account {svc_name:?} exists but has no grant for permission(s): {} — the \
-         token would mint but the corresponding admin-task CronJob(s) would be denied (403) \
-         at run time. Add the following to your gitopsConfig and re-apply:\n",
+        "service account {svc_name:?} exists but has no grant for permission(s): {}{scope_suffix} \
+         — the token would mint but the corresponding admin-task CronJob(s) would be denied \
+         (403) at run time. Add the following to your gitopsConfig and re-apply:\n",
         names.join(", ")
     );
     for name in &names {
+        let repo_line = match repository_name {
+            Some(r) => format!("\n    repository: {r}"),
+            None => "        # global (no repository:)".to_string(),
+        };
         msg.push_str(&format!(
             "\n  apiVersion: project-hort.de/v1\n  kind: PermissionGrant\n  \
              metadata: {{ name: {svc_name}-{name} }}\n  spec:\n    \
              subject: {{ kind: serviceAccount, name: {svc_name} }}\n    \
-             permission: {name}        # global (no repository:)\n"
+             permission: {name}{repo_line}\n"
         ));
     }
     msg
+}
+
+/// The minted token's per-repository cap: `None` for a
+/// global token — today's byte-compatible default — or `Some([repo_id])`
+/// when `--repository` scoped the mint. Single-element only: a
+/// list-valued `--repository` is a distinct future need, out of scope
+/// here. Pure so the regression pin (flagless mint stays `None`) is
+/// unit-testable without a database.
+fn cap_repository_ids(repository_id: Option<Uuid>) -> Option<Vec<Uuid>> {
+    repository_id.map(|id| vec![id])
 }
 
 async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
@@ -427,6 +480,24 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
     // the event store in a no-broadcast publisher.
     let event_publisher = Arc::new(EventStorePublisher::without_broadcast(event_store));
 
+    // Resolve `--repository` to a repository id before any DB write —
+    // an unknown name fails loudly here, not after minting. Scopes both
+    // the `--require-authority` preflight below and the minted token's
+    // capability. Without the flag: `None`, byte-compatible
+    // with today (global cap, global-only preflight).
+    let repository_scope: Option<(Uuid, String)> = match &args.repository {
+        Some(name) => {
+            let repository_repo: Arc<dyn RepositoryRepository> =
+                Arc::new(PgRepositoryRepository::new(pool.clone()));
+            let repo = repository_repo
+                .find_by_key(name)
+                .await
+                .with_context(|| format!("resolving --repository {name:?}: unknown repository"))?;
+            Some((repo.id, name.clone()))
+        }
+        None => None,
+    };
+
     // Require a PRE-EXISTING gitops ServiceAccount. The command no
     // longer creates a user when absent: an SA's authority must flow
     // through the audited gitops apply path (ADR 0012), not be
@@ -454,7 +525,15 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
         // with — not a hand-rolled grants query — so this check cannot
         // drift from the request-time gate.
         let evaluator = RbacEvaluator::new(grants);
-        check_require_authority(&evaluator, &args.name, svc_user.id, &permissions)?;
+        check_require_authority(
+            &evaluator,
+            &args.name,
+            svc_user.id,
+            &permissions,
+            repository_scope
+                .as_ref()
+                .map(|(id, name)| (*id, name.as_str())),
+        )?;
     }
 
     // Check for an existing token with the same name on this user.
@@ -513,7 +592,7 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
                 name: args.name.clone(),
                 description: Some("Issued by hort-server admin issue-svc-token".to_owned()),
                 declared_permissions: permissions,
-                repository_ids: None,
+                repository_ids: cap_repository_ids(repository_scope.as_ref().map(|(id, _)| *id)),
                 // System-mint resolves `None` to `DEFAULT_SVC_EXPIRY_DAYS`
                 // (365) itself, but we pass the CLI value explicitly so
                 // `--expires-in-days <N>` overrides cleanly.
@@ -936,6 +1015,46 @@ mod tests {
     }
 
     #[test]
+    fn issue_svc_token_accepts_repository_flag() {
+        let cli = TestCli::try_parse_from([
+            "hort-server",
+            "admin",
+            "issue-svc-token",
+            "--name",
+            "uat-smoke",
+            "--repository",
+            "maven-proxy",
+        ])
+        .unwrap();
+        let super::super::Command::Admin(admin_cmd) = cli.command else {
+            panic!("expected Admin");
+        };
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
+        assert_eq!(args.repository.as_deref(), Some("maven-proxy"));
+    }
+
+    #[test]
+    fn issue_svc_token_repository_flag_defaults_to_none() {
+        let cli = TestCli::try_parse_from([
+            "hort-server",
+            "admin",
+            "issue-svc-token",
+            "--name",
+            "cronjob-tasks",
+        ])
+        .unwrap();
+        let super::super::Command::Admin(admin_cmd) = cli.command else {
+            panic!("expected Admin");
+        };
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
+        assert_eq!(args.repository, None);
+    }
+
+    #[test]
     fn issue_svc_token_accepts_custom_expiry() {
         let cli = TestCli::try_parse_from([
             "hort-server",
@@ -1058,6 +1177,7 @@ mod tests {
             rotate: false,
             expires_in_days: DEFAULT_SVC_EXPIRY_DAYS,
             require_authority: false,
+            repository: None,
         };
         // We can't call issue_svc_token_async without a live DB, but we can
         // assert the output detection logic by checking the expected branch.
@@ -1213,6 +1333,7 @@ mod tests {
             "cronjob-tasks",
             uid,
             &[Permission::AdminTaskInvoke, Permission::Read],
+            None,
         )
         .expect("all declared permissions are backed by a global grant");
     }
@@ -1221,9 +1342,14 @@ mod tests {
     fn check_require_authority_fails_naming_the_single_unbacked_permission() {
         let uid = Uuid::new_v4();
         let eval = RbacEvaluator::new(Vec::new());
-        let err =
-            check_require_authority(&eval, "cronjob-tasks", uid, &[Permission::AdminTaskInvoke])
-                .unwrap_err();
+        let err = check_require_authority(
+            &eval,
+            "cronjob-tasks",
+            uid,
+            &[Permission::AdminTaskInvoke],
+            None,
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("cronjob-tasks"), "unexpected: {msg}");
         assert!(msg.contains("admin_task_invoke"), "unexpected: {msg}");
@@ -1256,6 +1382,7 @@ mod tests {
                 Permission::Read,
                 Permission::Write,
             ],
+            None,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -1278,10 +1405,11 @@ mod tests {
 
     #[test]
     fn check_require_authority_repo_scoped_grant_does_not_satisfy_the_global_check() {
-        // The preflight checks GLOBAL authority (repository = None). A grant
-        // scoped to one repository must not be mistaken for a global grant —
-        // it would let the preflight pass while the CronJob (which invokes
-        // admin tasks with no repository in scope) still 403s.
+        // Regression pin: repo-scoped grant + NO `--repository`
+        // still fails the GLOBAL check exactly as today. A grant scoped to
+        // one repository must not be mistaken for a global grant — it would
+        // let the preflight pass while the CronJob (which invokes admin
+        // tasks with no repository in scope) still 403s.
         let uid = Uuid::new_v4();
         let repo = Uuid::new_v4();
         let eval = RbacEvaluator::new(vec![user_grant(
@@ -1289,9 +1417,14 @@ mod tests {
             Permission::AdminTaskInvoke,
             Some(repo),
         )]);
-        let err =
-            check_require_authority(&eval, "cronjob-tasks", uid, &[Permission::AdminTaskInvoke])
-                .unwrap_err();
+        let err = check_require_authority(
+            &eval,
+            "cronjob-tasks",
+            uid,
+            &[Permission::AdminTaskInvoke],
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("admin_task_invoke"));
     }
 
@@ -1304,9 +1437,14 @@ mod tests {
             Permission::AdminTaskInvoke,
             None,
         )]);
-        let err =
-            check_require_authority(&eval, "cronjob-tasks", uid, &[Permission::AdminTaskInvoke])
-                .unwrap_err();
+        let err = check_require_authority(
+            &eval,
+            "cronjob-tasks",
+            uid,
+            &[Permission::AdminTaskInvoke],
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("admin_task_invoke"));
     }
 
@@ -1315,11 +1453,109 @@ mod tests {
         let msg = unbacked_authority_message(
             "cronjob-tasks",
             &[Permission::AdminTaskInvoke, Permission::Read],
+            None,
         );
         assert!(msg.contains("admin_task_invoke"));
         assert!(msg.contains("permission: read"));
         assert_eq!(msg.matches("apiVersion: project-hort.de/v1").count(), 2);
         assert_eq!(msg.matches("metadata: { name: cronjob-tasks-").count(), 2);
+    }
+
+    // -- issue-svc-token: scope-aware preflight -----------------------------
+
+    #[test]
+    fn check_require_authority_repo_scoped_grant_backs_matching_repository_scope() {
+        // A grant scoped to the SAME repository the CLI checks satisfies
+        // the preflight — the whole point of scope-aware authority.
+        let uid = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(uid, Permission::Read, Some(repo))]);
+        check_require_authority(
+            &eval,
+            "uat-smoke",
+            uid,
+            &[Permission::Read],
+            Some((repo, "maven-proxy")),
+        )
+        .expect("repo-scoped grant backs the matching repo-scoped check");
+    }
+
+    #[test]
+    fn check_require_authority_repo_scoped_grant_does_not_back_a_different_repository() {
+        let uid = Uuid::new_v4();
+        let granted_repo = Uuid::new_v4();
+        let checked_repo = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(uid, Permission::Read, Some(granted_repo))]);
+        let err = check_require_authority(
+            &eval,
+            "uat-smoke",
+            uid,
+            &[Permission::Read],
+            Some((checked_repo, "maven-proxy")),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        // Names the checked scope, not just the permission.
+        assert!(msg.contains("maven-proxy"), "unexpected: {msg}");
+        assert!(msg.contains("read"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn check_require_authority_global_grant_backs_a_repo_scoped_check() {
+        // Global ⊇ repo: a global grant satisfies a repo-scoped preflight
+        // exactly as it satisfies a repo-scoped request at runtime.
+        let uid = Uuid::new_v4();
+        let repo = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![user_grant(uid, Permission::Read, None)]);
+        check_require_authority(
+            &eval,
+            "uat-smoke",
+            uid,
+            &[Permission::Read],
+            Some((repo, "maven-proxy")),
+        )
+        .expect("a global grant must satisfy a repo-scoped preflight (global ⊇ repo)");
+    }
+
+    #[test]
+    fn unbacked_authority_message_names_the_checked_repository_scope() {
+        let msg = unbacked_authority_message("uat-smoke", &[Permission::Read], Some("maven-proxy"));
+        assert!(
+            msg.contains("(repository: maven-proxy)"),
+            "must name the checked scope in the summary: {msg}"
+        );
+        assert!(
+            msg.contains("repository: maven-proxy"),
+            "must show the matching grant YAML shape for that scope: {msg}"
+        );
+        // Never the unconditional global form when a scope was checked.
+        assert!(
+            !msg.contains("global (no repository:)"),
+            "must not show the global YAML shape for a scoped check: {msg}"
+        );
+    }
+
+    #[test]
+    fn unbacked_authority_message_global_form_is_byte_unchanged() {
+        // No repository scope → identical shape to the pre-scoping message.
+        let msg = unbacked_authority_message("cronjob-tasks", &[Permission::AdminTaskInvoke], None);
+        assert!(msg.contains("# global (no repository:)"));
+        assert!(!msg.contains("(repository:"));
+    }
+
+    // -- issue-svc-token: cap scoping ----------------------------------------
+
+    #[test]
+    fn cap_repository_ids_is_none_without_a_repository_flag() {
+        // Regression pin: flagless mint stays byte-compatible — `None`,
+        // not an empty vec (which the use case rejects outright).
+        assert_eq!(cap_repository_ids(None), None);
+    }
+
+    #[test]
+    fn cap_repository_ids_scopes_to_the_single_resolved_repo() {
+        let repo = Uuid::new_v4();
+        assert_eq!(cap_repository_ids(Some(repo)), Some(vec![repo]));
     }
 
     // -- output-mode parsing (shared helper) --------------------------------

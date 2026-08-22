@@ -156,6 +156,34 @@ impl ArtifactRepository for PgArtifactRepository {
         })
     }
 
+    fn first_seen_for_checksum(
+        &self,
+        sha256: &ContentHash,
+    ) -> BoxFuture<'_, DomainResult<Option<DateTime<Utc>>>> {
+        let sha256 = sha256.as_ref().to_string();
+        Box::pin(async move {
+            tracing::debug!(entity = "Artifact", sha256 = %sha256, "first_seen_for_checksum");
+            // Unscoped by repository AND unfiltered by `is_deleted`, both
+            // deliberately: the question is "when did hort first hold
+            // these bytes, anywhere", and a soft-delete withdraws a row
+            // from service without un-observing the bytes. `MIN` over the
+            // `idx_artifacts_checksum` equality range — no new index, no
+            // stored projection to keep in step.
+            //
+            // `fetch_one` (not `fetch_optional`): an aggregate over an
+            // empty range still returns exactly one row, carrying SQL
+            // NULL, which maps to the `None` the caller reads as
+            // "no evidence".
+            let (first_seen,): (Option<DateTime<Utc>>,) =
+                sqlx::query_as("SELECT MIN(created_at) FROM artifacts WHERE checksum_sha256 = $1")
+                    .bind(&sha256)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| map_sqlx_error(&e, "Artifact", &sha256))?;
+            Ok(first_seen)
+        })
+    }
+
     fn list_by_repository(
         &self,
         repository_id: Uuid,
@@ -631,6 +659,67 @@ impl ArtifactRepository for PgArtifactRepository {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Artifact", "find_pypi_wheels_without_kind"))?;
+            let items: Vec<Artifact> = rows
+                .into_iter()
+                .map(Artifact::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(items)
+        })
+    }
+
+    fn find_oci_image_manifests_without_kind(
+        &self,
+        kind: &str,
+        limit: u32,
+    ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+        let kind = kind.to_owned();
+        let limit = limit as i64;
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Artifact",
+                %kind,
+                %limit,
+                "find_oci_image_manifests_without_kind"
+            );
+            // Backfill candidacy. Manifest-shaped rows only (`path LIKE
+            // 'manifests/sha256:%'`, the coords convention
+            // `hort-http-oci::coords` writes) AND no `content_references`
+            // row of the given kind (in practice `oci_config`) AND NOT an
+            // image index — discriminated on the stored media type
+            // (`artifact_metadata.metadata->>'oci_media_type'`, mirroring
+            // `hort-http-oci::manifests::resolve_media_type`'s read). A
+            // row with no `artifact_metadata` row at all, or one whose
+            // `oci_media_type` field is absent, is NOT excluded — that
+            // mirrors `resolve_media_type`'s own fallback to the
+            // single-image default and is exactly the pre-metadata-
+            // migration shape this backfill targets.
+            let sql = format!(
+                "SELECT {SELECT_COLS} FROM artifacts \
+                 WHERE path LIKE 'manifests/sha256:%' \
+                   AND is_deleted = false \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM content_references \
+                       WHERE source_artifact_id = artifacts.id \
+                         AND kind = $1 \
+                   ) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM artifact_metadata \
+                       WHERE artifact_id = artifacts.id \
+                         AND metadata->>'oci_media_type' IN ($3, $4) \
+                   ) \
+                 ORDER BY id \
+                 LIMIT $2"
+            );
+            let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
+                .bind(&kind)
+                .bind(limit)
+                .bind(hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE)
+                .bind(hort_domain::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    map_sqlx_error(&e, "Artifact", "find_oci_image_manifests_without_kind")
+                })?;
             let items: Vec<Artifact> = rows
                 .into_iter()
                 .map(Artifact::try_from)
@@ -2035,6 +2124,285 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
+    // ---------------------------------------------------------------------
+    // find_oci_image_manifests_without_kind PG SQL pin
+    // ---------------------------------------------------------------------
+
+    /// Seed an `artifact_metadata` row carrying `oci_media_type` in its
+    /// JSONB `metadata` column, for the media-type-discrimination tests
+    /// below. Mirrors the shape `hort-http-oci`'s manifest write path
+    /// stores it in.
+    async fn seed_oci_media_type(pool: &PgPool, artifact_id: Uuid, media_type: &str) {
+        sqlx::query(
+            r#"INSERT INTO artifact_metadata (artifact_id, format, metadata)
+               VALUES ($1, 'oci', jsonb_build_object('oci_media_type', $2::text))"#,
+        )
+        .bind(artifact_id)
+        .bind(media_type)
+        .execute(pool)
+        .await
+        .expect("seed artifact_metadata oci_media_type");
+    }
+
+    /// Insert an `oci_config` ContentReference row pointing the given
+    /// source artifact at an arbitrary content hash — models "this
+    /// manifest has already been repaired."
+    async fn seed_oci_config_ref(
+        pool: &PgPool,
+        repo_id: Uuid,
+        source_artifact_id: Uuid,
+        seed: usize,
+    ) {
+        let target_hash = deterministic_hex64(seed ^ 0xFACE_FEED_usize);
+        sqlx::query(
+            r#"INSERT INTO content_references (
+                   repository_id, source_artifact_id, target_content_hash,
+                   kind, metadata, recorded_at
+               ) VALUES (
+                   $1, $2, $3, 'oci_config', '{}'::jsonb, now()
+               )"#,
+        )
+        .bind(repo_id)
+        .bind(source_artifact_id)
+        .bind(&target_hash)
+        .execute(pool)
+        .await
+        .expect("seed oci_config content_reference");
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_returns_empty_when_no_manifests_exist() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        assert!(got.is_empty(), "no manifests seeded → empty candidate set");
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Mixed seed: an un-backfilled image manifest (candidate), a manifest
+    /// that already has an `oci_config` row (NOT a candidate — NOT EXISTS
+    /// prunes it), and a blob row under `blobs/sha256:…` (path filter
+    /// excludes it regardless of content_references). The query MUST
+    /// return exactly the one un-backfilled image manifest.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_excludes_repaired_and_blobs() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let candidate = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:aaaa000000000000000000000000000000000000000000000000000000000000",
+            400,
+        )
+        .await;
+        seed_oci_media_type(
+            &pool,
+            candidate,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .await;
+
+        let repaired = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:bbbb000000000000000000000000000000000000000000000000000000000000",
+            401,
+        )
+        .await;
+        seed_oci_media_type(
+            &pool,
+            repaired,
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .await;
+        seed_oci_config_ref(&pool, repo, repaired, 401).await;
+
+        let _blob = seed_artifact_at_path(
+            &pool,
+            repo,
+            "blobs/sha256:cccc000000000000000000000000000000000000000000000000000000000000",
+            402,
+        )
+        .await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
+        assert_eq!(
+            got_ids,
+            [candidate].into_iter().collect(),
+            "candidate set MUST be exactly the un-repaired image manifest: {got_ids:?}"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// An image index (`oci_media_type` = the index or manifest-list
+    /// media type) MUST NEVER be returned — it legitimately has no
+    /// `config`/`layers` edges (it carries `oci_index_member` children
+    /// instead), so it would otherwise always match NOT EXISTS
+    /// `oci_config` despite having nothing to repair.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_excludes_indexes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let index_artifact = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:dddd000000000000000000000000000000000000000000000000000000000000",
+            410,
+        )
+        .await;
+        seed_oci_media_type(
+            &pool,
+            index_artifact,
+            hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE,
+        )
+        .await;
+
+        let docker_list_artifact = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:eeee000000000000000000000000000000000000000000000000000000000000",
+            411,
+        )
+        .await;
+        seed_oci_media_type(
+            &pool,
+            docker_list_artifact,
+            hort_domain::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE,
+        )
+        .await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        assert!(
+            got.is_empty(),
+            "both index-shaped manifests must be excluded, got {got:?}"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// A manifest row with NO `artifact_metadata` row at all (the
+    /// pre-metadata-migration shape this backfill exists for) is treated
+    /// as an image manifest — mirroring `resolve_media_type`'s own
+    /// fallback to the single-image default — and MUST be returned.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_includes_rows_with_no_metadata_row() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let legacy = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:ffff000000000000000000000000000000000000000000000000000000000000",
+            420,
+        )
+        .await;
+        // Deliberately no `seed_oci_media_type` call — models a row that
+        // predates the metadata-write path entirely.
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
+        assert_eq!(
+            got_ids,
+            [legacy].into_iter().collect(),
+            "a manifest with no artifact_metadata row must be treated as an image manifest"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `limit` is honoured — mirrors `find_pypi_wheels_without_kind_honours_limit`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_honours_limit() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        for seed in 430..435 {
+            let hex = deterministic_hex64(seed);
+            let _ =
+                seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{hex}"), seed).await;
+        }
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 3)
+            .await
+            .expect("query");
+        assert_eq!(got.len(), 3, "LIMIT 3 must yield exactly 3 candidates");
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Soft-deleted manifests are excluded — mirrors
+    /// `find_pypi_wheels_without_kind_excludes_soft_deleted_wheels`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_excludes_soft_deleted() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let live_hex = deterministic_hex64(440);
+        let live =
+            seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{live_hex}"), 440).await;
+        let dead_hex = deterministic_hex64(441);
+        let deleted =
+            seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{dead_hex}"), 441).await;
+        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .expect("soft-delete update");
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let got = r
+            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .await
+            .expect("query");
+        let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
+        assert_eq!(
+            got_ids,
+            [live].into_iter().collect(),
+            "soft-deleted manifest MUST be excluded — got {got_ids:?}"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
     /// The registration-collision probe folds `-`/`_` on BOTH
     /// sides (the probe key is pre-folded by `cargo_collision_key`; the
     /// stored name is folded in SQL via `replace(name, '_', '-')`), so a
@@ -2299,5 +2667,140 @@ mod tests {
         cleanup_repo(&pool, plain_repo).await;
         cleanup_policy(&pool, global_policy).await;
         cleanup_policy(&pool, scoped_policy).await;
+    }
+
+    // -----------------------------------------------------------------
+    // `first_seen_for_checksum` — the live content-level age evidence
+    // behind the quarantine anchor (ADR 0054).
+    // -----------------------------------------------------------------
+
+    /// Seed one artifact row carrying an explicit observation instant.
+    /// `created_at` is written explicitly (rather than left to the
+    /// column default) precisely because it IS the value under test.
+    async fn seed_observation(
+        pool: &PgPool,
+        repo: Uuid,
+        sha256: &str,
+        created_at: DateTime<Utc>,
+        is_deleted: bool,
+    ) {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"INSERT INTO artifacts (
+                   id, repository_id, name, name_as_published, version, path,
+                   size_bytes, checksum_sha256, content_type, storage_key,
+                   is_deleted, created_at
+               ) VALUES (
+                   $1, $2, 'obs-pkg', 'obs-pkg', '1.0.0', $3,
+                   0, $4, 'application/octet-stream', $4,
+                   $5, $6
+               )"#,
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(format!("obs-pkg/1.0.0/{id}.tar.gz"))
+        .bind(sha256)
+        .bind(is_deleted)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("seed observation row");
+    }
+
+    /// No row carries the hash ⇒ `None`. The aggregate returns one row
+    /// holding SQL NULL, so this pins that the adapter maps that to
+    /// "no evidence" rather than erroring on a missing row — the caller
+    /// reads `None` as "fall back on the mint instant".
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn first_seen_for_checksum_reports_no_evidence_for_an_unknown_hash() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let r = PgArtifactRepository::new(pool.clone());
+        let unknown: ContentHash = deterministic_hex64(0xF145_7BAD).parse().unwrap();
+
+        let seen = r
+            .first_seen_for_checksum(&unknown)
+            .await
+            .expect("aggregate read");
+
+        assert_eq!(seen, None, "unknown hash has no observation");
+    }
+
+    /// The evidence is the minimum over EVERY repository's rows for that
+    /// hash — the property that dissolves the leader/follower asymmetry:
+    /// whichever repository observed the content first supplies the age
+    /// fact for all of them. Rows carrying a different hash must not
+    /// contribute, however early they are.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn first_seen_for_checksum_is_the_minimum_across_repositories() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_a = seed_repo(&pool).await;
+        let repo_b = seed_repo(&pool).await;
+        let subject = deterministic_hex64(0x0B5E_4ED0);
+        let other = deterministic_hex64(0x07E4_0000);
+
+        let earliest: DateTime<Utc> = "2025-01-02T03:04:05Z".parse().unwrap();
+        let later: DateTime<Utc> = "2026-07-08T09:10:11Z".parse().unwrap();
+        let decoy: DateTime<Utc> = "2020-01-01T00:00:00Z".parse().unwrap();
+
+        seed_observation(&pool, repo_b, &subject, later, false).await;
+        seed_observation(&pool, repo_a, &subject, earliest, false).await;
+        // A far earlier row for DIFFERENT content — must not leak in.
+        seed_observation(&pool, repo_a, &other, decoy, false).await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let seen = r
+            .first_seen_for_checksum(&subject.parse().unwrap())
+            .await
+            .expect("aggregate read");
+
+        assert_eq!(
+            seen,
+            Some(earliest),
+            "the earliest observation of THIS hash, in any repository"
+        );
+
+        cleanup_repo(&pool, repo_a).await;
+        cleanup_repo(&pool, repo_b).await;
+    }
+
+    /// A soft-deleted row still counts. Withdrawing a row from service
+    /// does not un-observe the bytes, and the observation is exactly what
+    /// this read reports — only a hard purge (which removes the row)
+    /// retires the evidence. This is the one place the port deviates from
+    /// the `is_deleted = false` filter the rest of the read path applies,
+    /// so it is pinned rather than left to the SQL's shape.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn first_seen_for_checksum_counts_soft_deleted_observations() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let subject = deterministic_hex64(0x50F7_DEAD);
+
+        let soft_deleted_at: DateTime<Utc> = "2024-03-04T05:06:07Z".parse().unwrap();
+        let live_at: DateTime<Utc> = "2026-03-04T05:06:07Z".parse().unwrap();
+        seed_observation(&pool, repo_id, &subject, soft_deleted_at, true).await;
+        seed_observation(&pool, repo_id, &subject, live_at, false).await;
+
+        let r = PgArtifactRepository::new(pool.clone());
+        let seen = r
+            .first_seen_for_checksum(&subject.parse().unwrap())
+            .await
+            .expect("aggregate read");
+
+        assert_eq!(
+            seen,
+            Some(soft_deleted_at),
+            "a soft-deleted row is a withdrawn service row, not a retracted observation"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
     }
 }

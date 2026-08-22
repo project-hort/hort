@@ -300,10 +300,12 @@ pub struct PypiVersionFile {
 /// only what the builder reads; anything not read on emission stays
 /// out").
 ///
-/// The hosted source (`HostedCargoSource`) populates this from the
-/// stored [`Artifact`] row — the earlier local-NDJSON path
-/// emitted `{name, vers, deps: [], cksum, features: {}, yanked:
-/// false, rust_version: null}`. The proxy source (`ProxyCargoSource`)
+/// The hosted source (`HostedCargoSource`) populates the identity and
+/// integrity fields from the stored [`Artifact`] row and the
+/// dependency-graph fields from the metadata the publish handler
+/// persisted; a version ingested without metadata falls back to the
+/// earlier local-NDJSON shape (`deps: []`, `features: {}`, no `v` /
+/// `features2`). The proxy source (`ProxyCargoSource`)
 /// parses the upstream NDJSON body and preserves whatever the
 /// upstream supplied for `deps` / `features` / `features2` / `links`
 /// / `v` / `rust_version` (the upstream-fidelity contract — cargo
@@ -323,11 +325,14 @@ pub struct PypiVersionFile {
 /// - `cksum` — the SHA-256 hex digest of the `.crate` file. Mandatory
 ///   per the cargo wire spec; populated from the stored sha256 on
 ///   hosted, and from the upstream NDJSON `cksum` field on proxy.
-/// - `deps` — the per-version dependency list. Hosted emits `[]`:
-///   cargo dep extraction from the publish `.crate` (a
-///   publish-`.crate` parser path) is not implemented yet.
-///   Proxy preserves the upstream-supplied array verbatim.
-/// - `features` — the named-features map. Hosted emits `{}`; proxy
+/// - `deps` — the per-version dependency list, in index shape
+///   (`req`, not the publish body's `version_req`). Hosted emits the
+///   translated publish-body deps, `[]` when the version has no
+///   stored metadata; proxy preserves the upstream-supplied array
+///   verbatim.
+/// - `features` — the named-features map, extended-syntax features
+///   excluded (they live in `features2`). Hosted emits the stored
+///   map, `{}` when the version has no stored metadata; proxy
 ///   preserves the upstream-supplied object verbatim.
 /// - `yanked` — the version's yanked status. **Yanked is orthogonal
 ///   to quarantine**: cargo's clients treat yanked separately from
@@ -337,19 +342,18 @@ pub struct PypiVersionFile {
 ///   set with `yanked: true`. This is the cargo per-protocol
 ///   contract.
 /// - `links` — the native-library linkage hint
-///   (`Cargo.toml` `[package].links`). `Some(...)` when the upstream
-///   supplied a non-null value; `None` for the local hosted path
-///   (the earlier local-NDJSON path never carried this field).
-///   The builder emits `null` when `None`, matching the wire shape
-///   cargo clients tolerate.
-/// - `rust_version` — the MSRV pin. `Some(...)` when the upstream
-///   supplied one; `None` for hosted (emitted as `null`).
-/// - `v` — the schema version. `Some(2)` when the upstream entry
-///   uses `features2` for namespaced/weak deps; `None` for legacy
-///   v1 entries. Hosted emits `None`.
+///   (`Cargo.toml` `[package].links`). `Some(...)` when the source
+///   supplied a non-null value, `None` otherwise. The builder emits
+///   `null` when `None`, matching the wire shape cargo clients
+///   tolerate.
+/// - `rust_version` — the MSRV pin. `Some(...)` when the source
+///   supplied one; `None` is emitted as `null`.
+/// - `v` — the schema version. `Some(2)` when the entry uses
+///   `features2` for namespaced/weak-dep features; `None` for
+///   legacy v1 entries.
 /// - `features2` — the v2-extra features map (namespaced /
-///   weak-dep features). Preserved verbatim from upstream when
-///   present. Hosted emits `None`.
+///   weak-dep features). Preserved verbatim from upstream on proxy;
+///   on hosted, the extended-syntax half of the stored feature map.
 #[derive(Debug, Clone)]
 pub struct CargoVersionPayload {
     /// Per-version `name` field — the cargo-published crate name.
@@ -366,12 +370,14 @@ pub struct CargoVersionPayload {
     /// emitted only when neither source supplied one (mirrors the
     /// earlier local-NDJSON `unwrap_or("")` semantics).
     pub cksum: String,
-    /// `deps` — per-version dependency list. Hosted carries `[]`;
-    /// proxy preserves the upstream-supplied array verbatim. Builder
-    /// embeds the value as-is into the NDJSON line.
+    /// `deps` — per-version dependency list in index shape. Hosted
+    /// carries the stored publish-body deps (`[]` when the version
+    /// has none stored); proxy preserves the upstream-supplied array
+    /// verbatim. Builder embeds the value as-is into the NDJSON line.
     pub deps: serde_json::Value,
-    /// `features` — named-features map. Hosted carries `{}`; proxy
-    /// preserves the upstream-supplied object verbatim.
+    /// `features` — named-features map. Hosted carries the stored map
+    /// (`{}` when the version has none stored); proxy preserves the
+    /// upstream-supplied object verbatim.
     pub features: serde_json::Value,
     /// `yanked` — the version's yanked status. Cargo clients honour
     /// this orthogonally to quarantine — yanked versions are kept

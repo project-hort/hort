@@ -83,14 +83,47 @@ pub struct UpstreamMappingSpec {
     /// `hort_upstream_insecure_total{format,reason}` on every fetch.
     #[serde(default, skip_serializing_if = "is_false")]
     pub insecure_upstream_url: bool,
-    /// Per-upstream opt-in to publish-time anchoring of the quarantine
-    /// window. Default `false`. When `true`, ingests served by this
-    /// mapping use `upstream_published_at` (clamped to `ingested_at`
-    /// to defeat future-skew) as the quarantine anchor; when `false`
-    /// (default), the anchor is `ingested_at`. Mirrors
-    /// `insecureUpstreamUrl`'s per-mapping shape so a publish-time
-    /// trust decision for one upstream cannot silently widen the
-    /// posture for the rest. See ADR 0007.
+    /// Per-upstream opt-in that admits this upstream's asserted publish
+    /// time as an **optional second source** for the quarantine-window
+    /// anchor. Default `false`.
+    ///
+    /// The anchor is the *earliest defensible evidence of the content's
+    /// age*, computed as the minimum over the applicable sources (ADR
+    /// 0054). The primary source needs no opt-in and is always in play:
+    /// the earliest moment hort itself observed these bytes in any of its
+    /// own repositories. That is an observation hort generates, so it
+    /// cannot be backdated — the most an attacker achieves by influencing
+    /// it is making hort see the content earlier, which requires the
+    /// content to genuinely have existed that much earlier.
+    ///
+    /// This flag adds `upstream_published_at` — an *assertion by the
+    /// upstream* — to that minimum, so it can move the anchor **earlier**
+    /// and never later. It is opt-in precisely because it is
+    /// attacker-influenceable: the clamp is future-skew only
+    /// (`min(upstream_ts, ingested_at)`), so a claimed *ancient* publish
+    /// time is bounded nowhere and collapses the window immediately.
+    /// Freshly uploaded malware carrying forged old metadata is the case
+    /// this opt-in exists to bound; enable it only for upstreams whose
+    /// metadata you are willing to treat as true. It is useful for
+    /// high-latency mirrors of already-aged content, where hort's own
+    /// first observation is far later than real publication.
+    ///
+    /// **Per-mapping, and it does not transit repositories.** Mirrors
+    /// `insecureUpstreamUrl`'s per-mapping shape: the value a repository
+    /// observes through *its* mapping never shortens another
+    /// repository's window, so a repository proxying an untrusted mirror
+    /// cannot weaken one proxying the genuine upstream. The primary
+    /// source carries no such restriction, because it introduces no
+    /// attacker-asserted input — that asymmetry is the point of keeping
+    /// the two sources separate.
+    ///
+    /// **Cross-opt-in constraint.** Combining this with an empty
+    /// `scanBackends` is rejected at apply time
+    /// (`trust_upstream_publish_time_requires_scan_backends`): together
+    /// they collapse the observation window to sweep-tick latency with no
+    /// scan behind it (ADR 0016). The window is a timer, never an
+    /// authority — release still requires this artifact's own
+    /// `ScanSucceeded` / `ScanWaived` (ADR 0007).
     #[serde(default, skip_serializing_if = "is_false")]
     pub trust_upstream_publish_time: bool,
     /// Reference to a SecretPort-resolved PEM-encoded mTLS client

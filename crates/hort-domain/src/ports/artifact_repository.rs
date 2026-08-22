@@ -275,6 +275,17 @@ pub trait ArtifactRepository: Send + Sync {
     /// Note: this query must not select any `quarantine_deadline` column
     /// (none exists); the schema stores only the anchor
     /// (`quarantine_window_start`), never a precomputed deadline.
+    ///
+    /// Contract any adapter implementing this method must honour: a
+    /// returned row always asserts locally-ingested content, regardless
+    /// of its `quarantine_status` — including `None`. This holds because
+    /// the row is sourced from `artifacts`, whose `checksum_sha256` and
+    /// `storage_key` columns are NOT NULL; there is no representable
+    /// "known upstream, not ingested" row. Callers that need to
+    /// distinguish "ingested, no quarantine lifecycle" (status `None`)
+    /// from "never ingested" must do so by row PRESENCE, not by status
+    /// value — the absence of a `(version, _, _)` entry for a queried
+    /// version is the only "not locally ingested" signal.
     fn package_version_status(
         &self,
         repository_id: Uuid,
@@ -300,6 +311,46 @@ pub trait ArtifactRepository: Send + Sync {
         _package: &str,
     ) -> BoxFuture<'_, DomainResult<Vec<PackageVersionStatusRow>>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// The earliest ingest observation hort holds for this content hash —
+    /// `MIN(created_at)` over every `artifacts` row carrying
+    /// `checksum_sha256 = $1`, across **all** repositories of this
+    /// instance. `None` when no row carries the hash.
+    ///
+    /// This is the primary age evidence behind the quarantine-window
+    /// anchor (ADR 0054): the moment hort itself first held these bytes.
+    /// It is an *observation*, not a third-party assertion, which is why
+    /// it needs no operator opt-in — an upstream claim can be backdated,
+    /// an observation cannot.
+    ///
+    /// **Derived, never materialised.** There is no content-level table
+    /// and no projection to keep in step; the aggregate is read live on
+    /// the index that already exists (`idx_artifacts_checksum`, migration
+    /// `003_artifacts_cas.sql`). A live aggregate is also race-free by
+    /// construction — concurrent observers cannot disagree about a `MIN`
+    /// the way they could about a stored value they each try to lower.
+    /// The accepted cost: the evidence does not outlive the rows, so
+    /// content whose last row is purged and which is later re-fetched
+    /// re-anchors at that later ingest. That direction is conservative —
+    /// a lost observation can only lengthen a window, never shorten one.
+    ///
+    /// **Soft-deleted rows count**, unlike the rest of this port's read
+    /// path. A soft-delete withdraws a row from *service*; it does not
+    /// un-observe the bytes, and hort's observation of them is exactly
+    /// what this method reports. Only a hard purge — which removes the
+    /// row — retires the evidence.
+    ///
+    /// **Default impl returns `Ok(None)`** so the many test doubles
+    /// compile unchanged. `None` is the fail-safe answer: the caller
+    /// treats absent evidence as "no evidence", falling back on the mint
+    /// instant and holding the content for a full window.
+    fn first_seen_for_checksum(
+        &self,
+        sha256: &ContentHash,
+    ) -> BoxFuture<'_, DomainResult<Option<DateTime<Utc>>>> {
+        let _ = sha256;
+        Box::pin(async { Ok(None) })
     }
 
     /// Find PyPI **wheel** artifacts (path ends `.whl`)
@@ -337,11 +388,200 @@ pub trait ArtifactRepository: Send + Sync {
         kind: &str,
         limit: u32,
     ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>>;
+
+    /// Find OCI **single-image manifest** artifacts (`path LIKE
+    /// 'manifests/sha256:%'`) that have no `content_references` row of the
+    /// given `kind` (in practice `"oci_config"`), bounded by `limit`.
+    /// Mirrors [`Self::find_pypi_wheels_without_kind`]'s shape and posture
+    /// one-for-one — same candidacy-query contract, same resumability, same
+    /// consumer (an admin-task backfill: `oci-membership-edge-backfill`
+    /// here vs. `wheel-metadata-backfill` there).
+    ///
+    /// **Image manifests only — an index must never be returned.** An OCI
+    /// image index legitimately carries no `config`/`layers` (it carries
+    /// `oci_index_member` children instead), so it would always match the
+    /// NOT-EXISTS-`oci_config` predicate despite having nothing to repair.
+    /// The adapter discriminates on the manifest's stored media type
+    /// (`artifact_metadata.metadata->>'oci_media_type'`, the same field the
+    /// OCI read path resolves via `resolve_media_type` —
+    /// `hort-http-oci::manifests::resolve_media_type`): a row whose stored
+    /// media type is one of the two index types
+    /// ([`crate::oci::OCI_IMAGE_INDEX_MEDIA_TYPE`] /
+    /// [`crate::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE`]) is excluded. A row
+    /// with **no** `artifact_metadata` row, or one whose `oci_media_type`
+    /// field is absent, is treated as an image manifest — this mirrors
+    /// `resolve_media_type`'s own fallback (`DEFAULT_MEDIA_TYPE`, the
+    /// single-image type) for exactly the pre-metadata-migration rows this
+    /// backfill exists to repair.
+    ///
+    /// SQL contract: `SELECT … FROM artifacts WHERE path LIKE
+    /// 'manifests/sha256:%' AND is_deleted = false AND NOT EXISTS (SELECT 1
+    /// FROM content_references WHERE source_artifact_id = artifacts.id AND
+    /// kind = $1) AND NOT EXISTS (SELECT 1 FROM artifact_metadata WHERE
+    /// artifact_id = artifacts.id AND metadata->>'oci_media_type' IN
+    /// (<index media types>)) ORDER BY id LIMIT $2`.
+    ///
+    /// **Resumable by construction** — stateless candidacy query, no
+    /// cursor. A failed batch leaves the candidate set unchanged; the next
+    /// invocation re-derives the same work minus whatever the previous run
+    /// completed. Idempotent for the same reason
+    /// [`Self::find_pypi_wheels_without_kind`] is: the upsert-on-PK
+    /// semantics of `ContentReferenceIndex::insert` absorb duplicate work
+    /// from overlapping runs.
+    fn find_oci_image_manifests_without_kind(
+        &self,
+        kind: &str,
+        limit: u32,
+    ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>>;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    /// One trait implementation shared by every shape test below.
+    ///
+    /// The three per-method shape tests each used to carry their own
+    /// near-identical 15-method stub; they are collapsed here because the
+    /// boilerplate is what the tests are least about, and a fourth copy
+    /// (for `first_seen_for_checksum`) would have made the file mostly
+    /// stub. Methods that a test asserts on carry their fixture data — and
+    /// their input assertions — directly in this impl.
+    ///
+    /// Deliberately does NOT override the trait's defaulted methods: their
+    /// fail-safe defaults are themselves part of the contract and are
+    /// exercised through this stub.
+    struct Stub;
+
+    impl ArtifactRepository for Stub {
+        fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
+            Box::pin(async {
+                Err(crate::error::DomainError::NotFound {
+                    entity: "Artifact",
+                    id: String::new(),
+                })
+            })
+        }
+        fn find_by_checksum(
+            &self,
+            _sha256: &ContentHash,
+        ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn find_by_repo_and_checksum(
+            &self,
+            _repository_id: Uuid,
+            _sha256: &ContentHash,
+        ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn list_by_repository(
+            &self,
+            _repository_id: Uuid,
+            _page: PageRequest,
+        ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+            Box::pin(async { Ok(Page::empty()) })
+        }
+        fn delete(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn find_by_path(
+            &self,
+            _repository_id: Uuid,
+            _path: &str,
+        ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn list_distinct_names(
+            &self,
+            _repository_id: Uuid,
+            _page: PageRequest,
+        ) -> BoxFuture<'_, DomainResult<Page<String>>> {
+            Box::pin(async { Ok(Page::empty()) })
+        }
+        fn find_by_name_in_repo(
+            &self,
+            _repository_id: Uuid,
+            _normalized_name: &str,
+            _page: PageRequest,
+        ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+            Box::pin(async { Ok(Page::empty()) })
+        }
+        fn find_by_name_as_published(
+            &self,
+            _repository_id: Uuid,
+            _raw_name: &str,
+            _page: PageRequest,
+        ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+            Box::pin(async { Ok(Page::empty()) })
+        }
+        fn list_active_for_repo(
+            &self,
+            _repository_id: Uuid,
+        ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
+            Box::pin(async { Ok(LimitedList::empty()) })
+        }
+        fn list_rejected_for_policy(
+            &self,
+            _policy_id: Uuid,
+        ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
+            Box::pin(async { Ok(LimitedList::empty()) })
+        }
+        fn list_active_for_policy(
+            &self,
+            _policy_id: Uuid,
+            _page: PageRequest,
+        ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
+            Box::pin(async { Ok(Page::empty()) })
+        }
+        fn package_version_status(
+            &self,
+            _repository_id: Uuid,
+            _package: &str,
+        ) -> BoxFuture<'_, DomainResult<Vec<(String, QuarantineStatus, Option<DateTime<Utc>>)>>>
+        {
+            Box::pin(async {
+                let deadline = DateTime::<Utc>::from_timestamp(1_700_000_000, 0);
+                Ok(vec![
+                    ("1.0.0".to_string(), QuarantineStatus::Released, None),
+                    ("1.1.0".to_string(), QuarantineStatus::Quarantined, deadline),
+                ])
+            })
+        }
+        fn find_pypi_wheels_without_kind(
+            &self,
+            kind: &str,
+            limit: u32,
+        ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+            // Pin the input shape: the stub returns nothing but
+            // accepts the documented kinds/limits without panicking.
+            assert_eq!(kind, "wheel_metadata");
+            assert!(limit <= 1_000, "handler-side cap is 1000");
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn find_oci_image_manifests_without_kind(
+            &self,
+            kind: &str,
+            limit: u32,
+        ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
+            // Pin the input shape: the stub accepts the documented
+            // kind/limit without panicking.
+            assert_eq!(kind, "oci_config");
+            assert!(limit <= 1_000, "handler-side cap is 1000");
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    /// The trait is dyn-compatible, and so is every method exercised
+    /// below — the shape tests all go through `&dyn ArtifactRepository`,
+    /// so a generic method or an `impl Future` return would fail to
+    /// compile here rather than silently regressing dyn-compat at some
+    /// distant call site.
+    fn stub() -> Arc<dyn ArtifactRepository> {
+        Arc::new(Stub)
+    }
 
     /// Compile-time assertion that `ArtifactRepository` is dyn-compatible.
     #[test]
@@ -359,119 +599,11 @@ mod tests {
     ///
     /// This is a *shape* assertion: it compiles only if the method signature
     /// matches the current contract verbatim. A future rename/retype is
-    /// caught here. The trait is dyn-compatible (proven above), so we
-    /// exercise the method through a `&dyn ArtifactRepository` to also pin
-    /// the dyn-compatibility of *this specific method* (a generic method or
-    /// `impl Future` return would silently regress dyn-compat).
+    /// caught here.
     #[test]
     fn package_version_status_has_documented_shape() {
-        use std::sync::Arc;
-        struct Stub;
-        impl ArtifactRepository for Stub {
-            fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
-                Box::pin(async {
-                    Err(crate::error::DomainError::NotFound {
-                        entity: "Artifact",
-                        id: String::new(),
-                    })
-                })
-            }
-            fn find_by_checksum(
-                &self,
-                _sha256: &ContentHash,
-            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
-                Box::pin(async { Ok(None) })
-            }
-            fn find_by_repo_and_checksum(
-                &self,
-                _repository_id: Uuid,
-                _sha256: &ContentHash,
-            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
-                Box::pin(async { Ok(None) })
-            }
-            fn list_by_repository(
-                &self,
-                _repository_id: Uuid,
-                _page: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn delete(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn find_by_path(
-                &self,
-                _repository_id: Uuid,
-                _path: &str,
-            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
-                Box::pin(async { Ok(None) })
-            }
-            fn list_distinct_names(
-                &self,
-                _repository_id: Uuid,
-                _page: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<String>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn find_by_name_in_repo(
-                &self,
-                _repository_id: Uuid,
-                _normalized_name: &str,
-                _page: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn find_by_name_as_published(
-                &self,
-                _repository_id: Uuid,
-                _raw_name: &str,
-                _page: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn list_active_for_repo(
-                &self,
-                _repository_id: Uuid,
-            ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
-                Box::pin(async { Ok(LimitedList::empty()) })
-            }
-            fn list_rejected_for_policy(
-                &self,
-                _policy_id: Uuid,
-            ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
-                Box::pin(async { Ok(LimitedList::empty()) })
-            }
-            fn list_active_for_policy(
-                &self,
-                _policy_id: Uuid,
-                _page: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn package_version_status(
-                &self,
-                _repository_id: Uuid,
-                _package: &str,
-            ) -> BoxFuture<'_, DomainResult<Vec<(String, QuarantineStatus, Option<DateTime<Utc>>)>>>
-            {
-                Box::pin(async {
-                    let deadline = DateTime::<Utc>::from_timestamp(1_700_000_000, 0);
-                    Ok(vec![
-                        ("1.0.0".to_string(), QuarantineStatus::Released, None),
-                        ("1.1.0".to_string(), QuarantineStatus::Quarantined, deadline),
-                    ])
-                })
-            }
-            fn find_pypi_wheels_without_kind(
-                &self,
-                _kind: &str,
-                _limit: u32,
-            ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-        }
-        let stub: Arc<dyn ArtifactRepository> = Arc::new(Stub);
-        let fut = stub.package_version_status(Uuid::nil(), "left-pad");
+        let repo = stub();
+        let fut = repo.package_version_status(Uuid::nil(), "left-pad");
         let result = futures::executor::block_on(fut).expect("stub returns Ok");
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].0, "1.0.0");
@@ -492,107 +624,62 @@ mod tests {
     /// `wheel-metadata-backfill` task handler.
     #[test]
     fn find_pypi_wheels_without_kind_has_documented_shape() {
-        use std::sync::Arc;
-        struct Stub;
-        impl ArtifactRepository for Stub {
-            fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
-                unimplemented!()
-            }
-            fn find_by_checksum(
-                &self,
-                _sha256: &ContentHash,
-            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
-                Box::pin(async { Ok(None) })
-            }
-            fn find_by_repo_and_checksum(
-                &self,
-                _r: Uuid,
-                _s: &ContentHash,
-            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
-                Box::pin(async { Ok(None) })
-            }
-            fn list_by_repository(
-                &self,
-                _r: Uuid,
-                _p: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn delete(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn find_by_path(
-                &self,
-                _r: Uuid,
-                _p: &str,
-            ) -> BoxFuture<'_, DomainResult<Option<Artifact>>> {
-                Box::pin(async { Ok(None) })
-            }
-            fn list_distinct_names(
-                &self,
-                _r: Uuid,
-                _p: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<String>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn find_by_name_in_repo(
-                &self,
-                _r: Uuid,
-                _n: &str,
-                _p: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn find_by_name_as_published(
-                &self,
-                _r: Uuid,
-                _n: &str,
-                _p: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn list_active_for_repo(
-                &self,
-                _r: Uuid,
-            ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
-                Box::pin(async { Ok(LimitedList::empty()) })
-            }
-            fn list_rejected_for_policy(
-                &self,
-                _p: Uuid,
-            ) -> BoxFuture<'_, DomainResult<LimitedList<Artifact>>> {
-                Box::pin(async { Ok(LimitedList::empty()) })
-            }
-            fn list_active_for_policy(
-                &self,
-                _p: Uuid,
-                _page: PageRequest,
-            ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
-                Box::pin(async { Ok(Page::empty()) })
-            }
-            fn package_version_status(
-                &self,
-                _r: Uuid,
-                _p: &str,
-            ) -> BoxFuture<'_, DomainResult<Vec<(String, QuarantineStatus, Option<DateTime<Utc>>)>>>
-            {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn find_pypi_wheels_without_kind(
-                &self,
-                kind: &str,
-                limit: u32,
-            ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
-                // Pin the input shape: the stub returns nothing but
-                // accepts the documented kinds/limits without panicking.
-                assert_eq!(kind, "wheel_metadata");
-                assert!(limit <= 1_000, "handler-side cap is 1000");
-                Box::pin(async { Ok(Vec::new()) })
-            }
-        }
-        let stub: Arc<dyn ArtifactRepository> = Arc::new(Stub);
-        let fut = stub.find_pypi_wheels_without_kind("wheel_metadata", 100);
+        let repo = stub();
+        let fut = repo.find_pypi_wheels_without_kind("wheel_metadata", 100);
         let result = futures::executor::block_on(fut).expect("stub returns Ok");
         assert!(result.is_empty());
+    }
+
+    /// The `find_oci_image_manifests_without_kind` method exists on the
+    /// trait with the documented shape: `(kind: &str, limit: u32) ->
+    /// BoxFuture<DomainResult<Vec<Artifact>>>`. Shape-pin guards against a
+    /// rename/retype that would silently break the
+    /// `oci-membership-edge-backfill` task handler — mirrors
+    /// `find_pypi_wheels_without_kind_has_documented_shape` above.
+    #[test]
+    fn find_oci_image_manifests_without_kind_has_documented_shape() {
+        let repo = stub();
+        let fut = repo.find_oci_image_manifests_without_kind("oci_config", 100);
+        let result = futures::executor::block_on(fut).expect("stub returns Ok");
+        assert!(result.is_empty());
+    }
+
+    /// `first_seen_for_checksum` exists with the documented shape —
+    /// `(&ContentHash) -> BoxFuture<DomainResult<Option<DateTime<Utc>>>>`
+    /// — and its default impl answers `None`.
+    ///
+    /// `None` is the load-bearing half: it is what an adapter that has not
+    /// implemented the method reports, and the quarantine-anchor
+    /// derivation must read that as "no age evidence" and fall back on the
+    /// mint instant (a full window), never as "evidence of an earlier
+    /// instant". A default that guessed would shorten a security window on
+    /// no evidence.
+    #[test]
+    fn first_seen_for_checksum_defaults_to_no_evidence() {
+        let hash: ContentHash = "a".repeat(64).parse().expect("valid sha256 hex");
+        let repo = stub();
+        let fut = repo.first_seen_for_checksum(&hash);
+        let result = futures::executor::block_on(fut).expect("default impl returns Ok");
+        assert_eq!(result, None, "absent evidence, not an invented instant");
+    }
+
+    /// The other two defaulted reads answer conservatively too:
+    /// `package_version_anchors` yields no rows (a test double that never
+    /// exercises discovery advertises nothing) and
+    /// `find_canonical_name_by_collision_key` yields "no collision".
+    #[test]
+    fn the_defaulted_reads_answer_conservatively() {
+        let repo = stub();
+
+        let anchors =
+            futures::executor::block_on(repo.package_version_anchors(Uuid::nil(), "left-pad"))
+                .expect("default impl returns Ok");
+        assert!(anchors.is_empty());
+
+        let canonical = futures::executor::block_on(
+            repo.find_canonical_name_by_collision_key(Uuid::nil(), "foo-bar"),
+        )
+        .expect("default impl returns Ok");
+        assert_eq!(canonical, None);
     }
 }

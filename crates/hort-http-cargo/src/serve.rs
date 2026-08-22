@@ -13,9 +13,9 @@
 //!      [`ArtifactUseCase::list_by_raw_name_visible`] — the
 //!      anti-enumeration-enforcing entry point).
 //! 2. **Filter pipeline.** `NonServableStatusFilter` then
-//!    `IndexModeFilter::new(repo.index_mode)`. Identical to the
-//!    npm/pypi pipeline; future operator-defined exclusion filters
-//!    append to this list.
+//!    `IndexModeFilter`, both carrying the caller's `HeldVisibility`.
+//!    Otherwise identical to the npm/pypi pipeline; future
+//!    operator-defined exclusion filters append to this list.
 //! 3. **Builder.** [`CargoIndexBuilder`] emits the sparse-index
 //!    NDJSON body.
 //!
@@ -30,6 +30,22 @@
 //! Empty result sets (hosted produces zero rows; proxy parses an
 //! empty NDJSON body) also map to 404 with the
 //! `Artifact NotFound { id: <crate_name> }` envelope.
+//!
+//! # Write-authorized hold-read
+//!
+//! A caller holding *granted* write authority on the repository sees
+//! `Quarantined` versions in the served index (ADR 0055, generalising
+//! ADR 0039 §10) — a publisher has to resolve the sibling it just
+//! uploaded, and `cargo publish` does that through the index even under
+//! `--no-verify`. The widening is metadata-only and `Quarantined`-only:
+//! terminal verdicts stay hidden from everyone, and held `.crate` bytes
+//! stay unserved to everyone (the download path carries no exemption).
+//! It does not apply to an aggregated (virtual) read, whose entries
+//! belong to member repositories the caller's grant says nothing about.
+//!
+//! Because the served set therefore varies by identity, every response
+//! from this handler carries `Cache-Control: private, no-store` and
+//! `Vary: Authorization`.
 //!
 //! # Yanked semantics
 //!
@@ -65,15 +81,18 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::header::CONTENT_TYPE;
+use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, VARY};
 use axum::http::StatusCode;
 use axum::response::Response;
 
 use hort_app::error::AppError;
-use hort_app::use_cases::index_filters::{IndexModeFilter, NonServableStatusFilter};
+use hort_app::use_cases::index_filters::{
+    HeldVisibility, IndexModeFilter, NonServableStatusFilter,
+};
 use hort_app::use_cases::index_serve::{BuildContext, IndexFilter, VersionEntry};
 use hort_app::use_cases::index_serve_filter::NpmSemverOrdering;
 use hort_app::use_cases::repository_access::AccessLevel;
+use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{Repository, RepositoryType};
 use hort_domain::ports::format_handler::FormatHandler;
@@ -175,10 +194,63 @@ pub(crate) async fn serve_index_unified(
     // Quarantined/Rejected/ScanIndeterminate regardless of mode), then
     // `IndexModeFilter` for the mode-specific never-ingested handling.
     // Future operator-exclusion filters append at the end of this list.
+    //
+    // Write-authorized hold-read (ADR 0055, generalising ADR 0039 §10):
+    // `cargo publish` resolves a crate's intra-workspace dependencies
+    // through the index even under `--no-verify`, so a publisher pushing
+    // a dependency chain into a hosted repo with an observation window
+    // cannot resolve the sibling it just uploaded — every publish after
+    // the first fails mid-chain, with the earlier crates already
+    // uploaded and only yankable. A principal that may WRITE the
+    // repository may therefore resolve held *metadata* there: the
+    // sparse-index entry is cargo's manifest analogue. Held `.crate`
+    // BYTES stay unserved to everyone, publisher included — the
+    // download path (`render_cargo_crate_response`) has no exemption
+    // and must never grow one.
+    //
+    // The predicate keys on GRANTED write authority
+    // (`resolve_granted_write`, the grants leg alone) rather than the
+    // presented token's cap. A cap-intersected `resolve(_, Write)` would
+    // never engage for a correctly-behaving publisher: cargo presents
+    // one registry token for both reading the index and uploading, and a
+    // read-scoped capability legitimately carries a read-only cap while
+    // the identity's grants carry Write. The read being exempted stays
+    // fully cap-gated through the ordinary `resolve(Read)` above; only
+    // the held-visibility decision consults identity-level authority.
+    //
+    // The rule is "may write to a repository ⇒ may resolve held
+    // metadata THERE", so it is evaluated against the repository that
+    // holds the artifacts. A virtual repo holds none — its entries come
+    // from its members (ADR 0031), and write authority on the aggregator
+    // is not write authority on the member the held entry lives in.
+    // Aggregated reads therefore keep the ordinary view.
+    //
+    // Fail closed: ONLY a definitive granted-Write authorization widens
+    // the view — a denied or errored resolve leaves held entries hidden.
+    // The resolve fires solely when the source actually produced a held
+    // entry, so the ordinary read path pays nothing for it.
     let upstream_count = output.entries.len();
+    let held_visibility = if !matches!(repo.repo_type, RepositoryType::Virtual)
+        && output
+            .entries
+            .iter()
+            .any(|e| e.status == Some(QuarantineStatus::Quarantined))
+        && ctx
+            .repository_access_use_case
+            .resolve_granted_write(repo_key, caller)
+            .await
+            .is_ok()
+    {
+        HeldVisibility::WriteAuthorized
+    } else {
+        HeldVisibility::Hidden
+    };
     let filters: Vec<Arc<dyn IndexFilter>> = vec![
-        Arc::new(NonServableStatusFilter),
-        Arc::new(IndexModeFilter::new(repo.index_mode)),
+        Arc::new(NonServableStatusFilter::new(held_visibility)),
+        Arc::new(IndexModeFilter::with_held_visibility(
+            repo.index_mode,
+            held_visibility,
+        )),
     ];
     let filtered: Vec<VersionEntry> = filters.iter().fold(output.entries, |acc, f| f.apply(acc));
     let served_count = filtered.len();
@@ -204,6 +276,7 @@ pub(crate) async fn serve_index_unified(
         upstream_versions = upstream_count,
         served_versions = served_count,
         filtered_versions = filtered_count,
+        held_visibility = ?held_visibility,
         "cargo unified sparse-index serve completed",
     );
 
@@ -223,9 +296,21 @@ pub(crate) async fn serve_index_unified(
         filtered,
     );
 
+    // The served set depends on the caller's authority (the hold-read
+    // above), so the response is identity-dependent and must never be
+    // reused across principals. Absent directives are not "no caching":
+    // heuristic caching applies, and with no `Vary` nothing tells an
+    // intermediary the body varies by identity — a shared cache or
+    // reverse proxy could otherwise store a publisher's response, held
+    // entries included, and replay it to an anonymous consumer. Both
+    // headers are unconditional: emitting them only on the exempted
+    // responses would leave the ordinary ones heuristically cacheable
+    // under the same URL key.
     let mut builder_resp = Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "text/plain; charset=utf-8");
+        .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(CACHE_CONTROL, "private, no-store")
+        .header(VARY, AUTHORIZATION.as_str());
     if output.truncated {
         builder_resp = builder_resp.header(
             "Warning",
@@ -296,7 +381,10 @@ mod tests {
     use hort_app::rbac::RbacEvaluator;
     use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use hort_app::use_cases::test_support::sample_repository;
-    use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
+    use hort_domain::entities::api_token::TokenCap;
+    use hort_domain::entities::artifact::Artifact;
+    use hort_domain::entities::managed_by::ManagedBy;
+    use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
     use hort_domain::entities::repository::{IndexMode, RepositoryFormat};
     use hort_domain::types::ContentHash;
     use hort_http_core::test_support::{
@@ -376,6 +464,63 @@ mod tests {
         artifact
     }
 
+    /// RBAC-enabled context over an explicit grant set, reusing the
+    /// harness's `repositories` mock so seeded repos still resolve.
+    fn rbac_grant_ctx(
+        base: &Arc<AppContext>,
+        mocks: &hort_http_core::test_support::MockPorts,
+        grants: Vec<PermissionGrant>,
+    ) -> Arc<AppContext> {
+        let access = Arc::new(RepositoryAccessUseCase::new(
+            mocks.repositories.clone(),
+            RbacAccess::Enabled(Arc::new(arc_swap::ArcSwap::from_pointee(
+                RbacEvaluator::new(grants),
+            ))),
+            true,
+        ));
+        with_repository_access(base, access)
+    }
+
+    /// RBAC-enabled context granting `claim` repo-wide `Write`. Whether
+    /// the *caller* carries the claim is the variable under test.
+    fn write_grant_ctx(
+        base: &Arc<AppContext>,
+        mocks: &hort_http_core::test_support::MockPorts,
+        claim: &str,
+    ) -> Arc<AppContext> {
+        rbac_grant_ctx(
+            base,
+            mocks,
+            vec![PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::Claims(vec![claim.to_string()]),
+                repository_id: None,
+                permission: Permission::Write,
+                created_at: Utc::now(),
+                managed_by: ManagedBy::Local,
+                managed_by_digest: None,
+            }],
+        )
+    }
+
+    /// A principal carrying `claim`, with `token_cap` set to the given
+    /// permissions (`None` = an uncapped session token).
+    fn principal(claim: &str, cap: Option<Vec<Permission>>) -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: Uuid::new_v4(),
+            external_id: format!("test:{claim}"),
+            username: claim.to_string(),
+            email: format!("{claim}@example.com"),
+            claims: vec![claim.to_string()],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: cap.map(|permissions| TokenCap {
+                permissions,
+                repository_ids: None,
+            }),
+        }
+    }
+
     fn parse_lines(body: &[u8]) -> Vec<serde_json::Value> {
         std::str::from_utf8(body)
             .unwrap()
@@ -394,6 +539,13 @@ mod tests {
     async fn quarantined_hosted_artifact_is_filtered_from_served_ndjson() {
         let (ctx, mocks) = build_mock_ctx(handle());
         let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        // Route through an RBAC-ENABLED context (not the mock harness's
+        // admit-everything default) so the anonymous caller genuinely
+        // lacks Write — otherwise the hold-read exemption would admit
+        // the admit-everything mock's anonymous "Write" and serve the
+        // held entry. In production an anonymous caller's Write resolve
+        // fails, so the entry stays hidden; this exercises that path.
+        let ctx = write_grant_ctx(&ctx, &mocks, "ci-publisher");
         let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
         insert_artifact(
             &mocks,
@@ -478,6 +630,193 @@ mod tests {
             versions,
             vec!["1.0.0"],
             "1.1.0 (Rejected via rescan) MUST be filtered by NonServableStatusFilter",
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 2b. Write-authorized hold-read (ADR 0055, generalising ADR 0039
+    //     §10). The exemption's full matrix: caller authority ×
+    //     artifact status.
+    //
+    //     `cargo publish` resolves a crate's intra-workspace
+    //     dependencies through the index even under `--no-verify`, so a
+    //     publisher pushing a dependency chain into a repo with an
+    //     observation window must be able to resolve the sibling it just
+    //     uploaded. Metadata only: held `.crate` bytes stay unserved to
+    //     everyone (pinned in `lib.rs`).
+    // -----------------------------------------------------------------
+
+    /// Seed one Released + one held/verdict-bearing version, serve as
+    /// `caller`, and return the versions in the served NDJSON.
+    async fn served_versions_for(
+        caller: Option<&CallerPrincipal>,
+        second_status: QuarantineStatus,
+    ) -> Vec<String> {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        // A `ci-publisher` Write grant always exists; whether the caller
+        // carries the claim is the variable under test.
+        let ctx = write_grant_ctx(&ctx, &mocks, "ci-publisher");
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "hort-domain",
+            "0.11.0",
+            1,
+            QuarantineStatus::Released,
+        );
+        insert_artifact(&mocks, repo.id, "hort-domain", "0.11.1", 2, second_status);
+
+        let res = serve_index_unified(&ctx, "cargo-test", "hort-domain", caller)
+            .await
+            .unwrap_or_else(|_| panic!("unified serve must succeed"));
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        parse_lines(&body)
+            .iter()
+            .map(|l| l["vers"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The exemption engages: a write-granted publisher resolves the
+    /// held sibling it just uploaded.
+    #[tokio::test]
+    async fn quarantined_entry_is_served_to_a_write_granted_caller() {
+        let publisher = principal("ci-publisher", None);
+        let versions = served_versions_for(Some(&publisher), QuarantineStatus::Quarantined).await;
+        assert_eq!(
+            versions,
+            vec!["0.11.0", "0.11.1"],
+            "a write-granted principal must resolve the held version — without it \
+             every publish after the first fails to resolve its just-uploaded sibling"
+        );
+    }
+
+    /// The ADR 0039 §10 trap as a regression test. Cargo presents one
+    /// registry token for both reading the index and uploading, so the
+    /// index read legitimately arrives under a read-scoped capability
+    /// while the identity's grants carry Write. A cap-intersected
+    /// `resolve(_, Write)` would silently never engage here; the
+    /// exemption keys on the grants leg alone, so it does.
+    #[tokio::test]
+    async fn read_scoped_token_of_a_write_granted_principal_still_gets_the_exemption() {
+        let publisher = principal("ci-publisher", Some(vec![Permission::Read]));
+        let versions = served_versions_for(Some(&publisher), QuarantineStatus::Quarantined).await;
+        assert_eq!(
+            versions,
+            vec!["0.11.0", "0.11.1"],
+            "the hold-read keys on GRANTED write authority, not the presented cap — \
+             a cap-intersected resolve would never engage for a real publisher"
+        );
+    }
+
+    /// Scope guard: the exemption is write-authorized only. A caller
+    /// holding read but not write sees the ordinary index.
+    #[tokio::test]
+    async fn quarantined_entry_stays_hidden_from_a_read_only_caller() {
+        let reader = principal("ci-reader", None);
+        let versions = served_versions_for(Some(&reader), QuarantineStatus::Quarantined).await;
+        assert_eq!(
+            versions,
+            vec!["0.11.0"],
+            "a principal without the Write grant must not see held metadata"
+        );
+    }
+
+    /// Scope guard: anonymous callers are the pull-through consumers the
+    /// quarantine window exists to protect. They never see held entries.
+    #[tokio::test]
+    async fn quarantined_entry_stays_hidden_from_an_anonymous_caller() {
+        let versions = served_versions_for(None, QuarantineStatus::Quarantined).await;
+        assert_eq!(
+            versions,
+            vec!["0.11.0"],
+            "anonymous callers must not see held metadata"
+        );
+    }
+
+    /// Scope guard: `Rejected` is a terminal verdict, not a hold pending
+    /// one. The exemption does NOT reach it, for any caller.
+    #[tokio::test]
+    async fn rejected_entry_stays_hidden_even_from_a_write_granted_caller() {
+        let publisher = principal("ci-publisher", None);
+        let versions = served_versions_for(Some(&publisher), QuarantineStatus::Rejected).await;
+        assert_eq!(
+            versions,
+            vec!["0.11.0"],
+            "the hold-read covers Quarantined only — a reached verdict stays hidden \
+             from everyone, publisher included"
+        );
+    }
+
+    /// Scope guard: `ScanIndeterminate` is a terminal fail-closed block
+    /// with no self-resolving deadline. Same answer as `Rejected`.
+    #[tokio::test]
+    async fn scan_indeterminate_entry_stays_hidden_even_from_a_write_granted_caller() {
+        let publisher = principal("ci-publisher", None);
+        let versions =
+            served_versions_for(Some(&publisher), QuarantineStatus::ScanIndeterminate).await;
+        assert_eq!(
+            versions,
+            vec!["0.11.0"],
+            "ScanIndeterminate is terminal and fail-closed — no caller sees it"
+        );
+    }
+
+    /// `Released` is unaffected by the caller's authority — the
+    /// exemption widens exactly one column.
+    #[tokio::test]
+    async fn released_entries_are_served_identically_to_every_caller() {
+        let publisher = principal("ci-publisher", None);
+        let reader = principal("ci-reader", None);
+        let expected = vec!["0.11.0", "0.11.1"];
+        for caller in [Some(&publisher), Some(&reader), None] {
+            let versions = served_versions_for(caller, QuarantineStatus::Released).await;
+            assert_eq!(
+                versions, expected,
+                "Released entries must not depend on caller authority"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 2c. The served set varies by principal, so the response must not
+    //     be reusable across principals by any intermediary. Absent
+    //     directives are not "no caching" — heuristic caching applies,
+    //     and with no `Vary` nothing marks the body identity-dependent.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn index_response_is_uncacheable_by_shared_caches() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "serde",
+            "1.0.0",
+            1,
+            QuarantineStatus::Released,
+        );
+
+        // Anonymous — the response a shared cache would be most willing
+        // to store and replay. The directives are unconditional, so this
+        // one carries them too.
+        let res = serve_index_unified(&ctx, "cargo-test", "serde", None)
+            .await
+            .unwrap_or_else(|_| panic!("unified serve must succeed"));
+        assert_eq!(
+            res.headers().get(CACHE_CONTROL).unwrap(),
+            "private, no-store",
+            "the served set varies by principal — a shared cache must not store it"
+        );
+        assert_eq!(
+            res.headers().get(VARY).unwrap(),
+            "authorization",
+            "without Vary nothing tells an intermediary the body is identity-dependent"
         );
     }
 
@@ -879,6 +1218,258 @@ mod tests {
         assert!(
             versions.is_empty(),
             "held primary copy filtered out, NOT replaced by the secondary's released copy: {versions:?}"
+        );
+    }
+
+    /// Scope guard on the hold-read: the rule is "may write to a
+    /// repository ⇒ may resolve held metadata THERE". A virtual repo
+    /// holds nothing — a Write grant on the aggregator says nothing
+    /// about the member the held entry actually lives in, so an
+    /// aggregated read keeps the ordinary view even for a write-granted
+    /// caller.
+    #[tokio::test]
+    async fn virtual_read_does_not_grant_the_hold_read_over_member_repos() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let ctx = write_grant_ctx(&ctx, &mocks, "ci-publisher");
+        let member = insert_hosted_repo(&mocks, "cargo-member", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            member.id,
+            "serde",
+            "1.0.0",
+            1,
+            QuarantineStatus::Quarantined,
+        );
+        insert_virtual_repo(&mocks, "cargo-virt", &[&member]);
+
+        // The very principal that WOULD see the held entry on the
+        // member repo directly.
+        let publisher = principal("ci-publisher", None);
+        let res = serve_index_unified(&ctx, "cargo-virt", "serde", Some(&publisher))
+            .await
+            .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+        let versions = served_versions(res).await;
+        assert!(
+            versions.is_empty(),
+            "a write grant on the aggregator must not surface a member's held \
+             metadata: {versions:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Stored publish metadata in the served entry.
+    //
+    // The hosted entry's dependency graph comes from the metadata the
+    // publish handler persisted. Without it every hosted entry claims
+    // `deps: []` / `features: {}`, and cargo — which validates a
+    // feature edge against the INDEX entry, not the dependency's own
+    // manifest — refuses to package a crate that names a sibling's
+    // feature.
+    // -----------------------------------------------------------------
+
+    /// The publish body of a crate whose only feature uses the
+    /// namespaced-dependency syntax — the shape that must reach the
+    /// wire as `features2` + `v: 2`.
+    const HORT_APP_PUBLISH_BODY: &str = r#"{
+        "name": "hort-app",
+        "vers": "0.11.0",
+        "deps": [
+            {
+                "name": "hort-domain",
+                "version_req": "=0.11.0",
+                "features": [],
+                "optional": false,
+                "default_features": true,
+                "target": null,
+                "kind": "normal",
+                "registry": null,
+                "explicit_name_in_toml": null
+            },
+            {
+                "name": "metrics-util",
+                "version_req": "^0.16",
+                "features": [],
+                "optional": true,
+                "default_features": true,
+                "target": null,
+                "kind": "normal",
+                "registry": null,
+                "explicit_name_in_toml": null
+            }
+        ],
+        "features": {
+            "default": [],
+            "test-support": ["dep:metrics-util"]
+        },
+        "links": null,
+        "rust_version": "1.94",
+        "cksum": "a-publisher-supplied-digest-that-must-be-ignored"
+    }"#;
+
+    /// Seed the metadata row a cargo publish of `publish_body` writes.
+    fn insert_publish_metadata(
+        mocks: &hort_http_core::test_support::MockPorts,
+        artifact_id: Uuid,
+        publish_body: &str,
+    ) {
+        let parsed: crate::publish_metadata::PublishMetadata =
+            serde_json::from_str(publish_body).expect("fixture publish body parses");
+        mocks
+            .artifact_metadata
+            .insert(hort_domain::entities::artifact::ArtifactMetadata {
+                artifact_id,
+                format: RepositoryFormat::Cargo,
+                metadata: parsed.to_index_metadata(),
+                metadata_blob: None,
+                properties: serde_json::Value::Null,
+            });
+    }
+
+    /// Serve `crate_name` from a hosted repo and return the one served
+    /// NDJSON line.
+    async fn single_served_line(
+        ctx: &Arc<AppContext>,
+        repo_key: &str,
+        crate_name: &str,
+    ) -> serde_json::Value {
+        let res = serve_index_unified(ctx, repo_key, crate_name, None)
+            .await
+            .unwrap_or_else(|_| panic!("hosted serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let mut lines = parse_lines(&body);
+        assert_eq!(lines.len(), 1, "one seeded version → one served line");
+        lines.remove(0)
+    }
+
+    #[tokio::test]
+    async fn hosted_entry_carries_stored_deps_in_index_shape() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "hort-app",
+            "0.11.0",
+            1,
+            QuarantineStatus::Released,
+        );
+        insert_publish_metadata(&mocks, artifact.id, HORT_APP_PUBLISH_BODY);
+
+        let line = single_served_line(&ctx, "cargo-test", "hort-app").await;
+
+        assert_eq!(
+            line["deps"],
+            serde_json::json!([
+                {
+                    "name": "hort-domain",
+                    "req": "=0.11.0",
+                    "features": [],
+                    "optional": false,
+                    "default_features": true,
+                    "target": null,
+                    "kind": "normal",
+                    "registry": null,
+                    "package": null,
+                },
+                {
+                    "name": "metrics-util",
+                    "req": "^0.16",
+                    "features": [],
+                    "optional": true,
+                    "default_features": true,
+                    "target": null,
+                    "kind": "normal",
+                    "registry": null,
+                    "package": null,
+                },
+            ]),
+            "served deps carry the index schema (`req`, `package`), not the publish schema"
+        );
+        assert_eq!(line["rust_version"], "1.94");
+        assert!(line["links"].is_null());
+        assert_eq!(
+            line["cksum"],
+            artifact.sha256_checksum.to_string(),
+            "the CAS hash is the served checksum — never the publisher-supplied one"
+        );
+        assert_eq!(line["yanked"], false);
+        assert_eq!(line["name"], "hort-app");
+        assert_eq!(line["vers"], "0.11.0");
+    }
+
+    /// The `v0.11.0-beta.8` publish failure, pinned: `hort-http-core`
+    /// declares `hort-app/test-support`, and cargo validates that edge
+    /// against `hort-app`'s served index entry. The entry must carry
+    /// the feature — in `features2`, because it names a dependency
+    /// with the `dep:` syntax — and announce the schema version that
+    /// tells a client to merge the two maps.
+    #[tokio::test]
+    async fn hosted_entry_splits_namespaced_features_into_features2() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "hort-app",
+            "0.11.0",
+            1,
+            QuarantineStatus::Released,
+        );
+        insert_publish_metadata(&mocks, artifact.id, HORT_APP_PUBLISH_BODY);
+
+        let line = single_served_line(&ctx, "cargo-test", "hort-app").await;
+
+        assert_eq!(
+            line["features"],
+            serde_json::json!({"default": []}),
+            "plain features stay in `features`"
+        );
+        assert_eq!(
+            line["features2"],
+            serde_json::json!({"test-support": ["dep:metrics-util"]}),
+            "a `dep:`-syntax feature is served in `features2`"
+        );
+        assert_eq!(line["v"], 2, "`features2` requires the v2 schema marker");
+    }
+
+    /// Versions ingested before publish captured metadata — and rows
+    /// written by non-publish paths, whose document has none of these
+    /// keys — keep serving exactly the entry they served before.
+    #[tokio::test]
+    async fn hosted_entry_without_stored_metadata_serves_the_pre_metadata_shape() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "hort-app",
+            "0.11.0",
+            1,
+            QuarantineStatus::Released,
+        );
+
+        let line = single_served_line(&ctx, "cargo-test", "hort-app").await;
+
+        assert_eq!(
+            line,
+            serde_json::json!({
+                "name": "hort-app",
+                "vers": "0.11.0",
+                "deps": [],
+                "cksum": artifact.sha256_checksum.to_string(),
+                "features": {},
+                "yanked": false,
+                "links": null,
+                "rust_version": null,
+            }),
+            "a version with no stored metadata serves the pre-metadata entry verbatim"
         );
     }
 

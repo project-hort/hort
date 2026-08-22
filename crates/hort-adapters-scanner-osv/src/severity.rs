@@ -7,14 +7,17 @@
 //! 1. `groups[].max_severity` — a bare numeric string like `"7.2"`,
 //!    `"9.8"`, or `""` (unscored). This is the preferred input.
 //! 2. `severity[].score` — a CVSS vector like
-//!    `"CVSS:3.1/AV:L/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H/E:H/RL:O/RC:C"`
-//!    where the trailing portion may include a `/` followed by the
-//!    bare score. osv-scanner does not embed the numeric base score in
-//!    the vector itself, so this fallback path is best-effort: we
-//!    look for a trailing numeric `/<float>` segment, then fall through
-//!    to a label match.
+//!    `"CVSS:3.1/AV:L/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H"`. When the vector
+//!    parses as a CVSS v3.0/v3.1 Base Metric Group, its base score is
+//!    computed directly via the `cvss` crate — this is the preferred
+//!    reading of the vector. A vector the `cvss` crate rejects (CVSS v2,
+//!    v4, Temporal/Environmental metrics mixed in, or malformed input)
+//!    falls through to a best-effort scan for a trailing numeric
+//!    `/<float>` segment some feeds embed, then to a label match.
 //!
-//! Bands (mirrored from `hort-adapters-advisory-osv::severity`):
+//! Bands (textually mirrored in `hort-adapters-advisory-osv::severity`
+//! — the two adapter crates share no dependency edge, so the banding
+//! logic is duplicated rather than extracted):
 //!
 //! | Numeric score          | Threshold |
 //! |------------------------|-----------|
@@ -60,6 +63,19 @@ pub(crate) fn parse_max_severity(s: &str) -> Option<f32> {
         return None;
     }
     trimmed.parse::<f32>().ok()
+}
+
+/// Parse a CVSS v3.0/v3.1 vector string (e.g.
+/// `"CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"`) and compute its base
+/// score per the CVSS v3.1 specification, section 5. Returns `None` for
+/// anything the `cvss` crate cannot parse as a v3.0/v3.1 Base Metric
+/// Group — a CVSS v2 or v4 vector, a vector carrying Temporal or
+/// Environmental metrics alongside the Base group, or malformed input.
+/// This is the preferred reading of a vector; callers try it before the
+/// best-effort trailing-numeric-segment fallback.
+pub(crate) fn cvss_vector_base_score(vector: &str) -> Option<f32> {
+    let base: cvss::v3::Base = vector.trim().parse().ok()?;
+    Some(base.score().value() as f32)
 }
 
 /// Best-effort score extraction from a CVSS vector string like
@@ -191,6 +207,77 @@ mod tests {
     fn infinity_score_is_none() {
         assert_eq!(cvss_score_to_severity(f32::INFINITY), None);
         assert_eq!(cvss_score_to_severity(f32::NEG_INFINITY), None);
+    }
+
+    // ----- cvss_vector_base_score --------------------------------------------
+
+    #[test]
+    fn cvss_vector_base_score_computes_marvin_advisory() {
+        // RUSTSEC-2023-0071 (the Marvin timing-oracle advisory on the `rsa`
+        // crate), verified against api.osv.dev. The CVSS 3.1 spec bands this
+        // vector's base score to 5.9 — Medium.
+        assert_eq!(
+            cvss_vector_base_score("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+            Some(5.9)
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_bands_to_critical_at_or_above_9() {
+        assert_eq!(
+            cvss_vector_base_score("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"),
+            Some(10.0)
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_bands_below_4_to_low() {
+        assert_eq!(
+            cvss_vector_base_score("CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N"),
+            Some(1.8)
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_accepts_v3_0() {
+        assert_eq!(
+            cvss_vector_base_score("CVSS:3.0/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N"),
+            Some(5.9)
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_returns_none_for_malformed_vector() {
+        assert_eq!(cvss_vector_base_score("CVSS:3.1/GARBAGE"), None);
+    }
+
+    #[test]
+    fn cvss_vector_base_score_returns_none_for_cvss_v2() {
+        // CVSS v2 stays out of scope; a v2-prefixed vector must not be
+        // silently mis-scored as v3.
+        assert_eq!(
+            cvss_vector_base_score("CVSS:2.0/AV:N/AC:L/Au:N/C:C/I:C/A:C"),
+            None
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_returns_none_for_temporal_metrics() {
+        // A vector mixing Temporal metrics (E/RL/RC) into the Base group is
+        // not a Base Metric Group the `cvss` crate parses; falls through to
+        // the trailing-numeric-segment heuristic instead.
+        assert_eq!(
+            cvss_vector_base_score("CVSS:3.1/AV:L/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H/E:H/RL:O/RC:C"),
+            None
+        );
+    }
+
+    #[test]
+    fn cvss_vector_base_score_trims_whitespace() {
+        assert_eq!(
+            cvss_vector_base_score("  CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N  "),
+            Some(5.9)
+        );
     }
 
     // ----- parse_max_severity -----------------------------------------------

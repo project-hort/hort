@@ -1,3 +1,32 @@
+# The first-party registry every intra-workspace dependency names.
+#
+# `[workspace.dependencies]` pins each `hort-*` entry to
+# `registry = "hort-crates"` so the requirement that survives into the
+# published manifest resolves against this registry rather than
+# crates.io. That key is not merely advisory at publish time: cargo
+# refuses to PARSE a manifest naming a registry it has no index for
+# ("registry index was not found in any configuration"), so without this
+# block nothing in the workspace builds — not `cargo build`, not
+# `cargo metadata`, not the guard tests.
+#
+# Declaring the index does not fetch it. Every intra-workspace
+# dependency also carries a `path`, so an ordinary build resolves from
+# local source and never opens a connection; only `cargo publish` /
+# `cargo package` actually reach the URL.
+#
+# The pin is also what keeps the dependency off the replacement path.
+# CI activates `[source.crates-io] replace-with = "hort"` (the
+# cargo-virtual aggregation index, read-only for the release identity);
+# a dependency with no `registry` key is a crates.io dependency and gets
+# replaced, resolving somewhere the release identity cannot publish to.
+# An explicit-registry dependency is exempt from source replacement.
+#
+# CI rewrites this whole file (see the hort-auth composite action and
+# the GitLab `.hort_auth` snippet) and re-declares this same registry
+# against the instance URL it authenticated to, so both worlds resolve.
+[registries.hort-crates]
+index = "sparse+https://registry.hort.rs/cargo/hort-crates/"
+
 # Cargo aliases.
 #
 # The `cov-*` aliases wrap `cargo llvm-cov` with a workspace-level

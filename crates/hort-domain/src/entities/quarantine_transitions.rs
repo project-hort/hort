@@ -296,7 +296,8 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         from: QuarantineStatus::Quarantined,
         to: &[QuarantineStatus::Quarantined, QuarantineStatus::Rejected],
         required_triggers: &[
-            "ScanOutcome::Clean -> no-op (stays Quarantined, no event)",
+            "ScanOutcome::Clean | ScanOutcome::FindingsRecorded(_) -> no-op \
+             (stays Quarantined, no event)",
             "ScanOutcome::Reject(_) -> Rejected",
         ],
     },
@@ -305,7 +306,8 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         from: QuarantineStatus::Released,
         to: &[QuarantineStatus::Released, QuarantineStatus::Rejected],
         required_triggers: &[
-            "ScanOutcome::Clean -> no-op (stays Released, no event)",
+            "ScanOutcome::Clean | ScanOutcome::FindingsRecorded(_) -> no-op \
+             (stays Released, no event)",
             "ScanOutcome::Reject(_) -> Rejected",
         ],
     },
@@ -362,8 +364,8 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         from: QuarantineStatus::Quarantined,
         to: &[QuarantineStatus::Released],
         required_triggers: &[
-            "authorized only for (Timer, ScanSucceeded|ScanWaived) with provenance \
-             cleared/not-required, (Admin, AdminOverride), or \
+            "authorized only for (Timer, ScanSucceeded|ScanWaived|ScanRecorded) with \
+             provenance cleared/not-required, (Admin, AdminOverride), or \
              (PolicyReEvaluation, PolicyReEvaluation) — every other (reason, authz) \
              pair is denied at the authorization step, independent of source state",
         ],
@@ -373,8 +375,8 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         from: QuarantineStatus::ScanIndeterminate,
         to: &[QuarantineStatus::Released],
         required_triggers: &[
-            "authorized only for (Timer, ScanSucceeded|ScanWaived) with provenance \
-             cleared/not-required, (Admin, AdminOverride), or \
+            "authorized only for (Timer, ScanSucceeded|ScanWaived|ScanRecorded) with \
+             provenance cleared/not-required, (Admin, AdminOverride), or \
              (PolicyReEvaluation, PolicyReEvaluation) — every other (reason, authz) \
              pair is denied at the authorization step, independent of source state",
         ],

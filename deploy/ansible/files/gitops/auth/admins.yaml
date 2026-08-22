@@ -1,3 +1,13 @@
+# NOT applied on registry.hort.rs. `hort_dex_enabled` defaults false there
+# (deploy/ansible/group_vars/all.yml), so the gitops role's Sync task
+# excludes this file and the gated ship/remove tasks in
+# roles/gitops/tasks/main.yml keep it absent from HORT_CONFIG_DIR — the
+# host runs with no IdP by design (see
+# docs/architecture/how-to/mint-operator-tokens-without-idp.md), not
+# because this wiring is unfinished. It is the template a future operator
+# uses if they choose to enable Dex/an org IdP for human admin: set
+# `hort_dex_enabled: true` and this file starts shipping automatically.
+#
 # ClaimMapping: the Dex (or any OIDC IdP) group `hort-admins` resolves to
 # the synthetic `admin` claim. A caller whose JWT `groups` claim contains
 # `hort-admins` resolves to is_admin at authentication time (the RBAC

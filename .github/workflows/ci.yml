@@ -509,6 +509,22 @@ jobs:
       - name: Render fixtures and assert expected/forbidden lines
         run: bash scripts/test-helm-templates.sh
 
+  # The release workflow skips a crate whose version is already in the
+  # hort-crates index, so a partly-published tag can be re-run instead of
+  # abandoned. That decision runs once per release; getting it wrong either
+  # drops a crate from a shipped release or burns another version number,
+  # and neither is visible until a release is under way. Tested here against
+  # fixture index documents — no registry, no network.
+  crates-index-check-tests:
+    name: 📦 Publish index-check tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assert the skip/publish verdicts
+        run: bash scripts/test-crate-version-in-index.sh
+
   security-audit:
     name: 🔒 Security Audit
     runs-on: ubuntu-latest

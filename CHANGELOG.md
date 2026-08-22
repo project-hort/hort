@@ -7,6 +7,303 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-22
+
+### Added
+
+- **`ScanPolicy` gained `enforcement: reject | record`** — a per-policy
+  choice of what a blocking scan verdict *does*, orthogonal to the
+  knobs that decide which findings are blocking (`severityThreshold`,
+  `licensePolicy`, `negligibleAction`). Under the default `reject` —
+  which an omitted field parses to, so no existing policy file needs an
+  edit — nothing changes. Under `record` the scan still runs, the
+  per-finding rows, the findings blob and the `PolicyEvaluated(Fail)`
+  verdict are still written, and the artifact is **not** rejected:
+  publication proceeds with findings, leaving retrieval-time blocking to
+  the consuming policy. Every API and metrics surface reports the
+  violations identically in both modes; the scan-result evaluation log
+  line and the `hort_policy_evaluation_total{result}` label name which
+  enforcement applied (`findings_recorded` vs `reject`), so an operator
+  never has to infer it. Because a `record`-mode artifact's own
+  `ScanCompleted` carries findings, it releases through a new, distinct
+  `ScanRecorded` release authority rather than a widened
+  `ScanSucceeded` — the release is auditable as "released with recorded,
+  over-threshold findings", and the authority carries the same
+  provenance precondition as the other timer authorities, so `record`
+  un-gates the scan axis only (an unverified artifact under
+  `provenanceMode: required`, an artifact matched by an active curation
+  rule, and an artifact that was never scanned at all are all still
+  held). Changing the field re-judges the existing population in both
+  directions and without re-running a scanner: `record` → `reject`
+  re-derives every in-scope artifact's verdict from its stored findings
+  and re-holds the now-non-compliant ones, `reject` → `record`
+  un-rejects the scan-rejected population while preserving the
+  remaining observation window. An unknown value is an apply-time
+  rejection naming the field and both valid values. (#191)
+
+- **`hort_sbom_resolution_total{format, result}`** — how each scan's SBOM
+  components were derived (`resolved` / `no_lockfile` /
+  `unusable_lockfile` / `payload_unavailable` / `not_applicable` /
+  `hosted_only`),
+  alongside the existing `hort_sbom_extraction_total`, which gains a
+  `payload_unavailable` result. `resolved / (resolved + no_lockfile +
+  unusable_lockfile)` is the share of scans that examined dependencies at
+  all — a registry scanning subjects only was previously indistinguishable
+  from one scanning everything. **`hort_sbom_components_skipped_total{format}`**
+  counts dependencies a resolved closure traversed but could not emit for
+  having no registry coordinates (path- and git-sourced entries). (#191)
+
+- **OCI membership-edge backfill.** The `oci-membership-edge-backfill`
+  admin task repairs OCI image-manifest rows ingested before the
+  pull-through path registered their `content_references` config/layer
+  edges, restoring GC keepalive for blobs referenced only by such a row.
+  One-shot, manually invoked, idempotent; reports rows scanned/repaired,
+  edges written, and skips by reason. (#162)
+
+- **Curator-invokable per-artifact re-evaluation.**
+  `POST /api/v1/admin/curation/quarantine/:artifact_id/reevaluate` and
+  `hort-cli curation reevaluate <artifact-id>` let a curator recompute a
+  `Rejected` artifact's verdict from its stored findings under the
+  currently active policy — no policy mutation, no forced outcome. (#152)
+
+- **Maven artifacts can be prefetch-warmed.** The per-format prefetch
+  dispatch implemented leaf pulls for PyPI, Cargo and npm and
+  short-circuited everything else as "no compose-style download URL".
+  For Maven that rationale was inverted — its layout
+  (`{group-path}/{artifact}/{version}/{filename}`) is the most
+  composable download URL in the system — so the only way to start a
+  Maven quarantine clock was a build failing on first contact. Maven
+  GAVs now warm through the same verified two-leg pull as the other
+  leaf formats. (#153)
+
+- **Chart: bootstrap service-account identities are a values-driven
+  list.** The `svc-token-bootstrap` Job was hardwired to one identity
+  (`cronjob-tasks`, `admin_task_invoke`) writing one Secret, so any
+  further bootstrap identity needed a manual in-pod mint plus a
+  hand-created Secret — unreproducible on rebuild, and dependent on a
+  Secret name that RBAC `resourceNames` rules bind to. The Job now
+  iterates `scheduledTasks.svcTokens`, minting every listed permission
+  per identity (effective authority is cap ∩ grants, so a
+  one-permission mint silently strands sibling grants) and writing each
+  to its declared `secretName`. Per-identity idempotence keeps today's
+  semantics, and an empty `secretName` resolves to the existing default
+  — existing installs need no values change. (#155)
+
+### Changed
+
+- **Scans of hosted cargo crates now compute their verdict from the
+  versions the crate was actually built against.** A published `.crate`
+  embeds its own `Cargo.lock`; scan orchestration streams the stored
+  artifact out of CAS and the cargo handler walks that lockfile's
+  closure, so every SBOM component carries an exact resolved version
+  instead of the declared range's floor (`serde = "1"` was scanned as
+  version `1`, matching advisories that the built `serde 1.0.x` never
+  had). A crate whose payload carries **no** lockfile now yields a
+  subject-only SBOM — the crate itself is still scanned, but the
+  range-floor dependency list is no longer produced at all, because it
+  cannot feed an honest verdict. A lockfile that is present but unusable
+  is reported distinctly from one that is absent. Extraction happens at
+  scan time from the payload, which makes it **retroactive**: a rescan of
+  an already-published artifact produces resolved components with no
+  backfill and no ingest-path change. Dev-only dependency subtrees are
+  excluded using the `kind` information in the stored index metadata —
+  consumers never compile them. Formats that do not derive their SBOM
+  from the payload (npm, PyPI, every opaque format) are unchanged and do
+  not pay for a CAS read. **Proxied, virtual and staging repositories are
+  unchanged too**: only a hosted publish's lockfile is the authenticated
+  publisher's own build witness, whereas a proxied library's is the
+  upstream author's dev-time resolve that consumers re-resolve and never
+  run — findings against it would carry gate power over a crate every
+  consumer would resolve safely. Those scans keep the metadata-only SBOM
+  they had before, and cost no CAS read. (#191)
+
+- **A principal with write authority on a cargo repository now resolves
+  held versions in that repository's sparse index.** `cargo publish`
+  resolves each crate's intra-workspace dependencies through the index
+  even under `--no-verify`, so publishing a workspace into a hosted repo
+  with a quarantine window failed at the second crate — mid-chain, with
+  the earlier crates already uploaded and only yankable. This extends the
+  existing OCI push-then-sign hold exemption (ADR 0039 §10) to the cargo
+  index and records the generalised rule in **ADR 0055**: *a principal
+  that may write to a repository may resolve held metadata there; held
+  bytes never leave quarantine, for anyone.* Scope: `Quarantined` only
+  (`Rejected` / `ScanIndeterminate` stay hidden from every caller,
+  publisher included), metadata only (a held `.crate` is still `503` to
+  its own publisher), keyed on **granted** write authority rather than
+  the presented token's capability, and not applied to virtual
+  (aggregating) repositories. Nothing is released earlier and the
+  release predicate is unchanged. (#179)
+
+- **The cargo sparse-index route emits `Cache-Control: private,
+  no-store` and `Vary: Authorization`.** The served set now varies by
+  principal, so a shared cache or reverse proxy must not store one
+  caller's response and replay it to another. Unconditional — absent
+  directives permit heuristic caching, so conditioning the headers on the
+  hold-read having engaged would leave the ordinary responses cacheable
+  under the same URL key. (#179)
+
+- **Intra-workspace dependencies name the `hort-crates` registry.**
+  Without the key they are crates.io dependencies, which the release
+  job's `[source.crates-io] replace-with` sends to the read-only
+  aggregation index — a repository the release identity cannot publish
+  to, where the hold-read above correctly does not engage.
+  `.cargo/config.toml` declares the matching `[registries.hort-crates]`
+  index (cargo refuses to parse a manifest naming a registry it has no
+  index for), and the `publishable_manifests` guard asserts both halves
+  plus their agreement with each member's `publish` allow-list. (#179)
+
+- **BREAKING (operators): the server and worker Deployment selectors now
+  carry an `app.kubernetes.io/component` discriminator.** Previously both
+  Deployments' `spec.selector.matchLabels` matched each other's pods, so
+  the `hort-server` Service could route to worker pods and a PodDisruption
+  Budget could count the wrong workload. `spec.selector` is immutable
+  after create, so **`helm upgrade` fails against an existing release**
+  with a `spec.selector is immutable` error. This is a one-time step per
+  install; a fresh install needs no action. The chart README documents
+  three migration paths — delete-then-upgrade, `--cascade=orphan`
+  re-adoption for zero-downtime-sensitive installs, and a suspend/resume
+  sequence for Flux-managed installs. (#159)
+
+- **The quarantine window is now anchored on the earliest defensible
+  evidence of the content's age**, not on whichever code path happened
+  to mint the repository row. The anchor is the minimum over the ingest
+  instant, hort's own earliest observation of that exact content in any
+  of its repositories (derived live, no new schema), a trusted upstream
+  publish time from *this* repository's own mapping, and the
+  referenced-tree-descendant carve-out. Both minting paths share one
+  derivation, so a pull-through coalesce no longer yields different
+  windows depending on which caller won the dedup race, and content hort
+  has already held for a while is no longer re-held for a full window on
+  registration into a second repository. An upstream claim observed
+  through another repository's mapping never shortens this repository's
+  window. Release authority is unchanged — an artifact still needs its
+  own `ScanSucceeded` / `ScanWaived` (ADR 0054, ADR 0007). (#163)
+
+- **The zero-window quarantine carve-out now applies on the registration
+  path as well as on ingest.** A referenced-tree descendant registered by
+  content hash previously got a full quarantine window even though its
+  parent's carve-out already applied to the same content, so the two
+  minting paths disagreed about the same artifact. Both paths now share
+  the carve-out decision. (#161)
+
+### Fixed
+
+- **Hosted cargo index entries now carry the crate's real dependencies
+  and features.** Every hosted entry was synthesized with `deps: []` and
+  `features: {}` because the publish handler kept only `name`/`vers` from
+  cargo's publish body and discarded the rest. Cargo validates a feature
+  edge against the *index entry*, not the dependency's own manifest, so
+  publishing a workspace where one crate names a sibling's feature failed
+  with "package `hort-http-core` depends on `hort-app` with feature
+  `test-support` but `hort-app` does not have that feature" — which is
+  what broke `v0.11.0-beta.8` after five of six crates had uploaded. More
+  broadly, an entry claiming a crate has no dependencies hands any
+  consumer an unbuildable graph. The publish handler now parses the whole
+  metadata object and persists it in sparse-index shape (the publish
+  API's `version_req` becomes the index's `req`, a renamed dependency's
+  aliased name and original package name swap fields, and features using
+  the namespaced `dep:` or weak `pkg?/feat` syntax are split into
+  `features2` with `v: 2`), and the hosted index source serves it. The
+  served `cksum` remains the stored CAS digest — a publisher-supplied
+  checksum is neither trusted nor kept. A publish body whose metadata
+  cannot be parsed is now rejected rather than ingested as an entry that
+  silently claims no dependencies. Versions published before this change
+  have nothing stored and keep serving exactly as they did; republishing
+  is what fills them in. A cargo publish now also produces an SBOM with
+  the crate's declared dependencies as components. (#188)
+
+- **A crates publish that fails partway can now be re-run.** An upload is
+  irreversible — a published version can be yanked, never replaced — so a
+  release that broke on the third crate left the first two in the registry
+  and cargo refused to republish them, killing the re-run at crate one.
+  Every crate that never uploaded was then unshippable at that version and
+  the whole tag had to be abandoned, which is what happened to
+  `v0.11.0-beta.7`. The release job now checks each crate against the
+  registry index *before* its attempt and skips the ones already there,
+  logging each skip by name and version. The check is an index lookup, never
+  an interpretation of cargo's exit status: after cargo has run, "refused to
+  republish" and "the upload failed" are the same non-zero, so a loop that
+  continued past it would ship a release with crates silently missing. Any
+  genuine publish failure still aborts the release. (#186)
+
+- **CVSS v3.x base scores are now computed from OSV severity vectors.**
+  OSV frequently delivers severity as a bare vector with no
+  pre-computed number — RustSec advisories almost always do. Severity
+  extraction tried numeric `groups[].max_severity`, then a
+  trailing-`/<float>` heuristic, then a text label; a pure vector
+  survived none of them, so the advisory landed unscored and the SUP-4
+  fail-closed rule recorded it as `Critical`. Fully-scored `Medium`
+  advisories therefore tripped `severityThreshold: high` policies —
+  concretely, `rsa 0.9.10` sat terminally `rejected` on `crates-proxy`
+  and structurally blocked the vetted crates publish. Vectors are now
+  parsed and scored per the CVSS specification, which is authoritative
+  over the previous heuristics. Genuinely unscored advisories still
+  fail closed to `Critical`. (#151)
+
+- **CVSS-vector severity scoring is no longer inert on advisory
+  enrichment.** The pre-scan enrichment queried OSV `/v1/querybatch`,
+  which returns only each advisory's `id` and `modified` — no `severity`
+  array, no `database_specific`. Every enrichment finding therefore fell
+  through to the fail-closed `Critical` with a NULL CVSS score, which
+  both made `severityThreshold` non-discriminating on affected
+  repositories and let the manufactured `Critical` outrank the
+  osv-scanner backend's correctly-scored finding in the dedup merge (the
+  Marvin advisory RUSTSEC-2023-0071 scores 5.9 → `Medium`, but was
+  recorded as `Critical`/unscored). Each distinct advisory id is now
+  hydrated from `GET /v1/vulns/{id}` before severity is derived, cached
+  on `(id, modified)` in the evictable `advisory:osv:vuln:` keyspace, one
+  request per distinct id per scan. Hydration is fail-soft: a failure
+  degrades that one advisory to the pre-existing unscored `Critical` and
+  ticks the new `hort_advisory_hydration_total{result="failed"}` counter
+  rather than failing the scan. New knob
+  `HORT_ADVISORY_OSV_VULNS_URL` (default `https://api.osv.dev/v1/vulns`,
+  Helm `worker.advisory.osvVulnsUrl`) — operators running an internal OSV
+  mirror must point it there alongside `HORT_ADVISORY_OSV_API_URL`. The
+  SUP-4 fail-closed default for genuinely unscored advisories is
+  unchanged. (#172)
+
+- **The worker's CAS volume is no longer mounted read-only on
+  Kubernetes.** The chart mounted the shared CAS with `readOnly: true`
+  on the worker Deployment, enforcing a consume-only contract that had
+  already stopped being true: scan outcomes persist per-finding blobs as
+  hash-referenced CAS objects, and worker-side prefetch ingest writes
+  the blob it verified. Every worker-driven CAS write failed with
+  `Read-only file system (os error 30)`. Compose had already dropped
+  `:ro` for the same reason; the chart never followed. Operators on the
+  filesystem backend need no action beyond the upgrade — the mount is
+  now writable. (#157)
+
+- **A just-ingested artifact is no longer re-pulled upstream on a
+  prefetch re-POST.** The held-check treated a row with no quarantine
+  lifecycle (`QuarantineStatus::None`) as "known upstream but not
+  ingested" and re-enqueued it. That premise was structurally false:
+  the query reads only `artifacts` rows, and every such row is ingested
+  content — "known upstream, not ingested" manifests as the row being
+  absent. `None` actually means ingested with no quarantine lifecycle,
+  which is stamped by design for pure Sigstore-bundle referrers and for
+  ingests matching no scan policy. Such rows are now classified held.
+  Ingested-or-not and quarantine status are two dimensions and are no
+  longer conflated. (#160)
+
+- **Self-service prefetch against a virtual repository can see held
+  state.** The held-check pre-flighted each item against the id of the
+  repository named in the URL. A virtual repository owns no artifact
+  rows — those are keyed by the member repository — so every warm
+  reported `already_held: 0` and re-enqueued the full set, however much
+  of it was already served. The check now walks the virtual's members in
+  the ADR 0031 priority order. (#146)
+
+- **`issue-svc-token --require-authority` is now scope-aware.** The
+  preflight checked every declared permission against global-scope
+  grants only, while runtime authorization checks the actual repository
+  scope. A repository-scoped grant therefore satisfied runtime but
+  failed the preflight, and the error text told the operator to create
+  *global* grants — steering toward privilege widening exactly where
+  narrow scoping was the point, and making repository-scoped bootstrap
+  identities impossible without over-granting. The new optional
+  `--repository <name>` checks each permission against that exact
+  scope; omitting it keeps today's global check. (#156)
+
 ## [0.10.0] - 2026-08-09
 
 ### Security

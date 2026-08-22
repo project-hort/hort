@@ -137,10 +137,15 @@ pub struct Artifact {
     /// derived `Serialize`/`Deserialize`).
     #[serde(default)]
     pub rejection_reason: Option<RejectionReason>,
-    /// Immutable observation-window **anchor** (ADR 0007). The
-    /// resolved window start — `ingested_at` by default, or
-    /// `min(upstream_published_at, ingested_at)` under the per-upstream
-    /// publish-anchoring opt-in. `None` ⇒ not quarantined.
+    /// Immutable observation-window **anchor** (ADR 0007). The resolved
+    /// window start: the earliest defensible evidence of the content's
+    /// age, computed by
+    /// [`derive_quarantine_anchor`](crate::policy::derive_quarantine_anchor)
+    /// as the minimum over the applicable sources — the mint instant, the
+    /// earliest moment hort observed this content in any of its
+    /// repositories, a trusted upstream publish time from this
+    /// repository's own mapping, and the referenced-tree-descendant
+    /// carve-out (ADR 0054). `None` ⇒ not quarantined.
     ///
     /// The window *deadline* is **not stored** — it is computed live as
     /// `quarantine_window_start + duration` (the duration resolved from
@@ -236,6 +241,32 @@ pub enum ReleaseAuthorization {
     /// release is permitted without a scan because the operator
     /// declared this repo/scope un-scanned by design.
     ScanWaived,
+    /// The artifact was scanned, the scan produced findings, and the
+    /// artifact's resolved `ScanPolicy` declares
+    /// `enforcement: record` — the operator has said the scan verdict is
+    /// recorded, not gating ("publish proceeds with findings; blocking at
+    /// retrieval is the consuming policy's job").
+    ///
+    /// **Deliberately NOT folded into [`Self::ScanSucceeded`].** That
+    /// authority means the artifact's latest `ScanCompleted` carries
+    /// `finding_count == 0`; widening it to cover a dirty scan would make
+    /// the ADR 0007 "latest verdict, not mere presence" clause
+    /// conditional on a policy field, and would make the release audit
+    /// (`authority = scan_succeeded`) claim a pass that never happened.
+    /// It is not [`Self::ScanWaived`] either — that authority asserts the
+    /// operator declared the scope un-scanned; here the scan ran and its
+    /// evidence exists. A distinct token keeps "released with recorded,
+    /// over-threshold findings" queryable in the audit trail and on the
+    /// release metric.
+    ///
+    /// Constructible only by the application layer, from two verified
+    /// facts: a `ScanCompleted` exists on the artifact's own stream with
+    /// no later `ArtifactRejected`, AND the resolved policy's
+    /// `enforcement` is `record`. Pairs only with
+    /// [`ReleaseReason::Timer`] and carries the same provenance
+    /// AND-precondition as the other two timer authorities — `record`
+    /// un-gates the scan axis, never the provenance or curation ones.
+    ScanRecorded,
     /// Admin explicitly released despite indeterminate/rejected/no-scan
     /// state. Attribution is populated at the call site
     /// (`released_by_user_id` + `justification` on the event).
@@ -365,6 +396,15 @@ impl Artifact {
     /// been blocked and a contradictory clean signal would mask the
     /// rejection. (This is the `quarantineDuration: 0` permissive-mode
     /// contract — see `docs/architecture/explanation/scanning-pipeline.md`.)
+    ///
+    /// **This is the state guard for every scan observation that does not
+    /// transition the artifact**, not only a literally-clean one: a
+    /// blocking verdict under `enforcement: record`
+    /// ([`ScanOutcome::FindingsRecorded`]) records its findings through
+    /// the same guard, because the artifact's status is likewise
+    /// untouched by that verdict. The method reads no findings and
+    /// mutates nothing — it answers only "is this artifact in a state
+    /// where recording a scan observation is meaningful?".
     pub fn record_clean_scan(&self) -> DomainResult<()> {
         match quarantine_transitions::allowed_targets(
             QuarantineEvent::RecordCleanScan,
@@ -469,6 +509,10 @@ impl Artifact {
     ///   `ArtifactRepository::list_active_for_policy` returns).
     /// - [`ScanOutcome::Clean`] (still-passing) → `Ok(None)`, no
     ///   transition, no event (invariant #2's "unchanged verdict → no-op").
+    /// - [`ScanOutcome::FindingsRecorded`] (now-failing, but the policy
+    ///   declares `enforcement: record`) → `Ok(None)`. The verdict blocks
+    ///   nothing, so a tighten pass leaves the artifact where it is; only
+    ///   a policy that enforces can re-hold a population.
     ///
     /// **No evidence ⇒ no re-rejection (invariant #4).** This method does
     /// not manufacture a verdict — it applies the one the caller computed.
@@ -514,6 +558,14 @@ impl Artifact {
             // Still-passing under the new policy — unchanged verdict, no-op
             // (invariant #2). The window is untouched; no event appended.
             ScanOutcome::Clean => Ok(None),
+            // The bumped policy computes a blocking verdict but declares
+            // `enforcement: record` — the verdict is recorded, never
+            // enforced, so a tighten pass must NOT re-hold. Same no-op
+            // shape as Clean: no transition, no event. (The recorded
+            // violations were already persisted by the scan that produced
+            // the findings; a re-evaluation pass appends no new audit for
+            // an unchanged download status.)
+            ScanOutcome::FindingsRecorded(_) => Ok(None),
             // Now-failing — re-hold. The window anchor is preserved (not
             // re-opened); only the status + reason move.
             ScanOutcome::Reject(_) => {
@@ -661,8 +713,9 @@ impl Artifact {
     /// read here** — the computed deadline is the sweep's *candidacy*
     /// filter (which rows to consider), not its *authorization*. A
     /// timer-driven
-    /// release requires a successful scan or an explicit
-    /// `scan_backends:[]` waiver; expiry alone can never release.
+    /// release requires a successful scan, an explicit
+    /// `scan_backends:[]` waiver, or a recorded verdict under
+    /// `enforcement: record`; expiry alone can never release.
     ///
     /// The entity emits
     /// the event with `released_by_user_id = None` and
@@ -708,8 +761,11 @@ impl Artifact {
         }
 
         // FAIL-CLOSED PREDICATE (ADR 0007). A timer-driven release
-        // (ReleaseReason::Timer) is authorized ONLY by ScanSucceeded or
-        // ScanWaived. AdminOverride / PolicyReEvaluation / CuratorWaiver
+        // (ReleaseReason::Timer) is authorized ONLY by ScanSucceeded,
+        // ScanWaived or ScanRecorded (the three scan-axis authorities:
+        // the scan passed / the operator waived scanning / the operator
+        // declared the verdict non-gating).
+        // AdminOverride / PolicyReEvaluation / CuratorWaiver
         // are operator / system / curator authorities and pair with
         // their own ReleaseReason.
         // A computed deadline `<= now()` alone is NOT a release
@@ -720,7 +776,7 @@ impl Artifact {
         // other cross pair involving either variant is denied
         // (deny-by-default preserved).
         // ADR 0027: the timer arm carries a provenance
-        // AND-precondition. A `(Timer, ScanSucceeded|ScanWaived)` release
+        // AND-precondition. A `(Timer, ScanSucceeded|ScanWaived|ScanRecorded)` release
         // is authorized only when `provenance ∈ {NotRequired, Cleared}` —
         // a `Pending` (Required mode, not yet a `ProvenanceVerified`)
         // candidate stays quarantined (fail-closed). The Admin / Curator /
@@ -734,6 +790,12 @@ impl Artifact {
         let authorized = match (&reason, authz) {
             (ReleaseReason::Timer, ReleaseAuthorization::ScanSucceeded) => provenance_clears_timer,
             (ReleaseReason::Timer, ReleaseAuthorization::ScanWaived) => provenance_clears_timer,
+            // `enforcement: record` — the scan ran and its verdict is
+            // recorded rather than gating. Same AND-precondition as the
+            // two arms above: recording a scan verdict says nothing about
+            // provenance, so a `Pending` (Required, unverified) candidate
+            // still stays quarantined.
+            (ReleaseReason::Timer, ReleaseAuthorization::ScanRecorded) => provenance_clears_timer,
             (ReleaseReason::Timer, _) => false,
             (ReleaseReason::Admin, ReleaseAuthorization::AdminOverride) => true,
             (ReleaseReason::Admin, _) => false,
@@ -745,7 +807,8 @@ impl Artifact {
         if !authorized {
             return Err(DomainError::Invariant(
                 "release not authorized: timer-only release requires a \
-                 successful scan or an explicit scan_backends:[] waiver, \
+                 successful scan, an explicit scan_backends:[] waiver or a \
+                 recorded verdict under enforcement:record, \
                  and a cleared/not-required provenance gate \
                  (fail-closed release predicate, ADR 0007)"
                     .into(),
@@ -2214,6 +2277,88 @@ mod tests {
         }
     }
 
+    // -- ScanRecorded (enforcement: record) --------------------------------
+    //
+    // The sixth authority behaves exactly like the other two scan-axis
+    // timer authorities: it releases on the timer arm, carries the same
+    // provenance AND-precondition, and pairs with NO other reason.
+
+    /// `(Timer, ScanRecorded, NotRequired)` releases — the operator
+    /// declared the scan verdict recorded rather than gating, so the
+    /// artifact's own dirty `ScanCompleted` no longer holds it.
+    #[test]
+    fn release_timer_scan_recorded_provenance_not_required_released() {
+        let mut a = quarantined_artifact();
+        assert!(a
+            .release(
+                ReleaseReason::Timer,
+                ReleaseAuthorization::ScanRecorded,
+                ProvenanceClearance::NotRequired,
+            )
+            .is_ok());
+        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+    }
+
+    /// `(Timer, ScanRecorded, Cleared)` releases.
+    #[test]
+    fn release_timer_scan_recorded_provenance_cleared_released() {
+        let mut a = quarantined_artifact();
+        assert!(a
+            .release(
+                ReleaseReason::Timer,
+                ReleaseAuthorization::ScanRecorded,
+                ProvenanceClearance::Cleared,
+            )
+            .is_ok());
+        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+    }
+
+    /// `(Timer, ScanRecorded, Pending)` is DENIED — `enforcement: record`
+    /// un-gates the scan axis only. A `Required`-mode artifact with no
+    /// `ProvenanceVerified` yet stays quarantined, exactly as it does
+    /// under `ScanSucceeded` / `ScanWaived`. This is the load-bearing
+    /// cross-axis pin: the new authority must not become a way to release
+    /// past the provenance gate.
+    #[test]
+    fn release_timer_scan_recorded_provenance_pending_denied() {
+        let mut a = quarantined_artifact();
+        let err = a
+            .release(
+                ReleaseReason::Timer,
+                ReleaseAuthorization::ScanRecorded,
+                ProvenanceClearance::Pending,
+            )
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Invariant(_)));
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+    }
+
+    /// `ScanRecorded` pairs ONLY with `Timer` — deny-by-default is
+    /// preserved for every other reason (an Admin/Curator/PolicyReEval
+    /// release carries its own authority token).
+    #[test]
+    fn release_scan_recorded_denied_for_every_non_timer_reason() {
+        for reason in [
+            ReleaseReason::Admin,
+            ReleaseReason::Curator,
+            ReleaseReason::PolicyReEvaluation,
+        ] {
+            let mut a = quarantined_artifact();
+            assert!(
+                matches!(
+                    a.release(
+                        reason.clone(),
+                        ReleaseAuthorization::ScanRecorded,
+                        ProvenanceClearance::NotRequired,
+                    ),
+                    Err(DomainError::Invariant(_))
+                ),
+                "({reason:?}, ScanRecorded) must be denied (deny-by-default)"
+            );
+            assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        }
+    }
+
     /// `Cleared`/`NotRequired` cannot rescue a non-scan timer authority —
     /// provenance clearing the gate does NOT substitute for the scan gate.
     #[test]
@@ -3473,8 +3618,11 @@ mod tests {
     // The tighten direction of continuous enforcement. The caller computes
     // the verdict via `evaluate_scan_result` over the artifact's STORED
     // findings and threads the `ScanOutcome` in; this method applies it.
-    //   Reject  → Rejected (ScanPolicyRetroactive), window NOT re-opened.
-    //   Clean   → no-op (Ok(None)), no mutation, no event.
+    //   Reject           → Rejected (ScanPolicyRetroactive), window NOT re-opened.
+    //   Clean            → no-op (Ok(None)), no mutation, no event.
+    //   FindingsRecorded → no-op (Ok(None)) — the bumped policy computes a
+    //                      blocking verdict but declares enforcement:record,
+    //                      so it holds nothing.
     // Valid only from the "active" states Quarantined / Released; terminal
     // source states return Err(Invariant) WITHOUT mutating.
 
@@ -3563,6 +3711,30 @@ mod tests {
             QuarantineStatus::Released,
             "an artifact with no evidence is never re-rejected on a tighten"
         );
+    }
+
+    #[test]
+    fn reject_from_scan_policy_retroactive_findings_recorded_is_noop() {
+        // A bumped policy whose verdict BLOCKS but whose enforcement is
+        // `record`: the tighten pass must leave the artifact exactly where
+        // it is. Without this arm a record-mode policy change would
+        // re-hold the population it explicitly declared non-gating.
+        for mut a in [released_artifact(), quarantined_artifact()] {
+            let before = a.clone();
+            let out = a
+                .reject_from_scan_policy_retroactive(
+                    &ScanOutcome::FindingsRecorded(vec![crate::events::PolicyViolation {
+                        rule: "cve-severity-threshold".into(),
+                        severity: crate::entities::scan_policy::SeverityThreshold::Critical,
+                        message: "critical finding".into(),
+                        details: serde_json::Value::Null,
+                    }]),
+                    "irrelevant".into(),
+                )
+                .expect("FindingsRecorded is Ok(None), never an error");
+            assert!(out.is_none(), "a recorded verdict must emit no event");
+            assert_eq!(a, before, "a recorded verdict must not mutate the artifact");
+        }
     }
 
     #[test]

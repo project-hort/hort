@@ -27,22 +27,19 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{
-    is_scan_clearable, Artifact, CurationClearance, ProvenanceClearance, QuarantineStatus,
+    Artifact, CurationClearance, ProvenanceClearance, QuarantineStatus,
 };
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection, SeverityThreshold,
-    SignerIdentityPattern,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::error::DomainError;
 use hort_domain::events::{
     Actor, ArtifactReEvaluated, ArtifactRejected, DomainEvent, ExclusionAdded, ExclusionRemoved,
     PolicyArchived, PolicyCreated, PolicyField, PolicyReactivated, PolicyScope, PolicyUpdated,
-    ReEvaluationTrigger, RejectionReason, StreamId,
+    ReEvaluationTrigger, StreamId,
 };
-use hort_domain::policy::{
-    effective_quarantine_deadline, evaluate_curation, evaluate_scan_result,
-    re_evaluate_after_exclusion, CurationOutcome, ReEvaluationOutcome,
-};
+use hort_domain::policy::{evaluate_scan_result, ReEvaluationOutcome};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
@@ -61,9 +58,9 @@ use crate::metrics::{
     PolicyEvaluationResult, PolicyReEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
-use crate::use_cases::release_clearance::resolve_provenance_clearance;
+use crate::use_cases::release_clearance::{self, resolve_provenance_clearance};
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
-use crate::use_cases::{read_expected_version, scan_history};
+use crate::use_cases::{read_expected_version, rejected_reevaluation, scan_history};
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -110,6 +107,12 @@ pub struct CreatePolicyCommand {
     /// `evaluate_scan_result`. The gitops apply pipeline validates the
     /// wire value via `hort_config::scan_policy::validate_scan_policy`.
     pub negligible_action: NegligibleAction,
+    /// What a blocking scan verdict does to the artifact. Default
+    /// [`ScanEnforcement::Reject`]; enforced by `evaluate_scan_result`
+    /// and by the re-evaluation decision point. The gitops apply
+    /// pipeline validates the wire value via
+    /// `hort_config::scan_policy::validate_scan_policy`.
+    pub enforcement: ScanEnforcement,
 }
 
 /// A field-level update directive for [`PolicyUseCase::update_policy`].
@@ -164,6 +167,11 @@ pub struct UpdatePolicyCommand {
     /// variant (Ignore / Warn / Block) is a meaningful value distinct
     /// from `FieldChange::Unchanged`.
     pub negligible_action: FieldChange<NegligibleAction>,
+    /// Operator-driven update of the enforcement mode. Both variants
+    /// (Reject / Record) are meaningful values distinct from
+    /// `FieldChange::Unchanged`, and a change in EITHER direction is
+    /// gate-affecting (it enqueues an ADR 0041 re-evaluation pass).
+    pub enforcement: FieldChange<ScanEnforcement>,
 }
 
 impl UpdatePolicyCommand {
@@ -186,6 +194,7 @@ impl UpdatePolicyCommand {
             scan_backends: FieldChange::Unchanged,
             rescan_interval_hours: FieldChange::Unchanged,
             negligible_action: FieldChange::Unchanged,
+            enforcement: FieldChange::Unchanged,
         }
     }
 }
@@ -445,6 +454,7 @@ impl PolicyUseCase {
             scan_backends: cmd.scan_backends,
             rescan_interval_hours: cmd.rescan_interval_hours,
             negligible_action: cmd.negligible_action,
+            enforcement: ScanEnforcement::Reject,
             stream_version: result.stream_position,
             created_at: now,
             updated_at: now,
@@ -686,6 +696,22 @@ impl PolicyUseCase {
             }
         }
 
+        // Same-value skip; the `previous_value` / `new_value` payloads are
+        // the lowercase `ScanEnforcement` wire strings (mirrors
+        // `NegligibleAction`). A change in either direction is
+        // gate-affecting, so it drives the re-evaluation enqueue below.
+        if let FieldChange::Set(new_enforcement) = &cmd.enforcement {
+            if *new_enforcement != projection.enforcement {
+                events.push(field_event(
+                    policy_id,
+                    PolicyField::Enforcement,
+                    serde_json::Value::String(projection.enforcement.to_string()),
+                    serde_json::Value::String(new_enforcement.to_string()),
+                ));
+                projection.enforcement = *new_enforcement;
+            }
+        }
+
         if events.is_empty() {
             // Idempotent no-op — same-value updates yield zero writes.
             tracing::debug!(
@@ -697,7 +723,8 @@ impl PolicyUseCase {
 
         let event_count = events.len();
         // ADR 0041 Item 3: a gate-affecting field change (severity
-        // threshold / license-policy classes / negligible_action) drives
+        // threshold / license-policy classes / negligible_action /
+        // enforcement) drives
         // ONE async re-evaluation pass over the policy's population, even
         // when several gate fields changed in this single `update_policy`
         // — `update_policy` emits one `PolicyUpdated` per changed field, so
@@ -1157,82 +1184,6 @@ impl PolicyUseCase {
         .await;
 
         Ok(exclusion_id)
-    }
-
-    /// Re-hydrate the artifact's structured rejection reason from its
-    /// stored `ArtifactRejected` event (ADR 0041 invariant #6 (a)).
-    ///
-    /// The `artifacts` projection does not persist the reason — it lives
-    /// on the artifact's event stream. Scans the stream in reverse for the
-    /// most recent [`DomainEvent::ArtifactRejected`] and returns its
-    /// `rejected_by`. `Ok(None)` when no rejection event is present (an
-    /// unknown reason — ineligible by default). Infrastructure read
-    /// failures surface as `Err` so the caller can skip the artifact
-    /// rather than treat an unknown reason as scan-clearable.
-    async fn hydrate_rejection_reason(
-        &self,
-        artifact_id: Uuid,
-    ) -> AppResult<Option<RejectionReason>> {
-        let stream_id = StreamId::artifact(artifact_id);
-        // The same 200-event reverse-scan bound the scan-history helper
-        // uses; an artifact stream begins well within it.
-        let persisted = self
-            .events
-            .read_stream(
-                &stream_id,
-                hort_domain::ports::event_store::ReadFrom::Start,
-                200,
-            )
-            .await?;
-        Ok(persisted.iter().rev().find_map(|e| match &e.event {
-            DomainEvent::ArtifactRejected(r) => Some(r.rejected_by.clone()),
-            _ => None,
-        }))
-    }
-
-    /// Compute the **active curation precondition** of the cross-axis
-    /// release conjunction (ADR 0041 invariant #6 (c)) for one artifact.
-    ///
-    /// Lists the artifact's repository's live curation rules
-    /// (`list_for_repo`) and runs the pure `evaluate_curation` over coords
-    /// built from the artifact (format resolved from the repository — the
-    /// format gate input). Returns [`CurationClearance::Blocked`] iff a
-    /// currently-active rule yields `CurationOutcome::Block`; `Warn` /
-    /// `Allow` / no-match all resolve to [`CurationClearance::Cleared`].
-    async fn resolve_curation_clearance(
-        &self,
-        artifact: &Artifact,
-    ) -> AppResult<CurationClearance> {
-        let rules = self
-            .curation_rules
-            .list_for_repo(artifact.repository_id)
-            .await?;
-        if rules.is_empty() {
-            // Fast path: no rules → cleared, no format lookup needed.
-            return Ok(CurationClearance::Cleared);
-        }
-        // The curation format gate needs the repository's format; every
-        // artifact in a repo shares it. A missing repo row resolves to the
-        // `Generic` format (the curation evaluator's `any`-format rules
-        // still apply; a format-specific rule simply won't match a Generic
-        // coord — the same no-match→Cleared path).
-        let format = self
-            .repository_access
-            .repository_format(artifact.repository_id)
-            .await?
-            .unwrap_or(hort_domain::entities::repository::RepositoryFormat::Generic);
-        let coords = ArtifactCoords {
-            name: artifact.name.clone(),
-            name_as_published: artifact.name_as_published.clone(),
-            version: artifact.version.clone(),
-            path: artifact.path.clone(),
-            format,
-            metadata: serde_json::Value::Null,
-        };
-        Ok(match evaluate_curation(&coords, &rules) {
-            CurationOutcome::Block { .. } => CurationClearance::Blocked,
-            CurationOutcome::Warn { .. } | CurationOutcome::Allow => CurationClearance::Cleared,
-        })
     }
 
     /// Generalised both-directions re-evaluation pass over the **whole**
@@ -1728,126 +1679,73 @@ impl PolicyUseCase {
     ) {
         let artifact_id = artifact.id;
 
-        // (a) Eligibility guard: re-hydrate the rejection reason from
-        // the stream and skip any non-scan-clearable rejection — a
-        // provenance- / curation- / admin-rejected artifact is NOT a
-        // candidate for a scan re-judgement (the pre-ADR-0041 pass
-        // released it irrespective of reason — the live fail-open).
-        // An infrastructure read failure skips the artifact.
-        let reason = match self.hydrate_rejection_reason(artifact_id).await {
-            Ok(r) => r,
+        let derivation = match rejected_reevaluation::derive_rejected_outcome(
+            &*self.events,
+            &self.storage,
+            &artifact,
+            Some(policy),
+            updated_exclusions,
+            now,
+        )
+        .await
+        {
+            Ok(d) => d,
             Err(e) => {
                 tracing::error!(
                     artifact_id = %artifact_id,
                     policy_id = %policy_id,
                     trigger = ?trigger,
                     error = %e,
-                    "re-evaluation (loosen): failed to read rejection reason; \
+                    "re-evaluation (loosen): failed to load re-evaluation evidence; \
                      skipping artifact",
                 );
                 return;
             }
         };
-        artifact.rejection_reason = reason.clone();
-        if !is_scan_clearable(reason.as_ref()) {
-            tallies.held_cross_axis += 1;
-            tracing::info!(
-                artifact_id = %artifact_id,
-                policy_id = %policy_id,
-                reason = ?reason,
-                outcome = "ineligible_non_scanner",
-                "artifact re-evaluation held: rejection reason is not scan-clearable \
-                 (ADR 0041 invariant #6)",
-            );
-            emit_policy_evaluation(
-                policy_decision_point::RE_EVALUATION,
-                PolicyEvaluationResult::StillRejected,
-            );
-            return;
-        }
 
-        let last_snapshot =
-            match scan_history::read_last_scan_completed(&*self.events, artifact_id).await {
-                Ok(Some(s)) => s,
-                Ok(None) => {
-                    tracing::error!(
-                        artifact_id = %artifact_id,
-                        policy_id = %policy_id,
-                        trigger = ?trigger,
-                        "re-evaluation (loosen): no ScanCompleted on artifact stream; \
-                         skipping artifact",
-                    );
-                    return;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        artifact_id = %artifact_id,
-                        policy_id = %policy_id,
-                        trigger = ?trigger,
-                        error = %e,
-                        "re-evaluation (loosen): failed to read artifact stream; \
-                         skipping artifact",
-                    );
-                    return;
-                }
-            };
-
-        // Prefer per-finding matching by
-        // hydrating the `findings_blob` from CAS. Best-effort: a
-        // missing or malformed blob logs a `warn!` inside
-        // `read_last_findings` and returns `None` so the
-        // re-evaluator falls back to the aggregate-summary
-        // path. Genuine event-store read failures are infrastructure
-        // errors and surface as `Err` here; we skip the artifact in
-        // that case (mirrors the `read_last_scan_completed` error
-        // arm above).
-        let last_findings =
-            match scan_history::read_last_findings(&*self.events, &self.storage, artifact_id).await
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!(
-                        artifact_id = %artifact_id,
-                        policy_id = %policy_id,
-                        trigger = ?trigger,
-                        error = %e,
-                        "re-evaluation (loosen): failed to hydrate findings_blob; \
-                         skipping artifact",
-                    );
-                    return;
-                }
-            };
-
-        // Correctness landmine: `re_evaluate_after_exclusion`
-        // branches on the **computed deadline**, never the stored
-        // anchor. The artifact stores only `quarantine_window_start`
-        // (the anchor — always in the past); pass
-        // `effective_quarantine_deadline(anchor, duration)` resolved
-        // from the matched policy's `quarantineDuration`. Passing the
-        // bare anchor type-checks (both are `Option<DateTime<Utc>>`)
-        // but releases re-evaluated `rejected` artifacts ~`duration`
-        // early.
-        let quarantine_deadline = artifact.quarantine_window_start.map(|anchor| {
-            effective_quarantine_deadline(
-                anchor,
-                chrono::Duration::seconds(policy.quarantine_duration_secs),
-            )
-        });
-        // Hydrate the transient computed deadline onto the artifact
-        // so `Artifact::re_evaluate` (invoked inside
-        // `commit_re_evaluation`) branches on the same computed
-        // deadline as the pure helper below — the two MUST agree on
-        // boundary semantics.
+        let (outcome, quarantine_deadline, reason) = match derivation {
+            // (a) Eligibility guard: a provenance- / curation- / admin-
+            // rejected artifact is NOT a candidate for a scan
+            // re-judgement (the pre-ADR-0041 pass released it
+            // irrespective of reason — the live fail-open).
+            rejected_reevaluation::RejectedDerivation::Ineligible { reason } => {
+                tallies.held_cross_axis += 1;
+                tracing::info!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    reason = ?reason,
+                    outcome = "ineligible_non_scanner",
+                    "artifact re-evaluation held: rejection reason is not scan-clearable \
+                     (ADR 0041 invariant #6)",
+                );
+                emit_policy_evaluation(
+                    policy_decision_point::RE_EVALUATION,
+                    PolicyEvaluationResult::StillRejected,
+                );
+                return;
+            }
+            rejected_reevaluation::RejectedDerivation::NoScanCompleted => {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    trigger = ?trigger,
+                    "re-evaluation (loosen): no ScanCompleted on artifact stream; \
+                     skipping artifact",
+                );
+                return;
+            }
+            rejected_reevaluation::RejectedDerivation::Determined {
+                outcome,
+                quarantine_deadline,
+                rejection_reason,
+            } => (outcome, quarantine_deadline, rejection_reason),
+        };
+        artifact.rejection_reason = reason;
+        // Hydrate the transient computed deadline onto the artifact so
+        // `Artifact::re_evaluate` (invoked inside `commit_re_evaluation`)
+        // branches on the same computed deadline the pure helper decided
+        // against — the two MUST agree on boundary semantics.
         artifact.quarantine_deadline = quarantine_deadline;
-        let outcome = re_evaluate_after_exclusion(
-            &artifact,
-            &last_snapshot.summary,
-            last_findings.as_deref(),
-            Some(policy),
-            updated_exclusions,
-            quarantine_deadline,
-            now,
-        );
 
         match outcome {
             ReEvaluationOutcome::StillRejected => {
@@ -1919,7 +1817,13 @@ impl PolicyUseCase {
                         return;
                     }
                 };
-                let curation = match self.resolve_curation_clearance(&artifact).await {
+                let curation = match release_clearance::resolve_curation_clearance(
+                    &*self.curation_rules,
+                    &self.repository_access,
+                    &artifact,
+                )
+                .await
+                {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::error!(
@@ -2417,6 +2321,7 @@ fn build_config_snapshot(cmd: &CreatePolicyCommand) -> serde_json::Value {
         "scan_backends": cmd.scan_backends,
         "rescan_interval_hours": cmd.rescan_interval_hours,
         "negligible_action": cmd.negligible_action.to_string(),
+        "enforcement": cmd.enforcement.to_string(),
     })
 }
 
@@ -2451,9 +2356,11 @@ fn optional_i64_to_value(v: Option<i64>) -> serde_json::Value {
 mod tests {
     use std::sync::Mutex;
 
-    use hort_domain::events::{ApiActor, PersistedEvent};
+    use hort_domain::events::{ApiActor, PersistedEvent, RejectionReason};
     use hort_domain::ports::event_store::{AppendResult, ReadFrom, SubscribeFrom};
     use hort_domain::ports::BoxFuture;
+
+    use crate::use_cases::test_support::{persisted_artifact_rejected, persisted_scan_completed};
 
     use super::*;
 
@@ -2483,6 +2390,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
         }
     }
 
@@ -2506,6 +2414,7 @@ mod tests {
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
             stream_version,
             created_at: now,
             updated_at: now,
@@ -4121,45 +4030,6 @@ mod tests {
         }
     }
 
-    fn persisted_scan_completed(
-        artifact_id: Uuid,
-        critical: u32,
-        stream_position: u64,
-    ) -> PersistedEvent {
-        // Invariant: blob iff non-empty findings.
-        let findings_blob = if critical > 0 {
-            Some(VALID_SHA256.parse::<ContentHash>().unwrap())
-        } else {
-            None
-        };
-        PersistedEvent {
-            event_id: Uuid::new_v4(),
-            stream_id: StreamId::artifact(artifact_id),
-            stream_position,
-            global_position: stream_position,
-            event: DomainEvent::ScanCompleted(ScanCompleted {
-                artifact_id,
-                scanner: "trivy".into(),
-                finding_count: critical,
-                severity_summary: SeveritySummary {
-                    critical,
-                    high: 0,
-                    medium: 0,
-                    low: 0,
-                    negligible: 0,
-                },
-                findings_blob,
-            }),
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: Actor::Api(ApiActor {
-                user_id: Uuid::new_v4(),
-            }),
-            event_version: 1,
-            stored_at: Utc::now(),
-        }
-    }
-
     /// Build an `ArtifactIngested` PersistedEvent — used to seed the
     /// "no ScanCompleted on artifact stream" path so the pass takes
     /// the best-effort skip.
@@ -4205,35 +4075,6 @@ mod tests {
             scope: PolicyScope::Global,
             reason: "matches the rejected artifact's only finding".into(),
             expires_at: None,
-        }
-    }
-
-    /// Build an `ArtifactRejected` PersistedEvent carrying `rejected_by`.
-    /// The post-exclusion re-evaluation pass re-hydrates the rejection
-    /// reason from this event (ADR 0041 invariant #6 (a)); a rejected
-    /// artifact in production always has one on its stream.
-    fn persisted_artifact_rejected(
-        artifact_id: Uuid,
-        rejected_by: RejectionReason,
-        stream_position: u64,
-    ) -> PersistedEvent {
-        PersistedEvent {
-            event_id: Uuid::new_v4(),
-            stream_id: StreamId::artifact(artifact_id),
-            stream_position,
-            global_position: stream_position,
-            event: DomainEvent::ArtifactRejected(ArtifactRejected {
-                artifact_id,
-                rejected_by,
-                reason: "seeded rejection".into(),
-            }),
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            actor: Actor::Api(ApiActor {
-                user_id: Uuid::new_v4(),
-            }),
-            event_version: 1,
-            stored_at: Utc::now(),
         }
     }
 
@@ -5940,6 +5781,87 @@ mod tests {
         }
     }
 
+    /// Loosen direction driven by `enforcement` alone: a
+    /// scan-rejected artifact whose findings STILL cross the threshold is
+    /// released purely because the policy flipped `reject → record`. No
+    /// exclusion, no rescan — the same stored evidence, re-judged under
+    /// the bumped policy, through release authority #5.
+    #[tokio::test]
+    async fn run_pass_loosen_un_rejects_when_enforcement_flips_to_record() {
+        let (uc, events, projections, artifacts, lifecycle, _storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        // Threshold Low: the seeded critical finding blocks under
+        // `reject`. The ONLY thing that clears it is the enforcement mode.
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        p.enforcement = ScanEnforcement::Record;
+        projections.insert(p);
+
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        artifacts.seed_active_for_policy(policy_id, vec![]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1, "one loosen transition");
+        let (committed_artifact, committed_events, _meta) = &transitions[0];
+        assert_eq!(committed_artifact.id, artifact_id);
+        assert_eq!(
+            committed_artifact.quarantine_status,
+            QuarantineStatus::Released,
+            "flipping enforcement to record must un-reject the population it \
+             declared non-gating"
+        );
+        match &committed_events.events[0].event {
+            DomainEvent::ArtifactReEvaluated(e) => {
+                assert_eq!(e.previous_status, QuarantineStatus::Rejected);
+                assert_eq!(e.new_status, QuarantineStatus::Released);
+            }
+            other => panic!("expected ArtifactReEvaluated, got {other:?}"),
+        }
+    }
+
+    /// The complement: under `enforcement: record` the TIGHTEN direction
+    /// re-holds nothing, because a recorded verdict blocks nothing. This
+    /// is what keeps a `record`-mode policy change from re-quarantining
+    /// the very population it just un-gated.
+    #[tokio::test]
+    async fn run_pass_tighten_under_record_enforcement_re_holds_nothing() {
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        p.enforcement = ScanEnforcement::Record;
+        projections.insert(p);
+
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+        // A Critical finding — which WOULD re-hold under `reject` (see
+        // `run_pass_tighten_re_holds_now_failing_released_artifact`, the
+        // identical setup with the default enforcement).
+        let findings = vec![sample_finding("CVE-2024-0001", SeverityThreshold::Critical)];
+        seed_active_with_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            &findings,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a recorded verdict holds nothing, so the tighten walk is all no-ops"
+        );
+    }
+
     /// Tighten direction: a `Released` artifact whose stored findings now
     /// fail under the bumped policy is re-held (`Rejected`) with
     /// `ScanPolicyRetroactive`. The timer window anchor is preserved.
@@ -6371,6 +6293,95 @@ mod tests {
         assert_eq!(
             trigger,
             ReEvaluationTrigger::PolicyUpdated { policy_id: id }
+        );
+    }
+
+    /// An `enforcement` change enqueues a re-evaluation pass in BOTH
+    /// directions. `record → reject` re-holds the now-non-compliant
+    /// population (skipping it would be fail-OPEN — the exact gap
+    /// ADR 0041 closed); `reject → record` un-rejects it (skipping it
+    /// would strand the population `Rejected` forever).
+    #[tokio::test]
+    async fn update_policy_enforcement_change_enqueues_reevaluation_in_both_directions() {
+        for (from, to) in [
+            (ScanEnforcement::Reject, ScanEnforcement::Record),
+            (ScanEnforcement::Record, ScanEnforcement::Reject),
+        ] {
+            let (uc, _events, projections, jobs) = make_use_case_with_jobs();
+            let id = Uuid::new_v4();
+            let mut p = sample_projection(id, 3);
+            p.enforcement = from;
+            projections.insert(p);
+
+            let mut cmd = UpdatePolicyCommand::new(id);
+            cmd.enforcement = FieldChange::Set(to);
+            uc.update_policy(cmd, api_actor()).await.unwrap();
+
+            let (policy_id, trigger) = assert_one_reeval_enqueue(&jobs);
+            assert_eq!(policy_id, id, "{from} -> {to}");
+            assert_eq!(
+                trigger,
+                ReEvaluationTrigger::PolicyUpdated { policy_id: id },
+                "{from} -> {to}"
+            );
+        }
+    }
+
+    /// The `FieldChange::Set` branch emits exactly one
+    /// `PolicyField::Enforcement` event carrying the lowercase wire
+    /// strings, and mutates the upserted projection. Same-value is a
+    /// no-op (and therefore enqueues no population pass).
+    #[tokio::test]
+    async fn update_policy_set_enforcement_emits_one_event_and_mutates_projection() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let p = sample_projection(id, 0);
+        assert_eq!(p.enforcement, ScanEnforcement::Reject);
+        projections.insert(p);
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.enforcement = FieldChange::Set(ScanEnforcement::Record);
+
+        uc.update_policy(cmd, api_actor()).await.unwrap();
+
+        let batches = events.appended_batches();
+        assert_eq!(batches.len(), 1, "single atomic batch");
+        assert_eq!(batches[0].events.len(), 1, "exactly one event");
+        match &batches[0].events[0].event {
+            DomainEvent::PolicyUpdated(u) => {
+                assert_eq!(u.field, PolicyField::Enforcement);
+                assert_eq!(u.previous_value, serde_json::Value::String("reject".into()));
+                assert_eq!(u.new_value, serde_json::Value::String("record".into()));
+            }
+            other => panic!("expected PolicyUpdated, got {other:?}"),
+        }
+
+        assert_eq!(
+            projections.upserts().last().unwrap().enforcement,
+            ScanEnforcement::Record,
+            "projection reflects the new enforcement mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_policy_set_enforcement_to_same_value_yields_zero_events() {
+        let (uc, events, projections) = make_use_case();
+        let id = Uuid::new_v4();
+        let p = sample_projection(id, 0);
+        assert_eq!(p.enforcement, ScanEnforcement::Reject);
+        projections.insert(p);
+        let baseline_upserts = projections.upserts().len();
+
+        let mut cmd = UpdatePolicyCommand::new(id);
+        cmd.enforcement = FieldChange::Set(ScanEnforcement::Reject);
+
+        uc.update_policy(cmd, api_actor()).await.unwrap();
+
+        assert!(events.appended_batches().is_empty(), "no event on no-op");
+        assert_eq!(
+            projections.upserts().len(),
+            baseline_upserts,
+            "no new upsert on no-op"
         );
     }
 

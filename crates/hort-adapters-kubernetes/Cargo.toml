@@ -4,12 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "hort Kubernetes outbound adapter — manages Secret resources for fallback PAT rotation (ADR 0018)"
+# Not published: the release set is every member whose `publish` names a registry.
+publish = false
 
 [lints]
 workspace = true
 
 [dependencies]
-hort-domain = { path = "../hort-domain" }
+hort-domain = { workspace = true }
 
 base64        = "0.23"
 chrono        = { workspace = true }

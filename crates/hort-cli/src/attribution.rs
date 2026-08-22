@@ -40,7 +40,14 @@ pub struct AttributionArgs {
 /// exit 0. A closed stdout pipe (`| head`) exits cleanly rather than
 /// panicking — see `hort_attribution::write_stdout_or_exit`.
 pub fn run(args: &AttributionArgs) -> ExitCode {
-    hort_attribution::write_stdout_or_exit(hort_attribution::render_attribution(args.format.into()))
+    run_to(&mut std::io::stdout(), args)
+}
+
+/// Generic-sink form of [`run`]: same rendering and exit behaviour against
+/// any [`std::io::Write`], so tests can assert on the written bytes without
+/// printing the embedded document to the real stdout.
+fn run_to<W: std::io::Write>(w: &mut W, args: &AttributionArgs) -> ExitCode {
+    hort_attribution::write_to_or_exit(w, hort_attribution::render_attribution(args.format.into()))
 }
 
 #[cfg(test)]
@@ -49,10 +56,20 @@ mod tests {
 
     #[test]
     fn text_format_is_default_and_succeeds() {
-        let code = run(&AttributionArgs {
-            format: AttributionFormatArg::Text,
-        });
+        let mut buf: Vec<u8> = Vec::new();
+        let code = run_to(
+            &mut buf,
+            &AttributionArgs {
+                format: AttributionFormatArg::Text,
+            },
+        );
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert!(!buf.is_empty());
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("serde"),
+            "expected a known crate name in output"
+        );
     }
 
     #[test]
@@ -60,10 +77,17 @@ mod tests {
         let text = hort_attribution::render_attribution(AttributionFormat::Text);
         let json = hort_attribution::render_attribution(AttributionFormat::Json);
         assert_ne!(text, json);
-        let code = run(&AttributionArgs {
-            format: AttributionFormatArg::Json,
-        });
+        let mut buf: Vec<u8> = Vec::new();
+        let code = run_to(
+            &mut buf,
+            &AttributionArgs {
+                format: AttributionFormatArg::Json,
+            },
+        );
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).expect("valid JSON");
+        let entries = parsed.as_array().expect("JSON array");
+        assert!(!entries.is_empty(), "expected > 0 attribution entries");
     }
 
     #[test]

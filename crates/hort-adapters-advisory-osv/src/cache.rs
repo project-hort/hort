@@ -53,17 +53,7 @@ pub(crate) fn cache_key_hash(eco: &str, name: &str, version: Option<&str>) -> St
         }
         None => hasher.update(b"v=*"),
     }
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest.iter() {
-        // Lowercase hex; std doesn't have a one-liner for this without
-        // an extra dep, so do it inline.
-        let hi = byte >> 4;
-        let lo = byte & 0x0F;
-        out.push(hex_nibble(hi));
-        out.push(hex_nibble(lo));
-    }
-    out
+    hex_of(hasher.finalize().as_slice())
 }
 
 /// Full cache key: [`ADVISORY_OSV_PREFIX`] + [`cache_key_hash`].
@@ -81,6 +71,69 @@ pub(crate) fn build_cache_key(eco: &str, name: &str, version: Option<&str>) -> S
         ADVISORY_OSV_PREFIX,
         cache_key_hash(eco, name, version)
     )
+}
+
+/// Keyspace prefix for hydrated full-record entries.
+///
+/// A sub-namespace of [`ADVISORY_OSV_PREFIX`], so it inherits the same
+/// evictable registry entry — the registry matches on prefix and
+/// `advisory:osv:vuln:` starts with `advisory:osv:`.
+pub(crate) const ADVISORY_OSV_VULN_PREFIX: &str = "advisory:osv:vuln:";
+
+/// SHA-256 (hex) of the `(id, modified)` pair — the suffix that
+/// follows [`ADVISORY_OSV_VULN_PREFIX`] in a hydrated-record cache key.
+///
+/// **`modified` is part of the key on purpose.** It is the exact
+/// invalidation signal `querybatch` hands back with every id: when OSV
+/// edits a record it moves `modified`, which shifts the key and forces
+/// a re-fetch; when OSV has not touched the record the key is stable
+/// and the cached copy stays valid for its full TTL. Keying on `id`
+/// alone would serve a stale severity for up to the TTL after OSV
+/// rescored an advisory.
+///
+/// Same 0x1F (Unit Separator) field separator as
+/// [`cache_key_hash`] so `("A-1", "2026-01")` and `("A", "1-2026-01")`
+/// cannot collide.
+///
+/// As with [`cache_key_hash`], the literal prefix is applied at the
+/// `EphemeralStore::put` call site (in `hydrate.rs`) so the
+/// `ephemeral_keyspace_exhaustive` guard can statically resolve it.
+pub(crate) fn vuln_cache_key_hash(id: &str, modified: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(id.as_bytes());
+    hasher.update([0x1F]);
+    match modified {
+        Some(m) => {
+            hasher.update(b"m=");
+            hasher.update(m.as_bytes());
+        }
+        None => hasher.update(b"m=*"),
+    }
+    hex_of(hasher.finalize().as_slice())
+}
+
+/// Full hydrated-record cache key: [`ADVISORY_OSV_VULN_PREFIX`] +
+/// [`vuln_cache_key_hash`].
+///
+/// Read side and tests only — the write site applies the prefix
+/// inline (see [`vuln_cache_key_hash`]).
+pub(crate) fn build_vuln_cache_key(id: &str, modified: Option<&str>) -> String {
+    format!(
+        "{}{}",
+        ADVISORY_OSV_VULN_PREFIX,
+        vuln_cache_key_hash(id, modified)
+    )
+}
+
+/// Lowercase hex encoding of a digest. `std` has no one-liner for this
+/// without an extra dependency.
+fn hex_of(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push(hex_nibble(byte >> 4));
+        out.push(hex_nibble(byte & 0x0F));
+    }
+    out
 }
 
 fn hex_nibble(n: u8) -> char {
@@ -207,6 +260,70 @@ mod tests {
             from_enum, direct,
             "Ecosystem::Npm must map to the same string the direct path uses"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Hydrated-record cache key — keyed on (id, modified)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn vuln_cache_key_starts_with_advisory_osv_vuln_prefix() {
+        let key = build_vuln_cache_key("RUSTSEC-2023-0071", Some("2026-04-25T06:45:06.122559Z"));
+        assert!(
+            key.starts_with(ADVISORY_OSV_VULN_PREFIX),
+            "key must carry the advisory:osv:vuln: prefix: {key}"
+        );
+        // Sub-namespace of the registered evictable keyspace.
+        assert!(key.starts_with(ADVISORY_OSV_PREFIX));
+    }
+
+    #[test]
+    fn vuln_cache_key_changes_when_modified_changes() {
+        // The whole point of the (id, modified) key: OSV rescoring a
+        // record moves `modified`, which must shift the key so the
+        // stale severity cannot be served for the rest of the TTL.
+        let before = build_vuln_cache_key("RUSTSEC-2023-0071", Some("2026-04-25T06:45:06Z"));
+        let after = build_vuln_cache_key("RUSTSEC-2023-0071", Some("2026-05-01T00:00:00Z"));
+        assert_ne!(
+            before, after,
+            "a changed `modified` must invalidate the hydrated record"
+        );
+    }
+
+    #[test]
+    fn vuln_cache_key_is_stable_for_same_id_and_modified() {
+        let a = build_vuln_cache_key("GHSA-xxxx", Some("2026-01-01T00:00:00Z"));
+        let b = build_vuln_cache_key("GHSA-xxxx", Some("2026-01-01T00:00:00Z"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn vuln_cache_key_differs_when_id_differs() {
+        let a = build_vuln_cache_key("GHSA-aaaa", Some("2026-01-01T00:00:00Z"));
+        let b = build_vuln_cache_key("GHSA-bbbb", Some("2026-01-01T00:00:00Z"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn vuln_cache_key_distinguishes_absent_modified_from_present() {
+        let absent = build_vuln_cache_key("GHSA-xxxx", None);
+        let empty = build_vuln_cache_key("GHSA-xxxx", Some(""));
+        assert_ne!(absent, empty, "None vs Some(\"\") must be distinct keys");
+    }
+
+    #[test]
+    fn vuln_cache_key_avoids_separator_collision() {
+        let a = build_vuln_cache_key("A-1", Some("2026-01"));
+        let b = build_vuln_cache_key("A", Some("1-2026-01"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn vuln_cache_key_hex_is_64_chars_after_prefix() {
+        let key = build_vuln_cache_key("GHSA-xxxx", Some("2026-01-01T00:00:00Z"));
+        let suffix = key.strip_prefix(ADVISORY_OSV_VULN_PREFIX).expect("prefix");
+        assert_eq!(suffix.len(), 64, "SHA-256 hex must be 64 chars: {suffix}");
+        assert!(suffix.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
     }
 
     #[test]

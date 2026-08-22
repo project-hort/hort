@@ -10,4 +10,9 @@ spec:
   selector:
     matchLabels:
       {{- include "hort-server.selectorLabels" . | nindent 6 }}
+      # This PDB is server-only (gated on replicaCount / this toggle,
+      # not on the worker's replica count); without this discriminator
+      # it would also match the worker pods, which have no PDB of their
+      # own and are governed by a different eviction budget entirely.
+      app.kubernetes.io/component: server
 {{- end -}}

@@ -1,0 +1,31 @@
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: npm-dedup-leader-e2e-quarantine
+spec:
+  # Deliberately QUARANTINING and deliberately NON-ZERO (24h). The
+  # cross-repository coalesce scenario
+  # (scripts/native-tests/scenarios/proxy/pull-dedup.sh) asserts that the
+  # FOLLOWER's row received the same quarantine anchor treatment as the
+  # LEADER's. Under quarantineDuration: 0s no row is quarantined at all —
+  # `quarantine_window_start` stays NULL on both sides, so the assertions
+  # have no anchor to compare and could not tell a correctly derived one
+  # from a mis-derived one. A non-zero window is what makes them mean
+  # anything.
+  #
+  # Must match npm-dedup-follower-e2e-quarantine.yaml exactly: the assertion
+  # is a comparison BETWEEN the two repositories' rows, so a divergence in
+  # duration here would make it compare unlike things.
+  #
+  # scanBackends: [] keeps the hold purely time-based — the compose stack's
+  # hort-worker runs no scanner for this repo, so no scan would ever complete
+  # and release the row mid-run. Repo-scoped, so no other scenario is
+  # affected.
+  scope:
+    repository: npm-dedup-leader-e2e
+  severityThreshold: critical
+  quarantineDuration: 24h
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

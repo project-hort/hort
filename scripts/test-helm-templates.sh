@@ -2,6 +2,12 @@
 #
 # scripts/test-helm-templates.sh — Helm chart render-assertion suite.
 #
+# Every render pins `--namespace default`: `helm template` otherwise
+# inherits the kube-context/HELM_NAMESPACE namespace, and
+# `.Release.Namespace` reaches rendered output (the svc-bootstrap
+# RoleBinding subject), so an unpinned render is environment-dependent —
+# byte-assertions and goldens must never depend on where the suite runs.
+#
 # Renders every `test-values-*.yaml` fixture in `deploy/helm/hort-server/`
 # via `helm template` and asserts that each fixture produces the
 # expected presence / absence of feature-gated lines in the rendered
@@ -121,6 +127,48 @@ test-values-dex.yaml|/etc/dex/config.yaml|1|the Dex Deployment serves the mounte
 test-values-dex.yaml|value: "https://registry.example.com/dex"|3|auth.dex.enabled overrides HORT_OIDC_ISSUER_URL to auth.dex.issuerUrl on the server Deployment AND the two DSN-direct runtimeEnv CronJobs (scrub + quarantineReleaseSweep)
 test-values-dex.yaml|^ +value: "hort-cli"$|3|auth.dex.enabled overrides HORT_OIDC_AUDIENCE to auth.dex.cliClientId (Dex mints the cli-flow token; its aud is the Dex client id, NOT auth.oidc.audience) — on the server Deployment AND the two DSN-direct runtimeEnv CronJobs; mirrors the issuer override and the Ansible flavor
 test-values-token-exchange-happy.yaml|hort-server.io/component: dex|0|auth.dex.enabled default false ⇒ NO Dex sidecar renders (negative counterpart to test-values-dex.yaml)
+test-values-svc-tokens-multi.yaml|name: issue-token$|1|two-entry svcTokens: exactly one bare `issue-token` init container (the first, backward-compatible entry)
+test-values-svc-tokens-multi.yaml|name: issue-token-uat-smoke$|1|two-entry svcTokens: the second entry gets its own suffixed init container
+test-values-svc-tokens-multi.yaml|^            - --name=cronjob-tasks$|1|two-entry svcTokens: first entry's identity name reaches issue-svc-token
+test-values-svc-tokens-multi.yaml|^            - --name=uat-smoke$|1|two-entry svcTokens: second entry's identity name reaches issue-svc-token
+test-values-svc-tokens-multi.yaml|^            - --output=file:/run/bootstrap/token$|1|two-entry svcTokens: first entry keeps the pre-list flat output path
+test-values-svc-tokens-multi.yaml|^            - --output=file:/run/bootstrap/uat-smoke.token$|1|two-entry svcTokens: second entry gets its own output path (no clobbering on the shared emptyDir)
+test-values-svc-tokens-multi.yaml|^      - hort-server-svc-token$|1|two-entry svcTokens: first entry's EMPTY secretName defaults correctly to the backward-compatible bare name, and the RBAC Role's resourceNames carries it
+test-values-svc-tokens-multi.yaml|^      - uat-smoke-svc-token$|1|two-entry svcTokens: second entry's EXPLICIT secretName is respected verbatim, and the RBAC Role's resourceNames carries it
+test-values-svc-tokens-rotate-entry.yaml|^            - --rotate$|1|per-entry rotate:true on only the second entry reaches ONLY that entry's init container as --rotate
+test-values-svc-tokens-rotate-global.yaml|^            - --rotate$|2|blanket scheduledTasks.rotateSvcToken=true reaches EVERY entry's init container as --rotate, even with no per-entry rotate set
+test-values-svc-tokens-repository.yaml|^            - --repository=maven-proxy$|1|per-entry repository:maven-proxy on only the second entry reaches ONLY that entry's init container as --repository
+test-values-svc-tokens-repository.yaml|repository=maven-proxy|1|exactly one entry declares repository — the first (unscoped) entry renders NO --repository flag at all
+EOF
+}
+
+# Template-scoped expectations — like expectations() but rendered via
+# `--show-only` so the assertion targets one template's output instead
+# of the whole multi-template render. Use this when the full-render grep
+# would also match an unrelated `readOnly`/pattern hit in a different
+# template (e.g. the worker Deployment's CAS mount vs. the scrub
+# CronJob's own readOnly mounts). Format:
+# `<fixture>|<template path, relative to the chart dir>|<grep -cE pattern>|<expected count>|<human label>`.
+scoped_expectations() {
+    cat <<'EOF'
+test-values-cronjobs.yaml|templates/worker-deployment.yaml|readOnly: true|0|worker's CAS data mount renders WITHOUT readOnly (the worker writes scan-finding + prefetch-ingest blobs)
+test-values-cronjobs.yaml|templates/worker-deployment.yaml|mountPath: /var/lib/hort-server/cas|1|worker's CAS data mount still renders (filesystem backend)
+test-values-ha.yaml|templates/deployment.yaml|app.kubernetes.io/component: server|2|server Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the existing pod-template label (1) — matchLabels stays a subset of the pod labels
+test-values-ha.yaml|templates/worker-deployment.yaml|app.kubernetes.io/component: worker|3|worker Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the Deployment metadata label (1) + pod-template label (1)
+test-values-ha.yaml|templates/pdb.yaml|app.kubernetes.io/component: server|1|the server-only PDB's selector.matchLabels carries the component discriminator so it no longer also matches worker pods, which have no PDB of their own
+EOF
+}
+
+# Byte-equivalence pin: rendering `scheduledTasks.svcTokens` at its
+# DEFAULT (the single pre-list `cronjob-tasks` identity) must be
+# byte-for-byte identical to the golden fixtures captured from the
+# chart BEFORE the list refactor — an explicit acceptance criterion,
+# not a best-effort match. Format:
+# `<fixture>|<template path, relative to the chart dir>|<golden file, relative to the chart dir>|<human label>`.
+golden_checks() {
+    cat <<'EOF'
+test-values-cronjobs.yaml|templates/svc-token-bootstrap-job.yaml|testdata/svc-token-bootstrap-job.golden.yaml|default single-identity svc-token-bootstrap Job renders byte-identical to the pre-list golden fixture
+test-values-cronjobs.yaml|templates/svc-bootstrap-rbac.yaml|testdata/svc-bootstrap-rbac.golden.yaml|default single-identity svc-bootstrap RBAC renders byte-identical to the pre-list golden fixture
 EOF
 }
 
@@ -139,6 +187,7 @@ test-values-extra-ca-both-sources.yaml|extraCaBundle|configMapName AND secretNam
 test-values-strict-schema-typo.yaml|[Aa]dditional propert|the strict schema (additionalProperties:false on the top-level + every nested block) must REJECT mistyped / retired keys (replicaCountt, apiBindAddr, http.ociUploadTimeoutSeconds, worker.scanner.osvScanner, worker.scanner.osvv) at helm template instead of silently ignoring them
 test-values-worker-metrics-no-scrapers.yaml|scrapeFrom|worker.metrics.enabled=true with an empty scrapeFrom must be rejected — an empty NetworkPolicy `from: []` means ALL sources (fail-OPEN) per the k8s spec, so the schema's `if enabled then scrapeFrom minItems 1` rule must fail the render rather than open the metrics port cluster-wide
 test-values-dex-broken.yaml|auth.dex.issuerUrl|auth.dex.enabled=true with an empty auth.dex.issuerUrl must fail schema validation — the chart points HORT_OIDC_ISSUER_URL at Dex so an empty issuer is rejected at render time
+test-values-svc-tokens-repository-typo.yaml|[Aa]dditional propert|a mistyped scheduledTasks.svcTokens[].repository key (repositroy) must fail schema validation — additionalProperties:false on the svcTokens item schema, mirroring the top-level strict-schema typo fixture
 EOF
 }
 
@@ -159,7 +208,7 @@ while IFS='|' read -r fixture pattern expected_count label; do
     # assertions on the same fixture).
     rendered_var="rendered_$(echo "${fixture}" | tr '.-' '__')"
     if [[ -z "${!rendered_var:-}" ]]; then
-        if ! rendered=$(helm template hort-server "${chart_dir}" -f "${fixture_path}" 2>&1); then
+        if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" 2>&1); then
             echo "FAIL: helm template failed for ${fixture}:" >&2
             echo "${rendered}" | sed 's/^/    /' >&2
             failed=$((failed + 1))
@@ -183,6 +232,41 @@ while IFS='|' read -r fixture pattern expected_count label; do
     fi
 done < <(expectations)
 
+# Process scoped expectations (see scoped_expectations() above) — each
+# row renders only the named template via `--show-only` and asserts a
+# pattern's match count within that template alone.
+while IFS='|' read -r fixture tmpl pattern expected_count label; do
+    [[ -z "${fixture}" ]] && continue
+    fixture_path="${chart_dir}/${fixture}"
+
+    if [[ ! -f "${fixture_path}" ]]; then
+        echo "FAIL: fixture missing: ${fixture}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
+        echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
+        echo "${rendered}" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+        checked_fixtures+=("${fixture}")
+        continue
+    fi
+    checked_fixtures+=("${fixture}")
+
+    actual_count=$(printf '%s\n' "${rendered}" | grep -cE "${pattern}" || true)
+
+    if [[ "${actual_count}" -ne "${expected_count}" ]]; then
+        echo "FAIL: ${fixture} (${tmpl}) → ${label}" >&2
+        echo "    pattern: ${pattern}" >&2
+        echo "    expected: ${expected_count} match(es)" >&2
+        echo "    actual:   ${actual_count} match(es)" >&2
+        failed=$((failed + 1))
+    else
+        echo "PASS: ${fixture} (${tmpl}) → ${label} (${actual_count} match(es))"
+    fi
+done < <(scoped_expectations)
+
 # Process render-failure expectations — fixtures that MUST fail to
 # render (typically because they exercise an install-block schema
 # rule). For each row, run `helm template` and assert it returns
@@ -197,7 +281,7 @@ while IFS='|' read -r fixture pattern label; do
         continue
     fi
 
-    if rendered_ok=$(helm template hort-server "${chart_dir}" -f "${fixture_path}" 2>&1); then
+    if rendered_ok=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" 2>&1); then
         echo "FAIL: ${fixture} → ${label}" >&2
         echo "    expected helm template to FAIL (install-block) but it rendered successfully" >&2
         failed=$((failed + 1))
@@ -218,6 +302,56 @@ while IFS='|' read -r fixture pattern label; do
         checked_fixtures+=("${fixture}")
     fi
 done < <(expect_render_failure)
+
+# Every version-bearing byte in these manifests derives from Chart.yaml's
+# `version`/`appVersion` (chart label, app-version label, and the default
+# image tag, which falls back to appVersion when image.tag is unset) — none
+# of it is structural. Golden files pin rendering STRUCTURE, not the release
+# number in flight when they were captured, so both sides of the diff go
+# through this same substitution before comparing. Every other byte stays
+# pinned verbatim.
+normalize_chart_version() {
+    sed -E \
+        -e 's/(helm\.sh\/chart: hort-server-)[0-9][^ ]*/\1VERSION/' \
+        -e 's/(app\.kubernetes\.io\/version: ")[^"]*/\1VERSION/' \
+        -e 's#(image: "[^"]*/hort-server:)[^"]*#\1VERSION#'
+}
+
+# Process golden-file byte-equivalence checks (see golden_checks() above).
+while IFS='|' read -r fixture tmpl golden label; do
+    [[ -z "${fixture}" ]] && continue
+    fixture_path="${chart_dir}/${fixture}"
+    golden_path="${chart_dir}/${golden}"
+
+    if [[ ! -f "${fixture_path}" ]]; then
+        echo "FAIL: golden-check fixture missing: ${fixture}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+    if [[ ! -f "${golden_path}" ]]; then
+        echo "FAIL: golden-check golden file missing: ${golden}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
+        echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
+        echo "${rendered}" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if diff_out=$(diff -u --label "${golden}" --label "rendered:${tmpl}" \
+        <(normalize_chart_version <"${golden_path}") \
+        <(printf '%s\n' "${rendered}" | normalize_chart_version)); then
+        echo "PASS: ${fixture} → ${label}"
+    else
+        echo "FAIL: ${fixture} → ${label}" >&2
+        echo "    rendered ${tmpl} does not byte-match ${golden}:" >&2
+        printf '%s\n' "${diff_out}" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+    fi
+done < <(golden_checks)
 
 # Catch fixtures that have no expectations row — silently rendering
 # without any assertion is a regression magnet (someone adds a fixture,
