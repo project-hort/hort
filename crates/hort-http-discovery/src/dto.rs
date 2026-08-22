@@ -11,9 +11,11 @@
 //! types with `Serialize` only; no DTO wrapper is needed for the response
 //! side.
 
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 use hort_domain::entities::discovery::PrefetchRequestItem;
+use hort_domain::ports::jobs_repository::JobRow;
 
 /// JSON envelope for `POST /api/v1/repositories/{repo_key}/prefetch`.
 ///
@@ -48,6 +50,46 @@ impl From<PrefetchRequestItemDto> for PrefetchRequestItem {
         Self {
             package: value.package,
             version: value.version,
+        }
+    }
+}
+
+/// Response envelope for
+/// `GET /api/v1/repositories/{repo_key}/prefetch/jobs/{job_id}`.
+///
+/// Built from the [`JobRow`]
+/// [`hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase::get_prefetch_job_outcome`]
+/// resolves and repo/kind-scopes — that use case owns the authz and
+/// cross-repo-isolation contract. Deliberately narrower than the
+/// admin-tasks `JobRowDto` (no `id`, `params`, `actor_id`, `priority`,
+/// `trigger_source`, `updated_at`): this is an operator-facing outcome
+/// projection for one specific job, not the full admin row.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrefetchJobOutcomeDto {
+    /// Wire shape from [`hort_domain::ports::jobs_repository::JobStatus::as_str`]
+    /// (`"pending"` / `"running"` / `"completed"` / `"failed"`).
+    pub status: String,
+    pub attempts: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_summary: Option<serde_json::Value>,
+    pub kind: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+}
+
+impl From<JobRow> for PrefetchJobOutcomeDto {
+    fn from(row: JobRow) -> Self {
+        Self {
+            status: row.status.as_str().to_string(),
+            attempts: row.attempts,
+            last_error: row.last_error,
+            result_summary: row.result_summary,
+            kind: row.kind,
+            created_at: row.created_at,
+            completed_at: row.completed_at,
         }
     }
 }
