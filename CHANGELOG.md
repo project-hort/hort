@@ -38,6 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   un-rejects the scan-rejected population while preserving the
   remaining observation window. An unknown value is an apply-time
   rejection naming the field and both valid values. (#191)
+- **`GET /api/v1/repositories/{repo_key}/prefetch/jobs/{job_id}`** — a
+  read-only, id-addressed lookup of a self-service prefetch job's outcome
+  (`status`, `attempts`, `last_error`, `result_summary`, `kind`,
+  `created_at`, `completed_at`). Authz is identical to the
+  `POST .../prefetch` that minted the id (`CliSession` or `ServiceAccount`
+  token, `Permission::Read ∧ Permission::Prefetch` on the repository); a
+  job that exists but belongs to a different repository, or is not a
+  `prefetch` / `prefetch-dependencies` job, 404s indistinguishably from an
+  unknown id — no cross-repo enumeration by id-probing. No list/filter/retry
+  surface. (#158)
 
 ### Changed
 

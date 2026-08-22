@@ -16,6 +16,7 @@
 //! - `GET  /api/v1/repositories`
 //! - `GET  /api/v1/repositories/:repo_key/discovery/versions/:package_name`
 //! - `POST /api/v1/repositories/:repo_key/prefetch`
+//! - `GET  /api/v1/repositories/:repo_key/prefetch/jobs/:job_id`
 //!
 //! **Auth posture** — none of these routes appear in
 //! `hort_http_core::router::is_anonymous_path`. The global router's
@@ -24,13 +25,17 @@
 //! exactly the read-endpoint pattern (ADR 0013): handlers receive `None`
 //! for unauthenticated callers and enforce visibility themselves via the
 //! use-case layer. `GET /repositories` has no token-kind restriction. The
-//! other two routes additionally apply a token-kind gate inside their use
+//! other three routes additionally apply a token-kind gate inside their use
 //! cases — NOT identical between them (issue #80): discovery-versions
-//! requires `TokenKind::CliSession` alone (PATs rejected); prefetch
-//! accepts `CliSession` **or** a `ServiceAccount` token whose resolved
-//! grants include `Permission::Read ∧ Permission::Prefetch` on the target
+//! requires `TokenKind::CliSession` alone (PATs rejected); prefetch (both
+//! the POST that mints a job id and the GET that reads its outcome) accepts
+//! `CliSession` **or** a `ServiceAccount` token whose resolved grants
+//! include `Permission::Read ∧ Permission::Prefetch` on the target
 //! repository (see `hort_app::use_cases::self_service_prefetch_use_case`'s
-//! module docs and `docs/ci/hort-quarantine-integration.md` for why).
+//! module docs and `docs/ci/hort-quarantine-integration.md` for why). The
+//! job-outcome GET applies the EXACT same token-kind + RBAC gate as the
+//! POST that minted the id — symmetry is load-bearing (ADR 0013's
+//! token-kind contract).
 
 use std::sync::Arc;
 
@@ -42,6 +47,7 @@ use hort_http_core::context::AppContext;
 use crate::handlers::list_repositories::list_repositories;
 use crate::handlers::list_versions::list_versions;
 use crate::handlers::prefetch::prefetch;
+use crate::handlers::prefetch_job::get_prefetch_job;
 
 /// Build the discovery + self-service prefetch route subtree.
 ///
@@ -57,4 +63,8 @@ pub fn routes() -> Router<Arc<AppContext>> {
             get(list_versions),
         )
         .route("/repositories/{repo_key}/prefetch", post(prefetch))
+        .route(
+            "/repositories/{repo_key}/prefetch/jobs/{job_id}",
+            get(get_prefetch_job),
+        )
 }
