@@ -255,7 +255,10 @@ pub(crate) async fn try_upstream_file_pull(
     // tarball-pull's own (uncached at this layer) leg; the simple-index
     // serve/cache path owns the simple-index mirror.
     let json_dedup_key = DedupKey::metadata("pypi", repo.id, &metadata_path);
-    let json_proxy = ctx.upstream_proxy.clone();
+    let json_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let json_mapping = mapping.clone();
     let json_path_for_closure = metadata_path.clone();
     let json_cap = ctx.upstream_projector_version_object_max_bytes;
@@ -401,7 +404,10 @@ pub(crate) async fn try_upstream_file_pull(
     // into `VerifiedIngestRequest` so `ingest_inner` can gate the
     // publish-anchored quarantine resolution on it.
     let blob_trust_publish_time = mapping.trust_upstream_publish_time;
-    let blob_proxy = ctx.upstream_proxy.clone();
+    let blob_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let blob_mapping = mapping.clone();
     let blob_absolute_url = absolute_url;
     let blob_ingest = ctx.ingest_use_case.clone();

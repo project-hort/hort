@@ -25,11 +25,13 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::Stream;
 
+use crate::entities::repository::RepositoryFormat;
 use crate::error::{DomainError, DomainResult};
 use crate::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping;
 
@@ -368,14 +370,14 @@ impl MetadataProjector for IdentityProjector {
 /// spec-bounded and never grow per-value-object large.
 pub struct CountingReader<R> {
     inner: R,
-    bytes_consumed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    bytes_consumed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<R> CountingReader<R> {
     pub fn new(inner: R) -> Self {
         Self {
             inner,
-            bytes_consumed: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bytes_consumed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -391,8 +393,8 @@ impl<R> CountingReader<R> {
     /// projectors that consume the reader (handing ownership to
     /// `serde_json::Deserializer::from_reader`) but still need to
     /// sample the count from inside a `Visitor::visit_map` loop.
-    pub fn counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
-        std::sync::Arc::clone(&self.bytes_consumed)
+    pub fn counter(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.bytes_consumed)
     }
 }
 
@@ -402,6 +404,105 @@ impl<R: std::io::Read> std::io::Read for CountingReader<R> {
         self.bytes_consumed
             .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         Ok(n)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-format selector
+// ---------------------------------------------------------------------------
+
+/// The formats whose inbound read path (on-miss pull-through) fetches
+/// through an [`UpstreamProxy`], one entry per inbound-HTTP format crate
+/// that owns such a path.
+///
+/// This is the exhaustive key set of [`UpstreamProxyByFormat`]: the
+/// composition root must supply an instance for every entry, and only
+/// these keys are ever looked up (each inbound crate passes its own
+/// compile-time constant). The OCI-family aliases (`Docker`, `Podman`,
+/// `Oras`, `WasmOci`, `HelmOci`, …) are all served by the one OCI
+/// handler, so they share the [`RepositoryFormat::Oci`] instance rather
+/// than getting keys of their own — the emitted `format` metric label is
+/// the *served protocol*, whose value set `docs/metrics-catalog.md` pins
+/// closed at `{oci, npm, pypi, maven, cargo}` for the server read path.
+pub const READ_PATH_PROXY_FORMATS: [RepositoryFormat; 5] = [
+    RepositoryFormat::Oci,
+    RepositoryFormat::Npm,
+    RepositoryFormat::Pypi,
+    RepositoryFormat::Maven,
+    RepositoryFormat::Cargo,
+];
+
+/// One [`UpstreamProxy`] instance per served read-path format.
+///
+/// # Why per-format instances
+///
+/// The adapter takes its `format` metric label at construction time, so a
+/// single shared instance attributes **every** format's upstream fetch to
+/// one label. That is not merely cosmetic: `hort_upstream_insecure_total`
+/// is a security signal, and an operator triaging "which upstream is
+/// plaintext?" needs the emitting format to be the real one. This
+/// registry is what lets each inbound crate reach the instance carrying
+/// its own label.
+///
+/// # No fallback, by construction
+///
+/// [`Self::new`] rejects a map that is missing any
+/// [`READ_PATH_PROXY_FORMATS`] entry, so an incomplete composition fails
+/// at boot rather than at the first request. [`Self::for_format`]
+/// deliberately has **no** default arm — a fallback instance is exactly
+/// the mis-attribution this type exists to remove.
+#[derive(Clone)]
+pub struct UpstreamProxyByFormat(
+    std::collections::HashMap<RepositoryFormat, Arc<dyn UpstreamProxy>>,
+);
+
+impl UpstreamProxyByFormat {
+    /// Build the registry from `(format, proxy)` pairs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any [`READ_PATH_PROXY_FORMATS`] entry is absent. A
+    /// missing served format is a composition bug — the registry is
+    /// assembled once at boot from a compile-time list, so failing loudly
+    /// there is strictly better than a per-request surprise.
+    pub fn new(
+        entries: impl IntoIterator<Item = (RepositoryFormat, Arc<dyn UpstreamProxy>)>,
+    ) -> Self {
+        let map: std::collections::HashMap<_, _> = entries.into_iter().collect();
+        for format in READ_PATH_PROXY_FORMATS {
+            assert!(
+                map.contains_key(&format),
+                "upstream-proxy registry is missing the served read-path format {format}; \
+                 every format in READ_PATH_PROXY_FORMATS must be wired at composition"
+            );
+        }
+        Self(map)
+    }
+
+    /// Build a registry that maps every served format to the SAME
+    /// instance. Test-harness shape only (`build_mock_ctx` seeds one mock
+    /// proxy and every format's handler tests read it back) — production
+    /// composition uses [`Self::new`] with one per-format instance each
+    /// carrying its own `format` metric label.
+    pub fn uniform(proxy: &Arc<dyn UpstreamProxy>) -> Self {
+        Self::new(READ_PATH_PROXY_FORMATS.map(|format| (format, Arc::clone(proxy))))
+    }
+
+    /// The proxy instance for `format`.
+    ///
+    /// # Panics
+    ///
+    /// Panics for a format outside [`READ_PATH_PROXY_FORMATS`]. Every
+    /// call site passes its own crate-level constant drawn from that
+    /// list, so this is unreachable short of a new inbound read path
+    /// landing without a matching registry entry.
+    pub fn for_format(&self, format: &RepositoryFormat) -> &Arc<dyn UpstreamProxy> {
+        self.0.get(format).unwrap_or_else(|| {
+            panic!(
+                "no upstream proxy wired for format {format}; it is not a served \
+                 read-path format (see READ_PATH_PROXY_FORMATS)"
+            )
+        })
     }
 }
 
@@ -556,5 +657,138 @@ mod tests {
             .await
             .expect("override fetch_referrers");
         assert_eq!(out, seeded);
+    }
+
+    // -- UpstreamProxyByFormat -----------------------------------------
+
+    /// A distinct instance per format so `for_format` can be proved to
+    /// hand back the RIGHT one, not merely *an* one. The tag is what the
+    /// production type carries as its `format` metric label.
+    #[derive(Debug)]
+    struct TaggedProxy(String);
+
+    impl UpstreamProxy for TaggedProxy {
+        fn fetch_blob(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _upstream_name: String,
+            _digest: String,
+        ) -> BoxFuture<'_, DomainResult<BlobFetch>> {
+            unreachable!("not exercised")
+        }
+        fn fetch_manifest(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _upstream_name: String,
+            _reference: String,
+            _accept: Vec<String>,
+        ) -> BoxFuture<'_, DomainResult<ManifestFetchOutcome>> {
+            unreachable!("not exercised")
+        }
+        fn fetch_artifact(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _path: String,
+        ) -> BoxFuture<'_, DomainResult<ArtifactFetch>> {
+            unreachable!("not exercised")
+        }
+        fn fetch_metadata(
+            &self,
+            _mapping: RepositoryUpstreamMapping,
+            _path: String,
+            _accept: Vec<String>,
+        ) -> BoxFuture<'_, DomainResult<MetadataFetchOutcome>> {
+            unreachable!("not exercised")
+        }
+    }
+
+    /// The registry plus the typed handles it was built from, so a test
+    /// can assert identity (`Arc::ptr_eq`) rather than "some instance".
+    fn tagged_registry() -> (
+        UpstreamProxyByFormat,
+        Vec<(RepositoryFormat, Arc<TaggedProxy>)>,
+    ) {
+        let handles: Vec<(RepositoryFormat, Arc<TaggedProxy>)> = READ_PATH_PROXY_FORMATS
+            .into_iter()
+            .map(|format| {
+                let tag = Arc::new(TaggedProxy(format.to_string()));
+                (format, tag)
+            })
+            .collect();
+        let registry =
+            UpstreamProxyByFormat::new(handles.iter().map(|(format, proxy)| {
+                (format.clone(), Arc::clone(proxy) as Arc<dyn UpstreamProxy>)
+            }));
+        (registry, handles)
+    }
+
+    /// Every served read-path format resolves to ITS OWN instance —
+    /// the defect this type closes was one instance answering for all
+    /// five.
+    #[test]
+    fn for_format_returns_the_instance_registered_for_that_format() {
+        let (registry, handles) = tagged_registry();
+        for (format, handle) in handles {
+            assert_eq!(handle.0, format.to_string(), "handle tag sanity");
+            let expected: Arc<dyn UpstreamProxy> = handle.clone();
+            assert!(
+                Arc::ptr_eq(registry.for_format(&format), &expected),
+                "for_format({format}) handed back the wrong instance"
+            );
+        }
+    }
+
+    /// `uniform` is the test-harness shape: one instance answering for
+    /// every served format, and the full key set still present.
+    #[test]
+    fn uniform_maps_every_served_format_to_the_same_instance() {
+        let shared: Arc<dyn UpstreamProxy> = Arc::new(TaggedProxy("shared".to_string()));
+        let registry = UpstreamProxyByFormat::uniform(&shared);
+        for format in READ_PATH_PROXY_FORMATS {
+            assert!(
+                Arc::ptr_eq(registry.for_format(&format), &shared),
+                "uniform() must hand the same instance back for {format}"
+            );
+        }
+    }
+
+    /// A composition that forgets a served format fails at construction,
+    /// not on the first request through the missing format.
+    #[test]
+    #[should_panic(expected = "missing the served read-path format cargo")]
+    fn new_rejects_a_registry_missing_a_served_format() {
+        let entries: Vec<(RepositoryFormat, Arc<dyn UpstreamProxy>)> = READ_PATH_PROXY_FORMATS
+            .into_iter()
+            .filter(|f| *f != RepositoryFormat::Cargo)
+            .map(|f| {
+                let proxy: Arc<dyn UpstreamProxy> = Arc::new(TaggedProxy(f.to_string()));
+                (f, proxy)
+            })
+            .collect();
+        let _ = UpstreamProxyByFormat::new(entries);
+    }
+
+    /// A format outside the served set has no entry and no fallback —
+    /// the silent "everything is oci" attribution is gone for good.
+    #[test]
+    #[should_panic(expected = "no upstream proxy wired for format helm")]
+    fn for_format_has_no_fallback_for_an_unserved_format() {
+        let (registry, _handles) = tagged_registry();
+        let _ = registry.for_format(&RepositoryFormat::Helm);
+    }
+
+    /// The registry is `Clone` (composition hands it to `AppContext` and
+    /// to the upstream-metadata adapter), and the clone shares the same
+    /// per-format instances rather than rebuilding them.
+    #[test]
+    fn clone_shares_the_same_per_format_instances() {
+        let (registry, _handles) = tagged_registry();
+        let cloned = registry.clone();
+        for format in READ_PATH_PROXY_FORMATS {
+            assert!(Arc::ptr_eq(
+                registry.for_format(&format),
+                cloned.for_format(&format),
+            ));
+        }
     }
 }

@@ -1018,7 +1018,10 @@ async fn prefetch_pypi_version(
     let normalized = PyPiFormatHandler.normalize_name(project_name);
     let metadata_path = format!("/pypi/{normalized}/{version}/json");
     let dedup_key = DedupKey::metadata("pypi", repo.id, &metadata_path);
-    let upstream_proxy = ctx.upstream_proxy.clone();
+    let upstream_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let mapping_for_closure = mapping.clone();
     let path_for_closure = metadata_path.clone();
     let cap = ctx.upstream_projector_version_object_max_bytes;
@@ -1311,7 +1314,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1365,7 +1370,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1414,7 +1421,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1461,7 +1470,9 @@ mod tests {
             let err = fetch_raw_with_cache(
                 ctx.upstream_resolver.as_ref(),
                 ctx.ephemeral_evictable.as_ref(),
-                ctx.upstream_proxy.as_ref(),
+                ctx.upstream_proxy
+                    .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                    .as_ref(),
                 ctx.pull_dedup.as_ref(),
                 Some(ctx.metadata_mirror.as_ref()),
                 cap(),
@@ -1497,7 +1508,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1526,7 +1539,9 @@ mod tests {
         let err = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1572,7 +1587,9 @@ mod tests {
         let err = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             4 * 1024, // small per-value cap so the padded file object trips it
@@ -1611,7 +1628,9 @@ mod tests {
         let err = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1658,7 +1677,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1715,7 +1736,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1758,7 +1781,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1820,7 +1845,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),

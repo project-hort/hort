@@ -25,6 +25,18 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_http_core::context::AppContext;
 use hort_http_core::limits::BoundedPath;
 
+use hort_domain::entities::repository::RepositoryFormat;
+
+/// The one format this crate's read path serves — the key into
+/// `AppContext.upstream_proxy` ([`hort_domain::ports::upstream_proxy::UpstreamProxyByFormat`]).
+///
+/// Every on-miss upstream fetch from this crate goes through the proxy
+/// instance registered under this key, which is what puts the correct
+/// `format` label on `hort_upstream_fetch_total`,
+/// `hort_upstream_fetch_duration_seconds` and — security-relevant —
+/// `hort_upstream_insecure_total`.
+pub(crate) const UPSTREAM_PROXY_FORMAT: RepositoryFormat = RepositoryFormat::Oci;
+
 pub mod blobs;
 pub mod catalog;
 pub mod config;
@@ -611,6 +623,27 @@ mod tests {
     //! and legacy global catalog. Handler-internal behaviour (link
     //! formatting, query parsing) is covered in the respective submodule
     //! tests; these drive the full dispatcher.
+
+    /// Tripwire: the crate-level `UPSTREAM_PROXY_FORMAT` decides which
+    /// per-format upstream-proxy instance every on-miss fetch from this
+    /// crate goes through, and therefore the `format` label on
+    /// `hort_upstream_fetch_*` and `hort_upstream_insecure_total`. The
+    /// mock context maps every served format to one proxy, so a wrong
+    /// constant here is invisible to the handler tests — this assertion
+    /// is what catches it.
+    #[test]
+    fn upstream_proxy_format_is_this_crates_served_format() {
+        assert_eq!(
+            UPSTREAM_PROXY_FORMAT,
+            hort_domain::entities::repository::RepositoryFormat::Oci
+        );
+        assert_eq!(UPSTREAM_PROXY_FORMAT.to_string(), "oci");
+        assert!(
+            hort_domain::ports::upstream_proxy::READ_PATH_PROXY_FORMATS
+                .contains(&UPSTREAM_PROXY_FORMAT),
+            "composition only builds instances for READ_PATH_PROXY_FORMATS"
+        );
+    }
 
     use super::*;
 

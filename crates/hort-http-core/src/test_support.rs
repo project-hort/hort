@@ -103,6 +103,7 @@ use hort_domain::ports::scanner_registry_repository::{
 };
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::subscription_repository::SubscriptionRepository;
+use hort_domain::ports::upstream_proxy::{UpstreamProxy, UpstreamProxyByFormat};
 use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{Page, PageRequest};
@@ -1084,6 +1085,7 @@ pub fn build_mock_ctx_with_label_flag(
     let repository_upstream_mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
     let upstream_resolver = Arc::new(MockUpstreamResolver::new());
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
+    let upstream_proxy_port: Arc<dyn UpstreamProxy> = upstream_proxy.clone();
 
     // Two distinct in-memory `EphemeralStore`
     // instances behind the production metrics wrapper, one per class
@@ -1395,7 +1397,10 @@ pub fn build_mock_ctx_with_label_flag(
         content_references: content_references.clone(),
         repository_upstream_mappings: repository_upstream_mappings.clone(),
         upstream_resolver: upstream_resolver.clone(),
-        upstream_proxy: upstream_proxy.clone(),
+        // Every served read-path format resolves to the SAME mock, so
+        // a per-format handler test seeds `mocks.upstream_proxy` once
+        // and reads it back through its crate's own format key.
+        upstream_proxy: UpstreamProxyByFormat::uniform(&upstream_proxy_port),
         policy_projections: policy_projections.clone(),
         curation_rules: curation_rules.clone(),
         metrics_handle: handle,

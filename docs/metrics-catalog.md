@@ -2235,19 +2235,40 @@ and error alike, so `errors_total` was a misnomer and the reserved
 alias became the canonical name.)
 
 `format` is taken at adapter construction time
-(`HttpUpstreamProxyConfig::format_label`) — the OCI composition
-root passes `"oci"`; future format consumers (Maven, npm proxy,
-…) construct their own instance with their own format string.
+(`HttpUpstreamProxyConfig::format_label`), so the **server read path
+builds one instance per served format** — `oci`, `npm`, `pypi`,
+`maven`, `cargo` — and each inbound format crate selects its own via
+`AppContext.upstream_proxy` (`UpstreamProxyByFormat::for_format`,
+keyed by the crate-level `UPSTREAM_PROXY_FORMAT` constant). The five
+instances share a single `reqwest::Client` (one connection pool);
+only the `format_label` differs. `format` on `hort_upstream_fetch_*`
+and `hort_upstream_insecure_total` is therefore the format that
+actually fetched. No new label *values*: the closed set below is
+unchanged — what changed is that the server read path now emits the
+correct member of it rather than always `oci`. There is deliberately
+no `HttpUpstreamProxyConfig::default()`: `format_label` has no
+defensible default, and the one it used to carry (`"oci"`) is exactly
+how every non-OCI server-side fetch came to be mis-attributed.
+
+A lookup for a format outside the served set panics rather than
+falling back — `UpstreamProxyByFormat::new` asserts at composition
+that every `READ_PATH_PROXY_FORMATS` entry is wired, so an
+incomplete composition fails at boot. A silent fallback instance is
+the defect, not the remedy.
+
 The worker builds two **subsystem-labelled** instances that fetch
 through the same adapter but are not a single artifact format:
 `prefetch_tick` (the scheduled prefetch tick / leaf-pull, which
 walks npm/cargo/pypi) and `provenance` (the upstream
 Sigstore-referrer fetch in the `provenance-verify` job). These are
 intentional non-format `format` values so dashboards separate
-background traffic from the OCI hot path; cloning one subsystem's
-proxy for another would mis-attribute its `hort_upstream_fetch_*`
-series (provenance traffic once emitted `format="prefetch_tick"`
-exactly this way).
+background traffic from the server hot path, and they are **not**
+converted to per-artifact-format labels: the prefetch tick walks
+npm/cargo/pypi within one job, so a per-format split there would
+name the artifact rather than the subsystem doing the work. Cloning
+one subsystem's proxy for another would mis-attribute its
+`hort_upstream_fetch_*` series (provenance traffic once emitted
+`format="prefetch_tick"` exactly this way).
 The `upstream` label is the mapping's `path_prefix` with a
 trailing slash trimmed (`"dockerhub/"` → `"dockerhub"`); empty
 prefixes (single-upstream catch-all) emit the `_default` sentinel.
@@ -2308,7 +2329,12 @@ upstream at apply time. Two `reason` values, fixed taxonomy owned by
 
 `format` is the same value the per-instance
 `HttpUpstreamProxyConfig::format_label` carries on
-`hort_upstream_fetch_total` (`oci`, `pypi`, `npm`, `cargo`, …).
+`hort_upstream_fetch_total` (`oci`, `pypi`, `npm`, `cargo`, …) — and
+since the server read path builds one instance per served format, it
+names the format that actually fetched through the plaintext
+upstream. That is load-bearing here specifically: this counter is the
+signal an operator triages to answer "which upstream is plaintext?",
+and a shared label answered "oci" for an insecure npm mapping.
 Cardinality envelope: 2 reason values × ~5 formats = ≤ 10 series.
 
 `hort_upstream_tls_handshake_total` is emitted by the `UpstreamProxy`

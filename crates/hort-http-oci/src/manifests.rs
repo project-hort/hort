@@ -823,7 +823,10 @@ async fn try_upstream_manifest_pull_by_digest(
     };
 
     let blob_dedup_key = DedupKey::blob_by_hash("sha256", upstream_digest.as_ref());
-    let blob_proxy = ctx.upstream_proxy.clone();
+    let blob_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let blob_ingest = ctx.ingest_use_case.clone();
     let blob_mapping = mapping.clone();
     let blob_upstream_name = upstream_name.clone();
@@ -1069,7 +1072,10 @@ async fn try_upstream_manifest_pull_by_tag(
     // first `Accept` type omitted the manifest's real media type).
     let manifest_path = format!("/v2/{name}/manifests/{tag}");
     let meta_dedup_key = DedupKey::metadata("oci", repo.id, &manifest_path);
-    let meta_proxy = ctx.upstream_proxy.clone();
+    let meta_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let meta_ingest = ctx.ingest_use_case.clone();
     let meta_ref_use_case = ctx.ref_use_case.clone();
     let meta_mapping = mapping.clone();

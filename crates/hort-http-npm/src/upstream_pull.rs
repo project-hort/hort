@@ -196,7 +196,9 @@ pub(crate) async fn try_upstream_tarball_pull(
     let projection = match fetch_raw_with_cache(
         ctx.upstream_resolver.as_ref(),
         ctx.ephemeral_evictable.as_ref(),
-        ctx.upstream_proxy.as_ref(),
+        ctx.upstream_proxy
+            .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+            .as_ref(),
         ctx.pull_dedup.as_ref(),
         Some(ctx.metadata_mirror.as_ref()),
         ctx.upstream_projector_version_object_max_bytes,
@@ -428,7 +430,10 @@ pub(crate) async fn try_upstream_tarball_pull(
     // so `ingest_inner` can gate the publish-anchored quarantine
     // resolution on it.
     let blob_trust_publish_time = mapping.trust_upstream_publish_time;
-    let blob_proxy = ctx.upstream_proxy.clone();
+    let blob_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let blob_mapping = mapping.clone();
     let blob_tarball_url = tarball_url;
     let blob_ingest = ctx.ingest_use_case.clone();
@@ -1414,7 +1419,9 @@ mod tests {
         let _served = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             ctx.upstream_projector_version_object_max_bytes,

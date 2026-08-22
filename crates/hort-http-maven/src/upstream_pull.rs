@@ -181,7 +181,10 @@ pub(crate) async fn try_upstream_maven_pull(
     //    so different repos pointing at the same upstream share one window.
     let dedup_alg = algorithm_token(algorithm);
     let blob_dedup_key = DedupKey::blob_by_hash(dedup_alg, upstream_checksum.hex());
-    let blob_proxy = ctx.upstream_proxy.clone();
+    let blob_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let blob_mapping = mapping.clone();
     let blob_path = artifact_path.to_string();
     let blob_ingest = ctx.ingest_use_case.clone();
@@ -427,7 +430,10 @@ async fn fetch_sidecar_body(
     sidecar_path: &str,
 ) -> Result<String, SidecarFetchError> {
     let dedup_key = DedupKey::metadata("maven", repo.id, sidecar_path);
-    let proxy = ctx.upstream_proxy.clone();
+    let proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let mapping = mapping.clone();
     let path = sidecar_path.to_string();
     let bytes = ctx

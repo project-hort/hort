@@ -707,13 +707,12 @@ pub async fn build_app_context(
             // never reaches the adapter (the adapter sees raw
             // mappings) — operators correlate cardinality at the
             // repo level via separate `hort_prefetch_*` metrics.
-            format_label: "prefetch_tick".to_string(),
             extra_trust_anchors: extra_ca.cloned(),
             // Same upstream User-Agent as hort-server (HORT_UPSTREAM_USER_AGENT
             // or the built-in default) — worker prefetch + provenance fetches
             // carry the identical UA so a custom value applies uniformly.
             user_agent: hort_adapters_upstream_http::user_agent_from_env(),
-            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::default()
+            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("prefetch_tick")
         };
         Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
             cfg_for_proxy,
@@ -788,13 +787,12 @@ pub async fn build_app_context(
     // instance keeps the two distinguishable on dashboards.
     let upstream_proxy_for_provenance: Arc<dyn UpstreamProxy> = {
         let cfg = hort_adapters_upstream_http::HttpUpstreamProxyConfig {
-            format_label: "provenance".to_string(),
             extra_trust_anchors: extra_ca.cloned(),
             // Same upstream User-Agent as hort-server (HORT_UPSTREAM_USER_AGENT
             // or the built-in default) — worker prefetch + provenance fetches
             // carry the identical UA so a custom value applies uniformly.
             user_agent: hort_adapters_upstream_http::user_agent_from_env(),
-            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::default()
+            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("provenance")
         };
         Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
             cfg,

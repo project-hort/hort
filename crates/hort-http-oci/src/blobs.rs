@@ -817,7 +817,10 @@ pub(crate) async fn try_upstream_blob_pull(
     // surface a wrapped `AppError::External` — typed-error
     // discrimination is a leader-only concern by design.
     let blob_dedup_key = DedupKey::blob_by_hash("sha256", hash.as_ref());
-    let blob_proxy = ctx.upstream_proxy.clone();
+    let blob_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let blob_ingest = ctx.ingest_use_case.clone();
     let blob_mapping = mapping.clone();
     let blob_upstream_name = upstream_name.clone();
