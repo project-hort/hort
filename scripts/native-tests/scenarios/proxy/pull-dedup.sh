@@ -49,7 +49,7 @@
 #   Δ hort_pull_dedup_total{format="npm", outcome="leader_started"}      = 2
 #   Δ hort_pull_dedup_total{format="_any",outcome="leader_started"}      = 1
 #   Δ hort_pull_dedup_total{format="_any",outcome="follower_waited_hit"} ≥ 1
-#   Δ hort_upstream_fetch_total{result="success"} (all formats)          = 3
+#   Δ hort_upstream_fetch_total{format="npm",result="success"}           = 3
 #
 # WHAT A NO-COALESCING BUILD WOULD PRODUCE. If leg 2's tarball stopped
 # taking the fast path — the terminal record not written, not read, or the
@@ -57,7 +57,7 @@
 # fetch the tarball itself:
 #   follower_waited_hit{_any} 0  (assertion demands ≥ 1  -> FAIL)
 #   leader_started{_any}      2  (assertion demands = 1  -> FAIL)
-#   upstream_fetch{result=success} (all formats) 4  (assertion demands = 3  -> FAIL)
+#   upstream_fetch{format=npm,result=success} 4  (assertion demands = 3  -> FAIL)
 # and, independently of any counter, the follower repo's row would carry a
 # `ChecksumVerified` event (it only fires when bytes are actually fetched
 # and re-hashed) — which the event assertions below demand is ABSENT.
@@ -287,11 +287,11 @@ metric_sum() {
 }
 
 dedup_total() { metric_sum hort_pull_dedup_total "$@"; }
-# The server builds one pull-through proxy with a single fixed `format`
-# label, so every format's upstream fetch is attributed to that one label
-# and a per-format filter would read zero. Filter on `result` only; restore
-# `format="npm"` once the label identifies the format.
-upstream_success() { metric_sum hort_upstream_fetch_total 'result="success"'; }
+# The server builds one pull-through proxy PER SERVED FORMAT, so the
+# `format` label names the format that actually fetched. This scenario
+# drives npm only — filter on it so an unrelated format's background
+# fetch cannot be counted into the delta.
+upstream_success() { metric_sum hort_upstream_fetch_total 'format="npm"' 'result="success"'; }
 
 # Every counter this scenario reasons about, as one string. Used both for
 # the quiesce below and for the before/after snapshots.
@@ -436,7 +436,7 @@ if [ "$METRICS_ARMED" = "1" ]; then
     if [ "$UPSTREAM_DELTA" -eq 3 ]; then
         pass "exactly 3 upstream fetches (2 packuments + 1 tarball) — the tarball was fetched once for both repositories"
     else
-        fail "hort_upstream_fetch_total{result=\"success\"} (all formats) delta = 3" \
+        fail "hort_upstream_fetch_total{format=\"npm\",result=\"success\"} delta = 3" \
             "got ${UPSTREAM_DELTA} — 4 means the follower re-fetched the tarball it should have coalesced onto"
     fi
 else

@@ -114,6 +114,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Server-side upstream-fetch metrics now name the format that actually
+  fetched.** The server built a single pull-through proxy with a
+  hardcoded `format_label: "oci"` and handed it to all five inbound
+  format crates, so every npm / PyPI / Maven / Cargo on-miss fetch
+  reported `format="oci"` on `hort_upstream_fetch_total`,
+  `hort_upstream_fetch_duration_seconds` and — security-relevant —
+  `hort_upstream_insecure_total`, where an operator triaging "which
+  upstream is plaintext?" was pointed at the wrong format. The server
+  now builds one proxy instance per served format (`oci`, `npm`, `pypi`,
+  `maven`, `cargo`), all sharing a single `reqwest::Client` and hence a
+  single connection pool, and each inbound crate selects its own via a
+  per-format registry on `AppContext`. There is no fallback instance: an
+  incomplete composition fails at boot. No new label values — the closed
+  set is unchanged; what changed is that the correct member of it is
+  emitted. The worker's two deliberately subsystem-labelled instances
+  (`prefetch_tick`, `provenance`) are untouched. `HttpUpstreamProxyConfig`
+  lost its `Default` impl so an omitted `format_label` can no longer
+  inherit `"oci"` silently. (#170)
+
 - **Hosted cargo index entries now carry the crate's real dependencies
   and features.** Every hosted entry was synthesized with `deps: []` and
   `features: {}` because the publish handler kept only `name`/`vers` from

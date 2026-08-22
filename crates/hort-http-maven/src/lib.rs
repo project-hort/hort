@@ -76,6 +76,16 @@ pub(crate) mod upstream_pull;
 
 use serve::MetadataLevel;
 
+/// The one format this crate's read path serves — the key into
+/// `AppContext.upstream_proxy` ([`hort_domain::ports::upstream_proxy::UpstreamProxyByFormat`]).
+///
+/// Every on-miss upstream fetch from this crate goes through the proxy
+/// instance registered under this key, which is what puts the correct
+/// `format` label on `hort_upstream_fetch_total`,
+/// `hort_upstream_fetch_duration_seconds` and — security-relevant —
+/// `hort_upstream_insecure_total`.
+pub(crate) const UPSTREAM_PROXY_FORMAT: RepositoryFormat = RepositoryFormat::Maven;
+
 /// Build the Maven route tree (GET / HEAD / PUT on a wildcard tail).
 ///
 /// PUT carries the shared publish body limit

@@ -226,7 +226,10 @@ pub(crate) async fn try_upstream_crate_pull(
     // the SERIALIZED projection so followers receive the small projection,
     // not the raw NDJSON body.
     let ndjson_dedup_key = DedupKey::metadata("cargo", repo.id, &ndjson_path);
-    let ndjson_proxy = ctx.upstream_proxy.clone();
+    let ndjson_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let ndjson_mapping = index_mapping.clone();
     let ndjson_path_for_closure = ndjson_path.clone();
     let ndjson_coalesce = ctx
@@ -350,7 +353,10 @@ pub(crate) async fn try_upstream_crate_pull(
     //    (followers never re-attempt; they surface the cached failure to
     //    the client).
     let blob_dedup_key = DedupKey::blob_by_hash("sha256", upstream_checksum.hex());
-    let blob_proxy = ctx.upstream_proxy.clone();
+    let blob_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let blob_mapping = mapping.clone();
     let blob_download_url = download_url;
     let blob_ingest = ctx.ingest_use_case.clone();
@@ -590,7 +596,10 @@ async fn resolve_registry_config(
     // may differ.
     let config_path = "/config.json".to_string();
     let config_dedup_key = DedupKey::metadata("cargo", mapping.repository_id, &config_path);
-    let config_proxy = ctx.upstream_proxy.clone();
+    let config_proxy = ctx
+        .upstream_proxy
+        .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+        .clone();
     let config_mapping = mapping.clone();
     let config_path_for_closure = config_path.clone();
     let body = ctx

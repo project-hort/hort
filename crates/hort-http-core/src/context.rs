@@ -81,7 +81,7 @@ use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstre
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
 use hort_domain::ports::stateful_upload_staging::StatefulUploadStagingPort;
 use hort_domain::ports::storage::StoragePort;
-use hort_domain::ports::upstream_proxy::UpstreamProxy;
+use hort_domain::ports::upstream_proxy::UpstreamProxyByFormat;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 
 /// Authentication context for the router.
@@ -643,14 +643,21 @@ pub struct AppContext {
     /// consumer; future formats with proxy semantics share the same
     /// port.
     pub upstream_resolver: Arc<dyn UpstreamResolver>,
-    /// Pull-through upstream proxy. Streams
-    /// blobs and fetches manifests from configured upstream
-    /// registries. Format-agnostic at this layer; the concrete
-    /// adapter
+    /// Pull-through upstream proxies, one per served read-path format.
+    /// Streams blobs and fetches manifests/metadata from configured
+    /// upstream registries. The concrete adapter
     /// (`hort_adapters_upstream_http::HttpUpstreamProxy`) lives in a
-    /// dedicated crate to keep `reqwest` off `hort-http-oci`'s
+    /// dedicated crate to keep `reqwest` off the format crates'
     /// dependency edge (ADR 0008).
-    pub upstream_proxy: Arc<dyn UpstreamProxy>,
+    ///
+    /// Each inbound format crate serves exactly one format, so it
+    /// selects its instance with its own crate-level constant:
+    /// `ctx.upstream_proxy.for_format(&UPSTREAM_PROXY_FORMAT)`. The
+    /// adapter takes its `format` metric label at construction, so a
+    /// single shared instance would attribute every format's upstream
+    /// fetch — including the `hort_upstream_insecure_total` security
+    /// signal — to one label.
+    pub upstream_proxy: UpstreamProxyByFormat,
     /// Prometheus handle used by `GET /metrics` to render the current
     /// snapshot. Constructed by the caller — `main.rs` installs the
     /// recorder globally via `PrometheusBuilder::install_recorder()`;
@@ -926,7 +933,7 @@ pub struct AppContextParts {
     pub content_references: Arc<dyn ContentReferenceIndex>,
     pub repository_upstream_mappings: Arc<dyn RepositoryUpstreamMappingRepository>,
     pub upstream_resolver: Arc<dyn UpstreamResolver>,
-    pub upstream_proxy: Arc<dyn UpstreamProxy>,
+    pub upstream_proxy: UpstreamProxyByFormat,
     pub policy_projections: Arc<dyn PolicyProjectionRepository>,
     pub curation_rules: Arc<dyn CurationRuleRepository>,
     pub metrics_handle: PrometheusHandle,

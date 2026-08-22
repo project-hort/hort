@@ -15,7 +15,12 @@ use crate::error::DomainError;
 ///
 /// Known formats get their own variant for exhaustive matching. WASM plugin
 /// formats that are not compiled-in land in [`Other`](Self::Other).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Hash` is derived so the format can key a small registry — the
+/// per-format upstream-proxy selector
+/// (`crate::ports::upstream_proxy::UpstreamProxyByFormat`) is the current
+/// consumer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RepositoryFormat {
     Maven,
     Gradle,

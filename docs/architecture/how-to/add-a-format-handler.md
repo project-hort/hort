@@ -233,10 +233,33 @@ let bytes = ctx
     .coalesce_metadata(dedup_key, move || async move {
         // Inside the closure: fetch upstream, verify checksum,
         // ingest via IngestUseCase. Return Bytes.
-        ctx.upstream_proxy.fetch_metadata(/* ... */).await?
+        ctx.upstream_proxy
+            .for_format(&UPSTREAM_PROXY_FORMAT)
+            .fetch_metadata(/* ... */)
+            .await?
     })
     .await?;
 ```
+
+**Register the crate's upstream-proxy format.** `ctx.upstream_proxy` is
+a `UpstreamProxyByFormat` registry, not a single instance: the adapter
+takes its `format` metric label at construction, so the composition root
+builds one instance per served format. A new format crate with a
+pull-through read path therefore needs three things:
+
+1. a crate-level `pub(crate) const UPSTREAM_PROXY_FORMAT:
+   RepositoryFormat` naming the format it serves, used at every
+   `for_format` call site;
+2. an entry in
+   `hort_domain::ports::upstream_proxy::READ_PATH_PROXY_FORMATS`;
+3. the matching `format` label value documented in
+   `docs/metrics-catalog.md`.
+
+`UpstreamProxyByFormat::new` asserts at composition that every
+`READ_PATH_PROXY_FORMATS` entry is wired, so a missed step 2 fails at
+boot; a missed step 1 (looking up a format with no entry) panics rather
+than silently falling back to another format's instance — the fallback
+is the mis-attribution the registry exists to remove.
 
 Build `dedup_key` via `DedupKey::metadata(format, repo_id, url)` or
 `DedupKey::blob_by_url(format, repo_id, url)` (see
