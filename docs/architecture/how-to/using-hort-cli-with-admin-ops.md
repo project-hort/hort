@@ -127,6 +127,88 @@ any worker not seen for 7 days, so the listing shows roughly the last week
 of churn and the table never grows without bound. (The read is also capped
 at the 1000 most-recently-seen workers as a safety bound.)
 
+### Inspect the effective config for a repository
+
+`GET /api/v1/admin/repositories/{key}/effective-config` returns the
+resolved, merged config a running server holds for one repository — the
+repository row, its upstream mapping(s), and the scan policy actually bound
+to it (repo-scoped > global > built-in default), as one projection. This is
+the answer to "what config is this repository *actually* running", which
+the gitops YAML alone cannot show since the YAML is the input to
+resolution, not the resolved result.
+
+```sh
+$ curl -sS -H "Authorization: Bearer $TOKEN" \
+    https://hort.example.com/api/v1/admin/repositories/npm-proxy/effective-config
+```
+
+The response is cross-repository (any admin can read any repository's
+effective config, not only ones they hold a grant on) and **secrets are
+hard omitted**: no `secret_ref`, `mtls_cert_ref`, `mtls_key_ref`, or
+`ca_bundle_ref` field is ever present on an upstream mapping. Credential
+presence is surfaced only as `has_credentials: bool`.
+
+This is a read-only admin endpoint and needs the `admin` claim like the
+other `admin` subcommands. Unknown repository key returns `404`.
+
+### Inspect what this process applied at boot
+
+`GET /api/v1/admin/gitops/apply-status` reports the gitops apply **this
+running process** performed at boot — in-memory only, not persisted. During
+a rolling upgrade, different pods can legitimately report different
+results until the rollout converges; this endpoint answers "what did *this
+process* apply", not "what was last applied cluster-wide".
+
+```sh
+$ curl -sS -H "Authorization: Bearer $TOKEN" \
+    https://hort.example.com/api/v1/admin/gitops/apply-status
+```
+
+```json
+{
+  "status": "applied",
+  "applied_at": "2026-08-23T09:14:02Z",
+  "generation": "3f9a1c...  (64 hex chars)",
+  "created": 1,
+  "updated": 2,
+  "deleted": 3,
+  "unchanged": 4,
+  "retro_warn_count": 5,
+  "retro_block_count": 6,
+  "per_kind": {
+    "repositories": { "created": 0, "updated": 0, "deleted": 0, "unchanged": 0 },
+    "upstream_mappings": { "created": 0, "updated": 0, "deleted": 0, "unchanged": 0 },
+    "claim_mappings": { "created": 0, "updated": 0, "deleted": 0, "unchanged": 0 },
+    "permission_grants": { "created": 0, "updated": 0, "deleted": 0, "unchanged": 0 },
+    "curation_rules": { "created": 0, "updated": 0, "deleted": 0, "unchanged": 0 }
+  }
+}
+```
+
+- `generation` is a 64-hex-character fingerprint of the applied config. Two
+  processes reporting the same `generation` applied the same config;
+  different values mean the config differs between them (e.g. a rollout
+  that has not converged yet). It is a fingerprint, not a counter — it does
+  not order two generations against each other.
+- **`per_kind` covers only the five CRUD kinds** listed above — it does
+  **not** sum to the aggregate `created`/`updated`/`deleted`/`unchanged`
+  counts, which also span event-sourced kinds (scan policies, retention
+  policies, exclusions) and machine-identity kinds (OIDC issuers, service
+  accounts).
+- If no gitops apply has run this boot (e.g. a DSN-only boot, or no gitops
+  config directory configured), the response is exactly
+  `{"status":"no_apply_recorded"}` — every other field is omitted, not
+  zeroed.
+
+This is a read-only admin endpoint and needs the `admin` claim like the
+other `admin` subcommands.
+
+Both of the above endpoints are gated by the same `AdminPrincipal` check as
+`GET /api/v1/admin/workers`; see
+[ADR 0058](../../adr/0058-admin-config-inspection-surface.md) for the design
+rationale behind the admin-only scope, the in-memory apply-status
+semantics, and the secrets-exclusion mechanism.
+
 ### Re-login after expiry ("session expired")
 
 A 15 min admin session expires quickly. Once the token crosses `expires_at`,

@@ -38,6 +38,12 @@ pub mod error;
 // no-op.
 pub mod event_store_publisher;
 pub mod gitops;
+// What THIS running process applied from gitops at boot — pure value
+// types (zero-I/O), filled by the boot path and parked on `AppContext`
+// for the admin apply-status inspection endpoint. In-memory by design:
+// gitops apply is a boot step with no live-refresh path, so the only
+// honest answer a running server can give is its own (ADR 0058).
+pub mod gitops_apply_status;
 // Apply-config linter — secure-by-default reject rules over the
 // desired permission-grant + claim-mapping set, run inside
 // `ApplyConfigUseCase::apply_permission_grants` before commit

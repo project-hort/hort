@@ -274,6 +274,13 @@ async fn run_async() -> anyhow::Result<()> {
     info!(?cfg.storage, "storage adapter wired");
     info!("metadata mirror adapter wired");
 
+    // What this process applied from gitops, threaded into
+    // `build_app_context` for the admin apply-status endpoint. Stays
+    // `None` on a DSN-only boot (no `HORT_CONFIG_DIR`) — the endpoint
+    // reports "no apply recorded" rather than a zeroed apply that never
+    // happened.
+    let mut gitops_apply_status: Option<hort_app::gitops_apply_status::GitopsApplyStatus> = None;
+
     if let Some(config_dir) = cfg.config_dir.as_ref() {
         info!(config_dir = %config_dir.display(), "gitops boot: starting");
         // Operator-controlled enumerated
@@ -317,26 +324,33 @@ async fn run_async() -> anyhow::Result<()> {
         // cause metric already fired exactly once inside
         // `apply_config_from_dir`; it is NOT the park signal —
         // the metrics listener never binds on a parked boot.
-        if let Err(e) = boot_result {
-            if crate::gitops_boot::is_park_eligible(&e) {
-                tracing::error!(
-                    error = %e,
-                    "gitops config invalid — serving not-ready (no crashloop); \
-                     fix the config and redeploy"
-                );
-                // The shared shutdown coordinator is normally installed
-                // much later (after `build_app_context`); on the park
-                // path we never reach that, so install it here and hand
-                // its token to the park serve loop. SIGTERM lets a
-                // rollout replace the pod.
-                let shutdown_handle = shutdown::ShutdownHandle::install();
-                return crate::cli::serve_parked::serve_config_invalid_park(
-                    cfg.api_bind_addr,
-                    shutdown_handle.token(),
-                )
-                .await;
+        match boot_result {
+            // Record what this process applied, for the admin
+            // apply-status endpoint. Only a successful apply is
+            // recorded: a parked or crashing boot applied nothing this
+            // endpoint could truthfully describe.
+            Ok(status) => gitops_apply_status = Some(status),
+            Err(e) => {
+                if crate::gitops_boot::is_park_eligible(&e) {
+                    tracing::error!(
+                        error = %e,
+                        "gitops config invalid — serving not-ready (no crashloop); \
+                         fix the config and redeploy"
+                    );
+                    // The shared shutdown coordinator is normally installed
+                    // much later (after `build_app_context`); on the park
+                    // path we never reach that, so install it here and hand
+                    // its token to the park serve loop. SIGTERM lets a
+                    // rollout replace the pod.
+                    let shutdown_handle = shutdown::ShutdownHandle::install();
+                    return crate::cli::serve_parked::serve_config_invalid_park(
+                        cfg.api_bind_addr,
+                        shutdown_handle.token(),
+                    )
+                    .await;
+                }
+                return Err(anyhow::anyhow!("gitops boot: {e}"));
             }
-            return Err(anyhow::anyhow!("gitops boot: {e}"));
         }
     }
 
@@ -733,6 +747,10 @@ async fn run_async() -> anyhow::Result<()> {
             allow_nonroutable_webhook_targets: cfg.allow_nonroutable_webhook_targets,
             nats_url: cfg.nats_url.clone(),
         },
+        // What this process applied from gitops above (`None` on a
+        // DSN-only boot). Parked on `AppContext` for
+        // `GET /api/v1/admin/gitops/apply-status`.
+        gitops_apply_status,
     )
     .await
     .context("building app context")?;

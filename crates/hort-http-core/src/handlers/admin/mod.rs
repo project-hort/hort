@@ -2,6 +2,8 @@
 //!
 //! Routes:
 //! - `GET    /repositories/:key`                          — look up a repo's UUID by key
+//! - `GET    /repositories/:key/effective-config`         — resolved repo config (read-only)
+//! - `GET    /gitops/apply-status`                        — this process's boot apply (read-only)
 //! - `GET    /quarantine/patch-candidates`                — list patch-candidate surface
 //! - `POST   /quarantine/:artifact_id/release`            — admin override release
 //!
@@ -47,14 +49,20 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use hort_app::error::AppError;
+use hort_app::gitops_apply_status::{ApplyKindCounts, GitopsApplyStatus, KindCounts};
 use hort_app::use_cases::effective_permissions_use_case::{EffectiveGrant, EffectivePermissions};
+use hort_app::use_cases::effective_repository_config_use_case::EffectiveScanPolicyView;
 use hort_app::use_cases::patch_candidate_use_case::MAX_LIMIT as PATCH_CANDIDATE_MAX_LIMIT;
 use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerView;
 use hort_app::use_cases::CallerPrivileges;
 use hort_domain::entities::rbac::GrantSubject;
+use hort_domain::entities::repository::PrefetchPolicy;
 use hort_domain::error::DomainError;
 use hort_domain::events::ApiActor;
 use hort_domain::ports::patch_candidate_repository::{PatchCandidate, PatchCandidateFilter};
+use hort_domain::ports::repository_upstream_mapping_repository::{
+    RepositoryUpstreamMapping, UpstreamAuth,
+};
 
 use crate::authz::AdminPrincipal;
 use crate::context::AppContext;
@@ -95,6 +103,20 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
         // `:repo_id` from a stable key (UUIDs are minted at first
         // apply, so operators can't hard-code them).
         .route("/repositories/{key}", get(get_repository_by_key))
+        // Admin-only, read-only projection of a repository's
+        // *effective* config — what the running server actually
+        // resolved (config drift, policy binding). No secrets ever
+        // serialized (see `EffectiveUpstreamMappingDto`); no write
+        // surface — gitops is still the only config writer.
+        .route(
+            "/repositories/{key}/effective-config",
+            get(get_repository_effective_config),
+        )
+        // Admin-only, read-only view of the gitops apply THIS process
+        // performed at boot — its generation fingerprint and object
+        // deltas. Reads an in-memory snapshot; touches no port, so it
+        // answers even when the database is unhealthy.
+        .route("/gitops/apply-status", get(get_gitops_apply_status))
         // Admin-only read of the patch-candidate
         // quarantine surface. Mounted before `post_quarantine_release`
         // so the `/quarantine/*` routes group by path. The handler is
@@ -177,6 +199,310 @@ async fn get_repository_by_key(
         }),
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Effective-config read (read-only, admin-only)
+// ---------------------------------------------------------------------------
+
+/// Resolved upstream-mapping projection.
+///
+/// **Hard-omits every secret field** (`secret_ref`, `mtls_cert_ref`,
+/// `mtls_key_ref`, `ca_bundle_ref`) — [`hort_domain::ports::secret_port::SecretRef`]
+/// derives `Serialize`, so a `#[serde(flatten)]` or a raw
+/// [`RepositoryUpstreamMapping`] in the response body would leak the
+/// opaque-but-sensitive locator (an env var name or a mounted-file path)
+/// into the admin surface. Surfaces at most `has_credentials: bool`.
+/// Constructed only via [`Self::from_domain`] — there is no `From`/
+/// `#[serde(flatten)]` path that could accidentally carry a secret field
+/// through.
+#[derive(Debug, Serialize)]
+struct EffectiveUpstreamMappingDto {
+    path_prefix: String,
+    upstream_url: String,
+    upstream_auth: &'static str,
+    has_credentials: bool,
+    insecure_upstream_url: bool,
+    trust_upstream_publish_time: bool,
+    managed_by: String,
+}
+
+impl EffectiveUpstreamMappingDto {
+    fn from_domain(m: RepositoryUpstreamMapping) -> Self {
+        let upstream_auth = match m.upstream_auth {
+            UpstreamAuth::Anonymous => "anonymous",
+            UpstreamAuth::BearerChallenge => "bearer_challenge",
+            UpstreamAuth::Basic { .. } => "basic",
+        };
+        Self {
+            path_prefix: m.path_prefix,
+            upstream_url: m.upstream_url,
+            upstream_auth,
+            has_credentials: m.secret_ref.is_some(),
+            insecure_upstream_url: m.insecure_upstream_url,
+            trust_upstream_publish_time: m.trust_upstream_publish_time,
+            managed_by: m.managed_by.to_string(),
+        }
+    }
+}
+
+/// Resolved scan-policy projection (repo-scoped > global > built-in
+/// default) — see
+/// [`hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase::effective_scan_policy`].
+#[derive(Debug, Serialize)]
+struct EffectiveScanPolicyDto {
+    policy_id: Option<Uuid>,
+    policy_name: Option<String>,
+    severity_threshold: String,
+    scan_backends: Vec<String>,
+    enforcement: String,
+    negligible_action: String,
+    quarantine_duration_secs: i64,
+}
+
+impl EffectiveScanPolicyDto {
+    fn from_view(v: EffectiveScanPolicyView) -> Self {
+        Self {
+            policy_id: v.policy_id,
+            policy_name: v.policy_name,
+            severity_threshold: v.severity_threshold.to_string(),
+            scan_backends: v.scan_backends,
+            enforcement: v.enforcement.to_string(),
+            negligible_action: v.negligible_action.to_string(),
+            quarantine_duration_secs: v.quarantine_duration_secs,
+        }
+    }
+}
+
+/// Response DTO for `GET /admin/repositories/:key/effective-config`.
+///
+/// Projects the repository aggregate + its upstream mappings + the
+/// resolved scan policy into one read-only view — what the running server
+/// actually resolved, for config-drift / policy-binding inspection. Every
+/// field is hand-projected in [`get_repository_effective_config`]; the
+/// response never `#[serde(flatten)]`s a domain row and no domain type
+/// here derives `Serialize` for API purposes beyond what already exists
+/// on [`PrefetchPolicy`] (a plain CRUD config value with no secret
+/// fields).
+#[derive(Debug, Serialize)]
+struct EffectiveRepositoryConfigResponse {
+    key: String,
+    name: String,
+    format: String,
+    repo_type: String,
+    is_public: bool,
+    storage_backend: String,
+    download_audit_enabled: bool,
+    quota_bytes: Option<i64>,
+    index_mode: String,
+    prefetch_policy: PrefetchPolicy,
+    curation_rule_names: Vec<String>,
+    managed_by: String,
+    upstream_mappings: Vec<EffectiveUpstreamMappingDto>,
+    scan_policy: EffectiveScanPolicyDto,
+}
+
+async fn get_repository_effective_config(
+    admin: AdminPrincipal,
+    State(ctx): State<Arc<AppContext>>,
+    Path(key): Path<String>,
+) -> Result<Response, ApiError> {
+    let repo = ctx.repository_use_case.get_by_key(&key).await?;
+    let mappings = ctx
+        .repository_upstream_mappings
+        .list_for_repository(repo.id)
+        .await?;
+
+    // The `AdminPrincipal` extractor already enforced `Permission::Admin`
+    // at the request edge; pass `is_admin: true` so the use-case-side
+    // gate is a no-op rather than a duplicate authz call (mirrors
+    // `get_scanner_workers` above).
+    let actor = ApiActor {
+        user_id: admin.0.user_id,
+    };
+    let privileges = CallerPrivileges {
+        is_admin: true,
+        is_reviewer: false,
+        is_curator: false,
+        writable_repository_ids: Vec::new(),
+    };
+    let scan_policy = ctx
+        .effective_repository_config_use_case
+        .effective_scan_policy(actor, privileges, repo.id)
+        .await?;
+
+    let body = EffectiveRepositoryConfigResponse {
+        key: repo.key,
+        name: repo.name,
+        format: repo.format.to_string(),
+        repo_type: repo.repo_type.to_string(),
+        is_public: repo.is_public,
+        storage_backend: repo.storage_backend,
+        download_audit_enabled: repo.download_audit_enabled,
+        quota_bytes: repo.quota_bytes,
+        index_mode: repo.index_mode.to_string(),
+        prefetch_policy: repo.prefetch_policy,
+        curation_rule_names: repo.curation_rule_names,
+        managed_by: repo.managed_by.to_string(),
+        upstream_mappings: mappings
+            .into_iter()
+            .map(EffectiveUpstreamMappingDto::from_domain)
+            .collect(),
+        scan_policy: EffectiveScanPolicyDto::from_view(scan_policy),
+    };
+
+    Ok((StatusCode::OK, Json(body)).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Gitops apply-status read (read-only, admin-only)
+// ---------------------------------------------------------------------------
+
+/// Create/update/delete/unchanged counts for one gitops kind.
+#[derive(Debug, Serialize)]
+struct KindCountsDto {
+    created: usize,
+    updated: usize,
+    deleted: usize,
+    unchanged: usize,
+}
+
+impl From<KindCounts> for KindCountsDto {
+    fn from(c: KindCounts) -> Self {
+        Self {
+            created: c.created,
+            updated: c.updated,
+            deleted: c.deleted,
+            unchanged: c.unchanged,
+        }
+    }
+}
+
+/// Per-kind breakdown of one apply.
+///
+/// These do **not** sum to the aggregate counters: the aggregate also
+/// spans the event-sourced kinds (scan policies, retention policies,
+/// exclusions) and the machine-identity kinds (OIDC issuers, service
+/// accounts), which have no per-kind breakdown here.
+#[derive(Debug, Serialize)]
+struct ApplyKindCountsDto {
+    repositories: KindCountsDto,
+    upstream_mappings: KindCountsDto,
+    claim_mappings: KindCountsDto,
+    permission_grants: KindCountsDto,
+    curation_rules: KindCountsDto,
+}
+
+impl From<ApplyKindCounts> for ApplyKindCountsDto {
+    fn from(c: ApplyKindCounts) -> Self {
+        Self {
+            repositories: c.repositories.into(),
+            upstream_mappings: c.upstream_mappings.into(),
+            claim_mappings: c.claim_mappings.into(),
+            permission_grants: c.permission_grants.into(),
+            curation_rules: c.curation_rules.into(),
+        }
+    }
+}
+
+/// Response DTO for `GET /admin/gitops/apply-status`.
+///
+/// `status` is the discriminator an operator (or a script) keys on:
+/// `applied` means this process ran a gitops apply and every other field
+/// is populated; `no_apply_recorded` means it did not — a DSN-only boot,
+/// or gitops disabled — and every other field is omitted. A zeroed
+/// "applied" body would be indistinguishable from a genuine no-op apply,
+/// which is why the absent case gets its own discriminator instead of
+/// default values.
+///
+/// Hand-projected from [`GitopsApplyStatus`] rather than deriving
+/// `Serialize` on the domain-adjacent type, matching the discipline of
+/// the effective-config response above. There are no secrets in an apply
+/// status — it carries counts, a timestamp and a digest, never a spec
+/// body or a `SecretRef` — and the hand projection is what keeps that
+/// true as the source type grows.
+#[derive(Debug, Serialize)]
+struct GitopsApplyStatusResponse {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    applied_at: Option<DateTime<Utc>>,
+    /// Hex SHA-256 fingerprint of the applied desired state. Equal
+    /// fingerprints across two processes mean they applied the same
+    /// configuration; it is not a counter and does not order anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deleted: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unchanged: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retro_warn_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retro_block_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_kind: Option<ApplyKindCountsDto>,
+}
+
+/// Discriminator: this process ran a gitops apply.
+const APPLY_STATUS_APPLIED: &str = "applied";
+/// Discriminator: this process ran no gitops apply.
+const APPLY_STATUS_NONE: &str = "no_apply_recorded";
+
+impl GitopsApplyStatusResponse {
+    fn applied(s: &GitopsApplyStatus) -> Self {
+        Self {
+            status: APPLY_STATUS_APPLIED,
+            applied_at: Some(s.applied_at),
+            generation: Some(s.generation.clone()),
+            created: Some(s.created),
+            updated: Some(s.updated),
+            deleted: Some(s.deleted),
+            unchanged: Some(s.unchanged),
+            retro_warn_count: Some(s.retro_warn_count),
+            retro_block_count: Some(s.retro_block_count),
+            per_kind: Some(s.per_kind.into()),
+        }
+    }
+
+    fn no_apply_recorded() -> Self {
+        Self {
+            status: APPLY_STATUS_NONE,
+            applied_at: None,
+            generation: None,
+            created: None,
+            updated: None,
+            deleted: None,
+            unchanged: None,
+            retro_warn_count: None,
+            retro_block_count: None,
+            per_kind: None,
+        }
+    }
+}
+
+/// `GET /admin/gitops/apply-status`.
+///
+/// Reports the gitops apply **this process** performed at boot. Not a
+/// cluster-wide view: during a rolling upgrade two pods legitimately
+/// report different generations, and that difference is the signal —
+/// it says the rollout has not converged yet.
+///
+/// Reads an in-memory snapshot behind an `ArcSwap`; it consults no port,
+/// so it keeps answering when the database does not.
+async fn get_gitops_apply_status(
+    _admin: AdminPrincipal,
+    State(ctx): State<Arc<AppContext>>,
+) -> Result<Response, ApiError> {
+    let guard = ctx.gitops_apply_status.load();
+    let body = match guard.as_ref().as_ref() {
+        Some(status) => GitopsApplyStatusResponse::applied(status),
+        None => GitopsApplyStatusResponse::no_apply_recorded(),
+    };
+    Ok((StatusCode::OK, Json(body)).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +1239,497 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
         crate::error::assert_no_internal_leakage(StatusCode::INTERNAL_SERVER_ERROR, &bytes);
+    }
+
+    // ----- GET /admin/repositories/:key/effective-config --------------
+
+    /// Build a router exposing `/admin` plus the full `MockPorts` handle,
+    /// so tests can seed a repo (`mocks.repositories`), upstream mappings
+    /// (`mocks.repository_upstream_mappings`), and a scan policy
+    /// (`mocks.policy_projections`) before the GET.
+    fn effective_config_harness() -> (Router, crate::test_support::MockPorts) {
+        let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+        let (base, mocks) = build_mock_ctx(metrics_handle);
+
+        let idp = Arc::new(MockIdentityProvider::new());
+        let authenticate = Arc::new(AuthenticateUseCase::new(
+            idp as Arc<dyn IdentityProvider>,
+            mocks.users.clone() as Arc<dyn UserRepository>,
+            Vec::new(),
+        ));
+        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
+            Vec::new(),
+        )));
+        let ctx = with_auth(
+            &base,
+            crate::context::AuthContext::Enabled {
+                authenticate,
+                rbac,
+                issuer_url: None,
+            },
+        );
+        let router = Router::new().nest("/admin", admin_routes()).with_state(ctx);
+        (router, mocks)
+    }
+
+    fn effective_config_get(key: &str, principal: Option<CallerPrincipal>) -> Request<Body> {
+        let mut req = Request::get(format!("/admin/repositories/{key}/effective-config"))
+            .body(Body::empty())
+            .unwrap();
+        if let Some(p) = principal {
+            crate::middleware::auth::test_support::inject_principal(&mut req, p);
+        }
+        req
+    }
+
+    /// A mapping carrying every secret-bearing field set, so the
+    /// secrets-exclusion assertion below actually exercises the omission
+    /// (a mapping with every secret field `None` would pass the assertion
+    /// vacuously). Constructed via struct literal — safe in test
+    /// scaffolding (see the port module's doc comment).
+    fn mapping_with_all_secrets(repository_id: Uuid) -> RepositoryUpstreamMapping {
+        use hort_domain::ports::secret_port::{SecretRef, SecretSource};
+        let now = Utc::now();
+        RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id,
+            path_prefix: String::new(),
+            upstream_url: "https://upstream.example.com".into(),
+            upstream_name_prefix: None,
+            upstream_auth: UpstreamAuth::Basic {
+                username: "svc-upstream".into(),
+            },
+            secret_ref: Some(SecretRef {
+                source: SecretSource::EnvVar,
+                location: "UPSTREAM_PASSWORD_ENV".into(),
+            }),
+            managed_by: ManagedBy::GitOps,
+            managed_by_digest: Some([0x11; 32]),
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: Some(SecretRef {
+                source: SecretSource::File,
+                location: "/etc/hort-secrets/mtls-cert.pem".into(),
+            }),
+            mtls_key_ref: Some(SecretRef {
+                source: SecretSource::File,
+                location: "/etc/hort-secrets/mtls-key.pem".into(),
+            }),
+            ca_bundle_ref: Some(SecretRef {
+                source: SecretSource::File,
+                location: "/etc/hort-secrets/ca-bundle.pem".into(),
+            }),
+            pinned_cert_sha256: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn effective_config_admin_returns_projected_shape() {
+        use hort_app::use_cases::test_support::sample_repository;
+        use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
+
+        let (router, mocks) = effective_config_harness();
+
+        let mut repo = sample_repository();
+        repo.key = "npm-proxy".into();
+        repo.curation_rule_names = vec!["no-gpl".into()];
+        let repo_id = repo.id;
+        mocks.repositories.insert(repo);
+
+        mocks
+            .repository_upstream_mappings
+            .upsert(mapping_with_all_secrets(repo_id))
+            .await
+            .unwrap();
+
+        let response = router
+            .oneshot(effective_config_get(
+                "npm-proxy",
+                Some(principal_with_claims(&["admin"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["key"], "npm-proxy");
+        assert_eq!(v["curation_rule_names"][0], "no-gpl");
+        assert_eq!(
+            v["upstream_mappings"][0]["upstream_url"],
+            "https://upstream.example.com"
+        );
+        assert_eq!(v["upstream_mappings"][0]["upstream_auth"], "basic");
+        assert_eq!(v["upstream_mappings"][0]["has_credentials"], true);
+        assert_eq!(v["upstream_mappings"][0]["managed_by"], "gitops");
+        // `build_mock_ctx` pre-seeds a permissive global policy
+        // (`seed_permissive_global_policy_for_tests`) — assert the
+        // resolved-policy branch of the projection against it. The
+        // no-policy-bound → `DefaultPolicy` fallback branch is covered by
+        // `effective_scan_policy_admin_no_policy_returns_default_policy_view`
+        // in the use case's own unit tests.
+        assert_eq!(
+            v["scan_policy"]["policy_name"],
+            "permissive-http-test-default"
+        );
+        assert_eq!(v["scan_policy"]["severity_threshold"], "critical");
+        assert_eq!(v["scan_policy"]["quarantine_duration_secs"], 0);
+    }
+
+    #[tokio::test]
+    async fn effective_config_no_secret_field_names_or_values_in_body() {
+        use hort_app::use_cases::test_support::sample_repository;
+        use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
+
+        let (router, mocks) = effective_config_harness();
+
+        let mut repo = sample_repository();
+        repo.key = "docker-proxy".into();
+        let repo_id = repo.id;
+        mocks.repositories.insert(repo);
+
+        mocks
+            .repository_upstream_mappings
+            .upsert(mapping_with_all_secrets(repo_id))
+            .await
+            .unwrap();
+
+        let response = router
+            .oneshot(effective_config_get(
+                "docker-proxy",
+                Some(principal_with_claims(&["admin"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        for field in [
+            "secret_ref",
+            "mtls_cert_ref",
+            "mtls_key_ref",
+            "ca_bundle_ref",
+        ] {
+            assert!(
+                !body.contains(field),
+                "response body must never carry the `{field}` field name: {body}"
+            );
+        }
+        for secret_value in [
+            "UPSTREAM_PASSWORD_ENV",
+            "/etc/hort-secrets/mtls-cert.pem",
+            "/etc/hort-secrets/mtls-key.pem",
+            "/etc/hort-secrets/ca-bundle.pem",
+        ] {
+            assert!(
+                !body.contains(secret_value),
+                "response body must never carry the secret locator `{secret_value}`: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn effective_config_reader_principal_returns_403() {
+        use hort_app::use_cases::test_support::sample_repository;
+        let (router, mocks) = effective_config_harness();
+        let mut repo = sample_repository();
+        repo.key = "npm-proxy".into();
+        mocks.repositories.insert(repo);
+
+        let response = router
+            .oneshot(effective_config_get(
+                "npm-proxy",
+                Some(principal_with_claims(&["reader"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn effective_config_anonymous_returns_401() {
+        let (router, _mocks) = effective_config_harness();
+        let mut req = Request::get("/admin/repositories/npm-proxy/effective-config")
+            .body(Body::empty())
+            .unwrap();
+        crate::middleware::auth::test_support::inject_optional_principal_none(&mut req);
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn effective_config_unknown_repo_returns_404() {
+        let (router, _mocks) = effective_config_harness();
+        let response = router
+            .oneshot(effective_config_get(
+                "no-such-repo",
+                Some(principal_with_claims(&["admin"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ----- GET /admin/gitops/apply-status ------------------------------
+
+    /// Router over `/admin` plus the `AppContext`, so a test can install
+    /// a recorded apply on the `ArcSwap` before the GET. Mirrors
+    /// [`effective_config_harness`]; it hands back the context rather
+    /// than the mock ports because the apply-status surface touches no
+    /// port at all.
+    fn apply_status_harness() -> (Router, Arc<AppContext>) {
+        let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+        let (base, mocks) = build_mock_ctx(metrics_handle);
+
+        let idp = Arc::new(MockIdentityProvider::new());
+        let authenticate = Arc::new(AuthenticateUseCase::new(
+            idp as Arc<dyn IdentityProvider>,
+            mocks.users.clone() as Arc<dyn UserRepository>,
+            Vec::new(),
+        ));
+        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
+            Vec::new(),
+        )));
+        let ctx = with_auth(
+            &base,
+            crate::context::AuthContext::Enabled {
+                authenticate,
+                rbac,
+                issuer_url: None,
+            },
+        );
+        let router = Router::new()
+            .nest("/admin", admin_routes())
+            .with_state(ctx.clone());
+        (router, ctx)
+    }
+
+    fn apply_status_get(principal: Option<CallerPrincipal>) -> Request<Body> {
+        let mut req = Request::get("/admin/gitops/apply-status")
+            .body(Body::empty())
+            .unwrap();
+        if let Some(p) = principal {
+            crate::middleware::auth::test_support::inject_principal(&mut req, p);
+        }
+        req
+    }
+
+    /// A status with every counter distinct, so a field mixed up in the
+    /// hand projection shows up as a wrong number rather than passing on
+    /// coincidentally equal values.
+    fn recorded_status() -> GitopsApplyStatus {
+        GitopsApplyStatus {
+            applied_at: Utc::now(),
+            generation: "ab".repeat(32),
+            created: 1,
+            updated: 2,
+            deleted: 3,
+            unchanged: 4,
+            retro_warn_count: 5,
+            retro_block_count: 6,
+            per_kind: ApplyKindCounts {
+                repositories: KindCounts {
+                    created: 7,
+                    updated: 8,
+                    deleted: 9,
+                    unchanged: 10,
+                },
+                upstream_mappings: KindCounts {
+                    created: 11,
+                    ..KindCounts::default()
+                },
+                claim_mappings: KindCounts {
+                    updated: 12,
+                    ..KindCounts::default()
+                },
+                permission_grants: KindCounts {
+                    deleted: 13,
+                    ..KindCounts::default()
+                },
+                curation_rules: KindCounts {
+                    unchanged: 14,
+                    ..KindCounts::default()
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_status_admin_sees_the_recorded_apply() {
+        let (router, ctx) = apply_status_harness();
+        let status = recorded_status();
+        ctx.gitops_apply_status
+            .store(Arc::new(Some(status.clone())));
+
+        let response = router
+            .oneshot(apply_status_get(Some(principal_with_claims(&["admin"]))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(v["status"], "applied");
+        assert_eq!(v["generation"], status.generation);
+        assert_eq!(v["created"], 1);
+        assert_eq!(v["updated"], 2);
+        assert_eq!(v["deleted"], 3);
+        assert_eq!(v["unchanged"], 4);
+        assert_eq!(v["retro_warn_count"], 5);
+        assert_eq!(v["retro_block_count"], 6);
+        assert!(
+            v["applied_at"].is_string(),
+            "applied_at must serialize as an RFC 3339 string: {v}"
+        );
+
+        assert_eq!(v["per_kind"]["repositories"]["created"], 7);
+        assert_eq!(v["per_kind"]["repositories"]["updated"], 8);
+        assert_eq!(v["per_kind"]["repositories"]["deleted"], 9);
+        assert_eq!(v["per_kind"]["repositories"]["unchanged"], 10);
+        assert_eq!(v["per_kind"]["upstream_mappings"]["created"], 11);
+        assert_eq!(v["per_kind"]["claim_mappings"]["updated"], 12);
+        assert_eq!(v["per_kind"]["permission_grants"]["deleted"], 13);
+        assert_eq!(v["per_kind"]["curation_rules"]["unchanged"], 14);
+    }
+
+    /// The absent case is its own discriminator, not a zeroed body: a
+    /// boot that ran no apply must be distinguishable from a genuine
+    /// no-op apply.
+    #[tokio::test]
+    async fn apply_status_without_an_apply_reports_no_apply_recorded() {
+        let (router, _ctx) = apply_status_harness();
+
+        let response = router
+            .oneshot(apply_status_get(Some(principal_with_claims(&["admin"]))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "no_apply_recorded");
+        for absent in [
+            "applied_at",
+            "generation",
+            "created",
+            "updated",
+            "deleted",
+            "unchanged",
+            "retro_warn_count",
+            "retro_block_count",
+            "per_kind",
+        ] {
+            assert!(
+                v.get(absent).is_none(),
+                "`{absent}` must be omitted when no apply was recorded, \
+                 not reported as a zero: {v}"
+            );
+        }
+    }
+
+    /// A genuine no-op apply still reports `applied` with zeros — the
+    /// counterpart to the test above, pinning that the two cases stay
+    /// distinguishable in both directions.
+    #[tokio::test]
+    async fn apply_status_reports_a_no_op_apply_as_applied() {
+        let (router, ctx) = apply_status_harness();
+        ctx.gitops_apply_status
+            .store(Arc::new(Some(GitopsApplyStatus::from_report(
+                hort_app::use_cases::apply_config_use_case::ApplyReport::default(),
+                [0u8; 32],
+                Utc::now(),
+            ))));
+
+        let response = router
+            .oneshot(apply_status_get(Some(principal_with_claims(&["admin"]))))
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "applied");
+        assert_eq!(v["created"], 0);
+        assert_eq!(v["per_kind"]["repositories"]["created"], 0);
+    }
+
+    #[tokio::test]
+    async fn apply_status_reader_principal_returns_403() {
+        let (router, ctx) = apply_status_harness();
+        ctx.gitops_apply_status
+            .store(Arc::new(Some(recorded_status())));
+
+        let response = router
+            .oneshot(apply_status_get(Some(principal_with_claims(&["reader"]))))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn apply_status_anonymous_returns_401() {
+        let (router, ctx) = apply_status_harness();
+        ctx.gitops_apply_status
+            .store(Arc::new(Some(recorded_status())));
+
+        let mut req = Request::get("/admin/gitops/apply-status")
+            .body(Body::empty())
+            .unwrap();
+        crate::middleware::auth::test_support::inject_optional_principal_none(&mut req);
+
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The status is a counts-and-digest view: no spec bodies, no
+    /// credential locators, nothing an apply read out of a `SecretRef`.
+    /// The DTO is hand-projected precisely so that stays true as
+    /// `GitopsApplyStatus` grows; this pins the current shape.
+    #[tokio::test]
+    async fn apply_status_body_carries_only_counts_and_a_digest() {
+        let (router, ctx) = apply_status_harness();
+        ctx.gitops_apply_status
+            .store(Arc::new(Some(recorded_status())));
+
+        let response = router
+            .oneshot(apply_status_get(Some(principal_with_claims(&["admin"]))))
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "applied_at",
+                "created",
+                "deleted",
+                "generation",
+                "per_kind",
+                "retro_block_count",
+                "retro_warn_count",
+                "status",
+                "unchanged",
+                "updated",
+            ],
+            "a new top-level field on the apply-status response is a \
+             deliberate API change — add it here once you have confirmed \
+             it carries no secret"
+        );
+
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        for leaked in ["secret_ref", "secretRef", "upstream_url", "spec"] {
+            assert!(
+                !body.contains(leaked),
+                "apply-status must never carry `{leaked}`: {body}"
+            );
+        }
     }
 
     // There is no `POST /admin/repositories` create endpoint
