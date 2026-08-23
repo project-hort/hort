@@ -51,6 +51,27 @@ pub enum StorageConfig {
     },
 }
 
+impl StorageConfig {
+    /// Project into the pure `hort-app`
+    /// [`EffectiveStorageBackend`](hort_app::storage_backend::EffectiveStorageBackend)
+    /// — the deployment's effective global storage backend in the
+    /// `{filesystem, s3}` value-domain. Mirrors
+    /// `hort_server::config::StorageConfig::effective_backend`, which is
+    /// what keeps the two binaries' view of the backend identical.
+    ///
+    /// The worker consumes it as the storage input to the shared
+    /// event-chain anchoring predicate
+    /// (`hort_app::event_chain_anchoring`).
+    #[must_use]
+    pub fn effective_backend(&self) -> hort_app::storage_backend::EffectiveStorageBackend {
+        use hort_app::storage_backend::EffectiveStorageBackend;
+        match self {
+            Self::Filesystem { .. } => EffectiveStorageBackend::Filesystem,
+            Self::S3 { .. } => EffectiveStorageBackend::S3,
+        }
+    }
+}
+
 impl std::fmt::Debug for StorageConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

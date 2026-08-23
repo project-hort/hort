@@ -22,6 +22,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Event-chain verification is now default-on, and a missing checkpoint
+  anchor is no longer a daily failure where no anchor is expected.**
+  `scheduledTasks.verifyEventChain.enabled` now defaults to `true`, so an
+  **existing install gains this CronJob on upgrade** (it still sits under
+  the `scheduledTasks.adminTasksEnabled` umbrella; set `enabled: false` to
+  opt out). Tamper detection an operator has to opt into is tamper
+  detection most deployments never get. Default-on is safe because the
+  missing-anchor semantic is split at its source: whether an anchor is
+  expected is derived from one shared predicate — S3 storage **and** a
+  provisioned anchor public key — that the checkpoint writer and the
+  verifier both consult, so a filesystem install (which can never host an
+  S3 Object-Lock WORM anchor) verifies its chain, expects no anchor, and
+  exits `0`. A real chain break still exits `2` everywhere; a
+  missing/stale checkpoint where an anchor **is** expected still exits
+  `3`. The verify job is never given the anchor private signing key —
+  verification is a public-key operation. Metric semantics:
+  unanchored-verified records `hort_event_chain_verify_total{result="ok"}`
+  — the `{ok, broken, missing_checkpoint}` series set is unchanged, and
+  the anchored-vs-unanchored distinction rides the exit code, the log line
+  and the new `anchor_expected` field of the subcommand's JSON output.
+  `--fail-on-missing-checkpoint` (and the chart's
+  `failOnMissingCheckpoint`, now defaulting to `null`) became tri-state:
+  unset derives, an explicit `true`/`false` forces. See ADR 0057. (#165)
+
 - **Server-side upstream-fetch metrics now name the format that actually
   fetched.** The server built a single pull-through proxy with a
   hardcoded `format_label: "oci"` and handed it to all five inbound
