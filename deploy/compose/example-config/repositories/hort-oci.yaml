@@ -1,0 +1,19 @@
+# Mirror of deploy/ansible/files/gitops/repositories/hort-oci.yaml — the
+# world-readable first-party image face. The dogfood scenario only probes it
+# anonymously (`/v2/<key>/tags/list` must not 401/403), so nothing is pushed
+# here on compose; it exists so that probe asserts public visibility rather
+# than self-skipping on an absent repository.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: hort-oci
+spec:
+  name: "Hort first-party OCI images"
+  description: "World-readable distribution of hort-server / hort-worker images."
+  format: oci
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/hort-oci
+  isPublic: true
+  replicationPriority: local_only

@@ -1,0 +1,25 @@
+# Mirror of deploy/ansible/files/gitops/repositories/hort-crates.yaml — the
+# first-party hosted cargo registry hort publishes its own workspace to. The
+# compose stack carries it so the dogfood group (which asserts against the
+# deployed posture) runs here instead of self-skipping on a missing repo, and
+# so the release-time publish chain has the repository it actually targets.
+#
+# Storage path follows the compose convention (/var/lib/hort-server/cas/<key>
+# on the shared `cas` volume) rather than the reference host path; everything
+# the scenarios assert on — format, type, public visibility, and the default
+# `released_only` index mode that makes a held sibling invisible to an
+# unauthorized reader — is identical.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: hort-crates
+spec:
+  name: "Hort first-party crates"
+  description: "World-readable distribution of hort's own published crates."
+  format: cargo
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/hort-crates
+  isPublic: true
+  replicationPriority: local_only

@@ -1,0 +1,20 @@
+# PermissionGrant: [reader, ci-reader] -> read hort-crates-chain-e2e.
+#
+# The control identity for the publish-chain scenario's held-visibility
+# assertions. It must be able to READ the repository — otherwise a private
+# repo answers it 404 for every crate and "the held version is not listed"
+# would pass without proving anything about the hold. What it must NOT have is
+# write authority, because that is the axis held index entries are served on
+# (ADR 0055): read-granted-but-not-write is exactly the caller that has to
+# keep seeing the ordinary, released-only view while the publisher resolves
+# its held siblings.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: reader-read-hort-crates-chain-e2e
+spec:
+  subject:
+    kind: claims
+    required: [reader, ci-reader]
+  permission: read
+  repository: hort-crates-chain-e2e

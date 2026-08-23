@@ -1,0 +1,20 @@
+# Mirror of deploy/ansible/files/gitops/policies/crates-scan.yaml.
+#
+# The 3d observation window is the point: the dogfood scenario's
+# authenticated first pull of a crates.io crate must come back 503 +
+# Retry-After (a fresh ingest, still inside the window) so the admin-release
+# leg has something to release. Shortening it here would collapse that
+# assertion into a pass that proves nothing.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: crates-scan
+spec:
+  scope:
+    repository: crates-proxy
+  severityThreshold: high
+  quarantineDuration: 3d
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["osv"]
+  licensePolicy: {}

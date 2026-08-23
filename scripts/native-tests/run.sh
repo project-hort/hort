@@ -367,6 +367,13 @@ run_one() {  # group name path
   # window; forwarding the variable under its real name means an operator who
   # retunes the server can point the scenario at the same value instead of
   # editing an assertion.
+  # HORT_CI_SCRIPTS: the repo's release-time cargo scripts (scripts/ci),
+  # bind-mounted read-only so a scenario can drive the ACTUAL publish chain
+  # rather than a paraphrase of it. A re-implementation would pass while the
+  # real chain was broken, which is the only failure mode that matters here.
+  # Mounted at a path of its own rather than under /work: /work is itself a
+  # read-only bind of the scenario tree, and nesting a second mount inside it
+  # depends on the target directory already existing there.
   # HORT_E2E_MODE: the runner's own --hort selector, forwarded verbatim.
   # General capability, not a one-scenario hack: any scenario whose fixture
   # premise only holds on a stack the runner owns (a coldness assertion, a
@@ -383,6 +390,7 @@ run_one() {  # group name path
     -e HORT_COMPOSE_OVERLAYS="${OVERLAYS[*]:-${HORT_COMPOSE_OVERLAYS:-}}" \
     -e HORT_E2E_MODE="$HORT_MODE" \
     -v "$SCRIPT_DIR":/work:ro -e FIXTURES=/work/fixtures \
+    -v "$REPO_ROOT/scripts/ci":/work-ci:ro -e HORT_CI_SCRIPTS=/work-ci \
     "$IMAGE" bash "/work/$rel"
 }
 

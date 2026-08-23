@@ -213,6 +213,13 @@ temp-env = "0.3"
 # dependency written as a `[dependencies.hort-x]` sub-table would slip
 # past it silently — so the guard parses real TOML.
 toml = { workspace = true }
+# `tests/publish_topology_guard.rs` builds the published-crate dependency
+# graph from `cargo metadata --no-deps` — the same data source
+# `scripts/ci/publishable-crates-in-order.sh` reads via `jq`. The typed
+# `Dependency::kind` / `Package::publish` fields remove the need to
+# hand-walk dependency tables (including target-specific ones) the way
+# `publishable_manifests.rs` does for its own, differently-scoped checks.
+cargo_metadata = "0.23"
 # Captures `tracing` output so the
 # deprecation warning for `HORT_GROUP_MAPPINGS_PATH` can be asserted on
 # directly (env_var field + one-shot emission). This is the first

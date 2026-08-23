@@ -1,0 +1,43 @@
+# Hosted cargo registry that the full-workspace publish-chain scenario
+# (scripts/native-tests/scenarios/dogfood/publish-chain.sh) publishes into.
+#
+# Separate from `hort-crates` on purpose, for two reasons.
+#
+# There has to BE a hold. The chain scenario needs the earlier crates still
+# held while the later ones resolve them — that race is the whole assertion.
+# hort-crates cannot provide it: its `quarantineDuration: 0s` is the
+# permissive opt-out, which skips the quarantine step entirely, so a crate
+# published there is servable the instant it lands and nothing races anything.
+# Here the hold is a real observation window (see the paired ScanPolicy), and
+# it is a TIMER rather than a scan verdict, so it is bounded, reproducible and
+# needs no egress — a gate that can run on every push.
+#
+# And the repository has to be PRIVATE for a cargo client to reach the rule
+# under test at all. Cargo fetches `config.json` anonymously and decides from
+# its `auth-required` field whether to attach the configured registry token to
+# index requests (RFC 3231; hort answers `auth-required: !isPublic` per
+# ADR 0035). On a public repo cargo therefore reads the index WITHOUT
+# credentials — and a held-visibility rule keyed on the caller's granted write
+# authority can never widen an anonymous read. Private is what makes the
+# publishing identity's authority visible to the server on the index request
+# the chain depends on.
+#
+# `indexMode` is deliberately unset, so the default `released_only` applies:
+# a held version is invisible to an ordinary reader and visible only to a
+# principal with granted write authority on this repository (ADR 0055). That
+# asymmetry is what the chain depends on and what the scenario asserts in both
+# directions — with a read-granted, non-writing identity as the control.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: hort-crates-chain-e2e
+spec:
+  name: "Cargo publish-chain E2E"
+  description: "Hosted cargo repo with a real observation window; target of the full-workspace publish-chain scenario (scripts/native-tests/scenarios/dogfood/publish-chain.sh)."
+  format: cargo
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/hort-crates-chain-e2e
+  isPublic: false
+  replicationPriority: local_only
