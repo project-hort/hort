@@ -199,10 +199,11 @@ separate decision rather than a silent widening of this one.
 The stranded-legacy consequence of §2 is closed by a **remediation sweep**
 over terminally-rejected artifacts, re-scanning them so their findings are
 re-emitted with a correct `severity_basis` and a collapsed alias group.
-Re-derivation, not a permissive default. The sweep is **operational, not a
-code path**: `rejected` is terminal and deliberately excluded from both
-cron-rescan candidate queries (ADR 0007), so freeing a stranded artifact
-is an operator action — see the Consequences section.
+Re-derivation, not a permissive default. The sweep is **operational**:
+`rejected` is deliberately excluded from the *automatic* cron-rescan
+candidate queries (ADR 0007), so freeing a stranded artifact is a deliberate
+operator action rather than an automatic one. It uses the existing admin
+tools — manual rescan then curator re-evaluate; see the Consequences section.
 
 ## ADR 0016 — not triggered
 
@@ -250,19 +251,25 @@ produced.
   advisory has mirrors. A per-advisory count is now a count of advisories
   rather than of database records, which is the honest number, but an
   operator watching finding volume will see a step change at deploy.
-- **Artifacts already `rejected` are not freed automatically.** `rejected`
-  is terminal (ADR 0007) and deliberately excluded from both cron-rescan
-  candidate queries — `select_eligible` takes `released`/`NULL`,
-  `select_stranded` takes `quarantined` — so no sweep re-runs the
-  collapsing code over them. Nor does policy re-evaluation help on its
-  own: it re-derives from the **stored** findings, which for these
-  artifacts are the pre-collapse set. Freeing one is an operator action:
-  either an exclusion on the bare mirror id (which re-evaluation then
-  clears via release authority #5, at the cost of a standing exclusion),
-  or purge-and-re-ingest, which rescans under the new code and needs no
-  exclusion. A code affordance for "rescan this rejected artifact" does
-  not exist and is intentionally not added here — it would be a new way
-  out of a terminal state, which is an ADR 0007 change.
+- **Artifacts already `rejected` are not freed *automatically*, but are
+  freed by an operator with the existing admin tools.** `rejected` is
+  deliberately excluded from the *automatic* cron-rescan candidate queries
+  (ADR 0007) — `select_eligible` takes `released`/`NULL`, `select_stranded`
+  takes `quarantined` — so nothing auto-re-runs the collapsing code over
+  them. The operator flow is **manual rescan → curator re-evaluate**, and it
+  needs no new mechanism: `POST /api/v1/artifacts/{id}/rescan`
+  (`ManualRescanUseCase`, by-id, with no terminal-state gate) re-runs the
+  scan under the new code and appends a fresh `ScanCompleted` carrying the
+  collapsed findings; then
+  `POST /api/v1/admin/curation/quarantine/{id}/reevaluate` (`Rejected`-only,
+  ADR 0025) re-derives the verdict from the **latest** event-store scan
+  evidence — the just-refreshed findings — and resets to
+  released/quarantined. Re-evaluate *alone* would not help (it re-derives
+  from the pre-collapse evidence); the rescan step is what refreshes it.
+  This is **not** an ADR 0007 exemption — the rescan re-runs the release
+  gate rather than bypassing it. (Alternatives that avoid a rescan: an
+  exclusion on the bare mirror id, which re-evaluation clears via release
+  authority #5 at the cost of a standing exclusion; or purge-and-re-ingest.)
 
 ## Alternatives considered
 
