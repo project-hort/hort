@@ -34,6 +34,7 @@ use hort_adapters_postgres::subscription_repo::PgSubscriptionRepository;
 use hort_adapters_postgres::user_repo::PgUserRepository;
 use hort_adapters_storage::filesystem_stateful_upload_staging::FilesystemStatefulUploadStaging;
 use hort_app::event_store_publisher::EventStorePublisher;
+use hort_app::gitops_apply_status::GitopsApplyStatus;
 use hort_app::pull_dedup::{PullDedup, PullDedupConfig};
 use hort_app::rbac::RbacEvaluator;
 use hort_app::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
@@ -42,6 +43,7 @@ use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
 use hort_app::use_cases::content_reference::ContentReferenceUseCase;
 use hort_app::use_cases::curation_use_case::CurationUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
+use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
@@ -1147,6 +1149,12 @@ pub async fn build_app_context(
     // `enable_notifications=false` constructs the publisher with no
     // broadcast channel — every append is a transparent pass-through.
     notify_config: NotifyConfig,
+    // What this process applied from gitops at boot, or `None` when no
+    // apply ran (DSN-only boot / no `HORT_CONFIG_DIR`). Threaded in from
+    // `cli::serve`, which is where the apply happens — composition never
+    // runs an apply itself. Parked on `AppContext` behind an `ArcSwap`
+    // for the admin apply-status endpoint (ADR 0058).
+    gitops_apply_status: Option<GitopsApplyStatus>,
 ) -> DomainResult<BuildAppContextOutput> {
     // Wrap the event store in an
     // `EventStorePublisher`. The publisher impls `EventStore`, so use
@@ -2280,6 +2288,15 @@ pub async fn build_app_context(
     );
     let scanner_worker_query_use_case = Arc::new(ScannerWorkerQueryUseCase::new(scanner_registry));
 
+    // `EffectiveRepositoryConfigUseCase` for the admin
+    // `GET /admin/repositories/:key/effective-config` endpoint's
+    // scan-policy leg. Wires the same `policy_projections` port every
+    // other quarantine/scan-policy consumer above shares — no new SQL,
+    // no new adapter.
+    let effective_repository_config_use_case = Arc::new(EffectiveRepositoryConfigUseCase::new(
+        policy_projections.clone(),
+    ));
+
     // Prefetch planner. Zero-cost unit struct;
     // the `Arc` mirrors the rest of the use-case surface.
     let prefetch_use_case = Arc::new(PrefetchUseCase::new());
@@ -2809,6 +2826,8 @@ pub async fn build_app_context(
         manual_rescan_use_case,
         patch_candidate_use_case,
         scanner_worker_query_use_case,
+        effective_repository_config_use_case,
+        gitops_apply_status: Arc::new(ArcSwap::from_pointee(gitops_apply_status)),
         prefetch_use_case,
         effective_permissions_use_case,
         rbac_resolve_use_case,

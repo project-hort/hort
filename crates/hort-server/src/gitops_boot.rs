@@ -22,9 +22,8 @@ use std::time::Instant;
 
 use hort_app::error::AppError;
 use hort_app::event_store_publisher::EventStorePublisher;
-use hort_app::use_cases::apply_config_use_case::{
-    ApplyConfigUseCase, ApplyReport, UpstreamHostAllowlist,
-};
+use hort_app::gitops_apply_status::GitopsApplyStatus;
+use hort_app::use_cases::apply_config_use_case::{ApplyConfigUseCase, UpstreamHostAllowlist};
 use hort_app::use_cases::PolicyUseCase;
 use hort_config::desired::EnvSnapshot;
 use hort_config::{DesiredState, EnvAuthProvider};
@@ -123,7 +122,7 @@ pub async fn apply_config_from_dir(
     // NOT a cross-crate edge (`EffectiveStorageBackend` is `hort-app`,
     // which `hort-server` already depends on).
     effective_storage_backend: hort_app::storage_backend::EffectiveStorageBackend,
-) -> Result<ApplyReport, GitopsBootError> {
+) -> Result<GitopsApplyStatus, GitopsBootError> {
     let started = Instant::now();
     let result = apply_inner(
         pool,
@@ -148,7 +147,7 @@ async fn apply_inner(
     extra_trust_anchors: Option<&hort_config::ExtraTrustAnchors>,
     storage: Arc<dyn StoragePort>,
     effective_storage_backend: hort_app::storage_backend::EffectiveStorageBackend,
-) -> Result<ApplyReport, GitopsBootError> {
+) -> Result<GitopsApplyStatus, GitopsBootError> {
     // ---- 1. walk the directory, collect (path, bytes) pairs ----
     let files = collect_yaml_files(config_dir)?;
     tracing::info!(
@@ -416,6 +415,13 @@ async fn apply_inner(
         };
     }
 
+    // Fingerprint the desired state BEFORE `apply` consumes it. This is
+    // the apply's `generation`: same digest on a later boot ⇒ the same
+    // configuration was applied. Computed here, once, on the state that
+    // is about to be applied — a successful `apply` is strict-atomic, so
+    // an `Ok` below means exactly this state landed.
+    let generation = hort_config::diff::desired_state_digest(&desired);
+
     let report = match apply_uc.apply(desired, env_snapshot).await {
         Ok(r) => r,
         Err(AppError::Domain(hort_domain::error::DomainError::Validation(msg))) => {
@@ -432,15 +438,18 @@ async fn apply_inner(
         }
     };
 
+    let status = GitopsApplyStatus::from_report(report, generation, chrono::Utc::now());
+
     tracing::info!(
-        created = report.created,
-        updated = report.updated,
-        deleted = report.deleted,
-        unchanged = report.unchanged,
+        generation = %status.generation,
+        created = status.created,
+        updated = status.updated,
+        deleted = status.deleted,
+        unchanged = status.unchanged,
         "gitops boot: apply succeeded"
     );
 
-    Ok(report)
+    Ok(status)
 }
 
 /// Recursively collect every `*.yaml` / `*.yml` file under `dir`.
@@ -565,7 +574,7 @@ pub fn is_park_eligible(err: &GitopsBootError) -> bool {
     }
 }
 
-fn classify_and_emit_apply_metric(result: &Result<ApplyReport, GitopsBootError>) {
+fn classify_and_emit_apply_metric(result: &Result<GitopsApplyStatus, GitopsBootError>) {
     let label = match result {
         Ok(_) => "ok",
         Err(GitopsBootError::Parse(_)) => "parse_error",

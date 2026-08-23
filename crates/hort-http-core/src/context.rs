@@ -20,8 +20,10 @@ use hort_app::use_cases::curation_use_case::CurationUseCase;
 // Repo-keyed discovery endpoint use case
 // (`GET /api/v1/repositories/{repo_key}/discovery/versions/{package}`).
 // Consumed by the `hort-http-discovery` inbound adapter.
+use hort_app::gitops_apply_status::GitopsApplyStatus;
 use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
+use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase;
@@ -309,6 +311,34 @@ pub struct AppContext {
     /// extractor enforces the same gate at the request edge) and stamps
     /// each row with derived liveness.
     pub scanner_worker_query_use_case: Arc<ScannerWorkerQueryUseCase>,
+    /// Admin-only read of the scan-policy leg of a repository's effective
+    /// config (`GET /api/v1/admin/repositories/:key/effective-config`).
+    /// Resolves the bound scan/retention policy behind the `pub(crate)`
+    /// `PolicyProjectionRepository` port (ADR 0008) so the inbound HTTP
+    /// handler never touches it directly; the repository row and upstream
+    /// mappings come from their own existing use cases / ports.
+    pub effective_repository_config_use_case: Arc<EffectiveRepositoryConfigUseCase>,
+    /// What **this process** applied from gitops at boot
+    /// (`GET /api/v1/admin/gitops/apply-status`).
+    ///
+    /// `None` when no apply ran — a DSN-only boot with no
+    /// `HORT_CONFIG_DIR`, or gitops disabled. The endpoint reports that
+    /// explicitly rather than inventing a zeroed apply.
+    ///
+    /// Held in an [`ArcSwap`], mirroring
+    /// [`AuthContext::Enabled::rbac`]: the read is lock-free on a
+    /// request path, and the seam is there if a future live-reapply path
+    /// ever needs to replace the snapshot without restarting. Today
+    /// there is no such path — gitops apply is a boot step and
+    /// restart-to-apply is the contract — so in practice this is written
+    /// once at composition and only read afterwards.
+    ///
+    /// Deliberately **not persisted**: it answers "what did *you*
+    /// apply?", which is a per-process fact. A shared row would answer
+    /// "what did whichever pod wrote last apply?", which mid-rollout is
+    /// a different pod's boot with no way for the reader to tell. See
+    /// ADR 0058.
+    pub gitops_apply_status: Arc<ArcSwap<Option<GitopsApplyStatus>>>,
     /// Prefetch trigger planner. Format crates
     /// (`hort-http-npm`, `hort-http-cargo`, `hort-http-pypi`) call
     /// [`PrefetchUseCase::plan`] from their index/metadata serve site
@@ -868,6 +898,10 @@ pub struct AppContextParts {
     pub patch_candidate_use_case: Arc<PatchCandidateUseCase>,
     /// See [`AppContext::scanner_worker_query_use_case`].
     pub scanner_worker_query_use_case: Arc<ScannerWorkerQueryUseCase>,
+    /// See [`AppContext::effective_repository_config_use_case`].
+    pub effective_repository_config_use_case: Arc<EffectiveRepositoryConfigUseCase>,
+    /// See [`AppContext::gitops_apply_status`].
+    pub gitops_apply_status: Arc<ArcSwap<Option<GitopsApplyStatus>>>,
     /// See [`AppContext::prefetch_use_case`].
     pub prefetch_use_case: Arc<PrefetchUseCase>,
     /// See [`AppContext::effective_permissions_use_case`].
@@ -995,6 +1029,8 @@ impl AppContext {
             manual_rescan_use_case: parts.manual_rescan_use_case,
             patch_candidate_use_case: parts.patch_candidate_use_case,
             scanner_worker_query_use_case: parts.scanner_worker_query_use_case,
+            effective_repository_config_use_case: parts.effective_repository_config_use_case,
+            gitops_apply_status: parts.gitops_apply_status,
             prefetch_use_case: parts.prefetch_use_case,
             effective_permissions_use_case: parts.effective_permissions_use_case,
             rbac_resolve_use_case: parts.rbac_resolve_use_case,

@@ -279,6 +279,7 @@ impl UpstreamHostAllowlist {
         }
     }
 }
+use crate::gitops_apply_status::ApplyKindCounts;
 use crate::use_cases::read_expected_version;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use crate::use_cases::{
@@ -310,6 +311,13 @@ pub struct ApplyReport {
     /// retroactive curation pass. Each emits one `CurationApplied`
     /// event AND one `ArtifactRejected` event, atomic per-artifact.
     pub retro_block_count: usize,
+    /// Per-kind breakdown of the same object deltas the aggregate
+    /// counters above roll up, projected from the apply plan so the
+    /// numbers reach the caller instead of dying with the plan.
+    ///
+    /// Covers five CRUD kinds; the aggregate spans more (see
+    /// [`ApplyKindCounts`]), so the breakdown does not sum to the total.
+    pub per_kind: ApplyKindCounts,
 }
 
 // The `RULE_TRUST_UPSTREAM_PUBLISH_TIME_REQUIRES_
@@ -1182,7 +1190,17 @@ impl ApplyConfigUseCase {
 
         // ----- plan -----
         let plan: ApplyPlan = diff(&snapshot, &desired);
-        let mut report = ApplyReport::default();
+        // The per-kind breakdown is captured from the plan up front.
+        // Every CRUD kind's apply below increments the aggregate
+        // counters from these very lists, and apply is strict-atomic
+        // (the first port failure aborts), so on the `Ok` path the
+        // planned per-kind numbers ARE the applied ones. Projected
+        // rather than recomputed — the plan is dropped at the end of
+        // this function.
+        let mut report = ApplyReport {
+            per_kind: ApplyKindCounts::from_plan(&plan),
+            ..ApplyReport::default()
+        };
 
         // Mint the typed-token at the
         // single legitimate construction site (the public entry to

@@ -18,6 +18,12 @@ pub mod curation_use_case;
 // compose the unified index pipeline
 // (`docs/architecture/explanation/index-construction.md`).
 pub mod discovery_use_case;
+// Admin-only effective-repository-config read surface
+// (`GET /api/v1/admin/repositories/:key/effective-config`). Resolves the
+// scan-policy leg (repo-scoped > global > `DefaultPolicy`) behind the
+// `pub(crate)` `PolicyProjectionRepository` port; the repository row and
+// upstream mappings come from their own existing use cases / ports.
+pub mod effective_repository_config_use_case;
 // Admin-only effective-permissions inspection surface
 // (`GET /api/v1/admin/users/:user_id/effective-permissions`).
 // The audit-time mitigation for additive-claims operator-discipline
