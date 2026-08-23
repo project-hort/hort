@@ -71,7 +71,6 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
                   ON v.repository_id = q.repository_id
                  AND v.name = q.name
                  AND v.id <> q.id
-                 AND v.is_deleted = false
                  AND v.quarantine_status = 'released'
                  AND v.created_at < q.created_at
                 JOIN LATERAL (
@@ -87,7 +86,6 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
                     WHERE sf.artifact_id = v.id
                 ) f ON f.finding_count > 0
                 WHERE q.quarantine_status = 'quarantined'
-                  AND q.is_deleted = false
                   AND r.format::text <> 'oci'
                   AND ($1::uuid IS NULL OR q.repository_id = $1)
                 ORDER BY f.max_severity_rank DESC, q.created_at DESC

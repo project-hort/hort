@@ -4024,7 +4024,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -5642,7 +5641,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

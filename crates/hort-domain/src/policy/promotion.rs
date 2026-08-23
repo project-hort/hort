@@ -251,7 +251,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: ts(0),
             updated_at: ts(0),
         }

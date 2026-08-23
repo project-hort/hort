@@ -1,9 +1,8 @@
 //! `PgPatchCandidateRepository` integration tests.
 //!
 //! Exercises the patch-candidate query end-to-end against a real Postgres. The
-//! five acceptance scenarios (basic detection, repository filter, OCI
-//! exclusion, soft-delete exclusion, severity ordering) each get their
-//! own `#[tokio::test]`.
+//! four acceptance scenarios (basic detection, repository filter, OCI
+//! exclusion, severity ordering) each get their own `#[tokio::test]`.
 //!
 //! DATABASE_URL-gated; every test early-returns silently when the env
 //! var is unset so dev environments without a database keep the suite
@@ -75,14 +74,12 @@ async fn seed_repo(pool: &PgPool, format_literal: &'static str) -> Uuid {
 /// Seed an artifact row. `created_at` lets tests order the released
 /// predecessor strictly before the quarantined sibling (the query
 /// requires `v.created_at < q.created_at`).
-#[allow(clippy::too_many_arguments)]
 async fn seed_artifact(
     pool: &PgPool,
     repo: Uuid,
     name: &str,
     version: &str,
     quarantine_status: Option<&str>,
-    is_deleted: bool,
     created_at: DateTime<Utc>,
 ) -> Uuid {
     let id = Uuid::new_v4();
@@ -94,11 +91,11 @@ async fn seed_artifact(
         r#"INSERT INTO public.artifacts (
                id, repository_id, name, name_as_published, version, path,
                size_bytes, checksum_sha256, content_type, storage_key,
-               quarantine_status, is_deleted, created_at, updated_at
+               quarantine_status, created_at, updated_at
            ) VALUES (
                $1, $2, $3, $3, $4, $5,
                0, $6, 'application/octet-stream', $6,
-               $7, $8, $9, $9
+               $7, $8, $8
            )"#,
     )
     .bind(id)
@@ -108,7 +105,6 @@ async fn seed_artifact(
     .bind(format!("{name}/{version}/{key}.tgz"))
     .bind(&sha256)
     .bind(quarantine_status)
-    .bind(is_deleted)
     .bind(created_at)
     .execute(pool)
     .await
@@ -160,36 +156,18 @@ async fn list_candidates_default_filter_returns_matching_pair() {
     let t_released = Utc::now() - Duration::hours(2);
     let t_quarantined = Utc::now() - Duration::hours(1);
 
-    let pkg_v1_0 = seed_artifact(
-        &pool,
-        repo_id,
-        "pkg",
-        "1.0",
-        Some("released"),
-        false,
-        t_released,
-    )
-    .await;
+    let pkg_v1_0 = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
     let pkg_v1_1 = seed_artifact(
         &pool,
         repo_id,
         "pkg",
         "1.1",
         Some("quarantined"),
-        false,
         t_quarantined,
     )
     .await;
-    let _other_v1_0 = seed_artifact(
-        &pool,
-        repo_id,
-        "other",
-        "1.0",
-        Some("released"),
-        false,
-        t_released,
-    )
-    .await;
+    let _other_v1_0 =
+        seed_artifact(&pool, repo_id, "other", "1.0", Some("released"), t_released).await;
     seed_finding(&pool, pkg_v1_0, "high").await;
 
     let adapter = PgPatchCandidateRepository::new(pool.clone());
@@ -240,7 +218,6 @@ async fn list_candidates_repository_filter_excludes_other_repos() {
         "pkg",
         "1.0",
         Some("released"),
-        false,
         t_released,
     )
     .await;
@@ -250,7 +227,6 @@ async fn list_candidates_repository_filter_excludes_other_repos() {
         "pkg",
         "1.1",
         Some("quarantined"),
-        false,
         t_quarantined,
     )
     .await;
@@ -296,7 +272,6 @@ async fn list_candidates_excludes_oci_format() {
         "image",
         "1.0",
         Some("released"),
-        false,
         t_released,
     )
     .await;
@@ -306,7 +281,6 @@ async fn list_candidates_excludes_oci_format() {
         "image",
         "1.1",
         Some("quarantined"),
-        false,
         t_quarantined,
     )
     .await;
@@ -344,68 +318,7 @@ async fn list_candidates_excludes_oci_format() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4 — soft-deleted quarantined rows are excluded
-// (`q.is_deleted = false`).
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn list_candidates_excludes_soft_deleted_quarantined_rows() {
-    let Some(pool) = admin_pool().await else {
-        return;
-    };
-    let repo_id = seed_repo(&pool, "npm").await;
-    let t_released = Utc::now() - Duration::hours(2);
-    let t_quarantined = Utc::now() - Duration::hours(1);
-
-    let pkg2_v1_0 = seed_artifact(
-        &pool,
-        repo_id,
-        "pkg2",
-        "1.0",
-        Some("released"),
-        false,
-        t_released,
-    )
-    .await;
-    let pkg2_v1_1_deleted = seed_artifact(
-        &pool,
-        repo_id,
-        "pkg2",
-        "1.1",
-        Some("quarantined"),
-        true, // is_deleted
-        t_quarantined,
-    )
-    .await;
-    seed_finding(&pool, pkg2_v1_0, "high").await;
-
-    let adapter = PgPatchCandidateRepository::new(pool.clone());
-    let rows = adapter
-        .list_candidates(PatchCandidateFilter {
-            repository_id: Some(repo_id),
-            ..PatchCandidateFilter::default()
-        })
-        .await
-        .expect("list_candidates");
-
-    assert!(
-        rows.is_empty(),
-        "soft-deleted quarantined row must not surface, and there are no \
-         other quarantined siblings in this scenario, so result must be empty \
-         (got {rows:#?})"
-    );
-    assert!(
-        rows.iter()
-            .all(|c| c.quarantined_artifact_id != pkg2_v1_1_deleted),
-        "soft-deleted quarantined row must not surface as a candidate"
-    );
-
-    cleanup(&pool, repo_id).await;
-}
-
-// ---------------------------------------------------------------------------
-// Test 5 — ORDER BY max_severity_rank DESC: a Critical-severity sibling
+// Test 4 — ORDER BY max_severity_rank DESC: a Critical-severity sibling
 // sorts before a High-severity sibling.
 // ---------------------------------------------------------------------------
 
@@ -420,46 +333,26 @@ async fn list_candidates_orders_by_severity_descending() {
     let t_quarantined = Utc::now() - Duration::hours(1);
 
     // The High-severity pkg pair (test #1 reproducer).
-    let pkg_v1_0 = seed_artifact(
-        &pool,
-        repo_id,
-        "pkg",
-        "1.0",
-        Some("released"),
-        false,
-        t_released,
-    )
-    .await;
+    let pkg_v1_0 = seed_artifact(&pool, repo_id, "pkg", "1.0", Some("released"), t_released).await;
     let pkg_v1_1 = seed_artifact(
         &pool,
         repo_id,
         "pkg",
         "1.1",
         Some("quarantined"),
-        false,
         t_quarantined,
     )
     .await;
     seed_finding(&pool, pkg_v1_0, "high").await;
 
     // The Critical-severity lib pair.
-    let lib_v1_0 = seed_artifact(
-        &pool,
-        repo_id,
-        "lib",
-        "1.0",
-        Some("released"),
-        false,
-        t_released,
-    )
-    .await;
+    let lib_v1_0 = seed_artifact(&pool, repo_id, "lib", "1.0", Some("released"), t_released).await;
     let lib_v1_1 = seed_artifact(
         &pool,
         repo_id,
         "lib",
         "1.1",
         Some("quarantined"),
-        false,
         t_quarantined,
     )
     .await;

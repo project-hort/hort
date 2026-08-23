@@ -27,7 +27,6 @@
 //! WHERE quarantine_status = 'quarantined'
 //!   AND repository_id = ANY($repos_for_D)
 //!   AND quarantine_window_start <= $now - D
-//!   AND is_deleted = false
 //! ```
 //!
 //! The partial index `idx_artifacts_quarantine_window_start ON
@@ -166,7 +165,6 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
                 SELECT DISTINCT repository_id
                 FROM artifacts
                 WHERE quarantine_status = 'quarantined'
-                  AND is_deleted = false
                   AND quarantine_window_start IS NOT NULL
                 "#,
             )
@@ -236,7 +234,6 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
                     SELECT id AS artifact_id
                     FROM artifacts
                     WHERE quarantine_status = 'quarantined'
-                      AND is_deleted = false
                       AND repository_id = ANY($1)
                       AND quarantine_window_start <= $2
                     ORDER BY quarantine_window_start
@@ -342,11 +339,11 @@ mod tests {
             r#"INSERT INTO public.artifacts (
                    id, repository_id, name, name_as_published, version, path,
                    size_bytes, checksum_sha256, content_type, storage_key,
-                   quarantine_status, is_deleted, quarantine_window_start
+                   quarantine_status, quarantine_window_start
                ) VALUES (
                    $1, $2, 'qrc-it', 'qrc-it', '0.0.0', $3,
                    0, $4, 'application/octet-stream', $4,
-                   'quarantined', false, $5
+                   'quarantined', $5
                )"#,
         )
         .bind(id)

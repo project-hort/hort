@@ -967,7 +967,7 @@ impl ArtifactUseCase {
     /// **Hot path.** This is called on every packument / sparse-index /
     /// simple-index serve. The adapter relies on the
     /// covering index `artifacts (repository_id, name) INCLUDE
-    /// (version, quarantine_status) WHERE NOT is_deleted`
+    /// (version, quarantine_status)`
     /// for an index-only scan; callers must NOT page-fan-out this method.
     ///
     /// **Return shape.** The port carries a third tuple
@@ -1162,7 +1162,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -2648,7 +2647,6 @@ mod visibility_extension_tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }

@@ -179,7 +179,6 @@ pub struct Artifact {
     /// opt-in (interaction constraints: ADR 0016).
     pub upstream_published_at: Option<DateTime<Utc>>,
     pub uploaded_by: Option<Uuid>,
-    pub is_deleted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1350,7 +1349,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: Some(Uuid::nil()),
-            is_deleted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
