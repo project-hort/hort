@@ -1841,6 +1841,21 @@ scheduledTasks:
   verifyEventChain:
     executionPath: admin-task
     enabled: false
+    # Treat a missing/stale/gapped anchoring checkpoint as a failure
+    # (CLI default, exit 3). Leave it `true` wherever `eventstoreCheckpoint`
+    # above is enabled: there, a missing checkpoint means the emitter is
+    # broken and the run SHOULD go red.
+    #
+    # Set it to `false` on installs that verify chain integrity but have not
+    # deployed WORM anchoring — the filesystem backend, or any S3 install
+    # without the Ed25519 anchor keys and an Object-Lock bucket. Without this
+    # knob such an install can only choose between a CronJob that fails every
+    # single night on `missing_checkpoint` and no verification at all, even
+    # though the chain check itself is exactly what it wants. The runbook
+    # recommends `--fail-on-missing-checkpoint=false` for that case; this
+    # exposes it. The chain-integrity verdict is unaffected — a genuinely
+    # broken chain still fails either way.
+    failOnMissingCheckpoint: true
     # Default cadence — daily, matching the boot gauge's
     # HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS default (86400 s).
     # Operators with a tighter compliance window may shorten both in
