@@ -1127,6 +1127,13 @@
             "batchSize": {"type": "integer", "minimum": 1},
             "maxAttempts": {"type": "integer", "minimum": 1},
             "lockDurationSecs": {"type": "integer", "minimum": 1},
+            "findingMerge": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "allowInformedDowngrade": {"type": "boolean"}
+              }
+            },
             "trivy": {
               "type": "object",
               "additionalProperties": false,

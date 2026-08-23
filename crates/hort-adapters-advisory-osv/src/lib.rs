@@ -45,7 +45,9 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::advisory::{AdvisoryDiffResult, AdvisoryPort};
 use hort_domain::ports::ephemeral_store::EphemeralStore;
-use hort_domain::types::{is_informational_class, Ecosystem, Finding, SbomComponent};
+use hort_domain::types::{
+    collapse_alias_groups, is_informational_class, Ecosystem, Finding, SbomComponent, SeverityBasis,
+};
 
 use crate::bulk::{osv_label_to_ecosystem, pull_one_ecosystem, BulkFetchErrorKind};
 use crate::ingest_metrics::emit_advisory_ingest_count;
@@ -436,7 +438,12 @@ impl OsvAdvisoryAdapter {
             .iter()
             .filter_map(|sv| sv.score.as_deref())
             .find_map(severity::cvss_vector_base_score);
-        let severity = cvss_score
+        // The severity we could actually *read*. `None` means no reading
+        // was possible at all, so the `Critical` below is a floor rather
+        // than an assessment — `severity_basis` records which, so the
+        // cross-backend merge can prefer a better-informed sibling for the
+        // same advisory (ADR 0059).
+        let assessed_severity = cvss_score
             .and_then(severity::cvss_score_to_severity)
             .or_else(|| {
                 vuln.database_specific
@@ -448,8 +455,12 @@ impl OsvAdvisoryAdapter {
                 Some(SeverityThreshold::Low)
             } else {
                 None
-            })
-            .unwrap_or(SeverityThreshold::Critical);
+            });
+        let severity = assessed_severity.unwrap_or(SeverityThreshold::Critical);
+        let severity_basis = match assessed_severity {
+            Some(_) => SeverityBasis::Assessed,
+            None => SeverityBasis::Unassessed,
+        };
 
         // Title: prefer the one-line summary; else the long-form
         // details; else the vuln id (so the field is never empty).
@@ -551,6 +562,7 @@ impl OsvAdvisoryAdapter {
             references,
             aliases,
             informational_class,
+            severity_basis,
         }
     }
 }
@@ -609,9 +621,12 @@ impl AdvisoryPort for OsvAdvisoryAdapter {
                 }
             }
 
-            // No misses → all answers came from cache.
+            // No misses → all answers came from cache. Collapse anyway:
+            // entries written before alias-group collapsing shipped hold
+            // one finding per mirror record, and they stay readable until
+            // the cache TTL expires them.
             if to_fetch.is_empty() {
-                return Ok(findings);
+                return Ok(collapse_alias_groups(findings));
             }
 
             // Chunk misses into `batch_size` batches and POST each. The
@@ -680,7 +695,17 @@ impl AdvisoryPort for OsvAdvisoryAdapter {
                 findings.extend(comp_findings);
             }
 
-            Ok(findings)
+            // OSV returns a RustSec advisory and its GitHub-reviewed GHSA
+            // mirror as separate records in the same response, and the
+            // mirror frequently carries neither a severity nor an
+            // informational marker — so it lowers to the SUP-4 fail-closed
+            // `Critical` and would otherwise shadow the sibling that
+            // actually carries the advisory's metadata. The cross-backend
+            // merge cannot reconcile them: they have different advisory
+            // ids. Collapse mutually-aliased findings to their
+            // best-informed member here, once, over the whole result set
+            // — cache hits included (ADR 0059).
+            Ok(collapse_alias_groups(findings))
         }
         .boxed()
     }

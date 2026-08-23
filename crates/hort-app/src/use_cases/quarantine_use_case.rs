@@ -2188,6 +2188,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: hort_domain::types::SeverityBasis::Assessed,
             });
         }
         for i in 0..severity.high {
@@ -2202,6 +2203,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: hort_domain::types::SeverityBasis::Assessed,
             });
         }
         for i in 0..severity.medium {
@@ -2216,6 +2218,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: hort_domain::types::SeverityBasis::Assessed,
             });
         }
         for i in 0..severity.low {
@@ -2230,6 +2233,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: hort_domain::types::SeverityBasis::Assessed,
             });
         }
         out
@@ -3470,6 +3474,7 @@ mod tests {
             references: vec![],
             aliases: vec![],
             informational_class: None,
+            severity_basis: hort_domain::types::SeverityBasis::Assessed,
         }];
         uc.record_scan_result(artifact_id, "trivy".into(), findings, None)
             .await
@@ -6690,6 +6695,7 @@ mod tests {
                 references: refs.clone(),
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: hort_domain::types::SeverityBasis::Assessed,
             });
         }
         // Sanity: confirm we cleared the cap before invoking the use case.

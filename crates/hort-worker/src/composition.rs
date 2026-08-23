@@ -506,6 +506,7 @@ pub async fn build_app_context(
     let mut orch_cfg = ScanOrchestrationConfig::defaults_for_worker(cfg.worker_id.clone());
     orch_cfg.max_attempts = cfg.max_attempts;
     orch_cfg.default_scan_backends = healthy_names.clone();
+    orch_cfg.allow_informed_downgrade = cfg.finding_merge_allow_informed_downgrade;
 
     let artifact_metadata: Arc<dyn ArtifactMetadataRepository> = metadata_concrete.clone();
 

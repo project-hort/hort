@@ -612,6 +612,7 @@ neither set the error surfaces the name `"DATABASE_URL"`.
 | `HORT_SCANNER_BATCH_SIZE` | u32 | `4` | No | Jobs claimed per poll (clamped to `u16::MAX`). |
 | `HORT_SCANNER_MAX_ATTEMPTS` | u32 | `5` | No | Max scan attempts before a job is failed. |
 | `HORT_SCANNER_LOCK_DURATION_SECS` | u64 | `900` (15 min) | No | Job lock / lease duration. |
+| `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE` | bool | `true` | No | Break-glass switch for the cross-backend finding merge (ADR 0059). Default: for one advisory reported by two backends, the reading that actually assessed a severity supersedes one whose `Critical` is the fail-closed floor a backend fell back to — across tiers, so a scored `Medium` wins over an unassessed `Critical`. `false` reverts to strict always-fail-closed (the floor wins on tier alone), which makes the release gate **stricter**. Set from `worker.scanner.findingMerge.allowInformedDowngrade`. |
 
 ### Scanner & advisory adapters
 

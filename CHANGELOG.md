@@ -67,6 +67,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A scan finding whose severity a backend could not read no longer
+  discards another backend's correctly-scored reading of the same
+  advisory.** When a backend cannot determine a severity it emits the
+  fail-closed `Critical` floor — a record byte-identical to a genuine
+  unscored `Critical` (same tier, no CVSS, no informational class). The
+  cross-backend merge compared collisions on severity tier alone, so that
+  floor won every time, including against a scored finding for the same
+  advisory: `rsa 0.9.10` / `RUSTSEC-2023-0071` sat terminally rejected for
+  six weeks on a verdict no backend had actually reached, reproducibly,
+  because the merge was deterministic over unchanged inputs. `Finding`
+  now carries `severity_basis` (`assessed` / `unassessed`), emitted
+  `unassessed` at the three fail-closed sites and nowhere else, and the
+  merge prefers a finding that carries a real reading — a CVSS score, a
+  recognised informational class, or an `assessed` marker — over one that
+  does not, **across severity tiers**. Two real readings still compare by
+  tier, so a scored `Low` never talks down a scored `Critical`. Findings
+  persisted before the field existed deserialise as `assessed`, the
+  fail-safe: a legacy record cannot be proven to be a fail-closed default,
+  so it keeps today's behaviour rather than becoming demotable. New
+  break-glass switch `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE`
+  (default `true`; Helm `worker.scanner.findingMerge.allowInformedDowngrade`)
+  reverts the merge to strict always-fail-closed — engaging it makes the
+  release gate stricter, not looser. See
+  [ADR 0059](docs/adr/0059-finding-reconciliation.md). (#177)
+
+- **One advisory returned under two ids no longer rejects a package
+  twice over.** OSV returns a RustSec advisory *and* its GitHub-reviewed
+  GHSA mirror as separate records in the same response. The mirror
+  frequently carries neither a severity nor an informational marker, so
+  it fell back to the fail-closed `Critical` and shadowed the sibling
+  that does carry the advisory's metadata — and the cross-backend merge
+  could not reconcile the pair, because the two records have **different
+  advisory ids**. `rand 0.7.3` and `typemap 0.3.3` were rejected this
+  way, on a verdict no backend reached, with `rejected` terminal for
+  serving. Both OSV adapters now collapse mutually-aliased findings for
+  a package into one finding per advisory, keeping the best-informed
+  member: a real CVSS beats a recognised informational class, which
+  beats a severity read without a score, which beats the fail-closed
+  floor. A genuinely-scored advisory therefore still blocks —
+  `traitobject 0.1.1` (CVSS 9.8) stays rejected. The collapsed-away
+  identifiers are unioned onto the surviving finding's aliases, so an
+  operator exclusion keyed by any of them still clears the advisory.
+  Artifacts already in the terminal `rejected` state are not freed
+  automatically; see
+  [ADR 0059](docs/adr/0059-finding-reconciliation.md) for the operator
+  paths. (#174)
+
 - **The quarantine-release sweep no longer strands artifacts in a
   repository whose scan-policy row does not resolve.** Sweep candidacy was
   the only consumer of the quarantine window without a `DefaultPolicy`

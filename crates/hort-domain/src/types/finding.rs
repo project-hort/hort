@@ -40,7 +40,7 @@ const MAX_REFERENCES: usize = 32;
 /// databases without becoming a vector for unbounded scanner output.
 /// Each alias is byte-capped via [`MAX_VULNERABILITY_ID_LEN`] (same
 /// cap as the primary `vulnerability_id` field).
-const MAX_ALIASES: usize = 16;
+pub(crate) const MAX_ALIASES: usize = 16;
 
 /// One vulnerability finding produced by a scanner backend, keyed on
 /// `(purl, vulnerability_id)` for delta computation against a prior
@@ -130,6 +130,54 @@ pub struct Finding {
     /// struct.
     #[serde(default)]
     pub informational_class: Option<String>,
+    /// Whether the backend that produced this finding actually *read* a
+    /// severity, or fell back to the unconditional `Critical` default
+    /// because it could not determine one. See [`SeverityBasis`].
+    ///
+    /// `#[serde(default)]` yields [`SeverityBasis::Assessed`] — the
+    /// fail-safe. A record written before this field existed cannot be
+    /// proven to be a fail-closed default, so it keeps the pre-existing
+    /// "a `Critical` always wins the merge" behaviour and is never talked
+    /// down by a better-informed sibling. Defaulting to `Unassessed`
+    /// instead would let a scored `Low` demote a legacy *genuine*
+    /// `Critical`, which is a fail-open regression (ADR 0007). Same
+    /// no-re-validation posture as every other shape-evolution on this
+    /// struct.
+    #[serde(default)]
+    pub severity_basis: SeverityBasis,
+}
+
+/// Whether a finding's `severity` is a real reading or the fail-closed
+/// default.
+///
+/// Two findings for the same advisory can be byte-identical
+/// (`Critical` / no CVSS / no informational class) and yet mean opposite
+/// things: one backend genuinely assessed the advisory as critical, another
+/// simply could not parse a severity at all and fell back to the highest
+/// tier (the fail-closed default that keeps an unreadable finding from
+/// slipping under a block threshold). Persisting *which* of the two it is
+/// lets the cross-backend merge keep the better-informed reading instead of
+/// discarding it — see [`Finding::is_informed`] and ADR 0059.
+///
+/// Persist the fact, derive the interpretation: this records what the
+/// backend did, not what the merge should conclude from it (the same shape
+/// as [`Finding::informational_class`], ADR 0040).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeverityBasis {
+    /// The backend produced a real severity reading — a parsed CVSS score,
+    /// a recognised severity label, or an informational classification.
+    ///
+    /// The `Default`, and therefore what `#[serde(default)]` yields for a
+    /// record persisted before the field existed: the fail-safe reading
+    /// that never talks a legacy finding down.
+    #[default]
+    Assessed,
+    /// The backend could **not** determine a severity and fell back to the
+    /// unconditional `Critical` default. The `Critical` carries no
+    /// information about the advisory beyond "unreadable"; it is a floor,
+    /// not an assessment.
+    Unassessed,
 }
 
 /// Recognises the OSV `database_specific.informational` classes that mark a
@@ -215,9 +263,11 @@ pub fn highest_severity(findings: &[Finding]) -> Option<SeverityThreshold> {
 }
 
 /// Numeric tier where `0 = Critical` and `3 = Low`. Lower number =
-/// higher severity. Internal helper for [`highest_severity`] and the
+/// higher severity. Internal helper for [`highest_severity`], the
+/// alias-group winner tie-break in
+/// [`super::alias_group::collapse_alias_groups`], and the
 /// `merge_findings` collision policy in `hort-app::scan_orchestration`.
-fn severity_tier(s: SeverityThreshold) -> u8 {
+pub(crate) fn severity_tier(s: SeverityThreshold) -> u8 {
     match s {
         SeverityThreshold::Critical => 0,
         SeverityThreshold::High => 1,
@@ -246,6 +296,26 @@ impl Finding {
                 .informational_class
                 .as_deref()
                 .is_some_and(is_informational_class)
+    }
+
+    /// Whether this finding carries a real severity reading, in any of the
+    /// three forms that count as one: a parsed CVSS score, a recognised
+    /// informational classification, or a [`SeverityBasis::Assessed`]
+    /// marker from the producing backend.
+    ///
+    /// The complement — [`SeverityBasis::Unassessed`] with neither a score
+    /// nor an informational class — is a finding whose `severity` is the
+    /// fail-closed `Critical` floor rather than an assessment of the
+    /// advisory. The cross-backend merge prefers an informed reading over
+    /// an uninformed one for the same advisory, across severity tiers, so
+    /// one backend's "I could not read this" does not discard another's
+    /// correct reading (ADR 0059). Two *informed* findings still compare by
+    /// severity tier, so a scored `Critical` is never talked down by a
+    /// scored `Low` (ADR 0007).
+    pub fn is_informed(&self) -> bool {
+        matches!(self.severity_basis, SeverityBasis::Assessed)
+            || self.cvss_score.is_some()
+            || self.is_informational()
     }
 
     /// Validate the per-finding length caps.
@@ -324,6 +394,7 @@ mod tests {
             references: vec!["https://nvd.nist.gov/vuln/detail/CVE-2021-23337".into()],
             aliases: vec!["GHSA-35jh-r3h4-6jhm".into()],
             informational_class: None,
+            severity_basis: SeverityBasis::Assessed,
         }
     }
 
@@ -350,6 +421,7 @@ mod tests {
             references: vec![],
             aliases: vec![],
             informational_class: None,
+            severity_basis: SeverityBasis::Assessed,
         };
         let json = serde_json::to_string(&f).unwrap();
         let back: Finding = serde_json::from_str(&json).unwrap();
@@ -547,6 +619,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: SeverityBasis::Assessed,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -559,6 +632,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: SeverityBasis::Assessed,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -571,6 +645,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: SeverityBasis::Assessed,
             },
             Finding {
                 purl: "pkg:npm/d@1".into(),
@@ -583,6 +658,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: SeverityBasis::Assessed,
             },
             Finding {
                 purl: "pkg:npm/e@1".into(),
@@ -595,6 +671,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: SeverityBasis::Assessed,
             },
         ];
         let s = severity_summary_from_findings(&findings);
@@ -774,6 +851,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: SeverityBasis::Assessed,
             },
             Finding {
                 purl: "pkg:npm/b@1".into(),
@@ -786,6 +864,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: SeverityBasis::Assessed,
             },
             Finding {
                 purl: "pkg:npm/c@1".into(),
@@ -798,6 +877,7 @@ mod tests {
                 references: vec![],
                 aliases: vec![],
                 informational_class: None,
+                severity_basis: SeverityBasis::Assessed,
             },
         ];
         assert_eq!(highest_severity(&findings), Some(SeverityThreshold::High));
@@ -833,5 +913,128 @@ mod tests {
         // ... and validate() rejects the same value.
         let err = parsed.validate().unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ----- SeverityBasis ---------------------------------------------------
+
+    /// Backward compatibility, and the fail-safe half of the merge rule. A
+    /// finding persisted before `severity_basis` existed carries no such
+    /// field; it MUST deserialise as `Assessed`. A legacy record cannot be
+    /// proven to be a fail-closed default, so defaulting it to
+    /// `Unassessed` would let a scored `Low` talk down a legacy *genuine*
+    /// `Critical` — a fail-open regression against ADR 0007. The stranded
+    /// legacy fail-closed records are un-stuck by re-emission with a
+    /// correct basis, not by a permissive default.
+    #[test]
+    fn legacy_finding_without_severity_basis_deserialises_as_assessed() {
+        let raw = serde_json::json!({
+            "purl": "pkg:cargo/rsa@0.9.10",
+            "vulnerability_id": "RUSTSEC-2023-0071",
+            "severity": "Critical",
+            "cvss_score": null,
+            "title": "Marvin Attack",
+            "fixed_versions": [],
+            "source_scanner": "trivy",
+            "references": [],
+        })
+        .to_string();
+        let parsed: Finding = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.severity_basis, SeverityBasis::Assessed);
+        assert!(
+            parsed.is_informed(),
+            "a legacy record is informed, so it is never demoted by the merge",
+        );
+    }
+
+    #[test]
+    fn severity_basis_round_trips_through_serde() {
+        for basis in [SeverityBasis::Assessed, SeverityBasis::Unassessed] {
+            let mut f = valid_finding();
+            f.severity_basis = basis;
+            let raw = serde_json::to_string(&f).unwrap();
+            let parsed: Finding = serde_json::from_str(&raw).unwrap();
+            assert_eq!(parsed.severity_basis, basis);
+        }
+    }
+
+    #[test]
+    fn severity_basis_wire_spelling_is_snake_case() {
+        let mut f = valid_finding();
+        f.severity_basis = SeverityBasis::Unassessed;
+        let raw = serde_json::to_string(&f).unwrap();
+        assert!(raw.contains("\"severity_basis\":\"unassessed\""), "{raw}");
+    }
+
+    #[test]
+    fn severity_basis_default_is_assessed() {
+        assert_eq!(SeverityBasis::default(), SeverityBasis::Assessed);
+    }
+
+    #[test]
+    fn severity_basis_debug_and_clone_are_available() {
+        let basis = SeverityBasis::Unassessed;
+        #[allow(clippy::clone_on_copy)]
+        let cloned = basis.clone();
+        assert_eq!(cloned, basis);
+        assert!(format!("{basis:?}").contains("Unassessed"));
+    }
+
+    // ----- is_informed -----------------------------------------------------
+
+    /// The only uninformed shape: `Unassessed`, no CVSS, no recognised
+    /// informational class. This is what all three SUP-4 fail-closed sites
+    /// emit when a backend cannot read a severity at all.
+    #[test]
+    fn unassessed_without_score_or_class_is_not_informed() {
+        let mut f = valid_finding();
+        f.severity_basis = SeverityBasis::Unassessed;
+        f.cvss_score = None;
+        f.informational_class = None;
+        assert!(!f.is_informed());
+    }
+
+    #[test]
+    fn assessed_without_score_or_class_is_informed() {
+        let mut f = valid_finding();
+        f.severity_basis = SeverityBasis::Assessed;
+        f.cvss_score = None;
+        f.informational_class = None;
+        assert!(f.is_informed());
+    }
+
+    /// Defensive: a real CVSS is a severity reading whatever the basis
+    /// marker says, so a mis-marked `Unassessed` scored finding is still
+    /// informed and cannot be demoted by the merge.
+    #[test]
+    fn unassessed_with_a_cvss_score_is_still_informed() {
+        let mut f = valid_finding();
+        f.severity_basis = SeverityBasis::Unassessed;
+        f.cvss_score = Some(7.5);
+        f.informational_class = None;
+        assert!(f.is_informed());
+    }
+
+    /// An informational classification is itself a reading (ADR 0040), so
+    /// it counts as informed even when the basis marker says otherwise.
+    #[test]
+    fn unassessed_with_a_recognised_informational_class_is_informed() {
+        let mut f = valid_finding();
+        f.severity_basis = SeverityBasis::Unassessed;
+        f.cvss_score = None;
+        f.informational_class = Some("unmaintained".to_string());
+        assert!(f.is_informational(), "fixture sanity");
+        assert!(f.is_informed());
+    }
+
+    /// An *unrecognised* class string is not a classification, so it does
+    /// not rescue an `Unassessed` finding from the uninformed lane — the
+    /// same recogniser gate `is_informational()` applies.
+    #[test]
+    fn unassessed_with_an_unrecognised_class_is_not_informed() {
+        let mut f = valid_finding();
+        f.severity_basis = SeverityBasis::Unassessed;
+        f.cvss_score = None;
+        f.informational_class = Some("mystery".to_string());
+        assert!(!f.is_informed());
     }
 }

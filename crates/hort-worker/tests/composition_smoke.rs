@@ -191,6 +191,7 @@ async fn build_app_context_registers_seed_import_handler() {
         max_attempts: 5,
         lock_duration: std::time::Duration::from_secs(900),
         worker_id: "hort-worker-smoke".to_string(),
+        finding_merge_allow_informed_downgrade: true,
         rotation_namespaces: std::collections::HashSet::new(),
         public_registry_host: None,
         include_service_account_label: true,
@@ -296,6 +297,7 @@ fn build_app_context_signature_compiles() {
             max_attempts: 5,
             lock_duration: std::time::Duration::from_secs(900),
             worker_id: String::new(),
+            finding_merge_allow_informed_downgrade: true,
             // Rotation reconciler config slots.
             rotation_namespaces: std::collections::HashSet::new(),
             public_registry_host: None,

@@ -29,7 +29,7 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
-use hort_domain::types::Finding;
+use hort_domain::types::{Finding, SeverityBasis};
 
 use crate::BoxFuture;
 
@@ -86,6 +86,15 @@ impl FindingRow {
             references: Vec::new(),
             aliases: Vec::new(),
             informational_class: self.informational_class,
+            // The projection has no `severity_basis` column and does not
+            // need one: the cross-backend merge runs over in-flight
+            // backend output and the CAS `findings_blob`, never over these
+            // rows. `Assessed` is the fail-safe reconstruction — it is the
+            // same value `#[serde(default)]` yields for a record written
+            // before the field existed, so a projection-sourced finding
+            // behaves identically to a legacy blob-sourced one and is
+            // never talked down by a lower reading.
+            severity_basis: SeverityBasis::Assessed,
         })
     }
 }

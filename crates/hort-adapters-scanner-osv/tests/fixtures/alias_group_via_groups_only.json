@@ -1,0 +1,113 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "/tmp/sbom.cdx.json",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "typemap",
+            "version": "0.3.3",
+            "ecosystem": "crates.io"
+          },
+          "groups": [
+            {
+              "ids": [
+                "GHSA-vfv3-9w6v-23jp",
+                "RUSTSEC-2019-0039"
+              ],
+              "aliases": [
+                "GHSA-vfv3-9w6v-23jp",
+                "RUSTSEC-2019-0039"
+              ],
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "GHSA-vfv3-9w6v-23jp",
+              "modified": "2021-08-25T20:53:52.000000000Z",
+              "published": "2019-11-16T12:00:00Z",
+              "schema_version": "1.7.5",
+              "summary": "typemap advisory",
+              "affected": [
+                {
+                  "package": {
+                    "ecosystem": "crates.io",
+                    "name": "typemap",
+                    "purl": "pkg:cargo/typemap"
+                  },
+                  "ranges": [
+                    {
+                      "events": [
+                        {
+                          "introduced": "0.0.0-0"
+                        }
+                      ],
+                      "type": "SEMVER"
+                    }
+                  ]
+                }
+              ],
+              "references": [
+                {
+                  "type": "ADVISORY",
+                  "url": "https://github.com/advisories/GHSA-vfv3-9w6v-23jp"
+                }
+              ]
+            },
+            {
+              "id": "RUSTSEC-2019-0039",
+              "modified": "2021-10-20T12:00:00.000000000Z",
+              "published": "2019-11-16T12:00:00Z",
+              "schema_version": "1.7.5",
+              "summary": "typemap is unmaintained",
+              "affected": [
+                {
+                  "database_specific": {
+                    "categories": [],
+                    "cvss": null,
+                    "informational": "unmaintained",
+                    "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2019-0039.json"
+                  },
+                  "package": {
+                    "ecosystem": "crates.io",
+                    "name": "typemap",
+                    "purl": "pkg:cargo/typemap"
+                  },
+                  "ranges": [
+                    {
+                      "events": [
+                        {
+                          "introduced": "0.0.0-0"
+                        }
+                      ],
+                      "type": "SEMVER"
+                    }
+                  ]
+                }
+              ],
+              "database_specific": {
+                "license": "CC0-1.0"
+              },
+              "references": [
+                {
+                  "type": "ADVISORY",
+                  "url": "https://rustsec.org/advisories/RUSTSEC-2019-0039.html"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}

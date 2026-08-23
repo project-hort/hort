@@ -258,6 +258,7 @@ mod tests {
             references: vec![],
             aliases: vec![],
             informational_class: None,
+            severity_basis: hort_domain::types::SeverityBasis::Assessed,
         }
     }
 

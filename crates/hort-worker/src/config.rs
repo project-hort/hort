@@ -213,6 +213,22 @@ pub struct WorkerConfig {
     pub max_attempts: u32,
     pub lock_duration: Duration,
     pub worker_id: String,
+    /// Break-glass switch for the cross-backend finding merge's
+    /// information-quality rule (ADR 0059). Parsed from
+    /// `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE`, **default `true`**.
+    ///
+    /// `true` (default): for the same advisory, a finding whose severity a
+    /// backend actually *read* supersedes one whose `Critical` is the
+    /// fail-closed floor a backend fell back to when it could not read a
+    /// severity — across severity tiers. `false`: the floor wins on tier
+    /// alone, the strict always-fail-closed behaviour that predates the
+    /// rule. Setting `false` makes the release gate **stricter**, so this
+    /// is a fail-closed escape hatch rather than a relaxation. Threaded
+    /// onto `ScanOrchestrationConfig::allow_informed_downgrade` and read on
+    /// every merge — a config field the consumer ignored would be an inert
+    /// operator surface (ADR 0015). The Helm chart wires this from
+    /// `worker.scanner.findingMerge.allowInformedDowngrade`.
+    pub finding_merge_allow_informed_downgrade: bool,
     /// Set of k8s namespaces the `ServiceAccountRotationHandler` is
     /// permitted to write Secrets in. Sourced from
     /// `HORT_ROTATION_TARGET_NAMESPACES` (comma-separated). Default empty
@@ -338,6 +354,7 @@ impl std::fmt::Debug for WorkerConfig {
             max_attempts,
             lock_duration,
             worker_id,
+            finding_merge_allow_informed_downgrade,
             rotation_namespaces,
             public_registry_host,
             include_service_account_label,
@@ -378,6 +395,10 @@ impl std::fmt::Debug for WorkerConfig {
             .field("max_attempts", max_attempts)
             .field("lock_duration", lock_duration)
             .field("worker_id", worker_id)
+            .field(
+                "finding_merge_allow_informed_downgrade",
+                finding_merge_allow_informed_downgrade,
+            )
             .field("rotation_namespaces", rotation_namespaces)
             .field("public_registry_host", public_registry_host)
             .field(
@@ -525,6 +546,12 @@ impl WorkerConfig {
         let lock_duration =
             Duration::from_secs(parse_u64_default("HORT_SCANNER_LOCK_DURATION_SECS", 900)?);
         let worker_id = parse_worker_id();
+        // Break-glass switch for the finding-merge information-quality
+        // rule (ADR 0059). Default `true` — the rule is on; setting
+        // `false` reverts to strict always-fail-closed, which makes the
+        // gate stricter.
+        let finding_merge_allow_informed_downgrade =
+            parse_bool_default("HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE", true)?;
         // Rotation handler target namespaces + registry host. Empty
         // default for namespaces is safe; missing
         // `HORT_PUBLIC_REGISTRY_HOST` is surfaced as `None` and the
@@ -628,6 +655,7 @@ impl WorkerConfig {
             max_attempts,
             lock_duration,
             worker_id,
+            finding_merge_allow_informed_downgrade,
             rotation_namespaces,
             public_registry_host,
             include_service_account_label,
@@ -1010,6 +1038,8 @@ mod tests {
         "HORT_SCANNER_LOCK_DURATION_SECS",
         "HORT_WORKER_ID",
         "POD_NAME",
+        // Finding-merge break-glass switch (ADR 0059).
+        "HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE",
         // Rotation handler env-var surface.
         "HORT_ROTATION_TARGET_NAMESPACES",
         "HORT_PUBLIC_REGISTRY_HOST",
@@ -1106,6 +1136,12 @@ mod tests {
             cfg.worker_id.starts_with("pod-") && cfg.worker_id.len() == 4 + 8,
             "worker_id default shape unexpected: {:?}",
             cfg.worker_id
+        );
+        // The finding-merge information-quality rule is ON by default; the
+        // switch exists to turn it off (which makes the gate stricter).
+        assert!(
+            cfg.finding_merge_allow_informed_downgrade,
+            "HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE default must be true"
         );
     }
 
@@ -1505,6 +1541,40 @@ mod tests {
         match err {
             ConfigError::InvalidValue { var, .. } => {
                 assert_eq!(var, "HORT_SCANNER_TRIVY_ENABLED");
+            }
+            other => panic!("expected InvalidValue, got {other:?}"),
+        }
+    }
+
+    // -- Finding-merge break-glass switch (ADR 0059) -----------------------
+
+    #[test]
+    fn finding_merge_switch_parses_false_when_set() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE", "false");
+
+        let cfg = WorkerConfig::from_env().expect("parses with the merge switch engaged");
+        assert!(
+            !cfg.finding_merge_allow_informed_downgrade,
+            "HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE=false must land on the config"
+        );
+    }
+
+    #[test]
+    fn finding_merge_switch_invalid_value_returns_invalid_value_error() {
+        let _g = lock_env();
+        clear_all();
+        std::env::set_var("HORT_DATABASE_URL", "postgres://x/y");
+        std::env::set_var("HORT_STORAGE_FILESYSTEM_PATH", "/tmp/hort");
+        std::env::set_var("HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE", "sometimes");
+
+        let err = WorkerConfig::from_env().expect_err("non-bool merge switch must error");
+        match err {
+            ConfigError::InvalidValue { var, .. } => {
+                assert_eq!(var, "HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE");
             }
             other => panic!("expected InvalidValue, got {other:?}"),
         }

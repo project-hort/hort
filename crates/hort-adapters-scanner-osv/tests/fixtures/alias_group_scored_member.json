@@ -1,0 +1,175 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "/tmp/sbom.cdx.json",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "traitobject",
+            "version": "0.1.1",
+            "ecosystem": "crates.io"
+          },
+          "groups": [
+            {
+              "ids": [
+                "GHSA-pp8r-vv2j-9j5v",
+                "RUSTSEC-2020-0027"
+              ],
+              "aliases": [
+                "GHSA-pp8r-vv2j-9j5v",
+                "RUSTSEC-2020-0027"
+              ],
+              "max_severity": "9.8"
+            },
+            {
+              "ids": [
+                "RUSTSEC-2021-0144"
+              ],
+              "aliases": [
+                "RUSTSEC-2021-0144"
+              ],
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "GHSA-pp8r-vv2j-9j5v",
+              "modified": "2021-08-25T20:53:52.000000000Z",
+              "published": "2021-08-25T20:00:00Z",
+              "schema_version": "1.7.5",
+              "summary": "traitobject: unsound trait object handling",
+              "aliases": [
+                "RUSTSEC-2020-0027"
+              ],
+              "affected": [
+                {
+                  "package": {
+                    "ecosystem": "crates.io",
+                    "name": "traitobject",
+                    "purl": "pkg:cargo/traitobject"
+                  },
+                  "ranges": [
+                    {
+                      "events": [
+                        {
+                          "introduced": "0.0.0-0"
+                        }
+                      ],
+                      "type": "SEMVER"
+                    }
+                  ]
+                }
+              ],
+              "references": [
+                {
+                  "type": "ADVISORY",
+                  "url": "https://github.com/advisories/GHSA-pp8r-vv2j-9j5v"
+                }
+              ]
+            },
+            {
+              "id": "RUSTSEC-2020-0027",
+              "modified": "2021-08-25T20:54:11.000000000Z",
+              "published": "2020-09-22T12:00:00Z",
+              "schema_version": "1.7.5",
+              "summary": "traitobject allows transmuting a non-'static lifetime",
+              "aliases": [
+                "GHSA-pp8r-vv2j-9j5v"
+              ],
+              "severity": [
+                {
+                  "type": "CVSS_V3",
+                  "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+                }
+              ],
+              "affected": [
+                {
+                  "database_specific": {
+                    "categories": [],
+                    "cvss": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                    "informational": "unsound",
+                    "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2020-0027.json"
+                  },
+                  "package": {
+                    "ecosystem": "crates.io",
+                    "name": "traitobject",
+                    "purl": "pkg:cargo/traitobject"
+                  },
+                  "ranges": [
+                    {
+                      "events": [
+                        {
+                          "introduced": "0.0.0-0"
+                        }
+                      ],
+                      "type": "SEMVER"
+                    }
+                  ]
+                }
+              ],
+              "database_specific": {
+                "license": "CC0-1.0"
+              },
+              "references": [
+                {
+                  "type": "ADVISORY",
+                  "url": "https://rustsec.org/advisories/RUSTSEC-2020-0027.html"
+                }
+              ]
+            },
+            {
+              "id": "RUSTSEC-2021-0144",
+              "modified": "2021-12-08T12:00:00.000000000Z",
+              "published": "2021-12-08T12:00:00Z",
+              "schema_version": "1.7.5",
+              "summary": "traitobject is unmaintained",
+              "affected": [
+                {
+                  "database_specific": {
+                    "categories": [],
+                    "cvss": null,
+                    "informational": "unmaintained",
+                    "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2021-0144.json"
+                  },
+                  "package": {
+                    "ecosystem": "crates.io",
+                    "name": "traitobject",
+                    "purl": "pkg:cargo/traitobject"
+                  },
+                  "ranges": [
+                    {
+                      "events": [
+                        {
+                          "introduced": "0.0.0-0"
+                        }
+                      ],
+                      "type": "SEMVER"
+                    }
+                  ]
+                }
+              ],
+              "database_specific": {
+                "license": "CC0-1.0"
+              },
+              "references": [
+                {
+                  "type": "ADVISORY",
+                  "url": "https://rustsec.org/advisories/RUSTSEC-2021-0144.html"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}

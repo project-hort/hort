@@ -935,6 +935,26 @@ worker:
     # whose pods die mid-scan have their claim expire after this window;
     # another worker re-claims the row.
     lockDurationSecs: 900
+    findingMerge:
+      # HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE — default true.
+      #
+      # When two scan backends report the SAME advisory for the same
+      # component, one may have read a real severity while the other
+      # could not read one at all and fell back to the unconditional
+      # `Critical` floor. With this true (the default), the reading that
+      # actually assessed the advisory wins — across severity tiers, so a
+      # scored Medium supersedes the other backend's unreadable Critical.
+      # Without it, the floor won on tier alone and correctly-scored
+      # advisories stayed terminally rejected on a verdict no backend had
+      # reached. See ADR 0059.
+      #
+      # Set false as a break-glass switch: the merge reverts to strict
+      # always-fail-closed and the Critical floor wins again. That makes
+      # the release gate STRICTER, not looser — this is an escape hatch
+      # for an operator who does not want one backend's lower reading to
+      # be able to supersede another's unknown-defaulted Critical, at the
+      # cost of the false rejections the default prevents.
+      allowInformedDowngrade: true
     trivy:
       # HORT_SCANNER_TRIVY_ENABLED — load-bearing. When false, the worker
       # does NOT register the Trivy backend, even
