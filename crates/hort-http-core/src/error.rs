@@ -31,6 +31,15 @@ impl From<DomainError> for ApiError {
 /// logs.
 const UPSTREAM_UNAVAILABLE_BODY: &str = r#"{"error":"upstream unavailable"}"#;
 
+/// `Retry-After` for a write-contention 503, in seconds.
+///
+/// One second, because that is the honest wait: a contention abort is already
+/// over by the time the client hears about it — the writer that won committed
+/// before Postgres raised the error — so the only thing left to wait out is
+/// whatever queue of co-writers is still draining. Advertising the
+/// quarantine-hold timescale here would strand a client for no reason.
+const CONTENDED_RETRY_AFTER_SECS_HEADER: &str = "1";
+
 /// The internal cause that must be logged before an [`ApiError`] is
 /// sanitised to an opaque `5xx` wire body.
 ///
@@ -119,6 +128,36 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
 
+        // Storage-layer write contention that outlived the adapter's own
+        // bounded retry. The request was valid, nothing was applied, and the
+        // same request is expected to succeed shortly — so it earns a 503
+        // with a retry hint, not the 500 an `Invariant` would have produced.
+        // The distinction is not cosmetic: a 500 tells a client (and an
+        // operator's alerting) that the server is broken, which sends anyone
+        // debugging an intermittent failure looking for a bug that is not
+        // there, and stops well-behaved clients from doing the one thing that
+        // would work — asking again.
+        //
+        // The body is a fixed literal: the inner message names the SQLSTATE
+        // for the server log and has no business on the wire. Early-return
+        // so the `Retry-After` header does not fall through to the generic
+        // `{"error": message}` tail, which sets no headers.
+        if let AppError::Domain(DomainError::Contended(detail)) = &self.0 {
+            tracing::warn!(error = %detail, "request failed on persistent write contention");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    (axum::http::header::CONTENT_TYPE, "application/json"),
+                    (
+                        axum::http::header::RETRY_AFTER,
+                        CONTENDED_RETRY_AFTER_SECS_HEADER,
+                    ),
+                ],
+                serde_json::json!({"error": "write contention, retry shortly"}).to_string(),
+            )
+                .into_response();
+        }
+
         // An upstream index/metadata parse failure (ADR 0006-adjacent
         // sanitisation): the wire body is a FIXED constant, never the
         // inner parse `cause` — that string comes straight out of the
@@ -176,6 +215,24 @@ impl IntoResponse for ApiError {
                 // which stays reserved for event-store optimistic-
                 // concurrency version conflicts.
                 DomainError::InvalidState(_) => (StatusCode::CONFLICT, domain_err.to_string()),
+                // Caught by the early-return at the top of this function.
+                // Match arm exists so the inner match stays exhaustive —
+                // fail loudly if a future edit removes the early return
+                // without updating both sites. Mirrors
+                // `ManagedByConfiguration`'s pattern. The fallback status is
+                // still 503 rather than 500: even unreachable, this arm must
+                // not be the thing that reclassifies a busy server as a
+                // broken one.
+                DomainError::Contended(_) => {
+                    debug_assert!(
+                        false,
+                        "Contended must be caught by the 503 + Retry-After early-return"
+                    );
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "write contention, retry shortly".to_string(),
+                    )
+                }
                 // Caught by the early-return arm at the top of this
                 // function. Match arm exists so the inner match stays
                 // exhaustive — fail loudly if someone removes the

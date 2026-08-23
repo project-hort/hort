@@ -12,6 +12,30 @@ pub enum DomainError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// The write lost a **concurrency race inside the storage engine** and
+    /// was rolled back whole: nothing was applied, and re-running the
+    /// identical request is expected to succeed once the contending writer
+    /// finishes. Two near-simultaneous writers touching the same row is the
+    /// canonical producer.
+    ///
+    /// Kept separate from its two neighbours because the correct caller
+    /// response differs in each case:
+    ///
+    /// - [`Self::Conflict`] is a *decided* outcome — a real duplicate, or an
+    ///   optimistic-concurrency clash against a position someone else took.
+    ///   Re-running it returns the same answer, so a caller must not treat it
+    ///   as retryable, and a retry layer must never widen onto it. That
+    ///   separation is what keeps idempotent re-writes idempotent.
+    /// - [`Self::Invariant`] is a breach that re-running cannot fix.
+    ///
+    /// The storage adapter retries this class itself, bounded, so the variant
+    /// only reaches a caller once that budget is spent. At that point it
+    /// still means "the system is contended right now", not "the server is
+    /// broken" — so the HTTP boundary owes the client a 503 with a retry
+    /// hint, never a 500.
+    #[error("contended: {0}")]
+    Contended(String),
+
     #[error("validation: {0}")]
     Validation(String),
 
