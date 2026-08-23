@@ -36,7 +36,7 @@
 //! (mirrors the Trivy adapter's `aggregate_findings`).
 
 use hort_domain::entities::scan_policy::SeverityThreshold;
-use hort_domain::types::{is_informational_class, Finding};
+use hort_domain::types::{collapse_alias_groups, is_informational_class, Finding, SeverityBasis};
 use serde::Deserialize;
 
 use crate::ecosystem::osv_ecosystem_to_purl_type;
@@ -217,6 +217,18 @@ pub(crate) fn parse_osv_scanner_report(
 /// Every `OsvVulnerability` becomes one [`Finding`]; over-cap findings
 /// are dropped with a `tracing::warn!`. Output preserves the
 /// scanner-given order so fixture tests stay stable.
+///
+/// Mutually-aliased findings are then collapsed to one finding per
+/// advisory ([`collapse_alias_groups`]). osv-scanner forwards the upstream
+/// OSV records verbatim, so it reports a RustSec advisory and its
+/// GitHub-reviewed GHSA mirror as two vulnerabilities — and the mirror
+/// usually carries neither a severity nor an informational marker, so it
+/// lowers to the SUP-4 fail-closed `Critical` and shadows the sibling that
+/// does carry the metadata. The cross-backend merge cannot reconcile the
+/// pair, because the two records have different advisory ids (ADR 0059).
+///
+/// The collapse runs after per-finding validation, and its alias union is
+/// itself capped, so a surviving finding is still valid.
 pub(crate) fn aggregate_findings(report: &OsvScannerReport) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::new();
     for src in &report.results {
@@ -237,7 +249,26 @@ pub(crate) fn aggregate_findings(report: &OsvScannerReport) -> Vec<Finding> {
             }
         }
     }
-    out
+    collapse_alias_groups(out)
+}
+
+/// Every id osv-scanner lists in the same `groups[]` entry as `vuln_id`.
+///
+/// osv-scanner derives these groups from the records' own `aliases`, so
+/// they normally add nothing — but a record whose `aliases` array is
+/// sparse is still grouped here, and folding the group's ids into the
+/// lowered finding's aliases is what lets the shared alias-group collapse
+/// see the link. Reusing the scanner's own grouping this way keeps one
+/// grouping implementation rather than a second one keyed on `groups[]`.
+/// Excludes `vuln_id` itself — a finding is not its own alias.
+fn group_sibling_ids<'a>(groups: &'a [OsvGroup], vuln_id: &str) -> Vec<&'a str> {
+    groups
+        .iter()
+        .filter(|g| g.ids.iter().any(|id| id == vuln_id))
+        .flat_map(|g| g.ids.iter())
+        .filter(|id| id.as_str() != vuln_id)
+        .map(String::as_str)
+        .collect()
 }
 
 /// Build the canonical `pkg:<type>/<name>@<version>` PURL for the
@@ -312,7 +343,12 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
         .is_some_and(is_informational_class);
 
     let cvss_score = pick_cvss_score(groups, vuln);
-    let severity = cvss_score
+    // The severity we could actually *read*. `None` means no reading was
+    // possible at all — the SUP-4 fallback below supplies a `Critical`
+    // floor, and `severity_basis` records that it is a floor rather than
+    // an assessment so the cross-backend merge can prefer a
+    // better-informed sibling for the same advisory (ADR 0059).
+    let assessed_severity = cvss_score
         .and_then(cvss_score_to_severity)
         // Fallback: try labelled severity inside the CVSS vector. Some
         // older OSV records spell "HIGH" inside a `score` string.
@@ -330,14 +366,18 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
             Some(SeverityThreshold::Low)
         } else {
             None
-        })
-        // Final fallback (SUP-4): a finding whose severity we cannot
-        // determine — AND which is not an informational advisory — maps to
-        // the HIGHEST tier (`Critical`), fail-closed: an
-        // unparseable-severity finding must still trip the default Critical
-        // block threshold rather than slip under it. Unified with the
-        // advisory-osv and trivy adapters.
-        .unwrap_or(SeverityThreshold::Critical);
+        });
+    // Final fallback (SUP-4): a finding whose severity we cannot
+    // determine — AND which is not an informational advisory — maps to
+    // the HIGHEST tier (`Critical`), fail-closed: an
+    // unparseable-severity finding must still trip the default Critical
+    // block threshold rather than slip under it. Unified with the
+    // advisory-osv and trivy adapters.
+    let severity = assessed_severity.unwrap_or(SeverityThreshold::Critical);
+    let severity_basis = match assessed_severity {
+        Some(_) => SeverityBasis::Assessed,
+        None => SeverityBasis::Unassessed,
+    };
 
     let title = vuln
         .summary
@@ -419,10 +459,23 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
     // finding. Trimmed to a small dedup'd set so a malicious upstream
     // can't blow up the per-finding wire shape; the domain validator
     // caps at `MAX_ALIASES`.
+    //
+    // The ids osv-scanner put in the same `groups[]` entry are appended
+    // after the record's own aliases: they name the same advisory, and
+    // carrying them here is what lets the shared alias-group collapse see
+    // a link that a sparse `aliases` array would have hidden.
     let mut aliases: Vec<String> = Vec::new();
-    for a in &vuln.aliases {
+    for a in vuln
+        .aliases
+        .iter()
+        .map(String::as_str)
+        .chain(group_sibling_ids(groups, &vuln.id))
+    {
         let trimmed = a.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case(vuln.id.trim()) {
             continue;
         }
         if aliases.iter().any(|x| x.eq_ignore_ascii_case(trimmed)) {
@@ -450,6 +503,7 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
         references,
         aliases,
         informational_class,
+        severity_basis,
     }
 }
 

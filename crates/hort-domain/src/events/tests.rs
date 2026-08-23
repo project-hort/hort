@@ -2407,6 +2407,7 @@ fn sample_finding() -> crate::types::Finding {
         references: vec!["https://nvd.nist.gov/vuln/detail/CVE-2021-23337".into()],
         aliases: vec!["GHSA-35jh-r3h4-6jhm".into()],
         informational_class: None,
+        severity_basis: crate::types::SeverityBasis::Assessed,
     }
 }
 

@@ -347,6 +347,7 @@ mod tests {
             references: vec![],
             aliases: vec![],
             informational_class: None,
+            severity_basis: crate::types::SeverityBasis::Assessed,
         }
     }
 
@@ -366,6 +367,7 @@ mod tests {
             references: vec![],
             aliases: vec![alias.into()],
             informational_class: None,
+            severity_basis: crate::types::SeverityBasis::Assessed,
         }
     }
 

@@ -167,8 +167,37 @@ chain, extracts the SBOM, runs the advisory enrichment (best-effort:
 a failed query logs and proceeds empty), and invokes each configured
 backend in declared order. A backend that fails while a sibling
 succeeds is tolerated; the union of findings is deduplicated on
-case-insensitive `(purl, vulnerability_id)` with the higher severity
-winning a collision (`merge_findings`). `record_outcome` then hands
+case-insensitive `(purl, vulnerability_id)` (`merge_findings`).
+
+A collision is won on **information quality first, severity tier
+second** ([ADR 0059](../../adr/0059-finding-reconciliation.md)). Severity
+tier alone cannot separate a genuine `Critical` from the SUP-4
+fail-closed floor a backend emits when it cannot read a severity at all —
+the two records are byte-identical — so the floor used to win every
+collision and discard the correctly-scored reading. `Finding.severity_basis`
+records which of the two it is (`Unassessed` at the three fail-closed
+sites, `Assessed` everywhere else), and a finding that carries a real
+reading — a CVSS score, a recognised informational class, or `Assessed` —
+supersedes one that does not, **across tiers**. Two real readings still
+compare by tier, so a scored `Low` never talks down a scored `Critical`
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)).
+`HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE=false` reverts the merge to
+strict always-fail-closed, which makes the gate stricter.
+
+That merge reconciles two readings of one advisory **id**. One advisory
+arriving under **two ids** is handled earlier, in the OSV adapters
+themselves: OSV returns a RustSec advisory and its GitHub-reviewed GHSA
+mirror as separate records in the same response, and the bare mirror would
+otherwise shadow its better-informed sibling with a fail-closed `Critical`
+the merge cannot reconcile. Both OSV adapters collapse mutually-aliased
+findings for a package into one finding per advisory, keeping the
+best-informed member — a real CVSS, then a recognised informational class,
+then a severity read without a score, then the fail-closed floor — so a
+genuinely-scored advisory still blocks. The collapsed-away identifiers ride
+along on the survivor's `aliases`, so an operator exclusion keyed by any of
+them still matches.
+
+`record_outcome` then hands
 the merged finding list to the consumer boundary,
 `QuarantineUseCase::record_scan_result`
 (`crates/hort-app/src/use_cases/quarantine_use_case.rs`).

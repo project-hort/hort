@@ -286,6 +286,7 @@ mod tests {
             references: vec![],
             aliases: vec![],
             informational_class: None,
+            severity_basis: crate::types::SeverityBasis::Assessed,
         }
     }
 

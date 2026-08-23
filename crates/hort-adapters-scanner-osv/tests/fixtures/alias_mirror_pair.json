@@ -1,0 +1,119 @@
+{
+  "results": [
+    {
+      "source": {
+        "path": "/tmp/sbom.cdx.json",
+        "type": "sbom"
+      },
+      "packages": [
+        {
+          "package": {
+            "name": "rand",
+            "version": "0.7.3",
+            "ecosystem": "crates.io"
+          },
+          "groups": [
+            {
+              "ids": [
+                "GHSA-cq8v-f236-94qc",
+                "RUSTSEC-2026-0097"
+              ],
+              "aliases": [
+                "GHSA-cq8v-f236-94qc",
+                "RUSTSEC-2026-0097"
+              ],
+              "max_severity": ""
+            }
+          ],
+          "vulnerabilities": [
+            {
+              "id": "GHSA-cq8v-f236-94qc",
+              "modified": "2026-05-14T09:11:02.000000000Z",
+              "published": "2026-05-14T09:00:00Z",
+              "schema_version": "1.7.5",
+              "summary": "rand: unsound use of uninitialized memory",
+              "aliases": [
+                "RUSTSEC-2026-0097"
+              ],
+              "affected": [
+                {
+                  "package": {
+                    "ecosystem": "crates.io",
+                    "name": "rand",
+                    "purl": "pkg:cargo/rand"
+                  },
+                  "ranges": [
+                    {
+                      "events": [
+                        {
+                          "introduced": "0.0.0-0"
+                        }
+                      ],
+                      "type": "SEMVER"
+                    }
+                  ]
+                }
+              ],
+              "references": [
+                {
+                  "type": "ADVISORY",
+                  "url": "https://github.com/advisories/GHSA-cq8v-f236-94qc"
+                }
+              ]
+            },
+            {
+              "id": "RUSTSEC-2026-0097",
+              "modified": "2026-05-14T09:12:44.000000000Z",
+              "published": "2026-05-14T09:00:00Z",
+              "schema_version": "1.7.5",
+              "summary": "rand is unsound",
+              "aliases": [
+                "GHSA-cq8v-f236-94qc"
+              ],
+              "affected": [
+                {
+                  "database_specific": {
+                    "categories": [],
+                    "cvss": null,
+                    "informational": "unsound",
+                    "source": "https://github.com/rustsec/advisory-db/blob/osv/crates/RUSTSEC-2026-0097.json"
+                  },
+                  "package": {
+                    "ecosystem": "crates.io",
+                    "name": "rand",
+                    "purl": "pkg:cargo/rand"
+                  },
+                  "ranges": [
+                    {
+                      "events": [
+                        {
+                          "introduced": "0.0.0-0"
+                        }
+                      ],
+                      "type": "SEMVER"
+                    }
+                  ]
+                }
+              ],
+              "database_specific": {
+                "license": "CC0-1.0"
+              },
+              "references": [
+                {
+                  "type": "ADVISORY",
+                  "url": "https://rustsec.org/advisories/RUSTSEC-2026-0097.html"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "experimental_config": {
+    "licenses": {
+      "summary": false,
+      "allowlist": null
+    }
+  }
+}

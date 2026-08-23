@@ -1159,3 +1159,298 @@ async fn id_less_record_issues_no_hydration_request() {
 
     server.verify().await;
 }
+
+// ---------------------------------------------------------------------------
+// Alias-group collapsing (ADR 0059)
+//
+// OSV returns a RustSec advisory and its GitHub-reviewed GHSA mirror as
+// two records in the same `querybatch` response. The mirror usually
+// carries neither a severity nor an informational marker, so it lowers to
+// the SUP-4 fail-closed `Critical` and shadows the sibling that does carry
+// the advisory's metadata — and the cross-backend merge cannot rescue it,
+// because the two records have different advisory ids.
+//
+// Fixtures keep the file's contract: querybatch emits id + modified only;
+// every richer field arrives on the hydrated `/v1/vulns/{id}` record.
+// ---------------------------------------------------------------------------
+
+/// A hydrated record with no `severity` and no informational marker — the
+/// bare GHSA mirror shape. Lowering fails it closed to `Critical`.
+fn bare_mirror_record(id: &str, eco: &str, pkg: &str, aliases: &[&str]) -> serde_json::Value {
+    json!({
+        "id": id,
+        "modified": MODIFIED,
+        "summary": format!("{pkg} advisory"),
+        "aliases": aliases,
+        "affected": [
+            { "package": { "ecosystem": eco, "name": pkg } }
+        ]
+    })
+}
+
+/// A hydrated RustSec informational record: no CVSS by design, the class
+/// under `affected[].database_specific.informational` where real RustSec
+/// OSV records put it.
+fn informational_record(
+    id: &str,
+    eco: &str,
+    pkg: &str,
+    class: &str,
+    aliases: &[&str],
+) -> serde_json::Value {
+    json!({
+        "id": id,
+        "modified": MODIFIED,
+        "summary": format!("{pkg}: {class}"),
+        "aliases": aliases,
+        "affected": [
+            {
+                "package": { "ecosystem": eco, "name": pkg },
+                "database_specific": { "informational": class }
+            }
+        ]
+    })
+}
+
+/// `rand 0.7.3` — `GHSA-cq8v-f236-94qc` (bare) + `RUSTSEC-2026-0097`
+/// (`informational: unsound`). The pair must collapse to the
+/// informational reading, which rides the negligible lane instead of
+/// rejecting the artifact.
+#[tokio::test]
+async fn rand_ghsa_mirror_collapses_into_its_informational_rustsec_sibling() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(querybatch_body(&[&[
+                ("GHSA-cq8v-f236-94qc", MODIFIED),
+                ("RUSTSEC-2026-0097", MODIFIED),
+            ]])),
+        )
+        .mount(&server)
+        .await;
+    mount_vuln_record(
+        &server,
+        "GHSA-cq8v-f236-94qc",
+        bare_mirror_record(
+            "GHSA-cq8v-f236-94qc",
+            "crates.io",
+            "rand",
+            &["RUSTSEC-2026-0097"],
+        ),
+        1,
+    )
+    .await;
+    mount_vuln_record(
+        &server,
+        "RUSTSEC-2026-0097",
+        informational_record(
+            "RUSTSEC-2026-0097",
+            "crates.io",
+            "rand",
+            "unsound",
+            &["GHSA-cq8v-f236-94qc"],
+        ),
+        1,
+    )
+    .await;
+
+    let cache = Arc::new(InMemoryEphemeralStore::new());
+    let adapter = build_adapter_with_url(server.uri(), cache, None).await;
+    let comps = vec![make_component("rand", "0.7.3", Ecosystem::Cargo)];
+
+    let findings = adapter.query(&comps).await.expect("query succeeds");
+
+    assert_eq!(findings.len(), 1, "the mirror pair is one advisory");
+    assert_eq!(findings[0].vulnerability_id, "RUSTSEC-2026-0097");
+    assert!(
+        findings[0].is_informational(),
+        "the classification must survive the collapse",
+    );
+    assert!(
+        findings[0]
+            .aliases
+            .iter()
+            .any(|a| a == "GHSA-cq8v-f236-94qc"),
+        "the collapsed-away id stays matchable by an exclusion: {:?}",
+        findings[0].aliases,
+    );
+    server.verify().await;
+}
+
+/// `typemap 0.3.3` — `GHSA-vfv3-9w6v-23jp` (bare) + `RUSTSEC-2019-0039`
+/// (`informational: unmaintained`), with the alias link pointing only
+/// from the RustSec record to the mirror.
+#[tokio::test]
+async fn typemap_pair_collapses_to_the_informational_reading() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(querybatch_body(&[&[
+                ("GHSA-vfv3-9w6v-23jp", MODIFIED),
+                ("RUSTSEC-2019-0039", MODIFIED),
+            ]])),
+        )
+        .mount(&server)
+        .await;
+    mount_vuln_record(
+        &server,
+        "GHSA-vfv3-9w6v-23jp",
+        bare_mirror_record("GHSA-vfv3-9w6v-23jp", "crates.io", "typemap", &[]),
+        1,
+    )
+    .await;
+    mount_vuln_record(
+        &server,
+        "RUSTSEC-2019-0039",
+        informational_record(
+            "RUSTSEC-2019-0039",
+            "crates.io",
+            "typemap",
+            "unmaintained",
+            &["GHSA-vfv3-9w6v-23jp"],
+        ),
+        1,
+    )
+    .await;
+
+    let cache = Arc::new(InMemoryEphemeralStore::new());
+    let adapter = build_adapter_with_url(server.uri(), cache, None).await;
+    let comps = vec![make_component("typemap", "0.3.3", Ecosystem::Cargo)];
+
+    let findings = adapter.query(&comps).await.expect("query succeeds");
+
+    assert_eq!(findings.len(), 1);
+    assert_eq!(findings[0].vulnerability_id, "RUSTSEC-2019-0039");
+    assert!(findings[0].is_informational());
+    server.verify().await;
+}
+
+/// **The load-bearing negative.** `traitobject 0.1.1` returns three
+/// records: `GHSA-pp8r-vv2j-9j5v` (bare), `RUSTSEC-2020-0027` (**CVSS
+/// 9.8**, `unsound`) and `RUSTSEC-2021-0144` (`unmaintained`). The
+/// collapse must pick the SCORED member — a real CVSS outranks a
+/// classification — so the package stays blocking. A collapse that
+/// preferred the informational reading here would turn an over-blocking
+/// fix into an under-blocking one (ADR 0007).
+#[tokio::test]
+async fn traitobject_group_collapses_to_the_scored_member_and_stays_blocking() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(querybatch_body(&[&[
+                ("GHSA-pp8r-vv2j-9j5v", MODIFIED),
+                ("RUSTSEC-2020-0027", MODIFIED),
+                ("RUSTSEC-2021-0144", MODIFIED),
+            ]])),
+        )
+        .mount(&server)
+        .await;
+    mount_vuln_record(
+        &server,
+        "GHSA-pp8r-vv2j-9j5v",
+        bare_mirror_record(
+            "GHSA-pp8r-vv2j-9j5v",
+            "crates.io",
+            "traitobject",
+            &["RUSTSEC-2020-0027"],
+        ),
+        1,
+    )
+    .await;
+    mount_vuln_record(
+        &server,
+        "RUSTSEC-2020-0027",
+        json!({
+            "id": "RUSTSEC-2020-0027",
+            "modified": MODIFIED,
+            "summary": "traitobject: unsound trait object handling",
+            "aliases": ["GHSA-pp8r-vv2j-9j5v"],
+            "severity": [
+                {
+                    "type": "CVSS_V3",
+                    "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+                }
+            ],
+            "affected": [
+                {
+                    "package": { "ecosystem": "crates.io", "name": "traitobject" },
+                    "database_specific": { "informational": "unsound" }
+                }
+            ]
+        }),
+        1,
+    )
+    .await;
+    mount_vuln_record(
+        &server,
+        "RUSTSEC-2021-0144",
+        informational_record(
+            "RUSTSEC-2021-0144",
+            "crates.io",
+            "traitobject",
+            "unmaintained",
+            &["RUSTSEC-2020-0027"],
+        ),
+        1,
+    )
+    .await;
+
+    let cache = Arc::new(InMemoryEphemeralStore::new());
+    let adapter = build_adapter_with_url(server.uri(), cache, None).await;
+    let comps = vec![make_component("traitobject", "0.1.1", Ecosystem::Cargo)];
+
+    let findings = adapter.query(&comps).await.expect("query succeeds");
+
+    assert_eq!(findings.len(), 1, "all three records are one advisory");
+    let f = &findings[0];
+    assert_eq!(f.vulnerability_id, "RUSTSEC-2020-0027");
+    assert_eq!(f.cvss_score, Some(9.8));
+    assert_eq!(f.severity, SeverityThreshold::Critical);
+    assert!(
+        !f.is_informational(),
+        "a scored advisory must never be demoted onto the negligible lane",
+    );
+    server.verify().await;
+}
+
+/// Two unrelated advisories on the same package stay two findings — the
+/// collapse groups on identifiers, not on the package.
+#[tokio::test]
+async fn unrelated_advisories_on_one_component_are_not_collapsed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/querybatch"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(querybatch_body(&[&[
+                ("GHSA-aaaa-aaaa-aaaa", MODIFIED),
+                ("GHSA-bbbb-bbbb-bbbb", MODIFIED),
+            ]])),
+        )
+        .mount(&server)
+        .await;
+    mount_vuln_record(
+        &server,
+        "GHSA-aaaa-aaaa-aaaa",
+        bare_mirror_record("GHSA-aaaa-aaaa-aaaa", "npm", "lodash", &[]),
+        1,
+    )
+    .await;
+    mount_vuln_record(
+        &server,
+        "GHSA-bbbb-bbbb-bbbb",
+        bare_mirror_record("GHSA-bbbb-bbbb-bbbb", "npm", "lodash", &[]),
+        1,
+    )
+    .await;
+
+    let cache = Arc::new(InMemoryEphemeralStore::new());
+    let adapter = build_adapter_with_url(server.uri(), cache, None).await;
+    let comps = vec![make_component("lodash", "4.17.20", Ecosystem::Npm)];
+
+    let findings = adapter.query(&comps).await.expect("query succeeds");
+    assert_eq!(findings.len(), 2);
+    server.verify().await;
+}
