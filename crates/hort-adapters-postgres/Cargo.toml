@@ -28,6 +28,11 @@ metrics = { workspace = true }
 # already pins `url` (see crates/hort-domain/Cargo.toml); the adapter
 # needs its own direct dep to `use url::Url` at the wire boundary.
 url = { workspace = true }
+# Jitter for the write-contention backoff (`contention.rs`). Without it a
+# pile-up of losing writers re-collides in lockstep on every retry, which is
+# the one shape a fixed backoff cannot break out of. Already in the binaries'
+# graph via `hort-app`'s event-append backoff, which this mirrors.
+rand = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -63,6 +63,7 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
 use hort_domain::types::ContentHash;
 
+use crate::contention::{contention_backoff, with_contention_retry, CONTENTION_RETRY_ATTEMPTS};
 use crate::{map_sqlx_error, BoxFuture};
 
 /// PostgreSQL implementation of [`ContentReferenceIndex`].
@@ -148,8 +149,28 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
             // typically supplies `Utc::now()` but tests / replay may
             // set `recorded_at` explicitly.
             let target_hex = reference.target_content_hash.as_ref().to_owned();
-            sqlx::query(
-                r#"INSERT INTO content_references (
+            // Retried on a contention abort. Sibling manifests of one push
+            // share targets by construction — every attestation manifest in a
+            // buildkit image index references the same empty-config blob — so
+            // their edge upserts contend on a single row whenever the push is
+            // concurrent, which for a multi-architecture client it always is.
+            // The upsert is one self-contained statement, so re-running it is
+            // re-running the whole unit of work; and it is idempotent by the
+            // `ON CONFLICT DO UPDATE` above, so a re-run cannot double-write
+            // even in the case where the abort was reported after the row
+            // landed. A genuine `Conflict` is not retried here (see
+            // `crate::contention`), which is what keeps that idempotence
+            // intact rather than papering over it.
+            with_contention_retry(
+                "content-reference upsert",
+                CONTENTION_RETRY_ATTEMPTS,
+                contention_backoff,
+                || {
+                    let target_hex = target_hex.clone();
+                    let reference = &reference;
+                    async move {
+                        sqlx::query(
+                            r#"INSERT INTO content_references (
                        source_artifact_id, target_content_hash, kind, metadata,
                        repository_id, recorded_at
                    ) VALUES ($1, $2, $3, $4, $5, $6)
@@ -157,25 +178,30 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                    DO UPDATE SET
                        metadata    = EXCLUDED.metadata,
                        recorded_at = EXCLUDED.recorded_at"#,
+                        )
+                        .bind(reference.source_artifact_id)
+                        .bind(&target_hex)
+                        .bind(&reference.kind)
+                        .bind(&reference.metadata)
+                        .bind(reference.repository_id)
+                        .bind(reference.recorded_at)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| {
+                            map_sqlx_error(
+                                &e,
+                                "ContentReference",
+                                &format!(
+                                    "{}/{}",
+                                    reference.repository_id, reference.source_artifact_id
+                                ),
+                            )
+                        })?;
+                        Ok(())
+                    }
+                },
             )
-            .bind(reference.source_artifact_id)
-            .bind(&target_hex)
-            .bind(&reference.kind)
-            .bind(&reference.metadata)
-            .bind(reference.repository_id)
-            .bind(reference.recorded_at)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
-                map_sqlx_error(
-                    &e,
-                    "ContentReference",
-                    &format!(
-                        "{}/{}",
-                        reference.repository_id, reference.source_artifact_id
-                    ),
-                )
-            })?;
+            .await?;
             Ok(())
         })
     }
@@ -781,6 +807,298 @@ mod tests {
             rows[0].metadata,
             serde_json::json!({"artifact_type": "application/vnd.second"}),
             "metadata is refreshed on the idempotent re-push",
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    // -------------------------------------------------------------------
+    // Write contention.
+    //
+    // Concurrent hosted manifest PUTs contend on `content_references` by
+    // construction: sibling manifests of one push share targets (every
+    // attestation manifest in a buildkit image index references the same
+    // empty-config blob), so their edge upserts land on one row.
+    //
+    // The two classifier tests below deliberately provoke a REAL Postgres
+    // abort rather than hand-building an error value. The whole change rests
+    // on `40001` / `40P01` being the codes this engine actually reports for
+    // these two conditions; a test that asserted a constant against itself
+    // would hold even if the codes were wrong, which is the one failure mode
+    // worth ruling out.
+    // -------------------------------------------------------------------
+
+    /// Update a seeded row inside `tx`, returning the raw `sqlx` error so
+    /// the caller can inspect its SQLSTATE.
+    async fn touch_row(
+        tx: &mut sqlx::PgConnection,
+        repo: Uuid,
+        source: Uuid,
+        target_hex: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE content_references SET recorded_at = now() \
+             WHERE repository_id = $1 AND source_artifact_id = $2 \
+               AND target_content_hash = $3 AND kind = 'oci_config'",
+        )
+        .bind(repo)
+        .bind(source)
+        .bind(target_hex)
+        .execute(&mut *tx)
+        .await
+        .map(|_| ())
+    }
+
+    /// A genuine Postgres **deadlock** maps to [`DomainError::Contended`],
+    /// not [`DomainError::Invariant`].
+    ///
+    /// Two transactions take the same two row locks in opposite order, so
+    /// Postgres has to break the cycle by aborting one of them. The victim's
+    /// transaction is rolled back whole — nothing it wrote survives — which
+    /// is exactly why re-running it is safe, and why classifying it as an
+    /// invariant breach (and answering 500) misdescribes it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_real_deadlock_classifies_as_contended() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgContentReferenceRepo::new(pool.clone());
+
+        let source_a = seed_artifact(&pool, repo, "deadlock-a").await;
+        let source_b = seed_artifact(&pool, repo, "deadlock-b").await;
+        for (source, target) in [(source_a, VALID_SHA256_A), (source_b, VALID_SHA256_B)] {
+            adapter
+                .insert(make_reference(
+                    repo,
+                    source,
+                    target,
+                    "oci_config",
+                    serde_json::json!({}),
+                ))
+                .await
+                .expect("seed row");
+        }
+
+        // Both transactions must hold their first lock before either asks
+        // for the second — otherwise one simply finishes and there is no
+        // cycle to detect.
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+
+        let run_one = |first: (Uuid, &'static str), second: (Uuid, &'static str)| {
+            let pool = pool.clone();
+            let gate = gate.clone();
+            async move {
+                let mut tx = pool.begin().await.expect("begin");
+                // Shorten the detector's wait where the role is allowed to;
+                // the cluster default (1s) is a correct fallback, just
+                // slower, so a refusal here is not a failure.
+                let _ = sqlx::query("SET LOCAL deadlock_timeout = '150ms'")
+                    .execute(&mut *tx)
+                    .await;
+                touch_row(&mut tx, repo, first.0, first.1)
+                    .await
+                    .expect("first lock");
+                gate.wait().await;
+                let outcome = touch_row(&mut tx, repo, second.0, second.1).await;
+                // Explicit rollback for the survivor; the victim's
+                // transaction is already aborted and this is a no-op.
+                let _ = tx.rollback().await;
+                outcome
+            }
+        };
+
+        let (first, second) = tokio::join!(
+            run_one((source_a, VALID_SHA256_A), (source_b, VALID_SHA256_B)),
+            run_one((source_b, VALID_SHA256_B), (source_a, VALID_SHA256_A)),
+        );
+
+        let victim = match (first, second) {
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => e,
+            (Ok(()), Ok(())) => {
+                cleanup_repo(&pool, repo).await;
+                panic!(
+                    "no deadlock was produced — the two transactions did not \
+                     actually contend, so this test proves nothing"
+                );
+            }
+            (Err(a), Err(b)) => {
+                cleanup_repo(&pool, repo).await;
+                panic!("both transactions failed, expected exactly one victim: {a} / {b}");
+            }
+        };
+
+        let code = victim
+            .as_database_error()
+            .and_then(|db| db.code().map(std::borrow::Cow::into_owned))
+            .unwrap_or_default();
+        assert_eq!(
+            code, "40P01",
+            "expected Postgres to report deadlock_detected; got {code:?} ({victim})"
+        );
+        assert!(
+            crate::contention::is_contention(&victim),
+            "the adapter must recognise a real deadlock as transient contention"
+        );
+        assert!(
+            matches!(
+                map_sqlx_error(&victim, "ContentReference", "test"),
+                DomainError::Contended(_)
+            ),
+            "a deadlock must map to Contended — mapping it to Invariant is what \
+             turned concurrent manifest PUTs into intermittent 500s"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// A genuine Postgres **serialization failure** maps to
+    /// [`DomainError::Contended`] too — the other half of the pair, and the
+    /// one an isolation level above READ COMMITTED produces.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_real_serialization_failure_classifies_as_contended() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgContentReferenceRepo::new(pool.clone());
+        let source = seed_artifact(&pool, repo, "serialization-victim").await;
+        adapter
+            .insert(make_reference(
+                repo,
+                source,
+                VALID_SHA256_A,
+                "oci_config",
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("seed row");
+
+        // The reader takes its snapshot first, the writer commits under it,
+        // and the reader's own write then cannot be serialized against a row
+        // that moved beneath its snapshot.
+        let mut reader = pool.begin().await.expect("begin reader");
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            .execute(&mut *reader)
+            .await
+            .expect("set isolation");
+        sqlx::query("SELECT 1 FROM content_references WHERE repository_id = $1")
+            .bind(repo)
+            .fetch_all(&mut *reader)
+            .await
+            .expect("establish snapshot");
+
+        let mut writer = pool.begin().await.expect("begin writer");
+        touch_row(&mut writer, repo, source, VALID_SHA256_A)
+            .await
+            .expect("writer update");
+        writer.commit().await.expect("writer commit");
+
+        let outcome = touch_row(&mut reader, repo, source, VALID_SHA256_A).await;
+        let _ = reader.rollback().await;
+
+        let Err(err) = outcome else {
+            cleanup_repo(&pool, repo).await;
+            panic!("expected a serialization failure, the update succeeded");
+        };
+        let code = err
+            .as_database_error()
+            .and_then(|db| db.code().map(std::borrow::Cow::into_owned))
+            .unwrap_or_default();
+        assert_eq!(
+            code, "40001",
+            "expected Postgres to report serialization_failure; got {code:?} ({err})"
+        );
+        assert!(
+            matches!(
+                map_sqlx_error(&err, "ContentReference", "test"),
+                DomainError::Contended(_)
+            ),
+            "a serialization failure must map to Contended, not Invariant"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Concurrent edge upserts contending on **one shared target** all
+    /// succeed, and every row lands.
+    ///
+    /// This is the incident's shape: several manifests of a single
+    /// multi-architecture push write their `oci_config` edge at the same
+    /// time, and because the attestation manifests all reference the OCI
+    /// empty-config blob, those writes converge on one target hash. The
+    /// claim asserted here is the one that matters to a client: every
+    /// concurrent writer completes and no write is lost — not "one of them
+    /// errors and the caller is expected to work it out".
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn concurrent_upserts_on_a_shared_target_all_succeed() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = std::sync::Arc::new(PgContentReferenceRepo::new(pool.clone()));
+
+        // Eight distinct manifests, one shared config target — plus a
+        // second writer per source presenting the IDENTICAL primary key, so
+        // the run covers both same-target-different-row contention and the
+        // pure idempotent-upsert collision on one row.
+        const WRITERS: usize = 8;
+        let shared_target = VALID_SHA256_C;
+        let mut sources = Vec::with_capacity(WRITERS);
+        for i in 0..WRITERS {
+            sources.push(seed_artifact(&pool, repo, &format!("concurrent-src-{i}")).await);
+        }
+
+        let mut handles = Vec::new();
+        for (i, source) in sources.iter().copied().enumerate() {
+            for pass in 0..2u32 {
+                let adapter = adapter.clone();
+                handles.push(tokio::spawn(async move {
+                    adapter
+                        .insert(make_reference(
+                            repo,
+                            source,
+                            shared_target,
+                            "oci_config",
+                            serde_json::json!({"writer": i, "pass": pass}),
+                        ))
+                        .await
+                }));
+            }
+        }
+
+        let mut failures = Vec::new();
+        for handle in handles {
+            match handle.await.expect("writer task did not panic") {
+                Ok(()) => {}
+                Err(e) => failures.push(e),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "every concurrent edge upsert must succeed; {} failed: {failures:?}",
+            failures.len()
+        );
+
+        let rows = adapter
+            .find_by_target(repo, &shared_target.parse().unwrap(), Some("oci_config"))
+            .await
+            .expect("read back the shared target");
+        assert_eq!(
+            rows.len(),
+            WRITERS,
+            "one row per source survives the contention — the second pass upserts \
+             its own row rather than displacing a sibling's"
+        );
+        let distinct: std::collections::HashSet<Uuid> =
+            rows.iter().map(|r| r.source_artifact_id).collect();
+        assert_eq!(
+            distinct.len(),
+            WRITERS,
+            "no source's edge was lost to a concurrent writer"
         );
 
         cleanup_repo(&pool, repo).await;

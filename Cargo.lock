@@ -2472,6 +2472,7 @@ dependencies = [
  "hort-domain",
  "metrics",
  "metrics-util",
+ "rand 0.10.2",
  "serde_json",
  "serial_test",
  "sqlx",
