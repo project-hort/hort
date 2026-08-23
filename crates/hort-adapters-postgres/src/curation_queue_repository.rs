@@ -159,8 +159,7 @@ impl CurationQueueRepository for PgCurationQueueRepository {
                              LIMIT 1)
                         ) AS duration_secs
                     FROM (SELECT DISTINCT repository_id FROM artifacts
-                          WHERE quarantine_status IN ('quarantined','rejected','scan_indeterminate')
-                            AND is_deleted = false) a
+                          WHERE quarantine_status IN ('quarantined','rejected','scan_indeterminate')) a
                 )
                 SELECT
                     a.id                        AS artifact_id,
@@ -244,7 +243,6 @@ impl CurationQueueRepository for PgCurationQueueRepository {
                     LIMIT 1
                 ) e ON true
                 WHERE a.quarantine_status IN ('quarantined','rejected','scan_indeterminate')
-                  AND a.is_deleted = false
                   AND ($1::uuid IS NULL OR a.repository_id = $1)
                   AND ($2::text IS NULL OR a.quarantine_status = $2)
                   AND ($3::text IS NULL OR e.rejection_reason_kind = $3)

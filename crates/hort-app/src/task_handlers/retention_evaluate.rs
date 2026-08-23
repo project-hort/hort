@@ -246,7 +246,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: DateTime::<Utc>::UNIX_EPOCH,
             updated_at: DateTime::<Utc>::UNIX_EPOCH,
         }

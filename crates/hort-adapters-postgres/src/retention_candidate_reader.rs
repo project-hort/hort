@@ -124,7 +124,7 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                        a.content_type, a.storage_key,
                        a.quarantine_status, a.quarantine_window_start,
                        a.upstream_published_at,
-                       a.uploaded_by, a.is_deleted,
+                       a.uploaded_by,
                        a.created_at, a.updated_at,
                        r.format AS repo_format,
                        p.rescan_interval_hours AS resolved_rescan_interval_hours
@@ -148,8 +148,7 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                     ORDER BY (pp.scope ? 'Repository') DESC
                     LIMIT 1
                 ) p ON TRUE
-                WHERE a.is_deleted = false
-                  AND a.quarantine_status NOT IN
+                WHERE a.quarantine_status NOT IN
                       ('quarantined', 'rejected', 'scan_indeterminate')
                   AND ($3::uuid IS NULL OR a.id > $3)
                 ORDER BY a.id

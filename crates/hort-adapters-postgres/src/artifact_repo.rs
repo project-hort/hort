@@ -28,7 +28,7 @@ const SELECT_COLS: &str = r#"
     size_bytes, checksum_sha256, checksum_sha1, checksum_md5,
     content_type, storage_key,
     quarantine_status, quarantine_window_start, upstream_published_at,
-    uploaded_by, is_deleted,
+    uploaded_by,
     created_at, updated_at
 "#;
 
@@ -38,7 +38,7 @@ const UPSERT_SQL: &str = r#"
         size_bytes, checksum_sha256, checksum_sha1, checksum_md5,
         content_type, storage_key,
         quarantine_status, quarantine_window_start, upstream_published_at,
-        uploaded_by, is_deleted,
+        uploaded_by,
         created_at, updated_at
     )
     VALUES (
@@ -46,8 +46,8 @@ const UPSERT_SQL: &str = r#"
         $7, $8, $9, $10,
         $11, $12,
         $13, $14, $15,
-        $16, $17,
-        $18, $19
+        $16,
+        $17, $18
     )
     ON CONFLICT (id) DO UPDATE SET
         name = EXCLUDED.name,
@@ -64,7 +64,6 @@ const UPSERT_SQL: &str = r#"
         quarantine_window_start = EXCLUDED.quarantine_window_start,
         upstream_published_at = EXCLUDED.upstream_published_at,
         uploaded_by = EXCLUDED.uploaded_by,
-        is_deleted = EXCLUDED.is_deleted,
         updated_at = EXCLUDED.updated_at
 "#;
 
@@ -92,7 +91,6 @@ fn bind_artifact_params<'q>(
         .bind(artifact.quarantine_window_start)
         .bind(artifact.upstream_published_at)
         .bind(artifact.uploaded_by)
-        .bind(artifact.is_deleted)
         .bind(artifact.created_at)
         .bind(artifact.updated_at)
 }
@@ -163,10 +161,8 @@ impl ArtifactRepository for PgArtifactRepository {
         let sha256 = sha256.as_ref().to_string();
         Box::pin(async move {
             tracing::debug!(entity = "Artifact", sha256 = %sha256, "first_seen_for_checksum");
-            // Unscoped by repository AND unfiltered by `is_deleted`, both
-            // deliberately: the question is "when did hort first hold
-            // these bytes, anywhere", and a soft-delete withdraws a row
-            // from service without un-observing the bytes. `MIN` over the
+            // Unscoped by repository, deliberately: the question is "when
+            // did hort first hold these bytes, anywhere". `MIN` over the
             // `idx_artifacts_checksum` equality range — no new index, no
             // stored projection to keep in step.
             //
@@ -282,7 +278,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // `LIMIT_LIST_MAX_ITEMS` cap.
             let names: Vec<String> = sqlx::query_scalar(
                 "SELECT DISTINCT name FROM artifacts \
-                 WHERE repository_id = $1 AND is_deleted = false \
+                 WHERE repository_id = $1 \
                  ORDER BY name \
                  OFFSET $2 LIMIT $3",
             )
@@ -299,7 +295,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // exposing the total is consistent with `list_by_repository`.
             let total: Option<i64> = sqlx::query_scalar(
                 "SELECT COUNT(DISTINCT name) FROM artifacts \
-                 WHERE repository_id = $1 AND is_deleted = false",
+                 WHERE repository_id = $1",
             )
             .bind(repository_id)
             .fetch_one(&self.pool)
@@ -381,7 +377,6 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE repository_id = $1 AND name_as_published = $2 \
-                   AND is_deleted = false \
                  ORDER BY version \
                  OFFSET $3 LIMIT $4"
             );
@@ -396,8 +391,7 @@ impl ArtifactRepository for PgArtifactRepository {
 
             let total: Option<i64> = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM artifacts \
-                 WHERE repository_id = $1 AND name_as_published = $2 \
-                   AND is_deleted = false",
+                 WHERE repository_id = $1 AND name_as_published = $2",
             )
             .bind(repository_id)
             .bind(&raw)
@@ -438,13 +432,11 @@ impl ArtifactRepository for PgArtifactRepository {
             // is `Some` over mixed-case stored names (defensive, ~zero
             // cost). The RETURNED `name` is the verbatim stored form (not
             // lowercased) — the use case compares it against the new
-            // crate's canonical name to decide collision. Soft-deleted rows
-            // do not reserve a name (mirrors the active read path).
+            // crate's canonical name to decide collision.
             let existing: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM artifacts \
                  WHERE repository_id = $1 \
                    AND replace(lower(name), '_', '-') = $2 \
-                   AND is_deleted = false \
                  LIMIT 1",
             )
             .bind(repository_id)
@@ -469,8 +461,6 @@ impl ArtifactRepository for PgArtifactRepository {
             // Drives the retroactive curation pass over previously-active
             // artifacts. Excludes already-rejected rows (retro-block on
             // a rejected artifact is a no-op; the rejection is sticky).
-            // `is_deleted = false` for symmetry with the rest of the read
-            // path.
             //
             // Over-fetch `LIMIT_LIST_MAX_ITEMS + 1` to detect saturation,
             // then funnel through `LimitedList::from_overfetch` which
@@ -483,7 +473,6 @@ impl ArtifactRepository for PgArtifactRepository {
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE repository_id = $1 \
                    AND quarantine_status IN ('quarantined', 'released') \
-                   AND is_deleted = false \
                  LIMIT $2"
             );
             let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
@@ -515,9 +504,8 @@ impl ArtifactRepository for PgArtifactRepository {
             );
             // The hot serve-path query for the quarantine-aware index
             // filter. Backed by the covering index `artifacts
-            // (repository_id, name) INCLUDE (version, quarantine_status)
-            // WHERE NOT is_deleted` — expect an index-only scan, no heap
-            // fetch.
+            // (repository_id, name) INCLUDE (version, quarantine_status)`
+            // — expect an index-only scan, no heap fetch.
             //
             // `version IS NOT NULL` — null-version rows have nothing to
             // advertise via an index serve (structural/sidecar files);
@@ -549,7 +537,6 @@ impl ArtifactRepository for PgArtifactRepository {
                 "SELECT version, quarantine_status \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 \
-                   AND NOT is_deleted \
                    AND version IS NOT NULL",
             )
             .bind(repository_id)
@@ -597,7 +584,6 @@ impl ArtifactRepository for PgArtifactRepository {
                 "SELECT version, quarantine_status, quarantine_window_start \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 \
-                   AND NOT is_deleted \
                    AND version IS NOT NULL",
             )
             .bind(repository_id)
@@ -633,9 +619,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // `NOT EXISTS` correlated subquery is index-friendly —
             // `content_references` has a UNIQUE constraint on
             // `(repository_id, source_artifact_id, kind)`, so the EXISTS
-            // probe is a single index dive per candidate row. The
-            // `is_deleted = false` filter matches the rest of the read
-            // path; a soft-deleted wheel is not a backfill target.
+            // probe is a single index dive per candidate row.
             //
             // Resumable by construction (no cursor, no "claimed" marker):
             // a failed batch leaves the candidate set unchanged; the next
@@ -644,7 +628,6 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE path LIKE '%.whl' \
-                   AND is_deleted = false \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM content_references \
                        WHERE source_artifact_id = artifacts.id \
@@ -696,7 +679,6 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE path LIKE 'manifests/sha256:%' \
-                   AND is_deleted = false \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM content_references \
                        WHERE source_artifact_id = artifacts.id \
@@ -766,7 +748,6 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 r#"SELECT {SELECT_COLS} FROM artifacts a
                    WHERE a.quarantine_status = 'rejected'
-                     AND a.is_deleted = false
                      AND (
                        -- Repo-scoped policy: artifact's repo must match
                        -- the policy's `scope.Repository` UUID.
@@ -841,7 +822,6 @@ impl ArtifactRepository for PgArtifactRepository {
             // duplicate-free across pages.
             const SCOPE_PREDICATE: &str = r#"
                 a.quarantine_status IN ('quarantined', 'released')
-                AND a.is_deleted = false
                 AND (
                   EXISTS (
                     SELECT 1 FROM policy_projections p
@@ -1325,19 +1305,17 @@ mod tests {
         cleanup_repo(&pool, repo_id).await;
     }
 
-    /// Seed a single artifact with an explicit quarantine status string,
-    /// version, and `is_deleted` flag. Used by the
-    /// `package_version_status` round-trip below; the existing helpers
-    /// don't cover quarantine + soft-delete + null-version combinations
-    /// in one shot, and the query exercises all three branches.
-    #[allow(clippy::too_many_arguments)]
+    /// Seed a single artifact with an explicit quarantine status string
+    /// and version. Used by the `package_version_status` round-trip
+    /// below; the existing helpers don't cover quarantine +
+    /// null-version combinations in one shot, and the query exercises
+    /// both branches.
     async fn seed_artifact_status(
         pool: &PgPool,
         repo: Uuid,
         name: &str,
         version: Option<&str>,
         status: Option<&str>,
-        is_deleted: bool,
         seed: usize,
     ) {
         let id = Uuid::new_v4();
@@ -1348,11 +1326,11 @@ mod tests {
             r#"INSERT INTO artifacts (
                    id, repository_id, name, name_as_published, version, path,
                    size_bytes, checksum_sha256, content_type, storage_key,
-                   quarantine_status, is_deleted
+                   quarantine_status
                ) VALUES (
                    $1, $2, $3, $3, $4, $5,
                    0, $6, 'application/octet-stream', $6,
-                   $7, $8
+                   $7
                )"#,
         )
         .bind(id)
@@ -1362,7 +1340,6 @@ mod tests {
         .bind(&path)
         .bind(&sha256)
         .bind(status)
-        .bind(is_deleted)
         .execute(pool)
         .await
         .expect("seed status artifact");
@@ -1375,7 +1352,6 @@ mod tests {
     ///   - matching `(repository_id, name)` with versions in every
     ///     quarantine status (None → SQL NULL, Quarantined, Released,
     ///     Rejected, ScanIndeterminate),
-    ///   - a soft-deleted row (`is_deleted = true`) that MUST be excluded,
     ///   - a null-version row that MUST be excluded (the serve filter
     ///     advertises versions; a null-version row has nothing to
     ///     advertise — see the port doc-comment),
@@ -1390,7 +1366,7 @@ mod tests {
     /// contract.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    async fn package_version_status_returns_repo_scoped_pairs_excluding_deleted_and_null_version() {
+    async fn package_version_status_returns_repo_scoped_pairs_excluding_null_version() {
         let Some(pool) = maybe_pool().await else {
             return;
         };
@@ -1398,61 +1374,30 @@ mod tests {
         let repo_b = seed_repo(&pool).await;
 
         // repo_a / "leftpad": one row per quarantine status, plus an
-        // excluded soft-deleted row + an excluded null-version row.
-        seed_artifact_status(&pool, repo_a, "leftpad", Some("1.0.0"), None, false, 0).await;
+        // excluded null-version row.
+        seed_artifact_status(&pool, repo_a, "leftpad", Some("1.0.0"), None, 0).await;
         seed_artifact_status(
             &pool,
             repo_a,
             "leftpad",
             Some("1.1.0"),
             Some("quarantined"),
-            false,
             1,
         )
         .await;
-        seed_artifact_status(
-            &pool,
-            repo_a,
-            "leftpad",
-            Some("1.2.0"),
-            Some("released"),
-            false,
-            2,
-        )
-        .await;
-        seed_artifact_status(
-            &pool,
-            repo_a,
-            "leftpad",
-            Some("1.3.0"),
-            Some("rejected"),
-            false,
-            3,
-        )
-        .await;
+        seed_artifact_status(&pool, repo_a, "leftpad", Some("1.2.0"), Some("released"), 2).await;
+        seed_artifact_status(&pool, repo_a, "leftpad", Some("1.3.0"), Some("rejected"), 3).await;
         seed_artifact_status(
             &pool,
             repo_a,
             "leftpad",
             Some("1.4.0"),
             Some("scan_indeterminate"),
-            false,
             4,
         )
         .await;
-        // Soft-deleted — MUST be excluded.
-        seed_artifact_status(
-            &pool,
-            repo_a,
-            "leftpad",
-            Some("9.9.0"),
-            Some("released"),
-            true,
-            5,
-        )
-        .await;
         // Null version — MUST be excluded.
-        seed_artifact_status(&pool, repo_a, "leftpad", None, Some("released"), false, 6).await;
+        seed_artifact_status(&pool, repo_a, "leftpad", None, Some("released"), 6).await;
         // Different name in the same repo — MUST be excluded.
         seed_artifact_status(
             &pool,
@@ -1460,21 +1405,11 @@ mod tests {
             "other-pkg",
             Some("1.0.0"),
             Some("released"),
-            false,
             7,
         )
         .await;
         // Same name, different repo — MUST be excluded.
-        seed_artifact_status(
-            &pool,
-            repo_b,
-            "leftpad",
-            Some("2.0.0"),
-            Some("released"),
-            false,
-            8,
-        )
-        .await;
+        seed_artifact_status(&pool, repo_b, "leftpad", Some("2.0.0"), Some("released"), 8).await;
 
         let r = PgArtifactRepository::new(pool.clone());
         let triples = r
@@ -1582,7 +1517,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: Some(upstream_ts),
             uploaded_by: None,
-            is_deleted: false,
             created_at: upstream_ts,
             updated_at: upstream_ts,
         };
@@ -1623,7 +1557,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: upstream_ts,
             updated_at: upstream_ts,
         };
@@ -1695,7 +1628,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: original_updated_at,
             updated_at: original_updated_at,
         };
@@ -1827,7 +1759,6 @@ mod tests {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: anchor,
             updated_at: anchor,
         };
@@ -2085,45 +2016,6 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
-    /// Soft-deleted wheels are excluded. The handler MUST NOT backfill
-    /// a soft-deleted artifact (its lifetime is over; running extract on
-    /// it would waste CAS bandwidth and the resulting ContentReference
-    /// would be unreachable). Mirrors `is_deleted = false` filter on the
-    /// rest of the read path.
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn find_pypi_wheels_without_kind_excludes_soft_deleted_wheels() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = seed_repo(&pool).await;
-
-        let live = seed_artifact_at_path(&pool, repo, "files/live.whl", 300).await;
-        let deleted = seed_artifact_at_path(&pool, repo, "files/dead.whl", 301).await;
-        // Mark `deleted` soft-deleted directly via SQL (the
-        // `ArtifactRepository` port has no setter — this is a test-
-        // local seed concern).
-        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
-            .bind(deleted)
-            .execute(&pool)
-            .await
-            .expect("soft-delete update");
-
-        let r = PgArtifactRepository::new(pool.clone());
-        let got = r
-            .find_pypi_wheels_without_kind("wheel_metadata", 100)
-            .await
-            .expect("query");
-        let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
-        assert_eq!(
-            got_ids,
-            [live].into_iter().collect(),
-            "soft-deleted wheel MUST be excluded — got {got_ids:?}"
-        );
-
-        cleanup_repo(&pool, repo).await;
-    }
-
     // ---------------------------------------------------------------------
     // find_oci_image_manifests_without_kind PG SQL pin
     // ---------------------------------------------------------------------
@@ -2366,49 +2258,11 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
-    /// Soft-deleted manifests are excluded — mirrors
-    /// `find_pypi_wheels_without_kind_excludes_soft_deleted_wheels`.
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn find_oci_image_manifests_without_kind_excludes_soft_deleted() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = seed_repo(&pool).await;
-
-        let live_hex = deterministic_hex64(440);
-        let live =
-            seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{live_hex}"), 440).await;
-        let dead_hex = deterministic_hex64(441);
-        let deleted =
-            seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{dead_hex}"), 441).await;
-        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE id = $1")
-            .bind(deleted)
-            .execute(&pool)
-            .await
-            .expect("soft-delete update");
-
-        let r = PgArtifactRepository::new(pool.clone());
-        let got = r
-            .find_oci_image_manifests_without_kind("oci_config", 100)
-            .await
-            .expect("query");
-        let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
-        assert_eq!(
-            got_ids,
-            [live].into_iter().collect(),
-            "soft-deleted manifest MUST be excluded — got {got_ids:?}"
-        );
-
-        cleanup_repo(&pool, repo).await;
-    }
-
     /// The registration-collision probe folds `-`/`_` on BOTH
     /// sides (the probe key is pre-folded by `cargo_collision_key`; the
     /// stored name is folded in SQL via `replace(name, '_', '-')`), so a
     /// stored `foo-bar` is found by a would-be `foo_bar` publish's key and
-    /// vice versa. A non-colliding key misses, and soft-deleted rows do not
-    /// reserve a name.
+    /// vice versa. A non-colliding key misses.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn find_canonical_name_by_collision_key_folds_both_separators() {
@@ -2447,20 +2301,6 @@ mod tests {
                 .expect("probe"),
             Some("foo_bar".to_string()),
             "a stored foo_bar folds to foo-bar and is found"
-        );
-
-        // Soft-deleted rows do not reserve the collision key.
-        sqlx::query("UPDATE artifacts SET is_deleted = true WHERE repository_id = $1")
-            .bind(repo2)
-            .execute(&pool)
-            .await
-            .expect("soft-delete update");
-        assert_eq!(
-            r.find_canonical_name_by_collision_key(repo2, "foo-bar")
-                .await
-                .expect("probe"),
-            None,
-            "soft-deleted rows do not reserve the collision key"
         );
         cleanup_repo(&pool, repo2).await;
     }
@@ -2537,8 +2377,8 @@ mod tests {
 
     /// `list_active_for_policy` returns ONLY the `Quarantined` / `Released`
     /// rows of a repo whose active policy resolves to `policy_id`,
-    /// excludes `Rejected` / `ScanIndeterminate` / soft-deleted, paginates
-    /// via `PageRequest`, and reports the full in-scope `total`.
+    /// excludes `Rejected` / `ScanIndeterminate`, paginates via
+    /// `PageRequest`, and reports the full in-scope `total`.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn list_active_for_policy_filters_status_and_paginates() {
@@ -2554,17 +2394,6 @@ mod tests {
         // Excluded rows: rejected + scan_indeterminate (not active).
         seed_status_artifacts(&pool, repo_id, "rejected", 5, 2_000).await;
         seed_status_artifacts(&pool, repo_id, "scan_indeterminate", 5, 3_000).await;
-        // Excluded: soft-deleted released row.
-        seed_artifact_status(
-            &pool,
-            repo_id,
-            "active-released",
-            Some("99.0.0"),
-            Some("released"),
-            true,
-            4_000,
-        )
-        .await;
 
         let r = PgArtifactRepository::new(pool.clone());
 
@@ -2677,30 +2506,23 @@ mod tests {
     /// Seed one artifact row carrying an explicit observation instant.
     /// `created_at` is written explicitly (rather than left to the
     /// column default) precisely because it IS the value under test.
-    async fn seed_observation(
-        pool: &PgPool,
-        repo: Uuid,
-        sha256: &str,
-        created_at: DateTime<Utc>,
-        is_deleted: bool,
-    ) {
+    async fn seed_observation(pool: &PgPool, repo: Uuid, sha256: &str, created_at: DateTime<Utc>) {
         let id = Uuid::new_v4();
         sqlx::query(
             r#"INSERT INTO artifacts (
                    id, repository_id, name, name_as_published, version, path,
                    size_bytes, checksum_sha256, content_type, storage_key,
-                   is_deleted, created_at
+                   created_at
                ) VALUES (
                    $1, $2, 'obs-pkg', 'obs-pkg', '1.0.0', $3,
                    0, $4, 'application/octet-stream', $4,
-                   $5, $6
+                   $5
                )"#,
         )
         .bind(id)
         .bind(repo)
         .bind(format!("obs-pkg/1.0.0/{id}.tar.gz"))
         .bind(sha256)
-        .bind(is_deleted)
         .bind(created_at)
         .execute(pool)
         .await
@@ -2748,10 +2570,10 @@ mod tests {
         let later: DateTime<Utc> = "2026-07-08T09:10:11Z".parse().unwrap();
         let decoy: DateTime<Utc> = "2020-01-01T00:00:00Z".parse().unwrap();
 
-        seed_observation(&pool, repo_b, &subject, later, false).await;
-        seed_observation(&pool, repo_a, &subject, earliest, false).await;
+        seed_observation(&pool, repo_b, &subject, later).await;
+        seed_observation(&pool, repo_a, &subject, earliest).await;
         // A far earlier row for DIFFERENT content — must not leak in.
-        seed_observation(&pool, repo_a, &other, decoy, false).await;
+        seed_observation(&pool, repo_a, &other, decoy).await;
 
         let r = PgArtifactRepository::new(pool.clone());
         let seen = r
@@ -2767,40 +2589,5 @@ mod tests {
 
         cleanup_repo(&pool, repo_a).await;
         cleanup_repo(&pool, repo_b).await;
-    }
-
-    /// A soft-deleted row still counts. Withdrawing a row from service
-    /// does not un-observe the bytes, and the observation is exactly what
-    /// this read reports — only a hard purge (which removes the row)
-    /// retires the evidence. This is the one place the port deviates from
-    /// the `is_deleted = false` filter the rest of the read path applies,
-    /// so it is pinned rather than left to the SQL's shape.
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn first_seen_for_checksum_counts_soft_deleted_observations() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo_id = seed_repo(&pool).await;
-        let subject = deterministic_hex64(0x50F7_DEAD);
-
-        let soft_deleted_at: DateTime<Utc> = "2024-03-04T05:06:07Z".parse().unwrap();
-        let live_at: DateTime<Utc> = "2026-03-04T05:06:07Z".parse().unwrap();
-        seed_observation(&pool, repo_id, &subject, soft_deleted_at, true).await;
-        seed_observation(&pool, repo_id, &subject, live_at, false).await;
-
-        let r = PgArtifactRepository::new(pool.clone());
-        let seen = r
-            .first_seen_for_checksum(&subject.parse().unwrap())
-            .await
-            .expect("aggregate read");
-
-        assert_eq!(
-            seen,
-            Some(soft_deleted_at),
-            "a soft-deleted row is a withdrawn service row, not a retracted observation"
-        );
-
-        cleanup_repo(&pool, repo_id).await;
     }
 }

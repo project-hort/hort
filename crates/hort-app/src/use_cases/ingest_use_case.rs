@@ -1512,7 +1512,6 @@ impl IngestUseCase {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: actor_to_uploaded_by(&actor),
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         };
@@ -2706,7 +2705,6 @@ impl IngestUseCase {
             // gated separately on the per-upstream opt-in.
             upstream_published_at,
             uploaded_by: actor_to_uploaded_by(&actor),
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         };
@@ -4143,7 +4141,6 @@ impl IngestUseCase {
             quarantine_deadline: None,
             upstream_published_at: None,
             uploaded_by: actor_to_uploaded_by(&actor),
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         };

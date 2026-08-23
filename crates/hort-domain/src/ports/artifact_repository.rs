@@ -190,8 +190,7 @@ pub trait ArtifactRepository: Send + Sync {
     /// future per-policy denormalised column can replace the
     /// in-memory filter without changing this signature.
     ///
-    /// `is_deleted = false` for symmetry with the rest of the read
-    /// path. Already-released or quarantined artifacts are excluded —
+    /// Already-released or quarantined artifacts are excluded —
     /// only `Rejected` rows can be unblocked by a new exclusion.
     ///
     /// Wrapped in
@@ -213,8 +212,7 @@ pub trait ArtifactRepository: Send + Sync {
     /// "Active scan-policy" is the same runtime resolution
     /// [`Self::list_rejected_for_policy`] encodes — repo-scoped policies win
     /// over global, mirroring
-    /// `QuarantineUseCase::resolve_active_policy_for_repo`. `is_deleted =
-    /// false` for symmetry with the rest of the read path; only
+    /// `QuarantineUseCase::resolve_active_policy_for_repo`. Only
     /// `Quarantined` / `Released` rows are returned (`Rejected` /
     /// `ScanIndeterminate` / `None` are excluded — a tighten never re-holds
     /// a never-held, already-blocked, or terminal-failure artifact).
@@ -254,9 +252,8 @@ pub trait ArtifactRepository: Send + Sync {
     /// index / sparse-index / `maven-metadata.xml` resolution (a single
     /// `npm install` does dozens to hundreds), so an event-store replay
     /// is not viable. The adapter relies on the covering index
-    /// `artifacts (repository_id, name) INCLUDE (version, quarantine_status)
-    ///  WHERE NOT is_deleted` for an index-only scan
-    /// with no heap fetch.
+    /// `artifacts (repository_id, name) INCLUDE (version, quarantine_status)`
+    /// for an index-only scan with no heap fetch.
     ///
     /// Artifact rows with a NULL `version` column (the format does not
     /// version the file — rare; structural metadata, signature files,
@@ -380,9 +377,6 @@ pub trait ArtifactRepository: Send + Sync {
     /// runs would re-walk the same set; the per-CAS `StoragePort::put`
     /// idempotency on identical content + the upsert semantics of
     /// `ContentReferenceIndex::insert` absorb the duplicate work.
-    ///
-    /// `is_deleted = false` for symmetry with the rest of the read
-    /// path; a soft-deleted wheel is not a backfill candidate.
     fn find_pypi_wheels_without_kind(
         &self,
         kind: &str,
@@ -415,7 +409,7 @@ pub trait ArtifactRepository: Send + Sync {
     /// backfill exists to repair.
     ///
     /// SQL contract: `SELECT … FROM artifacts WHERE path LIKE
-    /// 'manifests/sha256:%' AND is_deleted = false AND NOT EXISTS (SELECT 1
+    /// 'manifests/sha256:%' AND NOT EXISTS (SELECT 1
     /// FROM content_references WHERE source_artifact_id = artifacts.id AND
     /// kind = $1) AND NOT EXISTS (SELECT 1 FROM artifact_metadata WHERE
     /// artifact_id = artifacts.id AND metadata->>'oci_media_type' IN

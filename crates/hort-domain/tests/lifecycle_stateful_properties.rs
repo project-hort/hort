@@ -161,7 +161,6 @@ fn fresh_artifact() -> Artifact {
         quarantine_deadline: None,
         upstream_published_at: None,
         uploaded_by: None,
-        is_deleted: false,
         created_at: base_time(),
         updated_at: base_time(),
     }

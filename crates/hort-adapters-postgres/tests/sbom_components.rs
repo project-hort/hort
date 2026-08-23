@@ -398,7 +398,6 @@ async fn commit_scan_result_constraint_violation_rolls_back_event_append() {
         quarantine_deadline: None,
         upstream_published_at: None,
         uploaded_by: None,
-        is_deleted: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

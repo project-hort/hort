@@ -8,7 +8,7 @@
 //! grouping repos by their handful of distinct durations, and issuing
 //! one indexed range scan per distinct duration `D`
 //! (`quarantine_status='quarantined' AND repository_id = ANY($repos_for_D)
-//! AND quarantine_window_start <= now() - D AND is_deleted = false`)
+//! AND quarantine_window_start <= now() - D`)
 //! — to this port. Keeping the SQL inside the Postgres adapter and
 //! exposing the result as a flat `Vec<QuarantineReleaseCandidate>`
 //! lets the handler stay a pure orchestration step (port boundary +
@@ -62,7 +62,7 @@ pub struct QuarantineReleaseCandidate {
 /// 3. Issuing one indexed range scan per distinct duration `D`
 ///    (`quarantine_window_start <= $now - D` AND
 ///    `repository_id = ANY($repos_for_D)` AND
-///    `quarantine_status = 'quarantined'` AND `is_deleted = false`).
+///    `quarantine_status = 'quarantined'`).
 /// 4. Union-ing the per-duration result sets and applying the
 ///    global `LIMIT $batch_size` to bound per-tick load.
 pub trait QuarantineReleaseCandidatesRepository: Send + Sync {

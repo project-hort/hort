@@ -269,7 +269,6 @@ pub struct ArtifactRow {
     /// itself consumed by any release path.
     pub upstream_published_at: Option<DateTime<Utc>>,
     pub uploaded_by: Option<Uuid>,
-    pub is_deleted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -315,7 +314,6 @@ impl TryFrom<ArtifactRow> for Artifact {
             quarantine_deadline: None,
             upstream_published_at: row.upstream_published_at,
             uploaded_by: row.uploaded_by,
-            is_deleted: row.is_deleted,
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
@@ -1549,7 +1547,6 @@ mod tests {
             quarantine_window_start: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
