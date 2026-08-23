@@ -71,6 +71,15 @@ repository classes.
   pull; push restricted to the `gha-release` ServiceAccount.
 - `hort-crates` — hort's own published crates (`cargo publish` from the release
   CI). World-readable fetch; push restricted to `gha-release`.
+- `hort-base` — a sovereign OCI mirror of the digest-pinned third-party base
+  images (dex, postgres) hort's own cold-start chain depends on, populated
+  exclusively by the mirror CI step (never a proxy, never an arbitrary-upstream
+  cache). World-readable pull; push restricted to `gha-release`. Governed by
+  [ADR 0051](0051-self-contained-chart-and-hort-base-hosting.md).
+- `hort-charts` — world-readable OCI distribution of the first-party
+  `hort-server` Helm chart (the turnkey/sovereign default). Push restricted to
+  `gha-release`. Governed by
+  [ADR 0051](0051-self-contained-chart-and-hort-base-hosting.md).
 
 **Identity is the write gate on this class**, not the scan: push is restricted
 to the `gha-release` ServiceAccount. First-party artifacts are built and signed
@@ -91,9 +100,21 @@ per-repository judgement rather than a class-wide one:
   imprecision the cargo path did, and a held image degrades only this showcase
   face (ghcr.io is the canonical distribution). The resolved-component work is a
   cargo-format decision and gives no reason to revisit this.
+- **`hort-base` — scanned and enforcing.** `scanBackends: ["trivy"]` with the
+  default `enforcement` and a 1 h window — the same posture as `hort-oci`, and
+  the one Class A repo whose contents are *not* first-party: it mirrors
+  digest-pinned third-party base images, so scanning it is the supply-chain gate
+  [ADR 0051](0051-self-contained-chart-and-hort-base-hosting.md) requires on that
+  mirror, not a formality.
+- **`hort-charts` — no scan, zero window.** `scanBackends: []`,
+  `quarantineDuration: 0`. A first-party Helm chart is self-published and signed;
+  trust here comes from its keyless cosign signature, not a quarantine/scan, and
+  a window would only add publish/adopter friction with no upside (an adopter
+  `helm install`s the chart the moment a release ships). Governed by
+  [ADR 0051](0051-self-contained-chart-and-hort-base-hosting.md).
 
 The ADR 0016 cross-opt-in collapse (`trust_upstream_publish_time = true` ×
-`scan_backends: []`) cannot arise on either repository because
+`scan_backends: []`) cannot arise on any of these repositories because
 `trust_upstream_publish_time` is irrelevant to hosted repos — there is no
 upstream clock to trust.
 
@@ -167,8 +188,9 @@ Three `kind: ServiceAccount` objects define CI authority. `role` and
   `{ issuer: github-actions, claims: { repository: project-hort/hort } }`.
 - **`gitlab-ci`** — `role: reader`, same repositories; bound via
   `{ issuer: gitlab, claims: { project_path: <group>/hort } }`.
-- **`gha-release`** — `role: developer` (push to `hort-oci` and `hort-crates`);
-  `repositories: [hort-oci, hort-crates]`; bound via
+- **`gha-release`** — `role: developer` (push to the four Class A hosted repos —
+  `hort-oci`, `hort-crates`, `hort-base`, `hort-charts`);
+  `repositories: [hort-oci, hort-crates, hort-base, hort-charts]`; bound via
   `{ issuer: github-actions, claims: { repository: project-hort/hort, environment: release } }`.
 
 **The confused-deputy risk is closed by the `repository`/`project_path` claim,
@@ -197,7 +219,7 @@ Minted by the `gitops` Ansible role via `hort-server admin issue-svc-token --nam
 maintainer-dev --permission read` (no admin API, no IdP). Operators log in via
 `hort-cli auth login --paste` with this token. Global `read` is acceptable on
 this instance because the only private repos are the dependency proxies;
-`hort-oci` and `hort-crates` are public. This is not a GitHub PAT and is not
+`hort-oci`, `hort-crates`, `hort-base` and `hort-charts` are public. This is not a GitHub PAT and is not
 bound to any GitHub identity.
 
 **Surface 3 — emergency early-release token (static, curator-permission only,
