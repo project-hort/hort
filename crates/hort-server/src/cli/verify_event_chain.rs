@@ -48,18 +48,43 @@
 //! stream_position)`**, one stream's bounded pages at a time (the
 //! adapter pages internally) — never buffering the whole table.
 //!
+//! ## Is an anchor expected here?
+//!
+//! Anchoring is not a property of this subcommand — it is a property of
+//! the deployment, and the checkpoint *writer* must agree with this
+//! *reader* about it. Both sides therefore derive it from one shared
+//! predicate,
+//! [`hort_app::event_chain_anchoring`]: anchoring is configured when the
+//! storage backend is S3 **and** an anchor public key is provisioned.
+//! The writer layers its own extra requirement (the private signing key
+//! it needs in order to *write* anchors) on top; this reader never sees
+//! that key — verification is a public-key operation and the integrity
+//! system's private key has no business in a read-only auditor.
+//!
+//! When no anchor is expected, the per-stream hash chain is still
+//! verified in full and a real break still fails; only "no checkpoint
+//! when none was expected" stops being a failure. **An unanchored
+//! deployment is a supported posture, not a degraded one.**
+//!
 //! ## Exit codes (distinct so automated gates can key on them
 //! deterministically)
 //!
-//! - `0` — [`ChainReport::Ok`].
+//! - `0` — [`ChainReport::Ok`]; also [`ChainReport::MissingCheckpoint`]
+//!   when no anchor is expected.
 //! - `2` — [`ChainReport::Broken`] (a detected integrity violation).
-//! - `3` — [`ChainReport::MissingCheckpoint`] when
-//!   `--fail-on-missing-checkpoint` (default `true`); a coverage gap,
-//!   not a proven violation.
+//! - `3` — [`ChainReport::MissingCheckpoint`] when an anchor **is**
+//!   expected; a coverage gap, not a proven violation.
 //! - `1` — operational error (DB unreachable, anchor store unreadable,
 //!   a deserialization failure not attributable to tampering): the
 //!   verifier could not run. Surfaced via [`super::run_with_runtime`]'s
 //!   `Err` → `ExitCode::FAILURE` path.
+//!
+//! `--fail-on-missing-checkpoint` is tri-state: left unset it *derives*
+//! from anchor-expectedness as above; passed explicitly it *forces* the
+//! exit-code decision either way (CI can demand a checkpoint regardless
+//! of configuration, or ignore one). The forcing flag moves the exit
+//! code only — the `result` label keeps reporting the configuration-
+//! derived fact.
 
 use std::collections::BTreeSet;
 use std::process::ExitCode;
@@ -75,6 +100,10 @@ use hort_adapters_checkpoint_anchor::ObjectStoreCheckpointAnchor;
 use hort_adapters_postgres::event_chain_reader::PgEventChainReader;
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_adapters_storage::builders::{build_s3_object_store, S3StorageOpts};
+// The ONE shared event-chain anchoring predicate — the same module the
+// worker's checkpoint-emission gate is built from, so the writer and
+// this reader cannot disagree about whether an anchor exists here.
+use hort_app::event_chain_anchoring as anchoring;
 use hort_domain::events::{
     roll_up, verify_against_checkpoint, verify_stream_chain, ChainReport, ChainRow, Checkpoint,
     EventHash, StreamRow, StreamRows, StreamVerdict,
@@ -131,18 +160,36 @@ pub struct VerifyEventChainArgs {
     #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
     pub format: OutputFormat,
 
-    /// Whether `missing_checkpoint` is a non-zero exit. CI wants `true`
-    /// (the default — a coverage gap must be investigated);
-    /// an operator spot-check may pass `--fail-on-missing-checkpoint=false`.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub fail_on_missing_checkpoint: bool,
+    /// Whether `missing_checkpoint` is a non-zero exit. **Tri-state.**
+    ///
+    /// Left unset (the default) the decision is *derived* from whether
+    /// this deployment has a checkpoint anchor configured: anchored ⇒
+    /// fail (a missing checkpoint means the emitter is broken),
+    /// unanchored ⇒ do not fail (no anchor was ever expected).
+    ///
+    /// Passed explicitly it *forces* the decision — `true` lets CI
+    /// demand a checkpoint regardless of configuration, `false` lets an
+    /// operator spot-check ignore one.
+    #[arg(long, action = clap::ArgAction::Set)]
+    pub fail_on_missing_checkpoint: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
 // Pure result → exit-code / metric / log mapping (unit-tested, no I/O)
 // ---------------------------------------------------------------------------
 
-/// Map a [`ChainReport`] (+ the `--fail-on-missing-checkpoint` flag) to
+/// Resolve the tri-state `--fail-on-missing-checkpoint` flag against the
+/// deployment's anchor-expectedness. Pure.
+///
+/// Unset derives; an explicit value forces. Forcing exists so a CI job
+/// can demand a checkpoint on a deployment whose configuration does not
+/// require one (and vice versa), which is why the forced value wins
+/// outright rather than being intersected with the derived one.
+fn resolve_fail_on_missing(flag: Option<bool>, anchor_expected: bool) -> bool {
+    flag.unwrap_or(anchor_expected)
+}
+
+/// Map a [`ChainReport`] (+ the resolved fail-on-missing decision) to
 /// a process exit code. Pure.
 fn report_to_exit_code(report: ChainReport, fail_on_missing: bool) -> ExitCode {
     match report {
@@ -159,11 +206,26 @@ fn report_to_exit_code(report: ChainReport, fail_on_missing: bool) -> ExitCode {
 }
 
 /// The `result` label value for a [`ChainReport`]. Pure.
-fn result_label(report: ChainReport) -> &'static str {
+///
+/// The label set is a closed three-value enum
+/// (`{ok, broken, missing_checkpoint}`) fixed by the metrics catalogue —
+/// the anchored-vs-unanchored distinction is carried by the exit code
+/// and the log line, never by a fourth series. So a missing checkpoint
+/// on a deployment that expects **no** anchor reports `ok`: the chain
+/// was verified and nothing was missing that this deployment ever
+/// promised to produce.
+///
+/// It keys on `anchor_expected` — the configuration-derived fact — not
+/// on the resolved fail-on-missing decision. An operator who forces
+/// `--fail-on-missing-checkpoint=false` on an anchored deployment
+/// suppresses the *exit code*; the counter still records the real
+/// coverage gap, which is what the compliance evidence is for.
+fn result_label(report: ChainReport, anchor_expected: bool) -> &'static str {
     match report {
         ChainReport::Ok => RESULT_OK,
         ChainReport::Broken => RESULT_BROKEN,
-        ChainReport::MissingCheckpoint => RESULT_MISSING_CHECKPOINT,
+        ChainReport::MissingCheckpoint if anchor_expected => RESULT_MISSING_CHECKPOINT,
+        ChainReport::MissingCheckpoint => RESULT_OK,
     }
 }
 
@@ -171,21 +233,28 @@ fn result_label(report: ChainReport) -> &'static str {
 /// **The single emitter** for this metric ("one metric, one layer, no
 /// double-count"). Called once, here, from the subcommand layer — never
 /// from `hort-domain` or `hort-adapters-postgres`.
-fn emit_metric(report: ChainReport) {
-    metrics::counter!(METRIC_NAME, "result" => result_label(report)).increment(1);
+fn emit_metric(report: ChainReport, anchor_expected: bool) {
+    metrics::counter!(METRIC_NAME, "result" => result_label(report, anchor_expected)).increment(1);
 }
 
 /// Structured log for the verdict:
 /// `error!` on a detected break (unrecoverable integrity failure),
-/// `warn!` on `missing_checkpoint` (a coverage gap, not a proven
-/// violation), `info!` on ok. **No `#[instrument(err)]`** anywhere on
-/// this path — a chain break is a *verdict*, not a `Result::Err`.
+/// `warn!` on `missing_checkpoint` when an anchor was expected (a
+/// coverage gap, not a proven violation), `info!` on ok — and `info!`
+/// on the unanchored case, which is a supported posture rather than a
+/// gap. **No `#[instrument(err)]`** anywhere on this path — a chain
+/// break is a *verdict*, not a `Result::Err`.
 fn log_report(report: ChainReport, summary: &VerifySummary) {
     match report {
         ChainReport::Ok => info!(
             streams_verified = summary.streams_verified,
             rows_read = summary.rows_read,
             "event-chain verification OK — all streams intact and anchor cross-check passed"
+        ),
+        ChainReport::MissingCheckpoint if !summary.anchor_expected => info!(
+            streams_verified = summary.streams_verified,
+            rows_read = summary.rows_read,
+            "anchoring not configured; chain verified, no anchor expected"
         ),
         ChainReport::MissingCheckpoint => warn!(
             streams_verified = summary.streams_verified,
@@ -237,6 +306,11 @@ pub struct VerifySummary {
     /// `error!` log + JSON; the precise position/reason is in the
     /// per-stream verdict).
     pub first_broken_stream: Option<String>,
+    /// Whether this deployment has a checkpoint anchor configured, per
+    /// the shared `hort_app::event_chain_anchoring` predicate. Selects
+    /// the `missing_checkpoint`-vs-`ok` mapping and, when
+    /// `--fail-on-missing-checkpoint` is left unset, the exit code.
+    pub anchor_expected: bool,
 }
 
 impl VerifySummary {
@@ -244,7 +318,7 @@ impl VerifySummary {
     fn to_text(&self) -> String {
         format!(
             "verify-event-chain: result={} streams={} rows={}{}",
-            result_label(self.report),
+            result_label(self.report, self.anchor_expected),
             self.streams_verified,
             self.rows_read,
             match &self.first_broken_stream {
@@ -267,11 +341,12 @@ impl VerifySummary {
         };
         format!(
             "{{\"result\":\"{}\",\"streams_verified\":{},\"rows_read\":{},\
-             \"first_broken_stream\":{}}}",
-            result_label(self.report),
+             \"first_broken_stream\":{},\"anchor_expected\":{}}}",
+            result_label(self.report, self.anchor_expected),
             self.streams_verified,
             self.rows_read,
-            broken
+            broken,
+            self.anchor_expected
         )
     }
 
@@ -290,10 +365,19 @@ impl VerifySummary {
 /// Entry point. Builds a Tokio runtime, runs [`run_async`], maps the
 /// [`VerifySummary`] to the exit code via [`report_to_exit_code`].
 pub fn run(args: VerifyEventChainArgs) -> ExitCode {
-    let fail_on_missing = args.fail_on_missing_checkpoint;
+    // The tri-state flag is resolved against the summary's
+    // anchor-expectedness, which is only known once the run has read the
+    // deployment's configuration — hence the resolve happens here, on
+    // the summary, rather than up-front on the args.
+    let forced = args.fail_on_missing_checkpoint;
     super::run_with_runtime(
         move || run_async(args),
-        move |summary| report_to_exit_code(summary.report, fail_on_missing),
+        move |summary| {
+            report_to_exit_code(
+                summary.report,
+                resolve_fail_on_missing(forced, summary.anchor_expected),
+            )
+        },
     )
 }
 
@@ -315,7 +399,7 @@ async fn run_async(args: VerifyEventChainArgs) -> anyhow::Result<VerifySummary> 
         streams = ?args.streams,
         since_global = ?args.since_global,
         format = ?args.format,
-        fail_on_missing_checkpoint = args.fail_on_missing_checkpoint,
+        fail_on_missing_checkpoint = ?args.fail_on_missing_checkpoint,
         "hort-server verify-event-chain starting"
     );
 
@@ -345,20 +429,23 @@ async fn run_async(args: VerifyEventChainArgs) -> anyhow::Result<VerifySummary> 
     // Build the checkpoint anchor read adapter from the same storage
     // backend the server uses. Reuses `build_s3_object_store` (ADR 0010
     // TLS posture); the verifier never constructs its own reqwest
-    // client. Filesystem-backed deployments have no object store to
-    // anchor to — the anchor read then yields no checkpoints, which the
-    // pure core correctly maps to `missing_checkpoint`.
-    let anchor = build_anchor(&full).await?;
+    // client. A deployment with no anchor configured gets the null
+    // anchor and `anchor_expected = false` — the chain is still fully
+    // verified, and an absent checkpoint is then not a failure.
+    let AnchorSetup {
+        anchor,
+        anchor_expected,
+    } = build_anchor(&full).await?;
 
     // The anchor-staleness window cadence — from config (default hourly),
     // not hardcoded. MUST match the deployment's `eventstore-checkpoint`
     // CronJob cadence.
     let cadence = Duration::from_secs(full.event_chain_checkpoint_cadence_secs);
 
-    let summary = verify(&reader, &args, anchor.as_ref(), cadence).await?;
+    let summary = verify(&reader, &args, anchor.as_ref(), cadence, anchor_expected).await?;
 
     // Single emitter — once per run, here.
-    emit_metric(summary.report);
+    emit_metric(summary.report, summary.anchor_expected);
     log_report(summary.report, &summary);
     println!("{}", summary.render(args.format));
 
@@ -389,67 +476,119 @@ async fn run_async(args: VerifyEventChainArgs) -> anyhow::Result<VerifySummary> 
     Ok(summary)
 }
 
-/// Build the `CheckpointAnchorPort` read adapter. Returns an
-/// `Arc<dyn CheckpointAnchorPort>`. For a filesystem storage backend
-/// (no object store) the anchor is `None` — the verifier then reports
-/// `missing_checkpoint` (a correct, spec-defined verdict when no anchor
-/// is configured/deployed).
-async fn build_anchor(
-    cfg: &crate::config::Config,
-) -> anyhow::Result<Arc<dyn CheckpointAnchorPort>> {
+/// The anchor read adapter plus the deployment's anchor-expectedness —
+/// the two facts the verdict mapping needs, resolved together so they
+/// cannot disagree.
+struct AnchorSetup {
+    anchor: Arc<dyn CheckpointAnchorPort>,
+    anchor_expected: bool,
+}
+
+/// Build the `CheckpointAnchorPort` read adapter and decide whether an
+/// anchor is expected at all.
+///
+/// The expectation comes from the shared
+/// [`anchoring::anchoring_status`] predicate — the same one the worker's
+/// checkpoint-emission gate is built from — over the effective storage
+/// backend and the operator-provisioned anchor public key. When it says
+/// no, the null anchor is installed: the per-stream chain check still
+/// runs in full, and the anchor cross-check resolves to
+/// `missing_checkpoint`, which the verdict mapping then reports as `ok`.
+///
+/// An anchor public-key path that is *set but unreadable* is an
+/// operational error (exit 1), not an unanchored posture: silently
+/// degrading a broken key mount into "no anchor expected" would turn a
+/// misconfiguration into a green run.
+async fn build_anchor(cfg: &crate::config::Config) -> anyhow::Result<AnchorSetup> {
     let extra_trust_anchors =
         composition::read_extra_ca_bundle().map_err(|e| anyhow::anyhow!("extra CA bundle: {e}"))?;
 
-    match &cfg.storage {
-        StorageConfig::S3 {
-            bucket,
-            region,
-            endpoint,
-            force_path_style,
-            allow_http,
-            access_key_id,
-            secret_access_key,
-            sse_mode,
-        } => {
-            let opts = S3StorageOpts {
-                bucket,
-                region,
-                endpoint: endpoint.as_deref(),
-                force_path_style: *force_path_style,
-                allow_http: *allow_http,
-                access_key: access_key_id,
-                secret_key: secret_access_key,
-                extra_trust_anchors: extra_trust_anchors.as_ref(),
-                sse_mode: sse_mode.as_ref().map(crate::config::S3SseMode::to_adapter),
-            };
-            let store = build_s3_object_store(&opts)
-                .map_err(|e| anyhow::anyhow!("building anchor object store: {e}"))?;
-            let public_key_pem = read_anchor_public_key()?;
-            let adapter = ObjectStoreCheckpointAnchor::new(store, &public_key_pem)
-                .map_err(|e| anyhow::anyhow!("anchor adapter: {e}"))?;
-            Ok(Arc::new(adapter))
-        }
-        StorageConfig::Filesystem { .. } => {
-            // No object store to anchor checkpoints in. The verifier
-            // still runs the per-stream chain check; the anchor
-            // cross-check resolves to `missing_checkpoint`.
-            Ok(Arc::new(NoAnchor))
-        }
+    let public_key_pem = read_anchor_public_key()?;
+    // One consultation of the shared predicate — the verdict carries
+    // both the decision and the operator-facing reason.
+    if let anchoring::AnchoringStatus::NotConfigured(gap) =
+        anchoring::anchoring_status(cfg.storage.effective_backend(), public_key_pem.as_deref())
+    {
+        info!(
+            reason = gap.reason(),
+            "no checkpoint anchor is configured — the per-stream chain is still \
+             verified in full; a missing checkpoint will not fail the run"
+        );
+        return Ok(AnchorSetup {
+            anchor: Arc::new(NoAnchor),
+            anchor_expected: false,
+        });
     }
+
+    let StorageConfig::S3 {
+        bucket,
+        region,
+        endpoint,
+        force_path_style,
+        allow_http,
+        access_key_id,
+        secret_access_key,
+        sse_mode,
+    } = &cfg.storage
+    else {
+        // Not reachable: the shared predicate only reports an expected
+        // anchor for an S3 effective backend. Written as a guard rather
+        // than an unwrap so a future storage variant degrades to the
+        // null anchor instead of panicking the verifier.
+        return Ok(AnchorSetup {
+            anchor: Arc::new(NoAnchor),
+            anchor_expected: false,
+        });
+    };
+
+    let opts = S3StorageOpts {
+        bucket,
+        region,
+        endpoint: endpoint.as_deref(),
+        force_path_style: *force_path_style,
+        allow_http: *allow_http,
+        access_key: access_key_id,
+        secret_key: secret_access_key,
+        extra_trust_anchors: extra_trust_anchors.as_ref(),
+        sse_mode: sse_mode.as_ref().map(crate::config::S3SseMode::to_adapter),
+    };
+    let store = build_s3_object_store(&opts)
+        .map_err(|e| anyhow::anyhow!("building anchor object store: {e}"))?;
+    // `anchor_expected` above already proved the key is present.
+    let public_key_pem = public_key_pem.unwrap_or_default();
+    let adapter = ObjectStoreCheckpointAnchor::new(store, &public_key_pem)
+        .map_err(|e| anyhow::anyhow!("anchor adapter: {e}"))?;
+    Ok(AnchorSetup {
+        anchor: Arc::new(adapter),
+        anchor_expected: true,
+    })
 }
 
-/// Operator-provisioned anchor public-key PEM file. Read from
-/// `HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE`.
-fn read_anchor_public_key() -> anyhow::Result<String> {
-    let path = std::env::var("HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE").context(
-        "HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE must point to the operator-provisioned \
-         anchor Ed25519 SPKI public-key PEM",
-    )?;
-    std::fs::read_to_string(&path).with_context(|| format!("reading anchor public key file {path}"))
+/// Operator-provisioned anchor public-key PEM file, read from the
+/// variable the shared module names
+/// ([`anchoring::ANCHOR_PUBLIC_KEY_FILE_ENV`]).
+///
+/// `Ok(None)` when the variable is unset — the operator did not
+/// provision an anchor, which the shared predicate reads as "not
+/// configured". `Err` when the variable is set but the file cannot be
+/// read: that is a misconfiguration and must not be quietly downgraded
+/// into an unanchored posture.
+///
+/// The **private** signing key is deliberately not read here, or
+/// anywhere on this path: verification is a public-key operation.
+fn read_anchor_public_key() -> anyhow::Result<Option<String>> {
+    let Ok(path) = std::env::var(anchoring::ANCHOR_PUBLIC_KEY_FILE_ENV) else {
+        return Ok(None);
+    };
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .with_context(|| format!("reading anchor public key file {path}"))
 }
 
-/// Null anchor: no checkpoints (filesystem backend / no object store).
-/// The pure core maps an empty checkpoint set to `MissingCheckpoint`.
+/// Null anchor: no checkpoints (no anchor configured for this
+/// deployment). The pure core maps an empty checkpoint set to
+/// `MissingCheckpoint`; the verdict mapping then reports it as `ok`
+/// whenever no anchor was expected.
 struct NoAnchor;
 
 impl CheckpointAnchorPort for NoAnchor {
@@ -489,11 +628,16 @@ fn explicit_stream_ids(streams: &[String]) -> Vec<String> {
 ///
 /// `cadence` is the anchor-staleness window input — from config (default
 /// hourly), not hardcoded.
+///
+/// `anchor_expected` is the shared-predicate verdict, carried into the
+/// summary so the exit-code / metric / log mapping downstream all read
+/// the same fact.
 async fn verify(
     reader: &dyn EventChainReaderPort,
     args: &VerifyEventChainArgs,
     anchor: &dyn CheckpointAnchorPort,
     cadence: Duration,
+    anchor_expected: bool,
 ) -> anyhow::Result<VerifySummary> {
     // Stream selection: the explicit `--stream` allow-list short-circuits
     // the DB read; otherwise the port lists ids (optionally filtered by
@@ -573,6 +717,7 @@ async fn verify(
         streams_verified: stream_ids.len(),
         rows_read,
         first_broken_stream,
+        anchor_expected,
     })
 }
 
@@ -608,7 +753,10 @@ mod tests {
         assert!(a.since_global.is_none());
         assert!(a.checkpoint_source.is_none());
         assert_eq!(a.format, OutputFormat::Text);
-        assert!(a.fail_on_missing_checkpoint);
+        assert_eq!(
+            a.fail_on_missing_checkpoint, None,
+            "unset means derive from anchor-expectedness, not a hardcoded true"
+        );
     }
 
     #[test]
@@ -629,7 +777,106 @@ mod tests {
     fn parses_json_format_and_fail_flag_false() {
         let a = parsed(&["--format", "json", "--fail-on-missing-checkpoint", "false"]);
         assert_eq!(a.format, OutputFormat::Json);
-        assert!(!a.fail_on_missing_checkpoint);
+        assert_eq!(a.fail_on_missing_checkpoint, Some(false));
+    }
+
+    /// Both spellings of an explicit force still parse, in both
+    /// directions — the tri-state must not have cost the operator the
+    /// forcing surface.
+    #[test]
+    fn parses_explicit_fail_flag_in_both_spellings() {
+        assert_eq!(
+            parsed(&["--fail-on-missing-checkpoint=true"]).fail_on_missing_checkpoint,
+            Some(true)
+        );
+        assert_eq!(
+            parsed(&["--fail-on-missing-checkpoint", "true"]).fail_on_missing_checkpoint,
+            Some(true)
+        );
+        assert_eq!(
+            parsed(&["--fail-on-missing-checkpoint=false"]).fail_on_missing_checkpoint,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn rejects_non_boolean_fail_flag() {
+        let err = TestCli::try_parse_from([
+            "hort-server",
+            "verify-event-chain",
+            "--fail-on-missing-checkpoint",
+            "maybe",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue);
+    }
+
+    // -- Anchor-expectedness comes from the shared predicate ---------------
+
+    /// The reader's anchor-expectedness IS the shared predicate — this
+    /// side adds no condition of its own. The exhaustive writer-vs-reader
+    /// agreement matrix lives with the predicate
+    /// (`hort_app::event_chain_anchoring`); this pins that the CLI reads
+    /// it rather than restating it.
+    #[test]
+    fn anchor_expectedness_comes_from_the_shared_predicate() {
+        use hort_app::storage_backend::EffectiveStorageBackend as B;
+        let expected = |backend, pem| anchoring::anchoring_status(backend, pem).is_configured();
+        assert!(!expected(B::Filesystem, Some("pem")));
+        assert!(!expected(B::S3, None));
+        assert!(expected(B::S3, Some("pem")));
+    }
+
+    /// **Least privilege on the integrity system's key.** Verification is
+    /// a public-key operation, so nothing on this path may reach for the
+    /// operator's Ed25519 private key. Source-scan guard: the needle is
+    /// assembled at compile time so this assertion cannot satisfy itself.
+    #[test]
+    fn the_verify_path_never_reads_the_private_signing_key() {
+        let src = include_str!("verify_event_chain.rs");
+        let env_var = concat!("HORT_EVENT_CHAIN_ANCHOR_", "SIGNING_KEY_FILE");
+        let shared_const = concat!("ANCHOR_", "SIGNING_KEY_FILE_ENV");
+        assert!(
+            !src.contains(env_var),
+            "the verify job must never be given the private signing key"
+        );
+        assert!(
+            !src.contains(shared_const),
+            "the verify job must never be given the private signing key"
+        );
+    }
+
+    #[test]
+    fn anchoring_gap_reasons_are_operator_facing() {
+        use hort_app::event_chain_anchoring::AnchoringGap;
+        assert!(AnchoringGap::StorageNotS3.reason().contains("S3"));
+        assert!(AnchoringGap::AnchorPublicKeyAbsent
+            .reason()
+            .contains("public key"));
+    }
+
+    // -- Tri-state resolution ---------------------------------------------
+
+    /// Unset derives from anchor-expectedness; an explicit value forces
+    /// regardless of it. This is the whole tri-state contract.
+    #[test]
+    fn tri_state_flag_derives_when_unset_and_forces_when_set() {
+        // Derive.
+        assert!(
+            resolve_fail_on_missing(None, true),
+            "an anchored deployment with the flag unset must fail on a missing \
+             checkpoint — the emitter is broken"
+        );
+        assert!(
+            !resolve_fail_on_missing(None, false),
+            "an unanchored deployment with the flag unset must not fail — no anchor \
+             was ever expected"
+        );
+        // Force, both directions, against both configurations.
+        assert!(resolve_fail_on_missing(Some(true), false));
+        assert!(resolve_fail_on_missing(Some(true), true));
+        assert!(!resolve_fail_on_missing(Some(false), true));
+        assert!(!resolve_fail_on_missing(Some(false), false));
     }
 
     #[test]
@@ -735,12 +982,63 @@ mod tests {
 
     #[test]
     fn result_labels_are_the_three_catalog_values() {
-        assert_eq!(result_label(ChainReport::Ok), "ok");
-        assert_eq!(result_label(ChainReport::Broken), "broken");
+        assert_eq!(result_label(ChainReport::Ok, true), "ok");
+        assert_eq!(result_label(ChainReport::Broken, true), "broken");
         assert_eq!(
-            result_label(ChainReport::MissingCheckpoint),
+            result_label(ChainReport::MissingCheckpoint, true),
             "missing_checkpoint"
         );
+    }
+
+    /// The label set stays a closed three-value enum whatever the
+    /// anchor-expectedness — the unanchored case reuses `ok`, it does
+    /// not introduce a fourth series (which would break the attestation
+    /// gate's `{metric, result-enum}` contract).
+    #[test]
+    fn result_label_set_is_closed_at_three_values() {
+        let mut seen = BTreeSet::new();
+        for report in [
+            ChainReport::Ok,
+            ChainReport::Broken,
+            ChainReport::MissingCheckpoint,
+        ] {
+            for anchor_expected in [true, false] {
+                seen.insert(result_label(report, anchor_expected));
+            }
+        }
+        assert_eq!(
+            seen,
+            BTreeSet::from([RESULT_OK, RESULT_BROKEN, RESULT_MISSING_CHECKPOINT]),
+            "the result label catalog is fixed at exactly {{ok, broken, \
+             missing_checkpoint}}"
+        );
+    }
+
+    /// A missing checkpoint on a deployment that expects no anchor is
+    /// `ok`: nothing was missing that this deployment ever promised.
+    #[test]
+    fn unanchored_missing_checkpoint_labels_as_ok() {
+        assert_eq!(result_label(ChainReport::MissingCheckpoint, false), "ok");
+    }
+
+    /// A real break is a break regardless of anchoring — the unanchored
+    /// posture must never soften the integrity verdict.
+    #[test]
+    fn a_break_is_broken_whether_or_not_an_anchor_is_expected() {
+        assert_eq!(result_label(ChainReport::Broken, true), "broken");
+        assert_eq!(result_label(ChainReport::Broken, false), "broken");
+        for anchor_expected in [true, false] {
+            assert_eq!(
+                format!(
+                    "{:?}",
+                    report_to_exit_code(
+                        ChainReport::Broken,
+                        resolve_fail_on_missing(None, anchor_expected)
+                    )
+                ),
+                format!("{:?}", ExitCode::from(2))
+            );
+        }
     }
 
     // -- Metric: DebuggingRecorder catalog test ---------------------------
@@ -764,16 +1062,16 @@ mod tests {
         })
     }
 
-    fn capture(report: ChainReport) -> Vec<MetricEntry> {
+    fn capture(report: ChainReport, anchor_expected: bool) -> Vec<MetricEntry> {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || emit_metric(report));
+        metrics::with_local_recorder(&recorder, || emit_metric(report, anchor_expected));
         snapshotter.snapshot().into_vec()
     }
 
     #[test]
     fn metric_fires_with_result_ok() {
-        let e = capture(ChainReport::Ok);
+        let e = capture(ChainReport::Ok, true);
         let v = counter_for(&e, "ok").expect("ok counter absent");
         assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
         // Exactly one series, exactly one increment.
@@ -783,16 +1081,34 @@ mod tests {
 
     #[test]
     fn metric_fires_with_result_broken() {
-        let e = capture(ChainReport::Broken);
+        let e = capture(ChainReport::Broken, true);
         let v = counter_for(&e, "broken").expect("broken counter absent");
         assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
     }
 
     #[test]
     fn metric_fires_with_result_missing_checkpoint() {
-        let e = capture(ChainReport::MissingCheckpoint);
+        let e = capture(ChainReport::MissingCheckpoint, true);
         let v = counter_for(&e, "missing_checkpoint").expect("missing_checkpoint counter absent");
         assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+    }
+
+    /// The unanchored run increments `result="ok"` — **not** a fourth
+    /// series. The metric catalogue fixes the cardinality at ≤ 3.
+    #[test]
+    fn metric_maps_unanchored_missing_checkpoint_to_ok() {
+        let e = capture(ChainReport::MissingCheckpoint, false);
+        let v = counter_for(&e, "ok").expect("ok counter absent");
+        assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+        assert!(counter_for(&e, "missing_checkpoint").is_none());
+        assert!(counter_for(&e, "broken").is_none());
+        assert_eq!(
+            e.iter()
+                .filter(|(ck, ..)| ck.key().name() == METRIC_NAME)
+                .count(),
+            1,
+            "exactly one series per run, never a new label value"
+        );
     }
 
     // -- VerifySummary rendering ------------------------------------------
@@ -804,6 +1120,7 @@ mod tests {
             streams_verified: 3,
             rows_read: 12,
             first_broken_stream: None,
+            anchor_expected: true,
         };
         assert_eq!(
             s.render(OutputFormat::Text),
@@ -818,6 +1135,7 @@ mod tests {
             streams_verified: 2,
             rows_read: 5,
             first_broken_stream: Some("authorization-x".into()),
+            anchor_expected: true,
         };
         assert_eq!(
             s.render(OutputFormat::Text),
@@ -833,6 +1151,7 @@ mod tests {
             streams_verified: 1,
             rows_read: 0,
             first_broken_stream: None,
+            anchor_expected: true,
         };
         let v: serde_json::Value = serde_json::from_str(&s.render(OutputFormat::Json)).unwrap();
         assert_eq!(v["result"], "missing_checkpoint");
@@ -848,6 +1167,7 @@ mod tests {
             streams_verified: 1,
             rows_read: 9,
             first_broken_stream: Some("admin-z".into()),
+            anchor_expected: true,
         };
         let v: serde_json::Value = serde_json::from_str(&s.render(OutputFormat::Json)).unwrap();
         assert_eq!(v["result"], "broken");
@@ -883,9 +1203,18 @@ mod tests {
             streams_verified: 1,
             rows_read: 1,
             first_broken_stream: None,
+            anchor_expected: true,
         };
         log_report(ChainReport::Ok, &base);
         log_report(ChainReport::MissingCheckpoint, &base);
+        // The unanchored arm: a distinct, non-warning log line.
+        log_report(
+            ChainReport::MissingCheckpoint,
+            &VerifySummary {
+                anchor_expected: false,
+                ..base.clone()
+            },
+        );
         log_report(
             ChainReport::Broken,
             &VerifySummary {
@@ -947,6 +1276,12 @@ mod tests {
     /// Test staleness cadence (the production default; these tests pin
     /// fresh anchors so staleness never trips).
     const TEST_CADENCE: Duration = Duration::from_secs(3600);
+
+    /// These tests model an **anchored** deployment (S3 + a provisioned
+    /// anchor public key) unless a test says otherwise: that is the
+    /// configuration in which a missing checkpoint is a real gap, so it
+    /// is the one the exit-code assertions below are pinned against.
+    const ANCHOR_EXPECTED: bool = true;
 
     async fn maybe_pool() -> Option<sqlx::PgPool> {
         // bare `DATABASE_URL` is read here INTENTIONALLY:
@@ -1070,7 +1405,10 @@ mod tests {
             since_global,
             checkpoint_source: None,
             format: OutputFormat::Json,
-            fail_on_missing_checkpoint: true,
+            // Explicit force: these DB tests pin the exit-code mapping
+            // directly and must not vary with the ambient config the
+            // shared anchoring predicate would otherwise read.
+            fail_on_missing_checkpoint: Some(true),
         }
     }
 
@@ -1093,11 +1431,12 @@ mod tests {
             &args,
             &anchor,
             TEST_CADENCE,
+            ANCHOR_EXPECTED,
         )
         .await
         .unwrap();
         assert_eq!(summary.report, ChainReport::Ok);
-        assert_eq!(result_label(summary.report), "ok");
+        assert_eq!(result_label(summary.report, summary.anchor_expected), "ok");
         assert_eq!(
             format!("{:?}", report_to_exit_code(summary.report, true)),
             format!("{:?}", ExitCode::SUCCESS)
@@ -1153,11 +1492,15 @@ mod tests {
             &args,
             &anchor,
             TEST_CADENCE,
+            ANCHOR_EXPECTED,
         )
         .await
         .unwrap();
         assert_eq!(summary.report, ChainReport::Broken);
-        assert_eq!(result_label(summary.report), "broken");
+        assert_eq!(
+            result_label(summary.report, summary.anchor_expected),
+            "broken"
+        );
         assert_eq!(
             format!("{:?}", report_to_exit_code(summary.report, true)),
             format!("{:?}", ExitCode::from(2))
@@ -1183,11 +1526,15 @@ mod tests {
             &args,
             &NoAnchor,
             TEST_CADENCE,
+            ANCHOR_EXPECTED,
         )
         .await
         .unwrap();
         assert_eq!(summary.report, ChainReport::MissingCheckpoint);
-        assert_eq!(result_label(summary.report), "missing_checkpoint");
+        assert_eq!(
+            result_label(summary.report, summary.anchor_expected),
+            "missing_checkpoint"
+        );
         assert_eq!(
             format!("{:?}", report_to_exit_code(summary.report, true)),
             format!("{:?}", ExitCode::from(3))
@@ -1195,6 +1542,78 @@ mod tests {
         assert_eq!(
             format!("{:?}", report_to_exit_code(summary.report, false)),
             format!("{:?}", ExitCode::SUCCESS)
+        );
+    }
+
+    /// **The unanchored-deployment guard.** Same scenario as above —
+    /// an intact chain and no checkpoints — but on a deployment where
+    /// the shared anchoring predicate says no anchor is expected (a
+    /// filesystem install, or S3 with no anchor public key provisioned).
+    ///
+    /// The chain is still fully verified, the raw domain verdict is
+    /// still `MissingCheckpoint`, and yet with the tri-state flag left
+    /// unset the run exits `0` and records `result="ok"`. This is the
+    /// behaviour that makes the verifier safe to ship default-on: an
+    /// install that can never have a WORM anchor must not go red every
+    /// single night for the absence of one.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn unanchored_deployment_verifies_green_without_a_checkpoint() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let sid = seed_stream(&pool, 2).await;
+        let args = VerifyEventChainArgs {
+            streams: vec![sid.clone()],
+            since_global: None,
+            checkpoint_source: None,
+            format: OutputFormat::Json,
+            // Unset — derive from anchor-expectedness.
+            fail_on_missing_checkpoint: None,
+        };
+
+        let summary = verify(
+            &PgEventChainReader::new(pool.clone()),
+            &args,
+            &NoAnchor,
+            TEST_CADENCE,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            summary.report,
+            ChainReport::MissingCheckpoint,
+            "the pure core still reports the raw verdict — the anchoring \
+             posture is applied at the mapping, not by weakening the core"
+        );
+        assert!(!summary.anchor_expected);
+        assert_eq!(result_label(summary.report, summary.anchor_expected), "ok");
+        assert_eq!(
+            format!(
+                "{:?}",
+                report_to_exit_code(
+                    summary.report,
+                    resolve_fail_on_missing(
+                        args.fail_on_missing_checkpoint,
+                        summary.anchor_expected
+                    )
+                )
+            ),
+            format!("{:?}", ExitCode::SUCCESS),
+            "a missing anchor must not be a daily failure where none was expected"
+        );
+        // Forcing still works: CI can demand a checkpoint anyway.
+        assert_eq!(
+            format!(
+                "{:?}",
+                report_to_exit_code(
+                    summary.report,
+                    resolve_fail_on_missing(Some(true), summary.anchor_expected)
+                )
+            ),
+            format!("{:?}", ExitCode::from(3))
         );
     }
 
@@ -1231,6 +1650,7 @@ mod tests {
             &args,
             &anchor,
             TEST_CADENCE,
+            ANCHOR_EXPECTED,
         )
         .await
         .unwrap();
@@ -1241,7 +1661,7 @@ mod tests {
              genesis; a per-row global_position filter would slice off \
              stream_position 0 and yield a false Broken (Critical #1)"
         );
-        assert_eq!(result_label(summary.report), "ok");
+        assert_eq!(result_label(summary.report, summary.anchor_expected), "ok");
         // The full stream is still read (from genesis), not a suffix.
         assert_eq!(summary.rows_read, 4);
     }
@@ -1371,13 +1791,14 @@ mod tests {
             since_global: None,
             checkpoint_source: None,
             format: OutputFormat::Json,
-            fail_on_missing_checkpoint: true,
+            fail_on_missing_checkpoint: Some(true),
         };
         let summary = verify(
             &PgEventChainReader::new(pool.clone()),
             &args,
             &anchor,
             TEST_CADENCE,
+            ANCHOR_EXPECTED,
         )
         .await
         .unwrap();

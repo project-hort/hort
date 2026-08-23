@@ -301,9 +301,9 @@ of this umbrella).
   admin task invoke <kind>` with the `<release>-svc-token` PAT and are gated
   by **both** `scheduledTasks.adminTasksEnabled` (the master toggle, which
   also renders the svc-token bootstrap Job + RBAC) **and** the task's own
-  `enabled`. All default **off** except `replaySeenPrune` and
-  `scannerRegistryPrune` (both default on once the master toggle is
-  flipped). `verifyEventChain` is the one hybrid: it
+  `enabled`. All default **off** except `replaySeenPrune`,
+  `scannerRegistryPrune` and `verifyEventChain` (all default on once the
+  master toggle is flipped). `verifyEventChain` is the one hybrid: it
   shares the `adminTasksEnabled` gate but runs `hort-server
   verify-event-chain` directly (no PAT).
 - **Worker prerequisites:** `worker.enabled=true` requires the

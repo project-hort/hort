@@ -1021,12 +1021,16 @@ as of HEAD:
 | `serviceAccountRotation` | admin-task | `false` | `*/15 * * * *` | — |
 | `eventstoreCheckpoint` | admin-task | `false` | `0 * * * *` | — |
 | `replaySeenPrune` | admin-task | `true` | `0 * * * *` | — |
-| `verifyEventChain` | admin-task | `false` | `0 2 * * *` | — |
+| `verifyEventChain` | admin-task | `true` | `0 2 * * *` | `failOnMissingCheckpoint` (tri-state, default `null` = derive) |
 | `scannerRegistryPrune` | admin-task | `true` | `0 * * * *` | — |
 
-`replaySeenPrune` and `scannerRegistryPrune` are the only admin-task
-tasks that default `enabled: true` (both run once `adminTasksEnabled`
-is flipped). `scrub.actionOnMismatch`
+`replaySeenPrune`, `scannerRegistryPrune` and `verifyEventChain` are the
+admin-task tasks that default `enabled: true` (all run once
+`adminTasksEnabled` is flipped). `verifyEventChain` is default-on because
+tamper detection nobody opts into is tamper detection nobody gets; its
+`failOnMissingCheckpoint` is tri-state and left `null` so an install with
+no checkpoint anchor derives "no anchor expected" and stays green
+(ADR 0057). `scrub.actionOnMismatch`
 (`HORT_CAS_SCRUB_ACTION_ON_MISMATCH`) is **also read by the main
 Deployment**, so it is load-bearing even with `scrub.enabled: false`. The
 schedule floor is 5 minutes (the admin-task Idempotency-Key uses

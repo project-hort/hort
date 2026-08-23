@@ -5,10 +5,11 @@ Periodically runs the offline tamper-evidence verifier
 `hort-server verify-event-chain --format json`, which reads the `events`
 table (per-stream hash chain) and the externally-anchored checkpoints,
 recomputes every stream's chain, cross-checks it against the anchored
-heads, and exits 0 (intact) / 2 (a detected integrity violation) / 3
-(missing/stale checkpoint, when `--fail-on-missing-checkpoint`, the
-default) / 1 (operational error — verifier could not run). The verdict
-is also surfaced as the `hort_event_chain_verify_total{result}` counter.
+heads, and exits 0 (intact — including a missing checkpoint where no
+anchor is expected) / 2 (a detected integrity violation) / 3
+(missing/stale checkpoint where an anchor IS expected) / 1 (operational
+error — verifier could not run). The verdict is also surfaced as the
+`hort_event_chain_verify_total{result}` counter.
 
 Unlike the sibling `cronjob-eventstore-checkpoint.yaml` (a *trigger* that
 POSTs to the worker's admin-task endpoint), this is NOT a worker-
@@ -39,12 +40,14 @@ checkpoint must be.)
 Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents a
 second pod while the previous run is still scanning.
 
-Gated by `scheduledTasks.verifyEventChain.enabled` (default false). The parent
-toggle `scheduledTasks.adminTasksEnabled` must also be true. The verifier runs against
-the same storage backend the server uses; on a filesystem backend (no
-object store) the anchor cross-check resolves to `missing_checkpoint`
-(exit 3) — enable the `eventstoreCheckpoint` CronJob + an S3 anchor
-bucket for full external-anchor attestation.
+Gated by `scheduledTasks.verifyEventChain.enabled` (default TRUE — an
+existing install that never set the key gains this CronJob on upgrade).
+The parent toggle `scheduledTasks.adminTasksEnabled` must also be true.
+The verifier runs against the same storage backend the server uses; on a
+backend with no checkpoint anchor (a filesystem install, or S3 without a
+provisioned anchor public key) it verifies the per-stream chain, expects
+no anchor, and exits 0 — enable the `eventstoreCheckpoint` CronJob + an
+S3 anchor bucket for full external-anchor attestation.
 */}}
 {{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.verifyEventChain.enabled }}
 apiVersion: batch/v1
@@ -100,12 +103,14 @@ spec:
                 - verify-event-chain
                 - --format
                 - json
-                {{- /* Passed explicitly whenever the value is a bool (values.yaml
-                       always sets one), so the rendered CronJob states the
-                       policy instead of inheriting the CLI default silently.
-                       Guarded with kindIs rather than `not`/`default`: both
-                       treat an absent key and an explicit `false` alike, which
-                       would invert the default for anyone on older values. */}}
+                {{- /* Passed only when the operator set an explicit bool. The
+                       chart default is `null`, which leaves the flag off the
+                       command line so the CLI derives the decision from whether
+                       this deployment has anchoring configured — that derivation
+                       is what keeps an unanchored install green. Guarded with
+                       kindIs rather than `not`/`default`: both treat an absent
+                       key and an explicit `false` alike, which would force the
+                       flag for anyone who never set it. */}}
                 {{- if kindIs "bool" .Values.scheduledTasks.verifyEventChain.failOnMissingCheckpoint }}
                 - --fail-on-missing-checkpoint={{ .Values.scheduledTasks.verifyEventChain.failOnMissingCheckpoint }}
                 {{- end }}

@@ -1834,28 +1834,50 @@ scheduledTasks:
   # so a verifier that was enabled and then stopped is alarmable. Keep this
   # schedule consistent with the expected-interval knob.
   #
-  # DEFAULT-DISABLED like its siblings. On a filesystem storage
-  # backend (no object store) the anchor cross-check resolves to
-  # `missing_checkpoint` (exit 3); enable `eventstoreCheckpoint` + an S3
-  # anchor bucket for full external-anchor attestation.
+  # DEFAULT-ENABLED — a deliberate divergence from the default-disabled
+  # admin-task convention, and the second template in this chart to take
+  # it (after `replaySeenPrune`). Tamper detection an operator has to
+  # opt into is tamper detection most deployments never get: an install
+  # that does nothing had no integrity verification at all. The
+  # verification is a read-only recompute over the `events` table on the
+  # runtime DML DSN — it writes nothing and cannot itself damage
+  # anything.
+  #
+  # UPGRADE NOTE: an existing install that never set this key GAINS this
+  # CronJob on upgrade. It runs daily at 02:00 by default. Set
+  # `enabled: false` to opt out.
+  #
+  # A deployment with no checkpoint anchor stays GREEN. The verifier
+  # derives whether an anchor is expected from the same predicate the
+  # checkpoint writer uses — S3 storage AND a provisioned anchor public
+  # key — so a filesystem install (which can never have an S3 Object-Lock
+  # WORM anchor) verifies its chain, expects no anchor, and exits 0. An
+  # unanchored deployment is a supported posture, not a degraded one. A
+  # real chain break still fails, everywhere.
   verifyEventChain:
     executionPath: admin-task
-    enabled: false
-    # Treat a missing/stale/gapped anchoring checkpoint as a failure
-    # (CLI default, exit 3). Leave it `true` wherever `eventstoreCheckpoint`
-    # above is enabled: there, a missing checkpoint means the emitter is
-    # broken and the run SHOULD go red.
+    enabled: true
+    # Whether a missing/stale/gapped anchoring checkpoint fails the run
+    # (exit 3). TRI-STATE.
     #
-    # Set it to `false` on installs that verify chain integrity but have not
-    # deployed WORM anchoring — the filesystem backend, or any S3 install
-    # without the Ed25519 anchor keys and an Object-Lock bucket. Without this
-    # knob such an install can only choose between a CronJob that fails every
-    # single night on `missing_checkpoint` and no verification at all, even
-    # though the chain check itself is exactly what it wants. The runbook
-    # recommends `--fail-on-missing-checkpoint=false` for that case; this
-    # exposes it. The chain-integrity verdict is unaffected — a genuinely
-    # broken chain still fails either way.
-    failOnMissingCheckpoint: true
+    # `null` (the default) DERIVES the decision from whether this
+    # deployment has anchoring configured: anchored ⇒ fail (a missing
+    # checkpoint means the emitter is broken and the run SHOULD go red);
+    # unanchored ⇒ do not fail (no anchor was ever expected). That
+    # derivation is why this CronJob is safe to default-enable, and it is
+    # what most installs want — leave it unset.
+    #
+    # An explicit `true`/`false` FORCES the decision instead: `true` lets
+    # a compliance-critical install demand a checkpoint regardless of
+    # configuration, `false` silences the exit code on an anchored
+    # install whose emitter is known-broken. Forcing moves only the exit
+    # code — the `hort_event_chain_verify_total{result}` counter keeps
+    # reporting the configuration-derived fact, so a forced `false` does
+    # not hide a real coverage gap from the metric.
+    #
+    # The chain-integrity verdict is unaffected either way — a genuinely
+    # broken chain still fails.
+    failOnMissingCheckpoint: null
     # Default cadence — daily, matching the boot gauge's
     # HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS default (86400 s).
     # Operators with a tighter compliance window may shorten both in

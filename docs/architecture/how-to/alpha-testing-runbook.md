@@ -839,23 +839,24 @@ completed` and the worker logs the task's `info!` summary.
 ## §13 — Retention + event-chain integrity  *(Track A+B)*
 
 ```bash
-# On the filesystem alpha there is no S3 WORM checkpoint anchor, so the
-# verifier returns exit 3 `missing_checkpoint` — the hash chain IS intact,
-# only the external-anchor attestation is absent. Pass the flag for exit 0:
-./target/release/hort-server verify-event-chain --fail-on-missing-checkpoint=false
+# On the filesystem alpha there is no S3 WORM checkpoint anchor. The
+# verifier derives that no anchor is expected and exits 0 — the hash
+# chain IS verified, only the external-anchor attestation is absent.
+./target/release/hort-server verify-event-chain
 ./target/release/hort-server scrub                # "checked=N mismatches=0 missing=0 read_errors=0"
 ```
 
 **Assertions (§13.a):** exit codes are deterministic — `0=ok`, `2=broken`
 (tamper — escalate immediately), `3=missing_checkpoint`, `1=operational
 error`. The **chain integrity** check (`streams`/`rows` verified, no `broken`)
-is the security property and passes on the alpha. **`missing_checkpoint`
-(exit 3 by default) is EXPECTED here** — external anchoring needs S3
-Object-Lock WORM + the `eventstore-checkpoint` CronJob, neither present in
-the filesystem alpha; `--fail-on-missing-checkpoint=false` makes that a
-clean exit 0 (CI keeps the default `true` so a real coverage gap is caught).
-The scrub reports zero `mismatches`/`missing`/`read_errors` (any non-zero is
-a real defect — capture and escalate). Retention sweep (`hort-cli admin task
+is the security property and passes on the alpha. **Exit `0` with
+`"anchor_expected": false` is EXPECTED here** — external anchoring needs
+S3 Object-Lock WORM + a provisioned anchor public key, neither present in
+the filesystem alpha, so the run reports `result=ok` rather than a
+coverage gap. To assert the anchored behaviour anyway, force it:
+`--fail-on-missing-checkpoint=true` then yields exit 3. The scrub reports
+zero `mismatches`/`missing`/`read_errors` (any non-zero is a real defect
+— capture and escalate). Retention sweep (`hort-cli admin task
 invoke retention-purge`) is informational unless a `kind: RetentionPolicy`
 is declared.
 
