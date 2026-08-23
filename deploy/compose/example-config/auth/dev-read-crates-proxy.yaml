@@ -1,0 +1,18 @@
+# PermissionGrant: [developer, ci-pusher] -> read crates-proxy.
+#
+# crates-proxy is private, and the dogfood scenario's ingest leg pulls from it
+# as dev-user: without this grant that pull returns 403 and the scenario can
+# never reach the quarantine gate (503 + Retry-After) it exists to assert.
+# Two-claim subject per the allowlist linter; `ci-pusher` is the e2e realm's
+# only second developer-side claim (see ci-pushers.yaml for why the fan-out
+# from one IdP group is a test-harness contrivance).
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-read-crates-proxy
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: read
+  repository: crates-proxy

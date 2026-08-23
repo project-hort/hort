@@ -1,0 +1,17 @@
+# Mirror of deploy/ansible/files/gitops/policies/hort-oci-scan.yaml.
+# Nothing is pushed to hort-oci on compose, so the trivy backend and the 1h
+# window never fire here; the policy is carried so the repository's applied
+# posture matches the deployment the dogfood scenario describes.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: hort-oci-scan
+spec:
+  scope:
+    repository: hort-oci
+  severityThreshold: high
+  quarantineDuration: 1h
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["trivy"]
+  licensePolicy: {}

@@ -1,0 +1,26 @@
+# PermissionGrant: [developer, ci-pusher] -> read hort-crates-chain-e2e.
+#
+# The publisher needs READ in addition to its write grant
+# (dev-write-hort-crates-chain-e2e). hort's permission model is discrete —
+# a Write grant does NOT subsume Read (rbac.rs `user_grants_authorize`
+# matches `grant.permission == permission` exactly). On a PRIVATE repo the
+# sparse-index resolve first requires `Permission::Read` for visibility
+# (repository_access.rs `can_read`); without it the repo is invisible and
+# every authenticated index/publish request collapses to 404
+# (anti-enumeration). ADR 0055's write-authorized held-read then WIDENS that
+# read view to include held siblings — it presupposes the base Read
+# visibility, it does not replace it. The routine cargo-e2e scenario never
+# hits this because that repo is public (read is free); this repo is private
+# by design so the hold is observable, so the publisher's Read must be
+# granted explicitly. Per-repo + two-claim subject passes the allowlist
+# linter, mirroring the write grant.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-read-hort-crates-chain-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: read
+  repository: hort-crates-chain-e2e

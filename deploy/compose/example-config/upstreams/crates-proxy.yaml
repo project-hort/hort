@@ -1,0 +1,13 @@
+# Mirror of deploy/ansible/files/gitops/upstreams/crates-proxy.yaml.
+# Empty pathPrefix → catch-all single-upstream mapping (the cargo orchestrator
+# passes "" on every resolve()).
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: crates-proxy
+spec:
+  repository: crates-proxy
+  pathPrefix: ""
+  upstreamUrl: https://index.crates.io
+  auth:
+    type: anonymous

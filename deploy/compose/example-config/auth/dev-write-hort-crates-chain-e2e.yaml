@@ -1,0 +1,19 @@
+# PermissionGrant: [developer, ci-pusher] -> write hort-crates-chain-e2e
+# (dev-user drives the publish chain in
+# scripts/native-tests/scenarios/dogfood/publish-chain.sh).
+#
+# The grant, not an admin claim, is what the scenario needs: held index
+# entries are served on GRANTED write authority for the repository
+# (ADR 0055), so publishing as an operator whose write comes from a real
+# PermissionGrant is the only way to exercise the same predicate the release
+# identity hits. Per-repo + two-claim subject passes the allowlist linter.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-write-hort-crates-chain-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: hort-crates-chain-e2e
