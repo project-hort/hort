@@ -87,3 +87,23 @@ ignore = [
     # (private-key) path is ever added.
     "RUSTSEC-2023-0071",
 ]
+
+# Yanked-crate posture — surfaced, but non-blocking. Mirrors `deny.toml`'s
+# `yanked = "warn"` so the two gates agree.
+#
+# A yank on crates.io is a maintainer withdrawing a version. It is NOT a
+# vulnerability (it carries no RUSTSEC advisory — genuine advisories are caught
+# by the checks above and block regardless), and NOT a deletion (the exact
+# locked version stays downloadable, so an already-pinned build is unaffected).
+# Without this stanza cargo-audit reports a yank as a warning and CI's
+# `--deny warnings` escalates it to a hard build failure. Neither cargo-audit
+# nor cargo-deny supports a *per-crate* yanked exemption (yanked is not an
+# advisory ID, so the `ignore` list above does not apply to it) — only this
+# blanket switch — so a hard block would red the build on an upstream-controlled,
+# often-transient signal for which there may be no upgrade path to clear it.
+# `cargo deny` remains the visible yanked reporter (a warning on every run), so
+# a withdrawal is never silent; it just does not block. This posture is outside
+# `scripts/check-advisory-sync.sh` (that script enforces `ignore`/Exclusion
+# parity over advisory IDs, of which a yank is none).
+[yanked]
+enabled = false
