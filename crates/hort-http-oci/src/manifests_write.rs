@@ -1068,6 +1068,7 @@ pub(crate) async fn delete_manifest_dispatch(
             &name,
             &reference,
             &access.principal,
+            actor,
         )
         .await
     } else {
@@ -1107,13 +1108,19 @@ async fn delete_by_tag(
     }
 }
 
+/// `principal` is the visibility subject for the path lookup; `actor` is
+/// the same authenticated identity in event-attribution form, threaded
+/// through to `ArtifactUseCase::delete` so the `ArtifactDeleted` event
+/// names who removed the manifest.
+#[allow(clippy::too_many_arguments)] // repo/name/digest coordinates + both actor forms.
 async fn delete_by_digest(
     ctx: &AppContext,
     repo_id: Uuid,
     repo_key: &str,
     name: &str,
     digest_str: &str,
-    actor: &hort_domain::entities::caller::CallerPrincipal,
+    principal: &hort_domain::entities::caller::CallerPrincipal,
+    actor: ApiActor,
 ) -> Response {
     let hash = match parse_digest(digest_str) {
         DigestParse::Ok(h) => h,
@@ -1142,7 +1149,7 @@ async fn delete_by_digest(
     // crate and matches the enforcement guarantee.
     let artifact = match ctx
         .artifact_use_case
-        .find_visible_by_path(repo_key, &coords.path, Some(actor))
+        .find_visible_by_path(repo_key, &coords.path, Some(principal))
         .await
     {
         Ok((_repo, a)) => a,
@@ -1180,12 +1187,18 @@ async fn delete_by_digest(
         );
     }
 
-    // Artifact lifecycle delete. Uses `ArtifactUseCase::delete`, the
-    // landed primitive for artifact removal — it delegates to
-    // `ArtifactRepository::delete` which hard-removes the row. The
-    // CAS blob is NOT removed (GC concern; multiple artifacts may
-    // share CAS bytes).
-    if let Err(e) = ctx.artifact_use_case.delete(artifact.id).await {
+    // Artifact lifecycle delete. `ArtifactUseCase::delete` is an
+    // event-sourced soft delete: the row survives with `deleted_at` set
+    // and an `ArtifactDeleted` event lands on the artifact's stream,
+    // attributed to this caller. The CAS blob is NOT removed (GC
+    // concern; multiple artifacts may share CAS bytes) — the
+    // `content_references` cleanup above is what lets refcount GC
+    // reclaim it later if nothing else references it.
+    if let Err(e) = ctx
+        .artifact_use_case
+        .delete(artifact.id, Actor::Api(actor))
+        .await
+    {
         tracing::error!(
             manifest_artifact_id = %artifact.id,
             error = %e,
@@ -4319,6 +4332,49 @@ mod tests {
         assert_eq!(
             post_refs, 0,
             "content_references rows with this source must be swept"
+        );
+    }
+
+    /// The digest-DELETE path must attribute the deletion to the
+    /// authenticated caller. The `ArtifactDeleted` event's actor comes
+    /// straight from this argument, so a dropped actor here produces an
+    /// unattributable terminal transition in the audit trail.
+    #[test]
+    fn delete_digest_attributes_the_deletion_to_the_authenticated_caller() {
+        let caller_id = Uuid::new_v4();
+        let deletions = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let content = b"attributed-manifest-body";
+            let hex = format!("{:x}", Sha256::digest(content));
+            let hash: ContentHash = hex.parse().unwrap();
+            let mut a = sample_artifact(QuarantineStatus::None);
+            a.repository_id = repo_id;
+            a.path = format!("manifests/sha256:{hex}");
+            a.sha256_checksum = hash.clone();
+            a.size_bytes = content.len() as i64;
+            h.artifacts.insert(a);
+            h.storage.insert_content(hash, content.to_vec());
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
+            let mut req = HttpRequest::delete(&uri).body(Body::empty()).unwrap();
+            let mut principal = test_principal();
+            principal.user_id = caller_id;
+            hort_http_core::middleware::auth::test_support::inject_principal(&mut req, principal);
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+            h.artifacts.deletions()
+        });
+
+        assert_eq!(deletions.len(), 1, "exactly one artifact deleted");
+        assert!(
+            matches!(&deletions[0].1, Actor::Api(a) if a.user_id == caller_id),
+            "deletion must be attributed to the authenticated caller, got {:?}",
+            deletions[0].1
         );
     }
 

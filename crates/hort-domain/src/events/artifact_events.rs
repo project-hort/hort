@@ -17,6 +17,11 @@ use super::validation::{validate_json, validate_optional_string, validate_string
 // ---------------------------------------------------------------------------
 
 const MAX_NAME_LEN: usize = 1024;
+/// Cap on a repository-relative artifact path. Mirrors the
+/// `artifacts.path character varying(2048)` column width, so a payload
+/// that validates here is storable and a payload that would not fit the
+/// projection is rejected before it reaches the append.
+const MAX_PATH_LEN: usize = 2048;
 const MAX_REASON_LEN: usize = 4096;
 const MAX_SCANNER_LEN: usize = 256;
 const MAX_SEVERITY_COUNT: u32 = 100_000;
@@ -1213,6 +1218,71 @@ impl ArtifactPurged {
     /// has a uniform arm (mirrors [`ArtifactCorrupted::validate`]).
     pub fn validate(&self) -> DomainResult<()> {
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArtifactDeleted
+// ---------------------------------------------------------------------------
+
+/// An artifact was **deleted** from its repository — the terminal
+/// artifact-lifecycle transition on the operator/registry-API axis.
+///
+/// Lands on the artifact's own stream
+/// ([`StreamCategory::Artifact`](super::StreamCategory::Artifact)), like
+/// [`ArtifactRejected`] and [`ArtifactPurged`], so a replay of
+/// `artifact-<id>` terminates here and never reconstructs the artifact as
+/// live. Deletion is **not** a new retention class — the artifact
+/// category already covers it — so no new stream category exists for it.
+///
+/// # Soft delete, not row removal
+///
+/// The projection row is retained with `artifacts.deleted_at` set; the
+/// CAS blob is untouched. Blob lifetime stays refcount-gated GC
+/// (`content_references` → the purge path), so deleting one repository's
+/// artifact can never remove bytes another artifact still references.
+/// The retained row keeps `checksum_sha256`, so an auditor can answer
+/// "what content did this path hold when it was deleted?" from the
+/// projection alone; this payload answers the same question from the
+/// event log alone, without resolving a projection row that a later
+/// purge may have removed.
+///
+/// # Why the payload denormalises `repository_id` / `path` /
+/// `content_hash`
+///
+/// The stream id carries only the artifact id. An audit query
+/// ("everything deleted from repository R", "was `foo/1.0.0/foo.tgz`
+/// ever deleted?") must not have to join a projection row that is itself
+/// deletable. Same rationale as [`ArtifactExpired::policy_name`]
+/// (denormalised because the referent can disappear).
+///
+/// **Actor and timestamp are NOT on this struct** — they ride the
+/// [`PersistedEvent`](super::PersistedEvent) envelope (`actor`,
+/// `stored_at`), exactly as for [`ArtifactRejected`]. Duplicating them in
+/// the payload would create two sources of truth for who deleted what and
+/// when.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactDeleted {
+    /// The artifact that was deleted. Same UUID as the `entity_id` of
+    /// the artifact stream this event lands on.
+    pub artifact_id: Uuid,
+    /// The repository the artifact was deleted from.
+    pub repository_id: Uuid,
+    /// The repository-relative path the artifact occupied. After this
+    /// event the path is free: the `artifacts` partial unique index is
+    /// predicated on `deleted_at IS NULL`, so a fresh ingest at the same
+    /// path mints a **new** artifact (new id, new row, new stream) rather
+    /// than colliding with the deleted one.
+    pub path: String,
+    /// The CAS content hash the artifact pointed at. Recorded so the
+    /// deleted artifact's content identity survives independently of the
+    /// projection row.
+    pub content_hash: ContentHash,
+}
+
+impl ArtifactDeleted {
+    pub fn validate(&self) -> DomainResult<()> {
+        validate_string("path", &self.path, MAX_PATH_LEN)
     }
 }
 

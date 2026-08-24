@@ -4,11 +4,18 @@
 //!
 //! 1. `artifacts.is_deleted` no longer exists.
 //! 2. Both partial indexes Postgres dropped along with the column are
-//!    recreated with the same key columns / `INCLUDE` payload, minus
-//!    the predicate.
+//!    recreated with the same key columns / `INCLUDE` payload.
 //! 3. The `package_version_status` servability read — the highest-QPS
 //!    query in the serve path — still plans an index-only scan against
 //!    the recreated covering index.
+//!
+//! These tests run against the schema produced by the WHOLE migration
+//! chain, so they assert only what survives it. The "no partial
+//! predicate" half of (2) does not: the soft-delete migration
+//! re-predicates both indexes on `deleted_at IS NULL` to match the live
+//! reads, and asserts that shape in its own test module. What (2) pins
+//! here is the invariant that outlives both changes — the key columns
+//! and the `INCLUDE` payload are never lost when an index is rebuilt.
 //!
 //! Tests follow the convention in `migration_009_jobs_and_findings.rs` /
 //! `migration_010_rescan_and_advisory.rs`: require `DATABASE_URL`; if
@@ -86,11 +93,6 @@ async fn migration_020_recreated_indexes_match_original_shape_minus_predicate() 
         name_idx_def.contains("(repository_id, name_as_published)"),
         "idx_artifacts_name_as_published must keep its original key columns; got: {name_idx_def}"
     );
-    assert!(
-        !name_idx_def.to_lowercase().contains("where"),
-        "idx_artifacts_name_as_published must be a plain (non-partial) index now \
-         the predicate selected the whole table; got: {name_idx_def}"
-    );
 
     let covering_idx_def: String = sqlx::query_scalar(
         "SELECT indexdef FROM pg_indexes \
@@ -107,11 +109,6 @@ async fn migration_020_recreated_indexes_match_original_shape_minus_predicate() 
     assert!(
         covering_idx_def.contains("INCLUDE (version, quarantine_status)"),
         "covering index must keep its original INCLUDE payload; got: {covering_idx_def}"
-    );
-    assert!(
-        !covering_idx_def.to_lowercase().contains("where"),
-        "covering index must be a plain (non-partial) index now the predicate \
-         selected the whole table; got: {covering_idx_def}"
     );
 }
 
@@ -190,9 +187,13 @@ async fn migration_020_servability_read_plans_index_only_scan() {
         .expect("disable bitmapscan");
 
     let plan: Vec<String> = sqlx::query_scalar(
+        // The live `package_version_status` shape, including the
+        // soft-delete filter every live read carries. The covering index
+        // is predicated on the same, so the plan stays index-only.
         "EXPLAIN (FORMAT TEXT) \
          SELECT version, quarantine_status FROM artifacts \
-         WHERE repository_id = $1 AND name = $2 AND version IS NOT NULL",
+         WHERE repository_id = $1 AND name = $2 AND version IS NOT NULL \
+           AND deleted_at IS NULL",
     )
     .bind(repo_id)
     .bind("leftpad")

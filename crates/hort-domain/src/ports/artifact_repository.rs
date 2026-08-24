@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::entities::artifact::{Artifact, QuarantineStatus};
 use crate::error::DomainResult;
+use crate::events::Actor;
 use crate::types::{ContentHash, LimitedList, Page, PageRequest};
 
 use super::BoxFuture;
@@ -62,12 +63,42 @@ pub trait ArtifactRepository: Send + Sync {
         repository_id: Uuid,
         page: PageRequest,
     ) -> BoxFuture<'_, DomainResult<Page<Artifact>>>;
-    fn delete(&self, id: Uuid) -> BoxFuture<'_, DomainResult<()>>;
+    /// Delete an artifact — an **event-sourced soft delete**.
+    ///
+    /// The implementation must, atomically:
+    ///
+    /// 1. mark the artifact deleted (`artifacts.deleted_at`), retaining
+    ///    the row, and
+    /// 2. append
+    ///    [`ArtifactDeleted`](crate::events::ArtifactDeleted) to the
+    ///    artifact's own stream ([`StreamId::artifact`](crate::events::StreamId::artifact)),
+    ///    attributed to `actor`.
+    ///
+    /// Neither may be observable without the other: a projection marked
+    /// deleted with no event is an unrecorded terminal transition, and an
+    /// event with no projection change is a lie about the catalog.
+    ///
+    /// The CAS blob is **not** touched. Blob lifetime is refcount-gated
+    /// GC (`content_references` → the purge path), because another
+    /// artifact may reference the same bytes.
+    ///
+    /// `actor` is the caller identity the event is attributed to; it
+    /// rides the persisted-event envelope, never the payload.
+    ///
+    /// **Idempotent.** Deleting an absent — or already-deleted — artifact
+    /// returns [`DomainError::NotFound`](crate::error::DomainError::NotFound)
+    /// and appends nothing, so a retried delete cannot put two terminal
+    /// events on one stream.
+    fn delete(&self, id: Uuid, actor: Actor) -> BoxFuture<'_, DomainResult<()>>;
 
     /// Find an artifact by its logical path within a repository.
     ///
-    /// Returns `None` if no artifact exists at that path. At most one row —
-    /// `(repository_id, path)` has a UNIQUE constraint.
+    /// Returns `None` if no **live** artifact exists at that path — the
+    /// lookup filters `deleted_at IS NULL`, like every other read on this
+    /// port except the content-age anchor
+    /// ([`Self::first_seen_for_checksum`], which counts deleted rows as
+    /// evidence on purpose). At most one row: `(repository_id, path)` is
+    /// unique among live rows.
     fn find_by_path(
         &self,
         repository_id: Uuid,
@@ -478,7 +509,7 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
             Box::pin(async { Ok(Page::empty()) })
         }
-        fn delete(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete(&self, _id: Uuid, _actor: Actor) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }
         fn find_by_path(

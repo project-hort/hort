@@ -968,6 +968,7 @@ impl ProvenanceOrchestrationUseCase {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: now,

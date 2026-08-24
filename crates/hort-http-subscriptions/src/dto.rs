@@ -605,6 +605,7 @@ pub fn parse_event_type_kind(s: &str) -> Result<EventTypeKind, DtoMapError> {
         "ServiceAccountTokenRotated" => EventTypeKind::ServiceAccountTokenRotated,
         "ArtifactExpired" => EventTypeKind::ArtifactExpired,
         "ArtifactPurged" => EventTypeKind::ArtifactPurged,
+        "ArtifactDeleted" => EventTypeKind::ArtifactDeleted,
         other => return Err(DtoMapError::UnknownEventTypeKind(other.to_string())),
     })
 }
@@ -680,6 +681,7 @@ fn event_type_kind_wire(k: &EventTypeKind) -> String {
         // (full round-trip, unlike StreamSealed).
         EventTypeKind::ArtifactExpired => "ArtifactExpired",
         EventTypeKind::ArtifactPurged => "ArtifactPurged",
+        EventTypeKind::ArtifactDeleted => "ArtifactDeleted",
         // Internal retention tombstone. The input-side map
         // (str -> EventTypeKind, above) has no `"StreamSealed"` arm and
         // its catch-all rejects it, so this never appears in a stored

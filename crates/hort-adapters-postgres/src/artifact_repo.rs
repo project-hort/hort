@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgArguments;
 use sqlx::{AssertSqlSafe, PgPool};
@@ -5,21 +7,30 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::events::{Actor, DomainEvent, StreamId};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::types::{ContentHash, LimitedList, Page, PageRequest, LIMIT_LIST_MAX_ITEMS};
 
-use crate::event_store::PgUnitOfWork;
+use crate::event_store::{PgEventStore, PgUnitOfWork};
 use crate::mappers::ArtifactRow;
 use crate::{map_sqlx_error, BoxFuture};
 
 /// PostgreSQL implementation of [`ArtifactRepository`].
+///
+/// Holds the concrete [`PgEventStore`] alongside the pool because
+/// [`ArtifactRepository::delete`] is an **event-sourced** transition: the
+/// soft-delete write and the `ArtifactDeleted` append have to land in one
+/// transaction, which the event store's unit-of-work provides. Every other
+/// method here is a plain pooled read/write.
 pub struct PgArtifactRepository {
     pool: PgPool,
+    event_store: Arc<PgEventStore>,
 }
 
 impl PgArtifactRepository {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, event_store: Arc<PgEventStore>) -> Self {
+        Self { pool, event_store }
     }
 }
 
@@ -29,7 +40,7 @@ const SELECT_COLS: &str = r#"
     content_type, storage_key,
     quarantine_status, quarantine_window_start, upstream_published_at,
     uploaded_by,
-    created_at, updated_at
+    created_at, updated_at, deleted_at
 "#;
 
 const UPSERT_SQL: &str = r#"
@@ -99,7 +110,8 @@ impl ArtifactRepository for PgArtifactRepository {
     fn find_by_id(&self, id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
         Box::pin(async move {
             tracing::debug!(entity = "Artifact", %id, "find_by_id");
-            let sql = format!("SELECT {SELECT_COLS} FROM artifacts WHERE id = $1");
+            let sql =
+                format!("SELECT {SELECT_COLS} FROM artifacts WHERE id = $1 AND deleted_at IS NULL");
             let row: ArtifactRow = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(id)
                 .fetch_one(&self.pool)
@@ -116,8 +128,10 @@ impl ArtifactRepository for PgArtifactRepository {
         let sha256 = sha256.as_ref().to_string();
         Box::pin(async move {
             tracing::debug!(entity = "Artifact", sha256 = %sha256, "find_by_checksum");
-            let sql =
-                format!("SELECT {SELECT_COLS} FROM artifacts WHERE checksum_sha256 = $1 LIMIT 1");
+            let sql = format!(
+                "SELECT {SELECT_COLS} FROM artifacts \
+                 WHERE checksum_sha256 = $1 AND deleted_at IS NULL LIMIT 1"
+            );
             let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(&sha256)
                 .fetch_optional(&self.pool)
@@ -142,7 +156,8 @@ impl ArtifactRepository for PgArtifactRepository {
             );
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
-                 WHERE repository_id = $1 AND checksum_sha256 = $2 LIMIT 1"
+                 WHERE repository_id = $1 AND checksum_sha256 = $2 \
+                   AND deleted_at IS NULL LIMIT 1"
             );
             let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
@@ -165,6 +180,13 @@ impl ArtifactRepository for PgArtifactRepository {
             // did hort first hold these bytes, anywhere". `MIN` over the
             // `idx_artifacts_checksum` equality range — no new index, no
             // stored projection to keep in step.
+            //
+            // Also unfiltered by `deleted_at`, deliberately: a
+            // soft-deleted row is still genuine evidence of when hort
+            // first held this content, and deletion cannot un-observe
+            // that. Excluding deleted rows could only move the anchor
+            // later and so shorten an observation window — the unsafe
+            // direction. Keeping them anchors fail-safe.
             //
             // `fetch_one` (not `fetch_optional`): an aggregate over an
             // empty range still returns exactly one row, carrying SQL
@@ -192,7 +214,7 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 r#"SELECT {SELECT_COLS}
                    FROM artifacts
-                   WHERE repository_id = $1
+                   WHERE repository_id = $1 AND deleted_at IS NULL
                    ORDER BY name, version
                    OFFSET $2 LIMIT $3"#
             );
@@ -204,12 +226,14 @@ impl ArtifactRepository for PgArtifactRepository {
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Artifact", "list"))?;
 
-            let total: Option<i64> =
-                sqlx::query_scalar("SELECT COUNT(*) FROM artifacts WHERE repository_id = $1")
-                    .bind(repository_id)
-                    .fetch_one(&self.pool)
-                    .await
-                    .map_err(|e| map_sqlx_error(&e, "Artifact", "count"))?;
+            let total: Option<i64> = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM artifacts \
+                     WHERE repository_id = $1 AND deleted_at IS NULL",
+            )
+            .bind(repository_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", "count"))?;
 
             let items: Vec<Artifact> = rows
                 .into_iter()
@@ -223,21 +247,98 @@ impl ArtifactRepository for PgArtifactRepository {
         })
     }
 
-    fn delete(&self, id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
+    /// Soft-delete the artifact and append `ArtifactDeleted` to its own
+    /// stream — **atomically**, in one transaction, so the projection can
+    /// never be marked deleted without the event that records it (or the
+    /// reverse).
+    ///
+    /// The row survives with `deleted_at` set; the CAS blob is untouched
+    /// (blob lifetime is refcount-gated GC — another artifact may
+    /// reference the same bytes). The `(repository_id, path)` unique index
+    /// is predicated on `deleted_at IS NULL`, so the freed path admits a
+    /// fresh ingest as a new artifact.
+    ///
+    /// ## Idempotency
+    ///
+    /// A missing id and an already-deleted artifact both surface as
+    /// [`DomainError::NotFound`]: the pre-read filters `deleted_at IS
+    /// NULL`, and the write re-asserts the same predicate, so a re-delete
+    /// appends no second terminal event.
+    ///
+    /// ## Statement order
+    ///
+    /// Append first, then write `artifacts` — the same events → artifacts
+    /// lock order every other transactional path in this adapter uses.
+    /// Taking the artifact row first would invert it against
+    /// `commit_transition` and let two concurrent writers on the same
+    /// artifact deadlock. Correctness does not depend on holding a row
+    /// lock across the read: the UPDATE's own `deleted_at IS NULL`
+    /// predicate is the arbiter, and a concurrent deleter that won makes
+    /// it match zero rows, which rolls this whole transaction back —
+    /// including the append.
+    fn delete(&self, id: Uuid, actor: Actor) -> BoxFuture<'_, DomainResult<()>> {
         Box::pin(async move {
             tracing::debug!(entity = "Artifact", %id, "delete");
-            let result = sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            let not_found = || DomainError::NotFound {
+                entity: "Artifact",
+                id: id.to_string(),
+            };
+
+            let mut uow = self.event_store.begin_unit_of_work().await?;
+
+            let sql = format!(
+                "SELECT {SELECT_COLS} FROM artifacts \
+                 WHERE id = $1 AND deleted_at IS NULL"
+            );
+            let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(id)
-                .execute(&self.pool)
+                .fetch_optional(uow.conn())
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Artifact", &id.to_string()))?;
+            let Some(row) = row else {
+                return Err(not_found());
+            };
+
+            let mut artifact = Artifact::try_from(row)?;
+            let deleted_at = Utc::now();
+            let event = artifact.delete(deleted_at)?;
+
+            self.event_store
+                .append_in_tx(
+                    &mut uow,
+                    AppendEvents {
+                        stream_id: StreamId::artifact(id),
+                        // The terminal deletion event is an independent
+                        // observation, not a compare-and-set against a
+                        // position the caller read: the state guard is the
+                        // conditional UPDATE below.
+                        expected_version: ExpectedVersion::Any,
+                        events: vec![EventToAppend::new(DomainEvent::ArtifactDeleted(event))],
+                        correlation_id: Uuid::new_v4(),
+                        causation_id: None,
+                        actor,
+                    },
+                )
+                .await?;
+
+            let result = sqlx::query(
+                "UPDATE artifacts SET deleted_at = $2, updated_at = $2 \
+                 WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(id)
+            .bind(deleted_at)
+            .execute(uow.conn())
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", &id.to_string()))?;
 
             if result.rows_affected() == 0 {
-                return Err(DomainError::NotFound {
-                    entity: "Artifact",
-                    id: id.to_string(),
-                });
+                // A concurrent deleter committed between the read and
+                // this write. Dropping `uow` un-committed rolls back the
+                // append too, so no orphan event survives.
+                return Err(not_found());
             }
+
+            uow.commit().await?;
             Ok(())
         })
     }
@@ -251,7 +352,8 @@ impl ArtifactRepository for PgArtifactRepository {
         Box::pin(async move {
             tracing::debug!(entity = "Artifact", %repository_id, %path, "find_by_path");
             let sql = format!(
-                "SELECT {SELECT_COLS} FROM artifacts WHERE repository_id = $1 AND path = $2"
+                "SELECT {SELECT_COLS} FROM artifacts \
+                 WHERE repository_id = $1 AND path = $2 AND deleted_at IS NULL"
             );
             let row: Option<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(repository_id)
@@ -278,7 +380,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // `LIMIT_LIST_MAX_ITEMS` cap.
             let names: Vec<String> = sqlx::query_scalar(
                 "SELECT DISTINCT name FROM artifacts \
-                 WHERE repository_id = $1 \
+                 WHERE repository_id = $1 AND deleted_at IS NULL \
                  ORDER BY name \
                  OFFSET $2 LIMIT $3",
             )
@@ -295,7 +397,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // exposing the total is consistent with `list_by_repository`.
             let total: Option<i64> = sqlx::query_scalar(
                 "SELECT COUNT(DISTINCT name) FROM artifacts \
-                 WHERE repository_id = $1",
+                 WHERE repository_id = $1 AND deleted_at IS NULL",
             )
             .bind(repository_id)
             .fetch_one(&self.pool)
@@ -323,7 +425,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // Paginated.
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
-                 WHERE repository_id = $1 AND name = $2 \
+                 WHERE repository_id = $1 AND name = $2 AND deleted_at IS NULL \
                  ORDER BY version \
                  OFFSET $3 LIMIT $4"
             );
@@ -338,7 +440,7 @@ impl ArtifactRepository for PgArtifactRepository {
 
             let total: Option<i64> = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM artifacts \
-                 WHERE repository_id = $1 AND name = $2",
+                 WHERE repository_id = $1 AND name = $2 AND deleted_at IS NULL",
             )
             .bind(repository_id)
             .bind(&name)
@@ -377,6 +479,7 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE repository_id = $1 AND name_as_published = $2 \
+                   AND deleted_at IS NULL \
                  ORDER BY version \
                  OFFSET $3 LIMIT $4"
             );
@@ -391,7 +494,8 @@ impl ArtifactRepository for PgArtifactRepository {
 
             let total: Option<i64> = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM artifacts \
-                 WHERE repository_id = $1 AND name_as_published = $2",
+                 WHERE repository_id = $1 AND name_as_published = $2 \
+                   AND deleted_at IS NULL",
             )
             .bind(repository_id)
             .bind(&raw)
@@ -433,6 +537,11 @@ impl ArtifactRepository for PgArtifactRepository {
             // cost). The RETURNED `name` is the verbatim stored form (not
             // lowercased) — the use case compares it against the new
             // crate's canonical name to decide collision.
+            //
+            // Deleted rows deliberately still participate: this is a
+            // name-squatting guard, and letting a deletion free the
+            // folded name would let a later publish claim a name a
+            // consumer may still resolve from a lockfile. Fail closed.
             let existing: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM artifacts \
                  WHERE repository_id = $1 \
@@ -473,6 +582,7 @@ impl ArtifactRepository for PgArtifactRepository {
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE repository_id = $1 \
                    AND quarantine_status IN ('quarantined', 'released') \
+                   AND deleted_at IS NULL \
                  LIMIT $2"
             );
             let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
@@ -537,7 +647,8 @@ impl ArtifactRepository for PgArtifactRepository {
                 "SELECT version, quarantine_status \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 \
-                   AND version IS NOT NULL",
+                   AND version IS NOT NULL \
+                   AND deleted_at IS NULL",
             )
             .bind(repository_id)
             .bind(&pkg)
@@ -584,7 +695,8 @@ impl ArtifactRepository for PgArtifactRepository {
                 "SELECT version, quarantine_status, quarantine_window_start \
                  FROM artifacts \
                  WHERE repository_id = $1 AND name = $2 \
-                   AND version IS NOT NULL",
+                   AND version IS NOT NULL \
+                   AND deleted_at IS NULL",
             )
             .bind(repository_id)
             .bind(&pkg)
@@ -628,6 +740,7 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE path LIKE '%.whl' \
+                   AND deleted_at IS NULL \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM content_references \
                        WHERE source_artifact_id = artifacts.id \
@@ -679,6 +792,7 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE path LIKE 'manifests/sha256:%' \
+                   AND deleted_at IS NULL \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM content_references \
                        WHERE source_artifact_id = artifacts.id \
@@ -748,6 +862,7 @@ impl ArtifactRepository for PgArtifactRepository {
             let sql = format!(
                 r#"SELECT {SELECT_COLS} FROM artifacts a
                    WHERE a.quarantine_status = 'rejected'
+                     AND a.deleted_at IS NULL
                      AND (
                        -- Repo-scoped policy: artifact's repo must match
                        -- the policy's `scope.Repository` UUID.
@@ -822,6 +937,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // duplicate-free across pages.
             const SCOPE_PREDICATE: &str = r#"
                 a.quarantine_status IN ('quarantined', 'released')
+                AND a.deleted_at IS NULL
                 AND (
                   EXISTS (
                     SELECT 1 FROM policy_projections p
@@ -1032,6 +1148,17 @@ mod tests {
         Some(pool)
     }
 
+    /// Build the adapter under test with a real event store attached —
+    /// `delete` is an event-sourced transition and appends through it.
+    async fn repo_under_test(pool: &PgPool) -> PgArtifactRepository {
+        let event_store = Arc::new(
+            PgEventStore::new(pool.clone())
+                .await
+                .expect("event store init"),
+        );
+        PgArtifactRepository::new(pool.clone(), event_store)
+    }
+
     async fn seed_repo(pool: &PgPool) -> Uuid {
         let id = Uuid::new_v4();
         let key = format!("it-artpag-{}", id.simple());
@@ -1170,7 +1297,7 @@ mod tests {
         // Seed 50 versions, request the first 20 (PageRequest::default).
         seed_artifacts_with_name(&pool, repo_id, "many", 50).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let page = r
             .find_by_name_in_repo(repo_id, "many", PageRequest::default())
             .await
@@ -1197,7 +1324,7 @@ mod tests {
         let repo_id = seed_repo(&pool).await;
         seed_artifacts_with_name(&pool, repo_id, "walk", 75).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let mut seen: Vec<Uuid> = Vec::new();
         let mut offset: u64 = 0;
         let limit: u64 = 20;
@@ -1238,7 +1365,7 @@ mod tests {
         // Seed enough to hit the cap; 1500 > 1000 = MAX_LIMIT.
         seed_artifacts_with_name(&pool, repo_id, "cap", 1_500).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let page = r
             .find_by_name_in_repo(repo_id, "cap", PageRequest::new(0, 5_000))
             .await
@@ -1265,7 +1392,7 @@ mod tests {
         // Seed cap + 1 active artifacts.
         seed_active_artifacts(&pool, repo_id, LIMIT_LIST_MAX_ITEMS as usize + 1).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let list = r
             .list_active_for_repo(repo_id)
             .await
@@ -1288,7 +1415,7 @@ mod tests {
         let repo_id = seed_repo(&pool).await;
         seed_active_artifacts(&pool, repo_id, 2_000).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let list = r
             .list_active_for_repo(repo_id)
             .await
@@ -1408,7 +1535,7 @@ mod tests {
         // Same name, different repo — MUST be excluded.
         seed_artifact_status(&pool, repo_b, "leftpad", Some("2.0.0"), Some("released"), 8).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let triples = r
             .package_version_status(repo_a, "leftpad")
             .await
@@ -1448,7 +1575,7 @@ mod tests {
             return;
         };
         let repo = seed_repo(&pool).await;
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let triples = r
             .package_version_status(repo, "never-seen-package")
             .await
@@ -1486,7 +1613,7 @@ mod tests {
         let event_store = PgEventStore::new(pool.clone())
             .await
             .expect("PgEventStore::new");
-        let repo = PgArtifactRepository::new(pool.clone());
+        let repo = repo_under_test(&pool).await;
 
         // A deterministic, microsecond-precision timestamp — TIMESTAMPTZ
         // round-trips at microsecond resolution; using `Utc::now()` raw
@@ -1512,6 +1639,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: Some(upstream_ts),
             uploaded_by: None,
             created_at: upstream_ts,
@@ -1552,6 +1680,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: upstream_ts,
@@ -1597,7 +1726,7 @@ mod tests {
         let event_store = PgEventStore::new(pool.clone())
             .await
             .expect("PgEventStore::new");
-        let repo = PgArtifactRepository::new(pool.clone());
+        let repo = repo_under_test(&pool).await;
 
         // Seed a full row via the ordinary full-row write path — as if
         // ingest had committed it, already carrying a quarantine anchor
@@ -1623,6 +1752,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: Some(anchor),
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: original_updated_at,
@@ -1700,7 +1830,7 @@ mod tests {
         let event_store = PgEventStore::new(pool.clone())
             .await
             .expect("PgEventStore::new");
-        let repo = PgArtifactRepository::new(pool.clone());
+        let repo = repo_under_test(&pool).await;
 
         let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
         let err = repo
@@ -1735,7 +1865,7 @@ mod tests {
         let event_store = PgEventStore::new(pool.clone())
             .await
             .expect("PgEventStore::new");
-        let repo = PgArtifactRepository::new(pool.clone());
+        let repo = repo_under_test(pool).await;
         let id = Uuid::new_v4();
         let anchor: DateTime<Utc> = "2025-06-01T00:00:00Z".parse().unwrap();
         let artifact = Artifact {
@@ -1754,6 +1884,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: Some(anchor),
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: anchor,
@@ -1789,7 +1920,7 @@ mod tests {
         let event_store = PgEventStore::new(pool.clone())
             .await
             .expect("PgEventStore::new");
-        let repo = PgArtifactRepository::new(pool.clone());
+        let repo = repo_under_test(&pool).await;
 
         // A stale verdict that LOADED `Quarantined` tries to write.
         let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
@@ -1841,7 +1972,7 @@ mod tests {
         let event_store = PgEventStore::new(pool.clone())
             .await
             .expect("PgEventStore::new");
-        let repo = PgArtifactRepository::new(pool.clone());
+        let repo = repo_under_test(&pool).await;
 
         let mut uow = event_store.begin_unit_of_work().await.expect("begin uow");
         repo.save_verdict_status_in_tx(
@@ -1934,7 +2065,7 @@ mod tests {
             return;
         };
         let repo = seed_repo(&pool).await;
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let got = r
             .find_pypi_wheels_without_kind("wheel_metadata", 100)
             .await
@@ -1969,7 +2100,7 @@ mod tests {
         // One sdist — path filter excludes regardless of content_references.
         let _sdist = seed_artifact_at_path(&pool, repo, "files/wbf_pkg-1.0.0.tar.gz", 103).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let got = r
             .find_pypi_wheels_without_kind("wheel_metadata", 100)
             .await
@@ -2003,7 +2134,7 @@ mod tests {
                 seed_artifact_at_path(&pool, repo, &format!("files/limit-{seed}.whl"), seed).await;
         }
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let got = r
             .find_pypi_wheels_without_kind("wheel_metadata", 3)
             .await
@@ -2066,7 +2197,7 @@ mod tests {
             return;
         };
         let repo = seed_repo(&pool).await;
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let got = r
             .find_oci_image_manifests_without_kind("oci_config", 100)
             .await
@@ -2125,7 +2256,7 @@ mod tests {
         )
         .await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let got = r
             .find_oci_image_manifests_without_kind("oci_config", 100)
             .await
@@ -2181,7 +2312,7 @@ mod tests {
         )
         .await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let got = r
             .find_oci_image_manifests_without_kind("oci_config", 100)
             .await
@@ -2216,7 +2347,7 @@ mod tests {
         // Deliberately no `seed_oci_media_type` call — models a row that
         // predates the metadata-write path entirely.
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let got = r
             .find_oci_image_manifests_without_kind("oci_config", 100)
             .await
@@ -2245,7 +2376,7 @@ mod tests {
                 seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{hex}"), seed).await;
         }
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let got = r
             .find_oci_image_manifests_without_kind("oci_config", 3)
             .await
@@ -2266,7 +2397,7 @@ mod tests {
         let Some(pool) = maybe_pool().await else {
             return;
         };
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
 
         // Stored HYPHEN form is found by the folded key.
         let repo1 = seed_repo(&pool).await;
@@ -2392,7 +2523,7 @@ mod tests {
         seed_status_artifacts(&pool, repo_id, "rejected", 5, 2_000).await;
         seed_status_artifacts(&pool, repo_id, "scan_indeterminate", 5, 3_000).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
 
         // First page of 20 — total reflects the full in-scope set (50).
         let page0 = r
@@ -2475,7 +2606,7 @@ mod tests {
         seed_status_artifacts(&pool, shadowed_repo, "released", 3, 5_000).await;
         seed_status_artifacts(&pool, plain_repo, "released", 4, 6_000).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let page = r
             .list_active_for_policy(global_policy, PageRequest::new(0, 100))
             .await
@@ -2536,7 +2667,7 @@ mod tests {
         let Some(pool) = maybe_pool().await else {
             return;
         };
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let unknown: ContentHash = deterministic_hex64(0xF145_7BAD).parse().unwrap();
 
         let seen = r
@@ -2572,7 +2703,7 @@ mod tests {
         // A far earlier row for DIFFERENT content — must not leak in.
         seed_observation(&pool, repo_a, &other, decoy).await;
 
-        let r = PgArtifactRepository::new(pool.clone());
+        let r = repo_under_test(&pool).await;
         let seen = r
             .first_seen_for_checksum(&subject.parse().unwrap())
             .await
@@ -2586,5 +2717,332 @@ mod tests {
 
         cleanup_repo(&pool, repo_a).await;
         cleanup_repo(&pool, repo_b).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Soft delete — event-sourced terminal transition
+    // -----------------------------------------------------------------------
+
+    fn api_actor() -> Actor {
+        Actor::Api(hort_domain::events::ApiActor {
+            user_id: Uuid::new_v4(),
+        })
+    }
+
+    /// Read the artifact stream's event types in stream order.
+    async fn stream_event_types(pool: &PgPool, artifact_id: Uuid) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT event_type FROM events \
+             WHERE stream_id = $1 ORDER BY stream_position",
+        )
+        .bind(StreamId::artifact(artifact_id).to_string())
+        .fetch_all(pool)
+        .await
+        .expect("read artifact stream")
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn delete_soft_deletes_the_row_and_appends_the_terminal_event() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let id = seed_artifact_at_path(&pool, repo_id, "simple/sd/sd-1.0.0.tar.gz", 9001).await;
+        let r = repo_under_test(&pool).await;
+
+        let actor = api_actor();
+        let Actor::Api(ref api) = actor else {
+            unreachable!("constructed as an API actor")
+        };
+        let user_id = api.user_id;
+        r.delete(id, actor).await.expect("live artifact deletes");
+
+        // The row survives, marked deleted.
+        let (deleted_at, checksum): (Option<DateTime<Utc>>, String) =
+            sqlx::query_as("SELECT deleted_at, checksum_sha256 FROM artifacts WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("row is retained, not removed");
+        assert!(deleted_at.is_some(), "deleted_at must be set");
+
+        // The event landed on the artifact's own stream, attributed.
+        assert_eq!(
+            stream_event_types(&pool, id).await,
+            vec!["ArtifactDeleted".to_owned()]
+        );
+        let (actor_type, actor_id, data): (String, Option<Uuid>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT actor_type, actor_id, event_data FROM events WHERE stream_id = $1",
+            )
+            .bind(StreamId::artifact(id).to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("read the appended event");
+        assert_eq!(actor_type, "api");
+        assert_eq!(actor_id, Some(user_id));
+        let payload = &data["data"];
+        assert_eq!(payload["artifact_id"], serde_json::json!(id));
+        assert_eq!(payload["repository_id"], serde_json::json!(repo_id));
+        assert_eq!(payload["path"], "simple/sd/sd-1.0.0.tar.gz");
+        assert_eq!(payload["content_hash"], serde_json::json!(checksum));
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn delete_hides_the_artifact_from_every_live_read() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let path = "simple/sd/sd-2.0.0.tar.gz";
+        let id = seed_artifact_at_path(&pool, repo_id, path, 9002).await;
+        let r = repo_under_test(&pool).await;
+        r.delete(id, api_actor()).await.expect("deletes");
+
+        assert!(matches!(
+            r.find_by_id(id).await,
+            Err(DomainError::NotFound { .. })
+        ));
+        assert!(r.find_by_path(repo_id, path).await.unwrap().is_none());
+        assert!(r
+            .list_by_repository(repo_id, PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(r
+            .list_distinct_names(repo_id, PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(r
+            .find_by_name_in_repo(repo_id, "wbf-pkg", PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .is_empty());
+        assert!(r
+            .package_version_status(repo_id, "wbf-pkg")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(r
+            .package_version_anchors(repo_id, "wbf-pkg")
+            .await
+            .unwrap()
+            .is_empty());
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// The content-age anchor deliberately still counts deleted rows:
+    /// deletion cannot un-observe when hort first held the bytes, and
+    /// excluding them could only shorten an observation window.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn delete_does_not_retract_the_content_age_anchor() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let id = seed_artifact_at_path(&pool, repo_id, "simple/sd/sd-3.0.0.tar.gz", 9003).await;
+        let checksum: String =
+            sqlx::query_scalar("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("read checksum");
+        let r = repo_under_test(&pool).await;
+        let before = r
+            .first_seen_for_checksum(&checksum.parse().unwrap())
+            .await
+            .unwrap();
+        assert!(before.is_some());
+
+        r.delete(id, api_actor()).await.expect("deletes");
+
+        assert_eq!(
+            r.first_seen_for_checksum(&checksum.parse().unwrap())
+                .await
+                .unwrap(),
+            before,
+            "a deleted row keeps anchoring the content age"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn re_delete_is_not_found_and_appends_no_second_event() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let id = seed_artifact_at_path(&pool, repo_id, "simple/sd/sd-4.0.0.tar.gz", 9004).await;
+        let r = repo_under_test(&pool).await;
+        r.delete(id, api_actor()).await.expect("first delete");
+
+        let err = r
+            .delete(id, api_actor())
+            .await
+            .expect_err("re-deleting an already-deleted artifact");
+        assert!(matches!(err, DomainError::NotFound { .. }), "got {err:?}");
+
+        assert_eq!(
+            stream_event_types(&pool, id).await.len(),
+            1,
+            "the terminal event must appear exactly once on the stream"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn delete_of_an_absent_artifact_is_not_found_and_appends_nothing() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let r = repo_under_test(&pool).await;
+        let ghost = Uuid::new_v4();
+        let err = r
+            .delete(ghost, api_actor())
+            .await
+            .expect_err("absent artifact");
+        assert!(matches!(err, DomainError::NotFound { .. }), "got {err:?}");
+        assert!(stream_event_types(&pool, ghost).await.is_empty());
+    }
+
+    /// The hazard the partial unique index exists to close: with the old
+    /// table-wide `UNIQUE (repository_id, path)`, a retained deleted row
+    /// kept occupying its path and the follow-up insert hit a constraint
+    /// violation. A fresh ingest at a deleted artifact's path must
+    /// succeed and mint a NEW artifact — new id, new row, new stream.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn re_ingest_at_a_deleted_artifacts_path_creates_a_new_artifact() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let path = "simple/sd/sd-5.0.0.tar.gz";
+        let original = seed_artifact_at_path(&pool, repo_id, path, 9005).await;
+        let r = repo_under_test(&pool).await;
+        r.delete(original, api_actor()).await.expect("deletes");
+
+        // Fresh ingest at the same path — this is the INSERT that the
+        // table-wide unique constraint used to reject.
+        let replacement = seed_artifact_at_path(&pool, repo_id, path, 9006).await;
+        assert_ne!(replacement, original, "re-ingest mints a new artifact id");
+
+        let live = r
+            .find_by_path(repo_id, path)
+            .await
+            .expect("path lookup")
+            .expect("the fresh artifact is live at the path");
+        assert_eq!(live.id, replacement);
+        assert!(live.deleted_at.is_none());
+
+        // Both rows coexist: the deleted one is still readable as history.
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_one(&pool)
+        .await
+        .expect("count rows at the path");
+        assert_eq!(rows, 2, "the deleted row is retained alongside the new one");
+
+        // Each has its own stream; the deleted one terminates at its
+        // deletion and the new one is untouched by it.
+        assert_eq!(
+            stream_event_types(&pool, original).await,
+            vec!["ArtifactDeleted".to_owned()]
+        );
+        assert!(stream_event_types(&pool, replacement).await.is_empty());
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// `list_active_for_repo` drives the retroactive curation pass. A
+    /// deleted artifact is not an active one, whatever status it held
+    /// when it was deleted.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn list_active_for_repo_excludes_a_deleted_released_artifact() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let path = "simple/sd/sd-7.0.0.tar.gz";
+        let id = seed_artifact_at_path(&pool, repo_id, path, 9009).await;
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'released' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("mark released");
+
+        let r = repo_under_test(&pool).await;
+        assert_eq!(
+            r.list_active_for_repo(repo_id).await.unwrap().items.len(),
+            1,
+            "a live released artifact is active"
+        );
+
+        r.delete(id, api_actor()).await.expect("deletes");
+        assert!(
+            r.list_active_for_repo(repo_id)
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "a deleted artifact is never active"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// Two LIVE rows at one path stay impossible — the partial index
+    /// narrows the uniqueness scope, it does not remove it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn two_live_artifacts_cannot_share_a_path() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let path = "simple/sd/sd-6.0.0.tar.gz";
+        seed_artifact_at_path(&pool, repo_id, path, 9007).await;
+
+        let sha256 = deterministic_hex64(9008 ^ 0xCAFE_BABE_usize);
+        let err = sqlx::query(
+            r#"INSERT INTO artifacts (
+                   id, repository_id, name, name_as_published, version, path,
+                   size_bytes, checksum_sha256, content_type, storage_key
+               ) VALUES (
+                   $1, $2, 'wbf-pkg', 'wbf-pkg', 'v2', $3,
+                   0, $4, 'application/octet-stream', $4
+               )"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo_id)
+        .bind(path)
+        .bind(&sha256)
+        .execute(&pool)
+        .await
+        .expect_err("a second LIVE row at the same path must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("unique"),
+            "expected a unique-violation, got {err}"
+        );
+
+        cleanup_repo(&pool, repo_id).await;
     }
 }

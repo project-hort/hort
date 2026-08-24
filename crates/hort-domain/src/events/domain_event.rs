@@ -7,10 +7,10 @@ use super::api_token_events::{
 };
 use super::artifact_events::{
     ApprovalDecided, ApprovalRequested, ArtifactBecameVulnerable, ArtifactCorrupted,
-    ArtifactExpired, ArtifactIngested, ArtifactPromoted, ArtifactPurged, ArtifactQuarantined,
-    ArtifactReEvaluated, ArtifactRejected, ArtifactReleased, ChecksumMismatch, ChecksumVerified,
-    PolicyEvaluated, PromotionRejected, PromotionRequested, ProvenanceRejected, ProvenanceVerified,
-    ScanCompleted, ScanIndeterminate, ScanRequested,
+    ArtifactDeleted, ArtifactExpired, ArtifactIngested, ArtifactPromoted, ArtifactPurged,
+    ArtifactQuarantined, ArtifactReEvaluated, ArtifactRejected, ArtifactReleased, ChecksumMismatch,
+    ChecksumVerified, PolicyEvaluated, PromotionRejected, PromotionRequested, ProvenanceRejected,
+    ProvenanceVerified, ScanCompleted, ScanIndeterminate, ScanRequested,
 };
 use super::artifact_group_events::{
     ArtifactGroupInitiated, ArtifactGroupMemberAdded, ArtifactGroupMemberRemoved,
@@ -113,6 +113,14 @@ pub enum DomainEvent {
     /// post-decrement cross-`kind` refcount. Idempotent (ADR 0028).
     /// Additive on this `#[non_exhaustive]` enum.
     ArtifactPurged(ArtifactPurged),
+    /// The artifact was deleted from its repository — the terminal
+    /// artifact-lifecycle transition on the operator/registry-API axis.
+    /// Soft delete: the `artifacts` row is retained with `deleted_at`
+    /// set and the CAS blob is left to refcount-gated GC. Lands on the
+    /// artifact's own stream, so a replay terminates here rather than
+    /// reconstructing a deleted artifact as live. Additive on this
+    /// `#[non_exhaustive]` enum.
+    ArtifactDeleted(ArtifactDeleted),
 
     // -- Download audit --
     /// Opt-in per-`(repository, UTC-date)` download-audit fact —
@@ -334,6 +342,7 @@ impl DomainEvent {
             Self::PromotionRejected(_) => "PromotionRejected",
             Self::ArtifactExpired(_) => "ArtifactExpired",
             Self::ArtifactPurged(_) => "ArtifactPurged",
+            Self::ArtifactDeleted(_) => "ArtifactDeleted",
             Self::ArtifactDownloaded(_) => "ArtifactDownloaded",
             Self::PolicyCreated(_) => "PolicyCreated",
             Self::PolicyUpdated(_) => "PolicyUpdated",
@@ -526,6 +535,7 @@ impl DomainEvent {
             | Self::PromotionRejected(_)
             | Self::ArtifactExpired(_)
             | Self::ArtifactPurged(_)
+            | Self::ArtifactDeleted(_)
             | Self::ArtifactDownloaded(_)
             | Self::PolicyCreated(_)
             | Self::PolicyUpdated(_)
@@ -614,6 +624,7 @@ impl DomainEvent {
             | Self::PromotionRejected(_)
             | Self::ArtifactExpired(_)
             | Self::ArtifactPurged(_)
+            | Self::ArtifactDeleted(_)
             | Self::PolicyCreated(_)
             | Self::PolicyUpdated(_)
             | Self::ExclusionAdded(_)
@@ -680,6 +691,7 @@ impl DomainEvent {
             Self::PromotionRejected(e) => e.validate(),
             Self::ArtifactExpired(e) => e.validate(),
             Self::ArtifactPurged(e) => e.validate(),
+            Self::ArtifactDeleted(e) => e.validate(),
             Self::ArtifactDownloaded(e) => e.validate(),
             Self::PolicyCreated(e) => e.validate(),
             Self::PolicyUpdated(e) => e.validate(),
@@ -741,9 +753,9 @@ pub(crate) mod tests {
         RevokeReason,
     };
     use super::super::artifact_events::{
-        ApprovalDecision, ArtifactCorrupted, ArtifactExpired, ArtifactPurged, IngestSource,
-        PolicyResult, ProvenanceRejected, ProvenanceVerified, ReEvaluationTrigger, RejectionReason,
-        ReleaseReason, SeveritySummary,
+        ApprovalDecision, ArtifactCorrupted, ArtifactDeleted, ArtifactExpired, ArtifactPurged,
+        IngestSource, PolicyResult, ProvenanceRejected, ProvenanceVerified, ReEvaluationTrigger,
+        RejectionReason, ReleaseReason, SeveritySummary,
     };
     use super::super::artifact_group_events::{
         ArtifactGroupInitiated, ArtifactGroupMemberAdded, ArtifactGroupMemberRemoved,
@@ -967,6 +979,12 @@ pub(crate) mod tests {
                 content_hash: sha256(),
                 refs_remaining: 0,
                 purged_at: Utc::now(),
+            }),
+            DomainEvent::ArtifactDeleted(ArtifactDeleted {
+                artifact_id: Uuid::nil(),
+                repository_id: Uuid::nil(),
+                path: "pkg/1.0/pkg-1.0.tar.gz".into(),
+                content_hash: sha256(),
             }),
             DomainEvent::ArtifactDownloaded(ArtifactDownloaded {
                 artifact_id: Uuid::nil(),

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Artifact deletion is now an event-sourced soft delete.** Deleting an
+  artifact — today reachable through the OCI manifest `DELETE` by digest —
+  used to be a bare `DELETE FROM artifacts` with no domain event: the one
+  terminal artifact-lifecycle transition that recorded nothing. It now
+  emits a new `ArtifactDeleted { artifact_id, repository_id, path,
+  content_hash }` event on the artifact's own stream
+  (`StreamCategory::Artifact` — no new stream category), attributed to the
+  authenticated caller, appended atomically with the state change so the
+  projection can never be marked deleted without the event that records
+  it. The `artifacts` row is **retained** with a new nullable `deleted_at`
+  column instead of being removed, so an auditor can still answer "what
+  content did this path hold, and who removed it?". Every live read
+  filters `deleted_at IS NULL`; the content-age anchor
+  (`first_seen_at = MIN(created_at)`) deliberately still counts deleted
+  rows, because deletion cannot un-observe when the content was first
+  seen and excluding them could only shorten an observation window. The
+  table-wide `UNIQUE (repository_id, path)` constraint becomes a partial
+  unique index predicated on `deleted_at IS NULL`, so a deleted row no
+  longer reserves its path: a fresh ingest there succeeds and mints a new
+  artifact (new id, new row, new stream). Deleting an absent or
+  already-deleted artifact stays a no-op (`NotFound`) and appends no
+  second terminal event. The CAS blob is untouched — blob lifetime
+  remains refcount-gated GC, since another artifact may reference the same
+  bytes. Migration `021_artifacts_soft_delete.sql`. (#145)
+
 ### Added
 
 - **`GET /api/v1/repositories/{repo_key}/prefetch/jobs/{job_id}`** — a

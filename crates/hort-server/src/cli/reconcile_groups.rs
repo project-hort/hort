@@ -104,8 +104,11 @@ async fn run_async(args: ReconcileGroupsArgs) -> anyhow::Result<ReconcileReport>
     let groups: Arc<dyn ArtifactGroupRepository> =
         Arc::new(PgArtifactGroupRepository::new(pool.clone()));
     let group_lifecycle: Arc<dyn ArtifactGroupLifecyclePort> =
-        Arc::new(PgArtifactGroupLifecycle::new(pg_event_store));
-    let artifacts: Arc<dyn ArtifactRepository> = Arc::new(PgArtifactRepository::new(pool.clone()));
+        Arc::new(PgArtifactGroupLifecycle::new(pg_event_store.clone()));
+    let artifacts: Arc<dyn ArtifactRepository> = Arc::new(PgArtifactRepository::new(
+        pool.clone(),
+        pg_event_store.clone(),
+    ));
     let repositories: Arc<dyn RepositoryRepository> =
         Arc::new(PgRepositoryRepository::new(pool.clone()));
     // Mirror the server's repository-label flag so dashboards line up

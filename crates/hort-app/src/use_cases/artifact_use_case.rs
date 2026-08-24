@@ -9,7 +9,9 @@ use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStat
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
-use hort_domain::events::{system_actor, ArtifactDownloaded, DomainEvent, DownloadActor, StreamId};
+use hort_domain::events::{
+    system_actor, Actor, ArtifactDownloaded, DomainEvent, DownloadActor, StreamId,
+};
 use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -307,10 +309,25 @@ impl ArtifactUseCase {
         Ok(fallback)
     }
 
-    /// Delete an artifact by ID.
-    #[tracing::instrument(skip(self))]
-    pub async fn delete(&self, id: Uuid) -> AppResult<()> {
-        Ok(self.artifacts.delete(id).await?)
+    /// Delete an artifact by ID — an event-sourced **soft delete**.
+    ///
+    /// The `artifacts` row is retained with `deleted_at` set and an
+    /// `ArtifactDeleted` event is appended to the artifact's own stream,
+    /// atomically, attributed to `actor`. The CAS blob is untouched: blob
+    /// lifetime stays refcount-gated GC, because another artifact may
+    /// reference the same bytes.
+    ///
+    /// `actor` is threaded from the authenticated request principal so the
+    /// terminal transition is attributable. Deleting an absent or
+    /// already-deleted artifact yields `NotFound` and appends nothing.
+    #[tracing::instrument(skip(self, actor))]
+    pub async fn delete(&self, id: Uuid, actor: Actor) -> AppResult<()> {
+        let attribution = actor.to_string();
+        self.artifacts.delete(id, actor).await?;
+        // Logged only after the transition committed — a state change
+        // that never happened must not appear in the audit trail.
+        tracing::info!(artifact_id = %id, actor = %attribution, "artifact deleted");
+        Ok(())
     }
 
     /// Download an artifact's content as a stream.
@@ -1160,11 +1177,19 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    /// An API actor stand-in for the delete path's attribution argument.
+    fn test_actor() -> Actor {
+        Actor::Api(hort_domain::events::ApiActor {
+            user_id: Uuid::nil(),
+        })
     }
 
     fn make_use_case_with_artifact() -> (ArtifactUseCase, Artifact, Arc<MockStoragePort>) {
@@ -1237,7 +1262,7 @@ mod tests {
     #[tokio::test]
     async fn delete_existing() {
         let (uc, artifact, _storage) = make_use_case_with_artifact();
-        uc.delete(artifact.id).await.unwrap();
+        uc.delete(artifact.id, test_actor()).await.unwrap();
         let err = uc.get_by_id(artifact.id).await.unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
@@ -1245,8 +1270,43 @@ mod tests {
     #[tokio::test]
     async fn delete_not_found() {
         let (uc, _, _storage) = make_use_case_with_artifact();
-        let err = uc.delete(Uuid::new_v4()).await.unwrap_err();
+        let err = uc.delete(Uuid::new_v4(), test_actor()).await.unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    /// The caller's identity must reach the port — the `ArtifactDeleted`
+    /// event's attribution is exactly this argument, so dropping it here
+    /// would produce an unattributable terminal transition.
+    #[tokio::test]
+    async fn delete_threads_the_actor_through_to_the_port() {
+        let mock = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repositories = Arc::new(MockRepositoryRepository::new());
+        let artifact = sample_artifact_in_repo(Uuid::new_v4());
+        mock.insert(artifact.clone());
+        let uc = ArtifactUseCase::new(mock.clone(), storage, repositories, true);
+
+        let user_id = Uuid::new_v4();
+        uc.delete(
+            artifact.id,
+            Actor::Api(hort_domain::events::ApiActor { user_id }),
+        )
+        .await
+        .unwrap();
+
+        let deletions = mock.deletions();
+        assert_eq!(deletions.len(), 1);
+        assert_eq!(deletions[0].0, artifact.id);
+        assert!(
+            matches!(&deletions[0].1, Actor::Api(a) if a.user_id == user_id),
+            "delete must forward the caller's actor verbatim, got {:?}",
+            deletions[0].1
+        );
+
+        // Re-deleting is a no-op that records nothing: the terminal
+        // transition happens at most once per artifact.
+        uc.delete(artifact.id, test_actor()).await.unwrap_err();
+        assert_eq!(mock.deletions().len(), 1);
     }
 
     // -- list_by_raw_name: normalisation drift fallback --------------
@@ -1730,7 +1790,11 @@ mod tests {
                 })
             })
         }
-        fn delete(&self, _id: Uuid) -> hort_domain::ports::BoxFuture<'_, DomainResult<()>> {
+        fn delete(
+            &self,
+            _id: Uuid,
+            _actor: Actor,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }
         fn find_by_path(
@@ -1892,7 +1956,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(page.is_empty());
-            repo.delete(Uuid::nil()).await.unwrap();
+            repo.delete(Uuid::nil(), system_actor()).await.unwrap();
             assert!(repo.find_by_path(Uuid::nil(), "x").await.unwrap().is_none());
             assert!(repo
                 .list_distinct_names(Uuid::nil(), PageRequest::default())
@@ -2063,7 +2127,7 @@ mod tests {
             // Batch recorder is system; subject rides the payload.
             assert!(matches!(
                 batch.actor,
-                hort_domain::events::Actor::Internal(hort_domain::events::InternalActor::System)
+                Actor::Internal(hort_domain::events::InternalActor::System)
             ));
             assert_eq!(batch.events.len(), 1);
             match &batch.events[0].event {
@@ -2645,6 +2709,7 @@ mod visibility_extension_tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: Utc::now(),
@@ -3071,6 +3136,7 @@ mod visibility_extension_tests {
             fn delete(
                 &self,
                 _id: Uuid,
+                _actor: Actor,
             ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<()>>
             {
                 Box::pin(async { Ok(()) })

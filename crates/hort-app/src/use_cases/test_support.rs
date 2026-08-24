@@ -130,6 +130,11 @@ pub struct MockArtifactRepository {
     /// age-evidence read must fall back on the mint instant (a full
     /// window), never on an invented earlier instant.
     first_seen_errors: Mutex<std::collections::VecDeque<DomainError>>,
+    /// Every accepted [`ArtifactRepository::delete`] call, in order, with
+    /// the actor it was attributed to. Lets a test assert that the
+    /// caller's identity actually reaches the port instead of being
+    /// dropped on the way — the event attribution depends on it.
+    deletions: Mutex<Vec<(Uuid, Actor)>>,
 }
 
 impl MockArtifactRepository {
@@ -141,7 +146,13 @@ impl MockArtifactRepository {
             pypi_wheels_without_kind_filter: Mutex::new(None),
             oci_image_manifests_without_kind_filter: Mutex::new(None),
             first_seen_errors: Mutex::new(std::collections::VecDeque::new()),
+            deletions: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Accepted deletions in call order, each with its attributed actor.
+    pub fn deletions(&self) -> Vec<(Uuid, Actor)> {
+        self.deletions.lock().unwrap().clone()
     }
 
     /// Arm the next
@@ -248,6 +259,7 @@ impl MockArtifactRepository {
                 rejection_reason: None,
                 quarantine_window_start: None,
                 quarantine_deadline: None,
+                deleted_at: None,
                 upstream_published_at: None,
                 uploaded_by: None,
                 created_at: now,
@@ -383,8 +395,16 @@ impl ArtifactRepository for MockArtifactRepository {
         Box::pin(async move { Ok(Page { items, total }) })
     }
 
-    fn delete(&self, id: Uuid) -> BoxFut<'_, DomainResult<()>> {
+    fn delete(&self, id: Uuid, actor: Actor) -> BoxFut<'_, DomainResult<()>> {
+        // Production soft-deletes and keeps the row; the mock drops it,
+        // which is observationally the same for every read here — all of
+        // them are live reads, and live reads exclude deleted artifacts.
+        // A second delete of the same id therefore also yields NotFound,
+        // matching the adapter's idempotency contract.
         let existed = self.artifacts.lock().unwrap().remove(&id).is_some();
+        if existed {
+            self.deletions.lock().unwrap().push((id, actor));
+        }
         Box::pin(async move {
             if existed {
                 Ok(())
@@ -3368,6 +3388,7 @@ pub fn sample_artifact(status: QuarantineStatus) -> Artifact {
         // on read paths; fixtures that exercise `Retry-After` set it
         // explicitly.
         quarantine_deadline: None,
+        deleted_at: None,
         upstream_published_at: None,
         uploaded_by: None,
         created_at: Utc::now(),

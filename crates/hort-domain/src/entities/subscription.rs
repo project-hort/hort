@@ -276,6 +276,13 @@ pub enum EventTypeKind {
     /// blob confirmed absent). Terminal for `ArtifactExpired`; same
     /// (no-)repository-association posture.
     ArtifactPurged,
+    /// Artifact deleted from its repository (soft delete — row retained
+    /// with `deleted_at` set, CAS blob left to refcount-gated GC).
+    /// Unlike the other post-ingest artifact-lifecycle kinds this one
+    /// IS directly repo-associated: the payload denormalises
+    /// `repository_id`, so the dispatcher's repo-scope filter can act on
+    /// it without resolving a projection row the deletion just retired.
+    ArtifactDeleted,
 
     // -- Policy lifecycle --
     PolicyCreated,
@@ -403,6 +410,7 @@ impl EventTypeKind {
             DomainEvent::PromotionRejected(_) => EventTypeKind::PromotionRejected,
             DomainEvent::ArtifactExpired(_) => EventTypeKind::ArtifactExpired,
             DomainEvent::ArtifactPurged(_) => EventTypeKind::ArtifactPurged,
+            DomainEvent::ArtifactDeleted(_) => EventTypeKind::ArtifactDeleted,
             DomainEvent::ArtifactDownloaded(_) => EventTypeKind::ArtifactDownloaded,
             DomainEvent::PolicyCreated(_) => EventTypeKind::PolicyCreated,
             DomainEvent::PolicyUpdated(_) => EventTypeKind::PolicyUpdated,
@@ -503,6 +511,12 @@ impl EventTypeKind {
             // other post-ingest artifact-lifecycle events above.
             DomainEvent::ArtifactExpired(_) => None,
             DomainEvent::ArtifactPurged(_) => None,
+            // Deletion is the one post-ingest artifact-lifecycle event
+            // that carries its repository directly: the payload
+            // denormalises `repository_id` precisely so an audit /
+            // subscription consumer never has to resolve the projection
+            // row the deletion retired.
+            DomainEvent::ArtifactDeleted(e) => Some(e.repository_id),
             // Download audit: the payload carries
             // the repository_id directly (it is the stream-sharding
             // key). Returned here for the dispatcher's repo-scope

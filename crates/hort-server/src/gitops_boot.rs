@@ -225,8 +225,12 @@ async fn apply_inner(
     // active artifacts plus an atomic state-plus-events writer for
     // `RetroBlock` outcomes. Mirrors `composition.rs`'s wiring; cheap
     // pool clones, the pool itself owns the connection lifecycle.
-    let pg_artifact_repo =
-        Arc::new(hort_adapters_postgres::artifact_repo::PgArtifactRepository::new(pool.clone()));
+    let pg_artifact_repo = Arc::new(
+        hort_adapters_postgres::artifact_repo::PgArtifactRepository::new(
+            pool.clone(),
+            pg_event_store.clone(),
+        ),
+    );
     let artifacts: Arc<dyn ArtifactRepository> = pg_artifact_repo.clone();
     let pg_artifact_metadata_repo = Arc::new(
         hort_adapters_postgres::artifact_metadata_repo::PgArtifactMetadataRepository::new(

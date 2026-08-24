@@ -2710,6 +2710,7 @@ mod tests {
         fn delete(
             &self,
             _id: Uuid,
+            _actor: hort_domain::events::Actor,
         ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }
