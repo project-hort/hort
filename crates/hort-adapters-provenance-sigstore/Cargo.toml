@@ -64,6 +64,21 @@ sigstore_protobuf_specs = { version = "0.5", default-features = false }
 # Identity extraction from the verified Fulcio leaf certificate. Pinned to
 # the same majors sigstore 0.14 uses so the `x509_cert::Certificate` types
 # unify (no duplicate-type mismatch).
+#
+# These two majors are NOT independently bumpable, and the constraint is
+# upstream rather than a matter of local adaptation:
+#   * `x509-cert 0.3` — `verifier.rs` implements sigstore's
+#     `bundle::verify::policy::VerificationPolicy`, whose method signature
+#     is `fn verify(&self, cert: &x509_cert::Certificate)` against
+#     sigstore's own `x509-cert ^0.2`. Bumping ours resolves a *second*
+#     `x509-cert` into the graph and the impl stops satisfying the trait
+#     (E0053/E0308 "multiple different versions of crate `x509_cert`").
+#     Only a sigstore release that itself moves to 0.3 unblocks this.
+#   * `const-oid 0.10` — `ObjectIdentifier` gains a `MAX_SIZE` const
+#     generic there, so it no longer unifies with the `ObjectIdentifier`
+#     reached through `x509-cert 0.2` → `der 0.7` → `const-oid 0.9` that
+#     `identity.rs` compares extension OIDs against. It moves only with
+#     `x509-cert`, which moves only with `sigstore`.
 x509-cert = { version = "0.2", default-features = false, features = ["std", "pem"] }
 const-oid = { version = "0.9", default-features = false }
 
