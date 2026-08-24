@@ -40,10 +40,7 @@ use hort_domain::ports::curation_decisions_repository::{
 async fn maybe_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
     let pool = hort_adapters_postgres::test_support::isolated_db_from(&url).await?;
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrations run cleanly against the test DB");
+    hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
     Some(pool)
 }
 

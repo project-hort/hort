@@ -42,10 +42,7 @@ use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersi
 async fn maybe_setup() -> Option<(PgPool, Uuid)> {
     let url = env::var("DATABASE_URL").ok()?;
     let pool = hort_adapters_postgres::test_support::isolated_db_from(&url).await?;
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrations run cleanly against the test DB");
+    hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
     let repo_id = seed_repo(&pool).await;
     Some((pool, repo_id))
 }

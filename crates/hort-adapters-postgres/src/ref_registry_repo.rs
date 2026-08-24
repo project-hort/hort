@@ -385,10 +385,7 @@ mod tests {
         let pool = crate::test_support::isolated_db_from(&url).await?;
         // Apply migrations so the `mutable_refs` table exists even on
         // a fresh test database.
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations run cleanly against the test DB");
+        crate::test_support::migrate_or_panic(&pool).await;
         Some(pool)
     }
 
