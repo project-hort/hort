@@ -221,3 +221,104 @@ pub async fn shared_migrated_pool() -> Option<PgPool> {
     }
     panic!("migrations failed against the shared DATABASE_URL target after retries: {last_err:?}");
 }
+
+/// Run the embedded migration set against `pool`, panicking with a message
+/// that names the actual failure instead of asserting the migrations ran.
+///
+/// `sqlx::migrate!().run()` can fail before a single migration statement
+/// executes: a pool that cannot hand out a connection within its timeout
+/// surfaces as `MigrateError::Execute(sqlx::Error::PoolTimedOut)`, which
+/// looks — to a message that just says "migrations failed" — identical to a
+/// broken migration. It is not: the migration set was never reached. This
+/// classifies that case at the point it happens so the panic names
+/// connection acquisition, not migrations, while a genuine migration
+/// failure still gets the accurate migration message. Either way the
+/// underlying error rides along in the panic payload.
+///
+/// `sqlx::migrate!` embeds relative to the crate that expands it, so calling
+/// this from any crate embeds *this* crate's `../../migrations` — the one
+/// workspace-root migration set every caller already runs today.
+pub async fn migrate_or_panic(pool: &PgPool) {
+    if let Err(err) = sqlx::migrate!("../../migrations").run(pool).await {
+        panic!("{}", classify_migrate_failure(&err));
+    }
+}
+
+/// True when `err` reflects a connection that was never acquired — the pool
+/// timed out waiting for one, or was closed out from under the wait — rather
+/// than a failure encountered while actually executing a migration.
+fn is_acquisition_failure(err: &sqlx::migrate::MigrateError) -> bool {
+    matches!(
+        err,
+        sqlx::migrate::MigrateError::Execute(sqlx::Error::PoolTimedOut)
+            | sqlx::migrate::MigrateError::Execute(sqlx::Error::PoolClosed)
+    )
+}
+
+/// Build the panic message for a failed migration run. Split out from
+/// [`migrate_or_panic`] so it can be exercised without a database: construct
+/// a `MigrateError` directly and check which message shape comes back.
+fn classify_migrate_failure(err: &sqlx::migrate::MigrateError) -> String {
+    if is_acquisition_failure(err) {
+        format!(
+            "connection acquisition timed out before migrations ran — this is \
+             contention for a connection, not a broken migration. Check for another \
+             `cargo test` run or a sibling DB-backed test target hitting the same \
+             Postgres server concurrently, and whether the server's connection limit \
+             is too low. Underlying error: {err}"
+        )
+    } else {
+        format!("migrations failed to run cleanly against the test DB: {err}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_timed_out_is_classified_as_acquisition_not_migrations() {
+        let err = sqlx::migrate::MigrateError::Execute(sqlx::Error::PoolTimedOut);
+        let message = classify_migrate_failure(&err);
+        assert!(
+            message.contains("connection acquisition"),
+            "expected an acquisition-shaped message, got: {message}"
+        );
+        assert!(
+            !message.contains("migrations failed"),
+            "must not blame migrations for a connection that was never acquired: {message}"
+        );
+        assert!(
+            message.contains("pool timed out"),
+            "must retain the underlying error: {message}"
+        );
+    }
+
+    #[test]
+    fn pool_closed_is_also_classified_as_acquisition() {
+        let err = sqlx::migrate::MigrateError::Execute(sqlx::Error::PoolClosed);
+        let message = classify_migrate_failure(&err);
+        assert!(
+            message.contains("connection acquisition"),
+            "expected an acquisition-shaped message, got: {message}"
+        );
+        assert!(
+            message.contains("closed"),
+            "must retain the underlying error: {message}"
+        );
+    }
+
+    #[test]
+    fn a_genuine_migration_failure_keeps_the_migration_meaning() {
+        let err = sqlx::migrate::MigrateError::VersionMissing(7);
+        let message = classify_migrate_failure(&err);
+        assert!(
+            message.contains("migrations failed"),
+            "expected the migration-failure message, got: {message}"
+        );
+        assert!(
+            message.contains('7'),
+            "must retain the underlying error: {message}"
+        );
+    }
+}

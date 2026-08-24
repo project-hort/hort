@@ -435,10 +435,7 @@ async fn per_repo_dev_user_mints_and_authorizes_endpoint_db_backed() {
     else {
         return;
     };
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrations run cleanly against the test DB");
+    hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
 
     // Seed the dev-user row the issuance + validate paths re-resolve.
     let uid = dev_user_id();
