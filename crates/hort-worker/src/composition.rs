@@ -281,8 +281,10 @@ pub async fn build_app_context(
     // `broadcast::Sender` and hand it to the (then-co-located) dispatcher.
     let event_publisher = Arc::new(EventStorePublisher::without_broadcast(event_store.clone()));
 
-    let artifacts_concrete: Arc<PgArtifactRepository> =
-        Arc::new(PgArtifactRepository::new(pool.clone()));
+    let artifacts_concrete: Arc<PgArtifactRepository> = Arc::new(PgArtifactRepository::new(
+        pool.clone(),
+        pg_event_store.clone(),
+    ));
     let artifacts: Arc<dyn ArtifactRepository> = artifacts_concrete.clone();
 
     let metadata_concrete: Arc<PgArtifactMetadataRepository> =

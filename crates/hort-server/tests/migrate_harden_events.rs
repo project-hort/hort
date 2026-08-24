@@ -265,13 +265,20 @@ async fn harden_events_role_tolerates_missing_events_table() {
 // catches accidental file proliferation. Both bounds protect against
 // the same drift the original test caught — silent shrinkage of the
 // canonical set.
+//
+// The lower bound is the load-bearing half: it is what catches a
+// squashed set silently losing files. The ceiling is a tripwire, not a
+// cap on migrations — the set grows by one whenever a deliberate,
+// reviewed schema change ships, so raising it to stay ahead of that
+// growth is expected maintenance. Raising the FLOOR to make something
+// pass would not be.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn migrator_set_within_squashed_baseline_bounds() {
     let count = MIGRATOR.iter().count();
     assert!(
-        (5..=20).contains(&count),
-        "squashed migration set out of bounds: count={count} (expected 5..=20 per the ADR 0022 squashed baseline)"
+        (5..=30).contains(&count),
+        "squashed migration set out of bounds: count={count} (expected 5..=30 per the ADR 0022 squashed baseline)"
     );
 }

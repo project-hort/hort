@@ -1618,8 +1618,8 @@ mod tests {
         // still pass for every one of them; only this anti-silent-
         // truncation tripwire is rebased.
         assert_eq!(
-            exercised, 70,
-            "expected all 70 DomainEvent test instances to be exercised, got {exercised}"
+            exercised, 71,
+            "expected all 71 DomainEvent test instances to be exercised, got {exercised}"
         );
     }
 }

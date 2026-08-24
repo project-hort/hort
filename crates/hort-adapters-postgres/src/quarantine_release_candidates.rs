@@ -160,12 +160,19 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             // Walk the quarantined repos. The set of repos that currently
             // hold any quarantined artifact is the only set we need a
             // duration for; resolve each via the precedence above.
+            //
+            // Soft-deleted artifacts are excluded here and in the
+            // per-duration scan below: deletion is the terminal event on
+            // the artifact's stream, so releasing one afterwards would
+            // append a lifecycle event past the terminal and make a
+            // replay reconstruct a deleted artifact as live.
             let quarantined_repos: Vec<Uuid> = sqlx::query(
                 r#"
                 SELECT DISTINCT repository_id
                 FROM artifacts
                 WHERE quarantine_status = 'quarantined'
                   AND quarantine_window_start IS NOT NULL
+                  AND deleted_at IS NULL
                 "#,
             )
             .fetch_all(&self.pool)
@@ -236,6 +243,7 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
                     WHERE quarantine_status = 'quarantined'
                       AND repository_id = ANY($1)
                       AND quarantine_window_start <= $2
+                      AND deleted_at IS NULL
                     ORDER BY quarantine_window_start
                     LIMIT $3
                     "#,

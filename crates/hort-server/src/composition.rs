@@ -1191,7 +1191,7 @@ pub async fn build_app_context(
     };
 
     let repo_repo = Arc::new(PgRepositoryRepository::new(db.clone()));
-    let artifact_repo = Arc::new(PgArtifactRepository::new(db.clone()));
+    let artifact_repo = Arc::new(PgArtifactRepository::new(db.clone(), event_store.clone()));
     let artifact_metadata_repo = Arc::new(PgArtifactMetadataRepository::new(db.clone()));
     let user_repo = Arc::new(PgUserRepository::new(db.clone()));
     // `PgApiTokenRepository` adapter. Always

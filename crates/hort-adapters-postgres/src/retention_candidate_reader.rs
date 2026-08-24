@@ -125,7 +125,7 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                        a.quarantine_status, a.quarantine_window_start,
                        a.upstream_published_at,
                        a.uploaded_by,
-                       a.created_at, a.updated_at,
+                       a.created_at, a.updated_at, a.deleted_at,
                        r.format AS repo_format,
                        p.rescan_interval_hours AS resolved_rescan_interval_hours
                 FROM artifacts a

@@ -53,7 +53,7 @@ async fn lifecycle(pool: &PgPool) -> PgArtifactLifecycle {
             .await
             .expect("event store init"),
     );
-    let artifact_repo = Arc::new(PgArtifactRepository::new(pool.clone()));
+    let artifact_repo = Arc::new(PgArtifactRepository::new(pool.clone(), event_store.clone()));
     let metadata_repo = Arc::new(PgArtifactMetadataRepository::new(pool.clone()));
     PgArtifactLifecycle::new(event_store, artifact_repo, metadata_repo)
 }
@@ -103,6 +103,7 @@ fn artifact(repo_id: Uuid) -> Artifact {
         rejection_reason: None,
         quarantine_window_start: None,
         quarantine_deadline: None,
+        deleted_at: None,
         upstream_published_at: None,
         uploaded_by: None,
         created_at: Utc::now(),

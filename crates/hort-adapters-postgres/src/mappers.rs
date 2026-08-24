@@ -271,6 +271,12 @@ pub struct ArtifactRow {
     pub uploaded_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Soft-delete marker. `NULL` ⇒ live. Every live read filters
+    /// `deleted_at IS NULL`, so a row materialised through one of them
+    /// always carries `None` here; the non-`None` case reaches this
+    /// mapper only through the deletion path, which reads the row it is
+    /// about to retire.
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 impl TryFrom<ArtifactRow> for Artifact {
@@ -312,6 +318,7 @@ impl TryFrom<ArtifactRow> for Artifact {
             // store; it is hydrated by the use-case layer on the read
             // path. A fresh row always carries `None`.
             quarantine_deadline: None,
+            deleted_at: row.deleted_at,
             upstream_published_at: row.upstream_published_at,
             uploaded_by: row.uploaded_by,
             created_at: row.created_at,
@@ -1549,6 +1556,7 @@ mod tests {
             uploaded_by: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            deleted_at: None,
         }
     }
 
@@ -1558,6 +1566,27 @@ mod tests {
         assert_eq!(artifact.name, "my-pkg");
         assert_eq!(artifact.sha256_checksum.as_ref(), VALID_SHA256);
         assert_eq!(artifact.quarantine_status, QuarantineStatus::None);
+    }
+
+    #[test]
+    fn artifact_null_deleted_at_maps_to_live() {
+        let artifact = Artifact::try_from(base_artifact_row()).unwrap();
+        assert!(artifact.deleted_at.is_none(), "NULL deleted_at is live");
+    }
+
+    #[test]
+    fn artifact_deleted_at_is_carried_through_the_mapping() {
+        // Reached only via the deletion path, which reads the row it is
+        // about to retire — but the mapping must not silently drop it,
+        // or that path would believe a deleted artifact is still live.
+        let at: DateTime<Utc> = "2026-03-04T05:06:07Z".parse().unwrap();
+        let row = ArtifactRow {
+            deleted_at: Some(at),
+            ..base_artifact_row()
+        };
+        let artifact = Artifact::try_from(row).unwrap();
+        assert_eq!(artifact.deleted_at, Some(at));
+        assert!(!artifact.is_downloadable());
     }
 
     #[test]

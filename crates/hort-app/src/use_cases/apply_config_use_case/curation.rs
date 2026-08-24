@@ -637,6 +637,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: Some(now),
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: now,
