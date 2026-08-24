@@ -444,6 +444,91 @@ mod tests {
         assert!(!verify_token("definitely-not-the-sentinel", s));
     }
 
+    // --- Stored-credential format pin ------------------------------------
+
+    /// Plaintext behind [`STORED_FORMAT_FIXTURE`].
+    const STORED_FORMAT_FIXTURE_PLAINTEXT: &str = "hort-argon2id-format-fixture";
+
+    /// The fixed salt (B64, 16 bytes decoded — the PHC-spec recommended
+    /// length) behind [`STORED_FORMAT_FIXTURE`]. Fixed rather than random
+    /// so the fixture is reproducible; production salts stay per-call
+    /// random (see `hash_token_unique_salt_per_call`).
+    const STORED_FORMAT_FIXTURE_SALT_B64: &str = "aG9ydGFyZ29uMmlkc2FsdA";
+
+    /// A committed Argon2id PHC string produced by [`argon2_context`] over
+    /// [`STORED_FORMAT_FIXTURE_PLAINTEXT`] and
+    /// [`STORED_FORMAT_FIXTURE_SALT_B64`].
+    ///
+    /// This is the **stored-credential format contract**: every PAT hash
+    /// already persisted is encoded exactly this way. Pinning it as a byte
+    /// literal means a change to the Argon2id output, the PHC encoding, or
+    /// the OWASP-2024 parameter set fails here instead of silently
+    /// invalidating every credential in the database on deploy.
+    ///
+    /// Changing this constant is a deliberate credential-format migration
+    /// and requires a rehash-on-next-use path for existing rows — never a
+    /// "just update the expected value" edit.
+    const STORED_FORMAT_FIXTURE: &str = "$argon2id$v=19$m=19456,t=2,p=1$\
+         aG9ydGFyZ29uMmlkc2FsdA$Uyu9KQlCo6ZfIj7vkEf4JiImTCYmnQeA/jjBrDxTiO0";
+
+    #[test]
+    fn committed_stored_hash_still_verifies() {
+        // The round-trip that matters: a credential hashed by an earlier
+        // build of this module must still verify against today's verifier.
+        assert!(
+            verify_token(STORED_FORMAT_FIXTURE_PLAINTEXT, STORED_FORMAT_FIXTURE),
+            "a stored Argon2id credential must keep verifying — a failure here \
+             means existing PAT hashes stop authenticating"
+        );
+        assert!(
+            !verify_token("not-the-fixture-plaintext", STORED_FORMAT_FIXTURE),
+            "the fixture must still reject a wrong plaintext"
+        );
+    }
+
+    #[test]
+    fn argon2_context_reproduces_the_committed_stored_format() {
+        // Hash the fixture plaintext under the fixture's own salt: the
+        // result must be byte-identical to the committed string. This is
+        // the strictest form of the contract — it pins the KDF output,
+        // the parameter encoding, and the PHC serialization together.
+        let salt = SaltString::from_b64(STORED_FORMAT_FIXTURE_SALT_B64).expect("fixture salt");
+        let produced = argon2_context()
+            .hash_password(STORED_FORMAT_FIXTURE_PLAINTEXT.as_bytes(), &salt)
+            .expect("fixture hash succeeds")
+            .to_string();
+        assert_eq!(
+            produced, STORED_FORMAT_FIXTURE,
+            "Argon2id output/encoding drifted from the committed stored format"
+        );
+    }
+
+    #[test]
+    fn freshly_issued_hashes_carry_the_committed_algorithm_version_and_params() {
+        // A hash minted today must be interchangeable with a stored one:
+        // same algorithm, same version, same cost parameters — only the
+        // salt and digest differ.
+        let fresh = hash_token("newly-issued-token").expect("hash succeeds");
+        let fresh = PasswordHash::new(&fresh).expect("fresh hash parses");
+        let stored = PasswordHash::new(STORED_FORMAT_FIXTURE).expect("fixture parses");
+
+        assert_eq!(
+            fresh.algorithm, stored.algorithm,
+            "algorithm must not drift"
+        );
+        assert_eq!(fresh.version, stored.version, "PHC version must not drift");
+        assert_eq!(
+            fresh.params, stored.params,
+            "cost parameters must not drift — new credentials would be hashed \
+             at a different strength than the stored ones"
+        );
+        assert_eq!(
+            stored.params.to_string(),
+            format!("m={M_COST_KIB},t={T_COST},p={P_COST}"),
+            "the committed fixture must encode the module's parameter constants"
+        );
+    }
+
     // --- Error variant ---------------------------------------------------
 
     #[test]

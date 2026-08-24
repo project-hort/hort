@@ -292,6 +292,18 @@ jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # removed from the workspace entirely; a CI grep gate (`no_bcrypt` guard)
 # keeps it out. `password-hash` ships with `argon2` and provides the PHC
 # string format encode/decode the helper module wraps.
+#
+# `argon2` and `password-hash` move together or not at all: `argon2 0.5`
+# requires `password-hash ^0.5`, and the `PasswordHash`/`SaltString` types
+# cross that boundary, so bumping `password-hash` alone is an
+# unresolved-import + duplicate-type build failure. `password-hash 0.6`
+# (which relocates the PHC types to the `phc` crate) needs `argon2 ^0.6`,
+# and `argon2 0.6` has no stable release — it is gated on `blake2 0.11`,
+# itself still pre-release. Pre-release crypto does not belong in the
+# credential path, so this pair stays on 0.5 until `argon2 0.6` ships
+# stable. The stored PHC encoding is byte-identical across that jump, and
+# `hort-app::argon2_hash`'s committed stored-format fixture is the guard
+# that proves it stays that way.
 argon2 = { version = "0.5", features = ["std"] }
 password-hash = { version = "0.5", features = ["alloc"] }
 # Ed25519 keypair used to sign the OCI Distribution-Spec `/v2/auth` token
