@@ -36,6 +36,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **npm abbreviated per-version / dist-tag route** —
+  `GET /npm/{repo_key}/{name}/{version-or-tag}` (and the `@scope` variant)
+  now serves the npm registry convention's per-version manifest:
+  `{name, version, dist:{tarball, shasum[, integrity]}}` for an exact
+  served version, or for the literal tag `latest` (resolved by the same
+  prerelease-excluding derivation the packument uses — one shared
+  definition). Previously the unscoped shape collided with the
+  scoped-packument route and returned a misleading
+  `"scoped npm name must start with '@'"` 400, which broke `corepack`
+  package-manager activation against a hort registry
+  (`COREPACK_NPM_REGISTRY`): corepack always issues
+  `GET /<pkg>/<version-or-tag>`, so every cold `COREPACK_HOME` failed.
+  Resolution runs against the same filtered served set as the packument,
+  so a quarantined or otherwise non-servable version 404s
+  indistinguishably from a nonexistent one; tarball routes are unaffected
+  (their literal `-` segment keeps matcher precedence). Tags other than
+  `latest` still resolve nowhere — upstream tag pass-through is tracked
+  separately (#202). (#203)
+
 - **`GET /api/v1/repositories/{repo_key}/prefetch/jobs/{job_id}`** — a
   read-only, id-addressed lookup of a self-service prefetch job's outcome
   (`status`, `attempts`, `last_error`, `result_summary`, `kind`,
