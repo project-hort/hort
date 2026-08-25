@@ -712,6 +712,59 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // 3b. dist-tags.latest never resolves to a prerelease while a
+    //     release is served — a canary must not become the version a
+    //     bare `npm i`/`pnpm add` installs.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn dist_tags_latest_excludes_canary_prerelease() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.1.0-canary.20260101",
+            "pkg-1.1.0-canary.20260101.tgz",
+            "bbb",
+            QuarantineStatus::Released,
+        );
+
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("unified serve must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        let versions = json["versions"].as_object().unwrap();
+        assert!(
+            versions.contains_key("1.1.0-canary.20260101"),
+            "the prerelease is still served — only excluded from dist-tags.latest"
+        );
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.0.0",
+            "a released canary prerelease must never resolve as latest while a \
+             release is served, even though it is semver-greater"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // 4. Anti-enumeration — anonymous caller on a private repo
     //    receives NotFound (not 403). Mirrors the existing
     //    `anonymous_get_packument_on_private_repo_returns_404` shape

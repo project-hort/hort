@@ -38,11 +38,17 @@
 //! # `dist-tags.latest` invariant
 //!
 //! `dist-tags.latest` must point at the **resolved-latest of the
-//! served set** — i.e. the max over `entries` per
-//! [`BuildContext::ordering`], computed *after* the filter pipeline.
-//! The builder sees only post-filter entries, so picking
-//! `max_by(ordering)` over `entries` IS the served-max. An empty served
-//! set produces a packument with empty `versions{}` and **no `dist-tags`
+//! served set, excluding pre-releases** — i.e. the max over `entries`
+//! per [`BuildContext::ordering`] whose
+//! [`VersionOrdering::is_prerelease`](hort_app::use_cases::index_serve_filter::VersionOrdering::is_prerelease)
+//! is `false`, computed *after* the filter pipeline. This mirrors the
+//! npm ecosystem contract: a pre-release is never `latest` while any
+//! release is served, so a bare `npm i`/`pnpm add` never installs a
+//! canary. If every served entry is a pre-release, `latest` falls back
+//! to the pre-release max (a pre-release-only package still gets a
+//! usable tag) — the builder sees only post-filter entries, so this
+//! fallback IS the served-max in that case. An empty served set
+//! produces a packument with empty `versions{}` and **no `dist-tags`
 //! block at all** — a client following an absent `latest` falls back to
 //! its lockfile or fails the same way as "nothing servable".
 //!
@@ -128,13 +134,23 @@ pub struct NpmIndexBuilder;
 impl IndexBuilder for NpmIndexBuilder {
     fn build(&self, ctx: BuildContext<'_>, entries: Vec<VersionEntry>) -> Bytes {
         // Pre-compute the served-max over the post-filter entries.
-        // `dist-tags.latest` points here. An empty served set produces
-        // no `dist-tags` block (the wire-equivalent of "no servable
-        // latest").
+        // `dist-tags.latest` points here. A pre-release never wins
+        // while a release is served: take the max over non-prerelease
+        // entries first, falling back to the unfiltered max only when
+        // the served set is all-prerelease (still non-empty). An empty
+        // served set produces no `dist-tags` block (the wire-equivalent
+        // of "no servable latest").
         let latest: Option<&str> = entries
             .iter()
             .map(|e| e.version.as_str())
-            .max_by(|a, b| ctx.ordering.compare(a, b));
+            .filter(|v| !ctx.ordering.is_prerelease(v))
+            .max_by(|a, b| ctx.ordering.compare(a, b))
+            .or_else(|| {
+                entries
+                    .iter()
+                    .map(|e| e.version.as_str())
+                    .max_by(|a, b| ctx.ordering.compare(a, b))
+            });
 
         let mut versions = serde_json::Map::new();
         for entry in &entries {
@@ -374,6 +390,64 @@ mod tests {
         assert!(versions.contains_key("1.2.0"));
         assert!(versions.contains_key("1.9.0"));
         assert!(versions.contains_key("1.10.0"));
+    }
+
+    // -----------------------------------------------------------------
+    // 4b. dist-tags.latest excludes a semver-greater prerelease while a
+    //     release is served — the npm ecosystem contract that a bare
+    //     `npm i`/`pnpm add` never installs a canary.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dist_tags_latest_excludes_prerelease_when_release_is_served() {
+        let entries = vec![
+            entry("1.2.8", payload("p", "p-1.2.8.tgz", None, "a")),
+            entry(
+                "1.3.0-canary.0",
+                payload("p", "p-1.3.0-canary.0.tgz", None, "b"),
+            ),
+        ];
+        let json = build(entries, "p", "https://r.example/npm/m");
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.2.8",
+            "a prerelease must never win latest while a release is served, \
+             even though it is semver-greater"
+        );
+        let versions = json["versions"].as_object().unwrap();
+        assert!(
+            versions.contains_key("1.3.0-canary.0"),
+            "the prerelease is still SERVED, only excluded from dist-tags.latest"
+        );
+    }
+
+    #[test]
+    fn dist_tags_latest_falls_back_to_prerelease_max_when_all_prerelease() {
+        let entries = vec![
+            entry("1.0.0-alpha.1", payload("p", "p-a1.tgz", None, "a")),
+            entry("1.0.0-alpha.2", payload("p", "p-a2.tgz", None, "b")),
+        ];
+        let json = build(entries, "p", "https://r.example/npm/m");
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.0.0-alpha.2",
+            "an all-prerelease served set still gets a usable latest tag"
+        );
+    }
+
+    #[test]
+    fn dist_tags_latest_build_metadata_only_version_treated_as_release() {
+        let entries = vec![
+            entry("1.0.0+build.5", payload("p", "p-b5.tgz", None, "a")),
+            entry("1.0.0-rc.1", payload("p", "p-rc1.tgz", None, "b")),
+        ];
+        let json = build(entries, "p", "https://r.example/npm/m");
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.0.0+build.5",
+            "build metadata alone is not a prerelease; it must beat an actual \
+             prerelease for latest"
+        );
     }
 
     // -----------------------------------------------------------------
