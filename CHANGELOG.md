@@ -94,6 +94,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **npm `dist-tags.latest` no longer resolves to a prerelease while a
+  release is served.** The served packument derived `latest` as a bare
+  semver-max over the served set, so any package whose next version has a
+  published prerelease (for React, a permanent condition) advertised that
+  prerelease — e.g. `19.3.0-canary-…` over `19.2.8` — and a bare
+  `npm i <pkg>` / `pnpm add <pkg>` installed a canary, under both
+  `indexMode` arms. `latest` is now the max over the **non-prerelease**
+  served versions; a served set consisting only of prereleases falls back
+  to the max prerelease (a prerelease-only package still gets a usable
+  tag); an empty served set still emits no `dist-tags` block, and build
+  metadata (`1.2.3+build.5`) does not count as a prerelease. Lockfile
+  installs, explicit versions, and range specs were never affected.
+  Upstream `next`/`beta`/`rc` tag pass-through remains future work
+  (#202); Maven's `<release>` derivation was verified correct for
+  Maven's own model (only `SNAPSHOT` is special there). (#200)
+
 - **A scan finding whose severity a backend could not read no longer
   discards another backend's correctly-scored reading of the same
   advisory.** When a backend cannot determine a severity it emits the
