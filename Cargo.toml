@@ -558,7 +558,7 @@ async-nats = { version = "0.50", default-features = false }
 # `hort-notifier-nats` to stand up `nats:latest` with JetStream enabled.
 # Workspace-pinned so future adapters that need real-broker fixtures
 # (e.g. a future Kafka relay) share the version.
-testcontainers = "0.27"
+testcontainers = "0.28"
 
 # RustSec-maintained CVSS v3.x vector parser/scorer. Consumers:
 # `hort-adapters-scanner-osv` and `hort-adapters-advisory-osv` compute a
