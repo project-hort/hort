@@ -2,14 +2,25 @@
 //!
 //! Routes (mounted under `/npm`):
 //! - `GET  /{repo_key}/{name}`                               — unscoped packument
+//! - `GET  /{repo_key}/{name}/{version_or_tag}`              — unscoped abbreviated per-version / `latest`
 //! - `GET  /{repo_key}/@{scope}/{name}`                      — scoped packument
+//! - `GET  /{repo_key}/@{scope}/{name}/{version_or_tag}`     — scoped abbreviated per-version / `latest`
 //! - `GET  /{repo_key}/{name}/-/{filename}`                  — unscoped tarball
 //! - `GET  /{repo_key}/@{scope}/{name}/-/{filename}`         — scoped tarball
 //! - `PUT  /{repo_key}/{name}`                               — unscoped publish
 //! - `PUT  /{repo_key}/@{scope}/{name}`                      — scoped publish
 //!
-//! Segment count disambiguates all six routes cleanly — 2/3/4/5 path
-//! segments after `/npm/`. No axum priority rules to rely on.
+//! Segment count disambiguates most routes cleanly — 2/3/4/5 path
+//! segments after `/npm/` — but axum/matchit cannot register two
+//! distinct all-param routes at the same segment count and position
+//! (`/{repo_key}/{scope}/{name}` and `/{repo_key}/{name}/{version_or_tag}`
+//! are both 3 segments; likewise the 4-segment scoped forms). So the
+//! 3-segment and 4-segment GET routes each dispatch **in-handler** on
+//! whether the second path segment starts with `@`: scoped
+//! packument / per-version when it does, unscoped per-version when it
+//! does not. The literal `-` third segment of the tarball routes
+//! always takes matcher precedence over a same-position param, so
+//! both tarball routes are unaffected by either dispatch.
 
 use std::sync::Arc;
 
@@ -119,8 +130,12 @@ pub fn npm_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
             get(download_scoped),
         )
         .route(
+            "/{repo_key}/{scope}/{name}/{version_or_tag}",
+            get(version_scoped),
+        )
+        .route(
             "/{repo_key}/{scope}/{name}",
-            get(packument_scoped).put(publish_scoped),
+            get(packument_scoped_or_version_unscoped).put(publish_scoped),
         )
         .route("/{repo_key}/{name}/-/{filename}", get(download_unscoped))
         .route(
@@ -172,10 +187,55 @@ async fn packument_unscoped(
     dispatch_packument(&ctx, &repo_key, &pkg, &trust, actor).await
 }
 
-async fn packument_scoped(
+/// Dispatch for the 3-segment GET route `/{repo_key}/{seg1}/{seg2}`.
+///
+/// axum/matchit cannot register a second all-param 3-segment route, so
+/// this ONE registration covers two distinct request shapes,
+/// disambiguated on whether `seg1` starts with `@`:
+/// - `@scope` → the existing scoped-packument behavior, unchanged
+///   (composes `scope/name`, no normalisation);
+/// - anything else → the new unscoped abbreviated per-version / `latest`
+///   route: `seg1` is the package name (normalised exactly like
+///   [`packument_unscoped`]), `seg2` is the version string or `latest`.
+async fn packument_scoped_or_version_unscoped(
     State(ctx): State<Arc<AppContext>>,
     Extension(trust): Extension<RequestTrust>,
-    BoundedPath((repo_key, scope, name)): BoundedPath<(String, String, String)>,
+    BoundedPath((repo_key, seg1, seg2)): BoundedPath<(String, String, String)>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See
+    // `packument_unscoped`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
+) -> Result<Response, ApiError> {
+    // `BoundedPath` enforces the route-parameter length cap on every
+    // captured segment before this handler body runs.
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
+    if seg1.starts_with('@') {
+        let full = format!("{seg1}/{seg2}");
+        dispatch_packument(&ctx, &repo_key, &full, &trust, actor).await
+    } else {
+        let pkg = NpmFormatHandler.normalize_name(&seg1);
+        serve::serve_npm_version_unified(&ctx, &repo_key, &pkg, &seg2, &trust, actor).await
+    }
+}
+
+/// `GET /{repo_key}/@{scope}/{name}/{version_or_tag}` — scoped
+/// abbreviated per-version / `latest` route. Mirrors the scoped
+/// packument's `@` guard and `scope/name` composition (no
+/// normalisation); resolution is delegated to
+/// [`serve::serve_npm_version_unified`], the same entry point the
+/// unscoped dispatch above uses.
+async fn version_scoped(
+    State(ctx): State<Arc<AppContext>>,
+    Extension(trust): Extension<RequestTrust>,
+    BoundedPath((repo_key, scope, name, version_or_tag)): BoundedPath<(
+        String,
+        String,
+        String,
+        String,
+    )>,
     // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
     // slot; outer `Option` tolerates the no-auth-layer case. See
     // `packument_unscoped`.
@@ -191,7 +251,7 @@ async fn packument_scoped(
         .as_deref()
         .and_then(|opt| opt.as_ref())
         .map(AuthenticatedPrincipal::as_caller);
-    dispatch_packument(&ctx, &repo_key, &full, &trust, actor).await
+    serve::serve_npm_version_unified(&ctx, &repo_key, &full, &version_or_tag, &trust, actor).await
 }
 
 /// Packument dispatch — both `Proxy` and `Hosted` / `Staging` /
@@ -2119,6 +2179,274 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    // -----------------------------------------------------------------
+    // Abbreviated per-version / dist-tag route.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn version_route_unscoped_exact_version_returns_correct_body_shape() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "express",
+            "1.0.0",
+            "express-1.0.0.tgz",
+            b"content",
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            QuarantineStatus::None,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/express/1.0.0")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get(CONTENT_TYPE).unwrap(), "application/json");
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"].as_str().unwrap(), "express");
+        assert_eq!(json["version"].as_str().unwrap(), "1.0.0");
+        assert_eq!(
+            json["dist"]["tarball"].as_str().unwrap(),
+            "https://registry.example.com/npm/npm-test/express/-/express-1.0.0.tgz"
+        );
+        assert_eq!(
+            json["dist"]["shasum"].as_str().unwrap(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert!(
+            json["dist"].get("integrity").is_none(),
+            "absent integrity must be omitted, not null"
+        );
+        assert!(
+            json.get("versions").is_none(),
+            "the abbreviated per-version body is not a packument"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_route_unscoped_latest_resolves_newest_served_release() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            b"a",
+            Some("aaa"),
+            QuarantineStatus::Released,
+        );
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "2.0.0",
+            "pkg-2.0.0.tgz",
+            b"b",
+            Some("bbb"),
+            QuarantineStatus::Released,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/pkg/latest")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"].as_str().unwrap(), "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn version_route_scoped_exact_and_latest() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "@types/node",
+            "20.0.0",
+            "node-20.0.0.tgz",
+            b"x",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            QuarantineStatus::None,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get("/npm/npm-test/@types/node/20.0.0")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"].as_str().unwrap(), "@types/node");
+        assert_eq!(
+            json["dist"]["tarball"].as_str().unwrap(),
+            "https://registry.example.com/npm/npm-test/@types/node/-/node-20.0.0.tgz"
+        );
+
+        let res2 = router
+            .oneshot(
+                Request::get("/npm/npm-test/@types/node/latest")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let body2 = to_bytes(res2.into_body(), 64 * 1024).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(json2["version"].as_str().unwrap(), "20.0.0");
+    }
+
+    #[tokio::test]
+    async fn version_route_unknown_version_returns_404_standard_envelope() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            b"a",
+            Some("aaa"),
+            QuarantineStatus::Released,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/pkg/9.9.9")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The misleading 3-segment non-`@` 400 is gone: that URL shape IS the
+    /// unscoped per-version route now. An unknown package/version still
+    /// 404s (anti-enumeration), never 400.
+    #[tokio::test]
+    async fn three_segment_non_at_shape_no_longer_400s() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/pkg/1.2.3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The 4-segment scoped shape keeps the `@` guard: a non-`@` second
+    /// segment is a validation error, not a (mis-shaped) version lookup.
+    #[tokio::test]
+    async fn version_route_scoped_shape_requires_at_prefix() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/notscope/pkg/1.0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Router-precedence pin: the literal `-` third segment of the
+    /// unscoped tarball route must keep matching over the new dynamic
+    /// 4-segment scoped-version route (`/{repo}/{scope}/{name}/{version}`)
+    /// registered at the same segment count. The 5-segment scoped tarball
+    /// route is untouched by either new route.
+    #[tokio::test]
+    async fn tarball_routes_keep_precedence_over_new_version_routes() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            b"unscoped-tarball-bytes",
+            Some("aaa"),
+            QuarantineStatus::None,
+        );
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "@scope/pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            b"scoped-tarball-bytes",
+            Some("bbb"),
+            QuarantineStatus::None,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get("/npm/npm-test/pkg/-/pkg-1.0.0.tgz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(&body[..], b"unscoped-tarball-bytes");
+
+        let res2 = router
+            .oneshot(
+                Request::get("/npm/npm-test/@scope/pkg/-/pkg-1.0.0.tgz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let body2 = to_bytes(res2.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(&body2[..], b"scoped-tarball-bytes");
     }
 
     /// Normalisation-drift regression. Ingest an artifact whose stored
