@@ -84,6 +84,22 @@ pub trait VersionOrdering {
     /// over the full string domain is the contract; semantic
     /// reasonableness for well-formed versions is the goal.
     fn compare(&self, a: &str, b: &str) -> Ordering;
+
+    /// True iff `version` is a pre-release under this format's version
+    /// scheme (e.g. npm/semver `1.2.3-rc.1`; build metadata alone,
+    /// `1.2.3+build.5`, is NOT a pre-release). Used to keep a
+    /// pre-release from winning a served-set "latest" resolution while
+    /// any release is present.
+    ///
+    /// Default `false`: a format without pre-release semantics (or
+    /// whose ordering hasn't opted in) treats every version as a
+    /// release, so `latest` resolution is unaffected — the safe
+    /// default is "no filtering", matching pre-existing behavior for
+    /// every ordering except the one that overrides this.
+    fn is_prerelease(&self, version: &str) -> bool {
+        let _ = version;
+        false
+    }
 }
 
 /// Outcome of [`filter_served_versions`].
@@ -246,6 +262,16 @@ impl VersionOrdering for NpmSemverOrdering {
             (Some(_), None) => Ordering::Greater,
             (None, Some(_)) => Ordering::Less,
             (None, None) => a.cmp(b),
+        }
+    }
+
+    fn is_prerelease(&self, version: &str) -> bool {
+        // Mirrors `compare`'s lexical-fallback posture: an unparseable
+        // version is not silently demoted out of `latest` eligibility,
+        // so it is treated as a release (not a prerelease) here too.
+        match ParsedNpmVersion::parse(version) {
+            Some(v) => !v.prerelease.is_empty(),
+            None => false,
         }
     }
 }
@@ -1432,6 +1458,49 @@ mod tests {
         let a = ParsedNpmVersion::parse("1.0.0").unwrap();
         let b = ParsedNpmVersion::parse("2.0.0").unwrap();
         assert_eq!(a.partial_cmp(&b), Some(Ordering::Less));
+    }
+
+    // ---------- NpmSemverOrdering::is_prerelease ----------
+
+    #[test]
+    fn npm_semver_is_prerelease_release_version_is_false() {
+        assert!(!NpmSemverOrdering.is_prerelease("1.2.3"));
+    }
+
+    #[test]
+    fn npm_semver_is_prerelease_prerelease_version_is_true() {
+        assert!(NpmSemverOrdering.is_prerelease("1.2.3-rc.1"));
+    }
+
+    #[test]
+    fn npm_semver_is_prerelease_build_metadata_only_is_false() {
+        // Build metadata alone is NOT a prerelease (semver §10).
+        assert!(!NpmSemverOrdering.is_prerelease("1.2.3+build.5"));
+    }
+
+    #[test]
+    fn npm_semver_is_prerelease_prerelease_plus_build_is_true() {
+        assert!(NpmSemverOrdering.is_prerelease("1.2.3-rc.1+build.5"));
+    }
+
+    #[test]
+    fn npm_semver_is_prerelease_unparseable_is_false() {
+        // Mirrors compare()'s lexical-fallback posture: an unparseable
+        // version is not silently demoted out of `latest` eligibility.
+        assert!(!NpmSemverOrdering.is_prerelease("not-a-version"));
+    }
+
+    // ---------- VersionOrdering::is_prerelease default impl ----------
+
+    #[test]
+    fn version_ordering_default_is_prerelease_is_false() {
+        struct NoOverrideOrdering;
+        impl VersionOrdering for NoOverrideOrdering {
+            fn compare(&self, a: &str, b: &str) -> Ordering {
+                a.cmp(b)
+            }
+        }
+        assert!(!NoOverrideOrdering.is_prerelease("1.2.3-rc.1"));
     }
 
     // ---------- filter_served_versions / ReleasedOnly ----------
