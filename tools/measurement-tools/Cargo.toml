@@ -89,7 +89,12 @@ hort-formats = { path = "../../crates/hort-formats" }
 # a throwaway binary; if a future change re-promotes it, restore
 # `{ workspace = true }` per the promotion-back checklist above.
 tokio              = { version = "1.50", features = ["full"] }
-reqwest            = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls-tls-native-roots"] }
+# `rustls-tls-native-roots` (0.12) has no direct 0.13 equivalent: 0.13
+# collapsed the webpki-roots/native-roots split into a single `rustls`
+# feature that always resolves trust via `rustls-platform-verifier` (the
+# OS trust store, same behavior `rustls-tls-native-roots` gave), so `rustls`
+# is the correct 0.13 spelling to keep native-root trust.
+reqwest            = { version = "0.13", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "rustls"] }
 serde              = { version = "1.0", features = ["derive"] }
 serde_json         = "1.0"
 clap               = { version = "4.5", features = ["derive", "env"] }
