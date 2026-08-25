@@ -93,9 +93,16 @@ git push -u origin chore/open-X.Y.Z-dev
 ## When a cycle becomes a new minor (dependency waves)
 
 A behavior-relevant dependency wave ships as a new **minor** version, not a
-patch: crate majors, TLS/auth-stack changes, and runtime-baseline moves (e.g.
-a shift of the tested Postgres window) are minor-bump material. Routine
-lockfile-compatible bumps are not — they ride whatever release ships next.
+patch. **Behavior-relevant means hort's observable behavior, security
+posture, or support baseline moves** — e.g. a TLS/auth-stack semantic change,
+or a runtime-baseline move (a shift of the tested Postgres window). A crate
+**major is a signal to check, not a verdict**: a major whose adaptation is
+mechanical and whose semantics are verified unchanged on the paths hort
+exercises — with that per-bump review recorded (for security-adjacent crates:
+the crypto/TLS lens, e.g. cipher defaults, verification strictness, KDF
+output format) — ships as a patch like any routine bump. Routine
+lockfile-compatible bumps are never minor-bump material — they ride whatever
+release ships next.
 
 - Open the cycle at the next minor (`X.(Y+1).0-dev`) as soon as the wave's
   scope is clear. The wave then soaks on staging as a unit, and the previous
@@ -108,7 +115,14 @@ lockfile-compatible bumps are not — they ride whatever release ships next.
   `Cargo.lock` merge conflicts, doubled CI, and staging ambiguity a parallel
   trunk costs. Exception: a coupled multi-batch migration that cannot land
   green per batch may use a short-lived integration branch, deleted after
-  its merge.
+  its merge. The same bounded exception covers the **cross-cycle case**:
+  dependency work for the *next* cycle that starts while the current final
+  is not yet promoted (`develop` still accumulates `X.Y.Z`) collects on a
+  `deps/X.Y.(Z+1)` integration branch off `develop` and merges into
+  `develop` right after the promotion — the deps stay honestly versioned in
+  their own cycle instead of folding into the in-flight release line. Such
+  a branch is short-lived by construction (it exists only for the promotion
+  gap) and is deleted after its merge.
 
 ## Alpha pre-release — `vX.Y.Z-alpha.N` (pushed, throwaway `test/*` branch)
 
