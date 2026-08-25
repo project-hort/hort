@@ -104,10 +104,76 @@
 
 use bytes::Bytes;
 use hort_app::use_cases::index_serve::{
-    BuildContext, IndexBuilder, PerVersionPayload, VersionEntry,
+    BuildContext, IndexBuilder, PerVersionPayload, VersionEntry, VersionOrdering,
 };
 
 pub use hort_app::use_cases::index_serve::NpmVersionPayload;
+
+/// Resolve `dist-tags.latest` over a **post-filter served** set: the
+/// max non-prerelease version per `ordering`, falling back to the
+/// unfiltered max only when every served entry is a prerelease.
+/// `None` for an empty served set — the wire-equivalent of "nothing
+/// servable" (no `dist-tags` block in the packument, 404 on the
+/// abbreviated per-version `latest` route).
+///
+/// This is the single definition of the npm ecosystem's "a pre-release
+/// never wins `latest` while a release is served" contract
+/// (see the module docs above); [`NpmIndexBuilder::build`] and the
+/// abbreviated per-version/tag route (`hort-http-npm::serve`) both
+/// call it so the invariant cannot drift between the two callers.
+pub fn resolve_served_latest<'a>(
+    entries: &'a [VersionEntry],
+    ordering: &dyn VersionOrdering,
+) -> Option<&'a str> {
+    entries
+        .iter()
+        .map(|e| e.version.as_str())
+        .filter(|v| !ordering.is_prerelease(v))
+        .max_by(|a, b| ordering.compare(a, b))
+        .or_else(|| {
+            entries
+                .iter()
+                .map(|e| e.version.as_str())
+                .max_by(|a, b| ordering.compare(a, b))
+        })
+}
+
+/// Compose the per-version JSON object (`{name, version, dist}`) shared
+/// by the full packument builder and the abbreviated per-version route.
+/// `None` for a non-`Npm` payload (cross-format mis-tag — see
+/// [`NpmIndexBuilder::build`]'s panics section).
+pub fn version_entry_json(base_url: &str, entry: &VersionEntry) -> Option<serde_json::Value> {
+    let PerVersionPayload::Npm(payload) = &entry.payload else {
+        return None;
+    };
+
+    let tarball_url = format!(
+        "{base_url}/{name}/-/{basename}",
+        name = payload.name_as_published,
+        basename = payload.tarball_basename,
+    );
+    let mut dist = serde_json::Map::new();
+    dist.insert(
+        "tarball".to_string(),
+        serde_json::Value::String(tarball_url),
+    );
+    dist.insert(
+        "shasum".to_string(),
+        serde_json::Value::String(payload.shasum.clone()),
+    );
+    if let Some(sri) = payload.integrity.as_ref() {
+        dist.insert(
+            "integrity".to_string(),
+            serde_json::Value::String(sri.clone()),
+        );
+    }
+
+    Some(serde_json::json!({
+        "name":    payload.name_as_published,
+        "version": entry.version,
+        "dist":    dist,
+    }))
+}
 
 /// npm `IndexBuilder` — emits the packument JSON from a post-filter
 /// `Vec<VersionEntry>`.
@@ -140,17 +206,7 @@ impl IndexBuilder for NpmIndexBuilder {
         // the served set is all-prerelease (still non-empty). An empty
         // served set produces no `dist-tags` block (the wire-equivalent
         // of "no servable latest").
-        let latest: Option<&str> = entries
-            .iter()
-            .map(|e| e.version.as_str())
-            .filter(|v| !ctx.ordering.is_prerelease(v))
-            .max_by(|a, b| ctx.ordering.compare(a, b))
-            .or_else(|| {
-                entries
-                    .iter()
-                    .map(|e| e.version.as_str())
-                    .max_by(|a, b| ctx.ordering.compare(a, b))
-            });
+        let latest: Option<&str> = resolve_served_latest(&entries, ctx.ordering);
 
         let mut versions = serde_json::Map::new();
         for entry in &entries {
@@ -159,50 +215,18 @@ impl IndexBuilder for NpmIndexBuilder {
             // enforced at the use-case layer not at the builder layer,
             // so the match arm is reachable in principle. Skip with a
             // structured warn (degraded packument, never a panic).
-            let PerVersionPayload::Npm(payload) = &entry.payload else {
-                tracing::warn!(
-                    version = %entry.version,
-                    "npm packument builder: skipping VersionEntry with non-Npm payload \
-                     (cross-format mis-tag — should be unreachable)",
-                );
-                continue;
-            };
-
-            // Compose the per-version `dist` object. `integrity` is
-            // included only when the source supplied one (the npm
-            // convention is to omit absent SRI rather than emit
-            // `null`). `shasum` is always emitted (defaults to empty
-            // string when absent, matching `unwrap_or_default`).
-            let tarball_url = format!(
-                "{base_url}/{name}/-/{basename}",
-                base_url = ctx.base_url,
-                name = payload.name_as_published,
-                basename = payload.tarball_basename,
-            );
-            let mut dist = serde_json::Map::new();
-            dist.insert(
-                "tarball".to_string(),
-                serde_json::Value::String(tarball_url),
-            );
-            dist.insert(
-                "shasum".to_string(),
-                serde_json::Value::String(payload.shasum.clone()),
-            );
-            if let Some(sri) = payload.integrity.as_ref() {
-                dist.insert(
-                    "integrity".to_string(),
-                    serde_json::Value::String(sri.clone()),
-                );
+            match version_entry_json(ctx.base_url, entry) {
+                Some(v) => {
+                    versions.insert(entry.version.clone(), v);
+                }
+                None => {
+                    tracing::warn!(
+                        version = %entry.version,
+                        "npm packument builder: skipping VersionEntry with non-Npm payload \
+                         (cross-format mis-tag — should be unreachable)",
+                    );
+                }
             }
-
-            versions.insert(
-                entry.version.clone(),
-                serde_json::json!({
-                    "name":    payload.name_as_published,
-                    "version": entry.version,
-                    "dist":    dist,
-                }),
-            );
         }
 
         let mut packument = serde_json::Map::new();
@@ -530,5 +554,46 @@ mod tests {
                 .unwrap(),
             "https://r.example/npm/m/legacy-name/-/legacy-name-1.0.0.tgz"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `resolve_served_latest` — direct unit tests for the extracted
+    // helper (the builder's `dist-tags.latest` derivation, and the
+    // abbreviated per-version route's `latest` resolution, both call
+    // this one definition).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_served_latest_release_mix_excludes_prerelease() {
+        let entries = vec![
+            entry("1.2.8", payload("p", "p-1.2.8.tgz", None, "a")),
+            entry(
+                "1.3.0-canary.0",
+                payload("p", "p-1.3.0-canary.0.tgz", None, "b"),
+            ),
+        ];
+        assert_eq!(
+            resolve_served_latest(&entries, &NpmSemverOrdering),
+            Some("1.2.8"),
+            "a prerelease must never win latest while a release is served"
+        );
+    }
+
+    #[test]
+    fn resolve_served_latest_all_prerelease_falls_back_to_prerelease_max() {
+        let entries = vec![
+            entry("1.0.0-alpha.1", payload("p", "p-a1.tgz", None, "a")),
+            entry("1.0.0-alpha.2", payload("p", "p-a2.tgz", None, "b")),
+        ];
+        assert_eq!(
+            resolve_served_latest(&entries, &NpmSemverOrdering),
+            Some("1.0.0-alpha.2"),
+            "an all-prerelease served set still resolves a usable latest"
+        );
+    }
+
+    #[test]
+    fn resolve_served_latest_empty_set_is_none() {
+        assert_eq!(resolve_served_latest(&[], &NpmSemverOrdering), None);
     }
 }

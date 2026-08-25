@@ -71,40 +71,45 @@ use hort_app::use_cases::index_serve::{BuildContext, IndexFilter, VersionEntry};
 use hort_app::use_cases::index_serve_filter::NpmSemverOrdering;
 use hort_app::use_cases::repository_access::AccessLevel;
 use hort_domain::entities::caller::CallerPrincipal;
-use hort_domain::entities::repository::{Repository, RepositoryType};
+use hort_domain::entities::repository::{IndexMode, Repository, RepositoryType};
 use hort_formats::index_serve::IndexBuilder;
-use hort_formats::npm::index::NpmIndexBuilder;
+use hort_formats::npm::index::{resolve_served_latest, version_entry_json, NpmIndexBuilder};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
 use hort_http_core::middleware::trust::RequestTrust;
 
 use crate::index_source::{select_source, IndexSourceOutput};
 
-/// Unified npm packument serve — the npm-side of the Source →
-/// Filter → Builder pipeline.
-///
-/// `caller` is threaded through the source layer; both hosted and
-/// proxy sources call `RepositoryAccessUseCase::resolve(_, caller,
-/// Read)` (directly or via `list_by_raw_name_visible`), so denied /
-/// invisible / missing repos all collapse to a 404
-/// `Repository NotFound` envelope before any rows / upstream bytes
-/// are surfaced.
-///
-/// On success returns a 200 `application/json` response carrying the
-/// packument bytes; on truncation, the same response gains a
-/// `Warning: 299 - "results truncated at <cap> items"` header
-/// (see `hort_domain::types::LIMIT_LIST_MAX_ITEMS`).
+/// Output of the shared Source → Filter step: a post-filter served set
+/// plus everything both `serve_packument_unified` (full packument) and
+/// `serve_npm_version_unified` (abbreviated per-version/tag route) need
+/// to render their response. One definition of the filter pipeline —
+/// a held / quarantined / non-servable version is absent from both
+/// callers' resolution input.
+struct ResolvedIndex {
+    filtered: Vec<VersionEntry>,
+    canonical_name: String,
+    base_str: String,
+    truncated: bool,
+    index_mode: IndexMode,
+}
+
+/// Resolve the repo, run the Source → Filter pipeline (`NonServableStatusFilter`
+/// then `IndexModeFilter`), and return the post-filter served set. Shared by
+/// [`serve_packument_unified`] and [`serve_npm_version_unified`] — see the
+/// module docs' anti-enumeration and `dist-tags.latest` sections, which both
+/// callers inherit unchanged.
 #[tracing::instrument(
     skip(ctx, trust, caller),
     fields(repo_key = %repo_key, pkg = %pkg_name),
 )]
-pub(crate) async fn serve_packument_unified(
+async fn resolve_served_versions(
     ctx: &Arc<AppContext>,
     repo_key: &str,
     pkg_name: &str,
     trust: &RequestTrust,
     caller: Option<&CallerPrincipal>,
-) -> Result<Response, ApiError> {
+) -> Result<ResolvedIndex, ApiError> {
     // ---- Resolve the repo + access check -----------------------------
     // Anti-enumeration: anonymous on private collapses to
     // `NotFound { entity: "Repository" }`
@@ -198,22 +203,58 @@ pub(crate) async fn serve_packument_unified(
         "npm unified packument serve completed",
     );
 
-    // ---- Step 3: Build the wire bytes --------------------------------
+    Ok(ResolvedIndex {
+        filtered,
+        canonical_name: output.canonical_name,
+        base_str,
+        truncated: output.truncated,
+        index_mode: repo.index_mode,
+    })
+}
+
+/// Unified npm packument serve — the npm-side of the Source →
+/// Filter → Builder pipeline.
+///
+/// `caller` is threaded through the source layer; both hosted and
+/// proxy sources call `RepositoryAccessUseCase::resolve(_, caller,
+/// Read)` (directly or via `list_by_raw_name_visible`), so denied /
+/// invisible / missing repos all collapse to a 404
+/// `Repository NotFound` envelope before any rows / upstream bytes
+/// are surfaced.
+///
+/// On success returns a 200 `application/json` response carrying the
+/// packument bytes; on truncation, the same response gains a
+/// `Warning: 299 - "results truncated at <cap> items"` header
+/// (see `hort_domain::types::LIMIT_LIST_MAX_ITEMS`).
+#[tracing::instrument(
+    skip(ctx, trust, caller),
+    fields(repo_key = %repo_key, pkg = %pkg_name),
+)]
+pub(crate) async fn serve_packument_unified(
+    ctx: &Arc<AppContext>,
+    repo_key: &str,
+    pkg_name: &str,
+    trust: &RequestTrust,
+    caller: Option<&CallerPrincipal>,
+) -> Result<Response, ApiError> {
+    let resolved = resolve_served_versions(ctx, repo_key, pkg_name, trust, caller).await?;
+
+    // ---- Build the wire bytes -----------------------------------------
     let builder = NpmIndexBuilder;
     let body_bytes = builder.build(
         BuildContext {
-            package_name: &output.canonical_name,
-            base_url: &base_str,
-            index_mode: repo.index_mode,
+            package_name: &resolved.canonical_name,
+            base_url: &resolved.base_str,
+            index_mode: resolved.index_mode,
             ordering: &NpmSemverOrdering,
         },
-        filtered,
+        resolved.filtered,
     );
 
     let mut builder_resp = Response::builder()
         .status(StatusCode::OK)
         .header(CONTENT_TYPE, "application/json");
-    if output.truncated {
+    if resolved.truncated {
         builder_resp = builder_resp.header(
             "Warning",
             format!(
@@ -223,6 +264,68 @@ pub(crate) async fn serve_packument_unified(
         );
     }
     Ok(builder_resp.body(Body::from(body_bytes)).unwrap())
+}
+
+/// Unified npm abbreviated per-version / dist-tag serve — the
+/// npm-side of the same Source → Filter pipeline
+/// [`serve_packument_unified`] uses, resolved down to a single
+/// version instead of built into a full packument.
+///
+/// `{version_or_tag}` resolution, over the filtered served entries:
+/// - an exact version-string match → that entry;
+/// - the literal `"latest"` → [`resolve_served_latest`] (the same
+///   `dist-tags.latest` derivation the packument builder uses — one
+///   definition, see that function's docs);
+/// - anything else → `None`, which this function turns into the same
+///   anti-enumeration `Artifact NotFound` envelope
+///   [`serve_packument_unified`] uses for an unknown package. Unknown
+///   version, held version, unknown package, and invisible repo are
+///   therefore indistinguishable on the wire.
+///
+/// On a match, the response body is exactly the per-version object the
+/// packument serves (`{name, version, dist: {tarball, shasum,
+/// integrity?}}`), composed by the same [`version_entry_json`] the
+/// builder calls — never a second URL-construction site.
+pub(crate) async fn serve_npm_version_unified(
+    ctx: &Arc<AppContext>,
+    repo_key: &str,
+    pkg_name: &str,
+    version_or_tag: &str,
+    trust: &RequestTrust,
+    caller: Option<&CallerPrincipal>,
+) -> Result<Response, ApiError> {
+    let resolved = resolve_served_versions(ctx, repo_key, pkg_name, trust, caller).await?;
+
+    let entry = if version_or_tag == "latest" {
+        resolve_served_latest(&resolved.filtered, &NpmSemverOrdering)
+            .and_then(|latest| resolved.filtered.iter().find(|e| e.version == latest))
+    } else {
+        resolved
+            .filtered
+            .iter()
+            .find(|e| e.version == version_or_tag)
+    };
+
+    let body = entry.and_then(|e| version_entry_json(&resolved.base_str, e));
+
+    let Some(body) = body else {
+        // Unknown version / tag, or a version whose only entry carried a
+        // non-Npm payload (unreachable in practice — see
+        // `version_entry_json`) — same anti-enumeration envelope as an
+        // unknown package.
+        return Err(ApiError::from(AppError::Domain(
+            hort_domain::error::DomainError::NotFound {
+                entity: "Artifact",
+                id: pkg_name.to_string(),
+            },
+        )));
+    };
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap())
 }
 
 /// Map an [`AppError`] coming out of [`ProxyNpmSource::fetch`] to an
@@ -1022,6 +1125,91 @@ mod tests {
         assert!(
             !tarball.contains("/drift-pkg/"),
             "tarball URL must NOT re-normalise the request parameter: {tarball}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Abbreviated per-version / dist-tag route —
+    // `serve_npm_version_unified` handler-level coverage. Router-level
+    // dispatch (`GET /{repo}/{pkg}/{version}` etc.) is pinned in
+    // `lib.rs::tests`; these drive the shared `resolve_served_versions`
+    // pipeline directly to pin the filter-leak and `latest` invariants.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn quarantined_version_404s_through_per_version_route() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.1.0",
+            "pkg-1.1.0.tgz",
+            "bbb",
+            QuarantineStatus::Quarantined,
+        );
+
+        let trust = trust_for_tests();
+        let res = serve_npm_version_unified(&ctx, "npm-test", "pkg", "1.0.0", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("released version must serve"));
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let err = serve_npm_version_unified(&ctx, "npm-test", "pkg", "1.1.0", &trust, None)
+            .await
+            .expect_err("a quarantined version MUST 404 through the per-version route, never leak");
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn version_route_latest_excludes_served_prerelease() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.1.0-canary.0",
+            "pkg-1.1.0-canary.0.tgz",
+            "bbb",
+            QuarantineStatus::Released,
+        );
+
+        let trust = trust_for_tests();
+        let res = serve_npm_version_unified(&ctx, "npm-test", "pkg", "latest", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("latest resolution must succeed"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["version"].as_str().unwrap(),
+            "1.0.0",
+            "a prerelease must never resolve as latest via the per-version route \
+             while a release is served, even though it is semver-greater"
         );
     }
 }
