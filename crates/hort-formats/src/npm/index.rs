@@ -34,15 +34,25 @@
 //!     },
 //!     ...
 //!   },
-//!   "dist-tags": { "latest": "<served-max>" }   // omitted when entries is empty
+//!   // The served tag map (stored map ∩ served set) plus the derived
+//!   // `latest` fallback. Omitted entirely when `entries` is empty.
+//!   "dist-tags": { "latest": "1.2.3", "next": "2.0.0-rc.1" }
 //! }
 //! ```
 //!
-//! # `dist-tags.latest` invariant
+//! # `dist-tags` invariant
 //!
-//! `dist-tags.latest` must point at the **resolved-latest of the
-//! served set, excluding pre-releases** — i.e. the max over `entries`
-//! per [`BuildContext::ordering`] whose
+//! The map the builder emits is the **stored** tag map — upstream's for
+//! a proxy repo, the maintainer's `mutable_refs` rows for a hosted one —
+//! already intersected with the served set by [`intersect_dist_tags`].
+//! A tag whose target version is not served is dropped, never rewritten.
+//! Tags are otherwise emitted verbatim: hort is not their author.
+//!
+//! `latest` is the one tag the builder will synthesise, and only when
+//! the served map has none (the stored `latest` was dropped by the
+//! intersection, or was never set). Then it points at the
+//! **resolved-latest of the served set, excluding pre-releases** —
+//! i.e. the max over `entries` per [`BuildContext::ordering`] whose
 //! [`VersionOrdering::is_prerelease`](hort_app::use_cases::index_serve_filter::VersionOrdering::is_prerelease)
 //! is `false`, computed *after* the filter pipeline. This mirrors the
 //! npm ecosystem contract: a pre-release is never `latest` while any
@@ -101,12 +111,48 @@
 //! Anti-enumeration tests live in `hort-http-npm/src/serve.rs`
 //! (the unified handler is the anti-enumeration assertion site).
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use hort_app::use_cases::index_serve::{
     BuildContext, IndexBuilder, PerVersionPayload, VersionEntry, VersionOrdering,
 };
 
 pub use hort_app::use_cases::index_serve::NpmVersionPayload;
+
+/// Intersect a stored `dist-tags` map with the **post-filter served
+/// set**: a tag whose target version is not served is DROPPED, never
+/// rewritten to something that is.
+///
+/// This is the whole of the pass-through contract's safety property. The
+/// stored map is authored elsewhere — upstream for a proxy repo, the
+/// maintainer's `mutable_refs` rows for a hosted one — and neither
+/// author knows what hort will serve. Rewriting a dropped tag to a
+/// nearby served version would silently hand a client a different
+/// artifact than the tag names; dropping it makes the tag absent, which
+/// every npm client already handles.
+///
+/// `latest` is NOT special here: this function is pure intersection.
+/// The "dropped or absent `latest` falls back to
+/// [`resolve_served_latest`]" half of the contract lives at the two
+/// emission sites ([`NpmIndexBuilder::build`] and the abbreviated
+/// per-version/tag route), so the derivation keeps exactly one
+/// definition.
+pub fn intersect_dist_tags(
+    stored: &BTreeMap<String, String>,
+    entries: &[VersionEntry],
+) -> BTreeMap<String, String> {
+    if stored.is_empty() {
+        return BTreeMap::new();
+    }
+    let served: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.version.as_str()).collect();
+    stored
+        .iter()
+        .filter(|(_, version)| served.contains(version.as_str()))
+        .map(|(tag, version)| (tag.clone(), version.clone()))
+        .collect()
+}
 
 /// Resolve `dist-tags.latest` over a **post-filter served** set: the
 /// max non-prerelease version per `ordering`, falling back to the
@@ -189,9 +235,20 @@ pub fn version_entry_json(base_url: &str, entry: &VersionEntry) -> Option<serde_
 /// npm `IndexBuilder` — emits the packument JSON from a post-filter
 /// `Vec<VersionEntry>`.
 ///
-/// Stateless; the per-format serve handler constructs an instance per
-/// request (cheap — it's a unit struct). The Item-1 [`IndexBuilder`]
-/// trait contract is "stateless wire-shape emitter"; this matches.
+/// Carries the request's **served** `dist-tags` map — the stored map
+/// already intersected with the served set by [`intersect_dist_tags`].
+/// The per-format serve handler constructs one instance per request, so
+/// the builder holds no state across requests; the map is per-call input
+/// that is not per-version, exactly like [`BuildContext`]'s fields. It
+/// lives on the builder rather than on `BuildContext` because
+/// `BuildContext` is the format-agnostic seam every builder shares
+/// (PyPI, Cargo, Maven), and a tag map is npm's own entity — putting it
+/// there would make three other formats carry a field they can only pass
+/// empty.
+///
+/// [`Self::default()`] builds with no stored tags, which is the
+/// pre-pass-through behaviour: `dist-tags.latest` is derived from the
+/// served set alone.
 ///
 /// # Panics
 ///
@@ -205,19 +262,45 @@ pub fn version_entry_json(base_url: &str, entry: &VersionEntry) -> Option<serde_
 /// is unreachable on the production hot path. Pinning it behind a
 /// warn rather than a `panic!` keeps the serve-time error mode the
 /// same as `rewrite_packument`'s parse-failure passthrough.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NpmIndexBuilder;
+#[derive(Debug, Default, Clone)]
+pub struct NpmIndexBuilder {
+    /// Served `dist-tags` — the stored map ∩ the served set. Emitted
+    /// verbatim; the only value this builder ever synthesises is the
+    /// `latest` fallback below.
+    dist_tags: BTreeMap<String, String>,
+}
+
+impl NpmIndexBuilder {
+    /// Build with an already-intersected tag map (see
+    /// [`intersect_dist_tags`]). Entries are emitted verbatim.
+    pub fn new(dist_tags: BTreeMap<String, String>) -> Self {
+        Self { dist_tags }
+    }
+}
 
 impl IndexBuilder for NpmIndexBuilder {
     fn build(&self, ctx: BuildContext<'_>, entries: Vec<VersionEntry>) -> Bytes {
-        // Pre-compute the served-max over the post-filter entries.
-        // `dist-tags.latest` points here. A pre-release never wins
-        // while a release is served: take the max over non-prerelease
-        // entries first, falling back to the unfiltered max only when
-        // the served set is all-prerelease (still non-empty). An empty
-        // served set produces no `dist-tags` block (the wire-equivalent
-        // of "no servable latest").
-        let latest: Option<&str> = resolve_served_latest(&entries, ctx.ordering);
+        // `latest` fallback: the served tag map wins verbatim when it
+        // carries one (the maintainer's / upstream's choice survived the
+        // intersection). Only a dropped or absent `latest` is derived —
+        // the max over non-prerelease entries, falling back to the
+        // unfiltered max when the served set is all-prerelease. An empty
+        // served set produces no `dist-tags` block at all (the
+        // wire-equivalent of "no servable latest").
+        let mut dist_tags = if entries.is_empty() {
+            // Nothing servable → no tags at all, whatever was stored. In
+            // production the intersection has already emptied the map;
+            // the guard is here so the "no dist-tags block for an empty
+            // served set" invariant holds at the emission site itself.
+            BTreeMap::new()
+        } else {
+            self.dist_tags.clone()
+        };
+        if !entries.is_empty() && !dist_tags.contains_key("latest") {
+            if let Some(derived) = resolve_served_latest(&entries, ctx.ordering) {
+                dist_tags.insert("latest".to_string(), derived.to_string());
+            }
+        }
 
         let mut versions = serde_json::Map::new();
         for entry in &entries {
@@ -246,19 +329,15 @@ impl IndexBuilder for NpmIndexBuilder {
             serde_json::Value::String(ctx.package_name.to_string()),
         );
         packument.insert("versions".to_string(), serde_json::Value::Object(versions));
-        // Empty entries → no `dist-tags` block. Mirrors the
-        // Wire-shape for "nothing servable": no dist-tags block. The
-        // client falls back to lockfile-or-error.
-        if let Some(v) = latest {
-            let mut dist_tags = serde_json::Map::new();
-            dist_tags.insert(
-                "latest".to_string(),
-                serde_json::Value::String(v.to_string()),
-            );
-            packument.insert(
-                "dist-tags".to_string(),
-                serde_json::Value::Object(dist_tags),
-            );
+        // Empty served set → empty tag map → no `dist-tags` block at
+        // all. Wire-shape for "nothing servable"; the client falls back
+        // to lockfile-or-error.
+        if !dist_tags.is_empty() {
+            let wire: serde_json::Map<String, serde_json::Value> = dist_tags
+                .into_iter()
+                .map(|(tag, version)| (tag, serde_json::Value::String(version)))
+                .collect();
+            packument.insert("dist-tags".to_string(), serde_json::Value::Object(wire));
         }
 
         // `serde_json::to_vec` on a `serde_json::Map` is infallible
@@ -307,7 +386,16 @@ mod tests {
     }
 
     fn build(entries: Vec<VersionEntry>, package: &str, base: &str) -> serde_json::Value {
-        let bytes = NpmIndexBuilder.build(
+        build_with_tags(entries, package, base, BTreeMap::new())
+    }
+
+    fn build_with_tags(
+        entries: Vec<VersionEntry>,
+        package: &str,
+        base: &str,
+        dist_tags: BTreeMap<String, String>,
+    ) -> serde_json::Value {
+        let bytes = NpmIndexBuilder::new(dist_tags).build(
             BuildContext {
                 package_name: package,
                 base_url: base,
@@ -662,5 +750,164 @@ mod tests {
     #[test]
     fn resolve_served_latest_empty_set_is_none() {
         assert_eq!(resolve_served_latest(&[], &NpmSemverOrdering), None);
+    }
+
+    // -----------------------------------------------------------------
+    // dist-tags pass-through: the served map is emitted verbatim, and
+    // `latest` is the only tag the builder will ever synthesise.
+    // -----------------------------------------------------------------
+
+    fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(t, v)| (t.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn three_version_entries() -> Vec<VersionEntry> {
+        vec![
+            entry("1.2.3", payload("p", "p-1.2.3.tgz", None, "a")),
+            entry("2.0.0-rc.1", payload("p", "p-2.0.0-rc.1.tgz", None, "b")),
+            entry(
+                "2.0.0-beta.4",
+                payload("p", "p-2.0.0-beta.4.tgz", None, "c"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn served_tag_map_is_emitted_verbatim() {
+        let json = build_with_tags(
+            three_version_entries(),
+            "p",
+            "https://r.example/npm/m",
+            tags(&[
+                ("latest", "1.2.3"),
+                ("next", "2.0.0-rc.1"),
+                ("beta", "2.0.0-beta.4"),
+            ]),
+        );
+        assert_eq!(
+            json["dist-tags"],
+            serde_json::json!({
+                "latest": "1.2.3",
+                "next": "2.0.0-rc.1",
+                "beta": "2.0.0-beta.4",
+            }),
+            "every served tag reaches the wire unaltered"
+        );
+    }
+
+    #[test]
+    fn stored_latest_beats_the_derivation() {
+        // The maintainer / upstream pinned `latest` at an older release.
+        // That is a deliberate choice, not something to second-guess:
+        // the derivation is a fallback, never an override.
+        let json = build_with_tags(
+            vec![
+                entry("1.0.0", payload("p", "p-1.0.0.tgz", None, "a")),
+                entry("2.0.0", payload("p", "p-2.0.0.tgz", None, "b")),
+            ],
+            "p",
+            "https://r.example/npm/m",
+            tags(&[("latest", "1.0.0")]),
+        );
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.0.0",
+            "a served `latest` is verbatim; the semver-max derivation must not override it"
+        );
+    }
+
+    #[test]
+    fn absent_latest_is_derived_while_other_tags_stay_verbatim() {
+        // The intersection dropped `latest` (or the maintainer never set
+        // one). `latest` derives; `next` still passes through.
+        let json = build_with_tags(
+            three_version_entries(),
+            "p",
+            "https://r.example/npm/m",
+            tags(&[("next", "2.0.0-rc.1")]),
+        );
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.2.3",
+            "absent latest falls back to the served-set derivation"
+        );
+        assert_eq!(json["dist-tags"]["next"].as_str().unwrap(), "2.0.0-rc.1");
+    }
+
+    #[test]
+    fn empty_served_set_emits_no_dist_tags_even_with_stored_tags() {
+        // Nothing servable → no `dist-tags` block, whatever the stored
+        // map said. (In production the intersection has already emptied
+        // it; this pins the builder's own guard.)
+        let json = build_with_tags(
+            Vec::new(),
+            "p",
+            "https://r.example/npm/m",
+            tags(&[("latest", "1.0.0")]),
+        );
+        assert!(
+            json.get("dist-tags").is_none(),
+            "an empty served set must never emit a dist-tags block"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `intersect_dist_tags` — the drop-never-rewrite contract.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn intersect_keeps_only_tags_whose_target_is_served() {
+        let entries = vec![
+            entry("1.2.3", payload("p", "p-1.2.3.tgz", None, "a")),
+            entry("2.0.0-rc.1", payload("p", "p-2.0.0-rc.1.tgz", None, "b")),
+        ];
+        let out = intersect_dist_tags(
+            &tags(&[
+                ("latest", "1.2.3"),
+                ("next", "2.0.0-rc.1"),
+                // 9.9.9 is quarantined / never ingested → not served.
+                ("canary", "9.9.9"),
+            ]),
+            &entries,
+        );
+        assert_eq!(out, tags(&[("latest", "1.2.3"), ("next", "2.0.0-rc.1")]));
+        assert!(
+            !out.contains_key("canary"),
+            "a tag pointing at a non-served version is dropped, never rewritten"
+        );
+    }
+
+    #[test]
+    fn intersect_drops_latest_when_its_target_is_not_served() {
+        let entries = vec![entry("1.0.0", payload("p", "p-1.0.0.tgz", None, "a"))];
+        let out = intersect_dist_tags(&tags(&[("latest", "9.9.9")]), &entries);
+        assert!(
+            out.is_empty(),
+            "latest gets no special treatment in the intersection itself"
+        );
+    }
+
+    #[test]
+    fn intersect_of_empty_inputs_is_empty() {
+        let entries = vec![entry("1.0.0", payload("p", "p-1.0.0.tgz", None, "a"))];
+        assert!(intersect_dist_tags(&BTreeMap::new(), &entries).is_empty());
+        assert!(intersect_dist_tags(&tags(&[("latest", "1.0.0")]), &[]).is_empty());
+    }
+
+    #[test]
+    fn intersect_is_identity_under_a_null_gate() {
+        // The transparency property: when nothing is filtered out, the
+        // intersection degrades to identity and hort serves upstream's
+        // map verbatim.
+        let entries = three_version_entries();
+        let upstream = tags(&[
+            ("latest", "1.2.3"),
+            ("next", "2.0.0-rc.1"),
+            ("beta", "2.0.0-beta.4"),
+        ]);
+        assert_eq!(intersect_dist_tags(&upstream, &entries), upstream);
     }
 }

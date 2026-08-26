@@ -58,6 +58,7 @@
 //!   triple. `index_source` is a tracing field only; no metric exists
 //!   for it (operators dashboard from the tracing field).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -73,7 +74,9 @@ use hort_app::use_cases::repository_access::AccessLevel;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{IndexMode, Repository, RepositoryType};
 use hort_formats::index_serve::IndexBuilder;
-use hort_formats::npm::index::{resolve_served_latest, version_entry_json, NpmIndexBuilder};
+use hort_formats::npm::index::{
+    intersect_dist_tags, resolve_served_latest, version_entry_json, NpmIndexBuilder,
+};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
 use hort_http_core::middleware::trust::RequestTrust;
@@ -88,6 +91,15 @@ use crate::index_source::{select_source, IndexSourceOutput};
 /// callers' resolution input.
 struct ResolvedIndex {
     filtered: Vec<VersionEntry>,
+    /// Served `dist-tags` — the source's stored map already intersected
+    /// with `filtered`. Computed once here so the packument builder and
+    /// the per-version/tag route resolve tags through the same map
+    /// rather than two intersections that could drift.
+    ///
+    /// A dropped `latest` is NOT back-filled here: the derivation
+    /// fallback stays at the two emission sites, which both call the
+    /// single `resolve_served_latest` definition.
+    dist_tags: BTreeMap<String, String>,
     canonical_name: String,
     base_str: String,
     truncated: bool,
@@ -180,6 +192,14 @@ async fn resolve_served_versions(
     let served_count = filtered.len();
     let filtered_count = upstream_count.saturating_sub(served_count);
 
+    // ---- Step 2b: dist-tags ∩ served set -----------------------------
+    // A tag whose target version did not survive the filters is dropped.
+    // This is what keeps "never advertise what we won't serve" true for
+    // the tag map as well as `versions{}` — a held or quarantined
+    // version can never be reached through a tag.
+    let dist_tags = intersect_dist_tags(&output.dist_tags, &filtered);
+    let dropped_tags = output.dist_tags.len().saturating_sub(dist_tags.len());
+
     // Emit the per-call filter metric once, summed across the filters
     // that fired (universal + mode arms). The catalog axis stays
     // `{format, repository}`.
@@ -200,11 +220,14 @@ async fn resolve_served_versions(
         upstream_versions = upstream_count,
         served_versions = served_count,
         filtered_versions = filtered_count,
+        served_dist_tags = dist_tags.len(),
+        dropped_dist_tags = dropped_tags,
         "npm unified packument serve completed",
     );
 
     Ok(ResolvedIndex {
         filtered,
+        dist_tags,
         canonical_name: output.canonical_name,
         base_str,
         truncated: output.truncated,
@@ -240,7 +263,7 @@ pub(crate) async fn serve_packument_unified(
     let resolved = resolve_served_versions(ctx, repo_key, pkg_name, trust, caller).await?;
 
     // ---- Build the wire bytes -----------------------------------------
-    let builder = NpmIndexBuilder;
+    let builder = NpmIndexBuilder::new(resolved.dist_tags);
     let body_bytes = builder.build(
         BuildContext {
             package_name: &resolved.canonical_name,
@@ -271,16 +294,24 @@ pub(crate) async fn serve_packument_unified(
 /// [`serve_packument_unified`] uses, resolved down to a single
 /// version instead of built into a full packument.
 ///
-/// `{version_or_tag}` resolution, over the filtered served entries:
-/// - an exact version-string match → that entry;
-/// - the literal `"latest"` → [`resolve_served_latest`] (the same
-///   `dist-tags.latest` derivation the packument builder uses — one
-///   definition, see that function's docs);
+/// `{version_or_tag}` resolution, over the filtered served entries, in
+/// this precedence:
+/// - an exact version-string match → that entry. First, so a served
+///   version is always reachable by its own version string even if some
+///   tag happens to share its spelling;
+/// - a tag in the **served** `dist-tags` map (the source's stored map ∩
+///   the served set — the same map the packument emits, resolved once in
+///   [`resolve_served_versions`]) → that tag's target entry. This is
+///   what makes `GET /npm/{repo}/{pkg}/next` resolve;
+/// - the literal `"latest"` when the served map carries no `latest` →
+///   [`resolve_served_latest`] (the same derivation fallback the
+///   packument builder applies — one definition, see that function's
+///   docs). No other tag has a fallback: present or absent;
 /// - anything else → `None`, which this function turns into the same
 ///   anti-enumeration `Artifact NotFound` envelope
 ///   [`serve_packument_unified`] uses for an unknown package. Unknown
-///   version, held version, unknown package, and invisible repo are
-///   therefore indistinguishable on the wire.
+///   tag, unknown version, held version, unknown package, and invisible
+///   repo are therefore indistinguishable on the wire.
 ///
 /// On a match, the response body is exactly the per-version object the
 /// packument serves (`{name, version, dist: {tarball, shasum,
@@ -296,15 +327,21 @@ pub(crate) async fn serve_npm_version_unified(
 ) -> Result<Response, ApiError> {
     let resolved = resolve_served_versions(ctx, repo_key, pkg_name, trust, caller).await?;
 
-    let entry = if version_or_tag == "latest" {
-        resolve_served_latest(&resolved.filtered, &NpmSemverOrdering)
-            .and_then(|latest| resolved.filtered.iter().find(|e| e.version == latest))
-    } else {
-        resolved
-            .filtered
-            .iter()
-            .find(|e| e.version == version_or_tag)
-    };
+    let find = |version: &str| resolved.filtered.iter().find(|e| e.version == version);
+    let entry = find(version_or_tag)
+        .or_else(|| {
+            resolved
+                .dist_tags
+                .get(version_or_tag)
+                .and_then(|target| find(target))
+        })
+        .or_else(|| {
+            if version_or_tag == "latest" {
+                resolve_served_latest(&resolved.filtered, &NpmSemverOrdering).and_then(find)
+            } else {
+                None
+            }
+        });
 
     let body = entry.and_then(|e| version_entry_json(&resolved.base_str, e));
 
@@ -1450,5 +1487,470 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("/npm/npm-mirror/pkg/-/pkg-1.0.0.tgz"));
+    }
+
+    // -----------------------------------------------------------------
+    // dist-tags pass-through (proxy / hosted / virtual).
+    //
+    // The contract under test, in one place:
+    //   1. served map = stored map ∩ served set (drop, never rewrite);
+    //   2. a surviving `latest` is verbatim, a dropped/absent one falls
+    //      back to the served-set derivation;
+    //   3. empty served set → no `dist-tags` block;
+    //   4. the per-version route resolves ANY served tag, and an unknown
+    //      tag is the standard anti-enumeration 404.
+    // -----------------------------------------------------------------
+
+    /// Insert an npm Proxy repo plus the upstream mapping
+    /// `fetch_with_cache` needs to resolve it.
+    fn insert_proxy_repo(
+        mocks: &hort_http_core::test_support::MockPorts,
+        key: &str,
+        mode: IndexMode,
+    ) -> Repository {
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::ports::repository_upstream_mapping_repository::{
+            RepositoryUpstreamMapping, UpstreamAuth,
+        };
+
+        let mut repo = sample_repository();
+        repo.key = key.into();
+        repo.format = RepositoryFormat::Npm;
+        repo.repo_type = RepositoryType::Proxy;
+        repo.upstream_url = Some("https://registry.npmjs.org".into());
+        repo.index_mode = mode;
+        mocks.repositories.insert(repo.clone());
+
+        let now = Utc::now();
+        mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: repo.id,
+            path_prefix: "".into(),
+            upstream_url: "https://registry.npmjs.org".into(),
+            upstream_name_prefix: None,
+            upstream_auth: UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            created_at: now,
+            updated_at: now,
+        });
+        repo
+    }
+
+    /// Upstream packument fixture: three versions plus a `{latest, next,
+    /// beta}` tag map. The version set is deliberately release + two
+    /// prereleases so a derived `latest` (1.2.3) is distinguishable from
+    /// a passed-through one.
+    fn upstream_with_three_tags() -> serde_json::Value {
+        let version = |v: &str| {
+            serde_json::json!({
+                "name": "pkg",
+                "version": v,
+                "dist": {
+                    "tarball": format!("https://registry.npmjs.org/pkg/-/pkg-{v}.tgz"),
+                    "shasum": "abc123",
+                },
+            })
+        };
+        serde_json::json!({
+            "name": "pkg",
+            "dist-tags": {
+                "latest": "1.2.3",
+                "next": "2.0.0-rc.1",
+                "beta": "2.0.0-beta.4",
+            },
+            "versions": {
+                "1.2.3": version("1.2.3"),
+                "2.0.0-rc.1": version("2.0.0-rc.1"),
+                "2.0.0-beta.4": version("2.0.0-beta.4"),
+            },
+        })
+    }
+
+    async fn body_json(res: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// Seed one maintainer dist-tag row for a hosted repo. npm's ref
+    /// shape: namespace = package name, ref_name = tag, target = version.
+    fn insert_dist_tag(
+        mocks: &hort_http_core::test_support::MockPorts,
+        repo_id: Uuid,
+        pkg: &str,
+        tag: &str,
+        version: &str,
+    ) {
+        use hort_domain::entities::mutable_ref::{MutableRef, RefTarget};
+        let now = Utc::now();
+        mocks.refs.insert(MutableRef {
+            id: Uuid::new_v4(),
+            repository_id: repo_id,
+            namespace: pkg.into(),
+            ref_name: tag.into(),
+            target: RefTarget::Version(version.into()),
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    #[tokio::test]
+    async fn proxy_null_gate_serves_upstream_dist_tags_verbatim() {
+        // The transparency row: with nothing filtered out (IncludePending,
+        // no local rows, no held versions) the intersection degrades to
+        // identity and hort's `dist-tags` is upstream's, byte for byte.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        insert_proxy_repo(&mocks, "npm-mirror", IndexMode::IncludePending);
+        let upstream = upstream_with_three_tags();
+        mocks
+            .upstream_proxy
+            .insert_metadata("", "/pkg", serde_json::to_vec(&upstream).unwrap());
+
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-mirror", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("proxy serve must succeed"));
+        let json = body_json(res).await;
+        assert_eq!(
+            serde_json::to_string(&json["dist-tags"]).unwrap(),
+            serde_json::to_string(&upstream["dist-tags"]).unwrap(),
+            "under a null gate hort's dist-tags must be upstream's, byte for byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_null_gate_tag_route_resolves_next() {
+        // `npm install pkg@next` — the per-version route resolves ANY
+        // served tag, not just the literal `latest`.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        insert_proxy_repo(&mocks, "npm-mirror", IndexMode::IncludePending);
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/pkg",
+            serde_json::to_vec(&upstream_with_three_tags()).unwrap(),
+        );
+
+        let trust = trust_for_tests();
+        let res = serve_npm_version_unified(&ctx, "npm-mirror", "pkg", "next", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("tag route must resolve"));
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = body_json(res).await;
+        assert_eq!(json["version"].as_str().unwrap(), "2.0.0-rc.1");
+    }
+
+    #[tokio::test]
+    async fn unknown_tag_is_the_standard_anti_enumeration_404() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        insert_proxy_repo(&mocks, "npm-mirror", IndexMode::IncludePending);
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/pkg",
+            serde_json::to_vec(&upstream_with_three_tags()).unwrap(),
+        );
+
+        let trust = trust_for_tests();
+        let err = serve_npm_version_unified(&ctx, "npm-mirror", "pkg", "canary", &trust, None)
+            .await
+            .expect_err("an unknown tag must 404");
+        assert_eq!(err.into_response().status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn tag_targeting_a_held_version_is_dropped_and_latest_derives() {
+        // 1.2.3 (upstream's `latest`) is quarantined locally and `next`'s
+        // target 2.0.0-rc.1 is rejected. Both tags are DROPPED, never
+        // rewritten to a served version; `latest` then falls back to the
+        // served-set derivation, which can only be the one survivor.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_proxy_repo(&mocks, "npm-mirror", IndexMode::IncludePending);
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/pkg",
+            serde_json::to_vec(&upstream_with_three_tags()).unwrap(),
+        );
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.2.3",
+            "pkg-1.2.3.tgz",
+            "aaa",
+            QuarantineStatus::Quarantined,
+        );
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "2.0.0-rc.1",
+            "pkg-2.0.0-rc.1.tgz",
+            "bbb",
+            QuarantineStatus::Rejected,
+        );
+
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-mirror", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("proxy serve must succeed"));
+        let json = body_json(res).await;
+        let tags = json["dist-tags"].as_object().unwrap();
+        assert!(
+            !tags.contains_key("next"),
+            "a non-latest tag whose target is held is absent — no fallback: {tags:?}"
+        );
+        assert_eq!(
+            tags["beta"].as_str().unwrap(),
+            "2.0.0-beta.4",
+            "the surviving tag still passes through verbatim"
+        );
+        assert_eq!(
+            tags["latest"].as_str().unwrap(),
+            "2.0.0-beta.4",
+            "a dropped latest falls back to the served-set derivation, \
+             NOT to upstream's held 1.2.3"
+        );
+        // And the held versions really are unservable through the tag route.
+        assert!(
+            serve_npm_version_unified(&ctx, "npm-mirror", "pkg", "next", &trust, None)
+                .await
+                .is_err(),
+            "a dropped tag must not resolve on the per-version route"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_maintainer_tags_are_served_and_resolve_on_the_tag_route() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-host", IndexMode::ReleasedOnly);
+        for v in ["1.0.0", "2.0.0-rc.1"] {
+            insert_artifact(
+                &mocks,
+                repo.id,
+                "pkg",
+                v,
+                &format!("pkg-{v}.tgz"),
+                "aaa",
+                QuarantineStatus::Released,
+            );
+        }
+        insert_dist_tag(&mocks, repo.id, "pkg", "latest", "1.0.0");
+        insert_dist_tag(&mocks, repo.id, "pkg", "next", "2.0.0-rc.1");
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-host", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+        assert_eq!(
+            json["dist-tags"],
+            serde_json::json!({"latest": "1.0.0", "next": "2.0.0-rc.1"}),
+            "maintainer-set tags reach the wire from mutable_refs"
+        );
+
+        let res = serve_npm_version_unified(&ctx, "npm-host", "pkg", "next", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("hosted tag route must resolve"));
+        assert_eq!(
+            body_json(res).await["version"].as_str().unwrap(),
+            "2.0.0-rc.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_tag_pointing_at_a_held_version_is_dropped() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-host", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "2.0.0",
+            "pkg-2.0.0.tgz",
+            "bbb",
+            QuarantineStatus::Quarantined,
+        );
+        // The maintainer moved `latest` onto a version that then got held.
+        insert_dist_tag(&mocks, repo.id, "pkg", "latest", "2.0.0");
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-host", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.0.0",
+            "a latest pointing at a held version is dropped and re-derived over \
+             the served set — never served as a pointer to something we refuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_serve_skips_a_hash_targeted_ref_in_the_npm_namespace() {
+        // npm dist-tags name versions. A `RefTarget::ContentHash` row is
+        // another format's data (OCI is the other consumer of this table)
+        // and has no npm wire representation — it must be skipped, not
+        // rendered as a version string.
+        use hort_domain::entities::mutable_ref::{MutableRef, RefTarget};
+
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-host", IndexMode::ReleasedOnly);
+        insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        let now = Utc::now();
+        mocks.refs.insert(MutableRef {
+            id: Uuid::new_v4(),
+            repository_id: repo.id,
+            namespace: "pkg".into(),
+            ref_name: "oci-ish".into(),
+            target: RefTarget::ContentHash("a".repeat(64).parse().unwrap()),
+            created_at: now,
+            updated_at: now,
+        });
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-host", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+        assert_eq!(
+            json["dist-tags"],
+            serde_json::json!({"latest": "1.0.0"}),
+            "the hash-targeted ref is skipped; only the derived latest remains"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_hosted_member_tags_win_and_proxy_tags_are_suppressed() {
+        // Dependency-confusion class, tag dimension: a hosted member owns
+        // the name, so the proxy member is dropped WHOLE — its versions
+        // and its tags. A public `next` can never shadow the internal
+        // package's tags.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let hosted = insert_hosted_repo(&mocks, "npm-host", IndexMode::ReleasedOnly);
+        let proxy = insert_proxy_repo(&mocks, "npm-mirror", IndexMode::IncludePending);
+        insert_artifact(
+            &mocks,
+            hosted.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        insert_artifact(
+            &mocks,
+            hosted.id,
+            "pkg",
+            "1.1.0",
+            "pkg-1.1.0.tgz",
+            "bbb",
+            QuarantineStatus::Released,
+        );
+        insert_dist_tag(&mocks, hosted.id, "pkg", "latest", "1.0.0");
+        insert_dist_tag(&mocks, hosted.id, "pkg", "next", "1.1.0");
+        // The attacker's public copy — never fetched for an owned name.
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/pkg",
+            serde_json::to_vec(&upstream_with_three_tags()).unwrap(),
+        );
+        insert_virtual_repo(&mocks, "npm-virt", &[&hosted, &proxy]);
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-virt", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("virtual serve must succeed")),
+        )
+        .await;
+        assert_eq!(
+            json["dist-tags"],
+            serde_json::json!({"latest": "1.0.0", "next": "1.1.0"}),
+            "only the owning member's tags are served"
+        );
+        let tags = json["dist-tags"].as_object().unwrap();
+        assert!(
+            !tags.contains_key("beta"),
+            "the proxy member's tags are suppressed for an owned name: {tags:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn virtual_unowned_name_serves_the_proxy_members_tags() {
+        // The complement: no non-proxy member owns the name, so the proxy
+        // participates normally and its tag map is served.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let hosted = insert_hosted_repo(&mocks, "npm-host", IndexMode::ReleasedOnly);
+        let proxy = insert_proxy_repo(&mocks, "npm-mirror", IndexMode::IncludePending);
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/pkg",
+            serde_json::to_vec(&upstream_with_three_tags()).unwrap(),
+        );
+        // The virtual's OWN index mode drives the filter pipeline, and a
+        // proxy member's never-ingested versions carry no local status —
+        // `IncludePending` is what keeps them (and therefore their tags)
+        // in the served set.
+        let mut virt = insert_virtual_repo(&mocks, "npm-virt", &[&hosted, &proxy]);
+        virt.index_mode = IndexMode::IncludePending;
+        mocks.repositories.insert(virt);
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-virt", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("virtual serve must succeed")),
+        )
+        .await;
+        assert_eq!(
+            json["dist-tags"],
+            serde_json::json!({
+                "latest": "1.2.3",
+                "next": "2.0.0-rc.1",
+                "beta": "2.0.0-beta.4",
+            }),
+            "an unowned name serves the proxy member's tags"
+        );
     }
 }

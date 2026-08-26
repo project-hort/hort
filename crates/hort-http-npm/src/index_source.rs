@@ -48,13 +48,17 @@
 //! are 10 MB-capped upstream-side, not paginated — there is no
 //! truncation channel to surface).
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use hort_app::error::AppError;
-use hort_app::use_cases::index_serve::{NpmVersionPayload, PerVersionPayload, VersionEntry};
+use hort_app::use_cases::index_serve::{
+    NpmVersionPayload, PerVersionPayload, TaggedIndex, VersionEntry,
+};
 use hort_domain::entities::caller::CallerPrincipal;
+use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::entities::repository::{Repository, RepositoryType};
 use hort_formats::npm::NpmFormatHandler;
 use hort_http_core::context::AppContext;
@@ -88,6 +92,14 @@ pub(crate) struct IndexSourceOutput {
     /// value, no transform needed). Threaded through to the
     /// `BuildContext::package_name`.
     pub canonical_name: String,
+    /// The package's **stored** `dist-tags` map, tag → version, exactly
+    /// as its author wrote it: upstream's for a proxy repo, the
+    /// maintainer's `mutable_refs` rows for a hosted one, the merged
+    /// member map for a virtual one. Pre-intersection — the unified
+    /// serve handler intersects it against the post-filter served set
+    /// (see [`crate::serve`]), which is what makes a served tag
+    /// incapable of naming a version hort would refuse to serve.
+    pub dist_tags: BTreeMap<String, String>,
 }
 
 /// Per-format index source — produces `Vec<VersionEntry>` from either
@@ -206,14 +218,71 @@ impl IndexSource for HostedNpmSource {
         }
 
         hydrate_hosted_manifests(ctx, &entry_artifact_ids, &mut entries).await?;
+        // No versions means the serve renders a 404 and the intersection
+        // would empty any map anyway — skip the read so an enumeration
+        // probe for a name that does not exist costs no ref query.
+        let dist_tags = if entries.is_empty() {
+            BTreeMap::new()
+        } else {
+            read_hosted_dist_tags(ctx, repo, &canonical_name).await?
+        };
 
         Ok(IndexSourceOutput {
             entries,
             truncated,
             canonical_name,
+            dist_tags,
         })
     }
 }
+
+/// Read the maintainer-set `dist-tags` for `package` on a hosted repo.
+///
+/// npm's ref shape is the documented one on
+/// [`MutableRef`](hort_domain::entities::mutable_ref::MutableRef):
+/// `namespace` = the package name **as stored** (the same canonical form
+/// the packument's top-level `name` carries, so a tag written at publish
+/// and a tag read at serve agree under name drift), `ref_name` = the tag,
+/// target = [`RefTarget::Version`].
+///
+/// One batched `list` covers the package, like the metadata read above.
+/// A [`RefTarget::ContentHash`] row is skipped: npm tags name versions,
+/// and a hash-targeted row in an npm namespace is another format's data
+/// that has no npm wire representation.
+///
+/// A read failure **fails the serve** rather than degrading to an empty
+/// map. Degrading looks harmless — `latest` would just derive — but the
+/// derivation is the semver-max, so a maintainer who deliberately pinned
+/// `latest` at an older release would have clients silently resolve a
+/// newer one for the duration of the outage. Answering honestly with an
+/// error is the safer failure.
+async fn read_hosted_dist_tags(
+    ctx: &Arc<AppContext>,
+    repo: &Repository,
+    package: &str,
+) -> Result<BTreeMap<String, String>, AppError> {
+    // `n = 0` would take the use case's 100-row default; ask for the
+    // clamp ceiling instead so a package with an unusual number of tags
+    // is served whole rather than silently truncated at an arbitrary
+    // page boundary (the wire shape has no continuation channel).
+    let page = ctx
+        .ref_use_case
+        .list(repo.id, package, None, REF_LIST_MAX)
+        .await?;
+    Ok(page
+        .items
+        .into_iter()
+        .filter_map(|r| match r.target {
+            RefTarget::Version(version) => Some((r.ref_name, version)),
+            RefTarget::ContentHash(_) => None,
+        })
+        .collect())
+}
+
+/// Per-page ceiling for the hosted dist-tag read. Matches
+/// `RefUseCase::list`'s own clamp, so one call returns every tag a
+/// package can have without a cursor walk.
+const REF_LIST_MAX: u32 = 1000;
 
 /// Fill each entry's `NpmVersionPayload::manifest` from the publish block
 /// the `artifact_metadata` projection stored at ingest.
@@ -452,6 +521,11 @@ impl IndexSource for ProxyNpmSource {
         // surfaces as a `PackumentFetchError` above — it never
         // reaches here as an empty-then-cached body.
         let mut entries: Vec<VersionEntry> = Vec::new();
+        // Upstream's whole tag map rides the projection exactly as
+        // `versions` does — no separate freshness channel, no TTL of its
+        // own. Proxy tag data stays cache/CRUD: hort is not its author,
+        // so there is no ref event to emit.
+        let dist_tags = projection.dist_tags;
         for v in projection.versions {
             // Per-version `name` — validated against the npm allowlist
             // before substitution. A mismatch drops the entry entirely;
@@ -509,6 +583,7 @@ impl IndexSource for ProxyNpmSource {
             entries,
             truncated: false,
             canonical_name: package_name.to_string(),
+            dist_tags,
         })
     }
 }
@@ -544,18 +619,25 @@ impl IndexSource for VirtualNpmSource {
         package_name: &str,
         caller: Option<&CallerPrincipal>,
     ) -> Result<IndexSourceOutput, AppError> {
-        let entries = ctx
+        let aggregated = ctx
             .virtual_resolution_use_case
-            .aggregate_virtual_index(repo, caller, move |member| async move {
-                Ok(select_source(&member)
+            .aggregate_virtual_index_tagged(repo, caller, move |member| async move {
+                let output = select_source(&member)
                     .fetch(ctx, &member, package_name, caller)
-                    .await?
-                    .entries)
+                    .await?;
+                Ok(TaggedIndex {
+                    entries: output.entries,
+                    tags: output.dist_tags,
+                })
             })
             .await?;
 
         Ok(IndexSourceOutput {
-            entries,
+            entries: aggregated.entries,
+            // Merged per ADR 0031's name-level pinning: the first
+            // surviving member to define a tag name owns it, and a proxy
+            // member contributes nothing at all for an owned name.
+            dist_tags: aggregated.tags,
             // A virtual aggregates already-bounded member sets; it does not
             // paginate, so it never sets the hosted truncation channel.
             truncated: false,

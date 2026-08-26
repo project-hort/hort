@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **npm `dist-tags` are passed through, intersected with the served
+  set.** hort served exactly one tag — `latest`, *inferred* as the
+  semver-max of the served set — and discarded every other tag the
+  authoritative source published. Consequences: a maintainer who pinned
+  `latest` at an older release had that choice silently overridden, and
+  `npm install <pkg>@next` / `@beta` / `@rc` could not resolve at all
+  through hort. The whole tag map is now served, from the source that
+  actually authors it: upstream's map for a proxy repository (widened
+  into the cached projection, CRUD like the rest of it — hort is not its
+  author), and the maintainer's own for a hosted one, held as
+  `mutable_refs` rows and event-sourced through `RefMoved` /
+  `RefRetired`. Hosted tags are written two ways: the `dist-tags` object
+  in the `npm publish` envelope (captured after a successful ingest, so a
+  tag can never point at a version that failed to land), and the npm
+  CLI's own routes, `PUT` / `DELETE
+  /npm/{repo_key}/-/package/{pkg}/dist-tags/{tag}` — `npm dist-tag add`
+  and `npm dist-tag rm`, gated on the same Write permission as publish
+  and rejected on proxy and virtual repositories, which have no
+  authorable tag store. A virtual repository merges its members' maps in
+  priority order under the existing dependency-confusion rules: the first
+  surviving member to define a tag name owns it, and a proxy member
+  contributes neither versions nor tags once a non-proxy member owns the
+  name, so a public `next` can never shadow an internal package's tags.
+  The gate is the intersection: **a tag whose target version is not
+  served is dropped, never rewritten**, so a tag can no longer be a
+  pointer to something hort would refuse to serve, and the per-version
+  route resolves any surviving tag (`GET /npm/{repo}/{pkg}/next`) with an
+  unknown tag returning the same anti-enumeration 404 as an unknown
+  version. `latest` is verbatim when it survives; the previous derivation
+  remains only as its fallback, never as an override. Under a null gate
+  the intersection degrades to identity — hort's `dist-tags` is
+  upstream's, byte for byte. No migration: the refs table, entity,
+  events, and adapter already existed. Pre-widening cached projections
+  decode to an empty map and heal on re-projection, so no cold-cache
+  event on deploy. (#202)
+
 ### Changed
 
 - **Artifact deletion is now an event-sourced soft delete.** Deleting an
