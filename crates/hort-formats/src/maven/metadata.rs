@@ -843,6 +843,7 @@ mod tests {
                 tarball_basename: "x.tgz".into(),
                 integrity: None,
                 shasum: String::new(),
+                manifest: serde_json::Map::new(),
             }),
         };
         let xml = build("com.example:foo", "20231201000000", vec![good, bad]);

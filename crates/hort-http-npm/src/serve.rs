@@ -1212,4 +1212,243 @@ mod tests {
              while a release is served, even though it is semver-greater"
         );
     }
+
+    // -----------------------------------------------------------------
+    // install-v1 per-version manifest fields. Without these a fresh,
+    // non-lockfile install sees every version as dependency-free.
+    // Asserted on the wire for BOTH repo types plus the per-version
+    // route, because the two sources read from different authorities
+    // (upstream packument vs. the stored publish block).
+    // -----------------------------------------------------------------
+
+    /// Seed an `artifact_metadata` row holding the per-version publish
+    /// block inline (the sub-threshold shape `do_publish` writes).
+    fn insert_publish_block(
+        mocks: &hort_http_core::test_support::MockPorts,
+        artifact_id: Uuid,
+        block: serde_json::Value,
+    ) {
+        mocks
+            .artifact_metadata
+            .insert(hort_domain::entities::artifact::ArtifactMetadata {
+                artifact_id,
+                format: RepositoryFormat::Npm,
+                metadata: block,
+                metadata_blob: None,
+                properties: serde_json::Value::Null,
+            });
+    }
+
+    fn express_publish_block() -> serde_json::Value {
+        serde_json::json!({
+            "name": "pkg",
+            "version": "1.0.0",
+            "dependencies": {"left-pad": "^1.3.0"},
+            "engines": {"node": ">=18"},
+            "deprecated": "use @scope/pkg",
+            // Out of contract — must not reach the wire.
+            "scripts": {"test": "mocha"},
+            "devDependencies": {"mocha": "^10"},
+        })
+    }
+
+    /// Assert the install-v1 contract on one emitted `versions[v]`
+    /// object: whitelist keys verbatim, out-of-contract keys absent, and
+    /// source-absent whitelist keys absent rather than `null`.
+    fn assert_install_v1_wire_shape(v: &serde_json::Value) {
+        assert_eq!(v["dependencies"], serde_json::json!({"left-pad": "^1.3.0"}));
+        assert_eq!(v["engines"], serde_json::json!({"node": ">=18"}));
+        assert_eq!(v["deprecated"].as_str().unwrap(), "use @scope/pkg");
+        assert!(v.get("scripts").is_none(), "`scripts` is out of contract");
+        assert!(
+            v.get("devDependencies").is_none(),
+            "`devDependencies` is out of contract"
+        );
+        for absent in ["os", "cpu", "bin", "optionalDependencies", "funding"] {
+            assert!(
+                v.get(absent).is_none(),
+                "`{absent}` was absent at the source and must stay absent, not null"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_packument_carries_install_v1_manifest_fields_from_the_publish_block() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        insert_publish_block(&mocks, artifact.id, express_publish_block());
+
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("hosted serve must succeed"));
+        let versions = served_versions(res).await;
+        assert_install_v1_wire_shape(&versions["1.0.0"]);
+    }
+
+    #[tokio::test]
+    async fn hosted_version_route_carries_install_v1_manifest_fields() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+        insert_publish_block(&mocks, artifact.id, express_publish_block());
+
+        let trust = trust_for_tests();
+        for version_or_tag in ["1.0.0", "latest"] {
+            let res =
+                serve_npm_version_unified(&ctx, "npm-test", "pkg", version_or_tag, &trust, None)
+                    .await
+                    .unwrap_or_else(|_| panic!("per-version serve must succeed"));
+            let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["version"].as_str().unwrap(), "1.0.0");
+            assert_install_v1_wire_shape(&json);
+        }
+    }
+
+    /// A publish block above npm's 256 KB inline threshold keeps only the
+    /// handler's summary on the projection row and spills the full block
+    /// to CAS. The hosted arm must follow that reference — the summary
+    /// alone drops most of the whitelist.
+    #[tokio::test]
+    async fn hosted_packument_follows_the_cas_spill_for_an_oversize_publish_block() {
+        use hort_domain::ports::format_handler::FormatHandler;
+
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        let artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            "aaa",
+            QuarantineStatus::Released,
+        );
+
+        // Pad past the 256 KB threshold with an out-of-contract key so
+        // the block genuinely spills the way ingest would have spilled it.
+        let mut full = express_publish_block();
+        full["readme"] = serde_json::json!("x".repeat(300 * 1024));
+        let blob_bytes = serde_json::to_vec(&full).unwrap();
+        assert!(
+            blob_bytes.len() > 256 * 1024,
+            "block must exceed the threshold"
+        );
+        let blob_hash: ContentHash = format!("{:0>64}", "abc").parse().unwrap();
+        mocks.storage.insert_content(blob_hash.clone(), blob_bytes);
+
+        // The projection row keeps only the handler's summary — which
+        // drops `deprecated`, so serving it directly would be visibly wrong.
+        let summary = hort_formats::npm::NpmFormatHandler.extract_metadata_summary(&full);
+        assert!(summary.get("deprecated").is_none());
+        mocks
+            .artifact_metadata
+            .insert(hort_domain::entities::artifact::ArtifactMetadata {
+                artifact_id: artifact.id,
+                format: RepositoryFormat::Npm,
+                metadata: summary,
+                metadata_blob: Some(blob_hash),
+                properties: serde_json::Value::Null,
+            });
+
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("hosted serve must succeed"));
+        let versions = served_versions(res).await;
+        assert_install_v1_wire_shape(&versions["1.0.0"]);
+        assert!(
+            versions["1.0.0"].get("readme").is_none(),
+            "the blob's out-of-contract keys must not widen the served shape"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_packument_carries_install_v1_manifest_fields_from_upstream() {
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::ports::repository_upstream_mapping_repository::{
+            RepositoryUpstreamMapping, UpstreamAuth,
+        };
+
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+
+        let mut repo = sample_repository();
+        repo.key = "npm-mirror".into();
+        repo.format = RepositoryFormat::Npm;
+        repo.repo_type = RepositoryType::Proxy;
+        repo.upstream_url = Some("https://registry.npmjs.org".into());
+        repo.index_mode = IndexMode::IncludePending;
+        mocks.repositories.insert(repo.clone());
+
+        let now = Utc::now();
+        mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: repo.id,
+            path_prefix: "".into(),
+            upstream_url: "https://registry.npmjs.org".into(),
+            upstream_name_prefix: None,
+            upstream_auth: UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            created_at: now,
+            updated_at: now,
+        });
+
+        let mut upstream_version = express_publish_block();
+        upstream_version["dist"] = serde_json::json!({
+            "tarball": "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz",
+            "integrity": "sha512-aGVsbG8=",
+            "shasum": "abc123",
+        });
+        let upstream = serde_json::json!({
+            "name": "pkg",
+            "versions": {"1.0.0": upstream_version},
+        });
+        mocks
+            .upstream_proxy
+            .insert_metadata("", "/pkg", serde_json::to_vec(&upstream).unwrap());
+
+        let trust = trust_for_tests();
+        let res = serve_packument_unified(&ctx, "npm-mirror", "pkg", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("proxy unified serve must succeed"));
+        let versions = served_versions(res).await;
+        assert_install_v1_wire_shape(&versions["1.0.0"]);
+        // The dist rewrite is unaffected by the widening.
+        assert!(versions["1.0.0"]["dist"]["tarball"]
+            .as_str()
+            .unwrap()
+            .contains("/npm/npm-mirror/pkg/-/pkg-1.0.0.tgz"));
+    }
 }

@@ -34,6 +34,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains refcount-gated GC, since another artifact may reference the same
   bytes. Migration `021_artifacts_soft_delete.sql`. (#145)
 
+### Fixed
+
+- **npm packuments now carry per-version install metadata.** Every
+  `versions[v]` entry hort served was exactly `{name, version, dist}`:
+  the proxy projector discarded the rest of the upstream per-version
+  object, and although a hosted publish stored the full block nothing
+  ever read it back. A fresh, non-lockfile install through hort
+  (`npm install <pkg>` / `pnpm add <pkg>`) therefore saw every version as
+  dependency-free and silently materialised a near-empty tree, while
+  `engines`/`os`/`cpu` filtering, `deprecated` warnings and
+  install-script detection were inert. Lockfile installs were unaffected
+  (they carry their own resolved graph), which is why this went
+  unnoticed. Both the packument and the abbreviated per-version route now
+  emit the npm registry API's abbreviated-metadata (install-v1) field set
+  — `dependencies`, `optionalDependencies`, `peerDependencies`,
+  `peerDependenciesMeta`, `bundledDependencies`, `bin`, `directories`,
+  `engines`, `os`, `cpu`, `libc`, `deprecated`, `hasInstallScript`,
+  `funding` — passed through **verbatim** from the authoritative source
+  (the upstream packument for proxy repositories, the stored publish
+  block for hosted ones, following the CAS reference when the block
+  spilled past the 256 KB inline threshold). A field absent at the source
+  stays absent: nothing is synthesised and nothing is emitted as `null`.
+  The set is a fixed whitelist, not a step toward full packument
+  equality — `description`, `scripts`, `devDependencies`, `time` and the
+  rest remain dropped. Pre-existing upstream-projection cache entries
+  decode unchanged and simply carry no manifest fields until their next
+  refresh. (#204)
+
 ### Added
 
 - **npm abbreviated per-version / dist-tag route** —

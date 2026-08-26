@@ -19,7 +19,7 @@ them: for each, its wire shape, whether hort **stores**, **derives**, or
 | Entity | Class | Where |
 |---|---|---|
 | Tarball | **Stored** (CAS artifact) | `artifacts` row + CAS blob |
-| Version entry | **Stored (projected, minimal)** | `NpmVersionPayload` |
+| Version entry | **Stored (projected, install-v1 whitelist)** | `NpmVersionPayload` |
 | Packument | **Derived** (built per request, never stored) | `NpmIndexBuilder::build` |
 | `dist` object | **Derived** from stored fields | builder |
 | `dist-tags` | **Derived** — only `latest`; upstream map discarded | builder |
@@ -38,19 +38,39 @@ segment). Artifact lifecycle (quarantine, scan, release) applies to this
 entity and only this entity — everything else on this page is metadata
 about it.
 
-### Version entry — stored, deliberately minimal
+### Version entry — stored, whitelisted to the install-v1 field set
 
 `NpmVersionPayload` (`crates/hort-app/src/use_cases/index_serve.rs`):
 `name_as_published`, `tarball_basename`, `integrity: Option<String>`,
-`shasum`. The payload is **minimal by contract** — it carries exactly what
-the packument builder reads, nothing else. Upstream per-version extras
-(`dependencies`, `engines`, `deprecated`, `scripts`, …) are dropped at
-projection. Consequence: hort's served metadata is sufficient for
-*install-by-lockfile* and *tarball fetch* flows, and for any client that
-resolves against the full packument; it cannot answer dependency-tree
-questions from per-version metadata alone. Enriching this payload is an
-entity-class change (widen the stored projection) and must update this
+`shasum`, plus `manifest` — the npm registry API's **abbreviated
+metadata** (`application/vnd.npm.install-v1+json`) field set, named once
+by `NPM_INSTALL_V1_MANIFEST_KEYS` (`crates/hort-formats/src/npm.rs`):
+
+    dependencies, optionalDependencies, peerDependencies,
+    peerDependenciesMeta, bundledDependencies, bin, directories,
+    engines, os, cpu, libc, deprecated, hasInstallScript, funding
+
+The invariant is **whitelist over verbatim pass-through**: each key's
+value is copied unaltered from the authoritative source — the upstream
+packument for proxy repositories (captured by the streaming projector
+into `NpmVersionEntry.manifest`), the stored publish block for hosted
+ones (read back from the `artifact_metadata` projection, following the
+`metadata_blob` CAS reference when the block spilled past npm's 256 KB
+inline threshold) — and a key absent at the source is **absent on the
+wire**, never synthesised and never emitted as `null`. Both the packument
+`versions{}` entries and the abbreviated per-version route emit the set,
+composed by the single `version_entry_json`.
+
+The whitelist is the boundary, not a step toward full packument
+equality: `description`, `scripts`, `devDependencies`, `time`,
+`maintainers`, `readme` and everything else outside the list stay
+dropped. Widening the list is an entity-class change and must update this
 page.
+
+Consequence: hort's served metadata answers dependency-tree resolution
+for a fresh, non-lockfile install, and carries the `engines`/`os`/`cpu`
+filtering, `deprecated` warnings, and install-script detection npm
+clients act on.
 
 ### Packument — derived, never stored
 

@@ -116,7 +116,15 @@ pub const KEYSPACE_REGISTRY: &[(&str, EphemeralKeyspaceClass)] = &[
     // keyspace, not Redis). Evictable: cache loss just re-projects from
     // the mirror or re-fetches upstream. The `_proj` prefix bump means a
     // rolling deploy never reads a pre-amendment `npm_packument_raw:`
-    // raw-body entry. Source: `crates/hort-http-npm/src/packument.rs` +
+    // raw-body entry.
+    // Entry size: the projection also carries each version's install-v1
+    // manifest whitelist (`dependencies`, `engines`, `bin`, …), so an
+    // entry is a multiple of the bare versions+dist shape rather than a
+    // few hundred bytes per version. That is bounded by design and needs
+    // no separate mechanism: the class is Evictable, the entry expires
+    // after the 1 h backend TTL, and the mirror already holds the full
+    // raw upstream body — an eviction costs one re-projection.
+    // Source: `crates/hort-http-npm/src/packument.rs` +
     // `.../upstream_pull.rs`.
     ("npm_packument_proj:", EphemeralKeyspaceClass::Evictable),
     // OSV advisory feed cache. Evictable: cache loss

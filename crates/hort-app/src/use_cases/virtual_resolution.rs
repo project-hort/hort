@@ -752,6 +752,7 @@ mod tests {
                 tarball_basename: "x".into(),
                 integrity: None,
                 shasum: String::new(),
+                manifest: serde_json::Map::new(),
             }),
         }
     }

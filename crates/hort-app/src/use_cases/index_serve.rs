@@ -142,13 +142,12 @@ pub enum PerVersionPayload {
 /// npm packument per-version data.
 ///
 /// Carries exactly the fields the `NpmIndexBuilder` reads when
-/// emitting one entry of the packument's `versions{}` object. Kept
-/// minimal by contract: anything the builder
-/// does *not* read stays out (no upstream `time`, no `maintainers`,
-/// no `bugs`, no README — the unified packument is the wire-shape
-/// minimum every npm client tolerates; carrying upstream extras
-/// would expand the surface the proxy source has to faithfully
-/// parse for no observable client win).
+/// emitting one entry of the packument's `versions{}` object: the
+/// `name`/`version`/`dist` triple plus the npm install-v1
+/// abbreviated-metadata whitelist in `manifest`. The whitelist bounds
+/// the surface — anything outside it stays out (no upstream `time`, no
+/// `maintainers`, no `bugs`, no README, no `scripts`), so the payload is
+/// a fixed contract rather than an upstream-shaped passthrough blob.
 ///
 /// # Field reference
 ///
@@ -198,6 +197,15 @@ pub struct NpmVersionPayload {
     /// empty string when neither source supplied one — mirrors the
     /// earlier local-CAS handler's `unwrap_or_default` semantics).
     pub shasum: String,
+    /// The npm install-v1 abbreviated-metadata field set
+    /// (`hort_formats::npm::NPM_INSTALL_V1_MANIFEST_KEYS`), copied
+    /// verbatim from the authoritative source: the upstream packument on
+    /// proxy, the stored publish block on hosted. The builder merges
+    /// these entries into the emitted `versions[v]` object after
+    /// `name`/`version`/`dist`. Empty means the source published none of
+    /// them — a field absent at the source is absent on the wire, never
+    /// `null`.
+    pub manifest: serde_json::Map<String, serde_json::Value>,
 }
 
 /// PyPI simple-index per-version data.
@@ -726,6 +734,7 @@ mod tests {
             tarball_basename: "express-1.0.0.tgz".into(),
             integrity: Some("sha512-aGVsbG8=".into()),
             shasum: "da39a3ee5e6b4b0d3255bfef95601890afd80709".into(),
+            manifest: serde_json::Map::new(),
         };
         let wrapped = PerVersionPayload::Npm(payload.clone());
         match wrapped {
@@ -763,6 +772,7 @@ mod tests {
                 tarball_basename: format!("p-{version}.tgz"),
                 integrity: None,
                 shasum: "x".into(),
+                manifest: serde_json::Map::new(),
             }),
         }
     }
