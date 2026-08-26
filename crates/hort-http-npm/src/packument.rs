@@ -723,6 +723,7 @@ mod tests {
                 integrity: Some("sha512-abc".to_string()),
                 shasum: Some("deadbeef".to_string()),
                 published_at: None,
+                manifest: serde_json::Map::new(),
             }],
         }
     }

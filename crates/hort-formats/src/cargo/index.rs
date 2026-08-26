@@ -546,6 +546,7 @@ mod tests {
                 tarball_basename: "ignored.tgz".into(),
                 integrity: None,
                 shasum: "".into(),
+                manifest: serde_json::Map::new(),
             }),
         };
         let body = build(vec![good_entry, bad_entry]);

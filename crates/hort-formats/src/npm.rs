@@ -305,6 +305,62 @@ const NPM_SUMMARY_KEYS: &[&str] = &[
     "engines",
 ];
 
+/// The per-version field set hort serves alongside `name`/`version`/`dist`
+/// in every `versions[v]` entry of a packument (and on the abbreviated
+/// per-version route).
+///
+/// Authority: the npm registry API's **abbreviated metadata** document
+/// (`application/vnd.npm.install-v1+json`), which specifies exactly this
+/// set as what an installer needs to resolve and materialise a dependency
+/// tree without fetching the full packument. Serving less makes every
+/// version look dependency-free to a fresh, non-lockfile install; serving
+/// more is out of contract for the abbreviated document.
+///
+/// The set is a **whitelist over verbatim pass-through**: values are copied
+/// unaltered from the authoritative source (upstream packument for proxy
+/// repositories, the stored publish block for hosted ones) and a field
+/// absent at the source stays absent on the wire — never synthesised, never
+/// emitted as `null`. None of these keys can collide with the
+/// `name`/`version`/`dist` triple the builder emits first.
+pub const NPM_INSTALL_V1_MANIFEST_KEYS: &[&str] = &[
+    "dependencies",
+    "optionalDependencies",
+    "peerDependencies",
+    "peerDependenciesMeta",
+    "bundledDependencies",
+    "bin",
+    "directories",
+    "engines",
+    "os",
+    "cpu",
+    "libc",
+    "deprecated",
+    "hasInstallScript",
+    "funding",
+];
+
+/// Filter a per-version packument block down to
+/// [`NPM_INSTALL_V1_MANIFEST_KEYS`], preserving each value verbatim.
+///
+/// Keys absent from `block` are omitted rather than nulled, and a
+/// non-object `block` yields an empty map — both arms encode "the source
+/// published nothing here", which the builder renders as the field simply
+/// not appearing.
+pub fn extract_install_v1_manifest(
+    block: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    let Some(obj) = block.as_object() else {
+        return out;
+    };
+    for key in NPM_INSTALL_V1_MANIFEST_KEYS {
+        if let Some(v) = obj.get(*key) {
+            out.insert((*key).to_string(), v.clone());
+        }
+    }
+    out
+}
+
 impl FormatHandler for NpmFormatHandler {
     fn format_key(&self) -> &str {
         "npm"
@@ -2191,6 +2247,74 @@ mod tests {
         // Value::Null is reserved for the non-object defensive branch.
         let out = handler().extract_metadata_summary(&serde_json::json!({}));
         assert_eq!(out, serde_json::json!({}));
+    }
+
+    // -- extract_install_v1_manifest ----------------------------------------
+
+    #[test]
+    fn extract_install_v1_manifest_keeps_the_whitelist_verbatim() {
+        let block = serde_json::json!({
+            "name": "express",
+            "version": "1.0.0",
+            "dist": {"tarball": "u"},
+            "dependencies": {"body-parser": "^1.20.0"},
+            "optionalDependencies": {"fsevents": "^2"},
+            "peerDependencies": {"react": ">=18"},
+            "peerDependenciesMeta": {"react": {"optional": true}},
+            "bundledDependencies": ["inner"],
+            "bin": {"express": "./cli.js"},
+            "directories": {"lib": "lib"},
+            "engines": {"node": ">=18"},
+            "os": ["linux"],
+            "cpu": ["x64"],
+            "libc": ["glibc"],
+            "deprecated": "use @express/core",
+            "hasInstallScript": true,
+            "funding": {"url": "https://example.invalid/fund"},
+            // Out of contract:
+            "scripts": {"test": "mocha"},
+            "devDependencies": {"mocha": "^10"},
+            "description": "fast web framework",
+            "readme": "# express",
+        });
+        let out = extract_install_v1_manifest(&block);
+        let mut got: Vec<&str> = out.keys().map(String::as_str).collect();
+        got.sort_unstable();
+        let mut want: Vec<&str> = NPM_INSTALL_V1_MANIFEST_KEYS.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "exactly the whitelist, nothing else");
+        assert_eq!(out["dependencies"], block["dependencies"]);
+        assert_eq!(out["funding"], block["funding"]);
+        assert_eq!(out["hasInstallScript"], serde_json::json!(true));
+        // The triple the builder emits itself is NOT part of the
+        // whitelist, so the merge can never displace it.
+        assert!(!out.contains_key("name"));
+        assert!(!out.contains_key("version"));
+        assert!(!out.contains_key("dist"));
+    }
+
+    #[test]
+    fn extract_install_v1_manifest_omits_absent_keys_rather_than_nulling_them() {
+        let out = extract_install_v1_manifest(&serde_json::json!({
+            "name": "express",
+            "engines": {"node": ">=18"},
+        }));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out["engines"], serde_json::json!({"node": ">=18"}));
+        assert!(!out.contains_key("dependencies"));
+    }
+
+    #[test]
+    fn extract_install_v1_manifest_yields_empty_for_non_object_input() {
+        for block in [
+            serde_json::Value::Null,
+            serde_json::json!("a string"),
+            serde_json::json!(42),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!({}),
+        ] {
+            assert!(extract_install_v1_manifest(&block).is_empty());
+        }
     }
 
     // -- upstream_checksum_metadata_path (see ADR 0006 §11) -----------------

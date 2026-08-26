@@ -27,7 +27,10 @@
 //!         "tarball": "<base_url>/npm/<repo_key derived from base_url+pkg>/<name>/-/<basename>",
 //!         "shasum":  "<sha1-hex>",
 //!         "integrity": "<sri>"   // present iff payload.integrity.is_some()
-//!       }
+//!       },
+//!       // …plus each install-v1 whitelist key the payload's `manifest`
+//!       // carries (`dependencies`, `engines`, `deprecated`, …), verbatim.
+//!       // A key the source did not publish is simply absent.
 //!     },
 //!     ...
 //!   },
@@ -69,23 +72,19 @@
 //! uses upstream's per-version `name` after the canonical
 //! [`validate_npm_name`](crate::npm::validate_npm_name) check.
 //!
-//! # Why not preserve upstream extras (`time`, `maintainers`, …)
+//! # Why the per-version field set is a whitelist
 //!
 //! The unified packument carries exactly what [`NpmVersionPayload`]
-//! declares — no upstream `time`, no `maintainers`, no `bugs`, no
-//! README. Two reasons:
-//!
-//! 1. The closed-payload-sum is the spine of the format-agnostic
-//!    pipeline. Carrying extras would force them onto every payload
-//!    variant or force a passthrough-blob escape hatch that defeats
-//!    the structural contract.
-//! 2. No npm test (router-level or otherwise) checks any upstream
-//!    extra. Both legacy paths (hosted local-CAS, proxy-rewrite) emit
-//!    only what the unified builder now emits or fewer (the hosted
-//!    path emits `time` from `Artifact.created_at`, which no test
-//!    asserts — preserving it would re-introduce per-version
-//!    `created_at` plumbing through the source adapter for no
-//!    observable client gain).
+//! declares: the `name`/`version`/`dist` triple plus
+//! [`NPM_INSTALL_V1_MANIFEST_KEYS`](crate::npm::NPM_INSTALL_V1_MANIFEST_KEYS)
+//! — the npm registry API's abbreviated-metadata (install-v1) field set,
+//! which is what an installer needs to resolve a dependency tree. Full
+//! packument equality is deliberately not the target: no `time`, no
+//! `maintainers`, no `bugs`, no README, no `scripts`, no
+//! `devDependencies`. Carrying arbitrary upstream extras would need a
+//! passthrough-blob escape hatch on the closed payload sum that is the
+//! spine of the format-agnostic pipeline; a fixed whitelist keeps the
+//! served surface a contract both sources can satisfy verbatim.
 //!
 //! # Tests
 //!
@@ -138,8 +137,11 @@ pub fn resolve_served_latest<'a>(
         })
 }
 
-/// Compose the per-version JSON object (`{name, version, dist}`) shared
-/// by the full packument builder and the abbreviated per-version route.
+/// Compose the per-version JSON object shared by the full packument
+/// builder and the abbreviated per-version route: `name`, `version`,
+/// `dist`, then the install-v1 manifest whitelist the payload carries,
+/// merged in verbatim. A whitelist key is never `name`/`version`/`dist`,
+/// so the merge cannot displace the triple.
 /// `None` for a non-`Npm` payload (cross-format mis-tag — see
 /// [`NpmIndexBuilder::build`]'s panics section).
 pub fn version_entry_json(base_url: &str, entry: &VersionEntry) -> Option<serde_json::Value> {
@@ -168,11 +170,20 @@ pub fn version_entry_json(base_url: &str, entry: &VersionEntry) -> Option<serde_
         );
     }
 
-    Some(serde_json::json!({
-        "name":    payload.name_as_published,
-        "version": entry.version,
-        "dist":    dist,
-    }))
+    let mut out = serde_json::Map::with_capacity(3 + payload.manifest.len());
+    out.insert(
+        "name".to_string(),
+        serde_json::Value::String(payload.name_as_published.clone()),
+    );
+    out.insert(
+        "version".to_string(),
+        serde_json::Value::String(entry.version.clone()),
+    );
+    out.insert("dist".to_string(), serde_json::Value::Object(dist));
+    for (key, value) in &payload.manifest {
+        out.insert(key.clone(), value.clone());
+    }
+    Some(serde_json::Value::Object(out))
 }
 
 /// npm `IndexBuilder` — emits the packument JSON from a post-filter
@@ -291,6 +302,7 @@ mod tests {
             tarball_basename: basename.to_string(),
             integrity: integrity.map(str::to_string),
             shasum: shasum.to_string(),
+            manifest: serde_json::Map::new(),
         }
     }
 
@@ -358,6 +370,61 @@ mod tests {
         );
         assert_eq!(v["dist"]["integrity"].as_str().unwrap(), "sha512-aGVsbG8=");
         assert_eq!(json["dist-tags"]["latest"].as_str().unwrap(), "1.0.0");
+    }
+
+    #[test]
+    fn manifest_whitelist_merges_alongside_the_name_version_dist_triple() {
+        let mut p = payload("express", "express-1.0.0.tgz", None, "abc123");
+        p.manifest = crate::npm::extract_install_v1_manifest(&serde_json::json!({
+            "name": "express",
+            "dependencies": {"body-parser": "^1.20.0"},
+            "engines": {"node": ">=18"},
+            "deprecated": "moved to @express/core",
+            "scripts": {"test": "mocha"},
+        }));
+        let json = build(
+            vec![entry("1.0.0", p)],
+            "express",
+            "https://r.example/npm/m",
+        );
+        let v = &json["versions"]["1.0.0"];
+        // The triple survives the merge.
+        assert_eq!(v["name"].as_str().unwrap(), "express");
+        assert_eq!(v["version"].as_str().unwrap(), "1.0.0");
+        assert_eq!(
+            v["dist"]["tarball"].as_str().unwrap(),
+            "https://r.example/npm/m/express/-/express-1.0.0.tgz"
+        );
+        // Whitelist keys ride alongside it, verbatim.
+        assert_eq!(
+            v["dependencies"],
+            serde_json::json!({"body-parser": "^1.20.0"})
+        );
+        assert_eq!(v["engines"], serde_json::json!({"node": ">=18"}));
+        assert_eq!(v["deprecated"].as_str().unwrap(), "moved to @express/core");
+        // Out-of-contract keys never reach the wire.
+        assert!(v.get("scripts").is_none());
+        // Absent whitelist keys are absent, not null.
+        assert!(v.get("os").is_none());
+        assert!(v.get("optionalDependencies").is_none());
+    }
+
+    #[test]
+    fn empty_manifest_emits_exactly_the_name_version_dist_triple() {
+        let p = payload("express", "express-1.0.0.tgz", None, "abc123");
+        let json = build(
+            vec![entry("1.0.0", p)],
+            "express",
+            "https://r.example/npm/m",
+        );
+        let mut keys: Vec<&str> = json["versions"]["1.0.0"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["dist", "name", "version"]);
     }
 
     // -----------------------------------------------------------------

@@ -171,6 +171,11 @@ impl IndexSource for HostedNpmSource {
             .unwrap_or_else(|| package_name.to_string());
 
         let mut entries = Vec::with_capacity(artifacts.len());
+        // Parallel to `entries` — the artifact id backing each entry, so
+        // the manifest hydration below can key the batched metadata read
+        // without re-walking `artifacts` (whose versionless rows are
+        // skipped here).
+        let mut entry_artifact_ids = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
             // Versionless rows are not part of the packument; skip.
             let Some(version) = artifact.version.clone() else {
@@ -189,7 +194,10 @@ impl IndexSource for HostedNpmSource {
                 tarball_basename: filename,
                 integrity: None,
                 shasum,
+                // Hydrated from the stored publish block below.
+                manifest: serde_json::Map::new(),
             };
+            entry_artifact_ids.push(artifact.id);
             entries.push(VersionEntry {
                 version,
                 status: Some(artifact.quarantine_status),
@@ -197,12 +205,55 @@ impl IndexSource for HostedNpmSource {
             });
         }
 
+        hydrate_hosted_manifests(ctx, &entry_artifact_ids, &mut entries).await?;
+
         Ok(IndexSourceOutput {
             entries,
             truncated,
             canonical_name,
         })
     }
+}
+
+/// Fill each entry's `NpmVersionPayload::manifest` from the publish block
+/// the `artifact_metadata` projection stored at ingest.
+///
+/// `artifact_ids[i]` backs `entries[i]`. Every id was already authorised
+/// by the `list_by_raw_name_visible` hop the caller made, which is what
+/// makes the trusted-ids batch read legitimate.
+///
+/// One batched read covers the whole served set. A row whose payload
+/// exceeded npm's inline threshold at ingest keeps only the handler's
+/// summary in `metadata` and holds the full block in CAS, so those rows —
+/// and only those — pay one blob read each to recover the whitelist keys
+/// the summary drops.
+///
+/// Goes through `ArtifactUseCase`: `AppContext::artifact_metadata` and
+/// `::storage` are `pub(crate)` and off-limits to a format crate (ADR
+/// 0008).
+async fn hydrate_hosted_manifests(
+    ctx: &Arc<AppContext>,
+    artifact_ids: &[uuid::Uuid],
+    entries: &mut [VersionEntry],
+) -> Result<(), AppError> {
+    let metadata = ctx.artifact_use_case.batch_metadata(artifact_ids).await?;
+    for (entry, id) in entries.iter_mut().zip(artifact_ids) {
+        let Some(row) = metadata.get(id) else {
+            // No projection row (e.g. a pre-metadata ingest): the source
+            // published nothing we can pass through.
+            continue;
+        };
+        let block = if row.metadata_blob.is_some() {
+            ctx.artifact_use_case.load_full_metadata(row).await?
+        } else {
+            row.metadata.clone()
+        };
+        let PerVersionPayload::Npm(payload) = &mut entry.payload else {
+            continue;
+        };
+        payload.manifest = hort_formats::npm::extract_install_v1_manifest(&block);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +496,11 @@ impl IndexSource for ProxyNpmSource {
                     tarball_basename,
                     integrity: v.integrity,
                     shasum: v.shasum.unwrap_or_default(),
+                    // Verbatim from the upstream per-version object: the
+                    // projection cache is the proxy-side store for these
+                    // fields, so `payload_metadata` on the pull-through
+                    // path stays untouched.
+                    manifest: v.manifest,
                 }),
             });
         }
