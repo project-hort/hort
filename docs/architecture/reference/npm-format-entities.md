@@ -22,9 +22,9 @@ them: for each, its wire shape, whether hort **stores**, **derives**, or
 | Version entry | **Stored (projected, install-v1 whitelist)** | `NpmVersionPayload` |
 | Packument | **Derived** (built per request, never stored) | `NpmIndexBuilder::build` |
 | `dist` object | **Derived** from stored fields | builder |
-| `dist-tags` | **Derived** — only `latest`; upstream map discarded | builder |
+| `dist-tags` | **Stored and intersected** — full map, ∩ served set | proxy: cached projection · hosted: `mutable_refs` |
 | Scope / name | **Normalised** at the edge | format handler |
-| Publish envelope | **Consumed** (subset), not stored | streaming publish parser |
+| Publish envelope | **Consumed** (subset; `dist-tags` → refs), not stored | streaming publish parser |
 | Upstream packument | **Cached projection**, not served verbatim | `CachedNpmProjection` |
 
 ## Entities
@@ -91,26 +91,55 @@ is host-relative), `shasum` (always emitted, empty when unknown),
 `integrity` (emitted only when known — omitted, never `null`, matching
 npm convention for absent SRI).
 
-### `dist-tags` — derived; upstream map discarded
+### `dist-tags` — stored and intersected
 
-The served packument carries exactly one tag: `latest`, **derived** as the
-max over non-prerelease served versions per `NpmSemverOrdering`
-(`VersionOrdering::is_prerelease`), falling back to the max prerelease
-only when the served set contains nothing else. A prerelease never wins
-`latest` while a release is served — the npm ecosystem contract.
+The whole tag map is passed through, **intersected with the served set**.
+hort is not the map's author; it is the map's gate.
 
-The upstream `dist-tags` **map** is discarded at ingest with one
-exception: `latest` survives into the cached projection
-(`NpmProjection.dist_tag_latest`) solely to drive the
-`on_dist_tag_move` prefetch trigger — it is never threaded into the
-served packument. Consequences: maintainer-set `latest` is not honored
-(the served `latest` is an inference over the served set), and
-`next`/`beta`/`rc`/`canary` cannot be installed through hort by tag.
-Restoring the map — intersected with the served set so a tag can never
-point at a non-servable version — is the planned pass-through initiative;
-it flips this entity's class from *derived* to *stored-and-intersected*
-(with the derivation above remaining as the fallback), and updates this
-section when it lands.
+**Where the stored map lives, per repository type.** Proxy: upstream's
+map, captured by the streaming projector into
+`NpmProjection.dist_tags` and cached with the rest of the projection —
+CRUD, no events, since hort did not author it. Hosted: the maintainer's
+own map, held as `mutable_refs` rows (namespace = the package name as
+stored, `ref_name` = the tag, target = `RefTarget::Version`) and
+therefore event-sourced through `RefMoved` / `RefRetired` like every
+other ref. Virtual: the members' maps merged in priority order — the
+first surviving member to define a tag name owns it, and a `Proxy`
+member contributes neither versions nor tags once a non-proxy member
+owns the name (ADR 0031 rule 2b, tag dimension: a public `next` can
+never shadow an internal package's tags).
+
+**The four-point serving contract**, identical for every repository
+type:
+
+1. Served map = stored map ∩ post-filter served set. A tag whose target
+   version is not served is **dropped, never rewritten** — rewriting it
+   to a nearby served version would hand a client a different artifact
+   than the tag names.
+2. `latest` verbatim when it survives the intersection. Only a dropped
+   or absent `latest` is **derived**: the max over non-prerelease served
+   versions per `NpmSemverOrdering` (`VersionOrdering::is_prerelease`),
+   falling back to the max prerelease when the served set contains
+   nothing else — a prerelease never wins `latest` while a release is
+   served. The derivation is a fallback, never an override. No other tag
+   has a fallback: present or absent.
+3. Empty served set → no `dist-tags` block at all.
+4. The per-version route (`GET /npm/{repo}/{pkg}/{version_or_tag}`)
+   resolves any tag in the served map, so `pkg@next` installs. An
+   unknown tag returns the standard anti-enumeration 404 — indistinguishable
+   from an unknown version or an unknown package.
+
+Under a null gate (nothing filtered) the intersection degrades to
+identity: hort's `dist-tags` is upstream's, byte for byte.
+
+The intersection lives in `intersect_dist_tags`
+(`crates/hort-formats/src/npm/index.rs`), computed once per request in
+`crates/hort-http-npm/src/serve.rs` so the packument builder and the
+per-version route resolve tags through the same map;
+`resolve_served_latest` remains the single derivation site.
+
+`NpmProjection.dist_tags` also drives the `on_dist_tag_move` prefetch
+trigger, which reads its `latest` entry.
 
 ### Scope / package name — normalised at the edge
 
@@ -124,12 +153,25 @@ literal `-` segment.
 ### Publish envelope — consumed subset, not stored
 
 `npm publish` PUTs a packument-shaped envelope. The streaming parser
-(`crates/hort-http-npm/src/streaming_publish.rs`) recognises exactly
-`name`, `versions` (the published version's entry → payload metadata),
-and `_attachments` (the tarball, into CAS). Everything else in the
-envelope — including any `dist-tags` the client sends — is **not
-captured**. There is no `npm dist-tag add` route
-(`/-/package/{pkg}/dist-tags/{tag}` is absent from the route table).
+(`crates/hort-http-npm/src/streaming_publish.rs`) reconstructs it minus
+the base64 `_attachments[*].data`, and the publish handler consumes
+exactly `name`, `versions` (the published version's entry → payload
+metadata), `_attachments` (the tarball, into CAS), and `dist-tags`
+(→ `mutable_refs`, one `RefMoved` per changed tag, written after a
+successful ingest so a tag can never point at a version that failed to
+land). Everything else in the envelope is discarded. A malformed tag
+entry is skipped with a warn rather than failing a publish whose
+artifact has already landed.
+
+Maintainer tags are also writable directly:
+`PUT` / `DELETE /npm/{repo_key}/-/package/{pkg}/dist-tags/{tag}` — the
+npm CLI's `dist-tag add` / `dist-tag rm`, thin wrappers over
+`RefUseCase::set` / `retire`. `{pkg}` arrives URL-encoded for scoped
+names (`@scope%2fname`). Authorization is the publish requirement
+(`Write` on the repo), and both routes are **hosted-only**: a proxy's
+tags belong to its upstream and a virtual's to its members, so neither
+has an authorable tag store and the write is rejected with the same
+validation error a publish to a virtual gets.
 
 ### Upstream packument — cached projection, not served
 

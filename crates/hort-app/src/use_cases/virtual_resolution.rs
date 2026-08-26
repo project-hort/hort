@@ -22,6 +22,7 @@
 //! per-member visibility itself (there is no middleware defence-in-depth for
 //! reads — ADR 0021).
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 
@@ -31,7 +32,9 @@ use hort_domain::error::DomainError;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 
 use crate::error::{AppError, AppResult};
-use crate::use_cases::index_serve::{aggregate_index_members, MemberFetch, VersionEntry};
+use crate::use_cases::index_serve::{
+    aggregate_index_members_tagged, MemberFetch, MemberIndexFetch, TaggedIndex, VersionEntry,
+};
 use crate::use_cases::repository_access::{AccessLevel, RepositoryAccessUseCase};
 
 /// One member's name-presence outcome for the download pinning decision
@@ -236,6 +239,43 @@ impl VirtualResolutionUseCase {
         FC: FnMut(Repository) -> Fut,
         Fut: Future<Output = Result<Vec<VersionEntry>, AppError>>,
     {
+        let aggregated = self
+            .aggregate_virtual_index_tagged(virtual_repo, caller, |member| {
+                let fut = fetch_member(member);
+                async move {
+                    fut.await.map(|entries| TaggedIndex {
+                        entries,
+                        tags: BTreeMap::new(),
+                    })
+                }
+            })
+            .await?;
+        Ok(aggregated.entries)
+    }
+
+    /// [`aggregate_virtual_index`](Self::aggregate_virtual_index) widened to
+    /// carry a package-level named-tag map (npm `dist-tags`) alongside the
+    /// entries. Same two phases, same fail-closed classification, same
+    /// ownership decision — the tag map is folded into the merge by
+    /// [`aggregate_index_members_tagged`] so it rides that ONE decision
+    /// rather than a transcribed copy. A proxy member's tags are therefore
+    /// dropped wholesale for an owned name, exactly as its entries are: a
+    /// public `next` can never shadow an internal package's tags.
+    ///
+    /// The returned tags are pre-intersection: the caller runs its filter
+    /// pipeline on `entries`, then the format's own intersection of `tags`
+    /// against the resulting served set.
+    #[tracing::instrument(skip(self, caller, fetch_member), fields(virtual_repo = %virtual_repo.key))]
+    pub async fn aggregate_virtual_index_tagged<FC, Fut>(
+        &self,
+        virtual_repo: &Repository,
+        caller: Option<&CallerPrincipal>,
+        mut fetch_member: FC,
+    ) -> AppResult<TaggedIndex>
+    where
+        FC: FnMut(Repository) -> Fut,
+        Fut: Future<Output = Result<TaggedIndex, AppError>>,
+    {
         let members = self.resolve_members(virtual_repo, caller).await?;
 
         // Phase 1 — fetch only the NON-PROXY members and compute name
@@ -246,20 +286,21 @@ impl VirtualResolutionUseCase {
         // leak the owned name (a reconnaissance signal — the very thing the
         // aggregator exists to prevent) on every cache-cold index request.
         // The dedup key is name+version, so this is semantics-preserving.
-        let mut slots: Vec<Option<MemberFetch>> = Vec::with_capacity(members.len());
+        let mut slots: Vec<Option<(MemberFetch, BTreeMap<String, String>)>> =
+            Vec::with_capacity(members.len());
         let mut name_is_owned = false;
         for member in &members {
             if matches!(member.repo_type, RepositoryType::Proxy) {
                 slots.push(None); // deferred — fetched in phase 2 iff unowned
                 continue;
             }
-            let fetch = classify_member_fetch(fetch_member(member.clone()).await);
+            let (fetch, tags) = classify_member_fetch(fetch_member(member.clone()).await);
             let owns = match &fetch {
                 MemberFetch::Present(entries) => !entries.is_empty(),
                 MemberFetch::Unavailable => true,
             };
             name_is_owned = name_is_owned || owns;
-            slots.push(Some(fetch));
+            slots.push(Some((fetch, tags)));
         }
         tracing::debug!(name_is_owned, "virtual index name-ownership resolved");
 
@@ -268,16 +309,20 @@ impl VirtualResolutionUseCase {
         // is dropped WITHOUT a fetch (no upstream GET, no leak). The result is
         // identical to fetch-then-pin — pinning is name-level — but no owned
         // name reaches a proxy upstream.
-        let mut per_member: Vec<(RepositoryType, MemberFetch)> = Vec::with_capacity(members.len());
+        let mut per_member: Vec<MemberIndexFetch> = Vec::with_capacity(members.len());
         for (member, slot) in members.iter().zip(slots) {
-            let fetch = match slot {
+            let (fetch, tags) = match slot {
                 Some(f) => f,                      // non-proxy, already fetched in phase 1
                 None if name_is_owned => continue, // owned → proxy excluded, never fetched
                 None => classify_member_fetch(fetch_member(member.clone()).await),
             };
-            per_member.push((member.repo_type, fetch));
+            per_member.push(MemberIndexFetch {
+                repo_type: member.repo_type,
+                fetch,
+                tags,
+            });
         }
-        Ok(aggregate_index_members(per_member))
+        Ok(aggregate_index_members_tagged(per_member))
     }
 }
 
@@ -292,13 +337,22 @@ impl VirtualResolutionUseCase {
 ///   non-proxy member that errors is a fail-closed *potential owner*, so the
 ///   aggregation keeps proxies suppressed).
 ///
-/// Shared by both phases of [`VirtualResolutionUseCase::aggregate_virtual_index`]
-/// so the security-critical classification is written exactly once.
-fn classify_member_fetch(result: Result<Vec<VersionEntry>, AppError>) -> MemberFetch {
+/// Shared by both phases of
+/// [`VirtualResolutionUseCase::aggregate_virtual_index_tagged`] so the
+/// security-critical classification is written exactly once.
+///
+/// The tag map rides along: a member that did not respond (`Unavailable`)
+/// or is definitively absent contributes NO tags, so an errored member can
+/// never inject a tag into the merged map.
+fn classify_member_fetch(
+    result: Result<TaggedIndex, AppError>,
+) -> (MemberFetch, BTreeMap<String, String>) {
     match result {
-        Ok(entries) => MemberFetch::Present(entries),
-        Err(AppError::Domain(DomainError::NotFound { .. })) => MemberFetch::Present(Vec::new()),
-        Err(_) => MemberFetch::Unavailable,
+        Ok(index) => (MemberFetch::Present(index.entries), index.tags),
+        Err(AppError::Domain(DomainError::NotFound { .. })) => {
+            (MemberFetch::Present(Vec::new()), BTreeMap::new())
+        }
+        Err(_) => (MemberFetch::Unavailable, BTreeMap::new()),
     }
 }
 
@@ -876,6 +930,108 @@ mod tests {
             vec!["h".to_string()],
             "the proxy member is NEVER fetched for an owned name (no upstream leak)"
         );
+    }
+
+    // --- aggregate_virtual_index_tagged (the tag dimension) ------------
+
+    fn tagged(versions: &[&str], tags: &[(&str, &str)]) -> TaggedIndex {
+        TaggedIndex {
+            entries: versions.iter().map(|v| ve(v)).collect(),
+            tags: tags
+                .iter()
+                .map(|(t, v)| (t.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_tagged_owned_name_never_fetches_the_proxy_so_its_tags_never_appear() {
+        // The tag dimension of S-1: an owned name is not driven to the
+        // proxy at all, so the proxy's tag map is not merely dropped —
+        // it is never read.
+        let (uc, vroot) =
+            vroot_with_members(&[("h", RepositoryType::Hosted), ("p", RepositoryType::Proxy)]);
+        let fetched = Arc::new(Mutex::new(Vec::<String>::new()));
+        let f = fetched.clone();
+        let out = uc
+            .aggregate_virtual_index_tagged(&vroot, None, move |m| {
+                let f = f.clone();
+                async move {
+                    f.lock().unwrap().push(m.key.clone());
+                    if matches!(m.repo_type, RepositoryType::Proxy) {
+                        Ok(tagged(
+                            &["9.9.9"],
+                            &[("latest", "9.9.9"), ("next", "9.9.9")],
+                        ))
+                    } else {
+                        Ok(tagged(&["1.0.0"], &[("latest", "1.0.0")]))
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            out.entries
+                .iter()
+                .map(|e| e.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1.0.0"]
+        );
+        assert_eq!(
+            out.tags.get("latest").map(String::as_str),
+            Some("1.0.0"),
+            "the owner's latest wins"
+        );
+        assert!(
+            !out.tags.contains_key("next"),
+            "the proxy's tags never enter the merge: {:?}",
+            out.tags
+        );
+        assert_eq!(*fetched.lock().unwrap(), vec!["h".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn aggregate_tagged_unowned_name_merges_proxy_tags() {
+        let (uc, vroot) =
+            vroot_with_members(&[("h", RepositoryType::Hosted), ("p", RepositoryType::Proxy)]);
+        let out = uc
+            .aggregate_virtual_index_tagged(&vroot, None, |m| async move {
+                if matches!(m.repo_type, RepositoryType::Proxy) {
+                    Ok(tagged(&["1.0.0"], &[("latest", "1.0.0")]))
+                } else {
+                    Ok(TaggedIndex::default()) // hosted does NOT own the name
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.tags.get("latest").map(String::as_str), Some("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_tagged_errored_member_contributes_no_tags() {
+        // The classification carries the tag map: a `NotFound` member is
+        // `Present(empty)` with no tags, and an infra error is
+        // `Unavailable` with no tags — an errored member can never inject
+        // a tag into the merged map.
+        let (uc, vroot) = vroot_with_members(&[
+            ("h1", RepositoryType::Hosted),
+            ("h2", RepositoryType::Hosted),
+        ]);
+        let out = uc
+            .aggregate_virtual_index_tagged(&vroot, None, |m| async move {
+                if m.key == "h1" {
+                    Err(AppError::Domain(DomainError::NotFound {
+                        entity: "Artifact",
+                        id: "x".into(),
+                    }))
+                } else {
+                    Err(AppError::Domain(DomainError::Invariant("pool down".into())))
+                }
+            })
+            .await
+            .unwrap();
+        assert!(out.entries.is_empty());
+        assert!(out.tags.is_empty());
     }
 
     #[tokio::test]

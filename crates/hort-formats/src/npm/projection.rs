@@ -12,7 +12,7 @@
 //!  - serde.rs/ignored-any.html (the skip-without-allocating mechanism).
 //!  - ADR 0026 streaming projection contract.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,7 +45,20 @@ use crate::npm::NPM_INSTALL_V1_MANIFEST_KEYS;
 /// existing fields round-trip through serde.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NpmProjection {
-    pub dist_tag_latest: Option<String>,
+    /// Upstream's whole `dist-tags` map (`latest`, `next`, `beta`, …),
+    /// tag → version string, captured verbatim. Consumers intersect it
+    /// with the served set before it reaches the wire — a tag whose
+    /// target version is not served is dropped, never rewritten.
+    ///
+    /// `#[serde(default)]` is load-bearing: cache frames written before
+    /// this field existed carry only the superseded `dist_tag_latest`
+    /// key, and must decode into an empty map. Failing the decode
+    /// instead would turn every pre-existing entry into a cold-cache
+    /// miss plus a warn on a rolling deploy; an empty map degrades to
+    /// the served-set derivation, which is exactly the pre-widening
+    /// behaviour, and heals on the next re-projection.
+    #[serde(default)]
+    pub dist_tags: BTreeMap<String, String>,
     pub versions: Vec<NpmVersionEntry>,
 }
 
@@ -189,7 +202,9 @@ impl<'de> Visitor<'de> for TopVisitor {
             v.published_at = time_map.get(&v.version).copied();
         }
         Ok(NpmProjection {
-            dist_tag_latest: dist_tags.and_then(|dt| dt.latest),
+            dist_tags: dist_tags
+                .map(DistTagsWire::into_string_map)
+                .unwrap_or_default(),
             versions,
         })
     }
@@ -271,9 +286,28 @@ impl<'de> Visitor<'de> for VersionsVisitor {
 // by serde's `deserialize_ignored_any` without allocating.
 // ---------------------------------------------------------------------------
 
+/// Upstream `dist-tags` wire DTO — the whole tag → version map.
+///
+/// Captured as a raw JSON object and narrowed to string values by
+/// [`Self::into_string_map`]. A tag whose value is not a JSON string is
+/// **dropped**, not a parse failure: one malformed entry must not cost
+/// the package its entire index, and a dropped tag simply falls out of
+/// the served map (with `latest` degrading to the served-set
+/// derivation, the same outcome as an absent tag).
 #[derive(Deserialize)]
-struct DistTagsWire {
-    latest: Option<String>,
+#[serde(transparent)]
+struct DistTagsWire(serde_json::Map<String, serde_json::Value>);
+
+impl DistTagsWire {
+    fn into_string_map(self) -> BTreeMap<String, String> {
+        self.0
+            .into_iter()
+            .filter_map(|(tag, value)| match value {
+                serde_json::Value::String(version) => Some((tag, version)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Per-version object DTO. `name` + `dist` feed the tarball / checksum
@@ -358,14 +392,53 @@ mod tests {
         let body = br#"{"versions":{}}"#;
         let p = project(body, 2 * 1024 * 1024).expect("project");
         assert!(p.versions.is_empty());
-        assert!(p.dist_tag_latest.is_none());
+        assert!(p.dist_tags.is_empty());
     }
 
     #[test]
     fn dist_tag_latest_round_trips() {
         let body = br#"{"dist-tags":{"latest":"1.2.3"},"versions":{}}"#;
         let p = project(body, 2 * 1024 * 1024).expect("project");
-        assert_eq!(p.dist_tag_latest.as_deref(), Some("1.2.3"));
+        assert_eq!(p.dist_tags.get("latest").map(String::as_str), Some("1.2.3"));
+    }
+
+    #[test]
+    fn whole_dist_tags_map_round_trips_not_just_latest() {
+        // The projector carries every tag upstream published, not only
+        // `latest` — the pass-through contract's source of truth.
+        let body = br#"{"dist-tags":{"latest":"1.2.3","next":"2.0.0-rc.1","beta":"2.0.0-beta.4"},
+                        "versions":{}}"#;
+        let p = project(body, 2 * 1024 * 1024).expect("project");
+        assert_eq!(
+            p.dist_tags,
+            BTreeMap::from([
+                ("latest".to_string(), "1.2.3".to_string()),
+                ("next".to_string(), "2.0.0-rc.1".to_string()),
+                ("beta".to_string(), "2.0.0-beta.4".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn non_string_dist_tag_value_is_dropped_not_a_parse_failure() {
+        // A malformed entry costs that tag only. Failing the whole
+        // packument would take a package's entire index offline over one
+        // bad tag; the dropped tag falls back to absence, and `latest`
+        // to the served-set derivation.
+        let body = br#"{"dist-tags":{"latest":"1.2.3","broken":null,"weird":{"a":1},
+                                     "numeric":7},"versions":{}}"#;
+        let p = project(body, 2 * 1024 * 1024).expect("project");
+        assert_eq!(
+            p.dist_tags,
+            BTreeMap::from([("latest".to_string(), "1.2.3".to_string())])
+        );
+    }
+
+    #[test]
+    fn null_dist_tags_block_projects_an_empty_map() {
+        let body = br#"{"dist-tags":null,"versions":{}}"#;
+        let p = project(body, 2 * 1024 * 1024).expect("project");
+        assert!(p.dist_tags.is_empty());
     }
 
     #[test]
@@ -508,11 +581,13 @@ mod tests {
     }
 
     #[test]
-    fn pre_widening_serialized_entry_decodes_to_an_empty_manifest() {
-        // A projection frame written before `manifest` existed carries no
-        // such key. `#[serde(default)]` must make it decode to an empty
-        // map — a decode failure here would turn every cached entry into
-        // a cold-cache miss plus a warn on a rolling deploy.
+    fn pre_widening_frame_decodes_to_an_empty_dist_tags_map() {
+        // A frame written before the `dist-tags` map existed carries the
+        // superseded `dist_tag_latest` key and no `dist_tags`.
+        // `#[serde(default)]` must make it decode to an empty map (the
+        // pre-widening behaviour: pure served-set derivation), never a
+        // decode failure — that would turn every cached entry into a
+        // cold-cache miss plus a warn on a rolling deploy.
         let frame = br#"{
             "dist_tag_latest": "1.0.0",
             "versions": [{
@@ -525,7 +600,46 @@ mod tests {
             }]
         }"#;
         let p: NpmProjection = serde_json::from_slice(frame).expect("pre-widening frame decodes");
-        assert_eq!(p.dist_tag_latest.as_deref(), Some("1.0.0"));
+        assert!(
+            p.dist_tags.is_empty(),
+            "the superseded scalar key must not resurrect as a map entry"
+        );
+        assert_eq!(p.versions.len(), 1);
+    }
+
+    #[test]
+    fn dist_tags_map_round_trips_through_the_cache_frame() {
+        let p = NpmProjection {
+            dist_tags: BTreeMap::from([
+                ("latest".to_string(), "1.0.0".to_string()),
+                ("next".to_string(), "2.0.0-rc.1".to_string()),
+            ]),
+            versions: Vec::new(),
+        };
+        let encoded = serde_json::to_vec(&p).expect("encode");
+        let decoded: NpmProjection = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded.dist_tags, p.dist_tags);
+    }
+
+    #[test]
+    fn pre_widening_serialized_entry_decodes_to_an_empty_manifest() {
+        // A projection frame written before `manifest` existed carries no
+        // such key. `#[serde(default)]` must make it decode to an empty
+        // map — a decode failure here would turn every cached entry into
+        // a cold-cache miss plus a warn on a rolling deploy.
+        let frame = br#"{
+            "dist_tags": {"latest": "1.0.0"},
+            "versions": [{
+                "version": "1.0.0",
+                "name_as_published": "foo",
+                "tarball": "https://r.example/foo/-/foo-1.0.0.tgz",
+                "integrity": "sha512-abc",
+                "shasum": "deadbeef",
+                "published_at": null
+            }]
+        }"#;
+        let p: NpmProjection = serde_json::from_slice(frame).expect("pre-widening frame decodes");
+        assert_eq!(p.dist_tags.get("latest").map(String::as_str), Some("1.0.0"));
         assert_eq!(p.versions.len(), 1);
         assert!(p.versions[0].manifest.is_empty());
         // The rest of the entry still derives unchanged.
