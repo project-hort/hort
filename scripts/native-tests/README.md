@@ -100,8 +100,8 @@ Each scenario is `scenarios/<group>/<name>.sh`:
   (when `requires: db`), and `assert_metric_ingest <format>`.
 - The runner passes `HORT_URL`, `KEYCLOAK_URL`, `METRICS_URL`, `METRICS_TOKEN`,
   `KEYCLOAK_CLIENT_ID`/`SECRET`, `FIXTURES=/work/fixtures`, `HORT_E2E_MODE`
-  (the active `--hort` selector, verbatim — see below), and (when available)
-  `HORT_DB_DSN` via env. In compose mode under `--compose-overlay=native-tokens`,
+  (the active `--hort` selector, verbatim — see below), `HORT_CI_SCRIPTS`
+  (see below), and (when available) `HORT_DB_DSN` via env. In compose mode under `--compose-overlay=native-tokens`,
   `METRICS_TOKEN` is a `read_metrics`-granted bearer the runner admin-mints once
   per run, against the `metrics-scraper` `ServiceAccount` + `PermissionGrant` in
   `deploy/compose/example-config/` — `common.sh` exposes it pre-split into a
@@ -128,6 +128,22 @@ Each scenario is `scenarios/<group>/<name>.sh`:
 
 A scenario whose `requires` aren't all provided is reported **SKIP (needs: …)**,
 never a failure.
+
+### The release-time scripts (`$HORT_CI_SCRIPTS`)
+
+`scripts/ci/` is bind-mounted read-only into every scenario container at
+`/work-ci`, exported as `HORT_CI_SCRIPTS`. It holds the scripts a tagged
+release actually runs — `publish-crates.sh`, `publishable-crates-in-order.sh`,
+`crate-version-in-index.sh` and their shared library.
+
+A scenario asserting on release behaviour should EXECUTE those rather than
+restate what they do: a paraphrase passes while the real chain is broken,
+which is the one failure mode such a scenario exists to catch.
+`scenarios/dogfood/publish-chain.sh` is the worked example — it generates a
+throwaway cargo workspace, copies the mounted scripts to
+`<workspace>/scripts/ci` (that path is not incidental: `publish-crates.sh`
+locates its siblings and the workspace root relative to its own location) and
+runs the chain unmodified against the compose stack.
 
 ### Mode-aware fixture premises
 

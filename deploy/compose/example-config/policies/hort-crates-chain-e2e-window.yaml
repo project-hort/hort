@@ -1,0 +1,35 @@
+# A REAL observation window on a hosted cargo repo — the opposite of the
+# `*-permissive` 0s opt-outs, and deliberately not waived.
+#
+# A multi-crate `cargo publish` chain resolves each crate's intra-workspace
+# dependencies through the registry index even under `--no-verify`, so every
+# publish after the first reads a sibling that is still inside this window.
+# Collapsing the window to 0s, or releasing on ingest, would make the chain
+# succeed for the wrong reason and the scenario would assert nothing: the
+# defect class it exists to catch is precisely "the index the chain resolves
+# against omits the crate the chain just uploaded".
+#
+# 90s is chosen against the scenario's own shape rather than picked round: the
+# chain publishes four crates and then makes its held-visibility assertions,
+# which together take well under half that even on a loaded runner, so the
+# hold is guaranteed still in force when they run — and short enough that the
+# release leg's bounded wait stays inside a smoke run.
+#
+# `scanBackends: []` keeps the release gate single-axis: with no scanner the
+# release authority is ScanWaived, so the quarantine timer is the only thing
+# holding these artifacts and the release the scenario waits for cannot be
+# confounded by an external advisory service being slow or unreachable.
+# `provenanceMode: off` for the same reason — no per-ingest verify job.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: hort-crates-chain-e2e-window
+spec:
+  scope:
+    repository: hort-crates-chain-e2e
+  severityThreshold: critical
+  quarantineDuration: 90s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: []
+  licensePolicy: {}

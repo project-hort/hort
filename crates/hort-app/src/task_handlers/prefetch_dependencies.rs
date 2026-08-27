@@ -345,7 +345,7 @@ impl PrefetchDependenciesHandler {
         match page
             .items
             .into_iter()
-            .find(|a| a.version.as_deref() == Some(version) && !a.is_deleted)
+            .find(|a| a.version.as_deref() == Some(version))
         {
             Some(artifact) => Ok(artifact),
             None => Err(TaskOutcome::fail(
@@ -1592,9 +1592,9 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         };
@@ -2308,9 +2308,9 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

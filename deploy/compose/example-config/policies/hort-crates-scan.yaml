@@ -1,0 +1,32 @@
+# Mirror of deploy/ansible/files/gitops/policies/hort-crates-scan.yaml.
+#
+# The posture is copied verbatim because the dogfood scenario asserts on it.
+# `quarantineDuration: 0s` on an operator policy is the explicit permissive
+# opt-out and is honoured literally: the ingest skips the quarantine step
+# entirely, so a published crate is servable at once and its scan runs
+# alongside. `enforcement: record` then decides what a finding may do to it —
+# record the verdict, do not transition the artifact.
+#
+# Both halves are load-bearing for a multi-crate publish. Under `reject` a
+# finding on the first crate would move it to Rejected and hide it from the
+# index, and the second crate — which resolves the first through that index —
+# would fail mid-chain with the first already uploaded and only yankable.
+#
+# Note what this posture therefore does NOT cover: with no hold at all,
+# nothing here races a publish against an observation window. That race is
+# covered deterministically, and without egress, by the separate
+# hort-crates-chain-e2e repository and its window policy.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: hort-crates-scan
+spec:
+  scope:
+    repository: hort-crates
+  severityThreshold: high
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["osv"]
+  enforcement: record
+  licensePolicy: {}

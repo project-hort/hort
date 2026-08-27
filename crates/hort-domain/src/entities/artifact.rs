@@ -10,8 +10,9 @@ use crate::entities::repository::RepositoryFormat;
 use crate::entities::scan_policy::ProvenanceMode;
 use crate::error::{DomainError, DomainResult};
 use crate::events::{
-    ArtifactCorrupted, ArtifactQuarantined, ArtifactRejected, ArtifactReleased, DomainEvent,
-    ProvenanceRejected, ProvenanceVerified, RejectionReason, ReleaseReason, ScanIndeterminate,
+    ArtifactCorrupted, ArtifactDeleted, ArtifactQuarantined, ArtifactRejected, ArtifactReleased,
+    DomainEvent, ProvenanceRejected, ProvenanceVerified, RejectionReason, ReleaseReason,
+    ScanIndeterminate,
 };
 use crate::policy::ScanOutcome;
 use crate::ports::provenance::{
@@ -179,9 +180,31 @@ pub struct Artifact {
     /// opt-in (interaction constraints: ADR 0016).
     pub upstream_published_at: Option<DateTime<Utc>>,
     pub uploaded_by: Option<Uuid>,
-    pub is_deleted: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Soft-delete marker. `None` ⇒ the artifact is **live**; `Some(ts)`
+    /// ⇒ it was deleted at `ts` and is no longer part of the repository's
+    /// served catalog.
+    ///
+    /// Deliberately a dedicated field rather than a
+    /// [`QuarantineStatus`] variant: deletion is **orthogonal** to scan
+    /// state (a `Released` artifact and a `Rejected` one are both
+    /// deletable), so folding it into the status enum would conflate two
+    /// axes and destroy the pre-deletion state the audit trail needs.
+    ///
+    /// Every live read filters `deleted_at IS NULL`, so an artifact
+    /// materialised by a normal lookup always carries `None` here; the
+    /// non-`None` case is observable only on the deletion path itself.
+    /// The projection column is what a fresh ingest at the same path
+    /// consults — the `(repository_id, path)` unique index is predicated
+    /// on `deleted_at IS NULL`, so a deleted row no longer reserves its
+    /// path.
+    ///
+    /// `#[serde(default)]` so any persisted/replayed `Artifact`
+    /// representation that predates the field deserialises as live —
+    /// which is exactly what those rows were.
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,20 +1242,75 @@ impl Artifact {
         }
     }
 
-    /// Check if downloads are allowed.
-    pub fn is_downloadable(&self) -> bool {
-        matches!(
-            self.quarantine_status,
-            QuarantineStatus::None | QuarantineStatus::Released
-        )
+    /// Record the **deletion** of this artifact — the terminal
+    /// artifact-lifecycle transition on the operator/registry-API axis.
+    ///
+    /// Deletion is a **soft delete**: the projection row survives with
+    /// `deleted_at` set and the CAS blob is untouched (blob lifetime is
+    /// refcount-gated GC, never a per-artifact delete — another
+    /// repository's artifact may reference the same bytes). What changes
+    /// is that the artifact leaves the live catalog: every live read
+    /// filters `deleted_at IS NULL`, and the `(repository_id, path)`
+    /// unique index is predicated on the same, so the freed path admits a
+    /// fresh ingest as a NEW artifact (new id, new row, new stream).
+    ///
+    /// Deliberately **orthogonal to [`QuarantineStatus`]**: this method
+    /// does not touch `quarantine_status`, and there is no `Deleted`
+    /// status variant. A `Released` artifact and a `Rejected` one are
+    /// both deletable, and the pre-deletion status is exactly what an
+    /// auditor needs preserved. For the same reason deletion does not go
+    /// through the [`quarantine_transitions`] table — that table models
+    /// the scan-verdict axis only.
+    ///
+    /// Idempotency guard: deleting an already-deleted artifact is an
+    /// invariant violation, not a second deletion — the terminal event
+    /// must appear at most once on the stream. Callers that treat a
+    /// re-delete as a benign no-op resolve it before reaching here (the
+    /// adapter's conditional `WHERE deleted_at IS NULL` write matches no
+    /// row and surfaces `NotFound`).
+    ///
+    /// `deleted_at` is caller-supplied rather than read from a clock so
+    /// the entity stays pure and the persisted column and the entity
+    /// agree on one timestamp.
+    pub fn delete(&mut self, deleted_at: DateTime<Utc>) -> DomainResult<ArtifactDeleted> {
+        if let Some(at) = self.deleted_at {
+            return Err(DomainError::Invariant(format!(
+                "artifact {} was already deleted at {at}",
+                self.id
+            )));
+        }
+        self.deleted_at = Some(deleted_at);
+        Ok(ArtifactDeleted {
+            artifact_id: self.id,
+            repository_id: self.repository_id,
+            path: self.path.clone(),
+            content_hash: self.sha256_checksum.clone(),
+        })
     }
 
-    /// Check if promotion is allowed.
+    /// Check if downloads are allowed.
+    ///
+    /// A deleted artifact is never downloadable, whatever its quarantine
+    /// status was when it was deleted. In practice every live read
+    /// already filters deleted rows out, so this conjunct is
+    /// defence-in-depth against a caller that materialised an artifact
+    /// through the deletion path itself.
+    pub fn is_downloadable(&self) -> bool {
+        self.deleted_at.is_none()
+            && matches!(
+                self.quarantine_status,
+                QuarantineStatus::None | QuarantineStatus::Released
+            )
+    }
+
+    /// Check if promotion is allowed. Deleted artifacts are not
+    /// promotable — same reasoning as [`Self::is_downloadable`].
     pub fn is_promotable(&self) -> bool {
-        matches!(
-            self.quarantine_status,
-            QuarantineStatus::None | QuarantineStatus::Released
-        )
+        self.deleted_at.is_none()
+            && matches!(
+                self.quarantine_status,
+                QuarantineStatus::None | QuarantineStatus::Released
+            )
     }
 }
 
@@ -1348,9 +1426,9 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: Some(Uuid::nil()),
-            is_deleted: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3860,5 +3938,91 @@ mod tests {
     #[test]
     fn is_promotable_scan_indeterminate() {
         assert!(!scan_indeterminate_artifact().is_promotable());
+    }
+
+    // -- delete (soft delete, terminal) -------------------------------------
+
+    fn deletion_ts() -> DateTime<Utc> {
+        "2026-03-04T05:06:07Z".parse().unwrap()
+    }
+
+    #[test]
+    fn delete_marks_deleted_and_returns_event_with_denormalised_coordinates() {
+        let mut a = sample_artifact();
+        let repo = Uuid::new_v4();
+        let id = Uuid::new_v4();
+        a.id = id;
+        a.repository_id = repo;
+
+        let event = a.delete(deletion_ts()).expect("live artifact is deletable");
+
+        assert_eq!(a.deleted_at, Some(deletion_ts()));
+        assert_eq!(event.artifact_id, id);
+        assert_eq!(event.repository_id, repo);
+        assert_eq!(event.path, a.path);
+        assert_eq!(event.content_hash, a.sha256_checksum);
+    }
+
+    #[test]
+    fn delete_does_not_touch_quarantine_status_or_rejection_reason() {
+        // Deletion is orthogonal to the scan axis: the pre-deletion state
+        // is exactly what an auditor needs preserved.
+        for mut a in [
+            sample_artifact(),
+            quarantined_artifact(),
+            released_artifact(),
+            rejected_artifact(),
+            scan_indeterminate_artifact(),
+        ] {
+            let before = a.quarantine_status;
+            let reason_before = a.rejection_reason.clone();
+            a.delete(deletion_ts()).expect("deletable in any state");
+            assert_eq!(a.quarantine_status, before, "status must be preserved");
+            assert_eq!(a.rejection_reason, reason_before);
+        }
+    }
+
+    #[test]
+    fn delete_is_terminal_second_delete_is_an_invariant_violation() {
+        let mut a = sample_artifact();
+        a.delete(deletion_ts()).expect("first delete succeeds");
+        let err = a
+            .delete(deletion_ts())
+            .expect_err("a deleted artifact cannot be deleted again");
+        assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
+        assert!(err.to_string().contains("already deleted"));
+        // The rejected second attempt must not move the recorded instant.
+        assert_eq!(a.deleted_at, Some(deletion_ts()));
+    }
+
+    #[test]
+    fn deleted_artifact_is_neither_downloadable_nor_promotable() {
+        // Even from `Released`, the state that otherwise permits both.
+        let mut a = released_artifact();
+        assert!(a.is_downloadable() && a.is_promotable());
+        a.delete(deletion_ts()).unwrap();
+        assert!(!a.is_downloadable());
+        assert!(!a.is_promotable());
+    }
+
+    #[test]
+    fn delete_event_validates_and_rejects_an_oversize_path() {
+        let mut a = sample_artifact();
+        let event = a.delete(deletion_ts()).unwrap();
+        event.validate().expect("well-formed payload validates");
+
+        let mut oversize = event.clone();
+        oversize.path = "x".repeat(2049);
+        let err = oversize.validate().expect_err("path is length-capped");
+        assert!(err.to_string().contains("path"));
+    }
+
+    #[test]
+    fn delete_event_rejects_an_empty_path() {
+        let mut a = sample_artifact();
+        let mut event = a.delete(deletion_ts()).unwrap();
+        event.path = String::new();
+        let err = event.validate().expect_err("empty path is not a location");
+        assert!(err.to_string().contains("path"));
     }
 }

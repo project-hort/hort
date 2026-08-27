@@ -38,6 +38,7 @@ use hort_app::use_cases::curation_use_case::CurationUseCase;
 // the shared harness.
 use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
+use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
@@ -103,6 +104,7 @@ use hort_domain::ports::scanner_registry_repository::{
 };
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::subscription_repository::SubscriptionRepository;
+use hort_domain::ports::upstream_proxy::{UpstreamProxy, UpstreamProxyByFormat};
 use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{Page, PageRequest};
@@ -1084,6 +1086,7 @@ pub fn build_mock_ctx_with_label_flag(
     let repository_upstream_mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
     let upstream_resolver = Arc::new(MockUpstreamResolver::new());
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
+    let upstream_proxy_port: Arc<dyn UpstreamProxy> = upstream_proxy.clone();
 
     // Two distinct in-memory `EphemeralStore`
     // instances behind the production metrics wrapper, one per class
@@ -1159,6 +1162,22 @@ pub fn build_mock_ctx_with_label_flag(
     let scanner_worker_query_use_case = Arc::new(ScannerWorkerQueryUseCase::new(
         scanner_workers.clone() as Arc<dyn ScannerRegistryRepository>,
     ));
+
+    // `EffectiveRepositoryConfigUseCase` for the admin
+    // effective-config read surface's scan-policy leg
+    // (`GET /admin/repositories/:key/effective-config`). Wired with the
+    // SAME `policy_projections` mock every other quarantine/scan-policy
+    // consumer above shares, so handler tests seed policies via
+    // `mocks.policy_projections.insert(...)`.
+    let effective_repository_config_use_case = Arc::new(EffectiveRepositoryConfigUseCase::new(
+        policy_projections.clone(),
+    ));
+
+    // No gitops apply runs in a mock context, so the default is the
+    // honest `None` — the same value a DSN-only boot produces. A handler
+    // test that needs a recorded apply stores one on the `ArcSwap`
+    // directly (`ctx.gitops_apply_status.store(Arc::new(Some(..)))`).
+    let gitops_apply_status = Arc::new(arc_swap::ArcSwap::from_pointee(None));
 
     // `PrefetchUseCase` planner. Zero-cost unit
     // struct; the `Arc` mirrors the rest of the use-case surface.
@@ -1332,6 +1351,10 @@ pub fn build_mock_ctx_with_label_flag(
         // See field doc.
         scanner_worker_query_use_case,
         // See field doc.
+        effective_repository_config_use_case,
+        // See field doc.
+        gitops_apply_status,
+        // See field doc.
         prefetch_use_case,
         // See field doc.
         effective_permissions_use_case,
@@ -1395,7 +1418,10 @@ pub fn build_mock_ctx_with_label_flag(
         content_references: content_references.clone(),
         repository_upstream_mappings: repository_upstream_mappings.clone(),
         upstream_resolver: upstream_resolver.clone(),
-        upstream_proxy: upstream_proxy.clone(),
+        // Every served read-path format resolves to the SAME mock, so
+        // a per-format handler test seeds `mocks.upstream_proxy` once
+        // and reads it back through its crate's own format key.
+        upstream_proxy: UpstreamProxyByFormat::uniform(&upstream_proxy_port),
         policy_projections: policy_projections.clone(),
         curation_rules: curation_rules.clone(),
         metrics_handle: handle,
@@ -1576,6 +1602,16 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         // Carry forward. The worker-list surface is admin-only and does
         // not consume `RepositoryAccessUseCase`, so no rebuild is needed.
         scanner_worker_query_use_case: base.scanner_worker_query_use_case.clone(),
+        // Carry forward. The effective-config
+        // read surface is admin-only and does not consume
+        // `RepositoryAccessUseCase`, so no `with_*` helper rebuild is
+        // needed when the access policy flips.
+        effective_repository_config_use_case: base.effective_repository_config_use_case.clone(),
+        // Carry forward. The apply-status
+        // surface is admin-only, in-memory, and does not consume
+        // `RepositoryAccessUseCase`; sharing the `Arc` also keeps a
+        // status installed before a rebuild visible after it.
+        gitops_apply_status: base.gitops_apply_status.clone(),
         // Carry forward. The prefetch planner is
         // a stateless unit struct; rebuilding would yield the identical
         // instance, but threading the existing `Arc` keeps pointer

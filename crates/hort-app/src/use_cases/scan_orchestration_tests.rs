@@ -41,6 +41,7 @@ use hort_domain::ports::scanner::ScannerPort;
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{
     ArtifactCoords, ContentHash, Ecosystem, Finding, PayloadAccess, Sbom, SbomComponent,
+    SeverityBasis,
 };
 
 use super::*;
@@ -249,12 +250,23 @@ fn finding(purl: &str, vuln: &str, sev: SeverityThreshold) -> Finding {
         references: vec![],
         aliases: vec![],
         informational_class: None,
+        severity_basis: SeverityBasis::Assessed,
     }
 }
 
 fn finding_with_score(purl: &str, vuln: &str, sev: SeverityThreshold, score: f32) -> Finding {
     let mut f = finding(purl, vuln, sev);
     f.cvss_score = Some(score);
+    f
+}
+
+/// A finding whose severity is the SUP-4 fail-closed floor rather than a
+/// reading: no CVSS, no informational class, `SeverityBasis::Unassessed`.
+/// This is the shape all three fail-closed emission sites produce when a
+/// backend cannot determine a severity.
+fn unassessed_finding(purl: &str, vuln: &str, sev: SeverityThreshold) -> Finding {
+    let mut f = finding(purl, vuln, sev);
+    f.severity_basis = SeverityBasis::Unassessed;
     f
 }
 
@@ -315,7 +327,44 @@ fn make_uc_full(
     // exists, which matches every test artifact's `repository_id`
     // (no repo-scoped policy is seeded by default).
     policy_projections.insert(seed_global_policy(backends));
-    make_uc_with_policy_repo_and_handlers(scanners, advisory, policy_projections, handlers)
+    make_uc_with_policy_repo_and_handlers(
+        scanners,
+        advisory,
+        policy_projections,
+        handlers,
+        ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+    )
+}
+
+/// Factory for the break-glass-switch tests: same wiring as
+/// [`make_uc_full`], but with
+/// [`ScanOrchestrationConfig::allow_informed_downgrade`] set explicitly so
+/// a `run_scan` test can prove the flag reaches the merge rather than
+/// sitting inert on the config struct (ADR 0015).
+#[allow(clippy::type_complexity)]
+fn make_uc_with_merge_switch(
+    backends: Vec<String>,
+    scanners: HashMap<String, Arc<dyn ScannerPort>>,
+    advisory: Arc<dyn AdvisoryPort>,
+    allow_informed_downgrade: bool,
+) -> (
+    ScanOrchestrationUseCase,
+    Arc<MockArtifactRepository>,
+    Arc<MockRepositoryRepository>,
+) {
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(backends));
+    let mut config = ScanOrchestrationConfig::defaults_for_worker("test-worker");
+    config.allow_informed_downgrade = allow_informed_downgrade;
+    let (uc, _jobs, _events, _storage, artifacts, repositories, _policy, _metadata) =
+        make_uc_with_policy_repo_and_handlers(
+            scanners,
+            advisory,
+            policy_projections,
+            HashMap::new(),
+            config,
+        );
+    (uc, artifacts, repositories)
 }
 
 /// Build a use case with NO policy seeded — the orchestrator's policy
@@ -360,6 +409,7 @@ fn make_uc_with_policy_repo(
             advisory,
             policy_projections,
             HashMap::new(),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
         );
     (uc, jobs, events, storage, artifacts, repositories, policy)
 }
@@ -370,6 +420,7 @@ fn make_uc_with_policy_repo_and_handlers(
     advisory: Arc<dyn AdvisoryPort>,
     policy_projections: Arc<MockPolicyProjectionRepository>,
     handlers: HashMap<String, Arc<dyn FormatHandler>>,
+    config: ScanOrchestrationConfig,
 ) -> (
     ScanOrchestrationUseCase,
     Arc<MockJobsRepository>,
@@ -407,8 +458,6 @@ fn make_uc_with_policy_repo_and_handlers(
         storage.clone(),
         jobs.clone(),
     ));
-
-    let config = ScanOrchestrationConfig::defaults_for_worker("test-worker");
 
     let uc = ScanOrchestrationUseCase::new(
         jobs.clone(),
@@ -586,7 +635,27 @@ fn compute_backoff_attempts_zero_defensive_returns_60_seconds() {
     assert_eq!(compute_backoff(0), Duration::from_secs(60));
 }
 
-// -- merge_findings: informational classification preference ----------------
+// -- merge_findings: collision preference ----------------------------------
+
+/// Merge `a` and `b` — two findings for the same `(purl,
+/// vulnerability_id)` — in BOTH contribution orders and return the single
+/// survivor. Order-independence is part of the contract: advisory
+/// enrichment is seeded first but scanners append after, and which backend
+/// runs first depends on the configured `scan_backends` list, so a merge
+/// rule that only holds one way round would be a latent bug.
+fn merge_collision(a: &Finding, b: &Finding, allow_informed_downgrade: bool) -> Finding {
+    let mut winners: Vec<Finding> = Vec::new();
+    for input in [vec![a.clone(), b.clone()], vec![b.clone(), a.clone()]] {
+        let mut merged = merge_findings(input, allow_informed_downgrade);
+        assert_eq!(merged.len(), 1, "collision must dedup to one finding");
+        winners.push(merged.remove(0));
+    }
+    assert_eq!(
+        winners[0], winners[1],
+        "merge outcome must not depend on contribution order",
+    );
+    winners.remove(0)
+}
 
 /// Regression (the F1 cross-backend fail-open). A `[trivy, osv]` policy: the
 /// advisory / osv enrichment reads the RustSec class and classifies
@@ -610,21 +679,13 @@ fn merge_preserves_informational_over_unscored_critical_collision() {
     let mut trivy_critical = finding(purl, vuln, SeverityThreshold::Critical);
     trivy_critical.source_scanner = "trivy".into(); // informational_class stays None
 
-    // The informational reading must win regardless of contribution order
-    // (advisory enrichment is seeded first, but scanners append after).
-    for input in [
-        vec![informational.clone(), trivy_critical.clone()],
-        vec![trivy_critical.clone(), informational.clone()],
-    ] {
-        let merged = merge_findings(input);
-        assert_eq!(merged.len(), 1, "collision must dedup to one finding");
-        assert!(
-            merged[0].is_informational(),
-            "merged finding must stay informational (class={:?}, sev={:?})",
-            merged[0].informational_class,
-            merged[0].severity,
-        );
-    }
+    let winner = merge_collision(&informational, &trivy_critical, true);
+    assert!(
+        winner.is_informational(),
+        "merged finding must stay informational (class={:?}, sev={:?})",
+        winner.informational_class,
+        winner.severity,
+    );
 }
 
 /// Fail-closed safety: the informational preference must NOT downgrade a
@@ -642,18 +703,132 @@ fn merge_does_not_downgrade_a_scored_critical_via_informational_collision() {
 
     let scored_critical = finding_with_score(purl, vuln, SeverityThreshold::Critical, 9.8);
 
-    for input in [
-        vec![informational.clone(), scored_critical.clone()],
-        vec![scored_critical.clone(), informational.clone()],
-    ] {
-        let merged = merge_findings(input);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].severity, SeverityThreshold::Critical);
-        assert!(
-            !merged[0].is_informational(),
-            "a scored critical must stay enforced, not be demoted to negligible",
-        );
-    }
+    let winner = merge_collision(&informational, &scored_critical, true);
+    assert_eq!(winner.severity, SeverityThreshold::Critical);
+    assert!(
+        !winner.is_informational(),
+        "a scored critical must stay enforced, not be demoted to negligible",
+    );
+}
+
+/// The production pairing (ADR 0059). Two backends report the same advisory
+/// for the same component: one could not read a severity and emitted the
+/// SUP-4 fail-closed `Critical` floor (`SeverityBasis::Unassessed`, no
+/// CVSS, no informational class), the other read a real CVSS and scored it
+/// `Medium`. The scored reading MUST survive.
+///
+/// Keeping the floor is what left a correctly-scored advisory terminally
+/// rejected for weeks: the merge discarded the only backend that actually
+/// knew something about the advisory, and the artifact carried a verdict no
+/// backend had reached.
+#[test]
+fn merge_prefers_scored_medium_over_unassessed_critical_floor() {
+    let purl = "pkg:cargo/rsa@0.9.10";
+    let vuln = "RUSTSEC-2023-0071";
+
+    let unassessed_critical = unassessed_finding(purl, vuln, SeverityThreshold::Critical);
+    let mut scored_medium = finding_with_score(purl, vuln, SeverityThreshold::Medium, 5.9);
+    scored_medium.source_scanner = "osv".into();
+
+    let winner = merge_collision(&unassessed_critical, &scored_medium, true);
+    assert_eq!(
+        winner.severity,
+        SeverityThreshold::Medium,
+        "the scored reading must supersede the unassessed Critical floor",
+    );
+    assert_eq!(winner.cvss_score, Some(5.9));
+}
+
+/// Fail-open protection, keyed on `SeverityBasis` rather than
+/// `cvss_score.is_none()`. Two backends both genuinely assessed the same
+/// advisory and disagree: `Critical` vs `Low`, both scored, both
+/// `Assessed`. The information-quality rule must not fire at all here —
+/// both are informed, so the comparison falls through to severity tier and
+/// the `Critical` survives (ADR 0007).
+#[test]
+fn merge_keeps_scored_critical_over_scored_low_when_both_assessed() {
+    let purl = "pkg:cargo/x@1.0.0";
+    let vuln = "CVE-9999-0002";
+
+    let scored_critical = finding_with_score(purl, vuln, SeverityThreshold::Critical, 9.8);
+    let scored_low = finding_with_score(purl, vuln, SeverityThreshold::Low, 2.1);
+    assert_eq!(scored_critical.severity_basis, SeverityBasis::Assessed);
+    assert_eq!(scored_low.severity_basis, SeverityBasis::Assessed);
+
+    let winner = merge_collision(&scored_critical, &scored_low, true);
+    assert_eq!(
+        winner.severity,
+        SeverityThreshold::Critical,
+        "two informed readings compare by tier; a scored Low never talks down a scored Critical",
+    );
+}
+
+/// The break-glass switch, engaged. With
+/// `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE=false` the
+/// information-quality rule is skipped entirely and the merge reverts to
+/// strict always-fail-closed: the same production pairing now keeps the
+/// `Unassessed` `Critical`. Engaging the switch makes the gate stricter,
+/// which is the point of the escape hatch.
+#[test]
+fn merge_reverts_to_fail_closed_critical_when_downgrade_disabled() {
+    let purl = "pkg:cargo/rsa@0.9.10";
+    let vuln = "RUSTSEC-2023-0071";
+
+    let unassessed_critical = unassessed_finding(purl, vuln, SeverityThreshold::Critical);
+    let scored_medium = finding_with_score(purl, vuln, SeverityThreshold::Medium, 5.9);
+
+    let winner = merge_collision(&unassessed_critical, &scored_medium, false);
+    assert_eq!(
+        winner.severity,
+        SeverityThreshold::Critical,
+        "with the switch engaged the fail-closed floor wins on tier alone",
+    );
+    assert_eq!(winner.severity_basis, SeverityBasis::Unassessed);
+}
+
+/// The switch does not touch the ADR 0040 informational arms, which sit
+/// ahead of the information-quality rule and are not gated by it: an
+/// informational reading still beats an unscored non-informational
+/// `Critical` even with the downgrade disabled. Those arms key on
+/// `is_informational()` (a *classification* the advisory DB published),
+/// not on the fail-closed basis, so the break-glass switch has nothing to
+/// revert there.
+#[test]
+fn merge_informational_preference_is_unaffected_by_the_break_glass_switch() {
+    let purl = "pkg:cargo/proc-macro-error2@2.0.1";
+    let vuln = "RUSTSEC-2026-0173";
+
+    let mut informational = finding(purl, vuln, SeverityThreshold::Low);
+    informational.informational_class = Some("unmaintained".into());
+
+    let unscored_critical = finding(purl, vuln, SeverityThreshold::Critical);
+
+    let winner = merge_collision(&informational, &unscored_critical, false);
+    assert!(winner.is_informational());
+}
+
+/// Two uninformed findings for the same advisory (both backends failed to
+/// read a severity) fall through to the tier comparison unchanged — the
+/// rule fires only on an informed/uninformed pair.
+#[test]
+fn merge_two_unassessed_findings_compare_by_tier() {
+    let purl = "pkg:cargo/x@1.0.0";
+    let vuln = "CVE-9999-0003";
+
+    let unassessed_critical = unassessed_finding(purl, vuln, SeverityThreshold::Critical);
+    let unassessed_low = unassessed_finding(purl, vuln, SeverityThreshold::Low);
+
+    let winner = merge_collision(&unassessed_critical, &unassessed_low, true);
+    assert_eq!(winner.severity, SeverityThreshold::Critical);
+}
+
+/// The orchestrator's default posture: `defaults_for_worker` has the
+/// information-quality rule **on**, so a deployment that sets nothing gets
+/// the fix. The knob exists to turn it off.
+#[test]
+fn scan_orchestration_config_defaults_allow_informed_downgrade() {
+    let cfg = ScanOrchestrationConfig::defaults_for_worker("w1");
+    assert!(cfg.allow_informed_downgrade);
 }
 
 // ===========================================================================
@@ -895,6 +1070,73 @@ async fn run_scan_dedupes_findings_across_backends_with_severity_preference() {
     };
     assert_eq!(findings.len(), 1, "duplicate (purl, vuln) must dedupe");
     assert_eq!(findings[0].severity, SeverityThreshold::Critical);
+}
+
+/// Run one scan over two backends that collide on the same purl+advisory —
+/// `trivy` could not read a severity and emitted the SUP-4 `Critical`
+/// floor, `osv` scored it `Medium` — with the break-glass switch set to
+/// `allow_informed_downgrade`. Returns the single merged finding.
+///
+/// Driven through `run_scan` rather than the pure helper so the whole path
+/// is exercised: the flag must actually travel config → use case → merge.
+async fn run_scan_over_colliding_backends(allow_informed_downgrade: bool) -> Finding {
+    let purl = "pkg:cargo/rsa@0.9.10";
+    let vuln = "RUSTSEC-2023-0071";
+    let trivy: Arc<dyn ScannerPort> = Arc::new(MockScanner::new(
+        "trivy",
+        Ok(vec![unassessed_finding(
+            purl,
+            vuln,
+            SeverityThreshold::Critical,
+        )]),
+    ));
+    let osv: Arc<dyn ScannerPort> = Arc::new(MockScanner::new(
+        "osv",
+        Ok(vec![finding_with_score(
+            purl,
+            vuln,
+            SeverityThreshold::Medium,
+            5.9,
+        )]),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy);
+    scanners.insert("osv".into(), osv);
+
+    let (uc, artifacts, repositories) = make_uc_with_merge_switch(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        Arc::new(MockAdvisory::ok(vec![])),
+        allow_informed_downgrade,
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed { mut findings, .. } = outcome else {
+        panic!("expected Completed");
+    };
+    assert_eq!(findings.len(), 1, "collision must dedup to one finding");
+    findings.remove(0)
+}
+
+/// Default posture: the scored reading reaches `ScanRunOutcome`, so the
+/// artifact is judged on a verdict a backend actually reached.
+#[tokio::test]
+async fn run_scan_prefers_the_informed_reading_over_the_unassessed_floor() {
+    let winner = run_scan_over_colliding_backends(true).await;
+    assert_eq!(winner.severity, SeverityThreshold::Medium);
+}
+
+/// The same scan with the break-glass switch engaged. The config flag must
+/// reach `prefer_replacement` — a flag the merge never reads would be an
+/// inert operator surface (ADR 0015), and this is what pins that it is
+/// not: identical inputs, opposite outcome.
+#[tokio::test]
+async fn run_scan_break_glass_switch_restores_the_fail_closed_floor() {
+    let winner = run_scan_over_colliding_backends(false).await;
+    assert_eq!(winner.severity, SeverityThreshold::Critical);
+    assert_eq!(winner.severity_basis, SeverityBasis::Unassessed);
 }
 
 #[tokio::test]

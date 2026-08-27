@@ -126,6 +126,16 @@ impl FailedBlockEntryDto {
             // ADR 0025 — caller-reachable state precondition (409 at the
             // single-resource boundary); per-version it's a labelled failure.
             AppError::Domain(DomainError::InvalidState(m)) => ("invalid_state", m.clone()),
+            // Storage write contention that survived the adapter's bounded
+            // retry. Per-row and retryable: nothing was applied for THIS
+            // artifact, and re-submitting the same bulk request re-attempts
+            // exactly the entries that carry this kind. Labelled distinctly
+            // from `invariant` so a caller can tell "come back" apart from
+            // "this will never work" — the whole point of keeping the two
+            // apart. The message is the adapter's own text (it names a
+            // SQLSTATE, no caller-supplied or upstream-derived content), so
+            // surfacing it is safe on this admin-only surface.
+            AppError::Domain(DomainError::Contended(m)) => ("contended", m.clone()),
             AppError::Domain(DomainError::ManagedByConfiguration { kind, name }) => (
                 "managed_by_configuration",
                 format!("{kind} {name} is gitops-managed"),

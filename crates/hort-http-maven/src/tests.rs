@@ -2108,3 +2108,21 @@ mod virtual_repo {
         assert_eq!(st, StatusCode::NOT_FOUND);
     }
 }
+
+/// Tripwire: the crate-level `UPSTREAM_PROXY_FORMAT` decides which
+/// per-format upstream-proxy instance every on-miss fetch from this
+/// crate goes through, and therefore the `format` label on
+/// `hort_upstream_fetch_*` and `hort_upstream_insecure_total`. The mock
+/// context maps every served format to one proxy, so a wrong constant
+/// here is invisible to the handler tests — this assertion is what
+/// catches it.
+#[test]
+fn upstream_proxy_format_is_this_crates_served_format() {
+    assert_eq!(UPSTREAM_PROXY_FORMAT, RepositoryFormat::Maven);
+    assert_eq!(UPSTREAM_PROXY_FORMAT.to_string(), "maven");
+    assert!(
+        hort_domain::ports::upstream_proxy::READ_PATH_PROXY_FORMATS
+            .contains(&UPSTREAM_PROXY_FORMAT),
+        "composition only builds instances for READ_PATH_PROXY_FORMATS"
+    );
+}

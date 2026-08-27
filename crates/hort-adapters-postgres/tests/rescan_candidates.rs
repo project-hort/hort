@@ -37,7 +37,6 @@
 //! - `select_stranded_skips_released_artifact_even_with_failed_scan`
 //! - `select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan`
 //! - `select_stranded_skips_rejected_artifact_even_with_failed_scan`
-//! - `select_stranded_skips_is_deleted_artifact_even_with_failed_scan` (#115)
 //! - `select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_failed_job`
 //!
 //! New tests carry `#[serial(hort_pg_db)]` per the crate-wide DB-test
@@ -67,10 +66,7 @@ use hort_domain::ports::rescan_candidates::RescanCandidatesRepository;
 async fn admin_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
     let pool = hort_adapters_postgres::test_support::isolated_db_from(&url).await?;
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrations run cleanly against the test DB");
+    hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
     Some(pool)
 }
 
@@ -753,42 +749,6 @@ async fn select_stranded_skips_quarantined_artifact_with_no_scan_job_under_scan_
         "a job-less quarantined artifact under a scan_backends:[] policy \
          is NOT stranded — it releases via the ScanWaived authority, and \
          must not receive an operator-contradicting scan enqueue"
-    );
-}
-
-// ---------------------------------------------------------------------
-// (b3) is_deleted artifact with a failed scan job → NOT returned.
-//      Mirrors the released/rejected/scan_indeterminate terminal-state
-//      exclusions — a soft-deleted artifact must never be re-picked for
-//      scanning regardless of its quarantine/job history.
-// ---------------------------------------------------------------------
-
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn select_stranded_skips_is_deleted_artifact_even_with_failed_scan() {
-    let _serial = lock_serial().await;
-    let Some(pool) = admin_pool().await else {
-        return;
-    };
-    let repo = seed_repo(&pool).await;
-    let artifact = seed_artifact(&pool, repo, Some("quarantined"), None).await;
-    let _job = seed_scan_job(&pool, repo, artifact, "failed").await;
-    sqlx::query("UPDATE public.artifacts SET is_deleted = true WHERE id = $1")
-        .bind(artifact)
-        .execute(&pool)
-        .await
-        .expect("mark artifact is_deleted for the exclusion test");
-
-    let port = PgRescanCandidatesRepository::new(pool.clone());
-    let rows = port
-        .select_stranded(1000)
-        .await
-        .expect("select_stranded Ok");
-
-    assert!(
-        filter_to(&rows, &[artifact]).is_empty(),
-        "a soft-deleted artifact must NEVER be re-picked for scanning, \
-         regardless of quarantine_status or scan-job history"
     );
 }
 

@@ -37,10 +37,7 @@ use hort_domain::types::sbom::{Ecosystem, SbomComponent};
 async fn admin_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
     let pool = hort_adapters_postgres::test_support::isolated_db_from(&url).await?;
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrations run cleanly against the test DB");
+    hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
     Some(pool)
 }
 
@@ -347,7 +344,7 @@ async fn commit_scan_result_constraint_violation_rolls_back_event_append() {
             .await
             .expect("PgEventStore::new"),
     );
-    let artifact_repo = Arc::new(PgArtifactRepository::new(pool.clone()));
+    let artifact_repo = Arc::new(PgArtifactRepository::new(pool.clone(), event_store.clone()));
     let metadata_repo = Arc::new(PgArtifactMetadataRepository::new(pool.clone()));
     let lifecycle = PgArtifactLifecycle::new(
         event_store.clone(),
@@ -396,9 +393,9 @@ async fn commit_scan_result_constraint_violation_rolls_back_event_append() {
         rejection_reason: None,
         quarantine_window_start: None,
         quarantine_deadline: None,
+        deleted_at: None,
         upstream_published_at: None,
         uploaded_by: None,
-        is_deleted: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };

@@ -130,6 +130,11 @@ pub struct MockArtifactRepository {
     /// age-evidence read must fall back on the mint instant (a full
     /// window), never on an invented earlier instant.
     first_seen_errors: Mutex<std::collections::VecDeque<DomainError>>,
+    /// Every accepted [`ArtifactRepository::delete`] call, in order, with
+    /// the actor it was attributed to. Lets a test assert that the
+    /// caller's identity actually reaches the port instead of being
+    /// dropped on the way — the event attribution depends on it.
+    deletions: Mutex<Vec<(Uuid, Actor)>>,
 }
 
 impl MockArtifactRepository {
@@ -141,7 +146,13 @@ impl MockArtifactRepository {
             pypi_wheels_without_kind_filter: Mutex::new(None),
             oci_image_manifests_without_kind_filter: Mutex::new(None),
             first_seen_errors: Mutex::new(std::collections::VecDeque::new()),
+            deletions: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Accepted deletions in call order, each with its attributed actor.
+    pub fn deletions(&self) -> Vec<(Uuid, Actor)> {
+        self.deletions.lock().unwrap().clone()
     }
 
     /// Arm the next
@@ -248,9 +259,9 @@ impl MockArtifactRepository {
                 rejection_reason: None,
                 quarantine_window_start: None,
                 quarantine_deadline: None,
+                deleted_at: None,
                 upstream_published_at: None,
                 uploaded_by: None,
-                is_deleted: false,
                 created_at: now,
                 updated_at: now,
             };
@@ -384,8 +395,16 @@ impl ArtifactRepository for MockArtifactRepository {
         Box::pin(async move { Ok(Page { items, total }) })
     }
 
-    fn delete(&self, id: Uuid) -> BoxFut<'_, DomainResult<()>> {
+    fn delete(&self, id: Uuid, actor: Actor) -> BoxFut<'_, DomainResult<()>> {
+        // Production soft-deletes and keeps the row; the mock drops it,
+        // which is observationally the same for every read here — all of
+        // them are live reads, and live reads exclude deleted artifacts.
+        // A second delete of the same id therefore also yields NotFound,
+        // matching the adapter's idempotency contract.
         let existed = self.artifacts.lock().unwrap().remove(&id).is_some();
+        if existed {
+            self.deletions.lock().unwrap().push((id, actor));
+        }
         Box::pin(async move {
             if existed {
                 Ok(())
@@ -500,7 +519,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .lock()
             .unwrap()
             .values()
-            .filter(|a| a.repository_id == repository_id && !a.is_deleted)
+            .filter(|a| a.repository_id == repository_id)
             .map(|a| a.name.clone())
             .find(|name| name.to_lowercase().replace('_', "-") == collision_key);
         Box::pin(async move { Ok(found) })
@@ -527,7 +546,6 @@ impl ArtifactRepository for MockArtifactRepository {
                         a.quarantine_status,
                         QuarantineStatus::Quarantined | QuarantineStatus::Released
                     )
-                    && !a.is_deleted
             })
             .cloned()
             .collect();
@@ -569,7 +587,6 @@ impl ArtifactRepository for MockArtifactRepository {
             .values()
             .filter(|a| {
                 a.quarantine_status == QuarantineStatus::Rejected
-                    && !a.is_deleted
                     && match &filter {
                         Some(repo_ids) => repo_ids.contains(&a.repository_id),
                         // No filter seeded — return all rejected
@@ -617,11 +634,10 @@ impl ArtifactRepository for MockArtifactRepository {
                 matches!(
                     a.quarantine_status,
                     QuarantineStatus::Quarantined | QuarantineStatus::Released
-                ) && !a.is_deleted
-                    && match &filter {
-                        Some(repo_ids) => repo_ids.contains(&a.repository_id),
-                        None => true,
-                    }
+                ) && match &filter {
+                    Some(repo_ids) => repo_ids.contains(&a.repository_id),
+                    None => true,
+                }
             })
             .cloned()
             .collect();
@@ -659,7 +675,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .lock()
             .unwrap()
             .values()
-            .filter(|a| a.repository_id == repository_id && a.name == pkg && !a.is_deleted)
+            .filter(|a| a.repository_id == repository_id && a.name == pkg)
             .filter_map(|a| {
                 a.version
                     .clone()
@@ -687,7 +703,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .lock()
             .unwrap()
             .values()
-            .filter(|a| a.repository_id == repository_id && a.name == pkg && !a.is_deleted)
+            .filter(|a| a.repository_id == repository_id && a.name == pkg)
             .filter_map(|a| {
                 a.version
                     .clone()
@@ -701,7 +717,6 @@ impl ArtifactRepository for MockArtifactRepository {
     /// Mock for the backfill candidacy query. Mirrors
     /// the SQL contract:
     /// - `path LIKE '%.whl'` (wheel-shaped artifacts only)
-    /// - `is_deleted = false`
     /// - NOT EXISTS a `content_references` row for `(artifact, kind)`
     ///
     /// The mock has no direct handle to the `MockContentReferenceIndex`;
@@ -731,7 +746,6 @@ impl ArtifactRepository for MockArtifactRepository {
             .values()
             .filter(|a| {
                 a.path.ends_with(".whl")
-                    && !a.is_deleted
                     && match &filter {
                         // No filter seeded — every wheel is a candidate.
                         None => true,
@@ -774,7 +788,6 @@ impl ArtifactRepository for MockArtifactRepository {
             .values()
             .filter(|a| {
                 a.path.starts_with("manifests/sha256:")
-                    && !a.is_deleted
                     && match &filter {
                         None => true,
                         Some(allowed) => allowed.contains(&a.id),
@@ -3375,9 +3388,9 @@ pub fn sample_artifact(status: QuarantineStatus) -> Artifact {
         // on read paths; fixtures that exercise `Retry-After` set it
         // explicitly.
         quarantine_deadline: None,
+        deleted_at: None,
         upstream_published_at: None,
         uploaded_by: None,
-        is_deleted: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -6948,31 +6961,26 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// The mock mirrors the Pg adapter: matches `(repository_id, name)`,
-    /// excludes soft-deleted rows, drops null-version rows, and returns
-    /// raw `(version, quarantine_status)` pairs. This unit test pins
-    /// each axis so the mock cannot silently drift from the adapter
-    /// contract (the mock is the authority for `hort-app` use-case tests
-    /// downstream of this port).
+    /// drops null-version rows, and returns raw `(version,
+    /// quarantine_status)` pairs. This unit test pins each axis so the
+    /// mock cannot silently drift from the adapter contract (the mock is
+    /// the authority for `hort-app` use-case tests downstream of this
+    /// port).
     #[tokio::test]
-    async fn mock_package_version_status_filters_repo_name_deleted_and_null_version() {
+    async fn mock_package_version_status_filters_repo_name_and_null_version() {
         let mock = MockArtifactRepository::new();
         let repo_a = Uuid::new_v4();
         let repo_b = Uuid::new_v4();
 
         // helper: clone-and-edit the shared fixture so each insert lands
         // a unique row.
-        let make = |repo: Uuid,
-                    name: &str,
-                    version: Option<&str>,
-                    status: QuarantineStatus,
-                    is_deleted: bool| {
+        let make = |repo: Uuid, name: &str, version: Option<&str>, status: QuarantineStatus| {
             let mut a = sample_artifact(status);
             a.id = Uuid::new_v4();
             a.repository_id = repo;
             a.name = name.into();
             a.name_as_published = name.into();
             a.version = version.map(str::to_owned);
-            a.is_deleted = is_deleted;
             a
         };
 
@@ -6982,45 +6990,27 @@ mod tests {
             "leftpad",
             Some("1.0.0"),
             QuarantineStatus::None,
-            false,
         ));
         mock.insert(make(
             repo_a,
             "leftpad",
             Some("1.1.0"),
             QuarantineStatus::Quarantined,
-            false,
         ));
         mock.insert(make(
             repo_a,
             "leftpad",
             Some("1.2.0"),
             QuarantineStatus::Released,
-            false,
-        ));
-        // Excluded: soft-deleted.
-        mock.insert(make(
-            repo_a,
-            "leftpad",
-            Some("9.9.0"),
-            QuarantineStatus::Released,
-            true,
         ));
         // Excluded: null version.
-        mock.insert(make(
-            repo_a,
-            "leftpad",
-            None,
-            QuarantineStatus::Released,
-            false,
-        ));
+        mock.insert(make(repo_a, "leftpad", None, QuarantineStatus::Released));
         // Excluded: different name in same repo.
         mock.insert(make(
             repo_a,
             "other-pkg",
             Some("1.0.0"),
             QuarantineStatus::Released,
-            false,
         ));
         // Excluded: same name in different repo.
         mock.insert(make(
@@ -7028,7 +7018,6 @@ mod tests {
             "leftpad",
             Some("2.0.0"),
             QuarantineStatus::Released,
-            false,
         ));
 
         let triples = mock

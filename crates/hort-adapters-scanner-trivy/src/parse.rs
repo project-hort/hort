@@ -153,7 +153,7 @@ pub(crate) fn aggregate_findings(report: &TrivyReport) -> Vec<Finding> {
 /// validation — the caller filters via [`Finding::validate`].
 fn vuln_to_finding(trivy_type: &str, vuln: &TrivyVulnerability) -> Finding {
     let purl = build_purl(trivy_type, &vuln.pkg_name, &vuln.installed_version);
-    let severity = trivy_severity_to_threshold(&vuln.severity);
+    let (severity, severity_basis) = trivy_severity_to_threshold(&vuln.severity);
     let cvss_score = extract_cvss(vuln);
     let title = vuln
         .title
@@ -227,6 +227,10 @@ fn vuln_to_finding(trivy_type: &str, vuln: &TrivyVulnerability) -> Finding {
         // populated only by the OSV adapters' `database_specific.informational`
         // discriminator.
         informational_class: None,
+        // `Unassessed` exactly when the severity band was unreadable and
+        // `trivy_severity_to_threshold` fell back to the SUP-4 `Critical`
+        // floor; `Assessed` for every band Trivy actually reported.
+        severity_basis,
     }
 }
 

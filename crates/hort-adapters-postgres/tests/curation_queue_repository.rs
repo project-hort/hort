@@ -41,10 +41,7 @@ use hort_domain::ports::curation_queue_repository::{CurationQueueFilter, Curatio
 async fn maybe_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
     let pool = hort_adapters_postgres::test_support::isolated_db_from(&url).await?;
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrations run cleanly against the test DB");
+    hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
     Some(pool)
 }
 
@@ -77,14 +74,12 @@ async fn seed_repo(pool: &PgPool, format_literal: &'static str) -> Uuid {
 }
 
 /// Seed an artifact row in the requested quarantine state.
-#[allow(clippy::too_many_arguments)]
 async fn seed_artifact(
     pool: &PgPool,
     repo: Uuid,
     name: &str,
     version: &str,
     quarantine_status: Option<&str>,
-    is_deleted: bool,
     created_at: DateTime<Utc>,
     quarantine_window_start: Option<DateTime<Utc>>,
 ) -> Uuid {
@@ -95,12 +90,12 @@ async fn seed_artifact(
         r#"INSERT INTO public.artifacts (
                id, repository_id, name, name_as_published, version, path,
                size_bytes, checksum_sha256, content_type, storage_key,
-               quarantine_status, is_deleted, created_at, updated_at,
+               quarantine_status, created_at, updated_at,
                quarantine_window_start
            ) VALUES (
                $1, $2, $3, $3, $4, $5,
                0, $6, 'application/octet-stream', $6,
-               $7, $8, $9, $9, $10
+               $7, $8, $8, $9
            )"#,
     )
     .bind(id)
@@ -110,7 +105,6 @@ async fn seed_artifact(
     .bind(format!("{name}/{version}/{key}.tgz"))
     .bind(&sha256)
     .bind(quarantine_status)
-    .bind(is_deleted)
     .bind(created_at)
     .bind(quarantine_window_start)
     .execute(pool)
@@ -262,7 +256,6 @@ async fn list_queue_returns_quarantined_artifact_with_findings() {
         "pkg",
         "1.0",
         Some("quarantined"),
-        false,
         now,
         Some(window_start),
     )
@@ -317,29 +310,18 @@ async fn list_queue_status_filter_isolates_rejected() {
         "p",
         "1.0",
         Some("quarantined"),
-        false,
         now,
         Some(now),
     )
     .await;
-    let id_rejected = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "2.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id_rejected =
+        seed_artifact(&pool, repo_id, "p", "2.0", Some("rejected"), now, Some(now)).await;
     let id_indeterminate = seed_artifact(
         &pool,
         repo_id,
         "p",
         "3.0",
         Some("scan_indeterminate"),
-        false,
         now,
         Some(now),
     )
@@ -382,7 +364,6 @@ async fn list_queue_scan_indeterminate_surfaces() {
         "p",
         "1.0",
         Some("scan_indeterminate"),
-        false,
         now,
         Some(now),
     )
@@ -399,60 +380,6 @@ async fn list_queue_scan_indeterminate_surfaces() {
         .expect("list_queue");
 
     assert!(rows.iter().any(|r| r.artifact_id == id));
-    cleanup_repo(&pool, repo_id).await;
-}
-
-// ---------------------------------------------------------------------------
-// Test 4 — `is_deleted = true` artifacts are excluded.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn list_queue_excludes_soft_deleted_rows() {
-    let Some(pool) = maybe_pool().await else {
-        return;
-    };
-    let repo_id = seed_repo(&pool, "npm").await;
-    let now = Utc::now();
-    let _id_deleted = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "1.0",
-        Some("quarantined"),
-        true, // is_deleted
-        now,
-        Some(now),
-    )
-    .await;
-    let id_live = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "2.0",
-        Some("quarantined"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
-
-    let adapter = PgCurationQueueRepository::new(pool.clone());
-    let rows = adapter
-        .list_queue(CurationQueueFilter {
-            repository_id: Some(repo_id),
-            ..CurationQueueFilter::default()
-        })
-        .await
-        .expect("list_queue");
-
-    let ids: Vec<Uuid> = rows.iter().map(|r| r.artifact_id).collect();
-    assert!(ids.contains(&id_live));
-    assert!(
-        !rows.iter().any(|r| r.artifact_id == _id_deleted),
-        "soft-deleted artifact must not surface"
-    );
-
     cleanup_repo(&pool, repo_id).await;
 }
 
@@ -479,7 +406,6 @@ async fn list_queue_limit_clamps_at_500() {
             "p",
             &format!("1.{i}.0"),
             Some("quarantined"),
-            false,
             now - Duration::seconds(i),
             Some(now),
         )
@@ -534,7 +460,6 @@ async fn list_queue_cross_repo_per_row_deadline_differs_by_policy() {
         "pkg",
         "1.0",
         Some("quarantined"),
-        false,
         now,
         Some(window_start),
     )
@@ -545,7 +470,6 @@ async fn list_queue_cross_repo_per_row_deadline_differs_by_policy() {
         "pkg",
         "1.0",
         Some("quarantined"),
-        false,
         now,
         Some(window_start),
     )
@@ -597,17 +521,7 @@ async fn list_queue_lateral_extracts_rejection_reason_scanner() {
     };
     let repo_id = seed_repo(&pool, "npm").await;
     let now = Utc::now();
-    let id = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "1.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id = seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
     // Unit variant: bare-string payload.
     seed_artifact_rejected_event(&pool, id, 0, json!("Scanner")).await;
 
@@ -637,17 +551,7 @@ async fn list_queue_lateral_extracts_rejection_reason_curator() {
     };
     let repo_id = seed_repo(&pool, "npm").await;
     let now = Utc::now();
-    let id = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "1.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id = seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
     let curator_id = Uuid::new_v4();
     // Tuple variant: single-key object payload.
     seed_artifact_rejected_event(
@@ -684,17 +588,7 @@ async fn list_queue_lateral_extracts_rejection_reason_curation_retroactive() {
     };
     let repo_id = seed_repo(&pool, "npm").await;
     let now = Utc::now();
-    let id = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "1.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id = seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
     let rule_id = Uuid::new_v4();
     seed_artifact_rejected_event(
         &pool,
@@ -751,17 +645,8 @@ async fn list_queue_filter_by_rejection_reason_kind_curator() {
     };
     let repo_id = seed_repo(&pool, "npm").await;
     let now = Utc::now();
-    let id_curator = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "1.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id_curator =
+        seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
     seed_artifact_rejected_event(
         &pool,
         id_curator,
@@ -769,17 +654,8 @@ async fn list_queue_filter_by_rejection_reason_kind_curator() {
         json!({ "Curator": { "curator_id": Uuid::new_v4() } }),
     )
     .await;
-    let id_scanner = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "2.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id_scanner =
+        seed_artifact(&pool, repo_id, "p", "2.0", Some("rejected"), now, Some(now)).await;
     seed_artifact_rejected_event(&pool, id_scanner, 0, json!("Scanner")).await;
 
     let adapter = PgCurationQueueRepository::new(pool.clone());
@@ -821,17 +697,8 @@ async fn list_queue_filter_by_rejection_reason_kind_scanner_excludes_curator() {
     };
     let repo_id = seed_repo(&pool, "npm").await;
     let now = Utc::now();
-    let id_curator = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "1.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id_curator =
+        seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
     seed_artifact_rejected_event(
         &pool,
         id_curator,
@@ -839,17 +706,8 @@ async fn list_queue_filter_by_rejection_reason_kind_scanner_excludes_curator() {
         json!({ "Curator": { "curator_id": Uuid::new_v4() } }),
     )
     .await;
-    let id_scanner = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "2.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id_scanner =
+        seed_artifact(&pool, repo_id, "p", "2.0", Some("rejected"), now, Some(now)).await;
     seed_artifact_rejected_event(&pool, id_scanner, 0, json!("Scanner")).await;
 
     let adapter = PgCurationQueueRepository::new(pool.clone());
@@ -890,17 +748,8 @@ async fn list_queue_filter_by_rejection_reason_kind_curation_retroactive() {
     };
     let repo_id = seed_repo(&pool, "npm").await;
     let now = Utc::now();
-    let id_retro = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "1.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id_retro =
+        seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
     seed_artifact_rejected_event(
         &pool,
         id_retro,
@@ -908,17 +757,8 @@ async fn list_queue_filter_by_rejection_reason_kind_curation_retroactive() {
         json!({ "CurationRetroactive": { "rule_id": Uuid::new_v4() } }),
     )
     .await;
-    let id_scanner = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "2.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id_scanner =
+        seed_artifact(&pool, repo_id, "p", "2.0", Some("rejected"), now, Some(now)).await;
     seed_artifact_rejected_event(&pool, id_scanner, 0, json!("Scanner")).await;
 
     let adapter = PgCurationQueueRepository::new(pool.clone());
@@ -959,17 +799,7 @@ async fn list_queue_rejected_without_event_has_none_rejection_reason_kind() {
     };
     let repo_id = seed_repo(&pool, "npm").await;
     let now = Utc::now();
-    let id = seed_artifact(
-        &pool,
-        repo_id,
-        "p",
-        "1.0",
-        Some("rejected"),
-        false,
-        now,
-        Some(now),
-    )
-    .await;
+    let id = seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
     // No `ArtifactRejected` event seeded.
 
     let adapter = PgCurationQueueRepository::new(pool.clone());

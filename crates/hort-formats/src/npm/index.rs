@@ -27,22 +27,41 @@
 //!         "tarball": "<base_url>/npm/<repo_key derived from base_url+pkg>/<name>/-/<basename>",
 //!         "shasum":  "<sha1-hex>",
 //!         "integrity": "<sri>"   // present iff payload.integrity.is_some()
-//!       }
+//!       },
+//!       // …plus each install-v1 whitelist key the payload's `manifest`
+//!       // carries (`dependencies`, `engines`, `deprecated`, …), verbatim.
+//!       // A key the source did not publish is simply absent.
 //!     },
 //!     ...
 //!   },
-//!   "dist-tags": { "latest": "<served-max>" }   // omitted when entries is empty
+//!   // The served tag map (stored map ∩ served set) plus the derived
+//!   // `latest` fallback. Omitted entirely when `entries` is empty.
+//!   "dist-tags": { "latest": "1.2.3", "next": "2.0.0-rc.1" }
 //! }
 //! ```
 //!
-//! # `dist-tags.latest` invariant
+//! # `dist-tags` invariant
 //!
-//! `dist-tags.latest` must point at the **resolved-latest of the
-//! served set** — i.e. the max over `entries` per
-//! [`BuildContext::ordering`], computed *after* the filter pipeline.
-//! The builder sees only post-filter entries, so picking
-//! `max_by(ordering)` over `entries` IS the served-max. An empty served
-//! set produces a packument with empty `versions{}` and **no `dist-tags`
+//! The map the builder emits is the **stored** tag map — upstream's for
+//! a proxy repo, the maintainer's `mutable_refs` rows for a hosted one —
+//! already intersected with the served set by [`intersect_dist_tags`].
+//! A tag whose target version is not served is dropped, never rewritten.
+//! Tags are otherwise emitted verbatim: hort is not their author.
+//!
+//! `latest` is the one tag the builder will synthesise, and only when
+//! the served map has none (the stored `latest` was dropped by the
+//! intersection, or was never set). Then it points at the
+//! **resolved-latest of the served set, excluding pre-releases** —
+//! i.e. the max over `entries` per [`BuildContext::ordering`] whose
+//! [`VersionOrdering::is_prerelease`](hort_app::use_cases::index_serve_filter::VersionOrdering::is_prerelease)
+//! is `false`, computed *after* the filter pipeline. This mirrors the
+//! npm ecosystem contract: a pre-release is never `latest` while any
+//! release is served, so a bare `npm i`/`pnpm add` never installs a
+//! canary. If every served entry is a pre-release, `latest` falls back
+//! to the pre-release max (a pre-release-only package still gets a
+//! usable tag) — the builder sees only post-filter entries, so this
+//! fallback IS the served-max in that case. An empty served set
+//! produces a packument with empty `versions{}` and **no `dist-tags`
 //! block at all** — a client following an absent `latest` falls back to
 //! its lockfile or fails the same way as "nothing servable".
 //!
@@ -63,23 +82,19 @@
 //! uses upstream's per-version `name` after the canonical
 //! [`validate_npm_name`](crate::npm::validate_npm_name) check.
 //!
-//! # Why not preserve upstream extras (`time`, `maintainers`, …)
+//! # Why the per-version field set is a whitelist
 //!
 //! The unified packument carries exactly what [`NpmVersionPayload`]
-//! declares — no upstream `time`, no `maintainers`, no `bugs`, no
-//! README. Two reasons:
-//!
-//! 1. The closed-payload-sum is the spine of the format-agnostic
-//!    pipeline. Carrying extras would force them onto every payload
-//!    variant or force a passthrough-blob escape hatch that defeats
-//!    the structural contract.
-//! 2. No npm test (router-level or otherwise) checks any upstream
-//!    extra. Both legacy paths (hosted local-CAS, proxy-rewrite) emit
-//!    only what the unified builder now emits or fewer (the hosted
-//!    path emits `time` from `Artifact.created_at`, which no test
-//!    asserts — preserving it would re-introduce per-version
-//!    `created_at` plumbing through the source adapter for no
-//!    observable client gain).
+//! declares: the `name`/`version`/`dist` triple plus
+//! [`NPM_INSTALL_V1_MANIFEST_KEYS`](crate::npm::NPM_INSTALL_V1_MANIFEST_KEYS)
+//! — the npm registry API's abbreviated-metadata (install-v1) field set,
+//! which is what an installer needs to resolve a dependency tree. Full
+//! packument equality is deliberately not the target: no `time`, no
+//! `maintainers`, no `bugs`, no README, no `scripts`, no
+//! `devDependencies`. Carrying arbitrary upstream extras would need a
+//! passthrough-blob escape hatch on the closed payload sum that is the
+//! spine of the format-agnostic pipeline; a fixed whitelist keeps the
+//! served surface a contract both sources can satisfy verbatim.
 //!
 //! # Tests
 //!
@@ -96,19 +111,144 @@
 //! Anti-enumeration tests live in `hort-http-npm/src/serve.rs`
 //! (the unified handler is the anti-enumeration assertion site).
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use hort_app::use_cases::index_serve::{
-    BuildContext, IndexBuilder, PerVersionPayload, VersionEntry,
+    BuildContext, IndexBuilder, PerVersionPayload, VersionEntry, VersionOrdering,
 };
 
 pub use hort_app::use_cases::index_serve::NpmVersionPayload;
 
+/// Intersect a stored `dist-tags` map with the **post-filter served
+/// set**: a tag whose target version is not served is DROPPED, never
+/// rewritten to something that is.
+///
+/// This is the whole of the pass-through contract's safety property. The
+/// stored map is authored elsewhere — upstream for a proxy repo, the
+/// maintainer's `mutable_refs` rows for a hosted one — and neither
+/// author knows what hort will serve. Rewriting a dropped tag to a
+/// nearby served version would silently hand a client a different
+/// artifact than the tag names; dropping it makes the tag absent, which
+/// every npm client already handles.
+///
+/// `latest` is NOT special here: this function is pure intersection.
+/// The "dropped or absent `latest` falls back to
+/// [`resolve_served_latest`]" half of the contract lives at the two
+/// emission sites ([`NpmIndexBuilder::build`] and the abbreviated
+/// per-version/tag route), so the derivation keeps exactly one
+/// definition.
+pub fn intersect_dist_tags(
+    stored: &BTreeMap<String, String>,
+    entries: &[VersionEntry],
+) -> BTreeMap<String, String> {
+    if stored.is_empty() {
+        return BTreeMap::new();
+    }
+    let served: std::collections::HashSet<&str> =
+        entries.iter().map(|e| e.version.as_str()).collect();
+    stored
+        .iter()
+        .filter(|(_, version)| served.contains(version.as_str()))
+        .map(|(tag, version)| (tag.clone(), version.clone()))
+        .collect()
+}
+
+/// Resolve `dist-tags.latest` over a **post-filter served** set: the
+/// max non-prerelease version per `ordering`, falling back to the
+/// unfiltered max only when every served entry is a prerelease.
+/// `None` for an empty served set — the wire-equivalent of "nothing
+/// servable" (no `dist-tags` block in the packument, 404 on the
+/// abbreviated per-version `latest` route).
+///
+/// This is the single definition of the npm ecosystem's "a pre-release
+/// never wins `latest` while a release is served" contract
+/// (see the module docs above); [`NpmIndexBuilder::build`] and the
+/// abbreviated per-version/tag route (`hort-http-npm::serve`) both
+/// call it so the invariant cannot drift between the two callers.
+pub fn resolve_served_latest<'a>(
+    entries: &'a [VersionEntry],
+    ordering: &dyn VersionOrdering,
+) -> Option<&'a str> {
+    entries
+        .iter()
+        .map(|e| e.version.as_str())
+        .filter(|v| !ordering.is_prerelease(v))
+        .max_by(|a, b| ordering.compare(a, b))
+        .or_else(|| {
+            entries
+                .iter()
+                .map(|e| e.version.as_str())
+                .max_by(|a, b| ordering.compare(a, b))
+        })
+}
+
+/// Compose the per-version JSON object shared by the full packument
+/// builder and the abbreviated per-version route: `name`, `version`,
+/// `dist`, then the install-v1 manifest whitelist the payload carries,
+/// merged in verbatim. A whitelist key is never `name`/`version`/`dist`,
+/// so the merge cannot displace the triple.
+/// `None` for a non-`Npm` payload (cross-format mis-tag — see
+/// [`NpmIndexBuilder::build`]'s panics section).
+pub fn version_entry_json(base_url: &str, entry: &VersionEntry) -> Option<serde_json::Value> {
+    let PerVersionPayload::Npm(payload) = &entry.payload else {
+        return None;
+    };
+
+    let tarball_url = format!(
+        "{base_url}/{name}/-/{basename}",
+        name = payload.name_as_published,
+        basename = payload.tarball_basename,
+    );
+    let mut dist = serde_json::Map::new();
+    dist.insert(
+        "tarball".to_string(),
+        serde_json::Value::String(tarball_url),
+    );
+    dist.insert(
+        "shasum".to_string(),
+        serde_json::Value::String(payload.shasum.clone()),
+    );
+    if let Some(sri) = payload.integrity.as_ref() {
+        dist.insert(
+            "integrity".to_string(),
+            serde_json::Value::String(sri.clone()),
+        );
+    }
+
+    let mut out = serde_json::Map::with_capacity(3 + payload.manifest.len());
+    out.insert(
+        "name".to_string(),
+        serde_json::Value::String(payload.name_as_published.clone()),
+    );
+    out.insert(
+        "version".to_string(),
+        serde_json::Value::String(entry.version.clone()),
+    );
+    out.insert("dist".to_string(), serde_json::Value::Object(dist));
+    for (key, value) in &payload.manifest {
+        out.insert(key.clone(), value.clone());
+    }
+    Some(serde_json::Value::Object(out))
+}
+
 /// npm `IndexBuilder` — emits the packument JSON from a post-filter
 /// `Vec<VersionEntry>`.
 ///
-/// Stateless; the per-format serve handler constructs an instance per
-/// request (cheap — it's a unit struct). The Item-1 [`IndexBuilder`]
-/// trait contract is "stateless wire-shape emitter"; this matches.
+/// Carries the request's **served** `dist-tags` map — the stored map
+/// already intersected with the served set by [`intersect_dist_tags`].
+/// The per-format serve handler constructs one instance per request, so
+/// the builder holds no state across requests; the map is per-call input
+/// that is not per-version, exactly like [`BuildContext`]'s fields. It
+/// lives on the builder rather than on `BuildContext` because
+/// `BuildContext` is the format-agnostic seam every builder shares
+/// (PyPI, Cargo, Maven), and a tag map is npm's own entity — putting it
+/// there would make three other formats carry a field they can only pass
+/// empty.
+///
+/// [`Self::default()`] builds with no stored tags, which is the
+/// pre-pass-through behaviour: `dist-tags.latest` is derived from the
+/// served set alone.
 ///
 /// # Panics
 ///
@@ -122,19 +262,45 @@ pub use hort_app::use_cases::index_serve::NpmVersionPayload;
 /// is unreachable on the production hot path. Pinning it behind a
 /// warn rather than a `panic!` keeps the serve-time error mode the
 /// same as `rewrite_packument`'s parse-failure passthrough.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NpmIndexBuilder;
+#[derive(Debug, Default, Clone)]
+pub struct NpmIndexBuilder {
+    /// Served `dist-tags` — the stored map ∩ the served set. Emitted
+    /// verbatim; the only value this builder ever synthesises is the
+    /// `latest` fallback below.
+    dist_tags: BTreeMap<String, String>,
+}
+
+impl NpmIndexBuilder {
+    /// Build with an already-intersected tag map (see
+    /// [`intersect_dist_tags`]). Entries are emitted verbatim.
+    pub fn new(dist_tags: BTreeMap<String, String>) -> Self {
+        Self { dist_tags }
+    }
+}
 
 impl IndexBuilder for NpmIndexBuilder {
     fn build(&self, ctx: BuildContext<'_>, entries: Vec<VersionEntry>) -> Bytes {
-        // Pre-compute the served-max over the post-filter entries.
-        // `dist-tags.latest` points here. An empty served set produces
-        // no `dist-tags` block (the wire-equivalent of "no servable
-        // latest").
-        let latest: Option<&str> = entries
-            .iter()
-            .map(|e| e.version.as_str())
-            .max_by(|a, b| ctx.ordering.compare(a, b));
+        // `latest` fallback: the served tag map wins verbatim when it
+        // carries one (the maintainer's / upstream's choice survived the
+        // intersection). Only a dropped or absent `latest` is derived —
+        // the max over non-prerelease entries, falling back to the
+        // unfiltered max when the served set is all-prerelease. An empty
+        // served set produces no `dist-tags` block at all (the
+        // wire-equivalent of "no servable latest").
+        let mut dist_tags = if entries.is_empty() {
+            // Nothing servable → no tags at all, whatever was stored. In
+            // production the intersection has already emptied the map;
+            // the guard is here so the "no dist-tags block for an empty
+            // served set" invariant holds at the emission site itself.
+            BTreeMap::new()
+        } else {
+            self.dist_tags.clone()
+        };
+        if !entries.is_empty() && !dist_tags.contains_key("latest") {
+            if let Some(derived) = resolve_served_latest(&entries, ctx.ordering) {
+                dist_tags.insert("latest".to_string(), derived.to_string());
+            }
+        }
 
         let mut versions = serde_json::Map::new();
         for entry in &entries {
@@ -143,50 +309,18 @@ impl IndexBuilder for NpmIndexBuilder {
             // enforced at the use-case layer not at the builder layer,
             // so the match arm is reachable in principle. Skip with a
             // structured warn (degraded packument, never a panic).
-            let PerVersionPayload::Npm(payload) = &entry.payload else {
-                tracing::warn!(
-                    version = %entry.version,
-                    "npm packument builder: skipping VersionEntry with non-Npm payload \
-                     (cross-format mis-tag — should be unreachable)",
-                );
-                continue;
-            };
-
-            // Compose the per-version `dist` object. `integrity` is
-            // included only when the source supplied one (the npm
-            // convention is to omit absent SRI rather than emit
-            // `null`). `shasum` is always emitted (defaults to empty
-            // string when absent, matching `unwrap_or_default`).
-            let tarball_url = format!(
-                "{base_url}/{name}/-/{basename}",
-                base_url = ctx.base_url,
-                name = payload.name_as_published,
-                basename = payload.tarball_basename,
-            );
-            let mut dist = serde_json::Map::new();
-            dist.insert(
-                "tarball".to_string(),
-                serde_json::Value::String(tarball_url),
-            );
-            dist.insert(
-                "shasum".to_string(),
-                serde_json::Value::String(payload.shasum.clone()),
-            );
-            if let Some(sri) = payload.integrity.as_ref() {
-                dist.insert(
-                    "integrity".to_string(),
-                    serde_json::Value::String(sri.clone()),
-                );
+            match version_entry_json(ctx.base_url, entry) {
+                Some(v) => {
+                    versions.insert(entry.version.clone(), v);
+                }
+                None => {
+                    tracing::warn!(
+                        version = %entry.version,
+                        "npm packument builder: skipping VersionEntry with non-Npm payload \
+                         (cross-format mis-tag — should be unreachable)",
+                    );
+                }
             }
-
-            versions.insert(
-                entry.version.clone(),
-                serde_json::json!({
-                    "name":    payload.name_as_published,
-                    "version": entry.version,
-                    "dist":    dist,
-                }),
-            );
         }
 
         let mut packument = serde_json::Map::new();
@@ -195,19 +329,15 @@ impl IndexBuilder for NpmIndexBuilder {
             serde_json::Value::String(ctx.package_name.to_string()),
         );
         packument.insert("versions".to_string(), serde_json::Value::Object(versions));
-        // Empty entries → no `dist-tags` block. Mirrors the
-        // Wire-shape for "nothing servable": no dist-tags block. The
-        // client falls back to lockfile-or-error.
-        if let Some(v) = latest {
-            let mut dist_tags = serde_json::Map::new();
-            dist_tags.insert(
-                "latest".to_string(),
-                serde_json::Value::String(v.to_string()),
-            );
-            packument.insert(
-                "dist-tags".to_string(),
-                serde_json::Value::Object(dist_tags),
-            );
+        // Empty served set → empty tag map → no `dist-tags` block at
+        // all. Wire-shape for "nothing servable"; the client falls back
+        // to lockfile-or-error.
+        if !dist_tags.is_empty() {
+            let wire: serde_json::Map<String, serde_json::Value> = dist_tags
+                .into_iter()
+                .map(|(tag, version)| (tag, serde_json::Value::String(version)))
+                .collect();
+            packument.insert("dist-tags".to_string(), serde_json::Value::Object(wire));
         }
 
         // `serde_json::to_vec` on a `serde_json::Map` is infallible
@@ -251,11 +381,21 @@ mod tests {
             tarball_basename: basename.to_string(),
             integrity: integrity.map(str::to_string),
             shasum: shasum.to_string(),
+            manifest: serde_json::Map::new(),
         }
     }
 
     fn build(entries: Vec<VersionEntry>, package: &str, base: &str) -> serde_json::Value {
-        let bytes = NpmIndexBuilder.build(
+        build_with_tags(entries, package, base, BTreeMap::new())
+    }
+
+    fn build_with_tags(
+        entries: Vec<VersionEntry>,
+        package: &str,
+        base: &str,
+        dist_tags: BTreeMap<String, String>,
+    ) -> serde_json::Value {
+        let bytes = NpmIndexBuilder::new(dist_tags).build(
             BuildContext {
                 package_name: package,
                 base_url: base,
@@ -320,6 +460,61 @@ mod tests {
         assert_eq!(json["dist-tags"]["latest"].as_str().unwrap(), "1.0.0");
     }
 
+    #[test]
+    fn manifest_whitelist_merges_alongside_the_name_version_dist_triple() {
+        let mut p = payload("express", "express-1.0.0.tgz", None, "abc123");
+        p.manifest = crate::npm::extract_install_v1_manifest(&serde_json::json!({
+            "name": "express",
+            "dependencies": {"body-parser": "^1.20.0"},
+            "engines": {"node": ">=18"},
+            "deprecated": "moved to @express/core",
+            "scripts": {"test": "mocha"},
+        }));
+        let json = build(
+            vec![entry("1.0.0", p)],
+            "express",
+            "https://r.example/npm/m",
+        );
+        let v = &json["versions"]["1.0.0"];
+        // The triple survives the merge.
+        assert_eq!(v["name"].as_str().unwrap(), "express");
+        assert_eq!(v["version"].as_str().unwrap(), "1.0.0");
+        assert_eq!(
+            v["dist"]["tarball"].as_str().unwrap(),
+            "https://r.example/npm/m/express/-/express-1.0.0.tgz"
+        );
+        // Whitelist keys ride alongside it, verbatim.
+        assert_eq!(
+            v["dependencies"],
+            serde_json::json!({"body-parser": "^1.20.0"})
+        );
+        assert_eq!(v["engines"], serde_json::json!({"node": ">=18"}));
+        assert_eq!(v["deprecated"].as_str().unwrap(), "moved to @express/core");
+        // Out-of-contract keys never reach the wire.
+        assert!(v.get("scripts").is_none());
+        // Absent whitelist keys are absent, not null.
+        assert!(v.get("os").is_none());
+        assert!(v.get("optionalDependencies").is_none());
+    }
+
+    #[test]
+    fn empty_manifest_emits_exactly_the_name_version_dist_triple() {
+        let p = payload("express", "express-1.0.0.tgz", None, "abc123");
+        let json = build(
+            vec![entry("1.0.0", p)],
+            "express",
+            "https://r.example/npm/m",
+        );
+        let mut keys: Vec<&str> = json["versions"]["1.0.0"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["dist", "name", "version"]);
+    }
+
     // -----------------------------------------------------------------
     // 3. `integrity = None` — the key is OMITTED, not emitted as null.
     //    Mirrors the npm convention (`dist.integrity` absent on legacy
@@ -374,6 +569,64 @@ mod tests {
         assert!(versions.contains_key("1.2.0"));
         assert!(versions.contains_key("1.9.0"));
         assert!(versions.contains_key("1.10.0"));
+    }
+
+    // -----------------------------------------------------------------
+    // 4b. dist-tags.latest excludes a semver-greater prerelease while a
+    //     release is served — the npm ecosystem contract that a bare
+    //     `npm i`/`pnpm add` never installs a canary.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn dist_tags_latest_excludes_prerelease_when_release_is_served() {
+        let entries = vec![
+            entry("1.2.8", payload("p", "p-1.2.8.tgz", None, "a")),
+            entry(
+                "1.3.0-canary.0",
+                payload("p", "p-1.3.0-canary.0.tgz", None, "b"),
+            ),
+        ];
+        let json = build(entries, "p", "https://r.example/npm/m");
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.2.8",
+            "a prerelease must never win latest while a release is served, \
+             even though it is semver-greater"
+        );
+        let versions = json["versions"].as_object().unwrap();
+        assert!(
+            versions.contains_key("1.3.0-canary.0"),
+            "the prerelease is still SERVED, only excluded from dist-tags.latest"
+        );
+    }
+
+    #[test]
+    fn dist_tags_latest_falls_back_to_prerelease_max_when_all_prerelease() {
+        let entries = vec![
+            entry("1.0.0-alpha.1", payload("p", "p-a1.tgz", None, "a")),
+            entry("1.0.0-alpha.2", payload("p", "p-a2.tgz", None, "b")),
+        ];
+        let json = build(entries, "p", "https://r.example/npm/m");
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.0.0-alpha.2",
+            "an all-prerelease served set still gets a usable latest tag"
+        );
+    }
+
+    #[test]
+    fn dist_tags_latest_build_metadata_only_version_treated_as_release() {
+        let entries = vec![
+            entry("1.0.0+build.5", payload("p", "p-b5.tgz", None, "a")),
+            entry("1.0.0-rc.1", payload("p", "p-rc1.tgz", None, "b")),
+        ];
+        let json = build(entries, "p", "https://r.example/npm/m");
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.0.0+build.5",
+            "build metadata alone is not a prerelease; it must beat an actual \
+             prerelease for latest"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -456,5 +709,205 @@ mod tests {
                 .unwrap(),
             "https://r.example/npm/m/legacy-name/-/legacy-name-1.0.0.tgz"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `resolve_served_latest` — direct unit tests for the extracted
+    // helper (the builder's `dist-tags.latest` derivation, and the
+    // abbreviated per-version route's `latest` resolution, both call
+    // this one definition).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_served_latest_release_mix_excludes_prerelease() {
+        let entries = vec![
+            entry("1.2.8", payload("p", "p-1.2.8.tgz", None, "a")),
+            entry(
+                "1.3.0-canary.0",
+                payload("p", "p-1.3.0-canary.0.tgz", None, "b"),
+            ),
+        ];
+        assert_eq!(
+            resolve_served_latest(&entries, &NpmSemverOrdering),
+            Some("1.2.8"),
+            "a prerelease must never win latest while a release is served"
+        );
+    }
+
+    #[test]
+    fn resolve_served_latest_all_prerelease_falls_back_to_prerelease_max() {
+        let entries = vec![
+            entry("1.0.0-alpha.1", payload("p", "p-a1.tgz", None, "a")),
+            entry("1.0.0-alpha.2", payload("p", "p-a2.tgz", None, "b")),
+        ];
+        assert_eq!(
+            resolve_served_latest(&entries, &NpmSemverOrdering),
+            Some("1.0.0-alpha.2"),
+            "an all-prerelease served set still resolves a usable latest"
+        );
+    }
+
+    #[test]
+    fn resolve_served_latest_empty_set_is_none() {
+        assert_eq!(resolve_served_latest(&[], &NpmSemverOrdering), None);
+    }
+
+    // -----------------------------------------------------------------
+    // dist-tags pass-through: the served map is emitted verbatim, and
+    // `latest` is the only tag the builder will ever synthesise.
+    // -----------------------------------------------------------------
+
+    fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(t, v)| (t.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn three_version_entries() -> Vec<VersionEntry> {
+        vec![
+            entry("1.2.3", payload("p", "p-1.2.3.tgz", None, "a")),
+            entry("2.0.0-rc.1", payload("p", "p-2.0.0-rc.1.tgz", None, "b")),
+            entry(
+                "2.0.0-beta.4",
+                payload("p", "p-2.0.0-beta.4.tgz", None, "c"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn served_tag_map_is_emitted_verbatim() {
+        let json = build_with_tags(
+            three_version_entries(),
+            "p",
+            "https://r.example/npm/m",
+            tags(&[
+                ("latest", "1.2.3"),
+                ("next", "2.0.0-rc.1"),
+                ("beta", "2.0.0-beta.4"),
+            ]),
+        );
+        assert_eq!(
+            json["dist-tags"],
+            serde_json::json!({
+                "latest": "1.2.3",
+                "next": "2.0.0-rc.1",
+                "beta": "2.0.0-beta.4",
+            }),
+            "every served tag reaches the wire unaltered"
+        );
+    }
+
+    #[test]
+    fn stored_latest_beats_the_derivation() {
+        // The maintainer / upstream pinned `latest` at an older release.
+        // That is a deliberate choice, not something to second-guess:
+        // the derivation is a fallback, never an override.
+        let json = build_with_tags(
+            vec![
+                entry("1.0.0", payload("p", "p-1.0.0.tgz", None, "a")),
+                entry("2.0.0", payload("p", "p-2.0.0.tgz", None, "b")),
+            ],
+            "p",
+            "https://r.example/npm/m",
+            tags(&[("latest", "1.0.0")]),
+        );
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.0.0",
+            "a served `latest` is verbatim; the semver-max derivation must not override it"
+        );
+    }
+
+    #[test]
+    fn absent_latest_is_derived_while_other_tags_stay_verbatim() {
+        // The intersection dropped `latest` (or the maintainer never set
+        // one). `latest` derives; `next` still passes through.
+        let json = build_with_tags(
+            three_version_entries(),
+            "p",
+            "https://r.example/npm/m",
+            tags(&[("next", "2.0.0-rc.1")]),
+        );
+        assert_eq!(
+            json["dist-tags"]["latest"].as_str().unwrap(),
+            "1.2.3",
+            "absent latest falls back to the served-set derivation"
+        );
+        assert_eq!(json["dist-tags"]["next"].as_str().unwrap(), "2.0.0-rc.1");
+    }
+
+    #[test]
+    fn empty_served_set_emits_no_dist_tags_even_with_stored_tags() {
+        // Nothing servable → no `dist-tags` block, whatever the stored
+        // map said. (In production the intersection has already emptied
+        // it; this pins the builder's own guard.)
+        let json = build_with_tags(
+            Vec::new(),
+            "p",
+            "https://r.example/npm/m",
+            tags(&[("latest", "1.0.0")]),
+        );
+        assert!(
+            json.get("dist-tags").is_none(),
+            "an empty served set must never emit a dist-tags block"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `intersect_dist_tags` — the drop-never-rewrite contract.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn intersect_keeps_only_tags_whose_target_is_served() {
+        let entries = vec![
+            entry("1.2.3", payload("p", "p-1.2.3.tgz", None, "a")),
+            entry("2.0.0-rc.1", payload("p", "p-2.0.0-rc.1.tgz", None, "b")),
+        ];
+        let out = intersect_dist_tags(
+            &tags(&[
+                ("latest", "1.2.3"),
+                ("next", "2.0.0-rc.1"),
+                // 9.9.9 is quarantined / never ingested → not served.
+                ("canary", "9.9.9"),
+            ]),
+            &entries,
+        );
+        assert_eq!(out, tags(&[("latest", "1.2.3"), ("next", "2.0.0-rc.1")]));
+        assert!(
+            !out.contains_key("canary"),
+            "a tag pointing at a non-served version is dropped, never rewritten"
+        );
+    }
+
+    #[test]
+    fn intersect_drops_latest_when_its_target_is_not_served() {
+        let entries = vec![entry("1.0.0", payload("p", "p-1.0.0.tgz", None, "a"))];
+        let out = intersect_dist_tags(&tags(&[("latest", "9.9.9")]), &entries);
+        assert!(
+            out.is_empty(),
+            "latest gets no special treatment in the intersection itself"
+        );
+    }
+
+    #[test]
+    fn intersect_of_empty_inputs_is_empty() {
+        let entries = vec![entry("1.0.0", payload("p", "p-1.0.0.tgz", None, "a"))];
+        assert!(intersect_dist_tags(&BTreeMap::new(), &entries).is_empty());
+        assert!(intersect_dist_tags(&tags(&[("latest", "1.0.0")]), &[]).is_empty());
+    }
+
+    #[test]
+    fn intersect_is_identity_under_a_null_gate() {
+        // The transparency property: when nothing is filtered out, the
+        // intersection degrades to identity and hort serves upstream's
+        // map verbatim.
+        let entries = three_version_entries();
+        let upstream = tags(&[
+            ("latest", "1.2.3"),
+            ("next", "2.0.0-rc.1"),
+            ("beta", "2.0.0-beta.4"),
+        ]);
+        assert_eq!(intersect_dist_tags(&upstream, &entries), upstream);
     }
 }

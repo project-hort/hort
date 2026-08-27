@@ -35,7 +35,7 @@
 //!   already lives in `hort-app` despite being consumed by format
 //!   crates through the same re-export pattern.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
 use hort_domain::entities::artifact::QuarantineStatus;
@@ -142,13 +142,12 @@ pub enum PerVersionPayload {
 /// npm packument per-version data.
 ///
 /// Carries exactly the fields the `NpmIndexBuilder` reads when
-/// emitting one entry of the packument's `versions{}` object. Kept
-/// minimal by contract: anything the builder
-/// does *not* read stays out (no upstream `time`, no `maintainers`,
-/// no `bugs`, no README — the unified packument is the wire-shape
-/// minimum every npm client tolerates; carrying upstream extras
-/// would expand the surface the proxy source has to faithfully
-/// parse for no observable client win).
+/// emitting one entry of the packument's `versions{}` object: the
+/// `name`/`version`/`dist` triple plus the npm install-v1
+/// abbreviated-metadata whitelist in `manifest`. The whitelist bounds
+/// the surface — anything outside it stays out (no upstream `time`, no
+/// `maintainers`, no `bugs`, no README, no `scripts`), so the payload is
+/// a fixed contract rather than an upstream-shaped passthrough blob.
 ///
 /// # Field reference
 ///
@@ -198,6 +197,15 @@ pub struct NpmVersionPayload {
     /// empty string when neither source supplied one — mirrors the
     /// earlier local-CAS handler's `unwrap_or_default` semantics).
     pub shasum: String,
+    /// The npm install-v1 abbreviated-metadata field set
+    /// (`hort_formats::npm::NPM_INSTALL_V1_MANIFEST_KEYS`), copied
+    /// verbatim from the authoritative source: the upstream packument on
+    /// proxy, the stored publish block on hosted. The builder merges
+    /// these entries into the emitted `versions[v]` object after
+    /// `name`/`version`/`dist`. Empty means the source published none of
+    /// them — a field absent at the source is absent on the wire, never
+    /// `null`.
+    pub manifest: serde_json::Map<String, serde_json::Value>,
 }
 
 /// PyPI simple-index per-version data.
@@ -523,31 +531,106 @@ pub enum MemberFetch {
 ///
 /// Runs BEFORE the `NonServableStatusFilter` / `IndexModeFilter` pipeline. Pure
 /// transform, no I/O.
+///
+/// Entries-only convenience over [`aggregate_index_members_tagged`], which is
+/// where the rules actually live — a format with named tags (npm `dist-tags`)
+/// calls that instead so its tag map rides the same pinning decision rather
+/// than a transcribed copy of it.
 pub fn aggregate_index_members(
     per_member_in_priority_order: Vec<(RepositoryType, MemberFetch)>,
 ) -> Vec<VersionEntry> {
-    let name_is_owned = per_member_in_priority_order
-        .iter()
-        .any(|(repo_type, fetch)| {
-            !matches!(repo_type, RepositoryType::Proxy)
-                && match fetch {
-                    MemberFetch::Present(entries) => !entries.is_empty(),
-                    MemberFetch::Unavailable => true,
-                }
-        });
-    let surviving: Vec<Vec<VersionEntry>> = per_member_in_priority_order
-        .into_iter()
-        .filter_map(|(repo_type, fetch)| {
-            if name_is_owned && matches!(repo_type, RepositoryType::Proxy) {
-                return None;
-            }
-            Some(match fetch {
-                MemberFetch::Present(entries) => entries,
-                MemberFetch::Unavailable => Vec::new(),
+    aggregate_index_members_tagged(
+        per_member_in_priority_order
+            .into_iter()
+            .map(|(repo_type, fetch)| MemberIndexFetch {
+                repo_type,
+                fetch,
+                tags: BTreeMap::new(),
             })
-        })
-        .collect();
-    merge_members_authoritative(surviving)
+            .collect(),
+    )
+    .entries
+}
+
+/// One member's index-fetch outcome plus its package-level named-tag map,
+/// as [`aggregate_index_members_tagged`] sees it.
+///
+/// `tags` is the member's OWN tag map (npm `dist-tags`), pre-intersection
+/// and pre-merge: upstream's for a proxy member, the maintainer's stored
+/// refs for a hosted one. It is empty for a member that has no tag
+/// concept, and necessarily empty for an `Unavailable` member (nothing
+/// was read).
+#[derive(Debug, Clone)]
+pub struct MemberIndexFetch {
+    pub repo_type: RepositoryType,
+    pub fetch: MemberFetch,
+    pub tags: BTreeMap<String, String>,
+}
+
+/// RAW index entries plus the package-level named-tag map that goes with
+/// them.
+///
+/// Used at both ends of the virtual aggregation: it is what one member's
+/// fetch closure produces, and what
+/// [`aggregate_index_members_tagged`] produces from the merge. Both are
+/// pre-filter — the caller still runs `NonServableStatusFilter` /
+/// `IndexModeFilter` on `entries`, and the format's own intersection of
+/// `tags` against the resulting served set.
+#[derive(Debug, Clone, Default)]
+pub struct TaggedIndex {
+    pub entries: Vec<VersionEntry>,
+    /// Tag → version. After the merge: the first surviving member
+    /// (highest priority) to define a tag name owns it. Empty when no
+    /// member carried tags.
+    pub tags: BTreeMap<String, String>,
+}
+
+/// [`aggregate_index_members`] widened to carry a package-level tag map
+/// alongside the entries. The entry-level rules are unchanged and
+/// computed exactly once here; the tag map rides the SAME name-level
+/// pinning decision:
+///
+/// 3. **Tag merge.** Over the members that survived pinning, in priority
+///    order, the first to define a tag name owns it. A proxy member's
+///    tags are dropped wholesale for an owned name by rule 1 above — so
+///    a public `next` can never shadow an internal package's tags, the
+///    same dependency-confusion class rule 2b closes for versions.
+///
+/// The merged map is still pre-intersection: a tag may name a version
+/// that the caller's filter pipeline later drops. The per-format
+/// intersection against the post-filter served set is what makes a tag
+/// un-servable-target-free, and it runs after the filters.
+pub fn aggregate_index_members_tagged(
+    per_member_in_priority_order: Vec<MemberIndexFetch>,
+) -> TaggedIndex {
+    let name_is_owned = per_member_in_priority_order.iter().any(|m| {
+        !matches!(m.repo_type, RepositoryType::Proxy)
+            && match &m.fetch {
+                MemberFetch::Present(entries) => !entries.is_empty(),
+                MemberFetch::Unavailable => true,
+            }
+    });
+    let mut surviving: Vec<Vec<VersionEntry>> =
+        Vec::with_capacity(per_member_in_priority_order.len());
+    let mut tags: BTreeMap<String, String> = BTreeMap::new();
+    for member in per_member_in_priority_order {
+        if name_is_owned && matches!(member.repo_type, RepositoryType::Proxy) {
+            continue;
+        }
+        // First surviving member to define a tag name owns it — the tag
+        // analogue of the authoritative-member merge below.
+        for (tag, version) in member.tags {
+            tags.entry(tag).or_insert(version);
+        }
+        surviving.push(match member.fetch {
+            MemberFetch::Present(entries) => entries,
+            MemberFetch::Unavailable => Vec::new(),
+        });
+    }
+    TaggedIndex {
+        entries: merge_members_authoritative(surviving),
+        tags,
+    }
 }
 
 /// Merge per-member version entries under the authoritative-member rule — the
@@ -726,6 +809,7 @@ mod tests {
             tarball_basename: "express-1.0.0.tgz".into(),
             integrity: Some("sha512-aGVsbG8=".into()),
             shasum: "da39a3ee5e6b4b0d3255bfef95601890afd80709".into(),
+            manifest: serde_json::Map::new(),
         };
         let wrapped = PerVersionPayload::Npm(payload.clone());
         match wrapped {
@@ -763,6 +847,7 @@ mod tests {
                 tarball_basename: format!("p-{version}.tgz"),
                 integrity: None,
                 shasum: "x".into(),
+                manifest: serde_json::Map::new(),
             }),
         }
     }
@@ -851,6 +936,110 @@ mod tests {
     #[test]
     fn aggregate_empty_input_is_empty() {
         assert!(aggregate_index_members(Vec::new()).is_empty());
+    }
+
+    // --- Tag dimension of the aggregation (npm dist-tags) --------------
+
+    fn tag_map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(t, v)| (t.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn member(
+        repo_type: RepositoryType,
+        fetch: MemberFetch,
+        tags: &[(&str, &str)],
+    ) -> MemberIndexFetch {
+        MemberIndexFetch {
+            repo_type,
+            fetch,
+            tags: tag_map(tags),
+        }
+    }
+
+    #[test]
+    fn tagged_first_member_to_define_a_tag_owns_it() {
+        let out = aggregate_index_members_tagged(vec![
+            member(
+                RepositoryType::Hosted,
+                Present(vec![ve("1.0.0", None)]),
+                &[("latest", "1.0.0")],
+            ),
+            member(
+                RepositoryType::Staging,
+                Present(vec![ve("2.0.0", None)]),
+                // `latest` is already owned; `next` is not.
+                &[("latest", "2.0.0"), ("next", "2.0.0")],
+            ),
+        ]);
+        assert_eq!(out.tags, tag_map(&[("latest", "1.0.0"), ("next", "2.0.0")]));
+    }
+
+    #[test]
+    fn tagged_owned_name_suppresses_proxy_tags_wholesale() {
+        // The tag dimension of rule 2b: a proxy member contributes
+        // neither versions NOR tags once the name is owned, so a public
+        // `next` cannot shadow an internal package's tags.
+        let out = aggregate_index_members_tagged(vec![
+            member(
+                RepositoryType::Proxy,
+                Present(vec![ve("9.9.9", None)]),
+                &[("latest", "9.9.9"), ("next", "9.9.9")],
+            ),
+            member(
+                RepositoryType::Hosted,
+                Present(vec![ve("1.0.0", Some(QuarantineStatus::Released))]),
+                &[("latest", "1.0.0")],
+            ),
+        ]);
+        assert_eq!(vers(out.entries), vec!["1.0.0".to_string()]);
+        assert_eq!(
+            out.tags,
+            tag_map(&[("latest", "1.0.0")]),
+            "the proxy's tags are dropped with the proxy, priority notwithstanding"
+        );
+    }
+
+    #[test]
+    fn tagged_unowned_name_keeps_proxy_tags() {
+        let out = aggregate_index_members_tagged(vec![member(
+            RepositoryType::Proxy,
+            Present(vec![ve("1.0.0", None)]),
+            &[("latest", "1.0.0")],
+        )]);
+        assert_eq!(out.tags, tag_map(&[("latest", "1.0.0")]));
+    }
+
+    #[test]
+    fn tagged_unavailable_member_contributes_no_tags() {
+        // An `Unavailable` non-proxy member pins fail-closed (proxies
+        // suppressed) but has nothing to contribute — including no tags.
+        let out = aggregate_index_members_tagged(vec![
+            member(RepositoryType::Hosted, Unavailable, &[]),
+            member(
+                RepositoryType::Proxy,
+                Present(vec![ve("9.9.9", None)]),
+                &[("latest", "9.9.9")],
+            ),
+        ]);
+        assert!(out.entries.is_empty());
+        assert!(out.tags.is_empty());
+    }
+
+    #[test]
+    fn tagged_empty_input_is_empty() {
+        let out = aggregate_index_members_tagged(Vec::new());
+        assert!(out.entries.is_empty());
+        assert!(out.tags.is_empty());
+    }
+
+    #[test]
+    fn tagged_index_default_is_empty() {
+        let out = TaggedIndex::default();
+        assert!(out.entries.is_empty());
+        assert!(out.tags.is_empty());
     }
 
     #[test]

@@ -39,6 +39,16 @@ use hort_http_core::middleware::trust::RequestTrust;
 
 use crate::publish_metadata::PublishMetadata;
 
+/// The one format this crate's read path serves — the key into
+/// `AppContext.upstream_proxy` ([`hort_domain::ports::upstream_proxy::UpstreamProxyByFormat`]).
+///
+/// Every on-miss upstream fetch from this crate goes through the proxy
+/// instance registered under this key, which is what puts the correct
+/// `format` label on `hort_upstream_fetch_total`,
+/// `hort_upstream_fetch_duration_seconds` and — security-relevant —
+/// `hort_upstream_insecure_total`.
+pub(crate) const UPSTREAM_PROXY_FORMAT: RepositoryFormat = RepositoryFormat::Cargo;
+
 // Upstream pull-through orchestrator. Wired to the route layer in the
 // download handler; declared here so the module + its tests are
 // reachable under `cargo test -p hort-http-cargo`.
@@ -486,7 +496,10 @@ async fn render_cargo_crate_response(
 /// tampering / ingest-fail). The hosted/proxy member paths already enforce
 /// visibility + quarantine; the virtual layer only chooses the member.
 enum VirtualMemberDownload {
-    Found(hort_domain::entities::artifact::Artifact),
+    /// Boxed: the artifact aggregate is several hundred bytes while the
+    /// error arm is a pre-rendered response, and every `Ok` return would
+    /// otherwise carry the larger of the two by value.
+    Found(Box<hort_domain::entities::artifact::Artifact>),
     Rendered(Response),
 }
 
@@ -523,7 +536,7 @@ async fn serve_virtual_cargo_crate(
 
     match resolved {
         Some(VirtualMemberDownload::Found(artifact)) => {
-            render_cargo_crate_response(ctx, artifact, actor).await
+            render_cargo_crate_response(ctx, *artifact, actor).await
         }
         Some(VirtualMemberDownload::Rendered(resp)) => Ok(resp),
         // No eligible member has the coordinate (or an owned name had the
@@ -587,7 +600,7 @@ async fn cargo_member_coord_fetch(
         .find_visible_by_path(&member.key, artifact_path, actor)
         .await
     {
-        Ok((_repo, artifact)) => return Ok(Some(VirtualMemberDownload::Found(artifact))),
+        Ok((_repo, artifact)) => return Ok(Some(VirtualMemberDownload::Found(Box::new(artifact)))),
         // Local path miss: a proxy member tries the upstream pull below; a
         // hosted/staging member simply lacks the coordinate.
         Err(hort_app::error::AppError::Domain(hort_domain::error::DomainError::NotFound {
@@ -614,7 +627,7 @@ async fn cargo_member_coord_fetch(
                 .artifact_use_case
                 .find_visible_by_path(&member.key, artifact_path, actor)
                 .await?;
-            Ok(Some(VirtualMemberDownload::Found(artifact)))
+            Ok(Some(VirtualMemberDownload::Found(Box::new(artifact))))
         }
         // A genuine upstream miss / no mapping / curation block means this
         // member cannot serve the coordinate → continue the walk (the
@@ -819,6 +832,25 @@ fn validation_error(msg: &str) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+
+    /// Tripwire: the crate-level `UPSTREAM_PROXY_FORMAT` decides which
+    /// per-format upstream-proxy instance every on-miss fetch from this
+    /// crate goes through, and therefore the `format` label on
+    /// `hort_upstream_fetch_*` and `hort_upstream_insecure_total`. The
+    /// mock context maps every served format to one proxy, so a wrong
+    /// constant here is invisible to the handler tests — this assertion
+    /// is what catches it.
+    #[test]
+    fn upstream_proxy_format_is_this_crates_served_format() {
+        assert_eq!(UPSTREAM_PROXY_FORMAT, RepositoryFormat::Cargo);
+        assert_eq!(UPSTREAM_PROXY_FORMAT.to_string(), "cargo");
+        assert!(
+            hort_domain::ports::upstream_proxy::READ_PATH_PROXY_FORMATS
+                .contains(&UPSTREAM_PROXY_FORMAT),
+            "composition only builds instances for READ_PATH_PROXY_FORMATS"
+        );
+    }
+
     use std::sync::Arc;
 
     use axum::body::{to_bytes, Body};

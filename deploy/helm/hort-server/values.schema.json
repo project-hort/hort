@@ -1051,13 +1051,14 @@
           }
         },
         "verifyEventChain": {
-          "description": "executionPath: admin-task (gating only — it actually runs the `hort-server` binary directly with the runtime DSN, no svc-token PAT). Event-chain tamper-evidence verifier CronJob. Runs `hort-server verify-event-chain --format json` DIRECTLY (an in-process reader using the runtime DML DSN + anchor object store, NOT a worker-dispatched task). Records a `kind='verify-event-chain'` liveness breadcrumb on each completed run; the boot-time `hort_event_chain_verify_overdue` gauge reads the newest one. DEFAULT-DISABLED. Keep the schedule consistent with HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS (default 86400 s = daily).",
+          "description": "executionPath: admin-task (gating only — it actually runs the `hort-server` binary directly with the runtime DSN, no svc-token PAT). Event-chain tamper-evidence verifier CronJob. Runs `hort-server verify-event-chain --format json` DIRECTLY (an in-process reader using the runtime DML DSN + anchor object store, NOT a worker-dispatched task). Records a `kind='verify-event-chain'` liveness breadcrumb on each completed run; the boot-time `hort_event_chain_verify_overdue` gauge reads the newest one. DEFAULT-ENABLED — an existing install that never set `enabled` gains this CronJob on upgrade; set `enabled: false` to opt out. A deployment with no checkpoint anchor stays green (the verifier derives anchor-expectedness from S3 storage AND a provisioned anchor public key). Keep the schedule consistent with HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS (default 86400 s = daily).",
           "type": "object",
           "additionalProperties": false,
           "properties": {
             "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
             "enabled": {"type": "boolean"},
-            "schedule": {"type": "string", "minLength": 1}
+            "schedule": {"type": "string", "minLength": 1},
+            "failOnMissingCheckpoint": {"type": ["boolean", "null"], "description": "Whether a missing/stale/gapped anchoring checkpoint fails the run (exit 3). TRI-STATE. null (the default) DERIVES the decision from whether anchoring is configured — S3 storage AND a provisioned anchor public key: anchored ⇒ fail (the emitter is broken), unanchored ⇒ do not fail (no anchor was ever expected). An explicit true/false FORCES it instead: true demands a checkpoint regardless of configuration, false silences the exit code. Forcing moves only the exit code — hort_event_chain_verify_total{result} keeps reporting the configuration-derived fact. The chain-integrity verdict is unaffected either way."}
           }
         },
         "retentionEvaluate": {
@@ -1126,6 +1127,13 @@
             "batchSize": {"type": "integer", "minimum": 1},
             "maxAttempts": {"type": "integer", "minimum": 1},
             "lockDurationSecs": {"type": "integer", "minimum": 1},
+            "findingMerge": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "allowInformedDowngrade": {"type": "boolean"}
+              }
+            },
             "trivy": {
               "type": "object",
               "additionalProperties": false,

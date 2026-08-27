@@ -151,6 +151,49 @@ const MANIFEST_BODY_MAX_BYTES: usize = 1024 * 1024;
 /// lookups, one per referenced blob).
 pub(crate) const MAX_BLOB_REFERENCES: usize = 1024;
 
+/// `Retry-After` for a manifest write that lost to persistent storage
+/// contention, in seconds.
+///
+/// Short on purpose. A contention abort is over by the time the client hears
+/// about it — the writer that won committed before the storage engine raised
+/// the error — so the only thing left to wait out is a co-writer queue that
+/// drains in milliseconds. This is a "come straight back" hint, not the
+/// quarantine-hold timescale [`OciError::Quarantined`] advertises, and an OCI
+/// client that honours it re-pushes the same manifest and succeeds.
+const MANIFEST_CONTENTION_RETRY_AFTER_SECS: i64 = 1;
+
+/// Classify a failed write on the manifest-PUT path.
+///
+/// `Some(response)` when the failure is storage write contention that
+/// outlived the adapter's own bounded retry ([`DomainError::Contended`]).
+/// That case is emphatically not a 500: the manifest was valid, the
+/// transaction rolled back whole so nothing was half-applied, and re-pushing
+/// it is expected to work. A concurrent multi-architecture push is the
+/// ordinary producer — sibling manifests share content-reference targets (an
+/// image index's attestation manifests all reference the same empty-config
+/// blob), so their edge writes contend on one row by construction. Answering
+/// that with `INTERNAL` reports a healthy registry as broken, sends whoever
+/// debugs the intermittent failure hunting a bug that is not there, and
+/// withholds from the client the one instruction that would resolve it.
+///
+/// `None` for every other failure, so each caller keeps its own
+/// rich-context `error!` and its `Internal` response untouched. The `warn`
+/// here rather than at the call sites is deliberate: their logging is
+/// `error!`, which is the right level for a genuine fault and the wrong one
+/// for a registry that is merely busy.
+fn manifest_write_contention(err: &AppError, stage: &'static str) -> Option<OciError> {
+    matches!(err, AppError::Domain(DomainError::Contended(_))).then(|| {
+        tracing::warn!(
+            stage,
+            error = %err,
+            "manifest write lost to persistent storage contention; answering 503 + Retry-After"
+        );
+        OciError::Unavailable {
+            retry_after_seconds: MANIFEST_CONTENTION_RETRY_AFTER_SECS,
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
@@ -545,6 +588,9 @@ pub(crate) async fn put_manifest_dispatch(
             .into_response();
         }
         Err(err) => {
+            if let Some(busy) = manifest_write_contention(&err, "manifest_ingest") {
+                return busy.into_response();
+            }
             tracing::error!(error = %err, "OCI manifest ingest failed");
             return OciError::Internal.into_response();
         }
@@ -821,6 +867,9 @@ pub(crate) async fn put_manifest_dispatch(
             .insert_for_repo(repo_id, reference_row)
             .await
         {
+            if let Some(busy) = manifest_write_contention(&e, "content_references_insert") {
+                return busy.into_response();
+            }
             tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
                 manifest_digest = %manifest_digest,
@@ -879,6 +928,9 @@ pub(crate) async fn put_manifest_dispatch(
             .insert_for_repo(repo_id, blob_reference)
             .await
         {
+            if let Some(busy) = manifest_write_contention(&e, "oci_blob_reference_insert") {
+                return busy.into_response();
+            }
             tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
                 manifest_digest = %manifest_digest,
@@ -936,6 +988,9 @@ pub(crate) async fn put_manifest_dispatch(
             .insert_for_repo(repo_id, member_reference)
             .await
         {
+            if let Some(busy) = manifest_write_contention(&e, "oci_index_member_insert") {
+                return busy.into_response();
+            }
             tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
                 manifest_digest = %manifest_digest,
@@ -1013,6 +1068,7 @@ pub(crate) async fn delete_manifest_dispatch(
             &name,
             &reference,
             &access.principal,
+            actor,
         )
         .await
     } else {
@@ -1052,13 +1108,19 @@ async fn delete_by_tag(
     }
 }
 
+/// `principal` is the visibility subject for the path lookup; `actor` is
+/// the same authenticated identity in event-attribution form, threaded
+/// through to `ArtifactUseCase::delete` so the `ArtifactDeleted` event
+/// names who removed the manifest.
+#[allow(clippy::too_many_arguments)] // repo/name/digest coordinates + both actor forms.
 async fn delete_by_digest(
     ctx: &AppContext,
     repo_id: Uuid,
     repo_key: &str,
     name: &str,
     digest_str: &str,
-    actor: &hort_domain::entities::caller::CallerPrincipal,
+    principal: &hort_domain::entities::caller::CallerPrincipal,
+    actor: ApiActor,
 ) -> Response {
     let hash = match parse_digest(digest_str) {
         DigestParse::Ok(h) => h,
@@ -1087,7 +1149,7 @@ async fn delete_by_digest(
     // crate and matches the enforcement guarantee.
     let artifact = match ctx
         .artifact_use_case
-        .find_visible_by_path(repo_key, &coords.path, Some(actor))
+        .find_visible_by_path(repo_key, &coords.path, Some(principal))
         .await
     {
         Ok((_repo, a)) => a,
@@ -1125,12 +1187,18 @@ async fn delete_by_digest(
         );
     }
 
-    // Artifact lifecycle delete. Uses `ArtifactUseCase::delete`, the
-    // landed primitive for artifact removal — it delegates to
-    // `ArtifactRepository::delete` which hard-removes the row. The
-    // CAS blob is NOT removed (GC concern; multiple artifacts may
-    // share CAS bytes).
-    if let Err(e) = ctx.artifact_use_case.delete(artifact.id).await {
+    // Artifact lifecycle delete. `ArtifactUseCase::delete` is an
+    // event-sourced soft delete: the row survives with `deleted_at` set
+    // and an `ArtifactDeleted` event lands on the artifact's stream,
+    // attributed to this caller. The CAS blob is NOT removed (GC
+    // concern; multiple artifacts may share CAS bytes) — the
+    // `content_references` cleanup above is what lets refcount GC
+    // reclaim it later if nothing else references it.
+    if let Err(e) = ctx
+        .artifact_use_case
+        .delete(artifact.id, Actor::Api(actor))
+        .await
+    {
         tracing::error!(
             manifest_artifact_id = %artifact.id,
             error = %e,
@@ -3396,6 +3464,141 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------
+    // Write contention on the manifest-PUT path.
+    //
+    // The reported symptom was an intermittent 500 on concurrent hosted
+    // manifest PUTs. The storage adapter now classifies a Postgres
+    // concurrency abort as `DomainError::Contended` and retries the write
+    // itself, bounded; these two cases pin what the OCI edge does with the
+    // classification once that budget is spent, and — just as importantly —
+    // what it does NOT do to everything else.
+    // -----------------------------------------------------------------
+
+    /// Persistent write contention on a content-reference edge answers
+    /// **503 + `Retry-After`**, not 500.
+    ///
+    /// The client's manifest was valid and nothing was half-applied, so the
+    /// correct instruction is "ask again shortly". A 500 tells it, and the
+    /// operator's alerting, that the registry is broken — which is how this
+    /// class of failure came to be reported as an intermittent server bug in
+    /// the first place.
+    #[test]
+    fn edge_write_contention_returns_503_with_retry_after_not_500() {
+        let (status, retry_after) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, &[layer]);
+
+            // The config edge is the one sibling manifests of a single push
+            // share by construction (every attestation manifest in a
+            // buildkit index references the same empty-config blob), so it
+            // is the realistic contention point.
+            h.content_references.fail_next_insert_for_kind(
+                "oci_config",
+                DomainError::Contended(
+                    "content-reference upsert aborted by concurrent write contention \
+                     (SQLSTATE 40P01)"
+                        .into(),
+                ),
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            (status, retry_after)
+        });
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "persistent write contention is a busy registry, not a broken one"
+        );
+        assert_eq!(
+            retry_after.as_deref(),
+            Some(MANIFEST_CONTENTION_RETRY_AFTER_SECS.to_string().as_str()),
+            "a contention 503 must tell the client when to come back — without it \
+             the client has no instruction it can act on"
+        );
+    }
+
+    /// The complement, and the reason the retry classification has to be
+    /// narrow: a genuine adapter failure on the same edge still answers
+    /// **500**. Widening the contention arm to any error would silently
+    /// convert real faults into "retry shortly" and hide them behind
+    /// clients that dutifully do.
+    #[test]
+    fn edge_write_genuine_failure_still_returns_500() {
+        let status = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, &[layer]);
+
+            h.content_references.fail_next_insert_for_kind(
+                "oci_config",
+                DomainError::Invariant("database error: connection reset".into()),
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap()
+                .status()
+        });
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "only a contention abort is retryable; a real fault must stay a 500"
+        );
+    }
+
+    /// The classifier itself, over the whole error surface it has to
+    /// discriminate. The router cases above prove the two ends are wired;
+    /// this pins the middle so a future variant cannot quietly join the
+    /// retryable side.
+    #[test]
+    fn manifest_write_contention_classifies_only_contended() {
+        assert!(
+            manifest_write_contention(
+                &AppError::Domain(DomainError::Contended("x".into())),
+                "test"
+            )
+            .is_some(),
+            "Contended is the retryable class"
+        );
+        for other in [
+            DomainError::Conflict("duplicate".into()),
+            DomainError::Invariant("boom".into()),
+            DomainError::Validation("bad".into()),
+            DomainError::NotFound {
+                entity: "Artifact",
+                id: "x".into(),
+            },
+            DomainError::InvalidState("held".into()),
+        ] {
+            assert!(
+                manifest_write_contention(&AppError::Domain(other.clone()), "test").is_none(),
+                "{other:?} must not be answered as retryable contention"
+            );
+        }
+    }
+
     /// An image **index** PUT writes **zero** `oci_config`/`oci_layer`
     /// blob edges — an index has no config/layers (only child manifests,
     /// covered by `oci_index_member` above). Pins the "index unchanged"
@@ -4129,6 +4332,49 @@ mod tests {
         assert_eq!(
             post_refs, 0,
             "content_references rows with this source must be swept"
+        );
+    }
+
+    /// The digest-DELETE path must attribute the deletion to the
+    /// authenticated caller. The `ArtifactDeleted` event's actor comes
+    /// straight from this argument, so a dropped actor here produces an
+    /// unattributable terminal transition in the audit trail.
+    #[test]
+    fn delete_digest_attributes_the_deletion_to_the_authenticated_caller() {
+        let caller_id = Uuid::new_v4();
+        let deletions = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let content = b"attributed-manifest-body";
+            let hex = format!("{:x}", Sha256::digest(content));
+            let hash: ContentHash = hex.parse().unwrap();
+            let mut a = sample_artifact(QuarantineStatus::None);
+            a.repository_id = repo_id;
+            a.path = format!("manifests/sha256:{hex}");
+            a.sha256_checksum = hash.clone();
+            a.size_bytes = content.len() as i64;
+            h.artifacts.insert(a);
+            h.storage.insert_content(hash, content.to_vec());
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
+            let mut req = HttpRequest::delete(&uri).body(Body::empty()).unwrap();
+            let mut principal = test_principal();
+            principal.user_id = caller_id;
+            hort_http_core::middleware::auth::test_support::inject_principal(&mut req, principal);
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+            h.artifacts.deletions()
+        });
+
+        assert_eq!(deletions.len(), 1, "exactly one artifact deleted");
+        assert!(
+            matches!(&deletions[0].1, Actor::Api(a) if a.user_id == caller_id),
+            "deletion must be attributed to the authenticated caller, got {:?}",
+            deletions[0].1
         );
     }
 

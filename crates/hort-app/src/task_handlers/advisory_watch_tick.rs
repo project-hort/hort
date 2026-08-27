@@ -444,9 +444,9 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         }
@@ -725,7 +725,11 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<hort_domain::types::Page<Artifact>>> {
             Box::pin(async { Ok(hort_domain::types::Page::empty()) })
         }
-        fn delete(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete(
+            &self,
+            _id: Uuid,
+            _actor: hort_domain::events::Actor,
+        ) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }
         fn find_by_path(

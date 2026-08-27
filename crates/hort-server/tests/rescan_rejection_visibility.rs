@@ -211,6 +211,7 @@ fn single_critical_finding() -> Vec<Finding> {
         references: Vec::new(),
         aliases: Vec::new(),
         informational_class: None,
+        severity_basis: hort_domain::types::SeverityBasis::Assessed,
     };
     // Sanity-check the validator against our hand-built fixture so a
     // future field-cap change surfaces against this test, not a

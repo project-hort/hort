@@ -53,6 +53,11 @@ data:
   HORT_SCANNER_BATCH_SIZE: {{ .Values.worker.scanner.batchSize | quote }}
   HORT_SCANNER_MAX_ATTEMPTS: {{ .Values.worker.scanner.maxAttempts | quote }}
   HORT_SCANNER_LOCK_DURATION_SECS: {{ .Values.worker.scanner.lockDurationSecs | quote }}
+  {{- /* Break-glass switch for the cross-backend finding merge's        */}}
+  {{- /* information-quality rule (ADR 0059). Default true. Setting      */}}
+  {{- /* false reverts to strict always-fail-closed, which makes the     */}}
+  {{- /* release gate STRICTER, not looser.                              */}}
+  HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE: {{ .Values.worker.scanner.findingMerge.allowInformedDowngrade | quote }}
   {{- /* Defense-in-depth seal-pool lock_timeout. 0 disables the         */}}
   {{- /* backstop and re-opens the unbounded-block failure mode;         */}}
   {{- /* default 120000 (2 min).                                         */}}

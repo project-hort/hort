@@ -50,7 +50,7 @@ and `args: ["serve"]` (k8s) are therefore correct and identical.
 | `scrub [FLAGS]` | CAS integrity scrubber — re-hash stored blobs, detect drift. | **full `Config`** |
 | `admin <SUB>` | Admin-user / service-token management (nested, required). | `MinimalConfig` |
 | `reconcile-groups [--since]` | Heal artifacts whose ingest-path group commit dropped between the `ArtifactIngested` and `ArtifactGroupMemberAdded` transactions. | `MinimalConfig` |
-| `verify-event-chain` | Offline tamper-evident event-chain verifier (ADR 0002): recomputes every per-stream hash chain, cross-checks live heads against anchored signed checkpoints, exits `0`=ok/`2`=broken/`3`=missing_checkpoint/`1`=operational error. Read-only — never writes or migrates. | `MinimalConfig` |
+| `verify-event-chain` | Offline tamper-evident event-chain verifier (ADR 0002): recomputes every per-stream hash chain, cross-checks live heads against anchored signed checkpoints, exits `0`=ok/`2`=broken/`3`=missing_checkpoint/`1`=operational error. Whether an anchor is expected is derived from the shared `hort_app::event_chain_anchoring` predicate (S3 storage AND a provisioned `HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE`), so an unanchored deployment verifies its chain and exits `0`; `--fail-on-missing-checkpoint` is tri-state and forces the decision when given (ADR 0057). Read-only — never writes or migrates, and is never given the anchor **private** signing key. | `MinimalConfig` |
 | `enqueue-quarantine-release-sweep` | Enqueue one `quarantine-release-sweep` job and exit; the always-on worker dispatches it to `QuarantineReleaseSweepHandler`. The default `executionPath: dsn-direct` CronJob. | `MinimalConfig` |
 | `seed-import` | Parse an operator-supplied TSV describing a dependency cutover set and enqueue one `seed-import` job; the worker bulk-registers each item with a backdated `quarantine_window_start` (the *time* gate only — scan gate unchanged). One-shot, operator-invoked. | `MinimalConfig` |
 | `enqueue-prefetch-tick` | Enqueue one `prefetch-tick` job and exit; the worker dispatches `PrefetchTickHandler` over every scheduled-eligible repo + tracked package. | `MinimalConfig` |
@@ -612,6 +612,7 @@ neither set the error surfaces the name `"DATABASE_URL"`.
 | `HORT_SCANNER_BATCH_SIZE` | u32 | `4` | No | Jobs claimed per poll (clamped to `u16::MAX`). |
 | `HORT_SCANNER_MAX_ATTEMPTS` | u32 | `5` | No | Max scan attempts before a job is failed. |
 | `HORT_SCANNER_LOCK_DURATION_SECS` | u64 | `900` (15 min) | No | Job lock / lease duration. |
+| `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE` | bool | `true` | No | Break-glass switch for the cross-backend finding merge (ADR 0059). Default: for one advisory reported by two backends, the reading that actually assessed a severity supersedes one whose `Critical` is the fail-closed floor a backend fell back to — across tiers, so a scored `Medium` wins over an unassessed `Critical`. `false` reverts to strict always-fail-closed (the floor wins on tier alone), which makes the release gate **stricter**. Set from `worker.scanner.findingMerge.allowInformedDowngrade`. |
 
 ### Scanner & advisory adapters
 

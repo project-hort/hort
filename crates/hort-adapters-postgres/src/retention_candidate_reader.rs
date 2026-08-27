@@ -124,8 +124,8 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                        a.content_type, a.storage_key,
                        a.quarantine_status, a.quarantine_window_start,
                        a.upstream_published_at,
-                       a.uploaded_by, a.is_deleted,
-                       a.created_at, a.updated_at,
+                       a.uploaded_by,
+                       a.created_at, a.updated_at, a.deleted_at,
                        r.format AS repo_format,
                        p.rescan_interval_hours AS resolved_rescan_interval_hours
                 FROM artifacts a
@@ -148,8 +148,7 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                     ORDER BY (pp.scope ? 'Repository') DESC
                     LIMIT 1
                 ) p ON TRUE
-                WHERE a.is_deleted = false
-                  AND a.quarantine_status NOT IN
+                WHERE a.quarantine_status NOT IN
                       ('quarantined', 'rejected', 'scan_indeterminate')
                   AND ($3::uuid IS NULL OR a.id > $3)
                 ORDER BY a.id
@@ -176,10 +175,7 @@ mod tests {
     async fn maybe_pool() -> Option<PgPool> {
         let url = env::var("DATABASE_URL").ok()?;
         let pool = crate::test_support::isolated_db_from(&url).await?;
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations run cleanly against the test DB");
+        crate::test_support::migrate_or_panic(&pool).await;
         Some(pool)
     }
 

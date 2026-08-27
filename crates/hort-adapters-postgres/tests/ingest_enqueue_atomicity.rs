@@ -42,10 +42,7 @@ use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersi
 async fn maybe_setup() -> Option<(PgPool, Uuid)> {
     let url = env::var("DATABASE_URL").ok()?;
     let pool = hort_adapters_postgres::test_support::isolated_db_from(&url).await?;
-    sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect("migrations run cleanly against the test DB");
+    hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
     let repo_id = seed_repo(&pool).await;
     Some((pool, repo_id))
 }
@@ -56,7 +53,7 @@ async fn lifecycle(pool: &PgPool) -> PgArtifactLifecycle {
             .await
             .expect("event store init"),
     );
-    let artifact_repo = Arc::new(PgArtifactRepository::new(pool.clone()));
+    let artifact_repo = Arc::new(PgArtifactRepository::new(pool.clone(), event_store.clone()));
     let metadata_repo = Arc::new(PgArtifactMetadataRepository::new(pool.clone()));
     PgArtifactLifecycle::new(event_store, artifact_repo, metadata_repo)
 }
@@ -106,9 +103,9 @@ fn artifact(repo_id: Uuid) -> Artifact {
         rejection_reason: None,
         quarantine_window_start: None,
         quarantine_deadline: None,
+        deleted_at: None,
         upstream_published_at: None,
         uploaded_by: None,
-        is_deleted: false,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

@@ -32,12 +32,23 @@ pub mod cli_session_signing;
 pub mod dispatcher;
 pub mod ephemeral_keyspace;
 pub mod error;
+// The one shared predicate deciding whether an event-chain checkpoint
+// anchor exists in this deployment. Consulted by BOTH the checkpoint
+// writer (worker) and the checkpoint reader (`verify-event-chain`) so
+// the two sides cannot drift apart (ADR 0002, ADR 0057).
+pub mod event_chain_anchoring;
 // Broadcasts persisted events on a `tokio::sync::broadcast` channel
 // after a successful append. The `dispatcher` module subscribes to the
 // sender; with no consumers the broadcast is a transparent best-effort
 // no-op.
 pub mod event_store_publisher;
 pub mod gitops;
+// What THIS running process applied from gitops at boot — pure value
+// types (zero-I/O), filled by the boot path and parked on `AppContext`
+// for the admin apply-status inspection endpoint. In-memory by design:
+// gitops apply is a boot step with no live-refresh path, so the only
+// honest answer a running server can give is its own (ADR 0058).
+pub mod gitops_apply_status;
 // Apply-config linter — secure-by-default reject rules over the
 // desired permission-grant + claim-mapping set, run inside
 // `ApplyConfigUseCase::apply_permission_grants` before commit

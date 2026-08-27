@@ -589,3 +589,274 @@ async fn prefetch_unknown_repo_returns_404() {
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+// ---------------------------------------------------------------------------
+// prefetch job outcome (GET .../prefetch/jobs/:job_id) — status code matrix
+// ---------------------------------------------------------------------------
+
+fn sample_prefetch_job_row(
+    kind: &str,
+    repository_id: Uuid,
+    status: hort_domain::ports::jobs_repository::JobStatus,
+    last_error: Option<&str>,
+) -> hort_domain::ports::jobs_repository::JobRow {
+    use hort_domain::ports::jobs_repository::KindFields;
+
+    hort_domain::ports::jobs_repository::JobRow {
+        id: Uuid::new_v4(),
+        kind: kind.to_string(),
+        status,
+        params: Some(serde_json::json!({
+            "repository_id": repository_id,
+            "package": "left-pad",
+            "version": "1.0.0",
+        })),
+        actor_id: None,
+        priority: 0,
+        trigger_source: "self_service".to_string(),
+        attempts: 5,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        last_error: last_error.map(str::to_string),
+        result_summary: None,
+        kind_fields: KindFields::Other,
+    }
+}
+
+fn prefetch_job_url(repo_key: &str, job_id: Uuid) -> String {
+    format!("/api/v1/repositories/{repo_key}/prefetch/jobs/{job_id}")
+}
+
+#[tokio::test]
+async fn prefetch_job_anonymous_returns_401() {
+    let repo = npm_repo();
+    let key = repo.key.clone();
+    let (ctx, mocks) = ctx_with_rbac(evaluator_with_read_and_prefetch("dev", repo.id));
+    mocks.repositories.insert(repo);
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url(&key, Uuid::new_v4()))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_none(&mut req);
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn prefetch_job_pat_token_kind_returns_403() {
+    let repo = npm_repo();
+    let repo_id = repo.id;
+    let key = repo.key.clone();
+    let (ctx, mocks) = ctx_with_rbac(evaluator_with_read_and_prefetch("dev", repo_id));
+    mocks.repositories.insert(repo);
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url(&key, Uuid::new_v4()))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(
+        &mut req,
+        caller_with_token_kind(&["dev"], Some(TokenKind::Pat)),
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn prefetch_job_missing_permission_returns_403() {
+    let repo = npm_repo();
+    let key = repo.key.clone();
+    // Empty evaluator (no Read/Prefetch grants).
+    let (ctx, mocks) = ctx_with_rbac(RbacEvaluator::new(Vec::new()));
+    mocks.repositories.insert(repo);
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url(&key, Uuid::new_v4()))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(&mut req, caller_cli_session(&["dev"]));
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn prefetch_job_unknown_repo_returns_404() {
+    let (ctx, _mocks) = ctx_with_rbac(evaluator_with_read_and_prefetch("dev", Uuid::new_v4()));
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url("does-not-exist", Uuid::new_v4()))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(&mut req, caller_cli_session(&["dev"]));
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn prefetch_job_unknown_id_returns_404() {
+    let repo = npm_repo();
+    let repo_id = repo.id;
+    let key = repo.key.clone();
+    let (ctx, mocks) = ctx_with_rbac(evaluator_with_read_and_prefetch("dev", repo_id));
+    mocks.repositories.insert(repo);
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url(&key, Uuid::new_v4()))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(&mut req, caller_cli_session(&["dev"]));
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// A `job_id` that belongs to a DIFFERENT repository 404s — never a 403,
+/// never any field of the other repo's job (anti-enumeration).
+#[tokio::test]
+async fn prefetch_job_cross_repo_returns_404() {
+    let repo = npm_repo();
+    let repo_id = repo.id;
+    let key = repo.key.clone();
+    let (ctx, mocks) = ctx_with_rbac(evaluator_with_read_and_prefetch("dev", repo_id));
+    mocks.repositories.insert(repo);
+
+    let row = sample_prefetch_job_row(
+        "prefetch",
+        Uuid::new_v4(), // a different repository
+        hort_domain::ports::jobs_repository::JobStatus::Failed,
+        Some("upstream: 503"),
+    );
+    let job_id = row.id;
+    mocks.jobs.seed_get(row);
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url(&key, job_id))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(&mut req, caller_cli_session(&["dev"]));
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn prefetch_job_non_prefetch_kind_returns_404() {
+    let repo = npm_repo();
+    let repo_id = repo.id;
+    let key = repo.key.clone();
+    let (ctx, mocks) = ctx_with_rbac(evaluator_with_read_and_prefetch("dev", repo_id));
+    mocks.repositories.insert(repo);
+
+    let row = sample_prefetch_job_row(
+        "scan",
+        repo_id,
+        hort_domain::ports::jobs_repository::JobStatus::Completed,
+        None,
+    );
+    let job_id = row.id;
+    mocks.jobs.seed_get(row);
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url(&key, job_id))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(&mut req, caller_cli_session(&["dev"]));
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// Envelope id → terminal `failed` + `last_error`, once the worker has
+/// given up. Pins the exact response shape.
+#[tokio::test]
+async fn prefetch_job_terminal_failed_returns_200_with_shape() {
+    let repo = npm_repo();
+    let repo_id = repo.id;
+    let key = repo.key.clone();
+    let (ctx, mocks) = ctx_with_rbac(evaluator_with_read_and_prefetch("dev", repo_id));
+    mocks.repositories.insert(repo);
+
+    let row = sample_prefetch_job_row(
+        "prefetch",
+        repo_id,
+        hort_domain::ports::jobs_repository::JobStatus::Failed,
+        Some("upstream: 503 after 5 attempts"),
+    );
+    let job_id = row.id;
+    mocks.jobs.seed_get(row);
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url(&key, job_id))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(&mut req, caller_cli_session(&["dev"]));
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["attempts"], 5);
+    assert_eq!(body["last_error"], "upstream: 503 after 5 attempts");
+    assert_eq!(body["kind"], "prefetch");
+    assert!(body["created_at"].is_string());
+    assert!(body["completed_at"].is_string());
+    assert!(body.get("result_summary").is_none(), "{body}");
+}
+
+/// A `ServiceAccount` token (the CI-caller shape) is accepted exactly as
+/// the POST accepts it for the enqueue.
+#[tokio::test]
+async fn prefetch_job_service_account_token_succeeds() {
+    let repo = npm_repo();
+    let repo_id = repo.id;
+    let key = repo.key.clone();
+    let (ctx, mocks) = ctx_with_rbac(evaluator_with_read_and_prefetch("ci", repo_id));
+    mocks.repositories.insert(repo);
+
+    let row = sample_prefetch_job_row(
+        "prefetch-dependencies",
+        repo_id,
+        hort_domain::ports::jobs_repository::JobStatus::Completed,
+        None,
+    );
+    let job_id = row.id;
+    mocks.jobs.seed_get(row);
+    let router = build_test_router(ctx);
+
+    let mut req = Request::builder()
+        .method(Method::GET)
+        .uri(prefetch_job_url(&key, job_id))
+        .body(Body::empty())
+        .unwrap();
+    auth_test::inject_optional_principal_some(
+        &mut req,
+        caller_with_token_kind(&["ci"], Some(TokenKind::ServiceAccount)),
+    );
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["kind"], "prefetch-dependencies");
+}

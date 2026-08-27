@@ -753,6 +753,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "camino"
+version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb1307f12aa967b5a58416e87b3653360e0fd614a016b6e970db08fecbb1b80d"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "cargo-platform"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd0061da739915fae12ea00e16397555ed4371a6bb285431aab930f61b0aa4ba"
+dependencies = [
+ "serde",
+ "serde_core",
+]
+
+[[package]]
+name = "cargo_metadata"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef987d17b0a113becdd19d3d0022d04d7ef41f9efe4f3fb63ac44ba61df3ade9"
+dependencies = [
+ "camino",
+ "cargo-platform",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2308,7 +2341,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-advisory-osv"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2336,7 +2369,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-checkpoint-anchor"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2355,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-ephemeral-memory"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2369,7 +2402,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-ephemeral-redis"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2385,7 +2418,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-kubernetes"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.23.0",
  "chrono",
@@ -2404,7 +2437,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-oidc"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2432,13 +2465,14 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-postgres"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "hort-app",
  "hort-domain",
  "metrics",
  "metrics-util",
+ "rand 0.10.2",
  "serde_json",
  "serial_test",
  "sqlx",
@@ -2452,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-provenance-cosign-key"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "hort-domain",
  "p256",
@@ -2465,7 +2499,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-provenance-sigstore"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.0",
@@ -2489,7 +2523,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-scanner-osv"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "cvss",
@@ -2505,7 +2539,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-scanner-trivy"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2520,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-secrets"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "hort-domain",
  "metrics",
@@ -2535,7 +2569,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-storage"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2558,7 +2592,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-upstream-http"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2595,7 +2629,7 @@ dependencies = [
 
 [[package]]
 name = "hort-app"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -2632,11 +2666,11 @@ dependencies = [
 
 [[package]]
 name = "hort-attribution"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "hort-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
@@ -2668,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "hort-config"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "hort-domain",
@@ -2684,7 +2718,7 @@ dependencies = [
 
 [[package]]
 name = "hort-domain"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.23.0",
  "blake3",
@@ -2706,7 +2740,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "base64 0.23.0",
  "bytes",
@@ -2729,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats-upstream"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2748,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-admin-security"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2770,7 +2804,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-admin-tasks"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2792,7 +2826,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-cargo"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2824,7 +2858,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2859,7 +2893,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-discovery"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2880,7 +2914,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-events"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2902,7 +2936,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-maven"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2933,7 +2967,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-npm"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2968,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-oci"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3006,7 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-pypi"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3040,7 +3074,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-subscriptions"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3061,11 +3095,11 @@ dependencies = [
 
 [[package]]
 name = "hort-net-egress"
-version = "0.11.0"
+version = "0.12.0"
 
 [[package]]
 name = "hort-notifier-nats"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-nats",
  "bytes",
@@ -3085,7 +3119,7 @@ dependencies = [
 
 [[package]]
 name = "hort-notifier-webhook"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "chrono",
  "hex",
@@ -3109,12 +3143,13 @@ dependencies = [
 
 [[package]]
 name = "hort-server"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
  "axum",
  "bytes",
+ "cargo_metadata",
  "chrono",
  "clap",
  "hort-adapters-checkpoint-anchor",
@@ -3173,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "hort-worker"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5839,6 +5874,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"

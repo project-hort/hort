@@ -125,16 +125,24 @@ use tls_config::{
 
 /// Per-instance configuration.
 ///
-/// `default()` carries production-sane defaults: 30s timeout, redirect
-/// cap of 5, no extra CA. Realm endpoints for the bearer-challenge
-/// flow are learned at runtime from upstream `WWW-Authenticate`
-/// responses — there is no configuration knob for them.
+/// [`HttpUpstreamProxyConfig::new`] carries production-sane defaults for
+/// every knob except `format_label`: 30s timeout, redirect cap of 5, no
+/// extra CA. Realm endpoints for the bearer-challenge flow are learned at
+/// runtime from upstream `WWW-Authenticate` responses — there is no
+/// configuration knob for them.
+///
+/// There is deliberately no `Default` impl: `format_label` names the
+/// emitting format/subsystem and has no defensible default, so it is a
+/// constructor argument. A default here silently mis-attributed every
+/// non-OCI upstream fetch — including the `hort_upstream_insecure_total`
+/// security signal — to whichever value the default happened to carry.
 #[derive(Clone)]
 pub struct HttpUpstreamProxyConfig {
     pub timeout: Duration,
-    /// `format` label fired on every metric emission. The OCI
-    /// composition root passes `"oci"`; future consumers supply
-    /// their own format identifier. Bounded label set (~40 across
+    /// `format` label fired on every metric emission. The server read
+    /// path builds one instance per served format, each passing its own
+    /// value; the worker passes a subsystem name (`prefetch_tick`,
+    /// `provenance`). Bounded label set (~40 across
     /// the workspace) per the cardinality rules in
     /// `docs/metrics-catalog.md`.
     pub format_label: String,
@@ -202,11 +210,15 @@ impl std::fmt::Debug for HttpUpstreamProxyConfig {
     }
 }
 
-impl Default for HttpUpstreamProxyConfig {
-    fn default() -> Self {
+impl HttpUpstreamProxyConfig {
+    /// Production-sane defaults for every knob except `format_label`,
+    /// which is mandatory — see the type docs for why there is no
+    /// `Default`. Callers override the rest with struct-update syntax:
+    /// `HttpUpstreamProxyConfig { timeout: …, ..HttpUpstreamProxyConfig::new("npm") }`.
+    pub fn new(format_label: impl Into<String>) -> Self {
         Self {
             timeout: Duration::from_secs(30),
-            format_label: "oci".to_string(),
+            format_label: format_label.into(),
             max_redirect_hops: 5,
             // Settled default (ADR 0026).
             metadata_cache_max_bytes: 64 * 1024 * 1024,
@@ -582,6 +594,55 @@ pub struct HttpUpstreamProxy {
     redirect_test_allowlist: Arc<Vec<SocketAddr>>,
 }
 
+/// Build the outbound `reqwest::Client` for the supplied config.
+///
+/// Single source of truth for the transport posture, shared by
+/// [`HttpUpstreamProxy::new`] (one client per instance) and
+/// [`HttpUpstreamProxy::build_client`] (one client shared across a
+/// per-format family), so the two paths cannot drift apart.
+///
+/// SSRF defence, three layers, all reusing `is_routable`:
+///  - `check_ssrf_safe` validates the initial absolute URL at parse time;
+///  - the redirect policy re-runs `is_routable` on every hop's resolved
+///    host and stops the chain when a hop resolves non-routable, while
+///    still enforcing the `max_redirect_hops` cap;
+///  - the connect-time `dns_guard::GuardedDnsResolver` re-runs
+///    `is_routable` at dial time so a DNS-rebind between the
+///    `check_ssrf_safe` resolve and reqwest's independent dial-time
+///    resolve cannot pivot to IMDS / RFC1918 / loopback (security audit
+///    finding INJ-1). Cross-origin Authorization-strip remains.
+///
+/// The guard shares the same `redirect_test_allowlist` seam (empty in
+/// production) the redirect policy uses, so wiremock host-name tests can
+/// drive it on loopback while production refuses every loopback /
+/// RFC1918 / link-local resolution.
+fn build_client_inner(
+    config: &HttpUpstreamProxyConfig,
+    redirect_test_allowlist: &Arc<Vec<SocketAddr>>,
+) -> DomainResult<Client> {
+    let base_builder = Client::builder()
+        .timeout(config.timeout)
+        .user_agent(config.user_agent.as_str())
+        .dns_resolver(Arc::new(dns_guard::GuardedDnsResolver::new(
+            redirect_test_allowlist.clone(),
+        )))
+        .redirect(build_redirect_policy(
+            config.max_redirect_hops,
+            redirect_test_allowlist.clone(),
+        ));
+
+    // Apply the process-wide extra CA bundle (ADR 0010) to the base
+    // client. Failure here is fatal: composition aborts rather than
+    // running with a partially-trusted TLS posture. The helper returns
+    // the builder unchanged when `extra_trust_anchors` is `None`.
+    let base_builder =
+        extra_ca::apply_to_reqwest_builder(base_builder, config.extra_trust_anchors.as_ref())?;
+
+    base_builder
+        .build()
+        .map_err(|e| DomainError::Invariant(format!("building reqwest client failed: {e}")))
+}
+
 impl HttpUpstreamProxy {
     /// Build a proxy with the supplied [`SecretPort`] adapter and
     /// [`HttpUpstreamProxyConfig`]. The shared `reqwest::Client`
@@ -594,6 +655,50 @@ impl HttpUpstreamProxy {
         // Production: empty redirect-policy allowlist — every loopback /
         // RFC1918 / link-local redirect hop is rejected.
         Self::new_inner(config, secret_port, Arc::new(Vec::new()))
+    }
+
+    /// Build the transport client a family of proxies can share.
+    ///
+    /// Pair with [`Self::with_client`] when several instances differ only
+    /// in `format_label`: `reqwest::Client` clones share one connection
+    /// pool, so building the client once and cloning it into N instances
+    /// keeps the outbound pool single while each instance keeps its own
+    /// metric label. Building N clients instead would fragment the pool
+    /// N ways for no gain.
+    ///
+    /// Only the transport knobs are read — `timeout`, `user_agent`,
+    /// `max_redirect_hops`, `extra_trust_anchors`. `format_label` and the
+    /// body caps are per-instance concerns consumed by
+    /// [`Self::with_client`], so the config passed here may carry any of
+    /// the family's labels.
+    pub fn build_client(config: &HttpUpstreamProxyConfig) -> DomainResult<Client> {
+        // Production: empty redirect-policy allowlist, as in `new`.
+        build_client_inner(config, &Arc::new(Vec::new()))
+    }
+
+    /// Construct a proxy on a pre-built, shared [`Client`] (see
+    /// [`Self::build_client`]).
+    ///
+    /// The per-instance auth caches (`bearer_cache`, `challenge_memo`,
+    /// `tls_client_cache`) are intentionally NOT shared across the
+    /// family: their keys are per-upstream-mapping, and a mapping belongs
+    /// to exactly one repository of exactly one format, so entries can
+    /// never overlap between instances. Only the connection pool is worth
+    /// sharing.
+    pub fn with_client(
+        client: Client,
+        config: HttpUpstreamProxyConfig,
+        secret_port: Arc<dyn SecretPort>,
+    ) -> Self {
+        Self {
+            client,
+            config,
+            secret_port,
+            bearer_cache: Arc::new(BearerCache::new()),
+            challenge_memo: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            tls_client_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            redirect_test_allowlist: Arc::new(Vec::new()),
+        }
     }
 
     /// Test-only constructor that seeds the per-hop redirect-policy
@@ -617,42 +722,7 @@ impl HttpUpstreamProxy {
         secret_port: Arc<dyn SecretPort>,
         redirect_test_allowlist: Arc<Vec<SocketAddr>>,
     ) -> DomainResult<Self> {
-        // SSRF defence, three layers, all reusing `is_routable`:
-        //  - `check_ssrf_safe` validates the initial absolute URL at parse
-        //    time;
-        //  - the redirect policy re-runs `is_routable` on every hop's
-        //    resolved host and stops the chain when a hop resolves
-        //    non-routable, while still enforcing the `max_redirect_hops` cap;
-        //  - the connect-time `dns_guard::GuardedDnsResolver` re-runs
-        //    `is_routable` at dial time so a DNS-rebind between the
-        //    `check_ssrf_safe` resolve and reqwest's independent dial-time
-        //    resolve cannot pivot to IMDS / RFC1918 / loopback (security
-        //    audit finding INJ-1). Cross-origin Authorization-strip remains.
-        // The guard shares the same `redirect_test_allowlist` seam (empty in
-        // production) the redirect policy uses, so wiremock host-name tests
-        // can drive it on loopback while production refuses every
-        // loopback / RFC1918 / link-local resolution.
-        let base_builder = Client::builder()
-            .timeout(config.timeout)
-            .user_agent(config.user_agent.as_str())
-            .dns_resolver(Arc::new(dns_guard::GuardedDnsResolver::new(
-                redirect_test_allowlist.clone(),
-            )))
-            .redirect(build_redirect_policy(
-                config.max_redirect_hops,
-                redirect_test_allowlist.clone(),
-            ));
-
-        // Apply the process-wide extra CA bundle (ADR 0010) to the base
-        // client. Failure here is fatal: composition aborts rather than
-        // running with a partially-trusted TLS posture. The helper returns
-        // the builder unchanged when `extra_trust_anchors` is `None`.
-        let base_builder =
-            extra_ca::apply_to_reqwest_builder(base_builder, config.extra_trust_anchors.as_ref())?;
-
-        let client = base_builder
-            .build()
-            .map_err(|e| DomainError::Invariant(format!("building reqwest client failed: {e}")))?;
+        let client = build_client_inner(&config, &redirect_test_allowlist)?;
         Ok(Self {
             client,
             config,
@@ -2788,6 +2858,14 @@ mod tests {
     }
 
     fn proxy_for(server: &MockServer) -> HttpUpstreamProxy {
+        proxy_for_format(server, "oci")
+    }
+
+    /// `proxy_for` with an explicit `format_label` — the per-format
+    /// server read path builds one instance per served format, so the
+    /// metric-label tests need to construct instances that are not
+    /// `"oci"`.
+    fn proxy_for_format(server: &MockServer, format_label: &str) -> HttpUpstreamProxy {
         // The connect-time SSRF guard was removed; reqwest's default DNS
         // resolver connects to wiremock's loopback bind address without
         // further wiring. The `server` argument is retained for signature
@@ -2795,8 +2873,7 @@ mod tests {
         let _ = server;
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new(format_label)
         };
         HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
     }
@@ -2811,10 +2888,9 @@ mod tests {
     fn proxy_for_with_caps(metadata_cap: u64, manifest_cap: u64) -> HttpUpstreamProxy {
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(5),
-            format_label: "oci".to_string(),
             metadata_cache_max_bytes: metadata_cap,
             manifest_cache_max_bytes: manifest_cap,
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
     }
@@ -2998,7 +3074,7 @@ mod tests {
 
         let cfg = HttpUpstreamProxyConfig {
             user_agent: "acme-proxy/2.0".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
         let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
@@ -3586,8 +3662,7 @@ mod tests {
         let _ = server;
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
     }
@@ -3838,8 +3913,7 @@ mod tests {
         let proxy = {
             let cfg = HttpUpstreamProxyConfig {
                 timeout: Duration::from_secs(2),
-                format_label: "oci".to_string(),
-                ..Default::default()
+                ..HttpUpstreamProxyConfig::new("oci")
             };
             HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
         };
@@ -3881,8 +3955,7 @@ mod tests {
         let proxy = {
             let cfg = HttpUpstreamProxyConfig {
                 timeout: Duration::from_secs(2),
-                format_label: "oci".to_string(),
-                ..Default::default()
+                ..HttpUpstreamProxyConfig::new("oci")
             };
             HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
         };
@@ -4443,8 +4516,7 @@ mod tests {
         }
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let proxy = HttpUpstreamProxy::new(
             cfg,
@@ -4517,8 +4589,7 @@ mod tests {
         }
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AlwaysNone)).unwrap();
         let mut m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
@@ -4569,8 +4640,7 @@ mod tests {
         }
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AlwaysErr)).unwrap();
         let mut m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
@@ -4614,8 +4684,7 @@ mod tests {
         }
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AlwaysErr)).unwrap();
         let mut m = mapping(
@@ -4700,8 +4769,7 @@ mod tests {
 
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let port = Arc::new(FixedSecretPort {
             bytes: b"hunter2".to_vec(),
@@ -4761,8 +4829,7 @@ mod tests {
 
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let port = Arc::new(FixedSecretPort { bytes: vec![] });
         let proxy = HttpUpstreamProxy::new(cfg, port).unwrap();
@@ -5166,6 +5233,177 @@ mod tests {
         }
     }
 
+    // -- Per-format instances ------------------------------------------
+    // The `format` label is taken at construction, so the server read
+    // path builds ONE INSTANCE PER SERVED FORMAT rather than fanning a
+    // single instance out to the five inbound format crates. These tests
+    // pin that the label an instance emits is its own — including on
+    // `hort_upstream_insecure_total`, where an operator triaging "which
+    // upstream is plaintext?" needs the format that actually fetched.
+
+    /// One `Snapshotter::snapshot()` call's rows. Taken ONCE per test and
+    /// passed to both helpers below: the debugging snapshotter drains
+    /// counter values as it reads them, so a second `snapshot()` sees the
+    /// same keys with zeroed counters.
+    type SnapshotRows = Vec<(
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        metrics_util::debugging::DebugValue,
+    )>;
+
+    /// Sum of `<metric>{format=<format>}` counter values in the snapshot.
+    fn counter_total_for_format(rows: &SnapshotRows, metric: &str, format: &str) -> u64 {
+        let mut total = 0u64;
+        for (key, _, _, value) in rows {
+            let inner: &metrics::Key = key.key();
+            if inner.name() != metric {
+                continue;
+            }
+            if !inner
+                .labels()
+                .any(|l| l.key() == "format" && l.value() == format)
+            {
+                continue;
+            }
+            if let metrics_util::debugging::DebugValue::Counter(n) = value {
+                total += n;
+            }
+        }
+        total
+    }
+
+    /// Every distinct `format` label value seen on `metric` — the
+    /// negative half: proves no stray `oci` series was emitted alongside
+    /// the expected ones.
+    fn format_labels_seen(rows: &SnapshotRows, metric: &str) -> std::collections::BTreeSet<String> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (key, _, _, _) in rows {
+            let inner: &metrics::Key = key.key();
+            if inner.name() != metric {
+                continue;
+            }
+            for label in inner.labels() {
+                if label.key() == "format" {
+                    seen.insert(label.value().to_string());
+                }
+            }
+        }
+        seen
+    }
+
+    /// An insecure (plaintext) npm upstream must tick
+    /// `hort_upstream_insecure_total{format="npm"}` — NOT `oci`.
+    #[test]
+    fn insecure_non_oci_upstream_emits_its_own_format_label() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    Mock::given(method("GET"))
+                        .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
+                        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tgz".as_slice()))
+                        .mount(&server)
+                        .await;
+                    let proxy = proxy_for_format(&server, "npm");
+                    let m = mapping_with_insecure(
+                        &server.uri(),
+                        "npmjs/",
+                        UpstreamAuth::Anonymous,
+                        true,
+                    );
+                    let _ = proxy
+                        .fetch_artifact(m, "/left-pad/-/left-pad-1.3.0.tgz".into())
+                        .await
+                        .expect("npm tarball fetch");
+                });
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_total_for_format(&rows, "hort_upstream_insecure_total", "npm"),
+            1,
+            "an insecure npm upstream must tick the counter under format=npm"
+        );
+        assert_eq!(
+            format_labels_seen(&rows, "hort_upstream_insecure_total"),
+            ["npm".to_string()].into_iter().collect(),
+            "no other format label may appear — a hardcoded oci is the defect being closed"
+        );
+    }
+
+    /// One `reqwest::Client` built once, N instances constructed on
+    /// clones of it: every instance emits ITS OWN `format` label on the
+    /// read-path fetch counter, and the shared connection pool is the
+    /// only thing they have in common.
+    #[test]
+    fn instances_sharing_one_client_each_emit_their_own_format_label() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let server = MockServer::start().await;
+                    Mock::given(method("GET"))
+                        .and(path("/pkg.tar"))
+                        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"body".as_slice()))
+                        .mount(&server)
+                        .await;
+
+                    let config_for = |format_label: &str| HttpUpstreamProxyConfig {
+                        timeout: Duration::from_secs(2),
+                        ..HttpUpstreamProxyConfig::new(format_label)
+                    };
+                    // ONE client for the whole family.
+                    let shared = HttpUpstreamProxy::build_client(&config_for("npm"))
+                        .expect("shared client builds");
+                    let secret_port: Arc<dyn SecretPort> = Arc::new(AnonymousFallbackPort);
+
+                    for format_label in ["npm", "pypi", "cargo"] {
+                        let proxy = HttpUpstreamProxy::with_client(
+                            shared.clone(),
+                            config_for(format_label),
+                            secret_port.clone(),
+                        );
+                        let m = mapping(&server.uri(), "", UpstreamAuth::Anonymous);
+                        let _ = proxy
+                            .fetch_artifact(m, "/pkg.tar".into())
+                            .await
+                            .unwrap_or_else(|e| panic!("{format_label} fetch: {e:?}"));
+                    }
+                });
+        });
+
+        let rows = snapshotter.snapshot().into_vec();
+        for format_label in ["npm", "pypi", "cargo"] {
+            assert_eq!(
+                counter_total_for_format(&rows, "hort_upstream_fetch_total", format_label),
+                1,
+                "each instance must attribute its fetch to its own format label",
+            );
+        }
+        assert_eq!(
+            format_labels_seen(&rows, "hort_upstream_fetch_total"),
+            ["cargo", "npm", "pypi"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            "exactly the three constructed formats — no shared fallback label",
+        );
+    }
+
     // -------------------------------------------------------------------
     // fetch_metadata
     // -------------------------------------------------------------------
@@ -5484,10 +5722,9 @@ mod tests {
         // using a raw TcpListener, not a MockServer.
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(5),
-            format_label: "test".to_string(),
             metadata_cache_max_bytes: STREAMING_TEST_CAP,
             manifest_cache_max_bytes: TEST_MANIFEST_CAP,
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("test")
         };
         let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
         let m = mapping(
@@ -5957,8 +6194,7 @@ mod tests {
     fn proxy_with_no_server() -> HttpUpstreamProxy {
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(1),
-            format_label: "test".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("test")
         };
         HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
     }
@@ -6033,8 +6269,7 @@ mod tests {
             .collect();
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let proxy = HttpUpstreamProxy::new_with_redirect_test_allowlist(
             cfg,
@@ -6299,8 +6534,7 @@ mod tests {
         let _ = addr;
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(5),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         // The TLS tests don't exercise SecretPort failure paths; the
         // anonymous fallback port serves any unexpected resolve attempts.
@@ -6360,8 +6594,7 @@ mod tests {
         let _ = addr;
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(5),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         HttpUpstreamProxy::new(cfg, Arc::new(secrets)).unwrap()
     }
@@ -6832,7 +7065,7 @@ mod tests {
 
         let cfg = HttpUpstreamProxyConfig {
             extra_trust_anchors: Some(anchors),
-            ..HttpUpstreamProxyConfig::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort))
             .expect("proxy construction with extra_trust_anchors must succeed");
@@ -6871,7 +7104,7 @@ mod tests {
         // No extra_trust_anchors — only public CAs are trusted.
         let cfg = HttpUpstreamProxyConfig {
             extra_trust_anchors: None,
-            ..HttpUpstreamProxyConfig::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort))
             .expect("proxy construction must succeed even without extra_trust_anchors");
@@ -6978,8 +7211,7 @@ mod tests {
         // here.
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         // FixedSecretPort returns the byte payload as a SecretValue; the
         // Basic-auth path in `authorization_header` formats it as
@@ -7179,9 +7411,8 @@ mod tests {
         let allow: Vec<SocketAddr> = servers.iter().map(|s| *s.address()).collect();
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
-            format_label: "oci".to_string(),
             max_redirect_hops,
-            ..Default::default()
+            ..HttpUpstreamProxyConfig::new("oci")
         };
         HttpUpstreamProxy::new_with_redirect_test_allowlist(
             cfg,

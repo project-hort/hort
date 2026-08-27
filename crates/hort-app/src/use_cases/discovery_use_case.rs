@@ -872,9 +872,9 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: Some(anchor),
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         }
@@ -1763,6 +1763,7 @@ mod tests {
         fn delete(
             &self,
             _id: Uuid,
+            _actor: hort_domain::events::Actor,
         ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }

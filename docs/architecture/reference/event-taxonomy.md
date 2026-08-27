@@ -81,3 +81,47 @@ must treat the second and later occurrences as no-ops. `refs_remaining`
 is observational — it tells a consumer whether the underlying blob
 survived deduplication, not whether this artifact's purge succeeded
 (it always did, by the time the event is emitted).
+
+## Deletion
+
+### `ArtifactDeleted`
+
+Emitted when an artifact is deleted from its repository — today reachable
+through the OCI manifest `DELETE` by digest. Lands on the **artifact**
+stream (`artifact-{uuid}`, `StreamCategory::Artifact`), so a replay of
+that stream terminates here and never reconstructs a deleted artifact as
+live. Attribution (who deleted it) and record time ride the persisted-event
+envelope's `actor` / `stored_at`, not the payload. Source:
+`crates/hort-domain/src/events/artifact_events.rs`.
+
+Deletion is a **soft delete**: the `artifacts` projection row is retained
+with `deleted_at` set, and the CAS blob is untouched — blob lifetime stays
+refcount-gated GC, because another artifact may reference the same bytes.
+A deleted artifact is excluded from every live read, and its path is
+released: the `(repository_id, path)` unique index is predicated on
+`deleted_at IS NULL`, so a later ingest at the same path mints a **new**
+artifact with a new id and its own stream rather than resurrecting this
+one.
+
+Deletion is orthogonal to the quarantine axis. The event does not change
+`quarantine_status`, and there is no `Deleted` status value: a `Released`
+artifact and a `Rejected` one are both deletable, and the pre-deletion
+status is exactly what an audit reader needs preserved.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `artifact_id` | `Uuid` | The deleted artifact; equals the artifact stream's `entity_id`. |
+| `repository_id` | `Uuid` | Repository the artifact was deleted from. Denormalised so an audit query ("everything deleted from repository R") never has to join a projection row that is itself deletable. |
+| `path` | `String` | Repository-relative path the artifact occupied. Free for re-ingest after this event. |
+| `content_hash` | `ContentHash` | CAS content hash the artifact pointed at (64 lowercase hex chars by construction), so its content identity survives independently of the projection row. |
+
+**Consumer contract.** `ArtifactDeleted` is terminal for the artifact on
+the operator/registry-API axis: at most one appears per stream, and no
+further **catalog**-lifecycle event follows it (the retention events above
+are a separate axis — they decide the blob's fate, not the catalog's, and
+may still appear on the stream afterwards). A consumer projecting a live
+catalog removes the artifact on this event and must not reinstate it — a later
+artifact at the same `path` arrives under a *different* `artifact_id` and
+a different stream. It is not a purge signal: `content_hash` may still be
+referenced by other artifacts, and the blob's fate is decided separately
+by `ArtifactExpired` / `ArtifactPurged` above.

@@ -34,6 +34,7 @@ use hort_adapters_postgres::subscription_repo::PgSubscriptionRepository;
 use hort_adapters_postgres::user_repo::PgUserRepository;
 use hort_adapters_storage::filesystem_stateful_upload_staging::FilesystemStatefulUploadStaging;
 use hort_app::event_store_publisher::EventStorePublisher;
+use hort_app::gitops_apply_status::GitopsApplyStatus;
 use hort_app::pull_dedup::{PullDedup, PullDedupConfig};
 use hort_app::rbac::RbacEvaluator;
 use hort_app::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
@@ -42,6 +43,7 @@ use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
 use hort_app::use_cases::content_reference::ContentReferenceUseCase;
 use hort_app::use_cases::curation_use_case::CurationUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
+use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
@@ -89,6 +91,7 @@ use hort_app::use_cases::user_use_case::UserUseCase;
 // PEP 658 wheel-metadata serve use case.
 use hort_app::use_cases::wheel_metadata_use_case::WheelMetadataUseCase;
 use hort_domain::entities::rbac::ClaimMapping;
+use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::DomainResult;
 use hort_domain::ports::api_token_cache_invalidator::ApiTokenCacheInvalidator;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
@@ -109,7 +112,9 @@ use hort_domain::ports::secret_port::SecretPort;
 use hort_domain::ports::stateful_upload_staging::StatefulUploadStagingPort;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
-use hort_domain::ports::upstream_proxy::UpstreamProxy;
+use hort_domain::ports::upstream_proxy::{
+    UpstreamProxy, UpstreamProxyByFormat, READ_PATH_PROXY_FORMATS,
+};
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 
 use crate::config::ConfigError;
@@ -1144,6 +1149,12 @@ pub async fn build_app_context(
     // `enable_notifications=false` constructs the publisher with no
     // broadcast channel — every append is a transparent pass-through.
     notify_config: NotifyConfig,
+    // What this process applied from gitops at boot, or `None` when no
+    // apply ran (DSN-only boot / no `HORT_CONFIG_DIR`). Threaded in from
+    // `cli::serve`, which is where the apply happens — composition never
+    // runs an apply itself. Parked on `AppContext` behind an `ArcSwap`
+    // for the admin apply-status endpoint (ADR 0058).
+    gitops_apply_status: Option<GitopsApplyStatus>,
 ) -> DomainResult<BuildAppContextOutput> {
     // Wrap the event store in an
     // `EventStorePublisher`. The publisher impls `EventStore`, so use
@@ -1180,7 +1191,7 @@ pub async fn build_app_context(
     };
 
     let repo_repo = Arc::new(PgRepositoryRepository::new(db.clone()));
-    let artifact_repo = Arc::new(PgArtifactRepository::new(db.clone()));
+    let artifact_repo = Arc::new(PgArtifactRepository::new(db.clone(), event_store.clone()));
     let artifact_metadata_repo = Arc::new(PgArtifactMetadataRepository::new(db.clone()));
     let user_repo = Arc::new(PgUserRepository::new(db.clone()));
     // `PgApiTokenRepository` adapter. Always
@@ -1404,28 +1415,51 @@ pub async fn build_app_context(
     // sinks fed from the same value. Do NOT read back through
     // `AppContext.extra_trust_anchors` — that would couple the adapter to
     // the inbound-HTTP shape, which is exactly what the layering forbids.
-    let upstream_proxy_config = hort_adapters_upstream_http::HttpUpstreamProxyConfig {
-        format_label: "oci".to_string(),
-        extra_trust_anchors: extra_trust_anchors.clone(),
-        // Thread the operator-tunable
-        // storage backstops from `Config` so chart values control the
-        // per-fetch-class caps. The default fallback (`Default`)
-        // carries the pinned values, but composition is the explicit
-        // wire-up site — never hide the cap behind `Default` once a
-        // chart knob exists.
-        metadata_cache_max_bytes: upstream_metadata_cache_max_bytes,
-        manifest_cache_max_bytes: upstream_manifest_cache_max_bytes,
-        // Outbound User-Agent: HORT_UPSTREAM_USER_AGENT or the built-in
-        // default (crates.io rejects requests with no UA). Resolved by the
-        // shared adapter helper so hort-server + hort-worker match.
-        user_agent: hort_adapters_upstream_http::user_agent_from_env(),
-        ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::default()
+    //
+    // One instance PER SERVED FORMAT. The adapter takes its `format`
+    // metric label at construction, so a single instance fanned out to
+    // the five inbound format crates attributes every format's upstream
+    // fetch to one label — including `hort_upstream_insecure_total`,
+    // where an operator triaging "which upstream is plaintext?" needs
+    // the emitting format to be the real one.
+    let upstream_user_agent = hort_adapters_upstream_http::user_agent_from_env();
+    let upstream_proxy_config = |format_label: &str| {
+        hort_adapters_upstream_http::HttpUpstreamProxyConfig {
+            extra_trust_anchors: extra_trust_anchors.clone(),
+            // Thread the operator-tunable
+            // storage backstops from `Config` so chart values control the
+            // per-fetch-class caps. `HttpUpstreamProxyConfig::new`
+            // carries the pinned values, but composition is the explicit
+            // wire-up site — never hide the cap behind a constructor
+            // default once a chart knob exists.
+            metadata_cache_max_bytes: upstream_metadata_cache_max_bytes,
+            manifest_cache_max_bytes: upstream_manifest_cache_max_bytes,
+            // Outbound User-Agent: HORT_UPSTREAM_USER_AGENT or the built-in
+            // default (crates.io rejects requests with no UA). Resolved by the
+            // shared adapter helper so hort-server + hort-worker match.
+            user_agent: upstream_user_agent.clone(),
+            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new(format_label)
+        }
     };
-    let upstream_proxy: Arc<dyn UpstreamProxy> =
-        Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
-            upstream_proxy_config,
-            secret_port.clone(),
-        )?);
+    // ONE `reqwest::Client` behind all of them: clones share the
+    // connection pool, so the per-format split costs an extra struct per
+    // format and nothing at the transport layer. Building N clients
+    // instead would fragment the outbound pool N ways. `build_client`
+    // reads only the transport knobs (timeout, UA, redirect cap, extra
+    // CA) and never `format_label`, so which member of the family seeds
+    // it is immaterial — the client is identical for all five.
+    let shared_upstream_client = hort_adapters_upstream_http::HttpUpstreamProxy::build_client(
+        &upstream_proxy_config(&RepositoryFormat::Oci.to_string()),
+    )?;
+    let upstream_proxy = UpstreamProxyByFormat::new(READ_PATH_PROXY_FORMATS.map(|format| {
+        let proxy: Arc<dyn UpstreamProxy> =
+            Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::with_client(
+                shared_upstream_client.clone(),
+                upstream_proxy_config(&format.to_string()),
+                secret_port.clone(),
+            ));
+        (format, proxy)
+    }));
 
     let repository_use_case = Arc::new(RepositoryUseCase::new(repo_repo.clone()));
     let user_use_case = Arc::new(UserUseCase::new(user_repo.clone()));
@@ -2254,6 +2288,15 @@ pub async fn build_app_context(
     );
     let scanner_worker_query_use_case = Arc::new(ScannerWorkerQueryUseCase::new(scanner_registry));
 
+    // `EffectiveRepositoryConfigUseCase` for the admin
+    // `GET /admin/repositories/:key/effective-config` endpoint's
+    // scan-policy leg. Wires the same `policy_projections` port every
+    // other quarantine/scan-policy consumer above shares — no new SQL,
+    // no new adapter.
+    let effective_repository_config_use_case = Arc::new(EffectiveRepositoryConfigUseCase::new(
+        policy_projections.clone(),
+    ));
+
     // Prefetch planner. Zero-cost unit struct;
     // the `Arc` mirrors the rest of the use-case surface.
     let prefetch_use_case = Arc::new(PrefetchUseCase::new());
@@ -2783,6 +2826,8 @@ pub async fn build_app_context(
         manual_rescan_use_case,
         patch_candidate_use_case,
         scanner_worker_query_use_case,
+        effective_repository_config_use_case,
+        gitops_apply_status: Arc::new(ArcSwap::from_pointee(gitops_apply_status)),
         prefetch_use_case,
         effective_permissions_use_case,
         rbac_resolve_use_case,

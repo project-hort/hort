@@ -173,10 +173,16 @@ impl PgUnitOfWork {
 
     /// Commit the transaction.
     pub(crate) async fn commit(self) -> DomainResult<()> {
-        self.tx
-            .commit()
-            .await
-            .map_err(|e| DomainError::Invariant(format!("transaction commit failed: {e}")))
+        self.tx.commit().await.map_err(|e| {
+            // A contention abort can surface here rather than at the
+            // statement that provoked it — Postgres may defer the report to
+            // COMMIT. Classifying it at both sites is what makes the
+            // whole-transaction retry cover the transaction rather than only
+            // its statements.
+            crate::contention::contention_error(&e, "transaction commit").unwrap_or_else(|| {
+                DomainError::Invariant(format!("transaction commit failed: {e}"))
+            })
+        })
     }
 }
 
@@ -1104,6 +1110,17 @@ async fn append_with_conn(
                 DomainError::Conflict(format!(
                     "stream {stream_id_str} concurrent append at position {stream_position}"
                 ))
+            } else if let Some(contended) = crate::contention::contention_error(&e, "event append")
+            {
+                // A serialization failure or deadlock is NOT the position
+                // clash above: the appender did not lose a decided race, its
+                // transaction was aborted whole so someone else's could
+                // proceed. Re-running the identical batch against the
+                // unchanged stream is expected to succeed, and the caller's
+                // `expected_version` still holds precisely because nothing
+                // was applied. Kept distinct from `Conflict` so the
+                // whole-transaction retry cannot widen onto a real clash.
+                contended
             } else {
                 DomainError::Invariant(format!("failed to insert event: {e}"))
             }
@@ -1288,10 +1305,7 @@ mod tests {
     async fn maybe_pool() -> Option<PgPool> {
         let url = env::var("DATABASE_URL").ok()?;
         let pool = crate::test_support::isolated_db_from(&url).await?;
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations run cleanly against the test DB");
+        crate::test_support::migrate_or_panic(&pool).await;
         Some(pool)
     }
 

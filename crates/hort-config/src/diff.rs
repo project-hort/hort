@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::claim_mapping::ClaimMappingSpec;
 use crate::curation_rule::CurationRuleSpec;
 use crate::desired::DesiredState;
-use crate::envelope::Envelope;
+use crate::envelope::{Envelope, Kind};
 use crate::oidc_issuer::OidcIssuerSpec;
 use crate::permission_grant::{GrantIdentity, PermissionGrantSpec};
 use crate::repository::RepositorySpec;
@@ -754,6 +754,156 @@ pub fn spec_digest_curation_rule(spec: &CurationRuleSpec) -> [u8; 32] {
 /// re-apply.
 pub fn spec_digest_upstream_mapping(spec: &UpstreamMappingSpec) -> [u8; 32] {
     sha256_canonical_json(spec)
+}
+
+/// Domain-separation prefix for [`desired_state_digest`]. Bumping it
+/// invalidates every previously-computed generation, which is exactly
+/// what a change to the fold below should do.
+const GENERATION_DIGEST_DOMAIN: &[u8] = b"hort-gitops-generation/v1";
+
+/// SHA-256 fingerprint of a whole [`DesiredState`] — the **generation**
+/// of a gitops apply.
+///
+/// Two applies with the same generation applied the same configuration;
+/// a different generation means the config changed. This is the property
+/// an operator inspecting apply-status across a rollout actually wants,
+/// so the fold is built to hold it exactly:
+///
+/// - It folds the **per-kind spec digests**, not a fresh serialization of
+///   `DesiredState`. Those digests are the same values the diff uses to
+///   decide `unchanged` vs `update`, and several of them normalise first
+///   (`spec_digest_repository` sorts virtual members,
+///   `spec_digest_oidc_issuer` sorts audiences,
+///   `spec_digest_service_account` sorts federated identities). Hashing a
+///   raw serialization instead would make the generation change on a YAML
+///   reordering that produces zero row updates — a "config changed"
+///   signal for a config that did not change.
+/// - Entries are `(kind, name, spec digest)` triples, **sorted**, so the
+///   file-walk order and the order envelopes appear within a file are
+///   both irrelevant. A `Vec` is sorted rather than collected into a set:
+///   duplicate `(kind, name)` pairs are a validation failure that runs
+///   before apply, and silently collapsing them here would hide it.
+/// - **Source paths are excluded.** `DesiredState::source_files` and
+///   `lint_config_sources` record which file declared what; moving a
+///   declaration between files changes neither the applied configuration
+///   nor the resulting rows, so it must not change the generation.
+///
+/// Every kind carried on `DesiredState` participates, including the
+/// singleton `lint_config` — a lint-config change is a real config
+/// change even though it writes no row of its own.
+pub fn desired_state_digest(desired: &DesiredState) -> [u8; 32] {
+    fn entry(kind: Kind, name: &str, digest: [u8; 32]) -> String {
+        // `\u{1f}` (unit separator) delimits the three parts: it cannot
+        // occur in a kind label and would not survive YAML parsing into
+        // a name, so no field can impersonate a delimiter.
+        let mut out = String::with_capacity(name.len() + 96);
+        out.push_str(kind.label());
+        out.push('\u{1f}');
+        out.push_str(name);
+        out.push('\u{1f}');
+        for b in digest {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+
+    // Kinds with a normalising per-spec digest reuse it, so the
+    // generation agrees with the diff about what "unchanged" means.
+    for e in &desired.repositories {
+        entries.push(entry(
+            Kind::ArtifactRepository,
+            &e.metadata.name,
+            spec_digest_repository(&e.spec),
+        ));
+    }
+    for e in &desired.claim_mappings {
+        entries.push(entry(
+            Kind::ClaimMapping,
+            &e.metadata.name,
+            spec_digest_claim_mapping(&e.spec),
+        ));
+    }
+    for e in &desired.permission_grants {
+        entries.push(entry(
+            Kind::PermissionGrant,
+            &e.metadata.name,
+            spec_digest_permission_grant(&e.spec),
+        ));
+    }
+    for e in &desired.curation_rules {
+        entries.push(entry(
+            Kind::CurationRule,
+            &e.metadata.name,
+            spec_digest_curation_rule(&e.spec),
+        ));
+    }
+    for e in &desired.upstream_mappings {
+        entries.push(entry(
+            Kind::UpstreamMapping,
+            &e.metadata.name,
+            spec_digest_upstream_mapping(&e.spec),
+        ));
+    }
+    for e in &desired.oidc_issuers {
+        entries.push(entry(
+            Kind::OidcIssuer,
+            &e.metadata.name,
+            spec_digest_oidc_issuer(&e.spec),
+        ));
+    }
+    for e in &desired.service_accounts {
+        entries.push(entry(
+            Kind::ServiceAccount,
+            &e.metadata.name,
+            spec_digest_service_account(&e.spec),
+        ));
+    }
+
+    // Event-sourced and singleton kinds have no diff-time digest of
+    // their own; the same canonical-JSON algorithm applies directly.
+    for e in &desired.scan_policies {
+        entries.push(entry(
+            Kind::ScanPolicy,
+            &e.metadata.name,
+            sha256_canonical_json(&e.spec),
+        ));
+    }
+    for e in &desired.retention_policies {
+        entries.push(entry(
+            Kind::RetentionPolicy,
+            &e.metadata.name,
+            sha256_canonical_json(&e.spec),
+        ));
+    }
+    for e in &desired.exclusions {
+        entries.push(entry(
+            Kind::Exclusion,
+            &e.metadata.name,
+            sha256_canonical_json(&e.spec),
+        ));
+    }
+    if let Some(e) = &desired.lint_config {
+        entries.push(entry(
+            Kind::PermissionGrantLintConfig,
+            &e.metadata.name,
+            sha256_canonical_json(&e.spec),
+        ));
+    }
+
+    entries.sort();
+
+    let mut hasher = Sha256::new();
+    hasher.update(GENERATION_DIGEST_DOMAIN);
+    for e in &entries {
+        hasher.update(b"\n");
+        hasher.update(e.as_bytes());
+    }
+    let out = hasher.finalize();
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(&out);
+    digest
 }
 
 fn sha256_canonical_json<S: Serialize>(value: &S) -> [u8; 32] {
@@ -1822,5 +1972,106 @@ mod tests {
             spec_digest_service_account(&a),
             spec_digest_service_account(&b)
         );
+    }
+
+    // -- desired_state_digest (the apply `generation`) ---------------------
+
+    #[test]
+    fn generation_is_stable_across_recomputation() {
+        let mut d = DesiredState::default();
+        d.repositories.push(repo_env("a"));
+        d.claim_mappings.push(cm_env("admins", "g", "r"));
+        assert_eq!(desired_state_digest(&d), desired_state_digest(&d));
+    }
+
+    #[test]
+    fn generation_of_the_empty_state_is_a_fixed_nonzero_value() {
+        let empty = desired_state_digest(&DesiredState::default());
+        assert_eq!(empty, desired_state_digest(&DesiredState::default()));
+        assert_ne!(
+            empty, [0u8; 32],
+            "the domain-separation prefix is always hashed, so even an \
+             empty desired state has a real digest"
+        );
+    }
+
+    #[test]
+    fn generation_is_insensitive_to_envelope_ordering() {
+        let mut a = DesiredState::default();
+        a.repositories.push(repo_env("one"));
+        a.repositories.push(repo_env("two"));
+        let mut b = DesiredState::default();
+        b.repositories.push(repo_env("two"));
+        b.repositories.push(repo_env("one"));
+        assert_eq!(
+            desired_state_digest(&a),
+            desired_state_digest(&b),
+            "the file-walk order must not change the generation"
+        );
+    }
+
+    #[test]
+    fn generation_ignores_source_file_paths() {
+        let mut a = DesiredState::default();
+        a.repositories.push(repo_env("one"));
+        let mut b = a.clone();
+        b.source_files.insert(
+            crate::desired::EnvelopeKey {
+                kind: Kind::ArtifactRepository,
+                name: "one".into(),
+            },
+            vec![std::path::PathBuf::from("/config/moved/elsewhere.yaml")],
+        );
+        b.lint_config_sources
+            .push(std::path::PathBuf::from("/config/lint.yaml"));
+        assert_eq!(
+            desired_state_digest(&a),
+            desired_state_digest(&b),
+            "moving a declaration between files changes no applied row, so \
+             it must not change the generation"
+        );
+    }
+
+    #[test]
+    fn generation_changes_when_a_spec_changes() {
+        let mut a = DesiredState::default();
+        a.repositories.push(repo_env("one"));
+        let mut b = DesiredState::default();
+        let mut changed = repo_env("one");
+        changed.spec.is_public = false;
+        b.repositories.push(changed);
+        assert_ne!(desired_state_digest(&a), desired_state_digest(&b));
+    }
+
+    #[test]
+    fn generation_changes_when_an_envelope_is_added_or_removed() {
+        let mut a = DesiredState::default();
+        a.repositories.push(repo_env("one"));
+        let mut b = a.clone();
+        b.repositories.push(repo_env("two"));
+        assert_ne!(desired_state_digest(&a), desired_state_digest(&b));
+
+        // The same name under a different kind is a different entry.
+        let mut c = DesiredState::default();
+        c.claim_mappings.push(cm_env("one", "g", "r"));
+        assert_ne!(desired_state_digest(&a), desired_state_digest(&c));
+    }
+
+    #[test]
+    fn generation_is_insensitive_to_virtual_member_ordering() {
+        // The per-spec digest normalises member order, and the
+        // generation inherits that: reordering members produces no row
+        // update, so it must produce no generation change either.
+        let mut a = DesiredState::default();
+        let mut ea = repo_env("v");
+        ea.spec.virtual_members = Some(vec!["x".into(), "y".into()]);
+        a.repositories.push(ea);
+
+        let mut b = DesiredState::default();
+        let mut eb = repo_env("v");
+        eb.spec.virtual_members = Some(vec!["y".into(), "x".into()]);
+        b.repositories.push(eb);
+
+        assert_eq!(desired_state_digest(&a), desired_state_digest(&b));
     }
 }

@@ -278,6 +278,7 @@ pub(crate) fn event_type_kind_to_text(k: EventTypeKind) -> &'static str {
         // (full round-trip, unlike StreamSealed).
         EventTypeKind::ArtifactExpired => "ArtifactExpired",
         EventTypeKind::ArtifactPurged => "ArtifactPurged",
+        EventTypeKind::ArtifactDeleted => "ArtifactDeleted",
         // Internal retention tombstone on the never-deleted
         // `admin-eventstore-retention` audit-meta stream. Mapped here
         // for the closed round-trip; it is not a user-subscribable event
@@ -1933,10 +1934,7 @@ mod tests {
     async fn maybe_pool() -> Option<PgPool> {
         let url = env::var("DATABASE_URL").ok()?;
         let pool = crate::test_support::isolated_db_from(&url).await?;
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations run cleanly against the test DB");
+        crate::test_support::migrate_or_panic(&pool).await;
         Some(pool)
     }
 

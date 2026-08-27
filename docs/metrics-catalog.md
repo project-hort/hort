@@ -2235,19 +2235,40 @@ and error alike, so `errors_total` was a misnomer and the reserved
 alias became the canonical name.)
 
 `format` is taken at adapter construction time
-(`HttpUpstreamProxyConfig::format_label`) — the OCI composition
-root passes `"oci"`; future format consumers (Maven, npm proxy,
-…) construct their own instance with their own format string.
+(`HttpUpstreamProxyConfig::format_label`), so the **server read path
+builds one instance per served format** — `oci`, `npm`, `pypi`,
+`maven`, `cargo` — and each inbound format crate selects its own via
+`AppContext.upstream_proxy` (`UpstreamProxyByFormat::for_format`,
+keyed by the crate-level `UPSTREAM_PROXY_FORMAT` constant). The five
+instances share a single `reqwest::Client` (one connection pool);
+only the `format_label` differs. `format` on `hort_upstream_fetch_*`
+and `hort_upstream_insecure_total` is therefore the format that
+actually fetched. No new label *values*: the closed set below is
+unchanged — what changed is that the server read path now emits the
+correct member of it rather than always `oci`. There is deliberately
+no `HttpUpstreamProxyConfig::default()`: `format_label` has no
+defensible default, and the one it used to carry (`"oci"`) is exactly
+how every non-OCI server-side fetch came to be mis-attributed.
+
+A lookup for a format outside the served set panics rather than
+falling back — `UpstreamProxyByFormat::new` asserts at composition
+that every `READ_PATH_PROXY_FORMATS` entry is wired, so an
+incomplete composition fails at boot. A silent fallback instance is
+the defect, not the remedy.
+
 The worker builds two **subsystem-labelled** instances that fetch
 through the same adapter but are not a single artifact format:
 `prefetch_tick` (the scheduled prefetch tick / leaf-pull, which
 walks npm/cargo/pypi) and `provenance` (the upstream
 Sigstore-referrer fetch in the `provenance-verify` job). These are
 intentional non-format `format` values so dashboards separate
-background traffic from the OCI hot path; cloning one subsystem's
-proxy for another would mis-attribute its `hort_upstream_fetch_*`
-series (provenance traffic once emitted `format="prefetch_tick"`
-exactly this way).
+background traffic from the server hot path, and they are **not**
+converted to per-artifact-format labels: the prefetch tick walks
+npm/cargo/pypi within one job, so a per-format split there would
+name the artifact rather than the subsystem doing the work. Cloning
+one subsystem's proxy for another would mis-attribute its
+`hort_upstream_fetch_*` series (provenance traffic once emitted
+`format="prefetch_tick"` exactly this way).
 The `upstream` label is the mapping's `path_prefix` with a
 trailing slash trimmed (`"dockerhub/"` → `"dockerhub"`); empty
 prefixes (single-upstream catch-all) emit the `_default` sentinel.
@@ -2308,7 +2329,12 @@ upstream at apply time. Two `reason` values, fixed taxonomy owned by
 
 `format` is the same value the per-instance
 `HttpUpstreamProxyConfig::format_label` carries on
-`hort_upstream_fetch_total` (`oci`, `pypi`, `npm`, `cargo`, …).
+`hort_upstream_fetch_total` (`oci`, `pypi`, `npm`, `cargo`, …) — and
+since the server read path builds one instance per served format, it
+names the format that actually fetched through the plaintext
+upstream. That is load-bearing here specifically: this counter is the
+signal an operator triages to answer "which upstream is plaintext?",
+and a shared label answered "oci" for an insecure npm mapping.
 Cardinality envelope: 2 reason values × ~5 formats = ≤ 10 series.
 
 `hort_upstream_tls_handshake_total` is emitted by the `UpstreamProxy`
@@ -4001,15 +4027,39 @@ is emitted exactly once per `hort-server verify-event-chain` run and maps
 
 | Metric | Type | Labels | Unit | Notes |
 |--------|------|--------|------|-------|
-| `hort_event_chain_verify_total` | counter | `result` | runs | One increment per `verify-event-chain` run. `result ∈ {ok, broken, missing_checkpoint}` — exactly these three values, a per-metric closed enum. `ok` = every per-stream hash chain intact **and** the anchored-checkpoint cross-check passed; `broken` = a detected integrity violation (per-event hash mismatch, dangling chain, position gap, or an unsealed/absent stream not justified by an anchored `StreamSealed`); `missing_checkpoint` = chain intact but external anchoring could not be fully attested (no checkpoint, a `checkpoint_seq` gap, or a stale anchor — a coverage gap, not a proven violation). |
+| `hort_event_chain_verify_total` | counter | `result` | runs | One increment per `verify-event-chain` run. `result ∈ {ok, broken, missing_checkpoint}` — exactly these three values, a per-metric closed enum. `ok` = every per-stream hash chain intact **and** either the anchored-checkpoint cross-check passed **or** this deployment expects no anchor (see *Anchored vs unanchored* below); `broken` = a detected integrity violation (per-event hash mismatch, dangling chain, position gap, or an unsealed/absent stream not justified by an anchored `StreamSealed`); `missing_checkpoint` = chain intact but external anchoring could not be fully attested **on a deployment that expects an anchor** (no checkpoint, a `checkpoint_seq` gap, or a stale anchor — a coverage gap, not a proven violation). |
 
 **`result` label semantics** (closed taxonomy of exactly 3):
 
 | `result` value | Maps from | Exit code |
 |---|---|---|
 | `ok` | `ChainReport::Ok` | `0` |
+| `ok` | `ChainReport::MissingCheckpoint` **and no anchor expected** | `0` |
 | `broken` | `ChainReport::Broken` | `2` |
-| `missing_checkpoint` | `ChainReport::MissingCheckpoint` | `3` (when `--fail-on-missing-checkpoint`, the default) / `0` otherwise |
+| `missing_checkpoint` | `ChainReport::MissingCheckpoint` **and an anchor expected** | `3` (or `0` with an explicit `--fail-on-missing-checkpoint=false`) |
+
+**Anchored vs unanchored — why `ok` covers the unanchored case.**
+Whether a checkpoint anchor exists is a property of the *deployment*, not
+of a run: it is configured when the storage backend is S3 **and** an
+anchor public key is provisioned (`hort_app::event_chain_anchoring`, the
+one predicate the checkpoint writer and the verifier both derive their
+gate from — ADR 0057). A deployment that expects no anchor is a
+**supported posture, not a degraded one**: the per-stream hash chain is
+still recomputed in full and a real break still reports `broken`, but
+"no checkpoint" is then not a coverage gap — nothing was missing that the
+deployment ever promised to produce. It therefore maps to `ok`.
+
+The anchored-vs-unanchored distinction is carried by the **exit code and
+the log line**, and by the `anchor_expected` field of the subcommand's
+JSON output — deliberately **not** by a fourth `result` value. The
+cardinality contract below is fixed at ≤ 3 series and
+`scripts/check-g1-attestation-gate.sh` keys on that exact shape.
+
+The label keys on the *configuration-derived* fact, never on the resolved
+`--fail-on-missing-checkpoint` decision: an operator who forces
+`--fail-on-missing-checkpoint=false` on an anchored deployment suppresses
+the exit code, and the counter still records `missing_checkpoint`. The
+compliance evidence must not be silenceable by a CLI flag.
 
 `result` is a per-metric schema label (see the global label table), not
 the global value set; for this metric it holds exactly the three values
@@ -4144,8 +4194,8 @@ Emitted **once at boot** by `hort-server::composition` (the
 `emit_event_chain_verify_liveness_signal` fn, a deliberate parallel of
 `emit_staging_sweep_liveness_signal`). The event-chain verifier
 (`hort-server verify-event-chain`) is correct crypto but ships CLI-only;
-the `scheduledTasks.verifyEventChain` CronJob (default-disabled)
-schedules it, and on each completed run the subcommand records a
+the `scheduledTasks.verifyEventChain` CronJob (default-**enabled** since
+ADR 0057) schedules it, and on each completed run the subcommand records a
 `kind='verify-event-chain' AND status='completed'` row via
 `JobsRepository::record_run_completion`. The composition root queries the
 newest `completed_at` for that kind
@@ -4155,9 +4205,10 @@ sets the gauge: `0.0` when a verify run completed within
 `HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER × HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS`
 (defaults `3 × 86400 s` = three days), `1.0` when overdue or when no
 verify run has ever completed. A `warn!` is logged on both the overdue
-and never-ran paths naming the remediation (enable the
-`scheduledTasks.verifyEventChain` CronJob — `scheduledTasks.adminTasksEnabled=true`
-+ `scheduledTasks.verifyEventChain.enabled=true` — or run
+and never-ran paths naming the remediation (the
+`scheduledTasks.verifyEventChain` CronJob still needs its umbrella —
+`scheduledTasks.adminTasksEnabled=true` — and must not have been opted out
+with `scheduledTasks.verifyEventChain.enabled=false`; or run
 `hort-server verify-event-chain` out of band).
 
 **Alarm.** `max_over_time(hort_event_chain_verify_overdue[…]) > 0` — the

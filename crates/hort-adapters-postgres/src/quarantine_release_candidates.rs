@@ -10,11 +10,13 @@
 //!    → that policy's `quarantine_duration_secs`.
 //! 2. **Global non-archived policy** when no repo-scoped match exists
 //!    → that policy's `quarantine_duration_secs`.
-//! 3. **`DefaultPolicy`** otherwise → currently contributes **no
-//!    candidates** because `DefaultPolicy` carries no quarantine
-//!    window (the implicit permissive default). An unconfigured repo
-//!    never quarantines today, so no candidate ever escapes the
-//!    per-policy resolution.
+//! 3. **`DefaultPolicy::quarantine_duration_secs()`** (86 400 s)
+//!    otherwise — the same tier every other quarantine-window
+//!    consumer falls back to (ingest, the scan fast path,
+//!    `is_window_elapsed`, the read-path deadline). A repo with no
+//!    resolvable policy row still quarantines everything for 24 h at
+//!    ingest, so it must still surface release candidates once that
+//!    window elapses.
 //!
 //! Cost is bounded by **number of policies**, not number of artifacts:
 //! there are typically a handful of distinct durations,
@@ -25,7 +27,6 @@
 //! WHERE quarantine_status = 'quarantined'
 //!   AND repository_id = ANY($repos_for_D)
 //!   AND quarantine_window_start <= $now - D
-//!   AND is_deleted = false
 //! ```
 //!
 //! The partial index `idx_artifacts_quarantine_window_start ON
@@ -51,6 +52,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::quarantine_release_candidates::{
     QuarantineReleaseCandidate, QuarantineReleaseCandidatesRepository,
 };
@@ -89,12 +91,12 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             //
             // Per-repo precedence (mirrors
             // `QuarantineUseCase::record_scan_result`):
-            //   repo-scoped non-archived > global non-archived > Default.
+            //   repo-scoped non-archived > global non-archived
+            //   > `DefaultPolicy::quarantine_duration_secs()`.
             //
-            // `DefaultPolicy` currently carries no quarantine window — a
-            // repo with no matched policy contributes no candidates, which
-            // is correct: an unconfigured repo never quarantines under the
-            // implicit permissive default.
+            // A repo with no matched policy row still resolves to the
+            // 86 400s default — the same window ingest applied when it
+            // quarantined those artifacts in the first place.
             // -----------------------------------------------------------------
 
             // Pull active policies grouped by scope. Tiny rowcount — at
@@ -158,13 +160,19 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             // Walk the quarantined repos. The set of repos that currently
             // hold any quarantined artifact is the only set we need a
             // duration for; resolve each via the precedence above.
+            //
+            // Soft-deleted artifacts are excluded here and in the
+            // per-duration scan below: deletion is the terminal event on
+            // the artifact's stream, so releasing one afterwards would
+            // append a lifecycle event past the terminal and make a
+            // replay reconstruct a deleted artifact as live.
             let quarantined_repos: Vec<Uuid> = sqlx::query(
                 r#"
                 SELECT DISTINCT repository_id
                 FROM artifacts
                 WHERE quarantine_status = 'quarantined'
-                  AND is_deleted = false
                   AND quarantine_window_start IS NOT NULL
+                  AND deleted_at IS NULL
                 "#,
             )
             .fetch_all(&self.pool)
@@ -179,15 +187,23 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-            // Group repos by their resolved effective duration. A repo
-            // resolving to `None` (no operator policy, no global default)
-            // contributes no candidates — the per-duration loop skips it.
-            // A repo whose resolved duration is `<= 0` (permissive opt-
-            // in) also contributes no candidates: permissive mode is
+            // Group repos by their resolved effective duration. Precedence
+            // is repo-scoped non-archived policy > global non-archived
+            // policy > `DefaultPolicy::quarantine_duration_secs()` — the
+            // same three-tier resolution every other consumer of the
+            // quarantine window uses (`QuarantineUseCase::record_scan_result`,
+            // the scan fast path, `is_window_elapsed`, the read-path
+            // deadline). A resolved duration of `<= 0` (the permissive
+            // opt-in: an explicit policy with `quarantine_duration_secs =
+            // 0`) still contributes no candidates — permissive mode is
             // exactly "no quarantine hold," so no release-sweep work.
             let mut by_duration: HashMap<i64, Vec<Uuid>> = HashMap::new();
             for repo in quarantined_repos {
-                let effective = repo_scoped.get(&repo).copied().or(global_duration);
+                let effective = repo_scoped
+                    .get(&repo)
+                    .copied()
+                    .or(global_duration)
+                    .or(Some(DefaultPolicy::quarantine_duration_secs()));
                 if let Some(secs) = effective {
                     if secs > 0 {
                         by_duration.entry(secs).or_default().push(repo);
@@ -225,9 +241,9 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
                     SELECT id AS artifact_id
                     FROM artifacts
                     WHERE quarantine_status = 'quarantined'
-                      AND is_deleted = false
                       AND repository_id = ANY($1)
                       AND quarantine_window_start <= $2
+                      AND deleted_at IS NULL
                     ORDER BY quarantine_window_start
                     LIMIT $3
                     "#,
@@ -275,6 +291,7 @@ mod tests {
 
     use std::env;
 
+    use serde_json::json;
     use serial_test::serial;
     use sqlx::PgPool;
 
@@ -287,18 +304,96 @@ mod tests {
     async fn maybe_pool() -> Option<PgPool> {
         let url = env::var("DATABASE_URL").ok()?;
         let pool = crate::test_support::isolated_db_from(&url).await?;
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .expect("migrations run cleanly against the test DB");
+        crate::test_support::migrate_or_panic(&pool).await;
         Some(pool)
     }
 
+    /// Seed a minimal repository row with a unique key and return its id.
+    async fn seed_repo(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = format!("it-qrc-{}", id.simple());
+        sqlx::query(
+            r#"INSERT INTO public.repositories (
+                   id, key, name, format, repo_type, storage_backend, storage_path,
+                   replication_priority
+               ) VALUES (
+                   $1, $2, $3,
+                   'pypi'::repository_format,
+                   'hosted'::repository_type,
+                   'filesystem', $4,
+                   'local_only'::replication_priority
+               )"#,
+        )
+        .bind(id)
+        .bind(&key)
+        .bind(&key)
+        .bind(format!("/tmp/{key}"))
+        .execute(pool)
+        .await
+        .expect("seed repository row");
+        id
+    }
+
+    /// Seed a quarantined artifact whose window started `started` and
+    /// return its id.
+    async fn seed_quarantined_artifact(pool: &PgPool, repo: Uuid, started: DateTime<Utc>) -> Uuid {
+        let id = Uuid::new_v4();
+        let key = id.simple().to_string();
+        let sha256 = format!("{key}{key}");
+        sqlx::query(
+            r#"INSERT INTO public.artifacts (
+                   id, repository_id, name, name_as_published, version, path,
+                   size_bytes, checksum_sha256, content_type, storage_key,
+                   quarantine_status, quarantine_window_start
+               ) VALUES (
+                   $1, $2, 'qrc-it', 'qrc-it', '0.0.0', $3,
+                   0, $4, 'application/octet-stream', $4,
+                   'quarantined', $5
+               )"#,
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(format!("simple/qrc-it/{key}.tar.gz"))
+        .bind(&sha256)
+        .bind(started)
+        .execute(pool)
+        .await
+        .expect("seed quarantined artifact row");
+        id
+    }
+
+    /// Seed a non-archived repository-scoped policy with the requested
+    /// `quarantine_duration_secs`.
+    async fn seed_repo_scoped_policy(pool: &PgPool, repo_id: Uuid, quarantine_duration_secs: i64) {
+        let policy_id = Uuid::new_v4();
+        let name = format!("it-qrc-policy-{}", policy_id.simple());
+        let scope = json!({ "Repository": repo_id });
+        sqlx::query(
+            r#"INSERT INTO public.policy_projections (
+                   policy_id, name, scope, severity_threshold,
+                   rescan_interval_hours, quarantine_duration_secs,
+                   require_approval, archived,
+                   stream_version
+               ) VALUES (
+                   $1, $2, $3, 'high',
+                   24, $4,
+                   false, false,
+                   1
+               )"#,
+        )
+        .bind(policy_id)
+        .bind(&name)
+        .bind(&scope)
+        .bind(quarantine_duration_secs)
+        .execute(pool)
+        .await
+        .expect("seed repo-scoped policy_projections row");
+    }
+
     /// `select_expired` returns an empty `Vec` on an empty database —
-    /// no policies, no artifacts, no candidates. With no
-    /// operator-configured `ScanPolicy` AND no
-    /// `DefaultPolicy::quarantine_duration_secs`, the adapter is a pure
-    /// no-op rather than panicking on the absent default.
+    /// no policies, no artifacts, no quarantined repos to resolve a
+    /// duration for in the first place, so the default-duration
+    /// fallback never even gets consulted.
     ///
     /// `#[serial(hort_pg_db)]` per CLAUDE.md "DB-backed test isolation
     /// (parallel-safety contract)": any new hort-adapters-postgres test
@@ -322,6 +417,98 @@ mod tests {
             out.is_empty(),
             "no policies + no artifacts ⇒ no candidates; got {} rows",
             out.len()
+        );
+    }
+
+    /// A quarantined artifact in a repo with **zero** resolvable policy
+    /// rows (no repo-scoped, no Global) becomes a release candidate once
+    /// `DefaultPolicy::quarantine_duration_secs()` (86 400 s) has
+    /// elapsed. This is the defect this module fixes: previously such a
+    /// repo resolved to `None` and was dropped from candidacy forever.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_falls_back_to_default_duration_when_no_policy_resolves() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let started = now
+            - chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs())
+            - chrono::Duration::seconds(1);
+        let artifact = seed_quarantined_artifact(&pool, repo, started).await;
+
+        let out = PgQuarantineReleaseCandidatesRepository::new(pool)
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        assert_eq!(
+            out.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+            vec![artifact],
+            "an artifact past the default window in a policy-less repo must be a candidate"
+        );
+    }
+
+    /// The counterpart of the fallback test above: before the default
+    /// window has elapsed, the same policy-less artifact is NOT a
+    /// candidate.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_default_duration_not_yet_elapsed_is_not_a_candidate() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let started = now - chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs())
+            + chrono::Duration::seconds(60);
+        let artifact = seed_quarantined_artifact(&pool, repo, started).await;
+
+        let out = PgQuarantineReleaseCandidatesRepository::new(pool)
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        assert!(
+            !out.iter().any(|c| c.artifact_id == artifact),
+            "an artifact inside the default window must not be a candidate yet"
+        );
+    }
+
+    /// Permissive opt-in: an explicit repo-scoped policy with
+    /// `quarantine_duration_secs = 0` must never contribute a candidate,
+    /// no matter how long ago the artifact's window started. The
+    /// default-duration fallback added by this fix must not override an
+    /// operator's explicit zero.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_explicit_zero_duration_never_a_candidate() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy(&pool, repo, 0).await;
+        let now = Utc::now();
+        // Started far in the past — would be well past the default
+        // window if the zero-duration policy did not exist.
+        let started = now - chrono::Duration::days(365);
+        let artifact = seed_quarantined_artifact(&pool, repo, started).await;
+
+        let out = PgQuarantineReleaseCandidatesRepository::new(pool)
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        assert!(
+            !out.iter().any(|c| c.artifact_id == artifact),
+            "quarantine_duration_secs = 0 must permanently exclude the repo from candidacy"
         );
     }
 }

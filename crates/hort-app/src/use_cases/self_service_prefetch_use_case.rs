@@ -898,6 +898,106 @@ impl SelfServicePrefetchUseCase {
         }
         Ok(None)
     }
+
+    /// Read-only outcome of a prefetch job minted by
+    /// [`Self::enqueue_self_service`] on the same repository —
+    /// `GET /api/v1/repositories/{repo_key}/prefetch/jobs/{job_id}`.
+    ///
+    /// **Authz is IDENTICAL to `enqueue_self_service`**: the same Gate 1
+    /// (token-kind: `CliSession` OR `ServiceAccount`) and the same Gate 2
+    /// (`Permission::Read ∧ Permission::Prefetch` on the resolved repo).
+    /// The read surface must admit exactly the caller that could have
+    /// minted the job id — no more, no less. This is a GET endpoint, so
+    /// it routes through `extract_optional_principal` rather than
+    /// `require_principal` (`hort-http-core::router.rs`'s method-based
+    /// dispatch); `caller: None` (no token, or an unvalidatable one) is
+    /// rejected with `AppError::Unauthorized`, mirroring
+    /// `DiscoveryUseCase::list_versions`'s Gate 0.
+    ///
+    /// **Cross-repo isolation:** a `job_id` that exists but belongs to a
+    /// DIFFERENT repository, or is not a `prefetch` / `prefetch-dependencies`
+    /// job, is indistinguishable from an unknown id — both collapse to
+    /// `DomainError::NotFound`. No field of another repository's job is
+    /// ever returned to a caller who cannot enumerate it.
+    #[instrument(skip(self))]
+    pub async fn get_prefetch_job_outcome(
+        &self,
+        repo_key: &str,
+        job_id: Uuid,
+        caller: Option<&CallerPrincipal>,
+    ) -> AppResult<hort_domain::ports::jobs_repository::JobRow> {
+        // -------- Gate 0: anonymous read-endpoint pattern -------------
+        let caller = caller.ok_or_else(|| {
+            AppError::Unauthorized("prefetch job outcome requires authentication".into())
+        })?;
+
+        // -------- Gate 1: token-kind (mirrors enqueue_self_service) ---
+        if !matches!(
+            caller.token_kind,
+            Some(TokenKind::CliSession) | Some(TokenKind::ServiceAccount)
+        ) {
+            return Err(AppError::Domain(DomainError::Forbidden(
+                TOKEN_KIND_DENIED_MESSAGE.into(),
+            )));
+        }
+
+        // -------- Resolve repository (anti-enumeration via NotFound) --
+        let repository = match self.repositories.find_by_key(repo_key).await {
+            Ok(r) => r,
+            Err(DomainError::NotFound { .. }) => {
+                return Err(AppError::Domain(DomainError::NotFound {
+                    entity: "Repository",
+                    id: repo_key.to_string(),
+                }));
+            }
+            Err(other) => return Err(AppError::Domain(other)),
+        };
+
+        // -------- Gate 2: RBAC Read ∧ Prefetch (mirrors enqueue_self_service) --
+        let evaluator = self.rbac.load();
+        let has_read = evaluator.authorize(caller, Permission::Read, Some(repository.id));
+        let has_prefetch = evaluator.authorize(caller, Permission::Prefetch, Some(repository.id));
+        if !(has_read && has_prefetch) {
+            return Err(AppError::Domain(DomainError::Forbidden(format!(
+                "Permission::Read AND Permission::Prefetch required on repository {}",
+                repository.key,
+            ))));
+        }
+
+        // -------- Fetch + repo/kind-scope the job ---------------------
+        let not_found = || {
+            AppError::Domain(DomainError::NotFound {
+                entity: "PrefetchJob",
+                id: job_id.to_string(),
+            })
+        };
+        let job = self
+            .jobs
+            .get_job(job_id)
+            .await
+            .map_err(AppError::from)?
+            .ok_or_else(not_found)?;
+
+        if !matches!(job.kind.as_str(), "prefetch" | "prefetch-dependencies") {
+            return Err(not_found());
+        }
+
+        // The physical `repository_id` column is populated only for
+        // `kind='scan'` rows (`KindFields::Scan`); a prefetch row carries
+        // its target repository inside `params.repository_id` instead
+        // (`PrefetchParams` / `PrefetchDependenciesParams`).
+        let job_repository_id = job
+            .params
+            .as_ref()
+            .and_then(|p| p.get("repository_id"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok());
+        if job_repository_id != Some(repository.id) {
+            return Err(not_found());
+        }
+
+        Ok(job)
+    }
 }
 
 /// Per-format ordering selector. The three formats in scope
@@ -2610,6 +2710,7 @@ mod tests {
         fn delete(
             &self,
             _id: Uuid,
+            _actor: hort_domain::events::Actor,
         ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -3583,5 +3684,248 @@ mod tests {
             counter_value(&snap, "hort_prefetch_self_service_total", "success"),
             Some(1)
         );
+    }
+
+    // -- get_prefetch_job_outcome ------------------------------------------
+
+    fn sample_job_row(
+        kind: &str,
+        repository_id: Uuid,
+        status: hort_domain::ports::jobs_repository::JobStatus,
+        last_error: Option<&str>,
+    ) -> hort_domain::ports::jobs_repository::JobRow {
+        use hort_domain::ports::jobs_repository::KindFields;
+
+        hort_domain::ports::jobs_repository::JobRow {
+            id: Uuid::new_v4(),
+            kind: kind.to_string(),
+            status,
+            params: Some(serde_json::json!({
+                "repository_id": repository_id,
+                "package": "serde",
+                "version": "1.0.0",
+            })),
+            actor_id: None,
+            priority: 0,
+            trigger_source: "self_service".to_string(),
+            attempts: 3,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            completed_at: Some(Utc::now()),
+            last_error: last_error.map(str::to_string),
+            result_summary: None,
+            kind_fields: KindFields::Other,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_anonymous_is_unauthorized() {
+        let repo = npm_repo();
+        let key = repo.key.clone();
+        let h = wire(repo, empty_evaluator());
+
+        let err =
+            h.uc.get_prefetch_job_outcome(&key, Uuid::new_v4(), None)
+                .await
+                .expect_err("anonymous must be rejected");
+        assert!(matches!(err, AppError::Unauthorized(_)), "{err:?}");
+    }
+
+    /// A PAT is exactly what the POST rejects (Gate 1) — the GET must
+    /// reject it identically.
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_pat_is_forbidden() {
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let key = repo.key.clone();
+        let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+        let actor = caller_with_token_kind(&["dev"], Some(TokenKind::Pat));
+
+        let err =
+            h.uc.get_prefetch_job_outcome(&key, Uuid::new_v4(), Some(&actor))
+                .await
+                .expect_err("PAT must be rejected");
+        assert!(matches!(err, AppError::Domain(DomainError::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_missing_permission_is_forbidden() {
+        let repo = npm_repo();
+        let key = repo.key.clone();
+        let h = wire(repo, empty_evaluator());
+        let actor = caller_cli_session(&["dev"]);
+
+        let err =
+            h.uc.get_prefetch_job_outcome(&key, Uuid::new_v4(), Some(&actor))
+                .await
+                .expect_err("no Read/Prefetch grant must be rejected");
+        assert!(matches!(err, AppError::Domain(DomainError::Forbidden(_))));
+    }
+
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_unknown_repo_is_not_found() {
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+        let actor = caller_cli_session(&["dev"]);
+
+        let err =
+            h.uc.get_prefetch_job_outcome("does-not-exist", Uuid::new_v4(), Some(&actor))
+                .await
+                .expect_err("unknown repo must 404");
+        assert!(matches!(
+            err,
+            AppError::Domain(DomainError::NotFound {
+                entity: "Repository",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_unknown_job_is_not_found() {
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let key = repo.key.clone();
+        let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+        let actor = caller_cli_session(&["dev"]);
+
+        let err =
+            h.uc.get_prefetch_job_outcome(&key, Uuid::new_v4(), Some(&actor))
+                .await
+                .expect_err("unseeded job id must 404");
+        assert!(matches!(
+            err,
+            AppError::Domain(DomainError::NotFound {
+                entity: "PrefetchJob",
+                ..
+            })
+        ));
+    }
+
+    /// A job of a non-prefetch kind (e.g. `scan`) in the SAME repo must
+    /// still 404 — this endpoint is prefetch-scoped, id-addressed only.
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_wrong_kind_is_not_found() {
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let key = repo.key.clone();
+        let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+        let actor = caller_cli_session(&["dev"]);
+
+        let row = sample_job_row(
+            "scan",
+            repo_id,
+            hort_domain::ports::jobs_repository::JobStatus::Completed,
+            None,
+        );
+        let job_id = row.id;
+        h.jobs.seed_get(row);
+
+        let err =
+            h.uc.get_prefetch_job_outcome(&key, job_id, Some(&actor))
+                .await
+                .expect_err("non-prefetch kind must 404");
+        assert!(matches!(
+            err,
+            AppError::Domain(DomainError::NotFound {
+                entity: "PrefetchJob",
+                ..
+            })
+        ));
+    }
+
+    /// A `prefetch` job that exists but belongs to a DIFFERENT
+    /// repository must 404 — never a 403, never leaking any field of
+    /// the other repo's job (anti-enumeration).
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_cross_repo_is_not_found() {
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let key = repo.key.clone();
+        let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+        let actor = caller_cli_session(&["dev"]);
+
+        let other_repo_id = Uuid::new_v4();
+        let row = sample_job_row(
+            "prefetch",
+            other_repo_id,
+            hort_domain::ports::jobs_repository::JobStatus::Failed,
+            Some("upstream: 503"),
+        );
+        let job_id = row.id;
+        h.jobs.seed_get(row);
+
+        let err =
+            h.uc.get_prefetch_job_outcome(&key, job_id, Some(&actor))
+                .await
+                .expect_err("cross-repo job id must 404, never leak");
+        assert!(matches!(
+            err,
+            AppError::Domain(DomainError::NotFound {
+                entity: "PrefetchJob",
+                ..
+            })
+        ));
+    }
+
+    /// Happy path: a terminal `failed` leaf-ingest job in the caller's
+    /// own repo surfaces its `status` + `last_error` verbatim.
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_returns_terminal_failed_leaf() {
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let key = repo.key.clone();
+        let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+        let actor = caller_cli_session(&["dev"]);
+
+        let row = sample_job_row(
+            "prefetch",
+            repo_id,
+            hort_domain::ports::jobs_repository::JobStatus::Failed,
+            Some("upstream: 503 after 5 attempts"),
+        );
+        let job_id = row.id;
+        h.jobs.seed_get(row);
+
+        let outcome =
+            h.uc.get_prefetch_job_outcome(&key, job_id, Some(&actor))
+                .await
+                .expect("same-repo prefetch job must be readable");
+        assert_eq!(
+            outcome.status,
+            hort_domain::ports::jobs_repository::JobStatus::Failed
+        );
+        assert_eq!(
+            outcome.last_error.as_deref(),
+            Some("upstream: 503 after 5 attempts")
+        );
+        assert_eq!(outcome.kind, "prefetch");
+    }
+
+    /// A `prefetch-dependencies` cascade-driver job in the caller's own
+    /// repo is readable too — the endpoint covers both prefetch kinds.
+    #[tokio::test]
+    async fn get_prefetch_job_outcome_returns_prefetch_dependencies_kind() {
+        let repo = npm_repo();
+        let repo_id = repo.id;
+        let key = repo.key.clone();
+        let h = wire(repo, evaluator_with_read_and_prefetch("dev", repo_id));
+        let actor = caller_cli_session(&["dev"]);
+
+        let row = sample_job_row(
+            "prefetch-dependencies",
+            repo_id,
+            hort_domain::ports::jobs_repository::JobStatus::Completed,
+            None,
+        );
+        let job_id = row.id;
+        h.jobs.seed_get(row);
+
+        let outcome =
+            h.uc.get_prefetch_job_outcome(&key, job_id, Some(&actor))
+                .await
+                .expect("same-repo prefetch-dependencies job must be readable");
+        assert_eq!(outcome.kind, "prefetch-dependencies");
     }
 }

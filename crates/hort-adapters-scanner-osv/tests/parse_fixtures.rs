@@ -203,3 +203,114 @@ fn informational_unmaintained_advisory_rides_the_negligible_lane() {
     assert_eq!(summary.medium, 0, "{summary:?}");
     assert_eq!(summary.low, 0, "{summary:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Alias-group collapsing (ADR 0059)
+//
+// osv-scanner forwards the upstream OSV records verbatim, so it reports a
+// RustSec advisory and its GitHub-reviewed GHSA mirror as two
+// vulnerabilities on the same package. The mirror usually carries neither
+// a severity nor an informational marker, so it lowers to the SUP-4
+// fail-closed `Critical` and shadows the sibling that does carry the
+// advisory's metadata — and the cross-backend merge cannot reconcile the
+// pair, because the two records have different advisory ids.
+// ---------------------------------------------------------------------------
+
+const ALIAS_MIRROR_PAIR: &[u8] = include_bytes!("fixtures/alias_mirror_pair.json");
+const ALIAS_GROUP_SCORED: &[u8] = include_bytes!("fixtures/alias_group_scored_member.json");
+const ALIAS_GROUP_VIA_GROUPS: &[u8] = include_bytes!("fixtures/alias_group_via_groups_only.json");
+
+/// `rand 0.7.3` — `GHSA-cq8v-f236-94qc` (no severity, no informational
+/// marker) alongside `RUSTSEC-2026-0097` (`informational: unsound`). The
+/// pair collapses to the informational reading, which rides the negligible
+/// lane instead of rejecting the artifact.
+#[test]
+fn alias_mirror_pair_collapses_to_the_informational_record() {
+    let findings = parse_findings_from_json(ALIAS_MIRROR_PAIR).expect("parse");
+
+    assert_eq!(
+        findings.len(),
+        1,
+        "the mirror pair is one advisory: {findings:#?}"
+    );
+    let f = &findings[0];
+    assert_eq!(f.vulnerability_id, "RUSTSEC-2026-0097");
+    assert_eq!(f.purl, "pkg:cargo/rand@0.7.3");
+    assert!(f.is_informational(), "the classification must survive");
+    assert!(
+        f.aliases.iter().any(|a| a == "GHSA-cq8v-f236-94qc"),
+        "the collapsed-away id stays matchable by an exclusion: {:?}",
+        f.aliases,
+    );
+
+    let summary = severity_summary_from_findings(&findings);
+    assert_eq!(summary.negligible, 1);
+    assert_eq!(summary.critical, 0);
+}
+
+/// **The load-bearing negative.** `traitobject 0.1.1` — the alias-linked
+/// `GHSA-pp8r-vv2j-9j5v` / `RUSTSEC-2020-0027` pair carries a
+/// `max_severity` of 9.8, and a *separate* group holds the unmaintained
+/// `RUSTSEC-2021-0144`. The scored pair must collapse to a scored
+/// `Critical` — a real CVSS outranks a classification, so the package
+/// stays blocking — while the unrelated advisory stays its own finding.
+#[test]
+fn alias_group_with_a_scored_member_stays_blocking() {
+    let findings = parse_findings_from_json(ALIAS_GROUP_SCORED).expect("parse");
+
+    assert_eq!(
+        findings.len(),
+        2,
+        "the alias pair collapses; the separate advisory does not: {findings:#?}",
+    );
+
+    let scored = findings
+        .iter()
+        .find(|f| f.cvss_score.is_some())
+        .expect("the scored member survives its group");
+    assert_eq!(scored.cvss_score, Some(9.8));
+    assert_eq!(scored.severity, SeverityThreshold::Critical);
+    assert!(
+        !scored.is_informational(),
+        "a scored advisory must never be demoted onto the negligible lane",
+    );
+
+    // One finding on the ENFORCED lane is what keeps the artifact
+    // rejected; the unmaintained advisory rides the negligible lane.
+    let summary = severity_summary_from_findings(&findings);
+    assert_eq!(summary.critical, 1);
+    assert_eq!(summary.negligible, 1);
+}
+
+/// Neither record in this fixture names the other in its own `aliases`
+/// array — the only link is osv-scanner's `groups[].ids`. Folding those
+/// sibling ids into the lowered finding's aliases is what lets the shared
+/// collapse see the group, so the pair still becomes one advisory.
+#[test]
+fn records_linked_only_by_the_scanner_group_still_collapse() {
+    let findings = parse_findings_from_json(ALIAS_GROUP_VIA_GROUPS).expect("parse");
+
+    assert_eq!(
+        findings.len(),
+        1,
+        "the group is one advisory: {findings:#?}"
+    );
+    let f = &findings[0];
+    assert_eq!(f.vulnerability_id, "RUSTSEC-2019-0039");
+    assert!(f.is_informational());
+    assert!(
+        f.aliases.iter().any(|a| a == "GHSA-vfv3-9w6v-23jp"),
+        "the collapsed-away id stays matchable: {:?}",
+        f.aliases,
+    );
+    assert_eq!(severity_summary_from_findings(&findings).negligible, 1);
+}
+
+/// A package whose vulnerabilities are unrelated must not over-collapse —
+/// the `mixed_severities` fixture has three distinct advisories and must
+/// still yield three findings.
+#[test]
+fn unrelated_advisories_are_not_collapsed() {
+    let findings = parse_findings_from_json(MIXED).expect("parse");
+    assert_eq!(findings.len(), 3);
+}

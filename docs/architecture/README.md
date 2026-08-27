@@ -84,6 +84,8 @@ Information-oriented, exhaustive, kept in lockstep with the code.
   — rendered-resource matrix, install-time schema rules, hook ordering, workload wiring, and chart-vs-binary caveats.
 - [Public event taxonomy](reference/event-taxonomy.md)
   — domain events external consumers may subscribe to, with payload fields, stream, and stability contract.
+- [npm format — entity reference](reference/npm-format-entities.md)
+  — every npm registry entity as hort handles it: stored, derived, or discarded, and why; updated whenever an initiative changes an entity's class.
 
 ## Tutorial — learn by tracing one request
 

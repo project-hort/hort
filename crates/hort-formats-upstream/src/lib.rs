@@ -22,7 +22,7 @@
 //! # Cycle-avoidance discipline
 //!
 //! [`UpstreamMetadataAdapter`] holds `Arc<dyn UpstreamResolver>` +
-//! `Arc<dyn EphemeralStore>` + `Arc<dyn UpstreamProxy>` +
+//! `Arc<dyn EphemeralStore>` + `UpstreamProxyByFormat` +
 //! `Arc<PullDedup>` — **never** `Arc<AppContext>`. The composition root
 //! wires `AppContext` to hold `Arc<dyn UpstreamMetadataPort>`, so holding
 //! `AppContext` here would close a construction cycle. The composition
@@ -92,10 +92,11 @@ use hort_app::metrics::UpstreamFetchError;
 use hort_app::ports::upstream_metadata::UpstreamMetadataPort;
 use hort_app::pull_dedup::PullDedup;
 use hort_domain::entities::repository::Repository;
+use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::entities::repository::RepositoryType;
 use hort_domain::ports::ephemeral_store::EphemeralStore;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping;
-use hort_domain::ports::upstream_proxy::UpstreamProxy;
+use hort_domain::ports::upstream_proxy::UpstreamProxyByFormat;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::BoxFuture;
 // No dispatcher calls `FormatHandler::extract_upstream_versions` any more:
@@ -135,7 +136,11 @@ const UPSTREAM_PROJECTOR_VERSION_OBJECT_DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024
 pub struct UpstreamMetadataAdapter {
     resolver: Arc<dyn UpstreamResolver>,
     cache: Arc<dyn EphemeralStore>,
-    upstream_proxy: Arc<dyn UpstreamProxy>,
+    /// The per-format proxy registry, NOT a single instance: this
+    /// adapter fans out across npm / pypi / cargo, so each `dispatch_*`
+    /// branch selects the instance whose `format` metric label matches
+    /// the branch it is on.
+    upstream_proxy: UpstreamProxyByFormat,
     pull_dedup: Arc<PullDedup>,
 }
 
@@ -150,7 +155,7 @@ impl UpstreamMetadataAdapter {
     pub fn new(
         resolver: Arc<dyn UpstreamResolver>,
         cache: Arc<dyn EphemeralStore>,
-        upstream_proxy: Arc<dyn UpstreamProxy>,
+        upstream_proxy: UpstreamProxyByFormat,
         pull_dedup: Arc<PullDedup>,
     ) -> Self {
         Self {
@@ -248,7 +253,9 @@ impl UpstreamMetadataAdapter {
         match npm_helpers::fetch_raw_with_cache(
             self.resolver.as_ref(),
             self.cache.as_ref(),
-            self.upstream_proxy.as_ref(),
+            self.upstream_proxy
+                .for_format(&RepositoryFormat::Npm)
+                .as_ref(),
             self.pull_dedup.as_ref(),
             None,
             UPSTREAM_PROJECTOR_VERSION_OBJECT_DEFAULT_MAX_BYTES,
@@ -296,7 +303,9 @@ impl UpstreamMetadataAdapter {
         match pypi_helpers::fetch_raw_with_cache(
             self.resolver.as_ref(),
             self.cache.as_ref(),
-            self.upstream_proxy.as_ref(),
+            self.upstream_proxy
+                .for_format(&RepositoryFormat::Pypi)
+                .as_ref(),
             self.pull_dedup.as_ref(),
             None,
             UPSTREAM_PROJECTOR_VERSION_OBJECT_DEFAULT_MAX_BYTES,
@@ -344,7 +353,9 @@ impl UpstreamMetadataAdapter {
         match cargo_helpers::fetch_raw_with_cache(
             self.resolver.as_ref(),
             self.cache.as_ref(),
-            self.upstream_proxy.as_ref(),
+            self.upstream_proxy
+                .for_format(&RepositoryFormat::Cargo)
+                .as_ref(),
             self.pull_dedup.as_ref(),
             None,
             &repo,
@@ -600,7 +611,7 @@ mod tests {
         // reading from the test ctx.
         let resolver: Arc<dyn UpstreamResolver> = ctx.upstream_resolver.clone();
         let cache: Arc<dyn EphemeralStore> = ctx.ephemeral_evictable.clone();
-        let upstream_proxy: Arc<dyn UpstreamProxy> = ctx.upstream_proxy.clone();
+        let upstream_proxy: UpstreamProxyByFormat = ctx.upstream_proxy.clone();
         let pull_dedup: Arc<PullDedup> = ctx.pull_dedup.clone();
 
         let adapter = UpstreamMetadataAdapter::new(resolver, cache, upstream_proxy, pull_dedup);
@@ -1077,7 +1088,7 @@ mod tests {
         let (ctx, _mocks) = build_mock_ctx(metrics);
         let resolver: Arc<dyn UpstreamResolver> = ctx.upstream_resolver.clone();
         let cache: Arc<dyn EphemeralStore> = ctx.ephemeral_evictable.clone();
-        let upstream_proxy: Arc<dyn UpstreamProxy> = ctx.upstream_proxy.clone();
+        let upstream_proxy: UpstreamProxyByFormat = ctx.upstream_proxy.clone();
         let pull_dedup: Arc<PullDedup> = ctx.pull_dedup.clone();
 
         let adapter = UpstreamMetadataAdapter::new(resolver, cache, upstream_proxy, pull_dedup);

@@ -1,0 +1,32 @@
+# Mirror of deploy/ansible/files/gitops/repositories/crates-proxy.yaml — the
+# private, quarantined crates.io pull-through the dogfood group asserts
+# against, and the member that makes cargo-virtual a complete build endpoint.
+#
+# `indexMode: include_pending` is load-bearing and copied verbatim: the
+# default `released_only` serves an empty index on a cold mirror, so a
+# range-based resolve cannot name a never-ingested version and the
+# pull-through (and the quarantine clock with it) never starts.
+#
+# The reference `prefetchPolicy` block is deliberately NOT mirrored. Prefetch
+# is a warming optimisation rather than a gate, and its transitive-dependency
+# cascade has a fan-out (up to `maxDescendants` per ingest) that is unbounded
+# relative to a smoke run: on a stack whose worker pool also has to complete
+# the scans the scenarios poll for, warming jobs would compete with the
+# assertions for the same workers. Nothing any scenario asserts depends on it.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: crates-proxy
+spec:
+  name: "crates.io pull-through (hardened)"
+  description: "Private, quarantined+scanned crates.io proxy. Read+ingest gated."
+  format: cargo
+  type: proxy
+  indexMode: include_pending
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/crates-proxy
+  proxy:
+    upstreamUrl: "https://index.crates.io"
+  isPublic: false
+  replicationPriority: local_only

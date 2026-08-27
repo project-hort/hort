@@ -1510,9 +1510,9 @@ impl IngestUseCase {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: actor_to_uploaded_by(&actor),
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         };
@@ -2701,12 +2701,12 @@ impl IngestUseCase {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             // Record the upstream-asserted publish
             // hint unconditionally (audit only). Anchor resolution is
             // gated separately on the per-upstream opt-in.
             upstream_published_at,
             uploaded_by: actor_to_uploaded_by(&actor),
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         };
@@ -4141,9 +4141,9 @@ impl IngestUseCase {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: actor_to_uploaded_by(&actor),
-            is_deleted: false,
             created_at: now,
             updated_at: now,
         };

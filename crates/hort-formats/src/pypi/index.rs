@@ -723,6 +723,7 @@ mod tests {
             tarball_basename: "npm-foreign-1.0.0.tgz".into(),
             integrity: None,
             shasum: "x".into(),
+            manifest: serde_json::Map::new(),
         };
         let mistagged = VersionEntry {
             version: "1.0.0".into(),
@@ -742,6 +743,7 @@ mod tests {
             tarball_basename: "npm-foreign-1.0.0.tgz".into(),
             integrity: None,
             shasum: "x".into(),
+            manifest: serde_json::Map::new(),
         };
         let mistagged = VersionEntry {
             version: "1.0.0".into(),

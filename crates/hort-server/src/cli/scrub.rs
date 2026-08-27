@@ -149,7 +149,10 @@ async fn run_async(args: ScrubArgs) -> anyhow::Result<ScrubReport> {
     // the flag-only path (report, don't transition).
     let mut use_case = CasScrubUseCase::new(storage, event_publisher);
     if cfg.cas_scrub_action_on_mismatch == ActionOnMismatch::Tombstone {
-        let artifact_repo = Arc::new(PgArtifactRepository::new(pool.clone()));
+        let artifact_repo = Arc::new(PgArtifactRepository::new(
+            pool.clone(),
+            pg_event_store.clone(),
+        ));
         let metadata_repo = Arc::new(PgArtifactMetadataRepository::new(pool.clone()));
         let lifecycle = Arc::new(PgArtifactLifecycle::new(
             pg_event_store,

@@ -790,18 +790,23 @@ Several are in-binary correctness gates with no operator-tunable surface.
   alarmable. The verifier runs as an in-process reader (runtime DML DSN
   + the anchor object store) — **not** a worker-dispatched task, so it
   needs no service-account PAT.
-- **Chart default:** **`scheduledTasks.verifyEventChain.enabled: false`**
-  (default-disabled, like its admin-task CronJob siblings); the master
+- **Chart default:** **`scheduledTasks.verifyEventChain.enabled: true`**
+  (default-**enabled** — tamper detection an operator has to opt into is
+  tamper detection most deployments never get; ADR 0057); the master
   toggle `scheduledTasks.adminTasksEnabled` must also be `true`. Default
   schedule `scheduledTasks.verifyEventChain.schedule: "0 2 * * *"` (daily) —
   keep it consistent with `HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS`.
-- **Operator action required:** recommended yes for production — set
-  `scheduledTasks.adminTasksEnabled: true` and
-  `scheduledTasks.verifyEventChain.enabled: true`
-  (paired with `scheduledTasks.eventstoreCheckpoint` + an S3 Object-Lock anchor
-  bucket for full external-anchor attestation; on a filesystem backend
-  the anchor cross-check resolves to `missing_checkpoint`, exit 3). Alarm
-  on `max_over_time(hort_event_chain_verify_overdue[2d]) > 0`.
+  An **existing install gains this CronJob on upgrade** once
+  `adminTasksEnabled` is on.
+- **Operator action required:** set `scheduledTasks.adminTasksEnabled: true`
+  (the verifier then runs without further configuration). Pair it with
+  `scheduledTasks.eventstoreCheckpoint` + an S3 Object-Lock anchor bucket
+  for full external-anchor attestation. A deployment with **no** anchor —
+  a filesystem backend, or S3 with no provisioned anchor public key —
+  verifies its chain, expects no anchor, and exits `0`; an unanchored
+  deployment is a supported posture, not a degraded one, and it does not
+  need `failOnMissingCheckpoint` set. Alarm on
+  `max_over_time(hort_event_chain_verify_overdue[2d]) > 0`.
 - **Verify post-install:**
   ```bash
   # The CronJob renders only when both toggles are true.

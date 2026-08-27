@@ -70,6 +70,11 @@ use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
 use hort_adapters_storage::builders::{build_s3_object_store, build_s3_storage, S3StorageOpts};
 use hort_adapters_storage::filesystem_stateful_upload_staging::FilesystemStatefulUploadStaging;
 use hort_adapters_storage::FilesystemStorage;
+// The ONE shared event-chain anchoring predicate. The worker (writer)
+// and `hort-server verify-event-chain` (reader) both derive their gate
+// from it, so the two sides cannot disagree about whether this
+// deployment has a checkpoint anchor.
+use hort_app::event_chain_anchoring as anchoring;
 use hort_app::event_store_publisher::EventStorePublisher;
 use hort_app::rbac::RbacEvaluator;
 use hort_app::task_dispatcher::TaskDispatcher;
@@ -276,8 +281,10 @@ pub async fn build_app_context(
     // `broadcast::Sender` and hand it to the (then-co-located) dispatcher.
     let event_publisher = Arc::new(EventStorePublisher::without_broadcast(event_store.clone()));
 
-    let artifacts_concrete: Arc<PgArtifactRepository> =
-        Arc::new(PgArtifactRepository::new(pool.clone()));
+    let artifacts_concrete: Arc<PgArtifactRepository> = Arc::new(PgArtifactRepository::new(
+        pool.clone(),
+        pg_event_store.clone(),
+    ));
     let artifacts: Arc<dyn ArtifactRepository> = artifacts_concrete.clone();
 
     let metadata_concrete: Arc<PgArtifactMetadataRepository> =
@@ -501,6 +508,7 @@ pub async fn build_app_context(
     let mut orch_cfg = ScanOrchestrationConfig::defaults_for_worker(cfg.worker_id.clone());
     orch_cfg.max_attempts = cfg.max_attempts;
     orch_cfg.default_scan_backends = healthy_names.clone();
+    orch_cfg.allow_informed_downgrade = cfg.finding_merge_allow_informed_downgrade;
 
     let artifact_metadata: Arc<dyn ArtifactMetadataRepository> = metadata_concrete.clone();
 
@@ -707,13 +715,12 @@ pub async fn build_app_context(
             // never reaches the adapter (the adapter sees raw
             // mappings) — operators correlate cardinality at the
             // repo level via separate `hort_prefetch_*` metrics.
-            format_label: "prefetch_tick".to_string(),
             extra_trust_anchors: extra_ca.cloned(),
             // Same upstream User-Agent as hort-server (HORT_UPSTREAM_USER_AGENT
             // or the built-in default) — worker prefetch + provenance fetches
             // carry the identical UA so a custom value applies uniformly.
             user_agent: hort_adapters_upstream_http::user_agent_from_env(),
-            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::default()
+            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("prefetch_tick")
         };
         Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
             cfg_for_proxy,
@@ -788,13 +795,12 @@ pub async fn build_app_context(
     // instance keeps the two distinguishable on dashboards.
     let upstream_proxy_for_provenance: Arc<dyn UpstreamProxy> = {
         let cfg = hort_adapters_upstream_http::HttpUpstreamProxyConfig {
-            format_label: "provenance".to_string(),
             extra_trust_anchors: extra_ca.cloned(),
             // Same upstream User-Agent as hort-server (HORT_UPSTREAM_USER_AGENT
             // or the built-in default) — worker prefetch + provenance fetches
             // carry the identical UA so a custom value applies uniformly.
             user_agent: hort_adapters_upstream_http::user_agent_from_env(),
-            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::default()
+            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("provenance")
         };
         Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
             cfg,
@@ -1978,24 +1984,27 @@ async fn register_service_account_rotation(
 
 /// Wire the `EventstoreCheckpointHandler` into the dispatcher.
 ///
-/// Registers only when **all** of the following hold; otherwise logs an
-/// `info!` and returns without registering (the
-/// `/api/v1/admin/tasks/eventstore-checkpoint` route then 404s — the
-/// same graceful-skip posture as `register_service_account_rotation`):
+/// Registers only when the shared write-gate
+/// [`checkpoint_emission_status`](hort_app::event_chain_anchoring::checkpoint_emission_status)
+/// resolves to `Enabled`; otherwise logs an `info!` and returns without
+/// registering (the `/api/v1/admin/tasks/eventstore-checkpoint` route
+/// then 404s — the same graceful-skip posture as
+/// `register_service_account_rotation`).
 ///
-/// 1. Storage is S3 — Object-Lock WORM anchoring requires an S3-
-///    compatible object store (a filesystem deployment has no WORM
-///    anchor). The store is built via `build_s3_object_store` so ADR 0010
-///    TLS posture applies (no `reqwest::Client::new()`).
-/// 2. `HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE` points to the
-///    operator-provisioned Ed25519 PKCS#8 PEM **private** key (distinct
-///    from any runtime credential, never embedded/derived). A
-///    missing/malformed key fails adapter construction here, loudly —
-///    never a silent unsigned checkpoint.
-/// 3. `HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE` points to the matching SPKI
-///    PEM **public** key (the same file `hort-server verify-event-chain`
-///    reads) — used to derive the next monotonic `checkpoint_seq` +
-///    the first-post-migration test via the read adapter.
+/// That gate is the shared, verifier-observable anchoring predicate —
+/// S3 storage (Object-Lock WORM anchoring has nowhere to live on a
+/// filesystem backend) **and** the operator-provisioned Ed25519 SPKI
+/// **public** key, the same file `hort-server verify-event-chain` reads
+/// (here it derives the next monotonic `checkpoint_seq` and the
+/// first-post-migration test via the read adapter) — **plus** this
+/// side's extra requirement: the matching Ed25519 PKCS#8 **private**
+/// key, because this side *writes* anchors. Stating the base condition
+/// once is what keeps the writer and the reader from drifting apart; a
+/// malformed private key still fails adapter construction below,
+/// loudly — never a silent unsigned checkpoint.
+///
+/// The store is built via `build_s3_object_store` so the ADR 0010 TLS
+/// posture applies (no `reqwest::Client::new()`).
 ///
 /// The `backfill_baseline` honesty caveat is sourced from
 /// `HORT_EVENT_CHAIN_BACKFILL_MAX_GLOBAL_POSITION` +
@@ -2008,6 +2017,31 @@ async fn register_eventstore_checkpoint(
     cfg: &WorkerConfig,
     extra_ca: Option<&hort_config::ExtraTrustAnchors>,
 ) {
+    let read_public_key = read_anchor_key_file(anchoring::ANCHOR_PUBLIC_KEY_FILE_ENV);
+    let read_signing_key = read_anchor_key_file(anchoring::ANCHOR_SIGNING_KEY_FILE_ENV);
+
+    let (public_key_pem, signing_key_pem) = match anchoring::checkpoint_emission_status(
+        cfg.storage.effective_backend(),
+        read_public_key.as_deref(),
+        read_signing_key.as_deref(),
+    ) {
+        anchoring::CheckpointEmissionStatus::Enabled {
+            anchor_public_key,
+            anchor_signing_key,
+        } => (anchor_public_key, anchor_signing_key),
+        anchoring::CheckpointEmissionStatus::Disabled(gap) => {
+            tracing::info!(
+                reason = gap.reason(),
+                "EventstoreCheckpointHandler not registered — checkpoint emission is \
+                 off. The /api/v1/admin/tasks/eventstore-checkpoint route will 404 \
+                 until this is resolved. An unanchored deployment is a supported \
+                 posture: `verify-event-chain` still verifies the per-stream hash \
+                 chain and expects no anchor.",
+            );
+            return;
+        }
+    };
+
     let StorageConfig::S3 {
         bucket,
         region,
@@ -2018,60 +2052,11 @@ async fn register_eventstore_checkpoint(
         secret_access_key,
     } = &cfg.storage
     else {
-        tracing::info!(
-            "EventstoreCheckpointHandler not registered: storage is filesystem, not S3 \
-             — S3 Object-Lock WORM is required to anchor checkpoints. \
-             The /api/v1/admin/tasks/eventstore-checkpoint route will 404 until an \
-             S3 anchor bucket is configured.",
-        );
+        // Not reachable: the gate above only resolves to `Enabled` for an
+        // S3 effective backend. Written as a guard rather than an unwrap
+        // so a future storage variant degrades to "handler not
+        // registered" instead of panicking the worker at boot.
         return;
-    };
-
-    let signing_key_pem = match std::env::var("HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE") {
-        Ok(path) => match std::fs::read_to_string(&path) {
-            Ok(pem) => pem,
-            Err(e) => {
-                tracing::info!(
-                    error = %e,
-                    "EventstoreCheckpointHandler not registered: \
-                     HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE is set but unreadable. \
-                     Provision the operator Ed25519 PKCS#8 PEM private key.",
-                );
-                return;
-            }
-        },
-        Err(_) => {
-            tracing::info!(
-                "EventstoreCheckpointHandler not registered: \
-                 HORT_EVENT_CHAIN_ANCHOR_SIGNING_KEY_FILE is unset. Set it to the \
-                 operator-provisioned Ed25519 PKCS#8 PEM private key (the private \
-                 counterpart of HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE) to enable \
-                 checkpoint emission.",
-            );
-            return;
-        }
-    };
-
-    let public_key_pem = match std::env::var("HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE") {
-        Ok(path) => match std::fs::read_to_string(&path) {
-            Ok(pem) => pem,
-            Err(e) => {
-                tracing::info!(
-                    error = %e,
-                    "EventstoreCheckpointHandler not registered: \
-                     HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE is set but unreadable.",
-                );
-                return;
-            }
-        },
-        Err(_) => {
-            tracing::info!(
-                "EventstoreCheckpointHandler not registered: \
-                 HORT_EVENT_CHAIN_ANCHOR_PUBKEY_FILE is unset (needed to derive the \
-                 next checkpoint_seq).",
-            );
-            return;
-        }
     };
 
     let opts = S3StorageOpts {
@@ -2097,7 +2082,7 @@ async fn register_eventstore_checkpoint(
         }
     };
 
-    let reader = match ObjectStoreCheckpointAnchor::new(store.clone(), &public_key_pem) {
+    let reader = match ObjectStoreCheckpointAnchor::new(store.clone(), public_key_pem) {
         Ok(r) => Arc::new(r),
         Err(e) => {
             tracing::info!(
@@ -2108,7 +2093,7 @@ async fn register_eventstore_checkpoint(
             return;
         }
     };
-    let emitter = match ObjectStoreCheckpointEmitter::new(store, &signing_key_pem) {
+    let emitter = match ObjectStoreCheckpointEmitter::new(store, signing_key_pem) {
         Ok(e) => Arc::new(e),
         Err(e) => {
             // A malformed signing key fails HERE (loudly), never a
@@ -2146,6 +2131,31 @@ async fn register_eventstore_checkpoint(
         "EventstoreCheckpointHandler registered (single-active per worker replica) \
          — checkpoint emission wired",
     );
+}
+
+/// Read an operator-provisioned anchor key file named by `env_var`.
+///
+/// `None` means "this half of the key material is not provisioned" —
+/// either the variable is unset (a deliberate unanchored posture) or the
+/// path it names could not be read. The second case gets its own `warn!`
+/// because a set-but-unreadable path is a misconfiguration rather than a
+/// posture, and the shared anchoring predicate cannot tell the two
+/// apart from the resulting `None`.
+fn read_anchor_key_file(env_var: &str) -> Option<String> {
+    let path = std::env::var(env_var).ok()?;
+    match std::fs::read_to_string(&path) {
+        Ok(pem) => Some(pem),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                env_var,
+                path,
+                "anchor key file is set but unreadable — treating this key material \
+                 as absent",
+            );
+            None
+        }
+    }
 }
 
 /// Read the backfill-baseline honesty-caveat inputs from the operator

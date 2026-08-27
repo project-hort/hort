@@ -1226,7 +1226,11 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Page<hort_domain::entities::artifact::Artifact>>> {
             panic!("list_by_repository should not be called by the prefetch-tick handler")
         }
-        fn delete(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete(
+            &self,
+            _id: Uuid,
+            _actor: hort_domain::events::Actor,
+        ) -> BoxFuture<'_, DomainResult<()>> {
             panic!("delete should not be called by the prefetch-tick handler")
         }
         fn find_by_path(

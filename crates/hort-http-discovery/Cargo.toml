@@ -20,14 +20,14 @@ tokio        = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 tracing      = { workspace = true }
+chrono       = { workspace = true }
+uuid         = { workspace = true }
 
 [dev-dependencies]
 tokio                       = { workspace = true, features = ["test-util"] }
 hort-app                      = { path = "../hort-app", features = ["test-support"] }
 hort-http-core                = { path = "../hort-http-core", features = ["test-support"] }
 arc-swap                    = { workspace = true }
-chrono                      = { workspace = true }
-uuid                        = { workspace = true }
 # Inline test module drives routers through tower's ServiceExt::oneshot.
 tower                       = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

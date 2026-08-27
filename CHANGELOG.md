@@ -7,6 +7,253 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-27
+
+### Added
+
+- **npm `dist-tags` are passed through, intersected with the served
+  set.** hort served exactly one tag — `latest`, *inferred* as the
+  semver-max of the served set — and discarded every other tag the
+  authoritative source published. Consequences: a maintainer who pinned
+  `latest` at an older release had that choice silently overridden, and
+  `npm install <pkg>@next` / `@beta` / `@rc` could not resolve at all
+  through hort. The whole tag map is now served, from the source that
+  actually authors it: upstream's map for a proxy repository (widened
+  into the cached projection, CRUD like the rest of it — hort is not its
+  author), and the maintainer's own for a hosted one, held as
+  `mutable_refs` rows and event-sourced through `RefMoved` /
+  `RefRetired`. Hosted tags are written two ways: the `dist-tags` object
+  in the `npm publish` envelope (captured after a successful ingest, so a
+  tag can never point at a version that failed to land), and the npm
+  CLI's own routes, `PUT` / `DELETE
+  /npm/{repo_key}/-/package/{pkg}/dist-tags/{tag}` — `npm dist-tag add`
+  and `npm dist-tag rm`, gated on the same Write permission as publish
+  and rejected on proxy and virtual repositories, which have no
+  authorable tag store. A virtual repository merges its members' maps in
+  priority order under the existing dependency-confusion rules: the first
+  surviving member to define a tag name owns it, and a proxy member
+  contributes neither versions nor tags once a non-proxy member owns the
+  name, so a public `next` can never shadow an internal package's tags.
+  The gate is the intersection: **a tag whose target version is not
+  served is dropped, never rewritten**, so a tag can no longer be a
+  pointer to something hort would refuse to serve, and the per-version
+  route resolves any surviving tag (`GET /npm/{repo}/{pkg}/next`) with an
+  unknown tag returning the same anti-enumeration 404 as an unknown
+  version. `latest` is verbatim when it survives; the previous derivation
+  remains only as its fallback, never as an override. Under a null gate
+  the intersection degrades to identity — hort's `dist-tags` is
+  upstream's, byte for byte. No migration: the refs table, entity,
+  events, and adapter already existed. Pre-widening cached projections
+  decode to an empty map and heal on re-projection, so no cold-cache
+  event on deploy. (#202)
+
+### Changed
+
+- **Artifact deletion is now an event-sourced soft delete.** Deleting an
+  artifact — today reachable through the OCI manifest `DELETE` by digest —
+  used to be a bare `DELETE FROM artifacts` with no domain event: the one
+  terminal artifact-lifecycle transition that recorded nothing. It now
+  emits a new `ArtifactDeleted { artifact_id, repository_id, path,
+  content_hash }` event on the artifact's own stream
+  (`StreamCategory::Artifact` — no new stream category), attributed to the
+  authenticated caller, appended atomically with the state change so the
+  projection can never be marked deleted without the event that records
+  it. The `artifacts` row is **retained** with a new nullable `deleted_at`
+  column instead of being removed, so an auditor can still answer "what
+  content did this path hold, and who removed it?". Every live read
+  filters `deleted_at IS NULL`; the content-age anchor
+  (`first_seen_at = MIN(created_at)`) deliberately still counts deleted
+  rows, because deletion cannot un-observe when the content was first
+  seen and excluding them could only shorten an observation window. The
+  table-wide `UNIQUE (repository_id, path)` constraint becomes a partial
+  unique index predicated on `deleted_at IS NULL`, so a deleted row no
+  longer reserves its path: a fresh ingest there succeeds and mints a new
+  artifact (new id, new row, new stream). Deleting an absent or
+  already-deleted artifact stays a no-op (`NotFound`) and appends no
+  second terminal event. The CAS blob is untouched — blob lifetime
+  remains refcount-gated GC, since another artifact may reference the same
+  bytes. Migration `021_artifacts_soft_delete.sql`. (#145)
+
+### Fixed
+
+- **npm packuments now carry per-version install metadata.** Every
+  `versions[v]` entry hort served was exactly `{name, version, dist}`:
+  the proxy projector discarded the rest of the upstream per-version
+  object, and although a hosted publish stored the full block nothing
+  ever read it back. A fresh, non-lockfile install through hort
+  (`npm install <pkg>` / `pnpm add <pkg>`) therefore saw every version as
+  dependency-free and silently materialised a near-empty tree, while
+  `engines`/`os`/`cpu` filtering, `deprecated` warnings and
+  install-script detection were inert. Lockfile installs were unaffected
+  (they carry their own resolved graph), which is why this went
+  unnoticed. Both the packument and the abbreviated per-version route now
+  emit the npm registry API's abbreviated-metadata (install-v1) field set
+  — `dependencies`, `optionalDependencies`, `peerDependencies`,
+  `peerDependenciesMeta`, `bundledDependencies`, `bin`, `directories`,
+  `engines`, `os`, `cpu`, `libc`, `deprecated`, `hasInstallScript`,
+  `funding` — passed through **verbatim** from the authoritative source
+  (the upstream packument for proxy repositories, the stored publish
+  block for hosted ones, following the CAS reference when the block
+  spilled past the 256 KB inline threshold). A field absent at the source
+  stays absent: nothing is synthesised and nothing is emitted as `null`.
+  The set is a fixed whitelist, not a step toward full packument
+  equality — `description`, `scripts`, `devDependencies`, `time` and the
+  rest remain dropped. Pre-existing upstream-projection cache entries
+  decode unchanged and simply carry no manifest fields until their next
+  refresh. (#204)
+
+### Added
+
+- **npm abbreviated per-version / dist-tag route** —
+  `GET /npm/{repo_key}/{name}/{version-or-tag}` (and the `@scope` variant)
+  now serves the npm registry convention's per-version manifest:
+  `{name, version, dist:{tarball, shasum[, integrity]}}` for an exact
+  served version, or for the literal tag `latest` (resolved by the same
+  prerelease-excluding derivation the packument uses — one shared
+  definition). Previously the unscoped shape collided with the
+  scoped-packument route and returned a misleading
+  `"scoped npm name must start with '@'"` 400, which broke `corepack`
+  package-manager activation against a hort registry
+  (`COREPACK_NPM_REGISTRY`): corepack always issues
+  `GET /<pkg>/<version-or-tag>`, so every cold `COREPACK_HOME` failed.
+  Resolution runs against the same filtered served set as the packument,
+  so a quarantined or otherwise non-servable version 404s
+  indistinguishably from a nonexistent one; tarball routes are unaffected
+  (their literal `-` segment keeps matcher precedence). Tags other than
+  `latest` still resolve nowhere — upstream tag pass-through is tracked
+  separately (#202). (#203)
+
+- **`GET /api/v1/repositories/{repo_key}/prefetch/jobs/{job_id}`** — a
+  read-only, id-addressed lookup of a self-service prefetch job's outcome
+  (`status`, `attempts`, `last_error`, `result_summary`, `kind`,
+  `created_at`, `completed_at`). Authz is identical to the
+  `POST .../prefetch` that minted the id (`CliSession` or `ServiceAccount`
+  token, `Permission::Read ∧ Permission::Prefetch` on the repository); a
+  job that exists but belongs to a different repository, or is not a
+  `prefetch` / `prefetch-dependencies` job, 404s indistinguishably from an
+  unknown id — no cross-repo enumeration by id-probing. No list/filter/retry
+  surface. (#158)
+
+### Changed
+
+- **Event-chain verification is now default-on, and a missing checkpoint
+  anchor is no longer a daily failure where no anchor is expected.**
+  `scheduledTasks.verifyEventChain.enabled` now defaults to `true`, so an
+  **existing install gains this CronJob on upgrade** (it still sits under
+  the `scheduledTasks.adminTasksEnabled` umbrella; set `enabled: false` to
+  opt out). Tamper detection an operator has to opt into is tamper
+  detection most deployments never get. Default-on is safe because the
+  missing-anchor semantic is split at its source: whether an anchor is
+  expected is derived from one shared predicate — S3 storage **and** a
+  provisioned anchor public key — that the checkpoint writer and the
+  verifier both consult, so a filesystem install (which can never host an
+  S3 Object-Lock WORM anchor) verifies its chain, expects no anchor, and
+  exits `0`. A real chain break still exits `2` everywhere; a
+  missing/stale checkpoint where an anchor **is** expected still exits
+  `3`. The verify job is never given the anchor private signing key —
+  verification is a public-key operation. Metric semantics:
+  unanchored-verified records `hort_event_chain_verify_total{result="ok"}`
+  — the `{ok, broken, missing_checkpoint}` series set is unchanged, and
+  the anchored-vs-unanchored distinction rides the exit code, the log line
+  and the new `anchor_expected` field of the subcommand's JSON output.
+  `--fail-on-missing-checkpoint` (and the chart's
+  `failOnMissingCheckpoint`, now defaulting to `null`) became tri-state:
+  unset derives, an explicit `true`/`false` forces. See ADR 0057. (#165)
+
+- **Server-side upstream-fetch metrics now name the format that actually
+  fetched.** The server built a single pull-through proxy with a
+  hardcoded `format_label: "oci"` and handed it to all five inbound
+  format crates, so every npm / PyPI / Maven / Cargo on-miss fetch
+  reported `format="oci"` on `hort_upstream_fetch_total`,
+  `hort_upstream_fetch_duration_seconds` and — security-relevant —
+  `hort_upstream_insecure_total`, where an operator triaging "which
+  upstream is plaintext?" was pointed at the wrong format. The server
+  now builds one proxy instance per served format (`oci`, `npm`, `pypi`,
+  `maven`, `cargo`), all sharing a single `reqwest::Client` and hence a
+  single connection pool, and each inbound crate selects its own via a
+  per-format registry on `AppContext`. There is no fallback instance: an
+  incomplete composition fails at boot. No new label values — the closed
+  set is unchanged; what changed is that the correct member of it is
+  emitted. The worker's two deliberately subsystem-labelled instances
+  (`prefetch_tick`, `provenance`) are untouched. `HttpUpstreamProxyConfig`
+  lost its `Default` impl so an omitted `format_label` can no longer
+  inherit `"oci"` silently. (#170)
+
+### Fixed
+
+- **npm `dist-tags.latest` no longer resolves to a prerelease while a
+  release is served.** The served packument derived `latest` as a bare
+  semver-max over the served set, so any package whose next version has a
+  published prerelease (for React, a permanent condition) advertised that
+  prerelease — e.g. `19.3.0-canary-…` over `19.2.8` — and a bare
+  `npm i <pkg>` / `pnpm add <pkg>` installed a canary, under both
+  `indexMode` arms. `latest` is now the max over the **non-prerelease**
+  served versions; a served set consisting only of prereleases falls back
+  to the max prerelease (a prerelease-only package still gets a usable
+  tag); an empty served set still emits no `dist-tags` block, and build
+  metadata (`1.2.3+build.5`) does not count as a prerelease. Lockfile
+  installs, explicit versions, and range specs were never affected.
+  Upstream `next`/`beta`/`rc` tag pass-through remains future work
+  (#202); Maven's `<release>` derivation was verified correct for
+  Maven's own model (only `SNAPSHOT` is special there). (#200)
+
+- **A scan finding whose severity a backend could not read no longer
+  discards another backend's correctly-scored reading of the same
+  advisory.** When a backend cannot determine a severity it emits the
+  fail-closed `Critical` floor — a record byte-identical to a genuine
+  unscored `Critical` (same tier, no CVSS, no informational class). The
+  cross-backend merge compared collisions on severity tier alone, so that
+  floor won every time, including against a scored finding for the same
+  advisory: `rsa 0.9.10` / `RUSTSEC-2023-0071` sat terminally rejected for
+  six weeks on a verdict no backend had actually reached, reproducibly,
+  because the merge was deterministic over unchanged inputs. `Finding`
+  now carries `severity_basis` (`assessed` / `unassessed`), emitted
+  `unassessed` at the three fail-closed sites and nowhere else, and the
+  merge prefers a finding that carries a real reading — a CVSS score, a
+  recognised informational class, or an `assessed` marker — over one that
+  does not, **across severity tiers**. Two real readings still compare by
+  tier, so a scored `Low` never talks down a scored `Critical`. Findings
+  persisted before the field existed deserialise as `assessed`, the
+  fail-safe: a legacy record cannot be proven to be a fail-closed default,
+  so it keeps today's behaviour rather than becoming demotable. New
+  break-glass switch `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE`
+  (default `true`; Helm `worker.scanner.findingMerge.allowInformedDowngrade`)
+  reverts the merge to strict always-fail-closed — engaging it makes the
+  release gate stricter, not looser. See
+  [ADR 0059](docs/adr/0059-finding-reconciliation.md). (#177)
+
+- **One advisory returned under two ids no longer rejects a package
+  twice over.** OSV returns a RustSec advisory *and* its GitHub-reviewed
+  GHSA mirror as separate records in the same response. The mirror
+  frequently carries neither a severity nor an informational marker, so
+  it fell back to the fail-closed `Critical` and shadowed the sibling
+  that does carry the advisory's metadata — and the cross-backend merge
+  could not reconcile the pair, because the two records have **different
+  advisory ids**. `rand 0.7.3` and `typemap 0.3.3` were rejected this
+  way, on a verdict no backend reached, with `rejected` terminal for
+  serving. Both OSV adapters now collapse mutually-aliased findings for
+  a package into one finding per advisory, keeping the best-informed
+  member: a real CVSS beats a recognised informational class, which
+  beats a severity read without a score, which beats the fail-closed
+  floor. A genuinely-scored advisory therefore still blocks —
+  `traitobject 0.1.1` (CVSS 9.8) stays rejected. The collapsed-away
+  identifiers are unioned onto the surviving finding's aliases, so an
+  operator exclusion keyed by any of them still clears the advisory.
+  Artifacts already in the terminal `rejected` state are not freed
+  automatically; see
+  [ADR 0059](docs/adr/0059-finding-reconciliation.md) for the operator
+  paths. (#174)
+
+- **The quarantine-release sweep no longer strands artifacts in a
+  repository whose scan-policy row does not resolve.** Sweep candidacy was
+  the only consumer of the quarantine window without a `DefaultPolicy`
+  fallback, so a repository holding quarantined artifacts but with no
+  resolvable non-archived policy row was silently dropped from the release
+  sweep forever — its full-window artifacts stranded permanently while the
+  API deadline read "expired". Candidacy now falls back to the default 24 h
+  window like every other consumer; an explicit `quarantineDuration: 0`
+  policy stays permissive (never a candidate), unchanged. (#190)
+
 ## [0.11.0] - 2026-08-22
 
 ### Added

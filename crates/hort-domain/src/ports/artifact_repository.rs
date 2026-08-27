@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 use crate::entities::artifact::{Artifact, QuarantineStatus};
 use crate::error::DomainResult;
+use crate::events::Actor;
 use crate::types::{ContentHash, LimitedList, Page, PageRequest};
 
 use super::BoxFuture;
@@ -62,12 +63,42 @@ pub trait ArtifactRepository: Send + Sync {
         repository_id: Uuid,
         page: PageRequest,
     ) -> BoxFuture<'_, DomainResult<Page<Artifact>>>;
-    fn delete(&self, id: Uuid) -> BoxFuture<'_, DomainResult<()>>;
+    /// Delete an artifact — an **event-sourced soft delete**.
+    ///
+    /// The implementation must, atomically:
+    ///
+    /// 1. mark the artifact deleted (`artifacts.deleted_at`), retaining
+    ///    the row, and
+    /// 2. append
+    ///    [`ArtifactDeleted`](crate::events::ArtifactDeleted) to the
+    ///    artifact's own stream ([`StreamId::artifact`](crate::events::StreamId::artifact)),
+    ///    attributed to `actor`.
+    ///
+    /// Neither may be observable without the other: a projection marked
+    /// deleted with no event is an unrecorded terminal transition, and an
+    /// event with no projection change is a lie about the catalog.
+    ///
+    /// The CAS blob is **not** touched. Blob lifetime is refcount-gated
+    /// GC (`content_references` → the purge path), because another
+    /// artifact may reference the same bytes.
+    ///
+    /// `actor` is the caller identity the event is attributed to; it
+    /// rides the persisted-event envelope, never the payload.
+    ///
+    /// **Idempotent.** Deleting an absent — or already-deleted — artifact
+    /// returns [`DomainError::NotFound`](crate::error::DomainError::NotFound)
+    /// and appends nothing, so a retried delete cannot put two terminal
+    /// events on one stream.
+    fn delete(&self, id: Uuid, actor: Actor) -> BoxFuture<'_, DomainResult<()>>;
 
     /// Find an artifact by its logical path within a repository.
     ///
-    /// Returns `None` if no artifact exists at that path. At most one row —
-    /// `(repository_id, path)` has a UNIQUE constraint.
+    /// Returns `None` if no **live** artifact exists at that path — the
+    /// lookup filters `deleted_at IS NULL`, like every other read on this
+    /// port except the content-age anchor
+    /// ([`Self::first_seen_for_checksum`], which counts deleted rows as
+    /// evidence on purpose). At most one row: `(repository_id, path)` is
+    /// unique among live rows.
     fn find_by_path(
         &self,
         repository_id: Uuid,
@@ -190,8 +221,7 @@ pub trait ArtifactRepository: Send + Sync {
     /// future per-policy denormalised column can replace the
     /// in-memory filter without changing this signature.
     ///
-    /// `is_deleted = false` for symmetry with the rest of the read
-    /// path. Already-released or quarantined artifacts are excluded —
+    /// Already-released or quarantined artifacts are excluded —
     /// only `Rejected` rows can be unblocked by a new exclusion.
     ///
     /// Wrapped in
@@ -213,8 +243,7 @@ pub trait ArtifactRepository: Send + Sync {
     /// "Active scan-policy" is the same runtime resolution
     /// [`Self::list_rejected_for_policy`] encodes — repo-scoped policies win
     /// over global, mirroring
-    /// `QuarantineUseCase::resolve_active_policy_for_repo`. `is_deleted =
-    /// false` for symmetry with the rest of the read path; only
+    /// `QuarantineUseCase::resolve_active_policy_for_repo`. Only
     /// `Quarantined` / `Released` rows are returned (`Rejected` /
     /// `ScanIndeterminate` / `None` are excluded — a tighten never re-holds
     /// a never-held, already-blocked, or terminal-failure artifact).
@@ -254,9 +283,8 @@ pub trait ArtifactRepository: Send + Sync {
     /// index / sparse-index / `maven-metadata.xml` resolution (a single
     /// `npm install` does dozens to hundreds), so an event-store replay
     /// is not viable. The adapter relies on the covering index
-    /// `artifacts (repository_id, name) INCLUDE (version, quarantine_status)
-    ///  WHERE NOT is_deleted` for an index-only scan
-    /// with no heap fetch.
+    /// `artifacts (repository_id, name) INCLUDE (version, quarantine_status)`
+    /// for an index-only scan with no heap fetch.
     ///
     /// Artifact rows with a NULL `version` column (the format does not
     /// version the file — rare; structural metadata, signature files,
@@ -380,9 +408,6 @@ pub trait ArtifactRepository: Send + Sync {
     /// runs would re-walk the same set; the per-CAS `StoragePort::put`
     /// idempotency on identical content + the upsert semantics of
     /// `ContentReferenceIndex::insert` absorb the duplicate work.
-    ///
-    /// `is_deleted = false` for symmetry with the rest of the read
-    /// path; a soft-deleted wheel is not a backfill candidate.
     fn find_pypi_wheels_without_kind(
         &self,
         kind: &str,
@@ -415,7 +440,7 @@ pub trait ArtifactRepository: Send + Sync {
     /// backfill exists to repair.
     ///
     /// SQL contract: `SELECT … FROM artifacts WHERE path LIKE
-    /// 'manifests/sha256:%' AND is_deleted = false AND NOT EXISTS (SELECT 1
+    /// 'manifests/sha256:%' AND NOT EXISTS (SELECT 1
     /// FROM content_references WHERE source_artifact_id = artifacts.id AND
     /// kind = $1) AND NOT EXISTS (SELECT 1 FROM artifact_metadata WHERE
     /// artifact_id = artifacts.id AND metadata->>'oci_media_type' IN
@@ -484,7 +509,7 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Page<Artifact>>> {
             Box::pin(async { Ok(Page::empty()) })
         }
-        fn delete(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete(&self, _id: Uuid, _actor: Actor) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }
         fn find_by_path(

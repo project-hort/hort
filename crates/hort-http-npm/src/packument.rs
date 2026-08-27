@@ -597,7 +597,10 @@ pub(crate) fn fire_prefetch_trigger_npm(
         .iter()
         .map(|v| v.version.clone())
         .collect();
-    let latest = projection.dist_tag_latest.clone();
+    // The planner respects upstream's explicit `latest` verbatim; every
+    // other tag is irrelevant to it (the trigger plans off the version
+    // list plus the single mutable-tag pointer).
+    let latest = projection.dist_tags.get("latest").cloned();
     hort_app::use_cases::prefetch_trigger::fire_hot_path_trigger(
         ctx,
         &ctx.prefetch_use_case,
@@ -715,7 +718,10 @@ mod tests {
 
     fn sample_projection() -> NpmProjection {
         NpmProjection {
-            dist_tag_latest: Some("1.2.3".to_string()),
+            dist_tags: std::collections::BTreeMap::from([(
+                "latest".to_string(),
+                "1.2.3".to_string(),
+            )]),
             versions: vec![NpmVersionEntry {
                 version: "1.2.3".to_string(),
                 name_as_published: Some("express".to_string()),
@@ -723,6 +729,7 @@ mod tests {
                 integrity: Some("sha512-abc".to_string()),
                 shasum: Some("deadbeef".to_string()),
                 published_at: None,
+                manifest: serde_json::Map::new(),
             }],
         }
     }
@@ -733,7 +740,14 @@ mod tests {
         let entry = CachedNpmProjection::from_projection(p);
         let encoded = entry.encode();
         let decoded = CachedNpmProjection::decode(&encoded).expect("decode");
-        assert_eq!(decoded.projection.dist_tag_latest.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            decoded
+                .projection
+                .dist_tags
+                .get("latest")
+                .map(String::as_str),
+            Some("1.2.3")
+        );
         assert_eq!(decoded.projection.versions.len(), 1);
         assert_eq!(
             decoded.projection.versions[0].tarball.as_deref(),
@@ -837,7 +851,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -846,7 +862,10 @@ mod tests {
         )
         .await
         .expect("fetch must succeed on upstream-200");
-        assert_eq!(projection.dist_tag_latest.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            projection.dist_tags.get("latest").map(String::as_str),
+            Some("1.0.0")
+        );
         assert_eq!(projection.versions.len(), 1);
 
         // Redis holds the PROJECTION frame (decodes as CachedNpmProjection,
@@ -903,7 +922,9 @@ mod tests {
         let err = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -952,7 +973,9 @@ mod tests {
         let err = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -984,7 +1007,9 @@ mod tests {
         let err = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1035,7 +1060,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1044,7 +1071,10 @@ mod tests {
         )
         .await
         .expect("stale projection must be served on upstream error");
-        assert_eq!(projection.dist_tag_latest.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            projection.dist_tags.get("latest").map(String::as_str),
+            Some("1.2.3")
+        );
     }
 
     /// No stale projection in Redis + upstream down + mirror present →
@@ -1077,7 +1107,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1086,7 +1118,10 @@ mod tests {
         )
         .await
         .expect("mirror re-projection must serve on upstream error");
-        assert_eq!(projection.dist_tag_latest.as_deref(), Some("9.9.9"));
+        assert_eq!(
+            projection.dist_tags.get("latest").map(String::as_str),
+            Some("9.9.9")
+        );
     }
 
     /// No upstream mapping → NoUpstream.
@@ -1100,7 +1135,9 @@ mod tests {
         let err = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1141,7 +1178,9 @@ mod tests {
             let err = fetch_raw_with_cache(
                 ctx.upstream_resolver.as_ref(),
                 ctx.ephemeral_evictable.as_ref(),
-                ctx.upstream_proxy.as_ref(),
+                ctx.upstream_proxy
+                    .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                    .as_ref(),
                 ctx.pull_dedup.as_ref(),
                 Some(ctx.metadata_mirror.as_ref()),
                 cap(),
@@ -1181,7 +1220,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1190,7 +1231,10 @@ mod tests {
         )
         .await
         .expect("valid name must pass the validation gate");
-        assert_eq!(projection.dist_tag_latest.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            projection.dist_tags.get("latest").map(String::as_str),
+            Some("1.2.3")
+        );
     }
 
     /// (d) Fresh projection-cache hit → returns the cached projection,
@@ -1222,7 +1266,9 @@ mod tests {
         let projection = fetch_raw_with_cache(
             ctx.upstream_resolver.as_ref(),
             ctx.ephemeral_evictable.as_ref(),
-            ctx.upstream_proxy.as_ref(),
+            ctx.upstream_proxy
+                .for_format(&crate::UPSTREAM_PROXY_FORMAT)
+                .as_ref(),
             ctx.pull_dedup.as_ref(),
             Some(ctx.metadata_mirror.as_ref()),
             cap(),
@@ -1232,7 +1278,10 @@ mod tests {
         .await
         .unwrap();
         // The fresh cached projection (1.2.3), not the upstream (7.7.7).
-        assert_eq!(projection.dist_tag_latest.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            projection.dist_tags.get("latest").map(String::as_str),
+            Some("1.2.3")
+        );
         // Fresh hit reads neither upstream nor the mirror.
         assert!(
             mocks.metadata_mirror.keys().is_empty(),

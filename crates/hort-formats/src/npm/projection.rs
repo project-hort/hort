@@ -12,7 +12,7 @@
 //!  - serde.rs/ignored-any.html (the skip-without-allocating mechanism).
 //!  - ADR 0026 streaming projection contract.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::upstream_proxy::{CountingReader, MetadataProjector};
 
+use crate::npm::NPM_INSTALL_V1_MANIFEST_KEYS;
+
 // ---------------------------------------------------------------------------
 // Projection — what consumers see
 // ---------------------------------------------------------------------------
@@ -31,7 +33,8 @@ use hort_domain::ports::upstream_proxy::{CountingReader, MetadataProjector};
 /// Project-out shape returned by [`NpmPackumentProjector`].
 ///
 /// Fields are exactly what `ProxyNpmSource::fetch` +
-/// `fire_prefetch_trigger_npm` need from a packument; everything else
+/// `fire_prefetch_trigger_npm` need from a packument — including the
+/// install-v1 abbreviated-metadata whitelist per version; everything else
 /// (`readme`, `_attachments`, `description`, `maintainers`, …) is
 /// streamed past the deserializer without allocating.
 ///
@@ -42,7 +45,20 @@ use hort_domain::ports::upstream_proxy::{CountingReader, MetadataProjector};
 /// existing fields round-trip through serde.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NpmProjection {
-    pub dist_tag_latest: Option<String>,
+    /// Upstream's whole `dist-tags` map (`latest`, `next`, `beta`, …),
+    /// tag → version string, captured verbatim. Consumers intersect it
+    /// with the served set before it reaches the wire — a tag whose
+    /// target version is not served is dropped, never rewritten.
+    ///
+    /// `#[serde(default)]` is load-bearing: cache frames written before
+    /// this field existed carry only the superseded `dist_tag_latest`
+    /// key, and must decode into an empty map. Failing the decode
+    /// instead would turn every pre-existing entry into a cold-cache
+    /// miss plus a warn on a rolling deploy; an empty map degrades to
+    /// the served-set derivation, which is exactly the pre-widening
+    /// behaviour, and heals on the next re-projection.
+    #[serde(default)]
+    pub dist_tags: BTreeMap<String, String>,
     pub versions: Vec<NpmVersionEntry>,
 }
 
@@ -67,6 +83,18 @@ pub struct NpmVersionEntry {
     /// `time{<version>}` — upstream publish timestamp. Populated from
     /// the sibling `time{}` map after deserialize.
     pub published_at: Option<DateTime<Utc>>,
+    /// The install-v1 abbreviated-metadata field set
+    /// ([`NPM_INSTALL_V1_MANIFEST_KEYS`]), captured verbatim from the
+    /// upstream per-version object. Empty when upstream published none
+    /// of them.
+    ///
+    /// `#[serde(default)]` is load-bearing: cache frames written before
+    /// this field existed carry no `manifest` key, and must decode into
+    /// an empty map. Failing the decode instead would turn every
+    /// pre-existing entry into a cold-cache miss plus a warn on a rolling
+    /// deploy.
+    #[serde(default)]
+    pub manifest: serde_json::Map<String, serde_json::Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +202,9 @@ impl<'de> Visitor<'de> for TopVisitor {
             v.published_at = time_map.get(&v.version).copied();
         }
         Ok(NpmProjection {
-            dist_tag_latest: dist_tags.and_then(|dt| dt.latest),
+            dist_tags: dist_tags
+                .map(DistTagsWire::into_string_map)
+                .unwrap_or_default(),
             versions,
         })
     }
@@ -244,6 +274,7 @@ impl<'de> Visitor<'de> for VersionsVisitor {
                 integrity: wire.dist.as_ref().and_then(|d| d.integrity.clone()),
                 shasum: wire.dist.and_then(|d| d.shasum),
                 published_at: None, // filled by outer visitor after time{} merges
+                manifest: wire.manifest,
             });
         }
         Ok(out)
@@ -255,17 +286,84 @@ impl<'de> Visitor<'de> for VersionsVisitor {
 // by serde's `deserialize_ignored_any` without allocating.
 // ---------------------------------------------------------------------------
 
+/// Upstream `dist-tags` wire DTO — the whole tag → version map.
+///
+/// Captured as a raw JSON object and narrowed to string values by
+/// [`Self::into_string_map`]. A tag whose value is not a JSON string is
+/// **dropped**, not a parse failure: one malformed entry must not cost
+/// the package its entire index, and a dropped tag simply falls out of
+/// the served map (with `latest` degrading to the served-set
+/// derivation, the same outcome as an absent tag).
 #[derive(Deserialize)]
-struct DistTagsWire {
-    latest: Option<String>,
+#[serde(transparent)]
+struct DistTagsWire(serde_json::Map<String, serde_json::Value>);
+
+impl DistTagsWire {
+    fn into_string_map(self) -> BTreeMap<String, String> {
+        self.0
+            .into_iter()
+            .filter_map(|(tag, value)| match value {
+                serde_json::Value::String(version) => Some((tag, version)),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
-#[derive(Deserialize)]
+/// Per-version object DTO. `name` + `dist` feed the tarball / checksum
+/// path; the install-v1 whitelist
+/// ([`NPM_INSTALL_V1_MANIFEST_KEYS`]) is captured verbatim into
+/// `manifest`. Every other key (`description`, `scripts`,
+/// `devDependencies`, `readme`, …) is consumed by `IgnoredAny` without
+/// allocating, so the projection's memory bound stays the whitelist, not
+/// the version object.
+///
+/// Hand-written `Deserialize` rather than a derive because the captured
+/// key set is a runtime slice, not a fixed list of struct fields — a
+/// derive would force one `Option<Value>` field per whitelist entry and
+/// split the whitelist's definition across two places.
 struct VersionWire {
     name: Option<String>,
     dist: Option<DistWire>,
-    // Every other per-version field (`description`, `bin`, `engines`,
-    // `dependencies`, …) is skipped via `deserialize_ignored_any`.
+    manifest: serde_json::Map<String, serde_json::Value>,
+}
+
+impl<'de> Deserialize<'de> for VersionWire {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(VersionWireVisitor)
+    }
+}
+
+struct VersionWireVisitor;
+
+impl<'de> Visitor<'de> for VersionWireVisitor {
+    type Value = VersionWire;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("an npm packument per-version object")
+    }
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<VersionWire, A::Error> {
+        let mut name = None;
+        let mut dist = None;
+        let mut manifest = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "name" => name = map.next_value()?,
+                "dist" => dist = map.next_value()?,
+                k if NPM_INSTALL_V1_MANIFEST_KEYS.contains(&k) => {
+                    let value: serde_json::Value = map.next_value()?;
+                    manifest.insert(key, value);
+                }
+                _ => {
+                    let _: IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+        Ok(VersionWire {
+            name,
+            dist,
+            manifest,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -294,14 +392,53 @@ mod tests {
         let body = br#"{"versions":{}}"#;
         let p = project(body, 2 * 1024 * 1024).expect("project");
         assert!(p.versions.is_empty());
-        assert!(p.dist_tag_latest.is_none());
+        assert!(p.dist_tags.is_empty());
     }
 
     #[test]
     fn dist_tag_latest_round_trips() {
         let body = br#"{"dist-tags":{"latest":"1.2.3"},"versions":{}}"#;
         let p = project(body, 2 * 1024 * 1024).expect("project");
-        assert_eq!(p.dist_tag_latest.as_deref(), Some("1.2.3"));
+        assert_eq!(p.dist_tags.get("latest").map(String::as_str), Some("1.2.3"));
+    }
+
+    #[test]
+    fn whole_dist_tags_map_round_trips_not_just_latest() {
+        // The projector carries every tag upstream published, not only
+        // `latest` — the pass-through contract's source of truth.
+        let body = br#"{"dist-tags":{"latest":"1.2.3","next":"2.0.0-rc.1","beta":"2.0.0-beta.4"},
+                        "versions":{}}"#;
+        let p = project(body, 2 * 1024 * 1024).expect("project");
+        assert_eq!(
+            p.dist_tags,
+            BTreeMap::from([
+                ("latest".to_string(), "1.2.3".to_string()),
+                ("next".to_string(), "2.0.0-rc.1".to_string()),
+                ("beta".to_string(), "2.0.0-beta.4".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn non_string_dist_tag_value_is_dropped_not_a_parse_failure() {
+        // A malformed entry costs that tag only. Failing the whole
+        // packument would take a package's entire index offline over one
+        // bad tag; the dropped tag falls back to absence, and `latest`
+        // to the served-set derivation.
+        let body = br#"{"dist-tags":{"latest":"1.2.3","broken":null,"weird":{"a":1},
+                                     "numeric":7},"versions":{}}"#;
+        let p = project(body, 2 * 1024 * 1024).expect("project");
+        assert_eq!(
+            p.dist_tags,
+            BTreeMap::from([("latest".to_string(), "1.2.3".to_string())])
+        );
+    }
+
+    #[test]
+    fn null_dist_tags_block_projects_an_empty_map() {
+        let body = br#"{"dist-tags":null,"versions":{}}"#;
+        let p = project(body, 2 * 1024 * 1024).expect("project");
+        assert!(p.dist_tags.is_empty());
     }
 
     #[test]
@@ -373,6 +510,141 @@ mod tests {
         // didn't break the parse.
         assert_eq!(p.versions[0].tarball.as_deref(), Some("u"));
         assert_eq!(p.versions[0].integrity.as_deref(), Some("sha512-x"));
+    }
+
+    #[test]
+    fn install_v1_whitelist_is_captured_verbatim_and_absent_keys_stay_absent() {
+        // Every whitelist key present at the source reaches the entry
+        // unaltered; non-whitelist per-version fields (`scripts`,
+        // `devDependencies`, `description`) do NOT; and a whitelist key
+        // the source omitted is absent rather than null.
+        let body = br#"{
+            "versions": {
+                "1.0.0": {
+                    "name": "foo",
+                    "description": "not served",
+                    "scripts": {"test": "jest"},
+                    "devDependencies": {"jest": "^29.0.0"},
+                    "dependencies": {"bar": "^2.0.0"},
+                    "peerDependencies": {"react": ">=18"},
+                    "peerDependenciesMeta": {"react": {"optional": true}},
+                    "engines": {"node": ">=20"},
+                    "os": ["linux"],
+                    "cpu": ["x64"],
+                    "bin": {"foo": "./cli.js"},
+                    "deprecated": "use bar instead",
+                    "hasInstallScript": true,
+                    "dist": {"tarball": "https://r.example/foo/-/foo-1.0.0.tgz"}
+                }
+            }
+        }"#;
+        let p = project(body, 2 * 1024 * 1024).expect("project");
+        let m = &p.versions[0].manifest;
+        assert_eq!(
+            m.get("dependencies"),
+            Some(&serde_json::json!({"bar": "^2.0.0"}))
+        );
+        assert_eq!(
+            m.get("peerDependencies"),
+            Some(&serde_json::json!({"react": ">=18"}))
+        );
+        assert_eq!(
+            m.get("peerDependenciesMeta"),
+            Some(&serde_json::json!({"react": {"optional": true}}))
+        );
+        assert_eq!(m.get("engines"), Some(&serde_json::json!({"node": ">=20"})));
+        assert_eq!(m.get("os"), Some(&serde_json::json!(["linux"])));
+        assert_eq!(m.get("cpu"), Some(&serde_json::json!(["x64"])));
+        assert_eq!(m.get("bin"), Some(&serde_json::json!({"foo": "./cli.js"})));
+        assert_eq!(
+            m.get("deprecated"),
+            Some(&serde_json::json!("use bar instead"))
+        );
+        assert_eq!(m.get("hasInstallScript"), Some(&serde_json::json!(true)));
+        // Out of contract — never captured.
+        assert!(!m.contains_key("scripts"));
+        assert!(!m.contains_key("devDependencies"));
+        assert!(!m.contains_key("description"));
+        // Whitelist keys the source omitted are absent, not null.
+        assert!(!m.contains_key("optionalDependencies"));
+        assert!(!m.contains_key("funding"));
+        assert!(!m.contains_key("libc"));
+        assert!(!m.contains_key("directories"));
+        assert!(!m.contains_key("bundledDependencies"));
+    }
+
+    #[test]
+    fn version_with_no_whitelist_keys_projects_an_empty_manifest() {
+        let body = br#"{"versions":{"1.0.0":{"name":"foo","dist":{"tarball":"u"}}}}"#;
+        let p = project(body, 2 * 1024 * 1024).expect("project");
+        assert!(p.versions[0].manifest.is_empty());
+    }
+
+    #[test]
+    fn pre_widening_frame_decodes_to_an_empty_dist_tags_map() {
+        // A frame written before the `dist-tags` map existed carries the
+        // superseded `dist_tag_latest` key and no `dist_tags`.
+        // `#[serde(default)]` must make it decode to an empty map (the
+        // pre-widening behaviour: pure served-set derivation), never a
+        // decode failure — that would turn every cached entry into a
+        // cold-cache miss plus a warn on a rolling deploy.
+        let frame = br#"{
+            "dist_tag_latest": "1.0.0",
+            "versions": [{
+                "version": "1.0.0",
+                "name_as_published": "foo",
+                "tarball": "https://r.example/foo/-/foo-1.0.0.tgz",
+                "integrity": "sha512-abc",
+                "shasum": "deadbeef",
+                "published_at": null
+            }]
+        }"#;
+        let p: NpmProjection = serde_json::from_slice(frame).expect("pre-widening frame decodes");
+        assert!(
+            p.dist_tags.is_empty(),
+            "the superseded scalar key must not resurrect as a map entry"
+        );
+        assert_eq!(p.versions.len(), 1);
+    }
+
+    #[test]
+    fn dist_tags_map_round_trips_through_the_cache_frame() {
+        let p = NpmProjection {
+            dist_tags: BTreeMap::from([
+                ("latest".to_string(), "1.0.0".to_string()),
+                ("next".to_string(), "2.0.0-rc.1".to_string()),
+            ]),
+            versions: Vec::new(),
+        };
+        let encoded = serde_json::to_vec(&p).expect("encode");
+        let decoded: NpmProjection = serde_json::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded.dist_tags, p.dist_tags);
+    }
+
+    #[test]
+    fn pre_widening_serialized_entry_decodes_to_an_empty_manifest() {
+        // A projection frame written before `manifest` existed carries no
+        // such key. `#[serde(default)]` must make it decode to an empty
+        // map — a decode failure here would turn every cached entry into
+        // a cold-cache miss plus a warn on a rolling deploy.
+        let frame = br#"{
+            "dist_tags": {"latest": "1.0.0"},
+            "versions": [{
+                "version": "1.0.0",
+                "name_as_published": "foo",
+                "tarball": "https://r.example/foo/-/foo-1.0.0.tgz",
+                "integrity": "sha512-abc",
+                "shasum": "deadbeef",
+                "published_at": null
+            }]
+        }"#;
+        let p: NpmProjection = serde_json::from_slice(frame).expect("pre-widening frame decodes");
+        assert_eq!(p.dist_tags.get("latest").map(String::as_str), Some("1.0.0"));
+        assert_eq!(p.versions.len(), 1);
+        assert!(p.versions[0].manifest.is_empty());
+        // The rest of the entry still derives unchanged.
+        assert_eq!(p.versions[0].integrity.as_deref(), Some("sha512-abc"));
+        assert_eq!(p.versions[0].shasum.as_deref(), Some("deadbeef"));
     }
 
     #[test]

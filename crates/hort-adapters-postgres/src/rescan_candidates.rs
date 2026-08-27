@@ -123,7 +123,6 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                 WHERE COALESCE(p.rescan_interval_hours, $3) > 0
                   AND (a.quarantine_status = 'released'
                        OR a.quarantine_status IS NULL)
-                  AND a.is_deleted = false
                   AND (
                         a.last_scan_at IS NULL
                      OR a.last_scan_at
@@ -217,7 +216,7 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // `quarantine_status = 'quarantined'` (NOT `'released'`/`NULL`
             // — that's `select_eligible`'s predicate, and NOT
             // `'scan_indeterminate'`/`'rejected'` — those are terminal,
-            // ADR 0007, never auto-rescanned — nor `is_deleted`). The
+            // ADR 0007, never auto-rescanned). The
             // in-flight exclusion reuses the same shape as
             // `select_eligible` and is covered by the existing
             // `jobs_scan_unique` partial unique index (migration 009).
@@ -255,7 +254,6 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                     LIMIT 1
                 ) p ON TRUE
                 WHERE a.quarantine_status = 'quarantined'
-                  AND a.is_deleted = false
                   AND (last_job.status = 'failed' OR last_job.status IS NULL)
                   AND COALESCE(cardinality(p.scan_backends), $2) > 0
                   AND NOT EXISTS (

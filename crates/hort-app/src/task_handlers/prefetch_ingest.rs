@@ -171,6 +171,13 @@ struct LeafSummary {
     /// format) caused the leaf to short-circuit. The outcome is
     /// still `Completed` — the operator-facing signal is this flag.
     short_circuited: bool,
+    /// `true` when at least one per-URL failure in this leaf was a
+    /// genuine hard failure (network, 5xx, checksum mismatch, storage)
+    /// rather than an upstream 404 (a package/version the upstream
+    /// legitimately never published — e.g. a Maven BOM's absent jar).
+    /// Feeds [`completion_is_error`]; not part of the persisted
+    /// `result_summary` JSON.
+    any_hard_failure: bool,
 }
 
 impl LeafSummary {
@@ -185,6 +192,30 @@ impl LeafSummary {
             "short_circuited":  self.short_circuited,
         })
     }
+}
+
+/// True when `message` — the rendered `Display` text of a failed
+/// upstream fetch or verified-ingest attempt — describes an upstream
+/// 404 (this specific URL/distribution simply isn't published, e.g. a
+/// Maven BOM's absent jar) rather than a genuine hard failure (network,
+/// 5xx, checksum mismatch, storage). The upstream-proxy adapter encodes
+/// a real 404 as an `upstream:not_found:...`-sentinel `DomainError`, and
+/// error `Display` chains preserve that text — mirrors the substring
+/// classification `pull_dedup::classify_app_error` uses for the
+/// negative-cache TTL lookup.
+fn is_upstream_not_found(message: &str) -> bool {
+    let s = message.to_ascii_lowercase();
+    s.contains("not_found") || s.contains("not found") || s.contains("404")
+}
+
+/// The whole-leaf terminal-completion severity: a
+/// fully-failed leaf (no URL succeeded) escalates to ERROR only when at
+/// least one of its failures was a genuine hard failure rather than an
+/// upstream 404 — an all-404 outcome (a package/version the upstream
+/// simply never published) stays at the completion line's normal level,
+/// same as any partial success.
+fn completion_is_error(summary: &LeafSummary) -> bool {
+    summary.urls_succeeded == 0 && summary.any_hard_failure
 }
 
 impl TaskHandler for PrefetchIngestHandler {
@@ -353,16 +384,29 @@ impl TaskHandler for PrefetchIngestHandler {
                 }
             }
 
-            tracing::info!(
-                repository = %repo.key,
-                package = %parsed.package,
-                version = %parsed.version,
-                urls_attempted = summary.urls_attempted,
-                urls_succeeded = summary.urls_succeeded,
-                urls_failed = summary.urls_failed,
-                short_circuited = summary.short_circuited,
-                "prefetch leaf pull complete",
-            );
+            if completion_is_error(&summary) {
+                tracing::error!(
+                    repository = %repo.key,
+                    package = %parsed.package,
+                    version = %parsed.version,
+                    urls_attempted = summary.urls_attempted,
+                    urls_succeeded = summary.urls_succeeded,
+                    urls_failed = summary.urls_failed,
+                    short_circuited = summary.short_circuited,
+                    "prefetch leaf pull complete",
+                );
+            } else {
+                tracing::info!(
+                    repository = %repo.key,
+                    package = %parsed.package,
+                    version = %parsed.version,
+                    urls_attempted = summary.urls_attempted,
+                    urls_succeeded = summary.urls_succeeded,
+                    urls_failed = summary.urls_failed,
+                    short_circuited = summary.short_circuited,
+                    "prefetch leaf pull complete",
+                );
+            }
 
             Ok(TaskOutcome::Completed {
                 result_summary: summary.to_json(
@@ -539,6 +583,9 @@ async fn fetch_and_ingest_one(
                 "prefetch: fetch_artifact failed; continuing",
             );
             summary.urls_failed += 1;
+            if !is_upstream_not_found(&err.to_string()) {
+                summary.any_hard_failure = true;
+            }
             return;
         }
     };
@@ -588,6 +635,9 @@ async fn fetch_and_ingest_one(
                 "prefetch: ingest_verified failed; continuing",
             );
             summary.urls_failed += 1;
+            if !is_upstream_not_found(&err.to_string()) {
+                summary.any_hard_failure = true;
+            }
         }
     }
 }
@@ -1068,6 +1118,9 @@ async fn maven_pull_one(
                 "prefetch (maven): fetch_artifact failed; continuing",
             );
             summary.urls_failed += 1;
+            if !is_upstream_not_found(&err.to_string()) {
+                summary.any_hard_failure = true;
+            }
             return false;
         }
     };
@@ -1116,6 +1169,9 @@ async fn maven_pull_one(
                 "prefetch (maven): ingest_verified failed; continuing",
             );
             summary.urls_failed += 1;
+            if !is_upstream_not_found(&err.to_string()) {
+                summary.any_hard_failure = true;
+            }
             false
         }
     }
@@ -1272,6 +1328,7 @@ async fn pypi_per_distribution_fanout(
                 );
                 summary.urls_attempted += 1;
                 summary.urls_failed += 1;
+                summary.any_hard_failure = true;
                 continue;
             }
         };
@@ -1303,6 +1360,7 @@ async fn pypi_per_distribution_fanout(
                     );
                     summary.urls_attempted += 1;
                     summary.urls_failed += 1;
+                    summary.any_hard_failure = true;
                     continue;
                 }
             };
@@ -1325,6 +1383,9 @@ async fn pypi_per_distribution_fanout(
                     "prefetch (pypi): fetch_artifact failed; continuing with next distribution",
                 );
                 summary.urls_failed += 1;
+                if !is_upstream_not_found(&err.to_string()) {
+                    summary.any_hard_failure = true;
+                }
                 continue;
             }
         };
@@ -1374,6 +1435,9 @@ async fn pypi_per_distribution_fanout(
                     "prefetch (pypi): ingest_verified failed; continuing with next distribution",
                 );
                 summary.urls_failed += 1;
+                if !is_upstream_not_found(&err.to_string()) {
+                    summary.any_hard_failure = true;
+                }
             }
         }
     }
@@ -2861,5 +2925,324 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // -- terminal-completion severity --------------------------------------
+
+    #[test]
+    fn is_upstream_not_found_recognizes_the_404_sentinel_and_plain_text() {
+        assert!(is_upstream_not_found("upstream:not_found:mock artifact"));
+        assert!(is_upstream_not_found("upstream returned 404"));
+        assert!(is_upstream_not_found("Not Found"));
+        assert!(!is_upstream_not_found("upstream:upstream_5xx:mock 503"));
+        assert!(!is_upstream_not_found("connection reset by peer"));
+        assert!(!is_upstream_not_found("checksum mismatch"));
+    }
+
+    #[test]
+    fn completion_is_error_only_when_fully_failed_with_a_hard_failure() {
+        // Every URL failed, and at least one was a hard failure -> ERROR.
+        let all_hard_failed = LeafSummary {
+            urls_attempted: 1,
+            urls_failed: 1,
+            any_hard_failure: true,
+            ..Default::default()
+        };
+        assert!(completion_is_error(&all_hard_failed));
+
+        // The Maven BOM case: the POM succeeded, only the (hard-failed) jar
+        // leg failed — `urls_succeeded != 0` dominates regardless of the
+        // failure's hardness.
+        let bom_partial_success = LeafSummary {
+            urls_attempted: 2,
+            urls_succeeded: 1,
+            urls_failed: 1,
+            any_hard_failure: true,
+            ..Default::default()
+        };
+        assert!(!completion_is_error(&bom_partial_success));
+
+        // All-404 (no hard failure at all) -> not ERROR.
+        let all_not_found = LeafSummary {
+            urls_attempted: 1,
+            urls_failed: 1,
+            ..Default::default()
+        };
+        assert!(!completion_is_error(&all_not_found));
+
+        // Nothing attempted (a guard-rail short-circuit, no per-URL
+        // failure recorded) -> not ERROR.
+        let short_circuit_only = LeafSummary {
+            short_circuited: true,
+            ..Default::default()
+        };
+        assert!(!completion_is_error(&short_circuit_only));
+    }
+
+    // -- terminal-completion severity: handler-level, via a tracing
+    // capture layer mirroring `quarantine_use_case::tests::AuditCapturingLayer`.
+
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::Registry;
+
+    #[derive(Clone, Default)]
+    struct SeverityCapturingLayer {
+        records: Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SeverityCapturingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = SeverityMessageVisitor::default();
+            event.record(&mut visitor);
+            self.records
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.message));
+        }
+    }
+
+    #[derive(Default)]
+    struct SeverityMessageVisitor {
+        message: String,
+    }
+    impl tracing::field::Visit for SeverityMessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    static SEVERITY_TRACING_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Process-global subscriber that returns `Interest::sometimes()` for
+    /// every callsite, installed once via `OnceLock`. Without this, a
+    /// sibling test running in parallel can fire the leaf's completion
+    /// callsite first under the default no-op subscriber, which caches
+    /// `Never` for it — locking every later test (including this one) out
+    /// regardless of the per-thread `set_default` below. Mirrors
+    /// `repository_access::tests::install_global_passthrough_subscriber`.
+    fn install_severity_passthrough_subscriber() {
+        use std::sync::OnceLock;
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let global_layer = SeverityCapturingLayer::default();
+            let global_subscriber = Registry::default().with(global_layer);
+            let _ = tracing::subscriber::set_global_default(global_subscriber);
+        });
+    }
+
+    /// Drives `fut` to completion under a fresh capturing subscriber
+    /// (serialized against sibling severity tests — the callsite interest
+    /// cache `rebuild_interest_cache` touches is process-global) and
+    /// returns the level the leaf's completion line was logged at.
+    fn completion_level_for<F>(fut: F) -> tracing::Level
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        install_severity_passthrough_subscriber();
+        let _serial = SEVERITY_TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let layer = SeverityCapturingLayer::default();
+        let captured = layer.records.clone();
+        let subscriber = Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut);
+
+        let found = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, msg)| msg.contains("prefetch leaf pull complete"))
+            .map(|(level, _)| *level);
+        found.expect("the completion line must have been logged")
+    }
+
+    /// Forced hard failure (a non-404 upstream error) on the leaf's only
+    /// URL, with nothing succeeding, escalates the completion line to
+    /// ERROR.
+    #[test]
+    fn completion_line_escalates_to_error_on_a_fully_failed_hard_failure() {
+        let level = completion_level_for(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let proxy = Arc::new(MockUpstreamProxy::new());
+            let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+            let repo = dispatch_repo(RepositoryFormat::Cargo);
+            repos.insert(repo.clone());
+            seed_catchall(&mappings, repo.id).await;
+
+            proxy.insert_metadata("", "/se/rd/serde", b"ndjson-unused-by-stub".to_vec());
+            proxy.insert_metadata(
+                "",
+                "/config.json",
+                br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#.to_vec(),
+            );
+            // No artifact fixture seeded; force a non-404 hard failure on
+            // the download leg instead of the default "unseeded" 404.
+            proxy.fail_next_artifact_with(DomainError::Invariant(
+                "upstream:upstream_5xx:mock 503".to_string(),
+            ));
+
+            let handler = build_dispatch_handler(
+                repos,
+                proxy,
+                mappings,
+                "cargo",
+                Arc::new(CargoDispatchStub {
+                    cksum_hex: sha256_hex(b"anything"),
+                }),
+            );
+
+            let outcome = handler
+                .run(&leaf_params(repo.id, "serde", "1.0.0"), make_context())
+                .await
+                .expect("Ok");
+            let summary = match outcome {
+                TaskOutcome::Completed { result_summary } => result_summary,
+                other => panic!("expected Completed, got {other:?}"),
+            };
+            assert_eq!(summary["urls_succeeded"], 0, "{summary}");
+            assert_eq!(summary["urls_failed"], 1, "{summary}");
+        });
+
+        assert_eq!(
+            level,
+            tracing::Level::ERROR,
+            "a fully-failed leaf with a non-404 hard failure must escalate"
+        );
+    }
+
+    /// The Maven BOM case (POM succeeds, no jar published) must NOT
+    /// escalate — a legitimate partial success stays at its current
+    /// level.
+    #[test]
+    fn completion_line_stays_non_error_on_the_maven_bom_case() {
+        let level = completion_level_for(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let proxy = Arc::new(MockUpstreamProxy::new());
+            let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+            let repo = dispatch_repo(RepositoryFormat::Maven);
+            repos.insert(repo.clone());
+            seed_catchall(&mappings, repo.id).await;
+
+            let pom = b"<project>bom pom</project>".to_vec();
+            proxy.insert_metadata(
+                "",
+                "com/example/foo/1.0/foo-1.0.pom.sha256",
+                sha256_hex(&pom).into_bytes(),
+            );
+            proxy.insert_artifact("", "com/example/foo/1.0/foo-1.0.pom", pom);
+            // No jar sidecar / jar body seeded — the BOM/parent-POM shape.
+
+            let handler = build_dispatch_handler(
+                repos,
+                proxy,
+                mappings,
+                "maven",
+                Arc::new(MavenDispatchStub),
+            );
+
+            let outcome = handler
+                .run(
+                    &leaf_params(repo.id, "com.example:foo", "1.0"),
+                    make_context(),
+                )
+                .await
+                .expect("Ok");
+            let summary = match outcome {
+                TaskOutcome::Completed { result_summary } => result_summary,
+                other => panic!("expected Completed, got {other:?}"),
+            };
+            assert_eq!(summary["urls_succeeded"], 1, "{summary}");
+        });
+
+        assert_ne!(
+            level,
+            tracing::Level::ERROR,
+            "a legitimate partial success (BOM) must not escalate"
+        );
+    }
+
+    /// An all-404 outcome (no hard failure at all — the upstream simply
+    /// never published this package/version) must NOT escalate.
+    #[test]
+    fn completion_line_stays_non_error_on_an_all_404_outcome() {
+        let level = completion_level_for(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let proxy = Arc::new(MockUpstreamProxy::new());
+            let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+            let repo = dispatch_repo(RepositoryFormat::Cargo);
+            repos.insert(repo.clone());
+            seed_catchall(&mappings, repo.id).await;
+
+            proxy.insert_metadata("", "/se/rd/serde", b"ndjson-unused-by-stub".to_vec());
+            proxy.insert_metadata(
+                "",
+                "/config.json",
+                br#"{"dl":"https://static.crates.io/crates","api":"https://crates.io"}"#.to_vec(),
+            );
+            // No artifact fixture seeded, no injected error — the mock's
+            // default unseeded-key response is a plain 404.
+
+            let handler = build_dispatch_handler(
+                repos,
+                proxy,
+                mappings,
+                "cargo",
+                Arc::new(CargoDispatchStub {
+                    cksum_hex: sha256_hex(b"anything"),
+                }),
+            );
+
+            let outcome = handler
+                .run(&leaf_params(repo.id, "serde", "1.0.0"), make_context())
+                .await
+                .expect("Ok");
+            let summary = match outcome {
+                TaskOutcome::Completed { result_summary } => result_summary,
+                other => panic!("expected Completed, got {other:?}"),
+            };
+            assert_eq!(summary["urls_succeeded"], 0, "{summary}");
+            assert_eq!(summary["urls_failed"], 1, "{summary}");
+        });
+
+        assert_ne!(
+            level,
+            tracing::Level::ERROR,
+            "an all-404 outcome (no hard failure) must not escalate"
+        );
     }
 }

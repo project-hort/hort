@@ -1,0 +1,20 @@
+# Mirror of deploy/ansible/files/gitops/repositories/cargo-virtual.yaml — the
+# single cargo source a hort build resolves against: own crates first, then
+# the hardened crates.io mirror.
+#
+# No indexMode of its own: the served index is the union of member indexes,
+# and the cold-start fix lives on the member (crates-proxy's
+# `include_pending`). Private, because it contains the private proxy member;
+# the public face for first-party crates is hort-crates.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: cargo-virtual
+spec:
+  name: "Cargo build endpoint (own crates + crates.io mirror)"
+  description: "Single cargo source CI/dev builds resolve against."
+  format: cargo
+  type: virtual
+  virtualMembers: [hort-crates, crates-proxy]
+  isPublic: false
+  replicationPriority: local_only

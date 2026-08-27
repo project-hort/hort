@@ -2,14 +2,27 @@
 //!
 //! Routes (mounted under `/npm`):
 //! - `GET  /{repo_key}/{name}`                               — unscoped packument
+//! - `GET  /{repo_key}/{name}/{version_or_tag}`              — unscoped abbreviated per-version / `latest`
 //! - `GET  /{repo_key}/@{scope}/{name}`                      — scoped packument
+//! - `GET  /{repo_key}/@{scope}/{name}/{version_or_tag}`     — scoped abbreviated per-version / `latest`
 //! - `GET  /{repo_key}/{name}/-/{filename}`                  — unscoped tarball
 //! - `GET  /{repo_key}/@{scope}/{name}/-/{filename}`         — scoped tarball
 //! - `PUT  /{repo_key}/{name}`                               — unscoped publish
 //! - `PUT  /{repo_key}/@{scope}/{name}`                      — scoped publish
+//! - `PUT  /{repo_key}/-/package/{pkg}/dist-tags/{tag}`      — `npm dist-tag add`
+//! - `DEL  /{repo_key}/-/package/{pkg}/dist-tags/{tag}`      — `npm dist-tag rm`
 //!
-//! Segment count disambiguates all six routes cleanly — 2/3/4/5 path
-//! segments after `/npm/`. No axum priority rules to rely on.
+//! Segment count disambiguates most routes cleanly — 2/3/4/5 path
+//! segments after `/npm/` — but axum/matchit cannot register two
+//! distinct all-param routes at the same segment count and position
+//! (`/{repo_key}/{scope}/{name}` and `/{repo_key}/{name}/{version_or_tag}`
+//! are both 3 segments; likewise the 4-segment scoped forms). So the
+//! 3-segment and 4-segment GET routes each dispatch **in-handler** on
+//! whether the second path segment starts with `@`: scoped
+//! packument / per-version when it does, unscoped per-version when it
+//! does not. The literal `-` third segment of the tarball routes
+//! always takes matcher precedence over a same-position param, so
+//! both tarball routes are unaffected by either dispatch.
 
 use std::sync::Arc;
 
@@ -18,7 +31,7 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::{Extension, Router};
 use chrono::Utc;
 
@@ -38,6 +51,16 @@ use hort_http_core::error::ApiError;
 use hort_http_core::limits::{BoundedPath, DEFAULT_PUBLISH_BODY_LIMIT};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 use hort_http_core::middleware::trust::RequestTrust;
+
+/// The one format this crate's read path serves — the key into
+/// `AppContext.upstream_proxy` ([`hort_domain::ports::upstream_proxy::UpstreamProxyByFormat`]).
+///
+/// Every on-miss upstream fetch from this crate goes through the proxy
+/// instance registered under this key, which is what puts the correct
+/// `format` label on `hort_upstream_fetch_total`,
+/// `hort_upstream_fetch_duration_seconds` and — security-relevant —
+/// `hort_upstream_insecure_total`.
+pub(crate) const UPSTREAM_PROXY_FORMAT: RepositoryFormat = RepositoryFormat::Npm;
 
 // Packument pull-through cache for Proxy repos (see ADR 0006). The
 // dispatch hop in `packument_unscoped` / `packument_scoped` resolves
@@ -104,13 +127,33 @@ pub fn npm_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
     // disambiguates by segment count, but ordering first preserves intent
     // and guards against a future matcher rule change.
     Router::new()
+        // Maintainer dist-tag writes. Six segments with three literals
+        // (`-`, `package`, `dist-tags`), so they cannot collide with any
+        // of the all-param read routes below (2–5 segments). `{pkg}`
+        // carries a scoped name URL-encoded (`@scope%2fname`) exactly as
+        // the npm CLI sends it; the path extractor decodes it.
+        .route(
+            "/{repo_key}/-/package/{pkg}/dist-tags/{tag}",
+            put(dist_tag_put)
+                .delete(dist_tag_delete)
+                // A dist-tag body is a JSON string holding one version.
+                // The router-wide publish limit (hundreds of MiB, sized
+                // for a base64 tarball) has no business applying to a
+                // buffered body this small; the per-route layer runs
+                // closer to the handler and wins.
+                .layer(DefaultBodyLimit::max(NPM_DIST_TAG_BODY_MAX)),
+        )
         .route(
             "/{repo_key}/{scope}/{name}/-/{filename}",
             get(download_scoped),
         )
         .route(
+            "/{repo_key}/{scope}/{name}/{version_or_tag}",
+            get(version_scoped),
+        )
+        .route(
             "/{repo_key}/{scope}/{name}",
-            get(packument_scoped).put(publish_scoped),
+            get(packument_scoped_or_version_unscoped).put(publish_scoped),
         )
         .route("/{repo_key}/{name}/-/{filename}", get(download_unscoped))
         .route(
@@ -162,10 +205,55 @@ async fn packument_unscoped(
     dispatch_packument(&ctx, &repo_key, &pkg, &trust, actor).await
 }
 
-async fn packument_scoped(
+/// Dispatch for the 3-segment GET route `/{repo_key}/{seg1}/{seg2}`.
+///
+/// axum/matchit cannot register a second all-param 3-segment route, so
+/// this ONE registration covers two distinct request shapes,
+/// disambiguated on whether `seg1` starts with `@`:
+/// - `@scope` → the existing scoped-packument behavior, unchanged
+///   (composes `scope/name`, no normalisation);
+/// - anything else → the new unscoped abbreviated per-version / `latest`
+///   route: `seg1` is the package name (normalised exactly like
+///   [`packument_unscoped`]), `seg2` is the version string or `latest`.
+async fn packument_scoped_or_version_unscoped(
     State(ctx): State<Arc<AppContext>>,
     Extension(trust): Extension<RequestTrust>,
-    BoundedPath((repo_key, scope, name)): BoundedPath<(String, String, String)>,
+    BoundedPath((repo_key, seg1, seg2)): BoundedPath<(String, String, String)>,
+    // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
+    // slot; outer `Option` tolerates the no-auth-layer case. See
+    // `packument_unscoped`.
+    principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
+) -> Result<Response, ApiError> {
+    // `BoundedPath` enforces the route-parameter length cap on every
+    // captured segment before this handler body runs.
+    let actor = principal
+        .as_deref()
+        .and_then(|opt| opt.as_ref())
+        .map(AuthenticatedPrincipal::as_caller);
+    if seg1.starts_with('@') {
+        let full = format!("{seg1}/{seg2}");
+        dispatch_packument(&ctx, &repo_key, &full, &trust, actor).await
+    } else {
+        let pkg = NpmFormatHandler.normalize_name(&seg1);
+        serve::serve_npm_version_unified(&ctx, &repo_key, &pkg, &seg2, &trust, actor).await
+    }
+}
+
+/// `GET /{repo_key}/@{scope}/{name}/{version_or_tag}` — scoped
+/// abbreviated per-version / `latest` route. Mirrors the scoped
+/// packument's `@` guard and `scope/name` composition (no
+/// normalisation); resolution is delegated to
+/// [`serve::serve_npm_version_unified`], the same entry point the
+/// unscoped dispatch above uses.
+async fn version_scoped(
+    State(ctx): State<Arc<AppContext>>,
+    Extension(trust): Extension<RequestTrust>,
+    BoundedPath((repo_key, scope, name, version_or_tag)): BoundedPath<(
+        String,
+        String,
+        String,
+        String,
+    )>,
     // GET → `extract_optional_principal`'s `Option<AuthenticatedPrincipal>`
     // slot; outer `Option` tolerates the no-auth-layer case. See
     // `packument_unscoped`.
@@ -181,7 +269,7 @@ async fn packument_scoped(
         .as_deref()
         .and_then(|opt| opt.as_ref())
         .map(AuthenticatedPrincipal::as_caller);
-    dispatch_packument(&ctx, &repo_key, &full, &trust, actor).await
+    serve::serve_npm_version_unified(&ctx, &repo_key, &full, &version_or_tag, &trust, actor).await
 }
 
 /// Packument dispatch — both `Proxy` and `Hosted` / `Staging` /
@@ -452,7 +540,10 @@ async fn render_artifact_response(
 /// tampering / ingest-fail). The hosted/proxy member paths already enforce
 /// visibility + quarantine; the virtual layer only chooses the member.
 enum VirtualMemberDownload {
-    Found(hort_domain::entities::artifact::Artifact),
+    /// Boxed: the artifact aggregate is several hundred bytes while the
+    /// error arm is a pre-rendered response, and every `Ok` return would
+    /// otherwise carry the larger of the two by value.
+    Found(Box<hort_domain::entities::artifact::Artifact>),
     Rendered(Response),
 }
 
@@ -493,7 +584,7 @@ async fn serve_virtual_tarball(
 
     match resolved {
         Some(VirtualMemberDownload::Found(artifact)) => {
-            render_artifact_response(ctx, artifact, actor).await
+            render_artifact_response(ctx, *artifact, actor).await
         }
         Some(VirtualMemberDownload::Rendered(resp)) => Ok(resp),
         // No eligible member has the coordinate (or an owned name had the
@@ -560,7 +651,7 @@ async fn npm_member_coord_fetch(
         .find_visible_by_path(&member.key, artifact_path, actor)
         .await
     {
-        Ok((_repo, artifact)) => return Ok(Some(VirtualMemberDownload::Found(artifact))),
+        Ok((_repo, artifact)) => return Ok(Some(VirtualMemberDownload::Found(Box::new(artifact)))),
         // Local path miss: a proxy member tries the upstream pull below; a
         // hosted/staging member simply lacks the coordinate.
         Err(hort_app::error::AppError::Domain(hort_domain::error::DomainError::NotFound {
@@ -592,7 +683,7 @@ async fn npm_member_coord_fetch(
                 .artifact_use_case
                 .find_visible_by_path(&member.key, artifact_path, actor)
                 .await?;
-            Ok(Some(VirtualMemberDownload::Found(artifact)))
+            Ok(Some(VirtualMemberDownload::Found(Box::new(artifact))))
         }
         // A genuine upstream miss / no mapping / curation block means this
         // member cannot serve the coordinate → continue the walk (the
@@ -818,7 +909,7 @@ async fn do_publish(
                 content_type: "application/octet-stream".into(),
                 // Quarantine resolution is policy-driven; no
                 // caller-supplied override field.
-                actor,
+                actor: actor.clone(),
                 legacy_sha1: Some(sha1_hex),
                 legacy_md5: None, // npm does not publish an MD5
                 // Per-version packument block harvested above — the
@@ -843,6 +934,11 @@ async fn do_publish(
     // SHA-1 alongside the artifact id makes it trivial to confirm
     // the new path produced the same hash the prior buffered path
     // would have.
+    // Maintainer tags the client sent with the publish (`{"latest": "<v>"}`
+    // by default, or the `--tag` value). Written AFTER a successful ingest
+    // so a tag can never point at a version that failed to land.
+    capture_publish_dist_tags(ctx, &repo, pkg_name, &body_json, actor).await?;
+
     tracing::debug!(
         artifact_id = %artifact.id,
         tarball_size = decoded.tarball_size,
@@ -861,6 +957,249 @@ async fn do_publish(
         .to_string(),
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// dist-tags (maintainer-set, hosted-only)
+// ---------------------------------------------------------------------------
+
+/// Write the publish envelope's `dist-tags` object through
+/// [`RefUseCase::set`](hort_app::use_cases::ref_use_case::RefUseCase::set).
+///
+/// The npm CLI sends `{"latest": "<version>"}` on a plain `npm publish`
+/// and `{"<--tag value>": "<version>"}` otherwise. Every string-valued
+/// entry is written; `set` already collapses an unchanged tag to a no-op,
+/// so a republish of the same coordinates emits no `RefMoved`. A publish
+/// with no `dist-tags` writes nothing.
+///
+/// Entries are validated the same way the publish path validates its own
+/// version, and an entry failing validation is **skipped with a warn**
+/// rather than failing the publish: the artifact has already landed, and
+/// one unparseable tag must not turn a successful ingest into an error
+/// the client will retry. A genuine write failure DOES propagate — a
+/// publish that silently reports `ok: true` while `latest` never moved is
+/// the worse failure mode.
+async fn capture_publish_dist_tags(
+    ctx: &AppContext,
+    repo: &hort_domain::entities::repository::Repository,
+    pkg_name: &str,
+    body_json: &serde_json::Value,
+    actor: ApiActor,
+) -> Result<(), ApiError> {
+    // Hosted-only, matching the dist-tag routes: only a hosted repo has
+    // an authorable tag store, and only the hosted serve path reads one.
+    // (`reject_write_to_virtual` has already excluded `Virtual` upstream
+    // of this call; `Proxy` serves upstream's map, so a ref written here
+    // would be inert.)
+    if !matches!(
+        repo.repo_type,
+        hort_domain::entities::repository::RepositoryType::Hosted
+            | hort_domain::entities::repository::RepositoryType::Staging
+    ) {
+        return Ok(());
+    }
+    let Some(tags) = body_json.get("dist-tags").and_then(|v| v.as_object()) else {
+        return Ok(());
+    };
+    for (tag, value) in tags {
+        let Some(version) = value.as_str() else {
+            tracing::warn!(
+                repository = %repo.key,
+                package = %pkg_name,
+                "npm publish: dist-tag value is not a string; skipping",
+            );
+            continue;
+        };
+        if let Err(cause) = validate_dist_tag(tag, version) {
+            // Never echo the rejected input (client-supplied); the
+            // reason alone is enough to act on.
+            tracing::warn!(
+                repository = %repo.key,
+                package = %pkg_name,
+                %cause,
+                "npm publish: rejecting malformed dist-tag; skipping",
+            );
+            continue;
+        }
+        ctx.ref_use_case
+            .set(
+                repo.id,
+                pkg_name,
+                tag,
+                hort_domain::entities::mutable_ref::RefTarget::Version(version.to_string()),
+                actor.clone(),
+                Some(&repo.key),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Validate a maintainer-set dist-tag pair.
+///
+/// The tag name must be a usable single path segment: non-empty, within
+/// npm's package-name byte cap (the same order of magnitude bound; a tag
+/// is never longer than a name in practice), and free of `/`, control
+/// bytes, and non-ASCII — anything else cannot round-trip through the
+/// `/-/package/{pkg}/dist-tags/{tag}` route it is served from. The target
+/// must be a well-formed npm version, so a tag can never name something
+/// that is not a version coordinate.
+fn validate_dist_tag(tag: &str, version: &str) -> Result<(), String> {
+    if tag.is_empty() {
+        return Err("npm.dist-tag: empty tag name is not permitted".into());
+    }
+    if tag.len() > NPM_DIST_TAG_MAX {
+        return Err(format!("npm.dist-tag: exceeds {NPM_DIST_TAG_MAX}-byte cap"));
+    }
+    if !tag
+        .bytes()
+        .all(|b| b.is_ascii_graphic() && b != b'/' && b != b'@')
+    {
+        return Err("npm.dist-tag: tag must be printable ASCII without `/` or `@`".into());
+    }
+    hort_formats::npm::validate_npm_version(version).map_err(|e| e.to_string())
+}
+
+/// Byte cap on a dist-tag name. Matches npm's package-name cap — a tag is
+/// an operator-visible label on the same order, and the bound exists so a
+/// pathological name cannot bloat the refs projection or the route.
+const NPM_DIST_TAG_MAX: usize = 214;
+
+/// Byte cap on a dist-tag write body — a JSON string holding one npm
+/// version, so a kilobyte is already generous.
+const NPM_DIST_TAG_BODY_MAX: usize = 1024;
+
+/// `PUT /{repo_key}/-/package/{pkg}/dist-tags/{tag}` — the npm CLI's
+/// `npm dist-tag add <pkg>@<version> <tag>`. Body is a JSON string
+/// holding the target version.
+///
+/// `{pkg}` arrives URL-encoded for scoped names (`@scope%2fname`); axum's
+/// path extractor percent-decodes it, so the handler sees the same
+/// `@scope/name` form the packument routes compose by hand.
+async fn dist_tag_put(
+    State(ctx): State<Arc<AppContext>>,
+    BoundedPath((repo_key, pkg, tag)): BoundedPath<(String, String, String)>,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let pkg = NpmFormatHandler.normalize_name(&pkg);
+    hort_formats::npm::validate_npm_name(&pkg)?;
+    // The npm CLI sends a bare JSON string; tolerate a raw (unquoted)
+    // version too — some clients and every `curl` example send that.
+    let version: String = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(serde_json::Value::String(v)) => v,
+        _ => String::from_utf8_lossy(&body)
+            .trim()
+            .trim_matches('"')
+            .to_string(),
+    };
+    validate_dist_tag(&tag, &version).map_err(|c| validation_error(&c))?;
+
+    let (repo, actor) = match resolve_dist_tag_write(&ctx, &repo_key, principal).await {
+        Ok(v) => v,
+        Err(response) => return Ok(*response),
+    };
+    ctx.ref_use_case
+        .set(
+            repo.id,
+            &pkg,
+            &tag,
+            hort_domain::entities::mutable_ref::RefTarget::Version(version),
+            actor,
+            Some(&repo.key),
+        )
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "ok": true }).to_string(),
+    )
+        .into_response())
+}
+
+/// `DELETE /{repo_key}/-/package/{pkg}/dist-tags/{tag}` — the npm CLI's
+/// `npm dist-tag rm <pkg> <tag>`. Retires the ref; a tag that does not
+/// exist surfaces the standard `MutableRef NotFound` 404.
+async fn dist_tag_delete(
+    State(ctx): State<Arc<AppContext>>,
+    BoundedPath((repo_key, pkg, tag)): BoundedPath<(String, String, String)>,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
+) -> Result<Response, ApiError> {
+    let pkg = NpmFormatHandler.normalize_name(&pkg);
+    hort_formats::npm::validate_npm_name(&pkg)?;
+
+    let (repo, actor) = match resolve_dist_tag_write(&ctx, &repo_key, principal).await {
+        Ok(v) => v,
+        Err(response) => return Ok(*response),
+    };
+    ctx.ref_use_case
+        .retire(repo.id, &pkg, &tag, actor, Some(&repo.key))
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        serde_json::json!({ "ok": true }).to_string(),
+    )
+        .into_response())
+}
+
+/// Shared resolve + authz gate for the two dist-tag write routes.
+///
+/// Identical to the publish path's gate — `Read` first for
+/// anti-enumeration (a caller who cannot see the repo gets the same 404
+/// as for a missing one), then the Write permission check, whose deny
+/// envelope stays `{"error":"insufficient permissions"}` verbatim.
+///
+/// Repo type: maintainer tags are hosted-only. A proxy's tags belong to
+/// its upstream and a virtual's belong to its members, so neither has an
+/// authorable tag store — the write is rejected with the crate's
+/// validation error (400), the same class `reject_write_to_virtual`
+/// already produces for a publish. 405 was the alternative; a validation
+/// error is chosen because the method IS allowed on this route, it is the
+/// *repository* that has no tag store to write, and it keeps one error
+/// shape for "wrong repo type for this write" across publish and tags.
+/// Ordered after the authz gate so a caller without Write never learns
+/// the repo's type.
+///
+/// The `Err` arm is a pre-rendered `Response` because the Write-deny path
+/// is: [`resolve_actor_user_id`] hands back a shaped response whose body
+/// must reach the client byte-for-byte, and `ApiError` (a newtype over
+/// `AppError`) has no arm that can carry one.
+async fn resolve_dist_tag_write(
+    ctx: &Arc<AppContext>,
+    repo_key: &str,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
+) -> Result<(hort_domain::entities::repository::Repository, ApiActor), Box<Response>> {
+    use hort_domain::entities::repository::RepositoryType;
+
+    let caller = principal.as_deref().map(AuthenticatedPrincipal::as_caller);
+    let repo = ctx
+        .repository_access_use_case
+        .resolve(repo_key, caller, AccessLevel::Read)
+        .await
+        .map_err(|e| Box::new(ApiError::from(e).into_response()))?;
+    let actor_user_id = resolve_actor_user_id(ctx, principal, repo.id)?;
+    match repo.repo_type {
+        RepositoryType::Hosted | RepositoryType::Staging => {}
+        RepositoryType::Proxy | RepositoryType::Virtual => {
+            return Err(Box::new(
+                validation_error(
+                    "dist-tags are maintainer-set and can only be written on a hosted \
+                     repository; a proxy serves its upstream's tags and a virtual serves \
+                     its members'",
+                )
+                .into_response(),
+            ));
+        }
+    }
+    Ok((
+        repo,
+        ApiActor {
+            user_id: actor_user_id,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +1236,25 @@ fn validation_error(msg: &str) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+
+    /// Tripwire: the crate-level `UPSTREAM_PROXY_FORMAT` decides which
+    /// per-format upstream-proxy instance every on-miss fetch from this
+    /// crate goes through, and therefore the `format` label on
+    /// `hort_upstream_fetch_*` and `hort_upstream_insecure_total`. The
+    /// mock context maps every served format to one proxy, so a wrong
+    /// constant here is invisible to the handler tests — this assertion
+    /// is what catches it.
+    #[test]
+    fn upstream_proxy_format_is_this_crates_served_format() {
+        assert_eq!(UPSTREAM_PROXY_FORMAT, RepositoryFormat::Npm);
+        assert_eq!(UPSTREAM_PROXY_FORMAT.to_string(), "npm");
+        assert!(
+            hort_domain::ports::upstream_proxy::READ_PATH_PROXY_FORMATS
+                .contains(&UPSTREAM_PROXY_FORMAT),
+            "composition only builds instances for READ_PATH_PROXY_FORMATS"
+        );
+    }
+
     use std::sync::Arc;
 
     use axum::body::{to_bytes, Body};
@@ -914,6 +1272,8 @@ mod tests {
     use hort_domain::entities::repository::Repository;
     use hort_domain::ports::artifact_repository::ArtifactRepository;
     use hort_domain::ports::repository_repository::RepositoryRepository;
+
+    use hort_domain::entities::mutable_ref::RefTarget;
 
     use super::*;
     use hort_http_core::context::AppContext;
@@ -934,6 +1294,11 @@ mod tests {
         /// `publish_curation_block_returns_403` test to install a
         /// blocking rule against the inbound repo.
         curation_rules: Arc<hort_app::use_cases::test_support::MockCurationRuleRepository>,
+        /// Mutable-ref seed/inspection handles — the dist-tag store.
+        /// `refs` seeds existing tags; `ref_lifecycle` records the
+        /// `RefMoved` / `RefRetired` batches a write produced.
+        refs: Arc<hort_app::use_cases::test_support::MockRefRegistryPort>,
+        ref_lifecycle: Arc<hort_app::use_cases::test_support::MockRefLifecyclePort>,
     }
 
     fn harness() -> TestHarness {
@@ -954,6 +1319,8 @@ mod tests {
             storage: mocks.storage,
             lifecycle: mocks.lifecycle,
             curation_rules: mocks.curation_rules,
+            refs: mocks.refs,
+            ref_lifecycle: mocks.ref_lifecycle,
         }
     }
 
@@ -1050,6 +1417,404 @@ mod tests {
             },
         });
         serde_json::to_vec(&body).unwrap()
+    }
+
+    // -- dist-tags (maintainer-set, hosted-only) -------------------------
+    //
+    // Two write surfaces reach the same `RefUseCase`: the publish
+    // envelope's `dist-tags` object, and the `npm dist-tag add`/`rm`
+    // routes. Both are hosted-only; the served side is covered in
+    // `serve::tests`.
+
+    /// `build_publish_body` plus a `dist-tags` object — the shape a real
+    /// `npm publish` sends (`{"latest": "<v>"}`, or `--tag`'s value).
+    fn build_publish_body_with_tags(
+        pkg_name: &str,
+        version: &str,
+        tarball_bytes: &[u8],
+        dist_tags: serde_json::Value,
+    ) -> Vec<u8> {
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&build_publish_body(pkg_name, version, tarball_bytes)).unwrap();
+        body["dist-tags"] = dist_tags;
+        serde_json::to_vec(&body).unwrap()
+    }
+
+    /// Every `(ref_name, target)` pair the ref lifecycle recorded a move
+    /// for, in call order.
+    fn recorded_tag_moves(h: &TestHarness) -> Vec<(String, RefTarget)> {
+        h.ref_lifecycle
+            .recorded_moves()
+            .into_iter()
+            .map(|(r, _batch)| (r.ref_name, r.target))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn publish_captures_dist_tags_as_ref_moves() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let body = build_publish_body_with_tags(
+            "express",
+            "1.0.0",
+            b"tarball-bytes",
+            serde_json::json!({ "latest": "1.0.0" }),
+        );
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        assert_eq!(
+            recorded_tag_moves(&h),
+            vec![("latest".to_string(), RefTarget::Version("1.0.0".into()))],
+            "the publish envelope's dist-tags must land as a RefMoved"
+        );
+        // And the event on the batch is the domain event, not just a row.
+        let (_r, batch) = h.ref_lifecycle.recorded_moves().remove(0);
+        match &batch.events[0].event {
+            hort_domain::events::DomainEvent::RefMoved(m) => {
+                assert_eq!(m.ref_name, "latest");
+                assert!(m.from.is_none(), "first placement has no prior target");
+                assert_eq!(m.to, RefTarget::Version("1.0.0".into()));
+                assert_eq!(m.namespace, "express");
+            }
+            other => panic!("expected RefMoved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_captures_a_custom_tag_from_npm_publish_tag() {
+        // `npm publish --tag next` sends `{"next": "<v>"}` and no `latest`.
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let body = build_publish_body_with_tags(
+            "express",
+            "2.0.0-rc.1",
+            b"tarball-bytes",
+            serde_json::json!({ "next": "2.0.0-rc.1" }),
+        );
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            recorded_tag_moves(&h),
+            vec![("next".to_string(), RefTarget::Version("2.0.0-rc.1".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_without_dist_tags_writes_no_ref() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let body = build_publish_body("express", "1.0.0", b"tarball-bytes");
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(recorded_tag_moves(&h).is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_skips_a_malformed_dist_tag_without_failing_the_publish() {
+        // The artifact has already landed by the time tags are written;
+        // one unparseable entry must not turn a successful ingest into an
+        // error the client will retry. The well-formed sibling still lands.
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let body = build_publish_body_with_tags(
+            "express",
+            "1.0.0",
+            b"tarball-bytes",
+            serde_json::json!({
+                "latest": "1.0.0",
+                "numeric": 7,                 // not a string
+                "bad-version": "not a semver", // fails validate_npm_version
+                "with/slash": "1.0.0",         // cannot round-trip the route
+            }),
+        );
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/express")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            recorded_tag_moves(&h),
+            vec![("latest".to_string(), RefTarget::Version("1.0.0".into()))],
+            "only the well-formed entry is written"
+        );
+    }
+
+    #[tokio::test]
+    async fn dist_tag_add_route_moves_the_tag() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "express",
+            "1.0.0",
+            "express-1.0.0.tgz",
+            b"bytes",
+            None,
+            QuarantineStatus::Released,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/-/package/express/dist-tags/next")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#""1.0.0""#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            recorded_tag_moves(&h),
+            vec![("next".to_string(), RefTarget::Version("1.0.0".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn dist_tag_add_route_accepts_a_url_encoded_scoped_name() {
+        // `npm dist-tag add @types/node@20.0.0 next` sends
+        // `@types%2fnode`; the decoded namespace must be the same
+        // `@scope/name` form the packument routes compose.
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/-/package/@types%2Fnode/dist-tags/next")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#""20.0.0""#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let moves = h.ref_lifecycle.recorded_moves();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].0.namespace, "@types/node");
+        assert_eq!(moves[0].0.ref_name, "next");
+    }
+
+    #[tokio::test]
+    async fn dist_tag_rm_route_retires_the_tag() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        h.refs
+            .insert(hort_domain::entities::mutable_ref::MutableRef {
+                id: Uuid::new_v4(),
+                repository_id: repo.id,
+                namespace: "express".into(),
+                ref_name: "next".into(),
+                target: RefTarget::Version("2.0.0-rc.1".into()),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::delete("/npm/npm-test/-/package/express/dist-tags/next")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let retires = h.ref_lifecycle.recorded_retires();
+        assert_eq!(retires.len(), 1);
+        assert_eq!(retires[0].1, "express");
+        assert_eq!(retires[0].2, "next");
+        match &retires[0].3.events[0].event {
+            hort_domain::events::DomainEvent::RefRetired(r) => {
+                assert_eq!(r.last_target, RefTarget::Version("2.0.0-rc.1".into()));
+            }
+            other => panic!("expected RefRetired, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dist_tag_rm_of_an_unknown_tag_is_404() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::delete("/npm/npm-test/-/package/express/dist-tags/ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(h.ref_lifecycle.recorded_retires().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dist_tag_write_rejects_a_malformed_target_version() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/-/package/express/dist-tags/next")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#""not a semver""#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(recorded_tag_moves(&h).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dist_tag_add_route_accepts_an_unquoted_version_body() {
+        // The npm CLI sends a bare JSON string; `curl` examples and some
+        // clients send the raw version with no quotes. Both must work.
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/-/package/express/dist-tags/next")
+                    .body(Body::from("1.0.0"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            recorded_tag_moves(&h),
+            vec![("next".to_string(), RefTarget::Version("1.0.0".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn dist_tag_write_body_is_capped_far_below_the_publish_limit() {
+        // The router-wide publish limit is sized for a base64 tarball; a
+        // dist-tag body is one version string and must not be able to
+        // make the server buffer more than that.
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let oversize = format!("\"{}\"", "1".repeat(NPM_DIST_TAG_BODY_MAX));
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-test/-/package/express/dist-tags/next")
+                    .header("content-type", "application/json")
+                    .body(Body::from(oversize))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(recorded_tag_moves(&h).is_empty());
+    }
+
+    #[test]
+    fn validate_dist_tag_accepts_ordinary_tags_and_rejects_unusable_ones() {
+        assert!(validate_dist_tag("latest", "1.0.0").is_ok());
+        assert!(validate_dist_tag("next", "2.0.0-rc.1").is_ok());
+        // Empty, oversize, and non-round-trippable tag names.
+        assert!(validate_dist_tag("", "1.0.0").is_err());
+        assert!(validate_dist_tag(&"a".repeat(NPM_DIST_TAG_MAX + 1), "1.0.0").is_err());
+        assert!(validate_dist_tag("with/slash", "1.0.0").is_err());
+        assert!(validate_dist_tag("with@at", "1.0.0").is_err());
+        assert!(validate_dist_tag("with space", "1.0.0").is_err());
+        assert!(validate_dist_tag("caf\u{e9}", "1.0.0").is_err());
+        // A tag may only name a well-formed version coordinate.
+        assert!(validate_dist_tag("latest", "not a semver").is_err());
+        assert!(validate_dist_tag("latest", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn dist_tag_write_is_rejected_on_a_proxy_repo() {
+        // A proxy serves its upstream's tags; there is no local tag store
+        // to author into.
+        let h = harness();
+        let mut repo = sample_repository();
+        repo.key = "npm-mirror".into();
+        repo.format = RepositoryFormat::Npm;
+        repo.repo_type = hort_domain::entities::repository::RepositoryType::Proxy;
+        h.repositories.insert(repo);
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::put("/npm/npm-mirror/-/package/express/dist-tags/next")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#""1.0.0""#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(recorded_tag_moves(&h).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dist_tag_write_is_rejected_on_a_virtual_repo() {
+        let h = harness();
+        let mut repo = sample_repository();
+        repo.key = "npm-virt".into();
+        repo.format = RepositoryFormat::Npm;
+        repo.repo_type = hort_domain::entities::repository::RepositoryType::Virtual;
+        h.repositories.insert(repo);
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::delete("/npm/npm-virt/-/package/express/dist-tags/next")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(h.ref_lifecycle.recorded_retires().is_empty());
     }
 
     // -- publish --------------------------------------------------------------
@@ -2089,6 +2854,274 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
+    // -----------------------------------------------------------------
+    // Abbreviated per-version / dist-tag route.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn version_route_unscoped_exact_version_returns_correct_body_shape() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "express",
+            "1.0.0",
+            "express-1.0.0.tgz",
+            b"content",
+            Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+            QuarantineStatus::None,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/express/1.0.0")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers().get(CONTENT_TYPE).unwrap(), "application/json");
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"].as_str().unwrap(), "express");
+        assert_eq!(json["version"].as_str().unwrap(), "1.0.0");
+        assert_eq!(
+            json["dist"]["tarball"].as_str().unwrap(),
+            "https://registry.example.com/npm/npm-test/express/-/express-1.0.0.tgz"
+        );
+        assert_eq!(
+            json["dist"]["shasum"].as_str().unwrap(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
+        );
+        assert!(
+            json["dist"].get("integrity").is_none(),
+            "absent integrity must be omitted, not null"
+        );
+        assert!(
+            json.get("versions").is_none(),
+            "the abbreviated per-version body is not a packument"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_route_unscoped_latest_resolves_newest_served_release() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            b"a",
+            Some("aaa"),
+            QuarantineStatus::Released,
+        );
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "2.0.0",
+            "pkg-2.0.0.tgz",
+            b"b",
+            Some("bbb"),
+            QuarantineStatus::Released,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/pkg/latest")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"].as_str().unwrap(), "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn version_route_scoped_exact_and_latest() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "@types/node",
+            "20.0.0",
+            "node-20.0.0.tgz",
+            b"x",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            QuarantineStatus::None,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get("/npm/npm-test/@types/node/20.0.0")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"].as_str().unwrap(), "@types/node");
+        assert_eq!(
+            json["dist"]["tarball"].as_str().unwrap(),
+            "https://registry.example.com/npm/npm-test/@types/node/-/node-20.0.0.tgz"
+        );
+
+        let res2 = router
+            .oneshot(
+                Request::get("/npm/npm-test/@types/node/latest")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let body2 = to_bytes(res2.into_body(), 64 * 1024).await.unwrap();
+        let json2: serde_json::Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(json2["version"].as_str().unwrap(), "20.0.0");
+    }
+
+    #[tokio::test]
+    async fn version_route_unknown_version_returns_404_standard_envelope() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            b"a",
+            Some("aaa"),
+            QuarantineStatus::Released,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/pkg/9.9.9")
+                    .header("host", "registry.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The misleading 3-segment non-`@` 400 is gone: that URL shape IS the
+    /// unscoped per-version route now. An unknown package/version still
+    /// 404s (anti-enumeration), never 400.
+    #[tokio::test]
+    async fn three_segment_non_at_shape_no_longer_400s() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/pkg/1.2.3")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The 4-segment scoped shape keeps the `@` guard: a non-`@` second
+    /// segment is a validation error, not a (mis-shaped) version lookup.
+    #[tokio::test]
+    async fn version_route_scoped_shape_requires_at_prefix() {
+        let h = harness();
+        insert_repo(&h, "npm-test");
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .oneshot(
+                Request::get("/npm/npm-test/notscope/pkg/1.0.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Router-precedence pin: the literal `-` third segment of the
+    /// unscoped tarball route must keep matching over the new dynamic
+    /// 4-segment scoped-version route (`/{repo}/{scope}/{name}/{version}`)
+    /// registered at the same segment count. The 5-segment scoped tarball
+    /// route is untouched by either new route.
+    #[tokio::test]
+    async fn tarball_routes_keep_precedence_over_new_version_routes() {
+        let h = harness();
+        let repo = insert_repo(&h, "npm-test");
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            b"unscoped-tarball-bytes",
+            Some("aaa"),
+            QuarantineStatus::None,
+        );
+        insert_tarball_artifact(
+            &h,
+            repo.id,
+            "@scope/pkg",
+            "1.0.0",
+            "pkg-1.0.0.tgz",
+            b"scoped-tarball-bytes",
+            Some("bbb"),
+            QuarantineStatus::None,
+        );
+        let router = router(h.ctx.clone());
+
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get("/npm/npm-test/pkg/-/pkg-1.0.0.tgz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(&body[..], b"unscoped-tarball-bytes");
+
+        let res2 = router
+            .oneshot(
+                Request::get("/npm/npm-test/@scope/pkg/-/pkg-1.0.0.tgz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res2.status(), StatusCode::OK);
+        let body2 = to_bytes(res2.into_body(), 64 * 1024).await.unwrap();
+        assert_eq!(&body2[..], b"scoped-tarball-bytes");
+    }
+
     /// Normalisation-drift regression. Ingest an artifact whose stored
     /// `name = "legacy-name"` differs from the current
     /// `NpmFormatHandler::normalize_name(raw)`. Request the packument using
@@ -2551,6 +3584,8 @@ mod tests {
                 storage: h.storage,
                 lifecycle: h.lifecycle,
                 curation_rules: h.curation_rules,
+                refs: h.refs,
+                ref_lifecycle: h.ref_lifecycle,
             }
         }
 
@@ -2793,6 +3828,8 @@ mod tests {
                 storage: base.storage,
                 lifecycle: base.lifecycle,
                 curation_rules: base.curation_rules,
+                refs: base.refs,
+                ref_lifecycle: base.ref_lifecycle,
             };
 
             let repo = insert_private_repo(&h, "private-npm");
@@ -3040,6 +4077,70 @@ mod tests {
             )
             .expect("deny counter absent");
             assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+        }
+
+        // -- dist-tags ------------------------------------------------------
+
+        #[test]
+        fn dist_tag_add_denied_principal_returns_403() {
+            // A dist-tag write moves what `npm install <pkg>` resolves to,
+            // so it carries the same Write requirement as a publish and the
+            // same deny envelope.
+            let (snap, (status, body)) = capture(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let h = harness();
+                        insert_repo(&h, "npm-test");
+                        let ctx = enabled_ctx(&h.ctx);
+                        put_with_principal(
+                            ctx,
+                            "/npm/npm-test/-/package/express/dist-tags/next",
+                            br#""1.0.0""#.to_vec(),
+                            Some(principal_with_claims(&[])),
+                        )
+                        .await
+                    })
+            });
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            let body_str = String::from_utf8(body).unwrap();
+            assert!(
+                body_str.contains(r#""error":"insufficient permissions""#),
+                "unexpected body: {body_str}"
+            );
+            let entries = snap.into_vec();
+            let v = find_counter(
+                &entries,
+                "hort_authz_decisions_total",
+                &[("result", "deny"), ("permission", "write")],
+            )
+            .expect("deny counter absent");
+            assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+        }
+
+        #[test]
+        fn dist_tag_add_authorized_principal_proceeds_to_success_path() {
+            let (_snap, (status, _)) = capture(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let h = harness();
+                        insert_repo(&h, "npm-test");
+                        let ctx = enabled_ctx(&h.ctx);
+                        put_with_principal(
+                            ctx,
+                            "/npm/npm-test/-/package/express/dist-tags/next",
+                            br#""1.0.0""#.to_vec(),
+                            Some(principal_with_claims(&["developer"])),
+                        )
+                        .await
+                    })
+            });
+            assert_eq!(status, StatusCode::OK);
         }
 
         // -- publish_scoped -------------------------------------------------

@@ -14,6 +14,7 @@ use hort_domain::types::sbom::SbomComponent;
 
 use crate::artifact_metadata_repo::PgArtifactMetadataRepository;
 use crate::artifact_repo::PgArtifactRepository;
+use crate::contention::{contention_backoff, with_contention_retry, CONTENTION_RETRY_ATTEMPTS};
 use crate::event_store::PgEventStore;
 use crate::jobs_repository::{enqueue_provenance_verify_in_tx, enqueue_scan_in_tx};
 use crate::repo_security_score_repository::apply_delta_in_tx;
@@ -191,6 +192,29 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
     /// The scan enqueue is idempotent (`enqueue_scan_in_tx` swallows the
     /// `jobs_scan_unique` conflict); any other insert failure aborts the whole
     /// transition (the ingest fails and is retriable), never a partial commit.
+    ///
+    /// ## Contention retry
+    ///
+    /// The transaction is re-run, bounded, when Postgres aborts it for
+    /// concurrency (`DomainError::Contended` — see `crate::contention`).
+    /// Concurrent ingests into one repository routinely touch the same rows:
+    /// a multi-architecture OCI push writes several manifests at once, and
+    /// their `artifacts` upserts and `jobs` inserts land in overlapping
+    /// transactions. An abort there is not a failed ingest, it is a
+    /// rescheduled one — the rollback is total, so a re-run writes exactly
+    /// what this attempt would have.
+    ///
+    /// Re-running is sound because every input is rebuilt identically and
+    /// nothing here derives from state the previous attempt observed: the
+    /// events carry caller-minted `event_id`s, and the batch's
+    /// `expected_version` still describes the stream, because the aborted
+    /// attempt left no event behind to advance it.
+    ///
+    /// The retry stays off `Conflict`. A `Conflict` from `append_in_tx` means
+    /// another appender genuinely took this stream position; re-running the
+    /// same batch against the same expected version reproduces it exactly,
+    /// and resolving it needs the caller to re-derive its events, not this
+    /// layer to try harder.
     fn commit_transition_with_enqueues<'a>(
         &'a self,
         artifact: &'a Artifact,
@@ -201,49 +225,67 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
         let artifact = artifact.clone();
         let enqueues = enqueues.to_vec();
         Box::pin(async move {
-            let mut uow = self.event_store.begin_unit_of_work().await?;
+            with_contention_retry(
+                "ingest transition",
+                CONTENTION_RETRY_ATTEMPTS,
+                contention_backoff,
+                || {
+                    // Cloned per attempt: the batch is consumed by
+                    // `append_in_tx`, and a retry must present the identical
+                    // one (same event ids, same expected version) for the
+                    // re-run to be the same write.
+                    let events = events.clone();
+                    let artifact = &artifact;
+                    let metadata = &metadata;
+                    let enqueues = &enqueues;
+                    async move {
+                        let mut uow = self.event_store.begin_unit_of_work().await?;
 
-            let result = self.event_store.append_in_tx(&mut uow, events).await?;
-            self.artifact_repo.save_in_tx(&mut uow, &artifact).await?;
-            if let Some(m) = &metadata {
-                self.metadata_repo.upsert_in_tx(&mut uow, m).await?;
-            }
+                        let result = self.event_store.append_in_tx(&mut uow, events).await?;
+                        self.artifact_repo.save_in_tx(&mut uow, artifact).await?;
+                        if let Some(m) = metadata {
+                            self.metadata_repo.upsert_in_tx(&mut uow, m).await?;
+                        }
 
-            for enq in &enqueues {
-                match enq {
-                    IngestEnqueue::Scan {
-                        format,
-                        priority,
-                        trigger_source,
-                    } => {
-                        enqueue_scan_in_tx(
-                            uow.conn(),
-                            artifact.id,
-                            artifact.repository_id,
-                            &artifact.sha256_checksum,
-                            format,
-                            *priority,
-                            trigger_source,
-                        )
-                        .await?;
+                        for enq in enqueues {
+                            match enq {
+                                IngestEnqueue::Scan {
+                                    format,
+                                    priority,
+                                    trigger_source,
+                                } => {
+                                    enqueue_scan_in_tx(
+                                        uow.conn(),
+                                        artifact.id,
+                                        artifact.repository_id,
+                                        &artifact.sha256_checksum,
+                                        format,
+                                        *priority,
+                                        trigger_source,
+                                    )
+                                    .await?;
+                                }
+                                IngestEnqueue::ProvenanceVerify {
+                                    priority,
+                                    trigger_source,
+                                } => {
+                                    enqueue_provenance_verify_in_tx(
+                                        uow.conn(),
+                                        artifact.id,
+                                        *priority,
+                                        trigger_source,
+                                    )
+                                    .await?;
+                                }
+                            }
+                        }
+
+                        uow.commit().await?;
+                        Ok(result)
                     }
-                    IngestEnqueue::ProvenanceVerify {
-                        priority,
-                        trigger_source,
-                    } => {
-                        enqueue_provenance_verify_in_tx(
-                            uow.conn(),
-                            artifact.id,
-                            *priority,
-                            trigger_source,
-                        )
-                        .await?;
-                    }
-                }
-            }
-
-            uow.commit().await?;
-            Ok(result)
+                },
+            )
+            .await
         })
     }
 

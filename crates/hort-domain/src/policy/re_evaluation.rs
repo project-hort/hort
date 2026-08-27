@@ -246,9 +246,9 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
-            is_deleted: false,
             created_at: ts(0),
             updated_at: ts(0),
         }
@@ -644,6 +644,7 @@ mod tests {
             references: vec![],
             aliases: vec![],
             informational_class: None,
+            severity_basis: crate::types::SeverityBasis::Assessed,
         }
     }
 

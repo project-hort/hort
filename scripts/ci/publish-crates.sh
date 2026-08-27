@@ -11,6 +11,19 @@
 #                                     check script for why it is wanted)
 #   HORT_PUBLISH_PROPAGATION_SLEEP    seconds to wait after each upload
 #                                     (default 10)
+#   HORT_TOKEN_REFRESH_CMD            optional: a command that prints a
+#                                     FRESH raw bearer to stdout. When set,
+#                                     it runs before EVERY publish attempt
+#                                     and the result replaces HORT_TOKEN
+#                                     and the CARGO_REGISTRIES_*_TOKEN
+#                                     vars cargo reads. The federated
+#                                     exchange mints non-refreshable
+#                                     bearers capped at ≤1h by design, and
+#                                     a full topological publish can
+#                                     outlive one — so a long loop
+#                                     re-mints per crate instead of
+#                                     holding a single token. Unset: the
+#                                     ambient token is used unchanged.
 #
 # Exits 0 when every crate in the publish set is present in the registry at
 # the workspace version — whether this run uploaded it or found it already
@@ -58,8 +71,33 @@ hort_url="$1"
 repo_key="$2"
 propagation_sleep="${HORT_PUBLISH_PROPAGATION_SLEEP:-10}"
 
+# Re-mint the bearer for the next publish attempt. cargo sends the registry
+# token verbatim, so it is wrapped as HTTP Basic with a dummy username —
+# the exact shape the hort-auth action writes (`Basic base64("x:" + raw)`);
+# both registries share the one session token (per-repo RBAC decides).
+# The repo-key var name follows cargo's env transform (uppercase, `-`→`_`).
+refresh_token() {
+  [[ -n "${HORT_TOKEN_REFRESH_CMD:-}" ]] || return 0
+  local fresh b64 key_var
+  fresh="$(bash -c "${HORT_TOKEN_REFRESH_CMD}")"
+  if [[ -z "${fresh}" ]]; then
+    echo "error: HORT_TOKEN_REFRESH_CMD produced an empty token" >&2
+    return 1
+  fi
+  b64="$(printf 'x:%s' "${fresh}" | base64 -w0)"
+  if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+    echo "::add-mask::${fresh}"
+    echo "::add-mask::${b64}"
+  fi
+  export HORT_TOKEN="${fresh}"
+  key_var="CARGO_REGISTRIES_$(printf '%s' "${repo_key}" | tr '[:lower:]-' '[:upper:]_')_TOKEN"
+  export "${key_var}=Basic ${b64}"
+  export CARGO_REGISTRIES_HORT_TOKEN="Basic ${b64}"
+}
+
 publish_crate() {
   local crate_path="$1"
+  refresh_token
   echo "Publishing ${crate_path} ..."
   cargo publish \
     --no-verify \

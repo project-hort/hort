@@ -935,6 +935,26 @@ worker:
     # whose pods die mid-scan have their claim expire after this window;
     # another worker re-claims the row.
     lockDurationSecs: 900
+    findingMerge:
+      # HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE — default true.
+      #
+      # When two scan backends report the SAME advisory for the same
+      # component, one may have read a real severity while the other
+      # could not read one at all and fell back to the unconditional
+      # `Critical` floor. With this true (the default), the reading that
+      # actually assessed the advisory wins — across severity tiers, so a
+      # scored Medium supersedes the other backend's unreadable Critical.
+      # Without it, the floor won on tier alone and correctly-scored
+      # advisories stayed terminally rejected on a verdict no backend had
+      # reached. See ADR 0059.
+      #
+      # Set false as a break-glass switch: the merge reverts to strict
+      # always-fail-closed and the Critical floor wins again. That makes
+      # the release gate STRICTER, not looser — this is an escape hatch
+      # for an operator who does not want one backend's lower reading to
+      # be able to supersede another's unknown-defaulted Critical, at the
+      # cost of the false rejections the default prevents.
+      allowInformedDowngrade: true
     trivy:
       # HORT_SCANNER_TRIVY_ENABLED — load-bearing. When false, the worker
       # does NOT register the Trivy backend, even
@@ -1834,13 +1854,50 @@ scheduledTasks:
   # so a verifier that was enabled and then stopped is alarmable. Keep this
   # schedule consistent with the expected-interval knob.
   #
-  # DEFAULT-DISABLED like its siblings. On a filesystem storage
-  # backend (no object store) the anchor cross-check resolves to
-  # `missing_checkpoint` (exit 3); enable `eventstoreCheckpoint` + an S3
-  # anchor bucket for full external-anchor attestation.
+  # DEFAULT-ENABLED — a deliberate divergence from the default-disabled
+  # admin-task convention, and the second template in this chart to take
+  # it (after `replaySeenPrune`). Tamper detection an operator has to
+  # opt into is tamper detection most deployments never get: an install
+  # that does nothing had no integrity verification at all. The
+  # verification is a read-only recompute over the `events` table on the
+  # runtime DML DSN — it writes nothing and cannot itself damage
+  # anything.
+  #
+  # UPGRADE NOTE: an existing install that never set this key GAINS this
+  # CronJob on upgrade. It runs daily at 02:00 by default. Set
+  # `enabled: false` to opt out.
+  #
+  # A deployment with no checkpoint anchor stays GREEN. The verifier
+  # derives whether an anchor is expected from the same predicate the
+  # checkpoint writer uses — S3 storage AND a provisioned anchor public
+  # key — so a filesystem install (which can never have an S3 Object-Lock
+  # WORM anchor) verifies its chain, expects no anchor, and exits 0. An
+  # unanchored deployment is a supported posture, not a degraded one. A
+  # real chain break still fails, everywhere.
   verifyEventChain:
     executionPath: admin-task
-    enabled: false
+    enabled: true
+    # Whether a missing/stale/gapped anchoring checkpoint fails the run
+    # (exit 3). TRI-STATE.
+    #
+    # `null` (the default) DERIVES the decision from whether this
+    # deployment has anchoring configured: anchored ⇒ fail (a missing
+    # checkpoint means the emitter is broken and the run SHOULD go red);
+    # unanchored ⇒ do not fail (no anchor was ever expected). That
+    # derivation is why this CronJob is safe to default-enable, and it is
+    # what most installs want — leave it unset.
+    #
+    # An explicit `true`/`false` FORCES the decision instead: `true` lets
+    # a compliance-critical install demand a checkpoint regardless of
+    # configuration, `false` silences the exit code on an anchored
+    # install whose emitter is known-broken. Forcing moves only the exit
+    # code — the `hort_event_chain_verify_total{result}` counter keeps
+    # reporting the configuration-derived fact, so a forced `false` does
+    # not hide a real coverage gap from the metric.
+    #
+    # The chain-integrity verdict is unaffected either way — a genuinely
+    # broken chain still fails.
+    failOnMissingCheckpoint: null
     # Default cadence — daily, matching the boot gauge's
     # HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS default (86400 s).
     # Operators with a tighter compliance window may shorten both in

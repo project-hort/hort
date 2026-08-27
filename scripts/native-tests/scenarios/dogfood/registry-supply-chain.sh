@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# requires: db
+# requires: db worker scanner egress
 # Dogfood supply-chain smoke: visibility + quarantine→release + cargo publish/fetch.
 #
 # Exercises the four dogfood repositories declared in deploy/ansible/files/gitops/:
@@ -28,9 +28,16 @@
 #       locked version (not the declared range's floor), and the finding is
 #       queryable afterwards.
 #
-# Preflight probes skip cleanly (exit 77) if the dogfood repos are not
-# present (compose stack uses example-config, not the ansible gitops tree;
-# external mode needs HORT_URL pointing at the live dogfood instance).
+# The compose stack mirrors these four repositories in
+# deploy/compose/example-config/{repositories,policies,upstreams}/, so this
+# scenario runs there as well as against the live instance. The preflight
+# probes still skip cleanly (exit 77) if a repo is absent, which is what an
+# external hort without the dogfood posture looks like.
+#
+# `requires: worker scanner` because (h) waits on a real scan verdict for a
+# published crate — with no worker that poll can only time out. `requires:
+# egress` because the crates.io pull-through in (b) and the advisory lookups
+# behind (h) both leave the network.
 #
 # Token strategy: Keycloak ROPC tokens for all authenticated steps.
 # Full OIDC federation (gha-ci / gha-release SAs) is exercised by live CI

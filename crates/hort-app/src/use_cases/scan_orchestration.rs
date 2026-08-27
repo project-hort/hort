@@ -76,6 +76,12 @@ fn is_report_too_large_error(err: &DomainError) -> bool {
 /// terminal `failed` status. Mirrors `HORT_SCANNER_MAX_ATTEMPTS`.
 const DEFAULT_MAX_ATTEMPTS: u32 = 5;
 
+/// Default for [`ScanOrchestrationConfig::allow_informed_downgrade`].
+/// Mirrors `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE`'s default: the
+/// information-quality merge rule is **on**, and the operator switch
+/// exists to turn it off (which makes the gate stricter, never looser).
+const DEFAULT_ALLOW_INFORMED_DOWNGRADE: bool = true;
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -104,6 +110,25 @@ pub struct ScanOrchestrationConfig {
     /// remove the field once the worker stops setting it.
     #[doc(hidden)]
     pub default_scan_backends: Vec<String>,
+    /// Break-glass switch for the information-quality half of the
+    /// cross-backend merge (ADR 0059). Sourced from
+    /// `HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE`; **default `true`**.
+    ///
+    /// `true` — an *informed* finding (real CVSS, recognised
+    /// informational class, or
+    /// [`SeverityBasis::Assessed`](hort_domain::types::SeverityBasis::Assessed))
+    /// supersedes an
+    /// *uninformed* one for the same advisory across severity tiers, so a
+    /// scored `Medium` wins over another backend's unreadable-severity
+    /// `Critical` floor.
+    ///
+    /// `false` — reverts to strict always-fail-closed: the `Critical`
+    /// floor wins on tier alone, as it did before this switch existed.
+    /// Engaging the switch makes the release gate **stricter**, so it is a
+    /// fail-closed escape hatch, not a relaxation. Read on every merge by
+    /// `prefer_replacement` — a config value that the consumer ignored
+    /// would be an inert operator surface (ADR 0015).
+    pub allow_informed_downgrade: bool,
 }
 
 impl ScanOrchestrationConfig {
@@ -114,6 +139,7 @@ impl ScanOrchestrationConfig {
             worker_id: worker_id.into(),
             max_attempts: DEFAULT_MAX_ATTEMPTS,
             default_scan_backends: Vec::new(),
+            allow_informed_downgrade: DEFAULT_ALLOW_INFORMED_DOWNGRADE,
         }
     }
 }
@@ -421,7 +447,7 @@ impl ScanOrchestrationUseCase {
         }
 
         // Step 9: dedupe across backends + advisory.
-        let merged = merge_findings(accumulated);
+        let merged = merge_findings(accumulated, self.config.allow_informed_downgrade);
         let scanner_label = if contributors.is_empty() {
             // Only advisory contributed; surface that explicitly.
             "advisory".to_string()
@@ -943,12 +969,14 @@ pub fn compute_backoff(attempts: u32) -> Duration {
 /// reading (no CVSS) wins over an UNSCORED non-informational finding for the
 /// same advisory — so a backend that cannot read the RustSec class and fails
 /// the unscored advisory closed to Critical does not discard the
-/// classification. Otherwise severity tier wins (`Critical > … > Low`); ties
+/// classification. Then an *informed* reading wins over an *uninformed* one
+/// across tiers (ADR 0059), unless `allow_informed_downgrade` is off.
+/// Otherwise severity tier wins (`Critical > … > Low`); ties
 /// prefer `Some(cvss_score)` over `None`; remaining ties keep the first-seen
 /// entry. A SCORED finding is never informational, so it is never downgraded
 /// by this preference. Vulnerability id matching is case-insensitive; PURL
 /// matching is case-sensitive (matches `compute_added_findings`'s convention).
-fn merge_findings(input: Vec<Finding>) -> Vec<Finding> {
+fn merge_findings(input: Vec<Finding>, allow_informed_downgrade: bool) -> Vec<Finding> {
     let mut out: Vec<Finding> = Vec::with_capacity(input.len());
     let mut seen: Vec<(String, String, usize)> = Vec::with_capacity(input.len());
     for f in input {
@@ -959,9 +987,9 @@ fn merge_findings(input: Vec<Finding>) -> Vec<Finding> {
             .find(|(p, v, _)| p == &purl && v == &vuln_lower)
             .map(|(_, _, idx)| *idx)
         {
-            // Collision — apply severity-tier preference.
+            // Collision — apply the merge preference.
             let existing = &out[idx];
-            if prefer_replacement(existing, &f) {
+            if prefer_replacement(existing, &f, allow_informed_downgrade) {
                 out[idx] = f;
             }
         } else {
@@ -975,7 +1003,19 @@ fn merge_findings(input: Vec<Finding>) -> Vec<Finding> {
 
 /// Decide whether `incoming` should replace `existing` in the
 /// dedup-merge step.
-fn prefer_replacement(existing: &Finding, incoming: &Finding) -> bool {
+///
+/// `allow_informed_downgrade` is the operator break-glass switch
+/// (`HORT_FINDING_MERGE_ALLOW_INFORMED_DOWNGRADE`, default `true`). With it
+/// off, the information-quality rule below is skipped and the comparison
+/// falls straight through to severity tier — the strict always-fail-closed
+/// behaviour that predates ADR 0059. It is read here, on the merge path,
+/// because a config field the consumer ignores is an inert operator
+/// surface (ADR 0015).
+fn prefer_replacement(
+    existing: &Finding,
+    incoming: &Finding,
+    allow_informed_downgrade: bool,
+) -> bool {
     // Informational classification preference (ADR 0040). For the same
     // advisory, a finding carrying a recognised RustSec informational class
     // (`is_informational()` — unmaintained / unsound / notice, and no CVSS)
@@ -992,6 +1032,36 @@ fn prefer_replacement(existing: &Finding, incoming: &Finding) -> bool {
         (true, false) if incoming.cvss_score.is_none() => return false,
         (false, true) if existing.cvss_score.is_none() => return true,
         _ => {}
+    }
+
+    // Information-quality preference (ADR 0059). A finding is *informed*
+    // when the producing backend actually read a severity — a real CVSS,
+    // a recognised informational class, or a `SeverityBasis::Assessed`
+    // marker. The complement is a finding whose `Critical` is the SUP-4
+    // fail-closed floor: the backend could not read a severity at all, so
+    // the tier says nothing about the advisory. An informed reading
+    // supersedes an uninformed one ACROSS TIERS — a scored Medium beats
+    // an unassessed Critical — because keeping the floor would discard the
+    // only real information anyone has about this advisory and strand the
+    // artifact on a verdict no backend actually reached.
+    //
+    // Two informed findings fall through to the severity comparison
+    // below, so a scored Critical is never talked down by a scored Low
+    // (ADR 0007 fail-closed preserved). Legacy findings persisted before
+    // `severity_basis` existed deserialise as `Assessed`, so they are
+    // informed and this rule never demotes one.
+    //
+    // Accepted residual risk: where two backends disagree and the lower
+    // reading is the wrong one, a wrong Low now outranks the other's
+    // unknown-defaulted Critical. That is the deliberate trade — an
+    // unassessed Critical is not evidence of severity, and treating it as
+    // such kept correctly-scored advisories terminally rejected.
+    if allow_informed_downgrade {
+        match (existing.is_informed(), incoming.is_informed()) {
+            (false, true) => return true,
+            (true, false) => return false,
+            _ => {}
+        }
     }
 
     let existing_tier = severity_tier(existing.severity);
