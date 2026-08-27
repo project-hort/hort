@@ -24,8 +24,8 @@ the result instead.
 | prost | 0.14.3 | Apache-2.0 | https://github.com/tokio-rs/prost |
 | ring | 0.17.14 | Apache-2.0 | https://github.com/briansmith/ring |
 | async-nats | 0.50.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
-| aws-lc-sys | 0.43.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
-| blake3 | 1.8.5 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
+| aws-lc-sys | 0.44.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
+| blake3 | 1.8.7 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
 | constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
 | kube-client | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
 | kube-core | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
@@ -37,15 +37,14 @@ the result instead.
 | ryu-js | 1.0.2 | Apache-2.0 | https://github.com/boa-dev/ryu-js |
 | ryu | 1.0.23 | Apache-2.0 | https://github.com/dtolnay/ryu |
 | sigstore | 0.14.0 | Apache-2.0 | https://github.com/sigstore/sigstore-rs |
-| sigstore_protobuf_specs | 0.5.1 | Apache-2.0 | https://github.com/sigstore/protobuf-specs |
+| sigstore_protobuf_specs | 0.5.2 | Apache-2.0 | https://github.com/sigstore/protobuf-specs |
 | sync_wrapper | 1.0.2 | Apache-2.0 | https://github.com/Actyx/sync_wrapper |
-| arrayref | 0.3.9 | BSD-2-Clause | https://github.com/droundy/arrayref |
 | matchit | 0.8.4 | BSD-3-Clause | https://github.com/ibraheemdev/matchit |
 | subtle | 2.6.1 | BSD-3-Clause | https://github.com/dalek-cryptography/subtle |
 | curve25519-dalek | 5.0.0 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek |
 | ed25519-dalek | 2.2.0 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek |
 | ed25519-dalek | 3.0.0 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek |
-| aws-lc-sys | 0.43.0 | BSD-3-Clause | https://github.com/aws/aws-lc-rs |
+| aws-lc-sys | 0.44.0 | BSD-3-Clause | https://github.com/aws/aws-lc-rs |
 | curve25519-dalek | 4.1.3 | BSD-3-Clause | https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek |
 | sha1_smol | 1.0.1 | BSD-3-Clause | https://github.com/mitsuhiko/sha1-smol |
 | encoding_rs | 0.8.35 | BSD-3-Clause | https://github.com/hsivonen/encoding_rs |
@@ -55,8 +54,8 @@ the result instead.
 | simple_asn1 | 0.6.4 | ISC | https://github.com/acw/simple_asn1 |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
 | rustls-webpki | 0.103.13 | ISC | https://github.com/rustls/webpki |
-| aws-lc-rs | 1.17.3 | ISC | https://github.com/aws/aws-lc-rs |
-| aws-lc-sys | 0.43.0 | ISC | https://github.com/aws/aws-lc-rs |
+| aws-lc-rs | 1.18.0 | ISC | https://github.com/aws/aws-lc-rs |
+| aws-lc-sys | 0.44.0 | ISC | https://github.com/aws/aws-lc-rs |
 | serde_yaml_ng | 0.10.0 | MIT | https://github.com/acatton/serde-yaml-ng |
 | dotenvy | 0.15.7 | MIT | https://github.com/allan2/dotenvy |
 | quanta | 0.12.6 | MIT | https://github.com/metrics-rs/quanta |
@@ -96,7 +95,7 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.24.0 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.24.1 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -127,15 +126,15 @@ the result instead.
 | hkdf | 0.13.0 | MIT | https://github.com/RustCrypto/KDFs/ |
 | poly1305 | 0.8.0 | MIT | https://github.com/RustCrypto/universal-hashes |
 | httparse | 1.10.1 | MIT | https://github.com/seanmonstar/httparse |
-| futures-channel | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-core | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-executor | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-io | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-macro | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-sink | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-task | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
-| futures-util | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
-| futures | 0.3.33 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-channel | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-core | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-executor | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-io | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-macro | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-sink | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-task | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
+| futures-util | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
+| futures | 0.3.34 | MIT | https://github.com/rust-lang/futures-rs |
 | hashbrown | 0.14.5 | MIT | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.16.1 | MIT | https://github.com/rust-lang/hashbrown |
 | hashbrown | 0.17.1 | MIT | https://github.com/rust-lang/hashbrown |
@@ -288,9 +287,9 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.5 | MIT | https://github.com/clap-rs/clap |
-| clap_builder | 4.6.5 | MIT | https://github.com/clap-rs/clap |
-| clap_complete | 4.6.8 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.6 | MIT | https://github.com/clap-rs/clap |
+| clap_builder | 4.6.6 | MIT | https://github.com/clap-rs/clap |
+| clap_complete | 4.6.9 | MIT | https://github.com/clap-rs/clap |
 | clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -395,7 +394,7 @@ the result instead.
 | rsa | 0.9.10 | MIT | https://github.com/RustCrypto/RSA |
 | adler2 | 2.0.1 | MIT | https://github.com/oyvindln/adler2 |
 | anyhow | 1.0.104 | MIT | https://github.com/dtolnay/anyhow |
-| async-trait | 0.1.91 | MIT | https://github.com/dtolnay/async-trait |
+| async-trait | 0.1.92 | MIT | https://github.com/dtolnay/async-trait |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
 | curve25519-dalek-derive | 0.1.1 | MIT | https://github.com/dalek-cryptography/curve25519-dalek |
 | displaydoc | 0.2.5 | MIT | https://github.com/yaahc/displaydoc |
@@ -436,9 +435,9 @@ the result instead.
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
 | syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror-impl | 2.0.19 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror-impl | 2.0.20 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror | 2.0.19 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror | 2.0.20 | MIT | https://github.com/dtolnay/thiserror |
 | typed-path | 0.12.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | unicode-ident | 1.0.24 | MIT | https://github.com/dtolnay/unicode-ident |
 | unsafe-libyaml | 0.2.11 | MIT | https://github.com/dtolnay/unsafe-libyaml |
@@ -471,8 +470,8 @@ the result instead.
 | security-framework | 3.7.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
 | jsonwebtoken | 11.0.0 | MIT | https://github.com/Keats/jsonwebtoken |
-| aws-lc-sys | 0.43.0 | MIT | https://github.com/aws/aws-lc-rs |
-| webbrowser | 1.2.3 | MIT | https://github.com/amodm/webbrowser-rs |
+| aws-lc-sys | 0.44.0 | MIT | https://github.com/aws/aws-lc-rs |
+| webbrowser | 1.2.4 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | derive_more | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | hdrhistogram | 7.5.4 | MIT | https://github.com/HdrHistogram/HdrHistogram_rust.git |
@@ -491,7 +490,7 @@ the result instead.
 | crossbeam-epoch | 0.9.20 | MIT | https://github.com/crossbeam-rs/crossbeam |
 | crossbeam-queue | 0.3.12 | MIT | https://github.com/crossbeam-rs/crossbeam |
 | crossbeam-utils | 0.8.21 | MIT | https://github.com/crossbeam-rs/crossbeam |
-| base64 | 0.23.0 | MIT | https://github.com/marshallpierce/rust-base64 |
+| base64 | 0.23.1 | MIT | https://github.com/marshallpierce/rust-base64 |
 | nu-ansi-term | 0.50.3 | MIT | https://github.com/nushell/nu-ansi-term |
 | mime_guess | 2.0.5 | MIT | https://github.com/abonander/mime_guess |
 | generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git |
@@ -2698,7 +2697,7 @@ limitations under the License.
 
 ```
 
-### aws-lc-sys 0.43.0 — Apache-2.0
+### aws-lc-sys 0.44.0 — Apache-2.0
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -2779,7 +2778,7 @@ limitations under the License.
 
 ```
 
-### blake3 1.8.5 — Apache-2.0
+### blake3 1.8.7 — Apache-2.0
 
 Repository: https://github.com/BLAKE3-team/BLAKE3
 
@@ -3751,7 +3750,7 @@ limitations under the License.
 
 ```
 
-### sigstore_protobuf_specs 0.5.1 — Apache-2.0
+### sigstore_protobuf_specs 0.5.2 — Apache-2.0
 
 Repository: https://github.com/sigstore/protobuf-specs
 
@@ -3910,40 +3909,6 @@ distributed under the License is distributed on an &quot;AS IS&quot; BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
-```
-
-### arrayref 0.3.9 — BSD-2-Clause
-
-Repository: https://github.com/droundy/arrayref
-
-```text
-Copyright (c) 2015 David Roundy &lt;roundyd@physics.oregonstate.edu&gt;
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without
-modification, are permitted provided that the following conditions are
-met:
-
-1. Redistributions of source code must retain the above copyright
-   notice, this list of conditions and the following disclaimer.
-
-2. Redistributions in binary form must reproduce the above copyright
-   notice, this list of conditions and the following disclaimer in the
-   documentation and/or other materials provided with the
-   distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-&quot;AS IS&quot; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
@@ -4130,7 +4095,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ```
 
-### aws-lc-sys 0.43.0 — BSD-3-Clause
+### aws-lc-sys 0.44.0 — BSD-3-Clause
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -4401,7 +4366,7 @@ third-party/chromium/LICENSE.
 
 ```
 
-### aws-lc-rs 1.17.3 — ISC
+### aws-lc-rs 1.18.0 — ISC
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -4417,7 +4382,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot; AND ISC DISCLAIMS ALL WARRANTIES WITH
 
 ```
 
-### aws-lc-sys 0.43.0 — ISC
+### aws-lc-sys 0.44.0 — ISC
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -5699,7 +5664,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.24.0 — MIT
+### uuid 1.24.1 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -6669,7 +6634,7 @@ THE SOFTWARE.
 
 ```
 
-### futures-channel 0.3.33 — MIT
+### futures-channel 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6703,7 +6668,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-core 0.3.33 — MIT
+### futures-core 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6737,7 +6702,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-executor 0.3.33 — MIT
+### futures-executor 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6771,7 +6736,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-io 0.3.33 — MIT
+### futures-io 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6805,7 +6770,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-macro 0.3.33 — MIT
+### futures-macro 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6839,7 +6804,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-sink 0.3.33 — MIT
+### futures-sink 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6873,7 +6838,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-task 0.3.33 — MIT
+### futures-task 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6907,7 +6872,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures-util 0.3.33 — MIT
+### futures-util 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -6941,7 +6906,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### futures 0.3.33 — MIT
+### futures 0.3.34 — MIT
 
 Repository: https://github.com/rust-lang/futures-rs
 
@@ -11871,7 +11836,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.5 — MIT
+### clap 4.6.6 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11898,7 +11863,7 @@ SOFTWARE.
 
 ```
 
-### clap_builder 4.6.5 — MIT
+### clap_builder 4.6.6 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -11925,7 +11890,7 @@ SOFTWARE.
 
 ```
 
-### clap_complete 4.6.8 — MIT
+### clap_complete 4.6.9 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -14803,7 +14768,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### async-trait 0.1.91 — MIT
+### async-trait 0.1.92 — MIT
 
 Repository: https://github.com/dtolnay/async-trait
 
@@ -16074,7 +16039,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror-impl 2.0.19 — MIT
+### thiserror-impl 2.0.20 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 
@@ -16136,7 +16101,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror 2.0.19 — MIT
+### thiserror 2.0.20 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 
@@ -17085,7 +17050,7 @@ SOFTWARE.
 
 ```
 
-### aws-lc-sys 0.43.0 — MIT
+### aws-lc-sys 0.44.0 — MIT
 
 Repository: https://github.com/aws/aws-lc-rs
 
@@ -17115,7 +17080,7 @@ SOFTWARE.
 
 ```
 
-### webbrowser 1.2.3 — MIT
+### webbrowser 1.2.4 — MIT
 
 Repository: https://github.com/amodm/webbrowser-rs
 
@@ -17691,7 +17656,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### base64 0.23.0 — MIT
+### base64 0.23.1 — MIT
 
 Repository: https://github.com/marshallpierce/rust-base64
 
