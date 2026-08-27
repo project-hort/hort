@@ -246,6 +246,9 @@ case "${1:-}" in
     done
     crate="$(basename "$(dirname "${manifest}")")"
     echo "${crate}" >> "${CARGO_STUB_DIR}/published.log"
+    # Record the registry token the publish would send, so the refresh-hook
+    # test can assert a re-minted bearer actually reaches cargo's env.
+    echo "${CARGO_REGISTRIES_HORT_CRATES_TOKEN:-unset}" >> "${CARGO_STUB_DIR}/tokens.log"
     if [[ "${crate}" == "${CARGO_STUB_FAIL_ON:-}" ]]; then
       echo "stub: upload failed" >&2
       exit 1
@@ -327,6 +330,54 @@ if [[ "$(published_log)" == "alpha beta" ]]; then
 else
   fail "the run stops at the failure (expected 'alpha beta', got '$(published_log)')"
 fi
+
+# 4. The token-refresh hook: a federated bearer inherits its subject
+# id-token's expiry (min(1h, jwt.exp − now) — for GitHub id-tokens ~5min),
+# so any publish loop longer than that MUST re-mint per crate. The hook is
+# optional; the cases pin both arms.
+cat > "${STUB_DIR}/refresh.sh" <<'REFRESH'
+#!/usr/bin/env bash
+set -euo pipefail
+n=$(( $(cat "${CARGO_STUB_DIR}/refresh.count" 2>/dev/null || echo 0) + 1 ))
+echo "${n}" > "${CARGO_STUB_DIR}/refresh.count"
+printf 'fresh-token-%s' "${n}"
+REFRESH
+chmod +x "${STUB_DIR}/refresh.sh"
+
+rm -f "${STUB_DIR}/refresh.count" "${STUB_DIR}/tokens.log"
+rc="$(HORT_TOKEN_REFRESH_CMD="'${STUB_DIR}/refresh.sh'" run_loop "${LOOP_INDEX}")"
+if [[ "${rc}" == "0" ]]; then
+  pass "a publish with the refresh hook exits 0"
+else
+  fail "a publish with the refresh hook exits 0 (got ${rc}); log: $(cat "${STUB_DIR}/run.log")"
+fi
+
+if [[ "$(cat "${STUB_DIR}/refresh.count" 2>/dev/null)" == "2" ]]; then
+  pass "the refresh hook runs once per PUBLISHED crate (skips do not re-mint)"
+else
+  fail "expected 2 refreshes for 2 uploads (beta, gamma), got '$(cat "${STUB_DIR}/refresh.count" 2>/dev/null)'"
+fi
+
+expected_tokens="$(printf 'Basic %s\nBasic %s' \
+  "$(printf 'x:fresh-token-1' | base64 -w0)" \
+  "$(printf 'x:fresh-token-2' | base64 -w0)")"
+if [[ "$(cat "${STUB_DIR}/tokens.log" 2>/dev/null)" == "${expected_tokens}" ]]; then
+  pass "each upload sees the freshly-minted bearer in cargo's env, Basic-wrapped"
+else
+  fail "refreshed bearer did not reach cargo's env; tokens.log: $(cat "${STUB_DIR}/tokens.log" 2>/dev/null)"
+fi
+
+# An empty mint must fail the run loudly, not publish with a stale token.
+rm -f "${STUB_DIR}/refresh.count" "${STUB_DIR}/tokens.log"
+rc="$(HORT_TOKEN_REFRESH_CMD="true" run_loop "${LOOP_INDEX}")"
+if [[ "${rc}" != "0" && "$(published_log)" == "" ]]; then
+  pass "an empty refresh output fails the run before any upload"
+else
+  fail "an empty refresh output must fail before uploading (exit ${rc}, published '$(published_log)')"
+fi
+# bash keeps command-prefix assignments made on FUNCTION calls after the
+# function returns — clear it so later cases start from the no-hook arm.
+unset HORT_TOKEN_REFRESH_CMD
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

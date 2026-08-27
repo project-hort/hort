@@ -429,6 +429,13 @@ jobs:
           # principal a wider index view than an anonymous reader (ADR 0055),
           # and the skip check has to see what cargo will see.
           HORT_TOKEN: ${{ steps.hortauth.outputs.token }}
+          # A federated bearer inherits its subject id-token's expiry —
+          # min(1h, jwt.exp − now), and GitHub id-tokens expire after ~5
+          # minutes — so any publish loop longer than that outlives one
+          # token. The loop re-mints per crate through this hook (the
+          # runner hands out fresh id-tokens for the whole job lifetime;
+          # `permissions: id-token: write` above is what enables it).
+          HORT_TOKEN_REFRESH_CMD: scripts/ci/github-oidc-hort-token.sh https://registry.hort.rs hort-server-release
         run: scripts/ci/publish-crates.sh https://registry.hort.rs hort-crates
 
   # ════════════════════════════════════════════════════════════════════════════
