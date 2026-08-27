@@ -204,12 +204,30 @@ jobs:
       # CVEs through — those are tracked in `.trivyignore` / the scheduled scan).
       # The SARIF is still produced and uploaded (`if: always()` below) so the
       # Security tab keeps full visibility even when this step fails.
-      - name: Trivy scan - Backend
+      # Two separate invocations because trivy-action's SARIF mode ignores
+      # the severity filter ("Building SARIF report with all severities")
+      # and the exit code then fires on ANY fixable finding — a single
+      # sarif+exit-code step therefore gates on a policy this workflow
+      # never declared (it failed v0.12.0-beta.2 on HIGH-and-below openssl
+      # findings in the base image). Splitting keeps the Security tab
+      # fully populated while the gate enforces exactly the documented
+      # policy: fixable CRITICALs block, everything else is visibility.
+      # The second scan reuses TRIVY_CACHE_DIR, so it costs seconds.
+      - name: Trivy scan - Backend (SARIF, all severities, non-blocking)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: ${{ steps.refs.outputs.backend }}
           format: 'sarif'
           output: 'backend-trivy.sarif'
+          ignore-unfixed: true
+          exit-code: '0'
+          skip-setup-trivy: true
+
+      - name: Trivy gate - Backend (fixable CRITICALs block)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        with:
+          image-ref: ${{ steps.refs.outputs.backend }}
+          format: 'table'
           severity: 'CRITICAL'
           ignore-unfixed: true
           exit-code: '1'
