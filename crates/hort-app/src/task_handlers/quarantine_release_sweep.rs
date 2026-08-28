@@ -37,10 +37,14 @@
 //!    next tick's candidacy rotates past it (below).
 //! 5. Return [`TaskOutcome::Completed`] with a result summary
 //!    `{ candidates, released, skipped_no_scan_authority,
-//!    skipped_provenance_pending }` — the two skip counts are the
-//!    deny-by-default observability signal, reported per cause because
-//!    a scan-authority backlog drains once scanners catch up while a
-//!    provenance-pending one never self-clears.
+//!    skipped_provenance_pending, held_parent_gated }` — the three hold
+//!    counts are the deny-by-default observability signal, reported per
+//!    cause because each calls for a different operator response: a
+//!    scan-authority backlog drains once scanners catch up, a
+//!    provenance-pending one resolves per artifact as signatures land
+//!    or final verifies decide, and a parent-gated one moves only when
+//!    roots get signed (or, in future, via retention) — an unsigned
+//!    root's blob constituents hold indefinitely by design (ADR 0039).
 //!
 //! **Fair candidacy — the attempt cursor.** A candidate the authority or
 //! provenance gate permanently holds is never released, so under
@@ -175,6 +179,7 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
                     released = 0_u64,
                     skipped_no_scan_authority = 0_u64,
                     skipped_provenance_pending = 0_u64,
+                    held_parent_gated = 0_u64,
                     "quarantine-release-sweep tick complete (no candidates)"
                 );
                 return Ok(TaskOutcome::Completed {
@@ -183,6 +188,7 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
                         "released": 0,
                         "skipped_no_scan_authority": 0,
                         "skipped_provenance_pending": 0,
+                        "held_parent_gated": 0,
                     }),
                 });
             }
@@ -226,11 +232,14 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
             // Per-cause counts come from `release_expired` itself. They
             // are NOT a `candidates - released` delta: that delta also
             // swallows candidates the domain source-state guard refused,
-            // and it cannot tell a scan-authority hold (drains when
-            // scanners catch up) from a provenance hold (may never
-            // self-clear) — the two need different operator responses.
+            // and it cannot tell the three holds apart — a scan-authority
+            // hold drains when scanners catch up, a provenance-pending
+            // one resolves per artifact once its signature lands or its
+            // final verify decides, and a parent-gated one moves only
+            // when roots get signed. Three different operator responses.
             let skipped_no_scan_authority = summary.skipped_no_scan_authority;
             let skipped_provenance_pending = summary.skipped_provenance_pending;
+            let held_parent_gated = summary.held_parent_gated;
 
             // A full batch that released nothing is the saturation
             // signature: the sweep is doing maximum work with zero
@@ -244,6 +253,7 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
                     released = released_count,
                     skipped_no_scan_authority,
                     skipped_provenance_pending,
+                    held_parent_gated,
                     "quarantine-release-sweep: full batch, zero releases — sweep saturated, \
                      nothing releasable this tick",
                 );
@@ -253,6 +263,7 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
                     released = released_count,
                     skipped_no_scan_authority,
                     skipped_provenance_pending,
+                    held_parent_gated,
                     "quarantine-release-sweep tick complete",
                 );
             }
@@ -263,6 +274,7 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
                     "released": released_count,
                     "skipped_no_scan_authority": skipped_no_scan_authority,
                     "skipped_provenance_pending": skipped_provenance_pending,
+                    "held_parent_gated": held_parent_gated,
                 }),
             })
         })
@@ -418,11 +430,13 @@ mod tests {
         /// Ids the mock pretends to release. Anything in the input not
         /// in this set is "skipped — no authority".
         released_subset: Mutex<Vec<Uuid>>,
-        /// Per-cause skip counts the mock reports back. Programmed
-        /// independently of `released_subset` on purpose: the handler
-        /// must report the counts the use case gives it, never
-        /// re-derive them from `candidates - released`.
-        skips: Mutex<(u32, u32)>,
+        /// Per-cause hold counts the mock reports back:
+        /// `(skipped_no_scan_authority, skipped_provenance_pending,
+        /// held_parent_gated)`. Programmed independently of
+        /// `released_subset` on purpose: the handler must report the
+        /// counts the use case gives it, never re-derive them from
+        /// `candidates - released`.
+        skips: Mutex<(u32, u32, u32)>,
         err: Mutex<Option<DomainError>>,
         last_input: Mutex<Vec<Uuid>>,
     }
@@ -431,7 +445,7 @@ mod tests {
         fn releases_none() -> Self {
             Self {
                 released_subset: Mutex::new(Vec::new()),
-                skips: Mutex::new((0, 0)),
+                skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(None),
                 last_input: Mutex::new(Vec::new()),
             }
@@ -442,7 +456,7 @@ mod tests {
             // "released". Used by the happy-path test.
             Self {
                 released_subset: Mutex::new(Vec::new()), // unused; flag below
-                skips: Mutex::new((0, 0)),
+                skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(None),
                 last_input: Mutex::new(Vec::new()),
             }
@@ -451,7 +465,7 @@ mod tests {
         fn new_failing(err: DomainError) -> Self {
             Self {
                 released_subset: Mutex::new(Vec::new()),
-                skips: Mutex::new((0, 0)),
+                skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(Some(err)),
                 last_input: Mutex::new(Vec::new()),
             }
@@ -459,8 +473,20 @@ mod tests {
 
         /// Programme the per-cause skip counts the mock reports:
         /// `(skipped_no_scan_authority, skipped_provenance_pending)`.
+        /// `held_parent_gated` stays 0 — use [`Self::with_held_parent_gated`]
+        /// for tests that need the third bucket populated.
         fn with_skips(self, no_scan_authority: u32, provenance_pending: u32) -> Self {
-            *self.skips.lock().unwrap() = (no_scan_authority, provenance_pending);
+            let held_parent_gated = self.skips.lock().unwrap().2;
+            *self.skips.lock().unwrap() =
+                (no_scan_authority, provenance_pending, held_parent_gated);
+            self
+        }
+
+        /// Programme the `held_parent_gated` count independently of the
+        /// other two — the structural-hold bucket the sweep report
+        /// carries alongside the two skip counts.
+        fn with_held_parent_gated(self, count: u32) -> Self {
+            self.skips.lock().unwrap().2 = count;
             self
         }
 
@@ -480,7 +506,7 @@ mod tests {
                 return Box::pin(async move { Err(err) });
             }
             let subset = self.released_subset.lock().unwrap().clone();
-            let (skipped_no_scan_authority, skipped_provenance_pending) =
+            let (skipped_no_scan_authority, skipped_provenance_pending, held_parent_gated) =
                 *self.skips.lock().unwrap();
             // Convention: empty subset means "release nothing" (fail-closed
             // path); otherwise the mock returns the ids that ALSO appear in
@@ -498,6 +524,7 @@ mod tests {
                     released,
                     skipped_no_scan_authority,
                     skipped_provenance_pending,
+                    held_parent_gated,
                 })
             })
         }
@@ -658,6 +685,7 @@ mod tests {
                 assert_eq!(result_summary["released"], 0);
                 assert_eq!(result_summary["skipped_no_scan_authority"], 0);
                 assert_eq!(result_summary["skipped_provenance_pending"], 0);
+                assert_eq!(result_summary["held_parent_gated"], 0);
                 assert!(
                     result_summary.get("skipped_no_authority").is_none(),
                     "the conflated `candidates - released` key is retired; the empty arm \
@@ -710,6 +738,7 @@ mod tests {
                 assert_eq!(result_summary["released"], 3);
                 assert_eq!(result_summary["skipped_no_scan_authority"], 0);
                 assert_eq!(result_summary["skipped_provenance_pending"], 0);
+                assert_eq!(result_summary["held_parent_gated"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -772,6 +801,7 @@ mod tests {
                      none release",
                 );
                 assert_eq!(result_summary["skipped_provenance_pending"], 0);
+                assert_eq!(result_summary["held_parent_gated"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -822,6 +852,56 @@ mod tests {
                 assert_eq!(result_summary["released"], 1);
                 assert_eq!(result_summary["skipped_no_scan_authority"], 1);
                 assert_eq!(result_summary["skipped_provenance_pending"], 1);
+                assert_eq!(result_summary["held_parent_gated"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    // =====================================================================
+    // three-way mixed batch: one of each hold plus a release → all three
+    // counters surface independently, straight from the use case.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_mixed_batch_reports_all_three_hold_counts_independently() {
+        let c1 = make_candidate();
+        let c2 = make_candidate();
+        let c3 = make_candidate();
+        let c4 = make_candidate();
+        let candidates = Arc::new(MockCandidates::new(vec![
+            c1.clone(),
+            c2.clone(),
+            c3.clone(),
+            c4.clone(),
+        ]));
+        // c1 releases; c2 lacks scan authority; c3 is an actionable
+        // pending provenance hold; c4 is a structural parent-gated hold.
+        let releaser = Arc::new(
+            MockReleaser::releases_all_input()
+                .with_skips(1, 1)
+                .with_held_parent_gated(1),
+        );
+        *releaser.released_subset.lock().unwrap() = vec![c1.artifact_id];
+
+        let handler = make_handler(candidates, releaser);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["candidates"], 4);
+                assert_eq!(result_summary["released"], 1);
+                assert_eq!(result_summary["skipped_no_scan_authority"], 1);
+                assert_eq!(result_summary["skipped_provenance_pending"], 1);
+                assert_eq!(
+                    result_summary["held_parent_gated"], 1,
+                    "the structural parent-gated hold must surface as its own bucket, \
+                     distinct from the actionable pending count",
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -841,15 +921,21 @@ mod tests {
         let c1 = make_candidate();
         let c2 = make_candidate();
         let c3 = make_candidate();
+        let c4 = make_candidate();
         let candidates = Arc::new(MockCandidates::new(vec![
             c1.clone(),
             c2.clone(),
             c3.clone(),
+            c4.clone(),
         ]));
-        // 3 candidates, 0 released, but only ONE was actually held —
+        // 4 candidates, 0 released, but only TWO were actually held —
         // the other two hit the not-in-releasable-state arm, which is
         // not a hold at all.
-        let releaser = Arc::new(MockReleaser::releases_none().with_skips(0, 1));
+        let releaser = Arc::new(
+            MockReleaser::releases_none()
+                .with_skips(0, 1)
+                .with_held_parent_gated(1),
+        );
 
         let handler = make_handler(candidates, releaser);
 
@@ -860,13 +946,17 @@ mod tests {
 
         match outcome {
             TaskOutcome::Completed { result_summary } => {
-                assert_eq!(result_summary["candidates"], 3);
+                assert_eq!(result_summary["candidates"], 4);
                 assert_eq!(result_summary["released"], 0);
                 assert_eq!(
                     result_summary["skipped_no_scan_authority"], 0,
                     "the handler must NOT back-fill a skip count from candidates - released",
                 );
                 assert_eq!(result_summary["skipped_provenance_pending"], 1);
+                assert_eq!(
+                    result_summary["held_parent_gated"], 1,
+                    "the handler must NOT back-fill the structural-hold count either",
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -955,9 +1045,17 @@ mod tests {
 
     #[test]
     fn run_full_batch_with_zero_releases_emits_stall_warn() {
+        // The production shape this split exists for: of a full 1000
+        // candidate batch, most (964) are structurally held — nothing
+        // short of signing their roots moves them — and the remainder
+        // splits across the two actionable buckets.
         let rows = full_batch();
         let candidates = Arc::new(MockCandidates::new(rows));
-        let releaser = Arc::new(MockReleaser::releases_none().with_skips(36, 964));
+        let releaser = Arc::new(
+            MockReleaser::releases_none()
+                .with_skips(30, 6)
+                .with_held_parent_gated(964),
+        );
 
         let handler = make_handler(candidates, releaser);
         let records = capture_tick_logs(&handler);
@@ -975,10 +1073,12 @@ mod tests {
             "stall warn must carry the alertable message; saw {warn}",
         );
         assert!(
-            warn.contains("skipped_no_scan_authority=36")
-                && warn.contains("skipped_provenance_pending=964"),
-            "stall warn must carry BOTH per-cause counts — they are what tells the \
-             operator which backlog is holding the sweep; saw {warn}",
+            warn.contains("skipped_no_scan_authority=30")
+                && warn.contains("skipped_provenance_pending=6")
+                && warn.contains("held_parent_gated=964"),
+            "stall warn must carry ALL THREE per-cause counts — they are what tells the \
+             operator which backlog is holding the sweep, and the structural one is what \
+             makes the stall readable rather than alarming; saw {warn}",
         );
         assert!(
             !records.iter().any(|(lvl, _)| *lvl == tracing::Level::INFO),
@@ -1032,7 +1132,11 @@ mod tests {
     #[test]
     fn run_tick_complete_log_drops_the_retired_conflated_key() {
         let candidates = Arc::new(MockCandidates::new(vec![make_candidate()]));
-        let releaser = Arc::new(MockReleaser::releases_none().with_skips(1, 0));
+        let releaser = Arc::new(
+            MockReleaser::releases_none()
+                .with_skips(1, 0)
+                .with_held_parent_gated(0),
+        );
 
         let handler = make_handler(candidates, releaser);
         let records = capture_tick_logs(&handler);
@@ -1048,8 +1152,9 @@ mod tests {
             records
                 .iter()
                 .any(|(_, msg)| msg.contains("skipped_no_scan_authority=1")
-                    && msg.contains("skipped_provenance_pending=0")),
-            "the tick line must carry both true per-cause counts; saw {records:?}",
+                    && msg.contains("skipped_provenance_pending=0")
+                    && msg.contains("held_parent_gated=0")),
+            "the tick line must carry all three true per-cause counts; saw {records:?}",
         );
     }
 

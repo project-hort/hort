@@ -1490,18 +1490,27 @@ impl QuarantineUseCase {
     /// Returns the successfully released artifact IDs plus the per-cause
     /// skip counts (see [`ReleaseExpiredSummary`]).
     ///
-    /// **Skip attribution.** The two counters are mutually exclusive and
-    /// order-stable, and they attribute only — they do not reorder the
-    /// gates. A candidate whose provenance clearance is `Pending` counts
-    /// as `skipped_provenance_pending` whatever the scan side says,
-    /// because the provenance gate denies the timer arm on its own; only
-    /// a provenance-cleared candidate for which no release authority is
-    /// constructible counts as `skipped_no_scan_authority`. A candidate
-    /// the domain source-state guard refuses (already released, not in a
-    /// releasable state) counts towards neither — it is not being held,
-    /// it is no longer releasable. Callers use the split to tell a
-    /// backlog that will drain once scanners catch up from one that never
-    /// self-clears.
+    /// **Skip attribution.** The three counters are mutually exclusive
+    /// and order-stable, and they attribute only — they do not reorder
+    /// the gates. A candidate whose provenance clearance is `Pending`
+    /// counts on the provenance side whatever the scan side says,
+    /// because the provenance gate denies the timer arm on its own; it
+    /// splits by whether anything short of signing the root can move it:
+    ///
+    /// - a parent-gated blob constituent (config / layer blob whose only
+    ///   clearance path is the parent manifest's cascade, ADR 0039)
+    ///   counts as `held_parent_gated` — a structural hold that moves
+    ///   only when roots get signed;
+    /// - any other `Pending` candidate counts as
+    ///   `skipped_provenance_pending` — it resolves per artifact, as its
+    ///   own signature lands or its final verify decides.
+    ///
+    /// Only a provenance-cleared candidate for which no release
+    /// authority is constructible counts as `skipped_no_scan_authority`
+    /// — the backlog that drains once scanners catch up. A candidate the
+    /// domain source-state guard refuses (already released, not in a
+    /// releasable state) counts towards none of the three — it is not
+    /// being held, it is no longer releasable.
     ///
     /// **Fail-closed release predicate (ADR 0007).**
     /// A timer release is authorized ONLY
@@ -1607,16 +1616,6 @@ impl QuarantineUseCase {
             // it keeps the backstop.
             let provenance_pending = matches!(provenance, ProvenanceClearance::Pending);
             if provenance_pending {
-                // Attribute the hold to provenance here, before the
-                // authority check runs: the provenance gate denies the
-                // timer arm on its own, so a `Pending` candidate is held
-                // by provenance whatever the scan side would have said.
-                // Counting it on the authority arm instead would report a
-                // scanner backlog to an operator whose real problem is an
-                // unverified signature — a different remediation.
-                summary.skipped_provenance_pending =
-                    summary.skipped_provenance_pending.saturating_add(1);
-
                 // INVARIANT: this lookup PROPAGATES its error, matching
                 // the verdict-side resolve in
                 // `ProvenanceOrchestrationUseCase::verify_artifact`.
@@ -1625,19 +1624,37 @@ impl QuarantineUseCase {
                 // enqueue flood this skip exists to remove, and `true`
                 // (assume "skip") would suppress the backstop for a
                 // candidate that may have no parent at all — the strand
-                // direction. A failed read aborts this sweep tick; the
-                // sweep is re-driven on the next one.
+                // direction. A failed read aborts this sweep tick before
+                // any hold is counted for this candidate; the sweep is
+                // re-driven on the next one.
                 let refs = self
                     .content_references
                     .find_by_target(repository_id, &artifact.sha256_checksum, None)
                     .await?;
+
+                // Attribute the hold to the provenance side here, before
+                // the authority check runs: the provenance gate denies
+                // the timer arm on its own, so a `Pending` candidate is
+                // held by provenance whatever the scan side would have
+                // said. Counting it on the authority arm instead would
+                // report a scanner backlog to an operator whose real
+                // problem is an unverified signature — a different
+                // remediation. The same edge set that decides the
+                // enqueue also decides which provenance bucket the hold
+                // belongs to, so the count can never disagree with the
+                // reason: a parent-gated blob is a STRUCTURAL hold
+                // (only the parent's cascade can lift it), everything
+                // else is an actionable pending one.
                 if is_parent_gated_blob_constituent(&refs) {
+                    summary.held_parent_gated = summary.held_parent_gated.saturating_add(1);
                     tracing::debug!(
                         artifact_id = %artifact_id,
                         "expiry backstop: parent-gated blob constituent; no verify enqueued \
                          (its clearance comes from the parent's cascade)"
                     );
                 } else {
+                    summary.skipped_provenance_pending =
+                        summary.skipped_provenance_pending.saturating_add(1);
                     self.enqueue_final_provenance_verify(artifact_id).await;
                 }
             }
@@ -1650,10 +1667,10 @@ impl QuarantineUseCase {
                 .resolve_release_authority(artifact_id, repository_id)
                 .await?
             else {
-                // Counted only when provenance already cleared —
-                // `skipped_provenance_pending` has claimed this candidate
-                // otherwise, and the two counts are mutually exclusive so
-                // their sum never double-counts one held artifact.
+                // Counted only when provenance already cleared — one of
+                // the two provenance buckets has claimed this candidate
+                // otherwise, and the three counts are mutually exclusive
+                // so their sum never double-counts one held artifact.
                 if !provenance_pending {
                     summary.skipped_no_scan_authority =
                         summary.skipped_no_scan_authority.saturating_add(1);
@@ -5051,6 +5068,7 @@ mod tests {
         assert!(summary.released.is_empty());
         assert_eq!(summary.skipped_no_scan_authority, 1);
         assert_eq!(summary.skipped_provenance_pending, 0);
+        assert_eq!(summary.held_parent_gated, 0);
     }
 
     /// Mutual exclusivity: a candidate that fails BOTH gates is
@@ -5080,12 +5098,51 @@ mod tests {
             summary.skipped_no_scan_authority, 0,
             "the counters are mutually exclusive: one held artifact is counted once",
         );
+        assert_eq!(
+            summary.held_parent_gated, 0,
+            "no inbound blob edge is seeded — this is the actionable-pending bucket, \
+             not the structural one",
+        );
+    }
+
+    /// A `Pending` candidate that IS a parent-gated blob constituent
+    /// (its only inbound edge is a parent manifest's `oci_layer`/
+    /// `oci_config`) counts as `held_parent_gated` — never as
+    /// `skipped_provenance_pending`, whatever the scan side says. The
+    /// same predicate that decides the S4 enqueue skip decides this
+    /// count, so the two can never disagree.
+    #[tokio::test]
+    async fn release_expired_attributes_a_parent_gated_pending_to_the_structural_bucket() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections, refs) =
+            make_use_case_with_content_refs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            summary.released.is_empty(),
+            "still not released — Pending denies the timer arm"
+        );
+        assert_eq!(
+            summary.held_parent_gated, 1,
+            "a parent-gated blob constituent is a structural hold, not an actionable one",
+        );
+        assert_eq!(
+            summary.skipped_provenance_pending, 0,
+            "the actionable-pending bucket must not also claim this candidate",
+        );
+        assert_eq!(summary.skipped_no_scan_authority, 0);
     }
 
     /// A candidate the domain source-state guard refuses counts towards
-    /// NEITHER hold: it is not waiting on a gate, it is no longer
-    /// releasable. This is why the counts deliberately do not sum to
-    /// `candidates - released`.
+    /// NONE of the three holds: it is not waiting on a gate, it is no
+    /// longer releasable. This is why the counts deliberately do not sum
+    /// to `candidates - released`.
     #[tokio::test]
     async fn release_expired_counts_no_hold_for_an_already_released_candidate() {
         let (uc, artifacts, _events, _lifecycle, repositories, projections) = make_use_case();
@@ -5101,13 +5158,18 @@ mod tests {
         assert!(summary.released.is_empty());
         assert_eq!(summary.skipped_no_scan_authority, 0);
         assert_eq!(summary.skipped_provenance_pending, 0);
+        assert_eq!(summary.held_parent_gated, 0);
     }
 
     /// Over a mixed batch the counters accumulate per candidate and the
-    /// released list stays exactly the authorized ones.
+    /// released list stays exactly the authorized ones. The three-way
+    /// split — a release, a scan-authority skip, an actionable pending
+    /// hold, and a structural parent-gated hold — pins that all three
+    /// counters surface independently in the same tick.
     #[tokio::test]
     async fn release_expired_accumulates_per_cause_counts_across_a_mixed_batch() {
-        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let (uc, artifacts, events, _lifecycle, repositories, projections, refs) =
+            make_use_case_with_content_refs();
 
         let releasable =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
@@ -5122,14 +5184,25 @@ mod tests {
         seed_stream_with_scan_completed(&events, pending);
         seed_required_provenance_policy(&projections, pending_repo);
 
+        let parent_gated =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let parent_gated_repo = artifacts.get(parent_gated).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, parent_gated);
+        seed_required_provenance_policy(&projections, parent_gated_repo);
+        seed_inbound_edge(&refs, &artifacts, parent_gated, "oci_config").await;
+
         let summary = uc
-            .release_expired(vec![releasable, no_authority, pending])
+            .release_expired(vec![releasable, no_authority, pending, parent_gated])
             .await
             .unwrap();
 
         assert_eq!(summary.released, vec![releasable]);
         assert_eq!(summary.skipped_no_scan_authority, 1);
         assert_eq!(summary.skipped_provenance_pending, 1);
+        assert_eq!(
+            summary.held_parent_gated, 1,
+            "the structural hold must accumulate independently of the other two",
+        );
     }
 
     /// A `Required`-mode artifact WITH a
