@@ -54,6 +54,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counts, in place of the routine `info!` — the stall signature is an
   operator alert rather than a line that reads like a normal policy
   outcome. (#208)
+- **The sweep's provenance-pending count now splits out structural
+  parent-gated holds.** `skipped_provenance_pending` used to conflate
+  two operator-distinct situations: an artifact whose own scan or
+  signature is still outstanding (actionable — resolves per artifact or
+  with time), and a config/layer blob constituent whose only clearance
+  path is its parent manifest's cascade (structural — moves only when
+  the root gets signed, and a never-signed root's blobs hold
+  indefinitely by design). The `quarantine-release-sweep` task's
+  `result_summary` gains a third count, `held_parent_gated`, carrying
+  the parent-gated share of what used to be reported under
+  `skipped_provenance_pending`; the log line's tick-complete and
+  stall-warn fields gain the same field. On the production deployment
+  that motivated this split, ~964 of 1000 candidates in a stalled batch
+  are the structural kind — the split is what makes that stall warning
+  readable rather than alarming. (#209)
 
 ## [0.12.0] - 2026-08-27
 
