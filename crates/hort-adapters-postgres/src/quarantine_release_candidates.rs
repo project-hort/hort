@@ -29,9 +29,33 @@
 //!   AND quarantine_window_start <= $now - D
 //! ```
 //!
-//! The partial index `idx_artifacts_quarantine_window_start ON
-//! (quarantine_window_start) WHERE quarantine_status = 'quarantined'`
-//! makes the `<= constant` predicate a clean indexed range scan.
+//! The partial index `idx_artifacts_quarantine_release_cursor ON
+//! (release_attempt_at NULLS FIRST, quarantine_window_start) WHERE
+//! quarantine_status = 'quarantined'` makes the `<= constant` predicate
+//! an indexed scan and satisfies the ordering below without a sort.
+//!
+//! **Fair candidacy — the attempt cursor.** Rows are ordered
+//! `release_attempt_at ASC NULLS FIRST, quarantine_window_start ASC`, and
+//! [`QuarantineReleaseCandidatesRepository::mark_attempted`] stamps the
+//! whole batch after each tick. Window-start-only ordering made the
+//! selection a fixed point: a candidate that the fail-closed authority
+//! gate or the provenance gate permanently holds is never released and so
+//! never leaves the head of the ordering, and once such rows filled a
+//! whole batch the sweep stopped reaching any other artifact in the
+//! deployment at all. With the cursor, never-attempted rows lead — a
+//! fresh artifact past its deadline is served on the next tick regardless
+//! of backlog size — and attempted rows rotate behind them, so a backlog
+//! of N is fully re-attempted every `ceil(N / batch_size)` ticks.
+//!
+//! `release_attempt_at` is **operational scheduling metadata,
+//! deliberately not event-sourced** — the same class as the task queue's
+//! scheduling columns. It records *when* the sweep last considered a row,
+//! never *what* it decided; nothing outside this ordering reads it, and a
+//! replay that ignores it reconstructs the identical artifact. The
+//! candidacy/authority layering (ADR 0007) is untouched: candidacy is
+//! still "window elapsed" in SQL, authority is still the per-artifact
+//! check in `release_expired`. The cursor reorders which candidates a
+//! bounded batch re-checks first; it can never authorize a release.
 //!
 //! **Permissive opt-in preserved.** An operator policy with
 //! `quarantine_duration_secs = 0` is permissive mode — the policy
@@ -216,15 +240,22 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             }
 
             // -----------------------------------------------------------------
-            // Step 2 — one indexed range scan per distinct duration.
+            // Step 2 — one indexed scan per distinct duration.
             //
-            // The partial index `idx_artifacts_quarantine_window_start
-            // ON (quarantine_window_start) WHERE quarantine_status =
-            // 'quarantined'` supports this.
-            // `quarantine_window_start <= <constant>` is a clean indexed
-            // range scan; combined with `repository_id = ANY(...)`,
-            // PostgreSQL applies the array filter as a bitmap-AND step
-            // before the heap fetch.
+            // The partial index
+            // `idx_artifacts_quarantine_release_cursor ON
+            // (release_attempt_at NULLS FIRST, quarantine_window_start)
+            // WHERE quarantine_status = 'quarantined'` supports this: it
+            // serves the ORDER BY directly (same column order, same
+            // NULLS FIRST) while `quarantine_window_start <= <constant>`
+            // filters inside the index, and `repository_id = ANY(...)`
+            // is applied before the heap fetch.
+            //
+            // The ORDER BY is the anti-starvation contract, not a
+            // cosmetic: never-attempted rows (NULL cursor) lead, so a
+            // freshly-expired artifact is served on the next tick no
+            // matter how large the unreleasable backlog ahead of it is;
+            // stamped rows rotate behind them in stamp order.
             // -----------------------------------------------------------------
             let mut candidates: Vec<QuarantineReleaseCandidate> = Vec::new();
             // Iteration order over a HashMap is non-deterministic, which
@@ -244,7 +275,7 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
                       AND repository_id = ANY($1)
                       AND quarantine_window_start <= $2
                       AND deleted_at IS NULL
-                    ORDER BY quarantine_window_start
+                    ORDER BY release_attempt_at ASC NULLS FIRST, quarantine_window_start ASC
                     LIMIT $3
                     "#,
                 )
@@ -269,6 +300,44 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             }
 
             Ok(candidates)
+        })
+    }
+
+    fn mark_attempted<'a>(
+        &'a self,
+        ids: &'a [Uuid],
+        at: DateTime<Utc>,
+    ) -> BoxFuture<'a, DomainResult<()>> {
+        Box::pin(async move {
+            if ids.is_empty() {
+                return Ok(());
+            }
+            tracing::debug!(count = ids.len(), %at, "mark_attempted");
+
+            // One statement for the whole batch. A per-id UPDATE would
+            // put a round-trip per candidate on a path that runs with up
+            // to a full batch every tick; `= ANY($1)` keeps it at one.
+            //
+            // No `quarantine_status` / `deleted_at` guard: the stamp is a
+            // scheduling cursor, so writing it to a row that has since
+            // been released or deleted is harmless (the row is no longer
+            // a candidate, and nothing but candidacy ordering reads the
+            // column). Adding a guard would only risk skipping the stamp
+            // on a row that raced back into the pool.
+            sqlx::query(
+                r#"
+                UPDATE artifacts
+                SET release_attempt_at = $2
+                WHERE id = ANY($1)
+                "#,
+            )
+            .bind(ids)
+            .bind(at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "QuarantineReleaseCandidate", "mark_attempted"))?;
+
+            Ok(())
         })
     }
 }
@@ -360,6 +429,15 @@ mod tests {
         .await
         .expect("seed quarantined artifact row");
         id
+    }
+
+    /// Read an artifact's fairness cursor straight from the row.
+    async fn read_release_attempt_at(pool: &PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT release_attempt_at FROM public.artifacts WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("read release_attempt_at")
     }
 
     /// Seed a non-archived repository-scoped policy with the requested
@@ -509,6 +587,275 @@ mod tests {
         assert!(
             !out.iter().any(|c| c.artifact_id == artifact),
             "quarantine_duration_secs = 0 must permanently exclude the repo from candidacy"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Fair candidacy — the attempt cursor
+    // -----------------------------------------------------------------
+
+    /// A never-attempted artifact (`release_attempt_at IS NULL`) is
+    /// served ahead of an already-attempted one **even though its
+    /// quarantine window started later**. This is the ordering that
+    /// stops a permanently-unreleasable head of the backlog from
+    /// occupying the batch forever: under the old
+    /// `ORDER BY quarantine_window_start` the older row would lead on
+    /// every tick, for good.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_serves_never_attempted_before_attempted() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let window = chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs());
+        // `older` has the earlier window start — it would win outright
+        // on window-start ordering alone.
+        let older =
+            seed_quarantined_artifact(&pool, repo, now - window - chrono::Duration::days(9)).await;
+        let newer =
+            seed_quarantined_artifact(&pool, repo, now - window - chrono::Duration::days(1)).await;
+
+        let adapter = PgQuarantineReleaseCandidatesRepository::new(pool.clone());
+        adapter
+            .mark_attempted(&[older], now - chrono::Duration::minutes(5))
+            .await
+            .expect("mark_attempted Ok");
+
+        let out = adapter
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        assert_eq!(
+            out.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+            vec![newer, older],
+            "NULLS FIRST: the never-attempted candidate leads, the stamped one rotates behind",
+        );
+    }
+
+    /// Among candidates that have all been attempted, the *least
+    /// recently* attempted leads — the rotation is by stamp, and the
+    /// window start only breaks ties within the same stamp.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_orders_attempted_candidates_by_stalest_stamp() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let window = chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs());
+        let recently_tried =
+            seed_quarantined_artifact(&pool, repo, now - window - chrono::Duration::days(9)).await;
+        let long_ago_tried =
+            seed_quarantined_artifact(&pool, repo, now - window - chrono::Duration::days(1)).await;
+
+        let adapter = PgQuarantineReleaseCandidatesRepository::new(pool.clone());
+        adapter
+            .mark_attempted(&[recently_tried], now - chrono::Duration::minutes(1))
+            .await
+            .expect("mark_attempted Ok");
+        adapter
+            .mark_attempted(&[long_ago_tried], now - chrono::Duration::hours(6))
+            .await
+            .expect("mark_attempted Ok");
+
+        let out = adapter
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        assert_eq!(
+            out.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+            vec![long_ago_tried, recently_tried],
+            "the stalest attempt leads regardless of window start",
+        );
+    }
+
+    /// One `mark_attempted` call stamps every id in the batch with the
+    /// same instant — the bulk contract. A per-id round trip on a
+    /// thousand-row batch is exactly what the `= ANY($1)` form avoids.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn mark_attempted_stamps_the_whole_batch_in_one_call() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let a = seed_quarantined_artifact(&pool, repo, now - chrono::Duration::days(3)).await;
+        let b = seed_quarantined_artifact(&pool, repo, now - chrono::Duration::days(3)).await;
+        let untouched =
+            seed_quarantined_artifact(&pool, repo, now - chrono::Duration::days(3)).await;
+
+        assert!(read_release_attempt_at(&pool, a).await.is_none());
+
+        // Whole-second instant: `timestamptz` stores microseconds, so a
+        // `Utc::now()` carrying nanoseconds would not round-trip
+        // bit-identically and the assertion would be about Postgres'
+        // resolution rather than about the stamp.
+        let at = DateTime::from_timestamp(now.timestamp() - 30, 0).expect("valid timestamp");
+        PgQuarantineReleaseCandidatesRepository::new(pool.clone())
+            .mark_attempted(&[a, b], at)
+            .await
+            .expect("mark_attempted Ok");
+
+        assert_eq!(read_release_attempt_at(&pool, a).await, Some(at));
+        assert_eq!(read_release_attempt_at(&pool, b).await, Some(at));
+        assert!(
+            read_release_attempt_at(&pool, untouched).await.is_none(),
+            "the stamp must touch exactly the ids it was handed",
+        );
+    }
+
+    /// An empty batch is a no-op, not a statement against every row.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn mark_attempted_with_no_ids_leaves_every_row_untouched() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let artifact =
+            seed_quarantined_artifact(&pool, repo, now - chrono::Duration::days(3)).await;
+
+        PgQuarantineReleaseCandidatesRepository::new(pool.clone())
+            .mark_attempted(&[], now)
+            .await
+            .expect("mark_attempted Ok");
+
+        assert!(read_release_attempt_at(&pool, artifact).await.is_none());
+    }
+
+    /// The candidacy index must match the ORDER BY exactly — same
+    /// column order, and `NULLS FIRST` spelled out (it is not the ASC
+    /// default). If they drift apart the query still returns correct
+    /// rows, so no functional test would notice; it just silently
+    /// degrades to sorting every quarantined row per tick.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn candidacy_index_matches_the_selection_ordering() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let indexdef: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE schemaname = 'public' AND tablename = 'artifacts' \
+               AND indexname = 'idx_artifacts_quarantine_release_cursor'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("probe index definition");
+
+        let def = indexdef.expect("idx_artifacts_quarantine_release_cursor must exist");
+        assert!(
+            def.contains("release_attempt_at NULLS FIRST"),
+            "leading key must be the cursor with NULLS FIRST; got {def}",
+        );
+        assert!(
+            def.contains("quarantine_window_start"),
+            "window start must remain the second key so the range predicate stays in \
+             the index; got {def}",
+        );
+        assert!(
+            def.contains("quarantined"),
+            "the index must stay partial on the quarantined set; got {def}",
+        );
+    }
+
+    /// **Starvation regression.** More unreleasable candidates than fit
+    /// in one batch, plus one newer artifact behind them: the newer one
+    /// must be reached within two select→mark cycles.
+    ///
+    /// This is the production failure reproduced in miniature — a
+    /// deployment whose oldest batch-worth of candidates could never
+    /// self-release (parent-gated blobs) released nothing, anywhere,
+    /// ever again. The batch size is parameterised here rather than the
+    /// handler's 1000 so the shape is testable; the ordering property
+    /// under test is identical at either size.
+    ///
+    /// "Unreleasable" is modelled by what the adapter can actually see:
+    /// the rows stay `quarantined` across ticks (no release ever
+    /// happens), so under window-start ordering they would re-fill every
+    /// batch forever.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_does_not_starve_a_newer_candidate_behind_a_full_unreleasable_batch() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        const BATCH: u32 = 3;
+
+        let repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let window = chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs());
+
+        // A backlog strictly larger than one batch, all older than the
+        // newcomer, none of which will ever release.
+        let mut stuck = Vec::new();
+        for days_old in 0..(BATCH + 1) {
+            stuck.push(
+                seed_quarantined_artifact(
+                    &pool,
+                    repo,
+                    now - window - chrono::Duration::days(10 + i64::from(days_old)),
+                )
+                .await,
+            );
+        }
+        // The newcomer: past its deadline, but the youngest of the lot.
+        let newcomer =
+            seed_quarantined_artifact(&pool, repo, now - window - chrono::Duration::minutes(1))
+                .await;
+
+        let adapter = PgQuarantineReleaseCandidatesRepository::new(pool.clone());
+
+        // Two ticks of the real loop: select a batch, then stamp exactly
+        // what was selected (what the handler does after
+        // `release_expired` returns).
+        let mut seen: Vec<Uuid> = Vec::new();
+        for tick in 0..2 {
+            let batch = adapter
+                .select_expired(BATCH, now + chrono::Duration::seconds(tick))
+                .await
+                .expect("select_expired Ok");
+            let ids: Vec<Uuid> = batch.iter().map(|c| c.artifact_id).collect();
+            assert_eq!(
+                ids.len(),
+                BATCH as usize,
+                "the backlog is larger than a batch, so every tick fills it",
+            );
+            adapter
+                .mark_attempted(&ids, now + chrono::Duration::seconds(tick))
+                .await
+                .expect("mark_attempted Ok");
+            seen.extend(ids);
+        }
+
+        assert!(
+            seen.contains(&newcomer),
+            "a newly-expired artifact must be reached within ceil(N/batch) ticks, not \
+             starved forever behind an unreleasable backlog",
+        );
+        assert!(
+            stuck.iter().all(|id| seen.contains(id)),
+            "and the rotation must still re-attempt the whole backlog — fairness is a \
+             rotation, not a de-prioritisation",
         );
     }
 }
