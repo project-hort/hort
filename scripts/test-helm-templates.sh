@@ -170,6 +170,10 @@ test-values-prepull-nodeselector.yaml|templates/prepull-daemonset.yaml|server-po
 test-values-prepull-nodeselector.yaml|templates/prepull-daemonset.yaml|worker-pool|0|the server pre-pull DaemonSet does NOT inherit the worker's nodeSelector
 test-values-prepull-nodeselector.yaml|templates/prepull-worker-daemonset.yaml|worker-pool|1|the worker pre-pull DaemonSet inherits worker.nodeSelector (same placement as the worker Deployment)
 test-values-prepull-nodeselector.yaml|templates/prepull-worker-daemonset.yaml|server-pool|0|the worker pre-pull DaemonSet does NOT inherit the top-level (server) nodeSelector
+test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook: pre-install,pre-upgrade|3|all three pre-pull RBAC resources (ServiceAccount, Role, RoleBinding) are hook resources — a regular (non-hook) resource is only applied AFTER hooks complete, which is exactly the ordering bug this fixes
+test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook-weight: "-11"|3|all three pre-pull RBAC resources render at weight -11 — strictly before the pre-pull DaemonSets (-10) and the wait Job (-9), so the ServiceAccount exists before anything that needs it
+test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook-delete-policy: before-hook-creation$|3|all three pre-pull RBAC resources use before-hook-creation ONLY — pinning the failure mode: adding hook-succeeded here would delete the ServiceAccount before the weight -9 Job ever runs (non-workload kinds "succeed" the instant they're created)
+test-values.yaml|templates/prepull-rbac.yaml|hook-succeeded|0|none of the three pre-pull RBAC resources may carry hook-succeeded in their delete-policy (see row above for why)
 EOF
 }
 
