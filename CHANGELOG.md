@@ -81,6 +81,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   migration — the marker rows use the existing `content_references`
   table. (#211)
 
+- **The scheduled prefetch tick now rotates across the whole repo × package
+  space instead of re-reading page 1 forever.** The walk read the first
+  1000 prefetch-enabled repositories and the first 1000 package names per
+  repository every tick, with no cross-tick cursor — deployments beyond
+  either ceiling silently never refreshed the remainder (the doc comment's
+  claimed multi-tick walk had no mechanism behind it). The tick now
+  persists a keyset cursor (last fully-processed repository/package) in its
+  completion summary and resumes strictly after it each tick, wrapping to
+  the start after a full traversal, so a traversal of W plannable prefetches
+  completes within ⌈W / 5000⌉ ticks and the per-tick caps are page sizes,
+  not visibility ceilings. Budget semantics are unchanged: deduplicated
+  enqueues still consume no budget. The summary's new `cursor` field makes
+  the walk's progress operator-visible. (#212)
+
 ## [0.12.1] - 2026-08-29
 
 ### Fixed

@@ -865,6 +865,37 @@ impl JobsRepository for PgJobsRepository {
         })
     }
 
+    fn last_result_summary_by_kind<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, DomainResult<Option<serde_json::Value>>> {
+        let kind = kind.to_string();
+        Box::pin(async move {
+            tracing::debug!(%kind, "last_result_summary_by_kind");
+            // Ordering by completed_at (NOT id — `jobs.id` is a random
+            // uuid), mirroring `last_completed_at_by_kind`. The outer
+            // `Option` is "no completed row of this kind exists yet";
+            // the inner `Option` is `result_summary`'s own nullability
+            // (a completed row with no summary) — `.flatten()` collapses
+            // both "never ran" and "ran with nothing to report" to the
+            // same `None`, which is exactly how callers already treat
+            // "no cursor" (start of the walk).
+            let summary: Option<Option<JsonValue>> = sqlx::query_scalar(
+                "SELECT result_summary \
+                 FROM public.jobs \
+                 WHERE kind = $1 \
+                   AND status = 'completed' \
+                 ORDER BY completed_at DESC \
+                 LIMIT 1",
+            )
+            .bind(&kind)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Job", &kind))?;
+            Ok(summary.flatten())
+        })
+    }
+
     fn record_run_completion<'a>(
         &'a self,
         kind: &'a str,
@@ -2069,6 +2100,92 @@ mod tests {
             .expect("last_completed_at_by_kind (newest)")
             .expect("a completion was recorded");
         assert_eq!(newest, later, "MAX(completed_at) tracks the newest run");
+    }
+
+    /// `last_result_summary_by_kind` — the cross-tick rotation-state read
+    /// `PrefetchTickHandler` uses. No completed row yet → `None`; after
+    /// `mark_completed` writes a summary, the SAME kind's next read gets
+    /// it back; a NEWER completion for the kind supersedes the older one.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn last_result_summary_by_kind_round_trips_the_newest_completion() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        let before = repo
+            .last_result_summary_by_kind("prefetch-tick")
+            .await
+            .expect("last_result_summary_by_kind (none)");
+        assert_eq!(
+            before, None,
+            "an isolated DB has no prior prefetch-tick run"
+        );
+
+        let first_summary = serde_json::json!({ "cursor": { "position": "after_repo", "repository_id": Uuid::new_v4() } });
+        let first_id = match repo
+            .enqueue_task(
+                "prefetch-tick",
+                &serde_json::json!({}),
+                None,
+                10,
+                "cron",
+                None,
+            )
+            .await
+            .expect("enqueue_task")
+        {
+            EnqueueOutcome::Enqueued { job_id } => job_id,
+            other => panic!("expected Enqueued, got {other:?}"),
+        };
+        repo.mark_completed(first_id, first_summary.clone())
+            .await
+            .expect("mark_completed (first)");
+
+        let after_first = repo
+            .last_result_summary_by_kind("prefetch-tick")
+            .await
+            .expect("last_result_summary_by_kind (first)");
+        assert_eq!(after_first, Some(first_summary));
+
+        // A second, later completion for the same kind supersedes it —
+        // this is exactly how the next tick's fresh job row reads back
+        // the PREVIOUS tick's cursor. The short sleep guarantees a
+        // distinct `completed_at` (the column is set via `now()`
+        // inside `mark_completed`, not caller-supplied).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let second_summary = serde_json::json!({ "cursor": null });
+        let second_id = match repo
+            .enqueue_task(
+                "prefetch-tick",
+                &serde_json::json!({}),
+                None,
+                10,
+                "cron",
+                None,
+            )
+            .await
+            .expect("enqueue_task")
+        {
+            EnqueueOutcome::Enqueued { job_id } => job_id,
+            other => panic!("expected Enqueued, got {other:?}"),
+        };
+        repo.mark_completed(second_id, second_summary.clone())
+            .await
+            .expect("mark_completed (second)");
+
+        let after_second = repo
+            .last_result_summary_by_kind("prefetch-tick")
+            .await
+            .expect("last_result_summary_by_kind (second)");
+        assert_eq!(after_second, Some(second_summary));
+
+        sqlx::query("DELETE FROM public.jobs WHERE id = ANY($1)")
+            .bind([first_id, second_id])
+            .execute(&pool)
+            .await
+            .expect("cleanup");
     }
 
     /// Regression (admin-task read 500): a completed job's

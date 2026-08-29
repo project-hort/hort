@@ -159,6 +159,35 @@ impl RepositoryRepository for PgRepositoryRepository {
         })
     }
 
+    fn list_after(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> BoxFuture<'_, DomainResult<Vec<Repository>>> {
+        let limit = limit as i64;
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Repository",
+                has_cursor = after.is_some(),
+                "list_after"
+            );
+            let sql = format!(
+                r#"SELECT {SELECT_COLS}
+                   FROM repositories
+                   WHERE ($1::uuid IS NULL OR id > $1)
+                   ORDER BY id
+                   LIMIT $2"#
+            );
+            let rows: Vec<RepositoryRowWithRules> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(after)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Repository", "list_after"))?;
+            Ok(rows.into_iter().map(Into::into).collect())
+        })
+    }
+
     fn save(&self, repository: &Repository) -> BoxFuture<'_, DomainResult<()>> {
         let repo = repository.clone();
         Box::pin(async move {
@@ -965,5 +994,60 @@ mod tests {
             msg.contains("repositories_prefetch_triggers_check") || msg.contains("23514"),
             "expected prefetch_triggers CHECK violation, got: {msg}"
         );
+    }
+
+    /// `list_after` — the keyset variant `PrefetchTickHandler` rotates
+    /// against. Orders by `id` ascending and resumes strictly after the
+    /// cursor.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn list_after_orders_by_id_and_resumes_past_cursor() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = PgRepositoryRepository::new(pool.clone());
+        let key_a = format!("it-list-after-a-{}", Uuid::new_v4().simple());
+        let key_b = format!("it-list-after-b-{}", Uuid::new_v4().simple());
+        let repo_a = sample_repository(&key_a, IndexMode::ReleasedOnly);
+        let repo_b = sample_repository(&key_b, IndexMode::ReleasedOnly);
+        adapter
+            .save_managed(&repo_a, &[0x11u8; 32])
+            .await
+            .expect("save a");
+        adapter
+            .save_managed(&repo_b, &[0x22u8; 32])
+            .await
+            .expect("save b");
+
+        let (first_id, second_id) = if repo_a.id < repo_b.id {
+            (repo_a.id, repo_b.id)
+        } else {
+            (repo_b.id, repo_a.id)
+        };
+
+        // The shared-per-test isolated DB may still carry other rows
+        // seeded by this same test if it's ever re-run against a dirty
+        // fixture, so assert containment + relative order rather than
+        // exact contents.
+        let all = adapter.list_after(None, 10_000).await.expect("list_after");
+        let ids: Vec<Uuid> = all.iter().map(|r| r.id).collect();
+        assert!(ids.contains(&first_id) && ids.contains(&second_id));
+        let pos_first = ids.iter().position(|&id| id == first_id).unwrap();
+        let pos_second = ids.iter().position(|&id| id == second_id).unwrap();
+        assert!(
+            pos_first < pos_second,
+            "list_after must order by id ascending"
+        );
+
+        let after_first = adapter
+            .list_after(Some(first_id), 10_000)
+            .await
+            .expect("list_after cursor");
+        let after_ids: Vec<Uuid> = after_first.iter().map(|r| r.id).collect();
+        assert!(
+            !after_ids.contains(&first_id),
+            "cursor excludes the row it names"
+        );
+        assert!(after_ids.contains(&second_id));
     }
 }

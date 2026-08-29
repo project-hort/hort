@@ -5941,6 +5941,13 @@ pub struct MockJobsRepository {
     /// When `Some`, the retention sweep returns
     /// this row count instead of the seeded list.
     prefetch_retention_deleted_count: Mutex<Option<u64>>,
+    /// Seed map for `last_result_summary_by_kind`, keyed by `kind`. A
+    /// cross-tick rotation test drives the handler repeatedly and calls
+    /// [`Self::set_last_result_summary_by_kind`] between simulated
+    /// ticks with the previous tick's `TaskOutcome::Completed.result_summary`
+    /// — mirroring what the real dispatcher persists via
+    /// `mark_completed` and the next tick's fresh job row reads back.
+    last_result_summary_by_kind: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 /// Recorded call to `enqueue_scan` — used by the manual-rescan use case
@@ -5981,6 +5988,7 @@ impl Default for MockJobsRepository {
             prefetch_batch_error: Mutex::new(None),
             prefetch_retention_calls: Mutex::new(Vec::new()),
             prefetch_retention_deleted_count: Mutex::new(None),
+            last_result_summary_by_kind: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -6141,6 +6149,21 @@ impl MockJobsRepository {
     pub fn set_prefetch_retention_deleted_count(&self, count: u64) {
         *self.prefetch_retention_deleted_count.lock().unwrap() = Some(count);
     }
+
+    /// Seed the value `last_result_summary_by_kind(kind)` returns.
+    /// A cross-tick rotation test calls this between simulated ticks
+    /// with the previous tick's `result_summary`, standing in for the
+    /// dispatcher's `mark_completed` write the real worker performs.
+    pub fn set_last_result_summary_by_kind(
+        &self,
+        kind: impl Into<String>,
+        value: serde_json::Value,
+    ) {
+        self.last_result_summary_by_kind
+            .lock()
+            .unwrap()
+            .insert(kind.into(), value);
+    }
 }
 
 impl JobsRepository for MockJobsRepository {
@@ -6185,6 +6208,19 @@ impl JobsRepository for MockJobsRepository {
             .unwrap()
             .push((job_id, last_error.to_string()));
         Box::pin(async { Ok(()) })
+    }
+
+    fn last_result_summary_by_kind<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, DomainResult<Option<serde_json::Value>>> {
+        let value = self
+            .last_result_summary_by_kind
+            .lock()
+            .unwrap()
+            .get(kind)
+            .cloned();
+        Box::pin(async move { Ok(value) })
     }
 
     fn enqueue_scan<'a>(

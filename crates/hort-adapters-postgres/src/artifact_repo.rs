@@ -411,6 +411,43 @@ impl ArtifactRepository for PgArtifactRepository {
         })
     }
 
+    fn list_distinct_names_after(
+        &self,
+        repository_id: Uuid,
+        after: Option<&str>,
+        limit: u64,
+    ) -> BoxFuture<'_, DomainResult<Vec<String>>> {
+        let after = after.map(str::to_string);
+        let limit = limit as i64;
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Artifact",
+                %repository_id,
+                has_cursor = after.is_some(),
+                "list_distinct_names_after"
+            );
+            // Same byte-stable `ORDER BY name` as `list_distinct_names`;
+            // `$2 IS NULL` starts at the beginning, otherwise the keyset
+            // `name > $2` resumes strictly after the cursor. A cursor
+            // naming a since-deleted artifact degrades gracefully — the
+            // comparison simply lands on the next existing name.
+            let names: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT name FROM artifacts \
+                 WHERE repository_id = $1 AND deleted_at IS NULL \
+                   AND ($2::text IS NULL OR name > $2) \
+                 ORDER BY name \
+                 LIMIT $3",
+            )
+            .bind(repository_id)
+            .bind(&after)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", "distinct_names_after"))?;
+            Ok(names)
+        })
+    }
+
     fn find_by_name_in_repo(
         &self,
         repository_id: Uuid,
@@ -3324,6 +3361,70 @@ mod tests {
             err.to_string().to_lowercase().contains("unique"),
             "expected a unique-violation, got {err}"
         );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// `list_distinct_names_after` — the keyset variant `PrefetchTickHandler`
+    /// rotates against. Byte-stable `ORDER BY name`, resumes strictly
+    /// after the cursor, and a cursor naming a since-deleted (here:
+    /// never-existed) name degrades gracefully to the next existing
+    /// entry rather than erroring or getting stuck.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn list_distinct_names_after_orders_by_name_and_resumes_past_cursor() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let adapter = repo_under_test(&pool).await;
+
+        for (i, name) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            let path = format!("simple/{name}/{name}-0.tar.gz");
+            let sha256 = deterministic_hex64(i ^ 0xD157_1000);
+            sqlx::query(
+                r#"INSERT INTO artifacts (
+                       id, repository_id, name, name_as_published, version, path,
+                       size_bytes, checksum_sha256, content_type, storage_key
+                   ) VALUES (
+                       $1, $2, $3, $3, '0', $4,
+                       0, $5, 'application/octet-stream', $5
+                   )"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo_id)
+            .bind(name)
+            .bind(&path)
+            .bind(&sha256)
+            .execute(&pool)
+            .await
+            .expect("seed named artifact");
+        }
+
+        let all = adapter
+            .list_distinct_names_after(repo_id, None, 100)
+            .await
+            .expect("list_distinct_names_after");
+        assert_eq!(
+            all,
+            vec!["alpha", "beta", "gamma"],
+            "byte-stable ORDER BY name"
+        );
+
+        let after_alpha = adapter
+            .list_distinct_names_after(repo_id, Some("alpha"), 100)
+            .await
+            .expect("list_distinct_names_after cursor");
+        assert_eq!(after_alpha, vec!["beta", "gamma"]);
+
+        // "alp" never existed as a name (it sorts strictly between
+        // nothing and "alpha") — a cursor at a gap degrades gracefully
+        // to every entry actually greater than it.
+        let after_gap = adapter
+            .list_distinct_names_after(repo_id, Some("alp"), 100)
+            .await
+            .expect("list_distinct_names_after cursor on gap");
+        assert_eq!(after_gap, vec!["alpha", "beta", "gamma"]);
 
         cleanup_repo(&pool, repo_id).await;
     }
