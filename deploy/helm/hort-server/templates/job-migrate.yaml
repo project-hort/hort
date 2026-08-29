@@ -6,6 +6,13 @@ The two-role split keeps DDL privileges off the runtime Deployment.
 Helm hook: pre-install,pre-upgrade. Hook weight -5 ensures the Job
 runs before the Deployment is created. Delete-before-creation cleans up
 any prior failed Job from the previous install attempt.
+
+Before applying, the `migrate` subcommand runs a runtime fleet fence
+(ADR 0030 amendment (c)): it refuses a pending destructive
+migration while an older-release hort-server/hort-worker is still
+connected. `migrate.allowRunningFleet` (default false) plumbs the
+`HORT_ALLOW_RUNNING_FLEET` escape hatch for the rare case an operator
+needs to force it through anyway.
 */}}
 apiVersion: batch/v1
 kind: Job
@@ -59,6 +66,14 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.postgres.admin.existingSecret | quote }}
                   key: {{ .Values.postgres.admin.secretKey | quote }}
+            {{- if .Values.migrate.allowRunningFleet }}
+            # Runtime fleet fence override (ADR 0030 amendment (c)) — forces
+            # a pending contraction through even while an older-release
+            # hort-server/hort-worker is still connected. Default off; see
+            # values.yaml `migrate.allowRunningFleet`.
+            - name: HORT_ALLOW_RUNNING_FLEET
+              value: "true"
+            {{- end }}
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           resources:

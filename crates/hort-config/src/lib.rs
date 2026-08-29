@@ -32,6 +32,7 @@ pub mod interpolate;
 pub mod lint_config;
 pub mod oidc_issuer;
 pub mod permission_grant;
+pub mod pg_identity;
 pub mod repository;
 pub mod retention_policy;
 pub mod scan_policy;

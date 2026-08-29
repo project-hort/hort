@@ -1,0 +1,91 @@
+#  Destructive-DDL manifest — the expand/contract record for migrations/
+#
+#  Enforced by `cargo test -p hort-app --test expand_contract_guard`
+#  (ADR 0030). Every migration under this directory that removes or narrows a
+#  schema identifier MUST have an entry here, and the entry's `identifiers`
+#  must name exactly what that migration's SQL does — no more, no less. The
+#  guard scans the SQL itself, so an entry cannot drift away from its
+#  migration without turning red.
+#
+#  ## Why this file exists
+#
+#  A migration set runs while the PREVIOUS release's binaries are still
+#  serving. Additive DDL is safe in that window (old code never names the new
+#  identifier); destructive DDL is not (old code names the identifier that
+#  just disappeared, and every query touching it fails the instant the
+#  migration commits — before a single new pod is Ready). So a contraction
+#  ships only in a release strictly AFTER the last release whose code
+#  referenced the identifier. Expand and contract never share a release.
+#
+#  ## Fields
+#
+#    migration             file name under migrations/
+#    identifiers           `table` or `table.column`, unqualified and
+#                          lower-cased; exactly the set the SQL affects
+#    reference_removed_in  the release whose code no longer references these
+#                          identifiers — so the release before it is the last
+#                          that did. A plain X.Y.Z (no pre-release suffix):
+#                          the policy is stated in terms of releases
+#                          operators upgrade between. The guard requires the
+#                          workspace version to be strictly greater than this.
+#    note                  why this contraction was safe — or, for a
+#                          historical entry, what actually happened. Required
+#                          and non-empty.
+#
+#  ## The reviewer step the guard cannot do
+#
+#  The guard is hermetic (no git, no network), so it can check the arithmetic
+#  and that the present tree no longer names the identifier — but it cannot
+#  see past releases. Before approving a NEW entry, run
+#
+#      git grep <identifier> v<reference_removed_in>
+#
+#  for each identifier and confirm no SQL at that tag names it. Without that
+#  check `reference_removed_in` is a wish, not a record. See ADR 0030.
+
+# ---------------------------------------------------------------------------
+# Historical entries (pre-policy). Seeded so the guard starts from the tree as
+# it is; each records what happened rather than claiming the policy was met.
+# ---------------------------------------------------------------------------
+
+[[contraction]]
+migration = "009_scan_jobs_and_findings.sql"
+identifiers = ["scans", "scan_configs"]
+reference_removed_in = "0.9.2"
+note = """
+Prototype scanning tables from before the folded scan/task baseline. They were
+dropped in the same migration that defines their replacements, and no released
+schema ever carried them: 0.9.2 is the first release in the repository's
+history and its code already names neither. Nothing could have been running
+against them, so there was no mixed-version window to protect.
+"""
+
+[[contraction]]
+migration = "014_service_accounts_identity_only.sql"
+identifiers = ["service_accounts.role", "service_accounts.repositories"]
+reference_removed_in = "0.9.8"
+note = """
+Service accounts became identity-only: authority moved out of two columns on
+the row and into explicit permission_grants against the backing user. The
+column drops and the code that stopped reading them shipped together in 0.9.8
+— the same-release shape this policy now forbids. It was survivable only
+because pre-1.0 alpha deployments wipe the database between releases
+(ADR 0022), so no previous-release binary was serving against the migrated
+schema. That excuse expires with the wipe contract.
+"""
+
+[[contraction]]
+migration = "020_drop_artifacts_is_deleted.sql"
+identifiers = ["artifacts.is_deleted"]
+reference_removed_in = "0.12.0"
+note = """
+THE INCIDENT EXEMPLAR — this is the migration this guard exists to prevent.
+The inert `is_deleted` flag was dropped in 0.12.0, the same release whose code
+removed the last predicate naming it. The still-running 0.11.0 fleet failed
+every artifact query the moment the pre-upgrade migration hook completed, and
+because that deployment mirrors the images it upgrades itself from, the broken
+old pod was load-bearing for the new pod's image pull: the outage pinned
+itself for roughly 22 minutes and could not roll forward or back on its own.
+Waiting one release — dropping the column in 0.12.1 — would have cost nothing
+and prevented all of it.
+"""

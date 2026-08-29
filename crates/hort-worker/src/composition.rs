@@ -148,6 +148,7 @@ use hort_formats::oci::OciFormatHandler;
 use hort_formats::pypi::PyPiFormatHandler;
 
 use crate::config::{StorageConfig, WorkerConfig};
+use crate::pg_identity;
 
 /// Output of [`build_app_context`] — the full set of handles the
 /// heartbeat task (and any future operator tasks) share via `Arc`.
@@ -231,7 +232,7 @@ pub async fn build_app_context(
         PgPoolOptions::new().acquire_timeout(Duration::from_secs(10)),
         cfg.lock_timeout_ms,
     )
-    .connect(&cfg.minimal.database_url)
+    .connect_with(pg_identity::connect_options(&cfg.minimal.database_url)?)
     .await
     .context("connecting to postgres")?;
     assert_schema_current(&pool)
@@ -1322,7 +1323,7 @@ pub async fn build_app_context(
                     PgPoolOptions::new().acquire_timeout(Duration::from_secs(10)),
                     cfg.lock_timeout_ms,
                 )
-                .connect(retention_dsn)
+                .connect_with(pg_identity::connect_options(retention_dsn)?)
                 .await
                 .context("connecting to HORT_RETENTION_DATABASE_URL (hort_retention_role)")?;
                 let retention_event_store: Arc<dyn EventStore> = Arc::new(

@@ -492,6 +492,17 @@ postgres:
     existingSecret: ""
     secretKey: DATABASE_URL
 
+# -------------------- Migrate Job --------------------
+migrate:
+  # HORT_ALLOW_RUNNING_FLEET — emergency override for the pre-install/
+  # pre-upgrade migrate Job's runtime fleet fence (ADR 0030 amendment (c)).
+  # The fence refuses to apply a pending contraction
+  # (migrations/CONTRACTIONS.toml) while an older-release hort-server/
+  # hort-worker is still connected. Default OFF: a rolling upgrade should
+  # let the old fleet roll off on its own. Set true only to force a
+  # migration through anyway — the Job logs loudly when it does.
+  allowRunningFleet: false
+
 # -------------------- Storage --------------------
 storage:
   # filesystem (PVC, RWO) | s3

@@ -73,7 +73,7 @@ use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::types::ContentHash;
 
 use crate::config::MinimalConfig;
-use crate::telemetry;
+use crate::{pg_identity, telemetry};
 
 /// `trigger_source` literal for `jobs.trigger_source`.
 /// Seed-import is always operator-driven (the subcommand is
@@ -141,7 +141,7 @@ async fn run_async(args: SeedImportArgs) -> anyhow::Result<()> {
     info!(item_count = items.len(), "parsed seed-import input");
 
     let pool = PgPoolOptions::new()
-        .connect(&cfg.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.database_url)?)
         .await
         .context("connecting to postgres")?;
     let jobs: Arc<dyn JobsRepository> = Arc::new(PgJobsRepository::new(pool));

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Expand/contract policy for schema migrations, enforced by a structural
+  guard** (#214; incident record #215). Destructive DDL — `DROP COLUMN`,
+  `DROP TABLE`, a table/column `RENAME`, a column type change, `SET NOT NULL`
+  on an existing column — may now ship only in a release strictly *after* the
+  last release whose code referenced the identifier; expand and contract never
+  share a release. A migration set has to be applicable while the previous
+  release's binaries are still serving, and migration
+  `020_drop_artifacts_is_deleted.sql` was not: it dropped `artifacts.is_deleted`
+  in the same release (0.12.0) that removed the last code reference, so the
+  still-running 0.11.0 fleet failed every artifact query the moment the
+  pre-upgrade hook completed.
+
+  The policy is now mechanical. A new DB-free, git-free, sub-second guard
+  (`cargo test -p hort-app --test expand_contract_guard`, part of
+  `cargo test --workspace`) scans `migrations/` for destructive DDL and
+  cross-checks it against a checked-in manifest,
+  `migrations/CONTRACTIONS.toml`. It fails when a contraction is undeclared or
+  declared inexactly, when the workspace version is not strictly greater than
+  the entry's `reference_removed_in`, or when the workspace's production
+  sources still name a removed identifier. The manifest is seeded with the
+  tree's existing destructive migrations, with `020` recorded as the incident
+  exemplar. See [ADR
+  0030](docs/adr/0030-sensitive-surface-structural-guards.md).
+
+- **`docs/architecture/how-to/deploy/upgrade.md`** — operator upgrade how-to:
+  what the expand/contract guarantee buys on a routine upgrade, how to handle
+  a release carrying a `### Migration notice` (two-step upgrade, or a
+  maintenance window), why self-hosting deployments that mirror their own
+  images have no safety net during an API-degrading window, and why automated
+  Flux remediation must be suspended for a flagged release — an automatic
+  chart rollback against a forward-only contraction pins the outage instead of
+  clearing it.
+
+### Changed
+
+- **`RELEASING.md`'s promotion checklist gains a Migration-notice step.** A
+  release whose migration set contains a contraction now carries a
+  `### Migration notice` changelog entry naming the dropped or narrowed
+  object, the minimum binary version that tolerates the change, and the
+  operator action, so a maintenance window can be planned rather than
+  discovered.
+
 ## [0.12.1] - 2026-08-29
 
 ### Fixed

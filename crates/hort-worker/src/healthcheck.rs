@@ -38,6 +38,7 @@ use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 
 use crate::config::WorkerConfig;
+use crate::pg_identity;
 
 /// Total wall-clock budget for the probe. Strictly below the chart's
 /// default `livenessProbe.timeoutSeconds=3` so a slow DB doesn't push
@@ -62,7 +63,7 @@ pub async fn run() -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
-        .connect(&cfg.minimal.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.minimal.database_url)?)
         .await
         .context("opening postgres connection")?;
 

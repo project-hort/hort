@@ -243,6 +243,9 @@ git checkout -b chore/release-X.Y.Z origin/develop
 # 2. stamp CHANGELOG.md:
 #      rename `## [Unreleased]`  →  `## [X.Y.Z] - <YYYY-MM-DD>`
 #      add a fresh empty `## [Unreleased]` above it
+# 2b. MIGRATION NOTICE CHECK — see the section below. If this release's
+#     migrations contain a contraction, the changelog needs a
+#     `### Migration notice` entry BEFORE the stamp.
 # 3. … run the full local gate …
 git commit -am "chore(release): X.Y.Z"
 git push -u origin chore/release-X.Y.Z
@@ -276,6 +279,58 @@ git push github-public vX.Y.Z                        # tag → ghcr publish + Gi
 This mirrors the `github-public` sync already documented for the beta track
 above. `:latest` moves here, and only here, because only a stable tag clears
 `docker-publish.yml`'s `!contains(github.ref, '-')` guard.
+
+### Migration notice: flag a release that contracts the schema
+
+Most releases are safe to roll straight through: schema change here is
+**expand/contract** (ADR 0030), so a migration set is applicable while the
+previous release's binaries are still serving, and `cargo test -p hort-app
+--test expand_contract_guard` fails the build if a destructive migration is
+authored too early. A release that finally *performs* a contraction is the
+exception, and operators need to be told — the old pods will error on the
+contracted identifier for the length of the rollout, and a self-hosting or
+automatically-remediated deployment can pin itself there.
+
+At promotion, check whether this release contains one:
+
+```bash
+# Which migrations are new since the previous release tag …
+git diff --name-only vX.Y.(Z-1)..HEAD -- migrations/
+# … and whether any of them is declared as a contraction.
+git diff vX.Y.(Z-1)..HEAD -- migrations/CONTRACTIONS.toml
+```
+
+A new `[[contraction]]` entry means this release is flagged. Add a
+`### Migration notice` section to the release's changelog block — above the
+usual `### Added` / `### Changed` sections, because an operator scanning the
+release must not have to find it — naming, for each contracted identifier:
+
+- **what is removed or narrowed** (`artifacts.is_deleted`, table `scans`, …)
+  and in which migration;
+- **the minimum binary version that tolerates the change** — the entry's
+  `reference_removed_in`, i.e. the first release whose code does not reference
+  the identifier. Anything older than this errors against the migrated schema;
+- **what the operator must do**: upgrade from at least that version, and take
+  a maintenance window (or suspend automated remediation) if their deployment
+  cannot tolerate the old pods erroring during the rollout. Point at
+  `docs/architecture/how-to/deploy/upgrade.md`.
+
+Shape:
+
+```markdown
+### Migration notice
+
+- **`artifacts.is_deleted` is dropped** (migration
+  `020_drop_artifacts_is_deleted.sql`). Minimum tolerating binary version:
+  **0.12.0** — instances running anything earlier will fail artifact queries
+  from the moment the migration hook completes until every pod is replaced.
+  Upgrade from 0.12.0 or newer, and see
+  [the upgrade how-to](docs/architecture/how-to/deploy/upgrade.md) for
+  self-hosting and Flux-remediation handling.
+```
+
+Contractions are worth **batching**: several in one flagged release cost the
+operator one maintenance window; spread across three releases they cost three.
 
 ### Precondition: the registry must already run any feature the publish needs
 

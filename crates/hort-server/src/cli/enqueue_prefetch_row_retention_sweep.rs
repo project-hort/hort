@@ -57,7 +57,7 @@ use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_domain::ports::jobs_repository::JobsRepository;
 
 use crate::config::MinimalConfig;
-use crate::telemetry;
+use crate::{pg_identity, telemetry};
 
 /// `trigger_source` literal — must match the SQL CHECK constraint on
 /// `jobs.trigger_source` (`'manual' | 'cron' | 'advisory' | 'ingest'`).
@@ -99,7 +99,7 @@ async fn run_async(_args: EnqueuePrefetchRowRetentionSweepArgs) -> anyhow::Resul
     info!("enqueueing prefetch-row-retention-sweep job");
 
     let pool = PgPoolOptions::new()
-        .connect(&cfg.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.database_url)?)
         .await
         .context("connecting to postgres")?;
 

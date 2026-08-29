@@ -55,6 +55,7 @@ Start here if you want to know **why** the system looks the way it does.
 - [Helm chart — values reference](how-to/deploy/values-reference.md)
 - [Helm chart — edge overlays](how-to/deploy/examples-overlays.md)
 - [Install fully sovereign against `registry.hort.rs`](how-to/deploy/self-contained-registry-install.md)
+- [Upgrade a running deployment (and `### Migration notice` releases)](how-to/deploy/upgrade.md)
 - [Provision the two Postgres roles](how-to/deploy/postgres-roles.md)
 - [Trust internal or corporate CAs (`extraCaBundle`)](how-to/deploy/extra-ca-bundle.md)
 - [Admin identity and the Dex bootstrap](how-to/deploy/admin-identity-and-dex.md)

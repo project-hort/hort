@@ -242,6 +242,16 @@
         }
       }
     },
+    "migrate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowRunningFleet": {
+          "description": "HORT_ALLOW_RUNNING_FLEET override for the migrate Job's runtime fleet fence (ADR 0030 amendment (c)). Default false.",
+          "type": "boolean"
+        }
+      }
+    },
     "storage": {
       "type": "object",
       "additionalProperties": false,

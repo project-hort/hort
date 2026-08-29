@@ -66,7 +66,7 @@ use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::types::PageRequest;
 
 use crate::config::MinimalConfig;
-use crate::{migrate, telemetry};
+use crate::{migrate, pg_identity, telemetry};
 
 /// Top-level container for the `admin` subcommand. Wraps a nested
 /// [`AdminSubcommand`] enum so future admin operations are discrete
@@ -452,7 +452,7 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
     telemetry::init_tracing(cfg.log_format)?;
 
     let pool = PgPoolOptions::new()
-        .connect(&cfg.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.database_url)?)
         .await
         .context("connecting to postgres")?;
     // `issue-svc-token` is a
@@ -830,7 +830,7 @@ async fn bootstrap_session_async(args: BootstrapSessionArgs) -> anyhow::Result<(
     require_allow_admin_tokens(cfg.allow_admin_tokens)?;
 
     let pool = PgPoolOptions::new()
-        .connect(&cfg.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.database_url)?)
         .await
         .context("connecting to postgres")?;
     // Runtime-DML only (INSERT into `users` + `api_tokens`); no DDL.

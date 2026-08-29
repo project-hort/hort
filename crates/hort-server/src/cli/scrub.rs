@@ -44,7 +44,7 @@ use hort_domain::ports::storage::StoragePort;
 
 use crate::composition;
 use crate::config::Config;
-use crate::{storage, telemetry};
+use crate::{pg_identity, storage, telemetry};
 
 /// Default concurrency — matches `ScrubOpts::defaults()`. Pin via a
 /// constant so clap's `help` output advertises the same value the use
@@ -127,7 +127,7 @@ async fn run_async(args: ScrubArgs) -> anyhow::Result<ScrubReport> {
     // under load is worse than a missing migration (which would be
     // caught by `PgEventStore::new`'s invariant check).
     let pool = PgPoolOptions::new()
-        .connect(&cfg.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.database_url)?)
         .await
         .context("connecting to postgres")?;
     let pg_event_store = Arc::new(

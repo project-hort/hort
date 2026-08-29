@@ -123,3 +123,9 @@ metrics-util = { workspace = true, features = ["debugging"] }
 # Captures `tracing` events in the
 # Write-grant denial test to assert the audit signal fires.
 tracing-subscriber = { workspace = true }
+# Parses `migrations/CONTRACTIONS.toml`, the checked-in destructive-DDL
+# manifest the `expand_contract_guard` target enforces. Hand-rolling a TOML
+# subset parser would make the guard's own input format the least-trusted
+# part of a fail-closed guard; `deny_unknown_fields` on the real parser turns
+# a mistyped manifest key into an error instead of a silently-ignored knob.
+toml = { workspace = true }

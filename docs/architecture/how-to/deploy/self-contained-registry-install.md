@@ -97,6 +97,9 @@ rewrite. (A node-level mirror may still be worth running for
   explanation doc (ingress-nginx, Gateway API, external-LB); the
   `examples/registry-hort-rs/` overlay referenced above follows the
   same shape.
+- [`upgrade.md`](./upgrade.md) — upgrading this topology: why the
+  expand/contract guarantee is what keeps a self-hosting instance from
+  pinning its own outage, and what to pre-stage for a flagged release.
 - [`values-reference.md`](./values-reference.md) — per-key
   `values.yaml` reference, including `global.imageRegistry`.
 - [`helm-chart.md`](../../reference/helm-chart.md) — the chart

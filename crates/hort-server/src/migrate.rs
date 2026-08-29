@@ -4,9 +4,13 @@
 //! macro resolves the path relative to the crate's `Cargo.toml`, which is
 //! why the argument includes `../../migrations`.
 
+use std::collections::BTreeSet;
+
 use anyhow::Context;
-use sqlx::migrate::Migrator;
+use sqlx::migrate::{Migrate, Migrator};
 use sqlx::PgPool;
+
+use hort_config::pg_identity::{parse_pg_application_name, parse_version_core};
 
 /// Compile-time-embedded migration set. Used by both `run` (the
 /// `migrate` subcommand) and `assert_current` (the runtime's
@@ -164,6 +168,153 @@ pub async fn assert_current(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Runtime fleet fence (ADR 0030 amendment (c)).
+// ---------------------------------------------------------------------------
+//
+// `expand_contract_guard` (build-time) stops a contraction from being
+// AUTHORED too early. It has no runtime effect: an operator who runs
+// `migrate` while a previous release's binaries are still connected can
+// still apply a legitimately-deferred contraction into that old fleet's
+// face. This fence closes that operational-ordering gap: before applying,
+// refuse when a pending migration is a declared contraction AND an older
+// (or unversioned, hence unknown) hort-shaped client is still connected.
+// Expand-only pending sets are never fenced — routine rolling upgrades
+// stay hook-driven and unattended.
+
+/// The result of checking the pending migration set against the connected
+/// fleet. `blocked` is only ever `true` when the pending set contains a
+/// declared contraction AND an older/unversioned fleet member is present;
+/// `offenders` names them for the refusal message (empty when not blocked).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetFenceOutcome {
+    pub blocked: bool,
+    pub offenders: Vec<String>,
+}
+
+/// Every migration version in [`MIGRATOR`] that is not yet recorded in the
+/// `_sqlx_migrations` table. Creates the bookkeeping table if it does not
+/// exist yet (a fresh database has every migration pending) — this runs
+/// under the `migrate` subcommand's admin DSN, which already has DDL
+/// rights to do so.
+pub async fn pending_migration_versions(pool: &PgPool) -> anyhow::Result<BTreeSet<i64>> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquiring a connection to inspect migration state")?;
+    conn.ensure_migrations_table(MIGRATOR.table_name.as_ref())
+        .await
+        .context("ensuring the sqlx migrations bookkeeping table exists")?;
+    let applied: BTreeSet<i64> = conn
+        .list_applied_migrations(MIGRATOR.table_name.as_ref())
+        .await
+        .context("listing applied migrations")?
+        .into_iter()
+        .map(|m| m.version)
+        .collect();
+    Ok(MIGRATOR
+        .iter()
+        .map(|m| m.version)
+        .filter(|v| !applied.contains(v))
+        .collect())
+}
+
+/// Every hort-shaped `pg_stat_activity` client connected to the **current
+/// database**, other than this connection, whose version is older than
+/// `current_version` — fail-closed: a hort-shaped-but-unversioned
+/// `application_name` counts as older, and a version that fails to parse
+/// counts as older too. Non-hort `application_name`s never appear in the
+/// result (they are unrelated).
+///
+/// Scoping invariant: `pg_stat_activity` is a cluster-wide view, but a
+/// pending contraction only changes the schema of the database being
+/// migrated — clients connected to a *different* database in the same
+/// cluster (a second hort deployment, a co-hosted staging DB, a CI
+/// database) cannot be broken by it and must not count as offenders. The
+/// query is scoped with `datname = current_database()` accordingly.
+///
+/// Each entry is a human-readable `"<application_name> x<connection count>"`
+/// string, ready to drop into the refusal message.
+async fn older_fleet_members(pool: &PgPool, current_version: &str) -> anyhow::Result<Vec<String>> {
+    let current = parse_version_core(current_version).ok_or_else(|| {
+        anyhow::anyhow!("this binary's own version {current_version:?} failed to parse")
+    })?;
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT application_name, count(*) FROM pg_stat_activity \
+         WHERE pid <> pg_backend_pid() AND application_name LIKE 'hort-%' \
+         AND datname = current_database() \
+         GROUP BY application_name \
+         ORDER BY application_name",
+    )
+    .fetch_all(pool)
+    .await
+    .context("querying pg_stat_activity for connected hort fleet members")?;
+
+    let mut offenders = Vec::new();
+    for (application_name, count) in rows {
+        let Some(parsed) = parse_pg_application_name(&application_name) else {
+            continue;
+        };
+        let is_older = match parsed.version.as_deref().and_then(parse_version_core) {
+            Some(client_version) => client_version < current,
+            // Hort-shaped but unversioned (predates this fence, or a
+            // version string this binary cannot parse): fail-closed.
+            None => true,
+        };
+        if is_older {
+            offenders.push(format!("{application_name} x{count}"));
+        }
+    }
+    Ok(offenders)
+}
+
+/// The fence itself: block only when the pending set contains a declared
+/// contraction AND an older/unversioned fleet member is connected. An
+/// expand-only pending set (no contraction present) is never fenced,
+/// regardless of what else is connected.
+pub async fn evaluate_fleet_fence(
+    pool: &PgPool,
+    current_version: &str,
+) -> anyhow::Result<FleetFenceOutcome> {
+    let pending = pending_migration_versions(pool).await?;
+    let contractions = crate::contractions::contraction_versions();
+    let pending_contracts = pending.iter().any(|v| contractions.contains(v));
+    if !pending_contracts {
+        return Ok(FleetFenceOutcome {
+            blocked: false,
+            offenders: Vec::new(),
+        });
+    }
+
+    let offenders = older_fleet_members(pool, current_version).await?;
+    Ok(FleetFenceOutcome {
+        blocked: !offenders.is_empty(),
+        offenders,
+    })
+}
+
+/// Pure decision: given a fence outcome and the operator's
+/// `--allow-running-fleet` override, may `migrate` proceed? `Err` carries
+/// the operator-actionable refusal message (naming the offending clients);
+/// the override path is `Ok` but the caller is expected to log loudly that
+/// it was used — this function only decides, it does not log.
+pub fn gate_on_fleet_fence(
+    outcome: &FleetFenceOutcome,
+    allow_override: bool,
+) -> Result<(), String> {
+    if !outcome.blocked || allow_override {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to apply: a pending migration is a declared contraction \
+         (migrations/CONTRACTIONS.toml) and an older or unversioned hort-shaped client is \
+         still connected: {}. Wait for the old fleet to roll off, or pass \
+         --allow-running-fleet (HORT_ALLOW_RUNNING_FLEET=true) to override.",
+        outcome.offenders.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     //! Pins the operator-actionable error-message contract for the
@@ -285,5 +436,40 @@ mod tests {
             !msg.contains("_sqlx_migrations"),
             "non-Database error must pass through, not synthesise a message; got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `gate_on_fleet_fence` — pure, DB-free coverage of the
+    // `--allow-running-fleet` override decision.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn not_blocked_is_always_ok() {
+        let outcome = FleetFenceOutcome {
+            blocked: false,
+            offenders: Vec::new(),
+        };
+        assert_eq!(gate_on_fleet_fence(&outcome, false), Ok(()));
+        assert_eq!(gate_on_fleet_fence(&outcome, true), Ok(()));
+    }
+
+    #[test]
+    fn blocked_without_override_refuses_and_names_offenders() {
+        let outcome = FleetFenceOutcome {
+            blocked: true,
+            offenders: vec!["hort-server/0.11.0 x2".to_string()],
+        };
+        let err = gate_on_fleet_fence(&outcome, false).expect_err("must refuse");
+        assert!(err.contains("hort-server/0.11.0 x2"), "message: {err}");
+        assert!(err.contains("--allow-running-fleet"), "message: {err}");
+    }
+
+    #[test]
+    fn blocked_with_override_proceeds() {
+        let outcome = FleetFenceOutcome {
+            blocked: true,
+            offenders: vec!["hort-server/0.11.0 x1".to_string()],
+        };
+        assert_eq!(gate_on_fleet_fence(&outcome, true), Ok(()));
     }
 }

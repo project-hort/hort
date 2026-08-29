@@ -159,8 +159,10 @@ pub enum Command {
     /// Apply database migrations and exit.
     ///
     /// Useful for k8s init-container patterns where migrations are
-    /// applied once before the serving replicas roll out.
-    Migrate,
+    /// applied once before the serving replicas roll out. Refuses when a
+    /// pending migration is a declared contraction and an older fleet is
+    /// still connected — see [`migrate::MigrateArgs`].
+    Migrate(migrate::MigrateArgs),
     /// CAS integrity scrubber.
     Scrub(scrub::ScrubArgs),
     /// Service-account token management. There is no `bootstrap`
@@ -274,7 +276,7 @@ pub fn run() -> ExitCode {
 fn dispatch(command: Command) -> ExitCode {
     match command {
         Command::Serve => serve::run(),
-        Command::Migrate => migrate::run(),
+        Command::Migrate(args) => migrate::run(args),
         Command::Scrub(args) => scrub::run(args),
         Command::Admin(cmd) => admin::run(cmd),
         Command::ReconcileGroups(args) => reconcile_groups::run(args),
@@ -316,12 +318,31 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Serve)));
     }
 
-    // `migrate` subcommand parses to `Command::Migrate`.
+    // `migrate` subcommand parses to `Command::Migrate`, with
+    // `--allow-running-fleet` defaulting off.
 
     #[test]
     fn migrate_parses() {
         let cli = Cli::try_parse_from(["hort-server", "migrate"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Migrate)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Migrate(migrate::MigrateArgs {
+                allow_running_fleet: false
+            }))
+        ));
+    }
+
+    // `--allow-running-fleet` flips the flag on.
+
+    #[test]
+    fn migrate_allow_running_fleet_flag_parses() {
+        let cli = Cli::try_parse_from(["hort-server", "migrate", "--allow-running-fleet"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Migrate(migrate::MigrateArgs {
+                allow_running_fleet: true
+            }))
+        ));
     }
 
     // `scrub` subcommand parses with empty args.
