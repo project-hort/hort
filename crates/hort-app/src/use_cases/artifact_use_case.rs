@@ -1881,6 +1881,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -1888,6 +1890,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -3236,6 +3240,8 @@ mod visibility_extension_tests {
                 &self,
                 _kind: &str,
                 _limit: u32,
+                _after: Option<Uuid>,
+                _skip_marker_kind: Option<&str>,
             ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<Vec<Artifact>>>
             {
                 Box::pin(async { Ok(Vec::new()) })
@@ -3244,6 +3250,8 @@ mod visibility_extension_tests {
                 &self,
                 _kind: &str,
                 _limit: u32,
+                _after: Option<Uuid>,
+                _skip_marker_kind: Option<&str>,
             ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<Vec<Artifact>>>
             {
                 Box::pin(async { Ok(Vec::new()) })

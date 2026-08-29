@@ -1883,6 +1883,8 @@ mod tests {
             &self,
             _k: &str,
             _l: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> hort_domain::ports::BoxFuture<
             '_,
             hort_domain::error::DomainResult<Vec<hort_domain::entities::artifact::Artifact>>,
@@ -1893,6 +1895,8 @@ mod tests {
             &self,
             _k: &str,
             _l: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> hort_domain::ports::BoxFuture<
             '_,
             hort_domain::error::DomainResult<Vec<hort_domain::entities::artifact::Artifact>>,
