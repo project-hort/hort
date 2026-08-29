@@ -51,6 +51,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operator action, so a maintenance window can be planned rather than
   discovered.
 
+### Fixed
+
+- **The wheel-metadata and OCI membership-edge backfills no longer
+  starve on permanent skips.** Both admin-task backfills walked
+  candidates `ORDER BY id LIMIT batch_size` with no cursor, and a
+  skipped item (corrupt wheel ZIP, no METADATA member, oversized
+  METADATA; an OCI manifest whose bytes don't parse or carry no
+  config-role reference) wrote nothing — so it never left candidacy nor
+  its position at the batch head. A backlog of ≥ `batch_size`
+  permanently-unprocessable rows with low ids meant the backfill never
+  progressed past them, reporting `Completed` every invocation while a
+  valid item behind them was never reached — the same starvation shape
+  as the quarantine-release sweep fixed for `#208`, here without a
+  release-authority stake. Each run now walks its full candidate set via
+  an in-run keyset cursor (`WHERE id > $after ORDER BY id LIMIT
+  $batch_size`, paged, cursor advanced after every page regardless of
+  outcome), and a **structural** skip (one re-running cannot change,
+  since CAS content is immutable) additionally writes a durable
+  `content_references` marker (`wheel_metadata_skipped` /
+  `oci_membership_skipped`) that permanently excludes the row from
+  candidacy — a **transient** skip (CAS/DB error) writes no marker and
+  is retried on the next invocation. New task param
+  `ignore_skip_markers` (default `false`) re-surfaces marked rows, e.g.
+  after a parser fix. Run-summary skip counters split into
+  `skipped_structural` / `skipped_transient` for both tasks (replacing
+  `skipped_no_metadata`/`errors` and
+  `skipped_cas_missing`/`skipped_unparseable`/`errors` respectively). No
+  migration — the marker rows use the existing `content_references`
+  table. (#211)
+
 ## [0.12.1] - 2026-08-29
 
 ### Fixed

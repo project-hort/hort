@@ -39,47 +39,86 @@
 //!
 //! # Params
 //!
-//! `{"batch_size": <int>}` — defaults to [`DEFAULT_BATCH_SIZE`] = 100,
-//! capped at [`MAX_BATCH_SIZE`] = 1000. Operators tightening below 100
-//! are explicitly making the per-run wall-clock + memory tradeoff (one
-//! fewer wheel per tick = less peak memory; one more run to drain).
+//! - `batch_size` (int) — the in-run keyset page size; defaults to
+//!   [`DEFAULT_BATCH_SIZE`] = 100, capped at [`MAX_BATCH_SIZE`] = 1000.
+//!   Operators tightening below 100 are explicitly making the per-page
+//!   wall-clock + memory tradeoff (one fewer wheel per page = less peak
+//!   memory; one more page to drain). This does NOT bound the run's
+//!   total work — see Resumability below.
+//! - `ignore_skip_markers` (bool) — defaults to `false`. When `true`, the
+//!   candidacy query re-surfaces wheels already carrying a
+//!   `wheel_metadata_skipped` durable marker (see "Durable structural-skip
+//!   marker" below) — for the day a parser fix makes a previously-corrupt
+//!   wheel readable.
 //!
 //! # Resumability
 //!
-//! Stateless. A failed batch leaves the candidacy query unchanged —
-//! the next invocation re-derives the same work. No checkpoint, no
-//! cursor; the candidacy predicate
-//! (`artifacts.path LIKE '%.whl' AND NOT EXISTS … kind='wheel_metadata'`)
-//! is the cursor. Two concurrent runs would walk overlapping sets; the
-//! per-CAS `StoragePort::put` idempotency on identical content + the
-//! upsert semantics of `ContentReferenceIndex::insert` absorb the
-//! duplicate work.
+//! **In-run keyset advance.** A single invocation walks candidates in
+//! pages of `batch_size`, using an in-memory keyset cursor
+//! (`after = max(id)` of the previous page, advanced regardless of that
+//! page's outcome — processed, structurally skipped, or transiently
+//! skipped). The candidacy query is otherwise stateless
+//! (`artifacts.path LIKE '%.whl' AND NOT EXISTS … kind='wheel_metadata'`,
+//! further narrowed by the durable skip marker below); a run keeps
+//! fetching pages until one comes back short of `batch_size`, so it visits
+//! every current candidate exactly once and always terminates. This is
+//! what prevents a page of 100%-skipped wheels from stalling the run at
+//! the same rows forever — a wheel that becomes a candidate only because
+//! `batch_size` low-id wheels ahead of it are permanently unprocessable is
+//! still reached within the SAME run.
+//!
+//! **Durable structural-skip marker.** A *structural* skip (see "Failure
+//! modes" below) additionally inserts a `content_references` row
+//! (`kind = "wheel_metadata_skipped"`, target = the wheel's own content
+//! hash — the same self-referential shape the `primary_content` refcount
+//! row uses) and the candidacy query's `NOT EXISTS` is extended to exclude
+//! marked rows. Re-running the extraction on the same immutable CAS
+//! content cannot change a structural outcome, so a structurally
+//! unprocessable wheel leaves the candidate pool permanently instead of
+//! paying a repeated CAS read + ZIP parse on every future invocation. A
+//! *transient* skip writes no marker — the artifact remains a candidate,
+//! and the in-run keyset advance above already keeps it from starving the
+//! current run.
+//!
+//! Across invocations: a failed page leaves the candidate set unchanged;
+//! the next invocation starts a fresh cursor at `after = None` and
+//! re-derives the same work minus whatever a prior successful invocation
+//! completed (extracted, or structurally marked). Two concurrent runs
+//! would walk overlapping sets; the per-CAS `StoragePort::put` idempotency
+//! on identical content + the upsert semantics of
+//! `ContentReferenceIndex::insert` absorb the duplicate work.
 //!
 //! # Failure modes per artifact
 //!
-//! Mirrors the ingest-hook posture:
+//! Mirrors the ingest-hook posture, split by the transient/structural
+//! criterion that decides marker-writing (see Resumability above):
 //!
 //! - `Ok(Some(bytes))` → write to CAS + insert ContentReference →
 //!   counts in `metadata_extracted`.
-//! - `Ok(None)` → silent skip (corrupt wheel, no METADATA member, not
-//!   actually a wheel ZIP) → counts in `skipped_no_metadata`.
-//! - `Err(DomainError::Validation(_))` → silent skip (oversized
-//!   METADATA past the 1 MiB cap) → counts in `skipped_no_metadata`.
-//!   Treated as non-fatal because the ingest hook treats it the
-//!   same (non-fatal warn → ingest succeeds); the backfill must not
-//!   diverge from that contract.
-//! - `Err(_)` (infrastructure-class — CAS read/write failure, DB
-//!   insert failure) → log `warn!`, count in `errors`, **continue**.
-//!   Per-artifact failure does not abort the batch — one bad wheel
-//!   cannot starve the rest of the candidate set. The next invocation
-//!   re-derives the same candidate and retries.
+//! - **Structural** (re-running cannot change the outcome for the same
+//!   immutable bytes — a durable marker is written): `Ok(None)` (corrupt
+//!   wheel, no METADATA member, not actually a wheel ZIP) or
+//!   `Err(DomainError::Validation(_))` (oversized METADATA past the 1 MiB
+//!   cap — the ingest hook treats this as non-fatal too; the backfill must
+//!   not diverge from that contract) → counts in `skipped_structural`. If
+//!   the marker insert itself fails, the wheel remains a candidate for the
+//!   next run — counted in `skipped_transient` instead (see below), since
+//!   what determines the bucket is whether the wheel stays a candidate,
+//!   not the parse-level cause.
+//! - **Transient** (infrastructure-class — CAS read/write failure, DB
+//!   insert failure, including a failed marker insert) → log `warn!`,
+//!   count in `skipped_transient`, **continue**. No marker is written; the
+//!   wheel remains a candidate and the next invocation retries it. A
+//!   per-artifact failure never aborts the batch — one bad wheel cannot
+//!   starve the rest of the candidate set.
 //!
 //! # No new domain event
 //!
 //! The backfill produces only derived-projection rows
-//! (`ContentReference kind=wheel_metadata`) — exactly what the
-//! ingest hook produces — not domain facts. No new event variant;
-//! the event stream stays lean.
+//! (`ContentReference kind=wheel_metadata` /
+//! `kind=wheel_metadata_skipped`) — exactly what the ingest hook
+//! produces — not domain facts. No new event variant; the event stream
+//! stays lean.
 //!
 //! # No new metrics
 //!
@@ -97,6 +136,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
+use uuid::Uuid;
 
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::error::{DomainError, DomainResult};
@@ -113,28 +153,54 @@ use hort_domain::types::PayloadAccess;
 // ---------------------------------------------------------------------------
 
 /// Default `batch_size` when the operator omits it from `params`.
-/// 100 wheels per tick balances per-tick wall clock (every wheel pays
+/// 100 wheels per page balances per-page wall clock (every wheel pays
 /// one CAS round-trip + one ZIP-seek + one CAS put + one DB insert)
-/// against operator-perceived progress.
+/// against operator-perceived progress. Bounds page size only — a run
+/// walks as many pages as the candidate set requires (see the module
+/// doc's Resumability section).
 pub(crate) const DEFAULT_BATCH_SIZE: u32 = 100;
 
 /// Hard cap on `batch_size` regardless of operator input. Mirrors the
 /// `BATCH_SIZE = 1000` discipline in
 /// [`super::quarantine_release_sweep::QuarantineReleaseSweepHandler`].
-/// Operators wanting a larger throughput tighten the CronJob schedule,
-/// not the per-run batch size — keeping the per-tick memory profile
-/// bounded.
+/// Operators wanting a larger per-page throughput tighten this cap's
+/// neighbourhood, not the run's total work — keeping the per-page memory
+/// profile bounded regardless of how large the candidate set is.
 pub(crate) const MAX_BATCH_SIZE: u32 = 1_000;
 
 /// `content_references.kind` value the candidacy query filters against
-/// and the produced row carries. Single source of truth so a future
-/// rename of the kind literal stays consistent across the handler +
-/// the SQL filter.
+/// and the produced row carries on a successful extraction. Single
+/// source of truth so a future rename of the kind literal stays
+/// consistent across the handler + the SQL filter.
 pub(crate) const WHEEL_METADATA_KIND: &str = "wheel_metadata";
+
+/// `content_references.kind` value written for a **structural** skip —
+/// see the module doc's "Durable structural-skip marker" section. A
+/// distinct kind from [`WHEEL_METADATA_KIND`] so the two are queryable
+/// (and excludable) independently: a row can never carry both, since a
+/// wheel is either successfully extracted or structurally unprocessable,
+/// never both.
+pub(crate) const WHEEL_METADATA_SKIPPED_KIND: &str = "wheel_metadata_skipped";
 
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
+
+/// Per-artifact extract outcome — the shape
+/// [`WheelMetadataBackfillHandler::extract_and_persist`] returns to the
+/// run loop. See the module doc's "Failure modes per artifact" section
+/// for the full contract deciding which outcome an artifact lands in.
+enum ExtractOutcome {
+    /// METADATA extracted and persisted (CAS put + CR insert both
+    /// succeeded).
+    Extracted,
+    /// Structural skip, durable marker written — the wheel leaves
+    /// candidacy permanently.
+    SkippedStructural,
+    /// Transient skip (infrastructure-class failure, including a failed
+    /// marker insert) — no marker; the wheel remains a candidate.
+    SkippedTransient,
+}
 
 /// [`TaskHandler`] for the periodic / one-shot wheel-metadata backfill.
 /// Constructed at composition time with the four ports it touches:
@@ -142,7 +208,8 @@ pub(crate) const WHEEL_METADATA_KIND: &str = "wheel_metadata";
 /// - [`ArtifactRepository`] — candidacy walk
 ///   ([`ArtifactRepository::find_pypi_wheels_without_kind`]).
 /// - [`ContentReferenceIndex`] — per-artifact ContentReference insert
-///   on a successful extraction.
+///   on a successful extraction, or a durable skip marker on a
+///   structural skip.
 /// - [`StoragePort`] — CAS read (wheel bytes) + CAS write (extracted
 ///   METADATA bytes).
 /// - PyPI [`FormatHandler`] — the
@@ -176,16 +243,8 @@ impl WheelMetadataBackfillHandler {
         }
     }
 
-    /// Per-artifact extract + persist sequence. Returns:
-    ///
-    /// - `Ok(true)` — METADATA extracted and persisted (CAS put + CR
-    ///   insert both succeeded).
-    /// - `Ok(false)` — non-fatal skip (no METADATA member, oversized
-    ///   METADATA, corrupt ZIP). Counts as `skipped_no_metadata` at
-    ///   the call site.
-    /// - `Err(_)` — infrastructure-class (CAS read / write / DB
-    ///   insert) failure. Counts as `errors` at the call site; the
-    ///   batch continues with the next artifact.
+    /// Per-artifact extract + persist sequence. See the module doc's
+    /// "Failure modes per artifact" section for the full contract.
     ///
     /// This is the same shape as the ingest hook, factored as a
     /// per-artifact method so the batch loop reads as a flat
@@ -199,18 +258,30 @@ impl WheelMetadataBackfillHandler {
     /// non-transactional shape, which is a worse fit for the hot
     /// ingest path.
     #[tracing::instrument(skip(self, artifact), fields(artifact_id = %artifact.id))]
-    async fn extract_and_persist(&self, artifact: &Artifact) -> DomainResult<bool> {
+    async fn extract_and_persist(&self, artifact: &Artifact) -> ExtractOutcome {
         // Re-read the wheel from CAS. The 1 MiB cap on METADATA is
         // enforced INSIDE `extract_wheel_metadata_bytes` on the ZIP
         // entry's header — the raw wheel bytes here are bounded only
         // by the per-format ingest cap that applied at original
         // ingest time (so no extra cap needed here).
         let mut wheel_bytes: Vec<u8> = Vec::new();
-        let mut stream = self.storage.get(&artifact.sha256_checksum).await?;
-        stream
-            .read_to_end(&mut wheel_bytes)
-            .await
-            .map_err(|e| DomainError::Invariant(format!("CAS re-read failed: {e}")))?;
+        let mut stream = match self.storage.get(&artifact.sha256_checksum).await {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "wheel-metadata-backfill: CAS read failed; skipping (transient)"
+                );
+                return ExtractOutcome::SkippedTransient;
+            }
+        };
+        if let Err(err) = stream.read_to_end(&mut wheel_bytes).await {
+            tracing::warn!(
+                error = %err,
+                "wheel-metadata-backfill: CAS stream read failed; skipping (transient)"
+            );
+            return ExtractOutcome::SkippedTransient;
+        }
 
         // Synthesise the minimum `ArtifactCoords` the trait method
         // needs. The PyPI format handler reads `coords.path` to gate
@@ -234,12 +305,23 @@ impl WheelMetadataBackfillHandler {
         match extract {
             Ok(Some(metadata_bytes)) => {
                 let metadata_len = metadata_bytes.len();
-                let put_result = self
+                let put_result = match self
                     .storage
                     .put(Box::new(std::io::Cursor::new(metadata_bytes.to_vec())))
-                    .await?;
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "wheel-metadata-backfill: METADATA CAS put failed; skipping (transient)"
+                        );
+                        return ExtractOutcome::SkippedTransient;
+                    }
+                };
                 let metadata_hash = put_result.hash;
-                self.content_references
+                if let Err(err) = self
+                    .content_references
                     .insert(ContentReference {
                         source_artifact_id: artifact.id,
                         target_content_hash: metadata_hash.clone(),
@@ -248,37 +330,86 @@ impl WheelMetadataBackfillHandler {
                         repository_id: artifact.repository_id,
                         recorded_at: Utc::now(),
                     })
-                    .await?;
+                    .await
+                {
+                    tracing::warn!(
+                        error = %err,
+                        "wheel-metadata-backfill: wheel_metadata ContentReference insert failed; \
+                         skipping (transient)"
+                    );
+                    return ExtractOutcome::SkippedTransient;
+                }
                 tracing::debug!(
                     metadata_hash = %metadata_hash,
                     metadata_bytes = metadata_len,
                     "wheel-metadata-backfill: extracted + persisted"
                 );
-                Ok(true)
+                ExtractOutcome::Extracted
             }
             Ok(None) => {
                 // Non-wheel ZIP, missing METADATA member, sdist that
-                // somehow slipped past the candidacy SQL — all silent
-                // no-op by design. The SQL guards
-                // against sdists (`path LIKE '%.whl'`); a wheel that
-                // legitimately has no METADATA member is corrupt and
-                // we count it.
-                Ok(false)
+                // somehow slipped past the candidacy SQL — all
+                // structural: re-running cannot change the outcome for
+                // the same immutable CAS content. The SQL guards against
+                // sdists (`path LIKE '%.whl'`); a wheel that legitimately
+                // has no METADATA member is corrupt and we mark it.
+                self.write_skip_marker(artifact).await
             }
             Err(DomainError::Validation(reason)) => {
                 // Oversized METADATA (the only production path
-                // surfacing `Err(Validation)` today). The ingest hook
-                // treats this as non-fatal; the backfill mirrors that
-                // posture — the wheel ingest succeeded, the PEP
-                // 658 advertisement just stays unavailable for this
-                // wheel (pip's fallback applies, correct but slower).
+                // surfacing `Err(Validation)` today) — structural for the
+                // same reason: the ingest hook treats this as non-fatal,
+                // and the byte count cannot change on a re-read of
+                // immutable content.
                 tracing::debug!(
                     reason = %reason,
-                    "wheel-metadata-backfill: validation skip (oversized METADATA)"
+                    "wheel-metadata-backfill: validation skip (oversized METADATA) — structural"
                 );
-                Ok(false)
+                self.write_skip_marker(artifact).await
             }
-            Err(e) => Err(e),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "wheel-metadata-backfill: extract_wheel_metadata_bytes failed; \
+                     skipping (transient)"
+                );
+                ExtractOutcome::SkippedTransient
+            }
+        }
+    }
+
+    /// Insert the durable `wheel_metadata_skipped` marker row for a
+    /// structural skip. Target = the wheel's own content hash —
+    /// self-referential, mirroring the `primary_content` refcount row's
+    /// shape (there is no separate "target content" for a marker; the
+    /// row documents an attribute of its own source).
+    ///
+    /// A failed insert downgrades the outcome to
+    /// [`ExtractOutcome::SkippedTransient`]: what decides the bucket is
+    /// whether the wheel remains a candidate on the next run, and if the
+    /// marker did not land, it does.
+    async fn write_skip_marker(&self, artifact: &Artifact) -> ExtractOutcome {
+        match self
+            .content_references
+            .insert(ContentReference {
+                source_artifact_id: artifact.id,
+                target_content_hash: artifact.sha256_checksum.clone(),
+                kind: WHEEL_METADATA_SKIPPED_KIND.to_string(),
+                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                repository_id: artifact.repository_id,
+                recorded_at: Utc::now(),
+            })
+            .await
+        {
+            Ok(()) => ExtractOutcome::SkippedStructural,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "wheel-metadata-backfill: wheel_metadata_skipped marker insert failed; \
+                     wheel remains a candidate (transient)"
+                );
+                ExtractOutcome::SkippedTransient
+            }
         }
     }
 }
@@ -296,57 +427,68 @@ impl TaskHandler for WheelMetadataBackfillHandler {
     ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
         Box::pin(async move {
             let batch_size = resolve_batch_size(params);
-
-            let candidates = match self
-                .artifacts
-                .find_pypi_wheels_without_kind(WHEEL_METADATA_KIND, batch_size)
-                .await
-            {
-                Ok(c) => c,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "wheel-metadata-backfill: find_pypi_wheels_without_kind failed; \
-                         will retry on next invocation",
-                    );
-                    return Ok(TaskOutcome::fail(
-                        format!("find_pypi_wheels_without_kind failed: {err}"),
-                        true,
-                    ));
-                }
-            };
+            let ignore_skip_markers = resolve_ignore_skip_markers(params);
+            let skip_marker_kind = (!ignore_skip_markers).then_some(WHEEL_METADATA_SKIPPED_KIND);
 
             let mut artifacts_walked: u64 = 0;
             let mut metadata_extracted: u64 = 0;
-            let mut skipped_no_metadata: u64 = 0;
-            let mut errors: u64 = 0;
+            let mut skipped_structural: u64 = 0;
+            let mut skipped_transient: u64 = 0;
+            let mut cursor: Option<Uuid> = None;
 
-            for artifact in &candidates {
-                artifacts_walked += 1;
-                match self.extract_and_persist(artifact).await {
-                    Ok(true) => metadata_extracted += 1,
-                    Ok(false) => skipped_no_metadata += 1,
+            loop {
+                let candidates = match self
+                    .artifacts
+                    .find_pypi_wheels_without_kind(
+                        WHEEL_METADATA_KIND,
+                        batch_size,
+                        cursor,
+                        skip_marker_kind,
+                    )
+                    .await
+                {
+                    Ok(c) => c,
                     Err(err) => {
-                        // Per-artifact infrastructure failure does NOT
-                        // abort the batch. The candidate set is
-                        // resumable; the next invocation re-derives the
-                        // same set minus the artifacts that already
-                        // landed a `wheel_metadata` row.
                         tracing::warn!(
                             error = %err,
-                            artifact_id = %artifact.id,
-                            "wheel-metadata-backfill: per-artifact extraction failed; continuing",
+                            "wheel-metadata-backfill: find_pypi_wheels_without_kind failed; \
+                             will retry on next invocation",
                         );
-                        errors += 1;
+                        return Ok(TaskOutcome::fail(
+                            format!("find_pypi_wheels_without_kind failed: {err}"),
+                            true,
+                        ));
                     }
+                };
+                if candidates.is_empty() {
+                    break;
+                }
+                // Advance the cursor to the last page's max id
+                // REGARDLESS of per-artifact outcome — the in-run keyset
+                // advance the module doc describes. `ORDER BY id` on the
+                // candidacy query makes the last element the max.
+                cursor = candidates.last().map(|a| a.id);
+                let short_page = (candidates.len() as u32) < batch_size;
+
+                for artifact in &candidates {
+                    artifacts_walked += 1;
+                    match self.extract_and_persist(artifact).await {
+                        ExtractOutcome::Extracted => metadata_extracted += 1,
+                        ExtractOutcome::SkippedStructural => skipped_structural += 1,
+                        ExtractOutcome::SkippedTransient => skipped_transient += 1,
+                    }
+                }
+
+                if short_page {
+                    break;
                 }
             }
 
             tracing::info!(
                 artifacts_walked,
                 metadata_extracted,
-                skipped_no_metadata,
-                errors,
+                skipped_structural,
+                skipped_transient,
                 "wheel-metadata-backfill complete"
             );
 
@@ -354,8 +496,8 @@ impl TaskHandler for WheelMetadataBackfillHandler {
                 result_summary: json!({
                     "artifacts_walked":     artifacts_walked,
                     "metadata_extracted":   metadata_extracted,
-                    "skipped_no_metadata":  skipped_no_metadata,
-                    "errors":               errors,
+                    "skipped_structural":   skipped_structural,
+                    "skipped_transient":    skipped_transient,
                 }),
             })
         })
@@ -365,7 +507,7 @@ impl TaskHandler for WheelMetadataBackfillHandler {
 /// Parse `params.batch_size` (u64) into a clamped u32. Out-of-range,
 /// missing, or non-integer values fall back to [`DEFAULT_BATCH_SIZE`].
 /// Values above [`MAX_BATCH_SIZE`] clamp to that cap — the operator
-/// CAN ask for more but the handler bounds the per-run memory profile.
+/// CAN ask for more but the handler bounds the per-page memory profile.
 ///
 /// Total/pure — extracted as a free function so the unit tests can pin
 /// every input shape without standing up the full handler.
@@ -383,6 +525,21 @@ pub(crate) fn resolve_batch_size(params: &serde_json::Value) -> u32 {
     }
 }
 
+/// Parse `params.ignore_skip_markers` (bool) — defaults to `false` for
+/// any missing or non-boolean value. `true` lifts the durable
+/// structural-skip exclusion for this invocation, re-surfacing
+/// previously-marked wheels (see the module doc's "Durable
+/// structural-skip marker" section).
+///
+/// Total/pure — mirrors [`resolve_batch_size`]'s shape so the unit tests
+/// can pin every input shape without standing up the full handler.
+pub(crate) fn resolve_ignore_skip_markers(params: &serde_json::Value) -> bool {
+    params
+        .get("ignore_skip_markers")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -390,8 +547,6 @@ pub(crate) fn resolve_batch_size(params: &serde_json::Value) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::collections::HashSet;
 
     use bytes::Bytes;
     use chrono::DateTime;
@@ -558,8 +713,8 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["artifacts_walked"], 0);
                 assert_eq!(result_summary["metadata_extracted"], 0);
-                assert_eq!(result_summary["skipped_no_metadata"], 0);
-                assert_eq!(result_summary["errors"], 0);
+                assert_eq!(result_summary["skipped_structural"], 0);
+                assert_eq!(result_summary["skipped_transient"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -618,8 +773,8 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["artifacts_walked"], 3);
                 assert_eq!(result_summary["metadata_extracted"], 3);
-                assert_eq!(result_summary["skipped_no_metadata"], 0);
-                assert_eq!(result_summary["errors"], 0);
+                assert_eq!(result_summary["skipped_structural"], 0);
+                assert_eq!(result_summary["skipped_transient"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -643,11 +798,12 @@ mod tests {
     }
 
     // =====================================================================
-    // Test 3: Wheel with no METADATA member → skipped_no_metadata, no CR
+    // Test 3: Wheel with no METADATA member → skipped_structural, marker
+    // written, no wheel_metadata CR.
     // =====================================================================
 
     #[tokio::test]
-    async fn run_corrupt_wheel_counts_skipped_no_metadata() {
+    async fn run_corrupt_wheel_counts_skipped_structural_and_writes_marker() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -655,7 +811,9 @@ mod tests {
 
         let bytes = b"corrupt-wheel-bytes";
         let sha = put_into_cas(&storage, bytes).await;
-        artifacts.insert(make_wheel(repo_id, 0, sha, "1.0.0"));
+        let wheel = make_wheel(repo_id, 0, sha, "1.0.0");
+        let wheel_id = wheel.id;
+        artifacts.insert(wheel);
 
         let baseline_puts = storage.put_call_count();
         let storage_for_assert = storage.clone();
@@ -678,8 +836,8 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["artifacts_walked"], 1);
                 assert_eq!(result_summary["metadata_extracted"], 0);
-                assert_eq!(result_summary["skipped_no_metadata"], 1);
-                assert_eq!(result_summary["errors"], 0);
+                assert_eq!(result_summary["skipped_structural"], 1);
+                assert_eq!(result_summary["skipped_transient"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -690,27 +848,36 @@ mod tests {
         );
         assert_eq!(
             refs_for_assert.entry_count(),
-            0,
-            "Ok(None) must NOT insert a ContentReference row"
+            1,
+            "Ok(None) must insert exactly the wheel_metadata_skipped marker row"
         );
+        let marker = refs_for_assert
+            .find_by_source_and_kind(repo_id, wheel_id, WHEEL_METADATA_SKIPPED_KIND)
+            .await
+            .expect("query")
+            .expect("marker row present");
+        assert_eq!(marker.kind, WHEEL_METADATA_SKIPPED_KIND);
     }
 
     // =====================================================================
-    // Test 4: Oversized METADATA (Err(Validation)) → skipped_no_metadata
+    // Test 4: Oversized METADATA (Err(Validation)) → skipped_structural,
+    // marker written.
     //
     // Mirrors the Item-3 hook's posture: Validation = non-fatal skip,
-    // NOT a counted error.
+    // still structural (immutable content, re-running cannot help).
     // =====================================================================
 
     #[tokio::test]
-    async fn run_oversized_metadata_counts_skipped_no_metadata() {
+    async fn run_oversized_metadata_counts_skipped_structural_and_writes_marker() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
         let storage = Arc::new(MockStoragePort::new());
 
         let sha = put_into_cas(&storage, b"oversized-wheel").await;
-        artifacts.insert(make_wheel(repo_id, 0, sha, "1.0.0"));
+        let wheel = make_wheel(repo_id, 0, sha, "1.0.0");
+        let wheel_id = wheel.id;
+        artifacts.insert(wheel);
 
         let baseline_puts = storage.put_call_count();
         let storage_for_assert = storage.clone();
@@ -732,16 +899,25 @@ mod tests {
                 assert_eq!(result_summary["artifacts_walked"], 1);
                 assert_eq!(result_summary["metadata_extracted"], 0);
                 assert_eq!(
-                    result_summary["skipped_no_metadata"], 1,
-                    "Err(Validation) counts as `skipped_no_metadata`, NOT `errors` — \
-                     mirrors the ingest hook posture"
+                    result_summary["skipped_structural"], 1,
+                    "Err(Validation) counts as `skipped_structural`, not `skipped_transient` — \
+                     mirrors the ingest hook posture (non-fatal) plus the immutable-content \
+                     rationale"
                 );
-                assert_eq!(result_summary["errors"], 0);
+                assert_eq!(result_summary["skipped_transient"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
         assert_eq!(storage_for_assert.put_call_count() - baseline_puts, 0);
-        assert_eq!(refs_for_assert.entry_count(), 0);
+        assert_eq!(refs_for_assert.entry_count(), 1, "the marker row");
+        assert!(
+            refs_for_assert
+                .find_by_source_and_kind(repo_id, wheel_id, WHEEL_METADATA_SKIPPED_KIND)
+                .await
+                .expect("query")
+                .is_some(),
+            "marker row present for the oversized-METADATA skip"
+        );
     }
 
     // =====================================================================
@@ -791,13 +967,67 @@ mod tests {
         );
     }
 
-    /// End-to-end batch-cap pin: feed 1500 candidate wheels and confirm
-    /// `artifacts_walked <= 1000`. The mock's
-    /// `find_pypi_wheels_without_kind` honours the limit param exactly
-    /// (it `.truncate(limit as usize)`s), so this also pins that the
-    /// handler ASKED for ≤ 1000.
+    #[test]
+    fn resolve_ignore_skip_markers_defaults_false() {
+        assert!(!resolve_ignore_skip_markers(&serde_json::Value::Null));
+        assert!(!resolve_ignore_skip_markers(&serde_json::json!({})));
+        assert!(!resolve_ignore_skip_markers(
+            &serde_json::json!({"ignore_skip_markers": "yes"})
+        ));
+        assert!(resolve_ignore_skip_markers(
+            &serde_json::json!({"ignore_skip_markers": true})
+        ));
+        assert!(!resolve_ignore_skip_markers(
+            &serde_json::json!({"ignore_skip_markers": false})
+        ));
+    }
+
+    /// The `skip_marker_kind` argument reaching the candidacy port call
+    /// reflects `ignore_skip_markers`: `Some(WHEEL_METADATA_SKIPPED_KIND)`
+    /// by default, `None` when the operator opts to re-visit marked rows.
     #[tokio::test]
-    async fn run_with_batch_size_above_cap_clamps_to_max() {
+    async fn run_passes_skip_marker_kind_per_ignore_skip_markers_param() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let refs = Arc::new(MockContentReferenceIndex::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let artifacts_for_assert = artifacts.clone();
+        let handler = make_handler_with(artifacts, refs, storage, WheelMetadataStubBehaviour::None);
+
+        handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        let default_calls = artifacts_for_assert.pypi_calls();
+        assert_eq!(default_calls.len(), 1);
+        assert_eq!(
+            default_calls[0].skip_marker_kind.as_deref(),
+            Some(WHEEL_METADATA_SKIPPED_KIND),
+            "default (ignore_skip_markers omitted) MUST exclude marked rows"
+        );
+
+        handler
+            .run(
+                &serde_json::json!({"ignore_skip_markers": true}),
+                make_context(),
+            )
+            .await
+            .expect("Ok");
+        let calls_after_ignore = artifacts_for_assert.pypi_calls();
+        assert_eq!(
+            calls_after_ignore.last().unwrap().skip_marker_kind,
+            None,
+            "ignore_skip_markers: true MUST lift the marker exclusion"
+        );
+    }
+
+    // =====================================================================
+    // Test 6: Batch-cap pin — request 2000, page size clamps to 1000, but
+    // the RUN still drains every candidate across multiple internal pages
+    // (the full-drain-per-run posture the in-run keyset advance enables).
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_with_batch_size_above_cap_clamps_page_size_but_drains_all_candidates() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -811,6 +1041,7 @@ mod tests {
         for seed in 0..1_500u32 {
             artifacts.insert(make_wheel(repo_id, seed, shared_sha.clone(), "1.0.0"));
         }
+        let artifacts_for_assert = artifacts.clone();
 
         let handler = make_handler_with(
             artifacts,
@@ -827,140 +1058,184 @@ mod tests {
         match outcome {
             TaskOutcome::Completed { result_summary } => {
                 let walked = result_summary["artifacts_walked"].as_u64().unwrap();
-                assert!(
-                    walked <= 1_000,
-                    "request 2000 must clamp at MAX_BATCH_SIZE (1000); walked = {walked}"
-                );
                 assert_eq!(
-                    walked, 1_000,
-                    "the mock has 1500 candidates and the request was clamped to 1000 — \
-                     the handler walks exactly 1000"
+                    walked, 1_500,
+                    "the in-run keyset advance drains every candidate across pages, \
+                     not just the first (page-size-capped) page; walked = {walked}"
                 );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+
+        let calls = artifacts_for_assert.pypi_calls();
+        assert!(
+            calls.iter().all(|c| c.limit == 1_000),
+            "every page request MUST be clamped to MAX_BATCH_SIZE (1000): {calls:?}"
+        );
+        assert_eq!(
+            calls.len(),
+            2,
+            "1500 candidates at page size 1000 → a full page then a short page: {calls:?}"
+        );
+        assert_eq!(calls[0].after, None, "the first page has no cursor");
+        assert!(
+            calls[1].after.is_some(),
+            "the second page carries the cursor advanced from the first page's max id"
+        );
+    }
+
+    /// Per-name-keyed [`FormatHandler`] stub — unlike `StubFormatHandler`
+    /// (one behaviour for every artifact), this returns `Ok(Some(bytes))`
+    /// for one distinguished package name and `Ok(None)` (structural
+    /// skip) for everything else. Lets a single run genuinely mix a
+    /// successful extraction with structural skips, which the acceptance
+    /// fixture below needs to prove the "valid item behind > batch-size
+    /// skips" case for real rather than by proxy.
+    struct NameKeyedWheelMetadataHandler {
+        valid_name: String,
+    }
+    impl FormatHandler for NameKeyedWheelMetadataHandler {
+        fn format_key(&self) -> &str {
+            "pypi"
+        }
+        fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+            unimplemented!()
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn extract_wheel_metadata_bytes(
+            &self,
+            coords: &ArtifactCoords,
+            _payload: PayloadAccess<'_>,
+        ) -> DomainResult<Option<Bytes>> {
+            if coords.name == self.valid_name {
+                Ok(Some(Bytes::from_static(b"METADATA")))
+            } else {
+                Ok(None)
+            }
+        }
     }
 
     // =====================================================================
-    // Test 6: Resumability — two invocations against a stable candidate
-    // set drain it deterministically.
-    //
-    // The mock's `find_pypi_wheels_without_kind` honours the per-test
-    // allowlist (`set_pypi_wheels_without_kind_filter`) — the first
-    // invocation processes 3 wheels (batch_size = 3), updates the
-    // allowlist to model "those rows now have a wheel_metadata CR",
-    // then the second invocation picks up the remaining 2.
+    // Test 7: In-run keyset advance — a valid wheel behind > batch-size
+    // structurally-skipped wheels is still processed in the FIRST run.
     // =====================================================================
 
     #[tokio::test]
-    async fn run_is_resumable_across_invocations() {
+    async fn run_processes_valid_item_behind_more_than_batch_size_structural_skips() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
         let storage = Arc::new(MockStoragePort::new());
 
-        // Seed 5 wheels with deterministic SHAs (one bytes payload per
-        // wheel so the test asserts per-wheel CR uniqueness via the
-        // distinct synthetic sha-field, not via shared bytes).
-        let mut all_ids: Vec<Uuid> = Vec::new();
+        // 5 low-id wheels that will structurally skip (batch_size = 3,
+        // so this is MORE than one page's worth of permanent skips) plus
+        // one valid wheel behind them.
+        let mut skip_ids: Vec<Uuid> = Vec::new();
         for seed in 0..5u32 {
-            let bytes = format!("wheel-{seed}");
+            let bytes = format!("skip-wheel-{seed}");
             let sha = put_into_cas(&storage, bytes.as_bytes()).await;
             let a = make_wheel(repo_id, seed, sha, &format!("1.{seed}.0"));
-            all_ids.push(a.id);
+            skip_ids.push(a.id);
             artifacts.insert(a);
         }
+        let valid_sha = put_into_cas(&storage, b"valid-wheel-bytes").await;
+        let valid = make_wheel(repo_id, 5, valid_sha, "1.5.0");
+        let valid_id = valid.id;
+        let valid_name = valid.name.clone();
+        artifacts.insert(valid);
 
-        // First invocation: all 5 are candidates, batch_size = 3.
-        artifacts.set_pypi_wheels_without_kind_filter(Some(all_ids.iter().copied().collect()));
-
-        let handler = make_handler_with(
-            artifacts.clone(),
-            refs.clone(),
-            storage.clone(),
-            WheelMetadataStubBehaviour::EmitBytes(b"METADATA".to_vec()),
+        let artifacts_for_assert = artifacts.clone();
+        let pypi_handler: Arc<dyn FormatHandler> =
+            Arc::new(NameKeyedWheelMetadataHandler { valid_name });
+        let handler = WheelMetadataBackfillHandler::new(
+            artifacts as Arc<dyn ArtifactRepository>,
+            refs.clone() as Arc<dyn ContentReferenceIndex>,
+            storage as Arc<dyn StoragePort>,
+            pypi_handler,
         );
 
-        let first = handler
+        let outcome = handler
             .run(&serde_json::json!({"batch_size": 3}), make_context())
             .await
             .expect("Ok");
-        let first_walked = match &first {
+
+        match outcome {
             TaskOutcome::Completed { result_summary } => {
-                result_summary["artifacts_walked"].as_u64().unwrap()
+                assert_eq!(
+                    result_summary["artifacts_walked"], 6,
+                    "all 6 candidates (5 skips + 1 behind them) walked in the FIRST run"
+                );
+                assert_eq!(result_summary["skipped_structural"], 5);
+                assert_eq!(
+                    result_summary["metadata_extracted"], 1,
+                    "the valid wheel behind the > batch-size skip run IS extracted \
+                     in the first run — the in-run keyset advance reaches it"
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
-        };
-        assert_eq!(first_walked, 3);
-        // Walk-stable order: the mock sorts candidates by id; the
-        // first 3 are the lowest-id artifacts in the seed.
-        let mut sorted_ids = all_ids.clone();
-        sorted_ids.sort();
-        let processed_first: Vec<Uuid> = sorted_ids[..3].to_vec();
-        let remaining_after_first: HashSet<Uuid> = sorted_ids[3..].iter().copied().collect();
-
-        // Model "the first 3 now have wheel_metadata CR rows" — the
-        // candidacy SQL would prune them. The mock's filter
-        // represents the *post-NOT-EXISTS* set; updating it to the
-        // remaining 2 mirrors what the production SQL would compute on
-        // the second run.
-        artifacts.set_pypi_wheels_without_kind_filter(Some(remaining_after_first.clone()));
-
-        let second = handler
-            .run(&serde_json::json!({"batch_size": 3}), make_context())
-            .await
-            .expect("Ok");
-        let (second_walked, second_extracted) = match second {
-            TaskOutcome::Completed { result_summary } => (
-                result_summary["artifacts_walked"].as_u64().unwrap(),
-                result_summary["metadata_extracted"].as_u64().unwrap(),
-            ),
-            other => panic!("expected Completed, got {other:?}"),
-        };
-        assert_eq!(
-            second_walked, 2,
-            "second invocation drains the remaining 2 (not 3 — the candidate set shrunk)"
-        );
-        assert_eq!(second_extracted, 2);
-        // Sanity: the first 3 ids are different from the remaining 2 set.
-        for id in processed_first {
-            assert!(!remaining_after_first.contains(&id));
         }
+
+        for id in &skip_ids {
+            assert!(
+                refs.find_by_source_and_kind(repo_id, *id, WHEEL_METADATA_SKIPPED_KIND)
+                    .await
+                    .expect("query")
+                    .is_some(),
+                "artifact {id} must have a structural-skip marker"
+            );
+        }
+        assert!(
+            refs.find_by_source_and_kind(repo_id, valid_id, WHEEL_METADATA_KIND)
+                .await
+                .expect("query")
+                .is_some(),
+            "the valid wheel must have landed its wheel_metadata ContentReference"
+        );
+
+        // The internal page sequence: 3 + 3 + 0 — a full-length page never
+        // short-circuits the loop on its own (only a page shorter than
+        // `batch_size` does), so a candidate count that is an exact
+        // multiple of `batch_size` costs one extra empty-page round trip
+        // before the run recognises it is drained.
+        let calls = artifacts_for_assert.pypi_calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "6 candidates at batch_size 3 → two full pages then a draining empty page"
+        );
+        assert_eq!(calls[0].after, None, "no cursor on the first page");
+        assert!(
+            calls[1].after.is_some(),
+            "the second page carries the cursor advanced from the first page's max id"
+        );
+        assert!(
+            calls[2].after > calls[1].after,
+            "the third (draining) page's cursor advanced past the second page's max id"
+        );
     }
 
     // =====================================================================
-    // Test 7: Infrastructure error on a single artifact does not abort
-    // the batch — counts as `errors`, the walk continues.
+    // Test 8: Transient skip (CAS read failure) — no marker, retried on
+    // the next invocation.
     // =====================================================================
 
     #[tokio::test]
-    async fn run_per_artifact_infrastructure_error_continues_walk() {
+    async fn run_transient_cas_failure_writes_no_marker_and_is_retried_next_run() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
         let storage = Arc::new(MockStoragePort::new());
 
-        // Two wheels in the candidate set. Only one has bytes in CAS;
-        // the other's `sha256_checksum` is a "valid hex" placeholder
-        // that the mock CAS does not have — `storage.get` errors,
-        // which is the infrastructure-class failure we want to drive.
-        let sha_ok = put_into_cas(&storage, b"good-wheel").await;
-        let a_ok = make_wheel(repo_id, 0, sha_ok, "1.0.0");
-        let ok_id = a_ok.id;
-        artifacts.insert(a_ok);
+        // sha256_checksum has no matching bytes in the mock CAS → the
+        // CAS `get` errors, the infrastructure-class failure we want.
+        let missing_sha = deterministic_sha(0xDEAD_BEEF);
+        let wheel = make_wheel(repo_id, 0, missing_sha, "1.0.0");
+        let wheel_id = wheel.id;
+        artifacts.insert(wheel);
 
-        let sha_missing = deterministic_sha(0xDEAD_BEEF);
-        let a_missing = make_wheel(repo_id, 1, sha_missing, "1.1.0");
-        let missing_id = a_missing.id;
-        artifacts.insert(a_missing);
-
-        // Set a stable order so the test is deterministic on which
-        // artifact errors. The mock orders by id, but we don't need
-        // that here — we just assert the *count* of errors vs
-        // extracted.
-        artifacts
-            .set_pypi_wheels_without_kind_filter(Some([ok_id, missing_id].into_iter().collect()));
-
+        let refs_for_assert = refs.clone();
         let handler = make_handler_with(
             artifacts,
             refs,
@@ -968,25 +1243,126 @@ mod tests {
             WheelMetadataStubBehaviour::EmitBytes(b"M".to_vec()),
         );
 
-        let outcome = handler
+        let first = handler
             .run(&serde_json::Value::Null, make_context())
             .await
             .expect("Ok");
+        match first {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["artifacts_walked"], 1);
+                assert_eq!(result_summary["metadata_extracted"], 0);
+                assert_eq!(result_summary["skipped_structural"], 0);
+                assert_eq!(
+                    result_summary["skipped_transient"], 1,
+                    "CAS read failure is transient, not structural"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(
+            refs_for_assert.entry_count(),
+            0,
+            "a transient skip MUST NOT write a marker row"
+        );
+        assert!(refs_for_assert
+            .find_by_source_and_kind(repo_id, wheel_id, WHEEL_METADATA_SKIPPED_KIND)
+            .await
+            .expect("query")
+            .is_none());
 
-        match outcome {
+        // No marker landed and the mock's candidacy set is unchanged
+        // (still no `wheel_metadata` row either), so a second invocation
+        // — a fresh `run()` call, fresh cursor — re-derives and re-walks
+        // the SAME artifact.
+        let second = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        match second {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(
-                    result_summary["artifacts_walked"], 2,
-                    "walked both candidates — the per-artifact error did NOT abort"
+                    result_summary["artifacts_walked"], 1,
+                    "the transient skip remains a candidate and is retried on the next run"
                 );
+                assert_eq!(result_summary["skipped_transient"], 1);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    // =====================================================================
+    // Test 9: Marker persistence proof — after structural skips land
+    // markers in run 1, a simulated run 2 (candidacy allowlist pruned of
+    // the marked ids, mirroring what the postgres adapter's NOT EXISTS
+    // predicate would enforce against a real `content_references` table)
+    // does not re-read them.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_two_does_not_reread_structural_skips_once_marked() {
+        let repo_id = Uuid::new_v4();
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let refs = Arc::new(MockContentReferenceIndex::new());
+        let storage = Arc::new(MockStoragePort::new());
+
+        let mut ids: Vec<Uuid> = Vec::new();
+        for seed in 0..3u32 {
+            let bytes = format!("skip-wheel-{seed}");
+            let sha = put_into_cas(&storage, bytes.as_bytes()).await;
+            let a = make_wheel(repo_id, seed, sha, &format!("1.{seed}.0"));
+            ids.push(a.id);
+            artifacts.insert(a);
+        }
+
+        let refs_for_assert = refs.clone();
+        let handler = make_handler_with(
+            artifacts.clone(),
+            refs,
+            storage,
+            WheelMetadataStubBehaviour::None,
+        );
+
+        let first = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        match first {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["artifacts_walked"], 3);
+                assert_eq!(result_summary["skipped_structural"], 3);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        for id in &ids {
+            assert!(
+                refs_for_assert
+                    .find_by_source_and_kind(repo_id, *id, WHEEL_METADATA_SKIPPED_KIND)
+                    .await
+                    .expect("query")
+                    .is_some(),
+                "marker row expected for {id}"
+            );
+        }
+
+        // Mirrors what the real adapter's NOT EXISTS predicate on
+        // `wheel_metadata_skipped` would enforce on a second invocation:
+        // every id that landed a marker in run 1 is no longer a
+        // candidate. This mock's candidacy is an explicit allowlist
+        // rather than a live read of `MockContentReferenceIndex`, so the
+        // test updates it directly — the marker rows asserted above are
+        // the proof the real adapter has what it needs to do this itself
+        // (see the `hort-adapters-postgres` `skip_marker_kind` tests).
+        artifacts.set_pypi_wheels_without_kind_filter(Some(std::collections::HashSet::new()));
+
+        let second = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        match second {
+            TaskOutcome::Completed { result_summary } => {
                 assert_eq!(
-                    result_summary["metadata_extracted"], 1,
-                    "the wheel whose bytes were in CAS produced a CR"
-                );
-                assert_eq!(result_summary["skipped_no_metadata"], 0);
-                assert_eq!(
-                    result_summary["errors"], 1,
-                    "the missing-CAS-bytes wheel counted as an error"
+                    result_summary["artifacts_walked"], 0,
+                    "the second run must not re-read the now-marked structural skips"
                 );
             }
             other => panic!("expected Completed, got {other:?}"),
@@ -994,7 +1370,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Test 8: find_pypi_wheels_without_kind failure → TaskOutcome::Failed
+    // Test 10: find_pypi_wheels_without_kind failure → TaskOutcome::Failed
     // (retry: true) — same shape as the quarantine-release-sweep precedent.
     // =====================================================================
 
@@ -1119,6 +1495,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::artifact::Artifact>>> {
             Box::pin(async {
                 Err(DomainError::Invariant(
@@ -1130,6 +1508,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::artifact::Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -1160,7 +1540,7 @@ mod tests {
     }
 
     // =====================================================================
-    // Test 9: kind() returns the exact literal that's in ADMIN_INVOKABLE_TASK_KINDS
+    // Test 11: kind() returns the exact literal that's in ADMIN_INVOKABLE_TASK_KINDS
     // — guards against a rename drift.
     // =====================================================================
 
@@ -1180,9 +1560,10 @@ mod tests {
     }
 
     // =====================================================================
-    // Test 10: extract_and_persist short-circuits cleanly when the stub
+    // Test 12: extract_and_persist short-circuits cleanly when the stub
     // returns Ok(Some) but the CAS write fails — the per-artifact path
-    // surfaces the error which the batch loop folds into `errors`.
+    // surfaces the error which the batch loop folds into
+    // `skipped_transient`.
     // (Pins the error-mapping arm of extract_and_persist.)
     // =====================================================================
 
@@ -1215,10 +1596,10 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["artifacts_walked"], 1);
                 assert_eq!(result_summary["metadata_extracted"], 0);
-                assert_eq!(result_summary["skipped_no_metadata"], 0);
+                assert_eq!(result_summary["skipped_structural"], 0);
                 assert_eq!(
-                    result_summary["errors"], 1,
-                    "CAS put failure is per-artifact `errors`, not aborting"
+                    result_summary["skipped_transient"], 1,
+                    "CAS put failure is per-artifact `skipped_transient`, not aborting"
                 );
             }
             other => panic!("expected Completed, got {other:?}"),

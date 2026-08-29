@@ -135,6 +135,26 @@ pub struct MockArtifactRepository {
     /// caller's identity actually reaches the port instead of being
     /// dropped on the way — the event attribution depends on it.
     deletions: Mutex<Vec<(Uuid, Actor)>>,
+    /// Every
+    /// [`find_pypi_wheels_without_kind`](ArtifactRepository::find_pypi_wheels_without_kind)
+    /// call, in order, with its full argument set. Lets a test assert the
+    /// in-run keyset cursor advances correctly across the handler's
+    /// internal page loop, and that `ignore_skip_markers` reaches the
+    /// port call as the documented `skip_marker_kind` toggle.
+    pypi_calls: Mutex<Vec<CandidacyCall>>,
+    /// Mirrors [`Self::pypi_calls`] for
+    /// [`find_oci_image_manifests_without_kind`](ArtifactRepository::find_oci_image_manifests_without_kind).
+    oci_calls: Mutex<Vec<CandidacyCall>>,
+}
+
+/// One recorded call to either backfill-candidacy query. See
+/// [`MockArtifactRepository::pypi_calls`] / `oci_calls`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidacyCall {
+    pub kind: String,
+    pub limit: u32,
+    pub after: Option<Uuid>,
+    pub skip_marker_kind: Option<String>,
 }
 
 impl MockArtifactRepository {
@@ -147,6 +167,8 @@ impl MockArtifactRepository {
             oci_image_manifests_without_kind_filter: Mutex::new(None),
             first_seen_errors: Mutex::new(std::collections::VecDeque::new()),
             deletions: Mutex::new(Vec::new()),
+            pypi_calls: Mutex::new(Vec::new()),
+            oci_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -190,6 +212,21 @@ impl MockArtifactRepository {
         allowed: Option<std::collections::HashSet<Uuid>>,
     ) {
         *self.oci_image_manifests_without_kind_filter.lock().unwrap() = allowed;
+    }
+
+    /// Every recorded call to `find_pypi_wheels_without_kind`, in order.
+    /// Used to assert the in-run keyset cursor sequence
+    /// (`after` advancing page over page within one handler `run()`) and
+    /// that `ignore_skip_markers` reaches the port call as the documented
+    /// `skip_marker_kind` toggle.
+    pub fn pypi_calls(&self) -> Vec<CandidacyCall> {
+        self.pypi_calls.lock().unwrap().clone()
+    }
+
+    /// Mirrors [`Self::pypi_calls`] for
+    /// `find_oci_image_manifests_without_kind`.
+    pub fn oci_calls(&self) -> Vec<CandidacyCall> {
+        self.oci_calls.lock().unwrap().clone()
     }
 
     pub fn insert(&self, artifact: Artifact) {
@@ -735,9 +772,17 @@ impl ArtifactRepository for MockArtifactRepository {
     /// to inject a per-test allowlist of artifact ids.
     fn find_pypi_wheels_without_kind(
         &self,
-        _kind: &str,
+        kind: &str,
         limit: u32,
+        after: Option<Uuid>,
+        skip_marker_kind: Option<&str>,
     ) -> BoxFut<'_, DomainResult<Vec<Artifact>>> {
+        self.pypi_calls.lock().unwrap().push(CandidacyCall {
+            kind: kind.to_string(),
+            limit,
+            after,
+            skip_marker_kind: skip_marker_kind.map(str::to_owned),
+        });
         let filter = self.pypi_wheels_without_kind_filter.lock().unwrap().clone();
         let mut items: Vec<Artifact> = self
             .artifacts
@@ -751,9 +796,13 @@ impl ArtifactRepository for MockArtifactRepository {
                         None => true,
                         // Filter seeded — only ids in the set are candidates
                         // (i.e. the test is modelling "these artifacts
-                        // have no `wheel_metadata` row").
+                        // have no `wheel_metadata` row" — and, once a
+                        // structural-skip marker lands, "no marker row
+                        // either").
                         Some(allowed) => allowed.contains(&a.id),
                     }
+                    // Keyset cursor — mirrors the adapter's `id > $after`.
+                    && after.is_none_or(|cursor| a.id > cursor)
             })
             .cloned()
             .collect();
@@ -773,9 +822,17 @@ impl ArtifactRepository for MockArtifactRepository {
     /// via [`Self::set_oci_image_manifests_without_kind_filter`].
     fn find_oci_image_manifests_without_kind(
         &self,
-        _kind: &str,
+        kind: &str,
         limit: u32,
+        after: Option<Uuid>,
+        skip_marker_kind: Option<&str>,
     ) -> BoxFut<'_, DomainResult<Vec<Artifact>>> {
+        self.oci_calls.lock().unwrap().push(CandidacyCall {
+            kind: kind.to_string(),
+            limit,
+            after,
+            skip_marker_kind: skip_marker_kind.map(str::to_owned),
+        });
         let filter = self
             .oci_image_manifests_without_kind_filter
             .lock()
@@ -792,6 +849,8 @@ impl ArtifactRepository for MockArtifactRepository {
                         None => true,
                         Some(allowed) => allowed.contains(&a.id),
                     }
+                    // Keyset cursor — mirrors the adapter's `id > $after`.
+                    && after.is_none_or(|cursor| a.id > cursor)
             })
             .cloned()
             .collect();

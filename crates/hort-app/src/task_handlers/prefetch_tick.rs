@@ -1332,6 +1332,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::artifact::Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -1339,6 +1341,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::entities::artifact::Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
