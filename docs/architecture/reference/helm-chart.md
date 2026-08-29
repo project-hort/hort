@@ -99,7 +99,7 @@ flipped on).
 | DaemonSet — pre-pull server (`prepull-daemonset.yaml`) | `prePull.enabled` (default **true**, pre-install/pre-upgrade hook) | pre-pulls the server image onto every node `deployment.yaml` can schedule onto. |
 | DaemonSet — pre-pull worker (`prepull-worker-daemonset.yaml`) | `prePull.enabled` **and** `worker.enabled` (pre-install/pre-upgrade hook) | pre-pulls the worker image onto every node `worker-deployment.yaml` can schedule onto. |
 | Job — pre-pull wait/cleanup (`prepull-job.yaml`) | `prePull.enabled` (pre-install/pre-upgrade hook) | blocks on both DaemonSets' rollout, then deletes them. |
-| SA+Role+RoleBinding — pre-pull (`prepull-rbac.yaml`) | `prePull.enabled` | lets the wait Job read/delete the pre-pull DaemonSets. |
+| SA+Role+RoleBinding — pre-pull (`prepull-rbac.yaml`) | `prePull.enabled` (pre-install/pre-upgrade hook) | lets the wait Job read/delete the pre-pull DaemonSets. |
 | ServiceAccount — server (`serviceaccount.yaml`) | `serviceAccount.create` (default **true**) | identity for server pods + scrub CronJob. |
 | PVC (`pvc.yaml`) | `storage.backend=filesystem` **and** `storage.filesystem.pvc.enabled` (default true) | CAS data volume; annotated `helm.sh/resource-policy: keep`. |
 | CronJob — scrub (`cronjob-scrub.yaml`) | `scheduledTasks.scrub.enabled` (default **true**) | `hort-server scrub` CAS integrity sweep. **`executionPath: dsn-direct`: gated by `scheduledTasks.scrub.enabled` alone — not by `scheduledTasks.adminTasksEnabled`.** |
@@ -130,20 +130,26 @@ does not appear in `helm template` output.
 
 ## 4. Helm hooks, install ordering & workload wiring
 
-Six templates carry `helm.sh/hook` annotations:
+Seven templates carry `helm.sh/hook` annotations:
 
 | Job/DaemonSet | Hook | Weight | Delete policy |
 |---|---|---|---|
+| pre-pull RBAC (`<fullname>-prepull` SA+Role+RoleBinding) | `pre-install,pre-upgrade` | `-11` | `before-hook-creation` |
 | pre-pull DaemonSets (`<fullname>-prepull-server`, `<fullname>-prepull-worker`) | `pre-install,pre-upgrade` | `-10` | `before-hook-creation` |
 | pre-pull wait/cleanup (`<fullname>-prepull`) | `pre-install,pre-upgrade` | `-9` | `before-hook-creation,hook-succeeded` |
 | migrate (`<fullname>-migrate`) | `pre-install,pre-upgrade` | `-5` | `before-hook-creation,hook-succeeded` |
 | svc-token bootstrap (`<fullname>-svc-token-bootstrap`) | `post-install,post-upgrade` | `5` | `before-hook-creation` |
 | test-connection | `test` | — | `before-hook-creation,hook-succeeded` |
 
-**Ordering guarantee:** pre-pull DaemonSets (`pre-install`, w=-10) →
-pre-pull wait Job (w=-9) → migrate Job (w=-5) → all non-hook resources
-incl. server Deployment + bootstrap RBAC (w=0) → svc-token bootstrap
-Job (`post-install`, w=5). Net effect: every node eligible to run the
+**Ordering guarantee:** pre-pull RBAC (`pre-install`, w=-11) → pre-pull
+DaemonSets (w=-10) → pre-pull wait Job (w=-9) → migrate Job (w=-5) →
+all non-hook resources incl. server Deployment + bootstrap RBAC (w=0)
+→ svc-token bootstrap Job (`post-install`, w=5). Net effect: the
+pre-pull ServiceAccount exists before anything that needs it — Helm
+applies regular (non-hook) release resources only AFTER hooks
+complete, so without its own hook annotation the pre-pull RBAC would
+not exist yet when the weight -9 wait Job's pod is scheduled, on both
+upgrades and fresh installs; every node eligible to run the
 server/worker Deployments already holds the release image (the
 pre-pull wait Job blocked on it) **before** the migrate Job even
 starts — closing the node-cache-miss window where the migrate Job
@@ -157,9 +163,14 @@ schedule, by which time the bootstrap Job has populated the
 Job/Pod completion, not DaemonSet rollout, so the DaemonSets carry only
 `before-hook-creation` — the wait Job at w=-9 is the resource that
 actually blocks the upgrade, via `kubectl rollout status` bounded by
-`prePull.timeoutSeconds`. The migrate Job runs under the namespace
-`default` ServiceAccount on purpose — as a pre-install hook it precedes
-the SA template.
+`prePull.timeoutSeconds`. The pre-pull RBAC carries only
+`before-hook-creation` too, and deliberately never `hook-succeeded`:
+non-workload kinds count as "succeeded" the instant they're created, so
+`hook-succeeded` would delete the ServiceAccount before the weight -9
+Job ever runs — these resources linger between upgrades by design,
+replaced idempotently on the next attempt. The migrate Job runs under
+the namespace `default` ServiceAccount on purpose — as a pre-install
+hook it precedes the SA template.
 
 **What each workload runs** (`hort-server` / `hort-worker` / `hort-cli`):
 
