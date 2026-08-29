@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-08-29
+
+### Fixed
+
+- **The quarantine-release sweep no longer starves.** Candidacy was
+  ordered oldest-first with a hard per-tick batch cap, and a candidate
+  the sweep skips — no scan authority, or a provenance clearance still
+  pending, the canonical case being a config/layer blob whose clearance
+  can only ever arrive through its parent manifest's cascade — stays
+  `quarantined` and therefore stays at the head of the next tick's
+  selection. Once a whole batch of the oldest candidates was permanently
+  unreleasable, **no artifact anywhere in the deployment was ever
+  released again**, with nothing in the logs that looked like a failure
+  (a live deployment hit this at 1482 quarantined artifacts against a
+  batch of 1000, of which 964 of the oldest 1000 were parent-gated
+  blobs). Candidacy now rotates: a new nullable
+  `artifacts.release_attempt_at` column records when the sweep last
+  *attempted* a row (scheduling metadata only — it records that a
+  decision was attempted, never what it was, and is deliberately not
+  event-sourced), the sweep stamps the whole batch each tick, and
+  selection orders by that cursor `NULLS FIRST` before the window
+  anchor. A never-attempted artifact is therefore served on the very
+  next tick regardless of backlog size, and a backlog of N is fully
+  re-attempted every ceil(N / 1000) ticks. Release authority is
+  untouched: candidacy is still "window elapsed" and every release still
+  goes through the fail-closed per-artifact check, so the cursor can
+  only change *which* candidates a bounded batch re-checks first, never
+  whether one may be released. Migration
+  `022_artifacts_release_attempt_at.sql` adds the column and replaces
+  the single-column candidacy index with the matching `(release_attempt_at
+  NULLS FIRST, quarantine_window_start)` partial index. (#208)
+
+### Changed
+
+- **The sweep's per-tick accounting names the gate that is actually
+  holding each candidate, and a saturated sweep is alertable.** The
+  `quarantine-release-sweep` task's `result_summary` key
+  `skipped_no_authority` — a fabricated `candidates - released` delta —
+  is replaced by two true per-cause counts reported by the use case
+  itself, `skipped_no_scan_authority` and `skipped_provenance_pending`
+  (also the log line's fields). The old delta conflated a scan-authority
+  hold, which drains once scanners catch up, with a provenance hold,
+  which may never self-clear, and additionally counted candidates that
+  are merely no longer releasable as though they were held. A tick that
+  fills the batch and releases nothing now emits a `warn!`
+  ("sweep saturated, nothing releasable this tick") carrying both
+  counts, in place of the routine `info!` — the stall signature is an
+  operator alert rather than a line that reads like a normal policy
+  outcome. (#208)
+- **The sweep's provenance-pending count now splits out structural
+  parent-gated holds.** `skipped_provenance_pending` used to conflate
+  two operator-distinct situations: an artifact whose own scan or
+  signature is still outstanding (actionable — resolves per artifact or
+  with time), and a config/layer blob constituent whose only clearance
+  path is its parent manifest's cascade (structural — moves only when
+  the root gets signed, and a never-signed root's blobs hold
+  indefinitely by design). The `quarantine-release-sweep` task's
+  `result_summary` gains a third count, `held_parent_gated`, carrying
+  the parent-gated share of what used to be reported under
+  `skipped_provenance_pending`; the log line's tick-complete and
+  stall-warn fields gain the same field. On the production deployment
+  that motivated this split, ~964 of 1000 candidates in a stalled batch
+  are the structural kind — the split is what makes that stall warning
+  readable rather than alarming. (#209)
+
 ## [0.12.0] - 2026-08-27
 
 ### Added

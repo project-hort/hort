@@ -20,9 +20,10 @@
 //!    deadline (`quarantine_window_start + effective_duration`) is at
 //!    or before `now` — the adapter resolves `repo → effective
 //!    duration` from `policy_projections` (repo-scoped → global →
-//!    default) and issues one indexed range scan per
+//!    default) and issues one indexed scan per
 //!    distinct duration `D`, using the partial index
-//!    `idx_artifacts_quarantine_window_start ON (quarantine_window_start)
+//!    `idx_artifacts_quarantine_release_cursor ON (release_attempt_at
+//!    NULLS FIRST, quarantine_window_start)
 //!    WHERE quarantine_status='quarantined'`.
 //! 3. Pass the ids to [`QuarantineReleasePort::release_expired`] (the
 //!    application-layer `QuarantineUseCase::release_expired`). That
@@ -30,12 +31,44 @@
 //!    fail-closed release-authority predicate (`ScanSucceeded` /
 //!    `ScanWaived`; ADR 0007) per artifact; a window-expired candidate
 //!    without a clean scan stays quarantined and falls out of the
-//!    returned `Vec`.
-//! 4. Return [`TaskOutcome::Completed`] with a result summary
-//!    `{ candidates, released, skipped_no_authority }` — the
-//!    `skipped_no_authority` count is the deny-by-default
-//!    observability signal (per-tick summary:
-//!    candidates / released / skipped-no-authority).
+//!    summary's `released` list.
+//! 4. Stamp the whole candidate batch through
+//!    [`QuarantineReleaseCandidatesRepository::mark_attempted`] so the
+//!    next tick's candidacy rotates past it (below).
+//! 5. Return [`TaskOutcome::Completed`] with a result summary
+//!    `{ candidates, released, skipped_no_scan_authority,
+//!    skipped_provenance_pending, held_parent_gated }` — the three hold
+//!    counts are the deny-by-default observability signal, reported per
+//!    cause because each calls for a different operator response: a
+//!    scan-authority backlog drains once scanners catch up, a
+//!    provenance-pending one resolves per artifact as signatures land
+//!    or final verifies decide, and a parent-gated one moves only when
+//!    roots get signed (or, in future, via retention) — an unsigned
+//!    root's blob constituents hold indefinitely by design (ADR 0039).
+//!
+//! **Fair candidacy — the attempt cursor.** A candidate the authority or
+//! provenance gate permanently holds is never released, so under
+//! oldest-first candidacy it never left the head of the selection: once
+//! such rows filled a whole [`BATCH_SIZE`] batch, the sweep stopped
+//! reaching any other artifact in the deployment and nothing was ever
+//! released again, silently. The handler therefore stamps
+//! `release_attempt_at` on every candidate it hands to `release_expired`
+//! (released ones included — they leave the pool anyway, and excluding
+//! them would cost a second statement), and the adapter orders candidacy
+//! by that cursor `NULLS FIRST`. Never-attempted artifacts are served
+//! first, so a freshly-expired artifact is picked up on the very next
+//! tick regardless of backlog size, and a backlog of N is fully
+//! re-attempted every `ceil(N / BATCH_SIZE)` ticks.
+//!
+//! A `mark_attempted` failure is warn-and-continue: the tick's release
+//! work already stands, and an unstamped batch merely re-serves next tick
+//! — the pre-cursor behaviour, never a wrong release.
+//!
+//! **Stall signal.** A tick that fills the batch and releases nothing is
+//! the saturation signature — the sweep is doing full-batch work with
+//! zero progress — and is reported at `warn!` so it is alertable, rather
+//! than hiding inside an `info!` line that reads like a normal policy
+//! outcome.
 //!
 //! **No new metric.** Reuse
 //! `hort_quarantine_released_total{reason=timer}` — that counter fires
@@ -144,21 +177,30 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
                 tracing::info!(
                     candidates = 0_u64,
                     released = 0_u64,
-                    skipped_no_authority = 0_u64,
+                    skipped_no_scan_authority = 0_u64,
+                    skipped_provenance_pending = 0_u64,
+                    held_parent_gated = 0_u64,
                     "quarantine-release-sweep tick complete (no candidates)"
                 );
                 return Ok(TaskOutcome::Completed {
                     result_summary: json!({
                         "candidates": 0,
                         "released": 0,
-                        "skipped_no_authority": 0,
+                        "skipped_no_scan_authority": 0,
+                        "skipped_provenance_pending": 0,
+                        "held_parent_gated": 0,
                     }),
                 });
             }
 
             let ids: Vec<uuid::Uuid> = candidates.iter().map(|c| c.artifact_id).collect();
 
-            let released = match self.release.release_expired(ids).await {
+            // `ids` is cloned rather than moved so the same batch can be
+            // stamped after the release run: the cursor must cover every
+            // candidate the tick considered, not just the ones that made
+            // it through the gates — that is the whole point of the
+            // rotation.
+            let summary = match self.release.release_expired(ids.clone()).await {
                 Ok(r) => r,
                 Err(err) => {
                     tracing::warn!(
@@ -173,25 +215,66 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
                 }
             };
 
-            let released_count = released.len();
-            // `release_expired` returns a strict subset (fail-closed): a
-            // candidate without `ScanSucceeded`/`ScanWaived` authority is
-            // skipped, not released. The delta is the deny-by-default
-            // observability signal.
-            let skipped_no_authority = candidate_count.saturating_sub(released_count);
+            // Advance the fairness cursor for the batch. Non-gating: the
+            // releases above are already committed, and an unstamped
+            // batch only means the same rows serve again next tick — the
+            // pre-cursor behaviour, never an incorrect release.
+            if let Err(err) = self.candidates.mark_attempted(&ids, now).await {
+                tracing::warn!(
+                    error = %err,
+                    candidates = candidate_count,
+                    "quarantine-release-sweep: mark_attempted failed; \
+                     candidacy cursor not advanced this tick",
+                );
+            }
 
-            tracing::info!(
-                candidates = candidate_count,
-                released = released_count,
-                skipped_no_authority,
-                "quarantine-release-sweep tick complete",
-            );
+            let released_count = summary.released.len();
+            // Per-cause counts come from `release_expired` itself. They
+            // are NOT a `candidates - released` delta: that delta also
+            // swallows candidates the domain source-state guard refused,
+            // and it cannot tell the three holds apart — a scan-authority
+            // hold drains when scanners catch up, a provenance-pending
+            // one resolves per artifact once its signature lands or its
+            // final verify decides, and a parent-gated one moves only
+            // when roots get signed. Three different operator responses.
+            let skipped_no_scan_authority = summary.skipped_no_scan_authority;
+            let skipped_provenance_pending = summary.skipped_provenance_pending;
+            let held_parent_gated = summary.held_parent_gated;
+
+            // A full batch that released nothing is the saturation
+            // signature: the sweep is doing maximum work with zero
+            // progress, which under a bounded batch means everything it
+            // can currently reach is unreleasable. Alertable at `warn!`
+            // — one line per tick at exactly one level, so the stall arm
+            // replaces the routine `info!` rather than doubling it.
+            if released_count == 0 && candidate_count == BATCH_SIZE as usize {
+                tracing::warn!(
+                    candidates = candidate_count,
+                    released = released_count,
+                    skipped_no_scan_authority,
+                    skipped_provenance_pending,
+                    held_parent_gated,
+                    "quarantine-release-sweep: full batch, zero releases — sweep saturated, \
+                     nothing releasable this tick",
+                );
+            } else {
+                tracing::info!(
+                    candidates = candidate_count,
+                    released = released_count,
+                    skipped_no_scan_authority,
+                    skipped_provenance_pending,
+                    held_parent_gated,
+                    "quarantine-release-sweep tick complete",
+                );
+            }
 
             Ok(TaskOutcome::Completed {
                 result_summary: json!({
                     "candidates": candidate_count,
                     "released": released_count,
-                    "skipped_no_authority": skipped_no_authority,
+                    "skipped_no_scan_authority": skipped_no_scan_authority,
+                    "skipped_provenance_pending": skipped_provenance_pending,
+                    "held_parent_gated": held_parent_gated,
                 }),
             })
         })
@@ -214,6 +297,7 @@ mod tests {
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
     use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
+    use hort_domain::ports::quarantine_release::ReleaseExpiredSummary;
     use hort_domain::ports::quarantine_release_candidates::QuarantineReleaseCandidate;
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 
@@ -260,6 +344,13 @@ mod tests {
         rows: Mutex<Vec<QuarantineReleaseCandidate>>,
         err: Mutex<Option<DomainError>>,
         last_batch_size: Mutex<Option<u32>>,
+        /// Ids handed to `mark_attempted`, in call order. `None` until
+        /// the first call, so tests can distinguish "not called" from
+        /// "called with an empty batch".
+        marked: Mutex<Option<Vec<Uuid>>>,
+        /// When set, the next `mark_attempted` fails with it — the
+        /// warn-and-continue path.
+        mark_err: Mutex<Option<DomainError>>,
     }
 
     impl MockCandidates {
@@ -268,6 +359,8 @@ mod tests {
                 rows: Mutex::new(rows),
                 err: Mutex::new(None),
                 last_batch_size: Mutex::new(None),
+                marked: Mutex::new(None),
+                mark_err: Mutex::new(None),
             }
         }
 
@@ -276,11 +369,23 @@ mod tests {
                 rows: Mutex::new(Vec::new()),
                 err: Mutex::new(Some(err)),
                 last_batch_size: Mutex::new(None),
+                marked: Mutex::new(None),
+                mark_err: Mutex::new(None),
             }
+        }
+
+        fn failing_mark_attempted(rows: Vec<QuarantineReleaseCandidate>, err: DomainError) -> Self {
+            let this = Self::new(rows);
+            *this.mark_err.lock().unwrap() = Some(err);
+            this
         }
 
         fn last_batch_size(&self) -> Option<u32> {
             *self.last_batch_size.lock().unwrap()
+        }
+
+        fn marked(&self) -> Option<Vec<Uuid>> {
+            self.marked.lock().unwrap().clone()
         }
     }
 
@@ -298,6 +403,21 @@ mod tests {
             let rows = self.rows.lock().unwrap().clone();
             Box::pin(async move { Ok(rows) })
         }
+
+        fn mark_attempted<'a>(
+            &'a self,
+            ids: &'a [Uuid],
+            _at: DateTime<Utc>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            *self.marked.lock().unwrap() = Some(ids.to_vec());
+            let maybe_err = self.mark_err.lock().unwrap().take();
+            Box::pin(async move {
+                match maybe_err {
+                    Some(err) => Err(err),
+                    None => Ok(()),
+                }
+            })
+        }
     }
 
     // ---------- mock QuarantineReleasePort -------------------------------
@@ -310,6 +430,13 @@ mod tests {
         /// Ids the mock pretends to release. Anything in the input not
         /// in this set is "skipped — no authority".
         released_subset: Mutex<Vec<Uuid>>,
+        /// Per-cause hold counts the mock reports back:
+        /// `(skipped_no_scan_authority, skipped_provenance_pending,
+        /// held_parent_gated)`. Programmed independently of
+        /// `released_subset` on purpose: the handler must report the
+        /// counts the use case gives it, never re-derive them from
+        /// `candidates - released`.
+        skips: Mutex<(u32, u32, u32)>,
         err: Mutex<Option<DomainError>>,
         last_input: Mutex<Vec<Uuid>>,
     }
@@ -318,6 +445,7 @@ mod tests {
         fn releases_none() -> Self {
             Self {
                 released_subset: Mutex::new(Vec::new()),
+                skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(None),
                 last_input: Mutex::new(Vec::new()),
             }
@@ -328,6 +456,7 @@ mod tests {
             // "released". Used by the happy-path test.
             Self {
                 released_subset: Mutex::new(Vec::new()), // unused; flag below
+                skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(None),
                 last_input: Mutex::new(Vec::new()),
             }
@@ -336,9 +465,29 @@ mod tests {
         fn new_failing(err: DomainError) -> Self {
             Self {
                 released_subset: Mutex::new(Vec::new()),
+                skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(Some(err)),
                 last_input: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Programme the per-cause skip counts the mock reports:
+        /// `(skipped_no_scan_authority, skipped_provenance_pending)`.
+        /// `held_parent_gated` stays 0 — use [`Self::with_held_parent_gated`]
+        /// for tests that need the third bucket populated.
+        fn with_skips(self, no_scan_authority: u32, provenance_pending: u32) -> Self {
+            let held_parent_gated = self.skips.lock().unwrap().2;
+            *self.skips.lock().unwrap() =
+                (no_scan_authority, provenance_pending, held_parent_gated);
+            self
+        }
+
+        /// Programme the `held_parent_gated` count independently of the
+        /// other two — the structural-hold bucket the sweep report
+        /// carries alongside the two skip counts.
+        fn with_held_parent_gated(self, count: u32) -> Self {
+            self.skips.lock().unwrap().2 = count;
+            self
         }
 
         fn last_input(&self) -> Vec<Uuid> {
@@ -350,17 +499,19 @@ mod tests {
         fn release_expired<'a>(
             &'a self,
             artifact_ids: Vec<Uuid>,
-        ) -> BoxFuture<'a, DomainResult<Vec<Uuid>>> {
+        ) -> BoxFuture<'a, DomainResult<ReleaseExpiredSummary>> {
             *self.last_input.lock().unwrap() = artifact_ids.clone();
             let maybe_err = self.err.lock().unwrap().take();
             if let Some(err) = maybe_err {
                 return Box::pin(async move { Err(err) });
             }
             let subset = self.released_subset.lock().unwrap().clone();
+            let (skipped_no_scan_authority, skipped_provenance_pending, held_parent_gated) =
+                *self.skips.lock().unwrap();
             // Convention: empty subset means "release nothing" (fail-closed
             // path); otherwise the mock returns the ids that ALSO appear in
             // the input (intersection).
-            let result: Vec<Uuid> = if subset.is_empty() {
+            let released: Vec<Uuid> = if subset.is_empty() {
                 Vec::new()
             } else {
                 artifact_ids
@@ -368,7 +519,14 @@ mod tests {
                     .filter(|id| subset.contains(id))
                     .collect()
             };
-            Box::pin(async move { Ok(result) })
+            Box::pin(async move {
+                Ok(ReleaseExpiredSummary {
+                    released,
+                    skipped_no_scan_authority,
+                    skipped_provenance_pending,
+                    held_parent_gated,
+                })
+            })
         }
     }
 
@@ -380,6 +538,115 @@ mod tests {
             candidates as Arc<dyn QuarantineReleaseCandidatesRepository>,
             releaser as Arc<dyn QuarantineReleasePort>,
         )
+    }
+
+    // ---------- tracing capture ------------------------------------------
+    //
+    // The per-tick log line IS the observability contract here (there is
+    // no per-tick metric — see the module docs), so the stall signal and
+    // the per-cause counts are asserted on the emitted records. Mirrors
+    // the capture block in `use_cases/quarantine_use_case.rs`: a global
+    // passthrough subscriber is installed once so callsite interest is
+    // not cached as "never", then each test layers a thread-local
+    // subscriber over it and rebuilds the interest cache.
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Registry;
+
+    #[derive(Clone, Default)]
+    struct CapturingLayer {
+        records: Arc<Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CapturingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = MessageVisitor::default();
+            event.record(&mut visitor);
+            self.records
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.combined));
+        }
+    }
+
+    #[derive(Default)]
+    struct MessageVisitor {
+        combined: String,
+    }
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.combined
+                .push_str(&format!("{}={:?} ", field.name(), value));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.combined
+                .push_str(&format!("{}={} ", field.name(), value));
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.combined
+                .push_str(&format!("{}={} ", field.name(), value));
+        }
+    }
+
+    fn install_passthrough_subscriber() {
+        use std::sync::OnceLock;
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let subscriber = Registry::default().with(CapturingLayer::default());
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    /// Run one tick under a thread-local capturing subscriber and return
+    /// the `(level, rendered fields)` records it emitted. Synchronous
+    /// (own current-thread runtime) because `set_default` is
+    /// thread-scoped — a multi-thread runtime could run the future on a
+    /// worker thread the guard does not cover.
+    fn capture_tick_logs(handler: &QuarantineReleaseSweepHandler) -> Vec<(tracing::Level, String)> {
+        install_passthrough_subscriber();
+
+        let layer = CapturingLayer::default();
+        let records = layer.records.clone();
+        let subscriber = Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            handler
+                .run(&serde_json::Value::Null, make_context())
+                .await
+                .expect("Ok");
+        });
+
+        let captured = records.lock().unwrap().clone();
+        captured
     }
 
     // =====================================================================
@@ -404,6 +671,7 @@ mod tests {
         let releaser = Arc::new(MockReleaser::releases_none());
 
         let releaser_for_assert = releaser.clone();
+        let candidates_for_assert = candidates.clone();
         let handler = make_handler(candidates, releaser);
 
         let outcome = handler
@@ -415,13 +683,24 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["candidates"], 0);
                 assert_eq!(result_summary["released"], 0);
-                assert_eq!(result_summary["skipped_no_authority"], 0);
+                assert_eq!(result_summary["skipped_no_scan_authority"], 0);
+                assert_eq!(result_summary["skipped_provenance_pending"], 0);
+                assert_eq!(result_summary["held_parent_gated"], 0);
+                assert!(
+                    result_summary.get("skipped_no_authority").is_none(),
+                    "the conflated `candidates - released` key is retired; the empty arm \
+                     must not resurrect it",
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
         assert!(
             releaser_for_assert.last_input().is_empty(),
             "no candidates → release_expired must NOT be called",
+        );
+        assert!(
+            candidates_for_assert.marked().is_none(),
+            "an empty tick has no batch to stamp — mark_attempted must not be called",
         );
     }
 
@@ -445,6 +724,7 @@ mod tests {
             vec![c1.artifact_id, c2.artifact_id, c3.artifact_id];
 
         let releaser_for_assert = releaser.clone();
+        let candidates_for_assert = candidates.clone();
         let handler = make_handler(candidates, releaser);
 
         let outcome = handler
@@ -456,7 +736,9 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["candidates"], 3);
                 assert_eq!(result_summary["released"], 3);
-                assert_eq!(result_summary["skipped_no_authority"], 0);
+                assert_eq!(result_summary["skipped_no_scan_authority"], 0);
+                assert_eq!(result_summary["skipped_provenance_pending"], 0);
+                assert_eq!(result_summary["held_parent_gated"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -465,6 +747,14 @@ mod tests {
         // or re-order between SQL and use case.
         let input = releaser_for_assert.last_input();
         assert_eq!(input, vec![c1.artifact_id, c2.artifact_id, c3.artifact_id]);
+        // Released rows are stamped too: they leave the candidacy pool
+        // anyway, and excluding them would buy nothing but a second
+        // statement.
+        assert_eq!(
+            candidates_for_assert.marked(),
+            Some(vec![c1.artifact_id, c2.artifact_id, c3.artifact_id]),
+            "the cursor is advanced for the WHOLE batch, released rows included",
+        );
     }
 
     // =====================================================================
@@ -488,7 +778,7 @@ mod tests {
         let candidates = Arc::new(MockCandidates::new(vec![c1.clone(), c2.clone()]));
         // Releaser returns the empty set: every candidate fails the
         // authority check (no ScanCompleted, no scan_backends:[]).
-        let releaser = Arc::new(MockReleaser::releases_none());
+        let releaser = Arc::new(MockReleaser::releases_none().with_skips(2, 0));
 
         let releaser_for_assert = releaser.clone();
         let handler = make_handler(candidates, releaser);
@@ -506,9 +796,12 @@ mod tests {
                     "fail-closed: NOTHING released when no authority is constructible",
                 );
                 assert_eq!(
-                    result_summary["skipped_no_authority"], 2,
-                    "fail-closed: skipped-no-authority MUST equal candidates when none release",
+                    result_summary["skipped_no_scan_authority"], 2,
+                    "fail-closed: the authority skip MUST account for every candidate when \
+                     none release",
                 );
+                assert_eq!(result_summary["skipped_provenance_pending"], 0);
+                assert_eq!(result_summary["held_parent_gated"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -527,6 +820,7 @@ mod tests {
 
     // =====================================================================
     // partial release: 3 candidates, 1 released, 2 skipped → counts split
+    // per cause, straight from the use case (never re-derived)
     // =====================================================================
 
     #[tokio::test]
@@ -539,8 +833,10 @@ mod tests {
             c2.clone(),
             c3.clone(),
         ]));
-        let releaser = Arc::new(MockReleaser::releases_all_input());
-        // Only c2 has authority (e.g. has a ScanCompleted on stream).
+        // Only c2 has authority (e.g. has a ScanCompleted on stream);
+        // of the other two, one lacks scan authority and one is held by
+        // an unresolved provenance clearance.
+        let releaser = Arc::new(MockReleaser::releases_all_input().with_skips(1, 1));
         *releaser.released_subset.lock().unwrap() = vec![c2.artifact_id];
 
         let handler = make_handler(candidates, releaser);
@@ -554,13 +850,312 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["candidates"], 3);
                 assert_eq!(result_summary["released"], 1);
+                assert_eq!(result_summary["skipped_no_scan_authority"], 1);
+                assert_eq!(result_summary["skipped_provenance_pending"], 1);
+                assert_eq!(result_summary["held_parent_gated"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    // =====================================================================
+    // three-way mixed batch: one of each hold plus a release → all three
+    // counters surface independently, straight from the use case.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_mixed_batch_reports_all_three_hold_counts_independently() {
+        let c1 = make_candidate();
+        let c2 = make_candidate();
+        let c3 = make_candidate();
+        let c4 = make_candidate();
+        let candidates = Arc::new(MockCandidates::new(vec![
+            c1.clone(),
+            c2.clone(),
+            c3.clone(),
+            c4.clone(),
+        ]));
+        // c1 releases; c2 lacks scan authority; c3 is an actionable
+        // pending provenance hold; c4 is a structural parent-gated hold.
+        let releaser = Arc::new(
+            MockReleaser::releases_all_input()
+                .with_skips(1, 1)
+                .with_held_parent_gated(1),
+        );
+        *releaser.released_subset.lock().unwrap() = vec![c1.artifact_id];
+
+        let handler = make_handler(candidates, releaser);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["candidates"], 4);
+                assert_eq!(result_summary["released"], 1);
+                assert_eq!(result_summary["skipped_no_scan_authority"], 1);
+                assert_eq!(result_summary["skipped_provenance_pending"], 1);
                 assert_eq!(
-                    result_summary["skipped_no_authority"], 2,
-                    "skipped_no_authority = candidates - released",
+                    result_summary["held_parent_gated"], 1,
+                    "the structural parent-gated hold must surface as its own bucket, \
+                     distinct from the actionable pending count",
                 );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+
+    // =====================================================================
+    // The counts are REPORTED, not re-derived. A summary whose skip
+    // counts do not sum to `candidates - released` (the domain
+    // source-state guard refuses a candidate without counting it as
+    // held) must surface verbatim — reconstructing the old
+    // `candidates - released` delta would silently re-fabricate the
+    // conflated number this split replaces.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_reports_use_case_skip_counts_verbatim_without_rederiving() {
+        let c1 = make_candidate();
+        let c2 = make_candidate();
+        let c3 = make_candidate();
+        let c4 = make_candidate();
+        let candidates = Arc::new(MockCandidates::new(vec![
+            c1.clone(),
+            c2.clone(),
+            c3.clone(),
+            c4.clone(),
+        ]));
+        // 4 candidates, 0 released, but only TWO were actually held —
+        // the other two hit the not-in-releasable-state arm, which is
+        // not a hold at all.
+        let releaser = Arc::new(
+            MockReleaser::releases_none()
+                .with_skips(0, 1)
+                .with_held_parent_gated(1),
+        );
+
+        let handler = make_handler(candidates, releaser);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["candidates"], 4);
+                assert_eq!(result_summary["released"], 0);
+                assert_eq!(
+                    result_summary["skipped_no_scan_authority"], 0,
+                    "the handler must NOT back-fill a skip count from candidates - released",
+                );
+                assert_eq!(result_summary["skipped_provenance_pending"], 1);
+                assert_eq!(
+                    result_summary["held_parent_gated"], 1,
+                    "the handler must NOT back-fill the structural-hold count either",
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    // =====================================================================
+    // Fairness cursor: the batch is stamped even when nothing releases —
+    // that is precisely the case the rotation exists for.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_marks_attempted_for_all_candidates_when_none_release() {
+        let c1 = make_candidate();
+        let c2 = make_candidate();
+        let candidates = Arc::new(MockCandidates::new(vec![c1.clone(), c2.clone()]));
+        let releaser = Arc::new(MockReleaser::releases_none().with_skips(2, 0));
+
+        let candidates_for_assert = candidates.clone();
+        let handler = make_handler(candidates, releaser);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        assert!(matches!(outcome, TaskOutcome::Completed { .. }));
+
+        assert_eq!(
+            candidates_for_assert.marked(),
+            Some(vec![c1.artifact_id, c2.artifact_id]),
+            "an all-skipped batch MUST still advance the cursor — otherwise the same \
+             unreleasable rows occupy the batch head forever and starve the backlog",
+        );
+    }
+
+    // =====================================================================
+    // `mark_attempted` failure is warn-and-continue: the tick's release
+    // work already stands, and an unstamped batch only re-serves next
+    // tick (the pre-cursor behaviour).
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_completes_when_mark_attempted_fails() {
+        let c1 = make_candidate();
+        let c2 = make_candidate();
+        let candidates = Arc::new(MockCandidates::failing_mark_attempted(
+            vec![c1.clone(), c2.clone()],
+            DomainError::Invariant("simulated mark_attempted failure".into()),
+        ));
+        let releaser = Arc::new(MockReleaser::releases_all_input());
+        *releaser.released_subset.lock().unwrap() = vec![c1.artifact_id];
+
+        let candidates_for_assert = candidates.clone();
+        let handler = make_handler(candidates, releaser);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(
+                    result_summary["released"], 1,
+                    "a cursor-stamp failure must not retract the tick's release work",
+                );
+                assert_eq!(result_summary["candidates"], 2);
+            }
+            other => panic!("expected Completed despite mark_attempted failure, got {other:?}"),
+        }
+        assert!(
+            candidates_for_assert.marked().is_some(),
+            "the handler must have attempted the stamp before swallowing its failure",
+        );
+    }
+
+    // =====================================================================
+    // Stall signal: full batch + zero releases ⇒ `warn!` carrying both
+    // per-cause counts. Anything less than a full batch, or any release
+    // at all, stays at `info!`.
+    // =====================================================================
+
+    /// Build a full `BATCH_SIZE`-sized candidate list.
+    fn full_batch() -> Vec<QuarantineReleaseCandidate> {
+        (0..BATCH_SIZE).map(|_| make_candidate()).collect()
+    }
+
+    #[test]
+    fn run_full_batch_with_zero_releases_emits_stall_warn() {
+        // The production shape this split exists for: of a full 1000
+        // candidate batch, most (964) are structurally held — nothing
+        // short of signing their roots moves them — and the remainder
+        // splits across the two actionable buckets.
+        let rows = full_batch();
+        let candidates = Arc::new(MockCandidates::new(rows));
+        let releaser = Arc::new(
+            MockReleaser::releases_none()
+                .with_skips(30, 6)
+                .with_held_parent_gated(964),
+        );
+
+        let handler = make_handler(candidates, releaser);
+        let records = capture_tick_logs(&handler);
+
+        let warn = records
+            .iter()
+            .find(|(lvl, _)| *lvl == tracing::Level::WARN)
+            .map(|(_, msg)| msg.clone())
+            .unwrap_or_else(|| panic!("expected a stall warn!; saw {records:?}"));
+        assert!(
+            warn.contains(
+                "quarantine-release-sweep: full batch, zero releases — sweep saturated, \
+                 nothing releasable this tick"
+            ),
+            "stall warn must carry the alertable message; saw {warn}",
+        );
+        assert!(
+            warn.contains("skipped_no_scan_authority=30")
+                && warn.contains("skipped_provenance_pending=6")
+                && warn.contains("held_parent_gated=964"),
+            "stall warn must carry ALL THREE per-cause counts — they are what tells the \
+             operator which backlog is holding the sweep, and the structural one is what \
+             makes the stall readable rather than alarming; saw {warn}",
+        );
+        assert!(
+            !records.iter().any(|(lvl, _)| *lvl == tracing::Level::INFO),
+            "the stall arm replaces the routine info! line, it does not double it; \
+             saw {records:?}",
+        );
+    }
+
+    #[test]
+    fn run_full_batch_with_one_release_does_not_warn() {
+        let rows = full_batch();
+        let first = rows[0].artifact_id;
+        let candidates = Arc::new(MockCandidates::new(rows));
+        let releaser = Arc::new(MockReleaser::releases_all_input().with_skips(999, 0));
+        *releaser.released_subset.lock().unwrap() = vec![first];
+
+        let handler = make_handler(candidates, releaser);
+        let records = capture_tick_logs(&handler);
+
+        assert!(
+            !records.iter().any(|(lvl, _)| *lvl == tracing::Level::WARN),
+            "a full batch that released something is progress, not saturation; saw {records:?}",
+        );
+        assert!(
+            records.iter().any(|(lvl, msg)| *lvl == tracing::Level::INFO
+                && msg.contains("quarantine-release-sweep tick complete")),
+            "the routine info! line must still be emitted; saw {records:?}",
+        );
+    }
+
+    #[test]
+    fn run_partial_batch_with_zero_releases_does_not_warn() {
+        let candidates = Arc::new(MockCandidates::new(vec![make_candidate()]));
+        let releaser = Arc::new(MockReleaser::releases_none().with_skips(1, 0));
+
+        let handler = make_handler(candidates, releaser);
+        let records = capture_tick_logs(&handler);
+
+        assert!(
+            !records.iter().any(|(lvl, _)| *lvl == tracing::Level::WARN),
+            "under-full batch: the sweep reached everything it could, so a zero-release \
+             tick is an ordinary policy outcome, not saturation; saw {records:?}",
+        );
+        assert!(
+            records.iter().any(|(lvl, msg)| *lvl == tracing::Level::INFO
+                && msg.contains("quarantine-release-sweep tick complete")),
+            "the routine info! line must still be emitted; saw {records:?}",
+        );
+    }
+
+    #[test]
+    fn run_tick_complete_log_drops_the_retired_conflated_key() {
+        let candidates = Arc::new(MockCandidates::new(vec![make_candidate()]));
+        let releaser = Arc::new(
+            MockReleaser::releases_none()
+                .with_skips(1, 0)
+                .with_held_parent_gated(0),
+        );
+
+        let handler = make_handler(candidates, releaser);
+        let records = capture_tick_logs(&handler);
+
+        assert!(
+            !records
+                .iter()
+                .any(|(_, msg)| msg.contains("skipped_no_authority=")),
+            "the fabricated candidates-minus-released field is retired from the log \
+             line too; saw {records:?}",
+        );
+        assert!(
+            records
+                .iter()
+                .any(|(_, msg)| msg.contains("skipped_no_scan_authority=1")
+                    && msg.contains("skipped_provenance_pending=0")
+                    && msg.contains("held_parent_gated=0")),
+            "the tick line must carry all three true per-cause counts; saw {records:?}",
+        );
     }
 
     // =====================================================================

@@ -23,6 +23,7 @@ use hort_domain::ports::content_reference_index::ContentReferenceIndex;
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ReadFrom};
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
+use hort_domain::ports::quarantine_release::ReleaseExpiredSummary;
 use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInvalidator;
 
 use crate::event_store_publisher::EventStorePublisher;
@@ -1486,7 +1487,30 @@ impl QuarantineUseCase {
     ///
     /// No actor parameter — uses `timer_actor()` internally (C2).
     /// Skips artifacts that fail validation (already released, wrong state).
-    /// Returns the list of successfully released artifact IDs.
+    /// Returns the successfully released artifact IDs plus the per-cause
+    /// skip counts (see [`ReleaseExpiredSummary`]).
+    ///
+    /// **Skip attribution.** The three counters are mutually exclusive
+    /// and order-stable, and they attribute only — they do not reorder
+    /// the gates. A candidate whose provenance clearance is `Pending`
+    /// counts on the provenance side whatever the scan side says,
+    /// because the provenance gate denies the timer arm on its own; it
+    /// splits by whether anything short of signing the root can move it:
+    ///
+    /// - a parent-gated blob constituent (config / layer blob whose only
+    ///   clearance path is the parent manifest's cascade, ADR 0039)
+    ///   counts as `held_parent_gated` — a structural hold that moves
+    ///   only when roots get signed;
+    /// - any other `Pending` candidate counts as
+    ///   `skipped_provenance_pending` — it resolves per artifact, as its
+    ///   own signature lands or its final verify decides.
+    ///
+    /// Only a provenance-cleared candidate for which no release
+    /// authority is constructible counts as `skipped_no_scan_authority`
+    /// — the backlog that drains once scanners catch up. A candidate the
+    /// domain source-state guard refuses (already released, not in a
+    /// releasable state) counts towards none of the three — it is not
+    /// being held, it is no longer releasable.
     ///
     /// **Fail-closed release predicate (ADR 0007).**
     /// A timer release is authorized ONLY
@@ -1508,9 +1532,12 @@ impl QuarantineUseCase {
     /// timer-release. Do NOT "fix" this by minting `ScanSucceeded`
     /// unconditionally — that re-opens the latent-Critical.
     #[tracing::instrument(skip(self))]
-    pub async fn release_expired(&self, artifact_ids: Vec<Uuid>) -> AppResult<Vec<Uuid>> {
+    pub async fn release_expired(
+        &self,
+        artifact_ids: Vec<Uuid>,
+    ) -> AppResult<ReleaseExpiredSummary> {
         let actor = timer_actor();
-        let mut released = Vec::new();
+        let mut summary = ReleaseExpiredSummary::default();
 
         for artifact_id in artifact_ids {
             let stream_id = StreamId::artifact(artifact_id);
@@ -1587,7 +1614,8 @@ impl QuarantineUseCase {
             // points at (`oci_subject`) or a child *manifest*
             // (`oci_index_member`) can still be cleared by a verify, so
             // it keeps the backstop.
-            if matches!(provenance, ProvenanceClearance::Pending) {
+            let provenance_pending = matches!(provenance, ProvenanceClearance::Pending);
+            if provenance_pending {
                 // INVARIANT: this lookup PROPAGATES its error, matching
                 // the verdict-side resolve in
                 // `ProvenanceOrchestrationUseCase::verify_artifact`.
@@ -1596,19 +1624,37 @@ impl QuarantineUseCase {
                 // enqueue flood this skip exists to remove, and `true`
                 // (assume "skip") would suppress the backstop for a
                 // candidate that may have no parent at all — the strand
-                // direction. A failed read aborts this sweep tick; the
-                // sweep is re-driven on the next one.
+                // direction. A failed read aborts this sweep tick before
+                // any hold is counted for this candidate; the sweep is
+                // re-driven on the next one.
                 let refs = self
                     .content_references
                     .find_by_target(repository_id, &artifact.sha256_checksum, None)
                     .await?;
+
+                // Attribute the hold to the provenance side here, before
+                // the authority check runs: the provenance gate denies
+                // the timer arm on its own, so a `Pending` candidate is
+                // held by provenance whatever the scan side would have
+                // said. Counting it on the authority arm instead would
+                // report a scanner backlog to an operator whose real
+                // problem is an unverified signature — a different
+                // remediation. The same edge set that decides the
+                // enqueue also decides which provenance bucket the hold
+                // belongs to, so the count can never disagree with the
+                // reason: a parent-gated blob is a STRUCTURAL hold
+                // (only the parent's cascade can lift it), everything
+                // else is an actionable pending one.
                 if is_parent_gated_blob_constituent(&refs) {
+                    summary.held_parent_gated = summary.held_parent_gated.saturating_add(1);
                     tracing::debug!(
                         artifact_id = %artifact_id,
                         "expiry backstop: parent-gated blob constituent; no verify enqueued \
                          (its clearance comes from the parent's cascade)"
                     );
                 } else {
+                    summary.skipped_provenance_pending =
+                        summary.skipped_provenance_pending.saturating_add(1);
                     self.enqueue_final_provenance_verify(artifact_id).await;
                 }
             }
@@ -1621,6 +1667,14 @@ impl QuarantineUseCase {
                 .resolve_release_authority(artifact_id, repository_id)
                 .await?
             else {
+                // Counted only when provenance already cleared — one of
+                // the two provenance buckets has claimed this candidate
+                // otherwise, and the three counts are mutually exclusive
+                // so their sum never double-counts one held artifact.
+                if !provenance_pending {
+                    summary.skipped_no_scan_authority =
+                        summary.skipped_no_scan_authority.saturating_add(1);
+                }
                 tracing::debug!(
                     artifact_id = %artifact_id,
                     status = %artifact.quarantine_status,
@@ -1652,7 +1706,7 @@ impl QuarantineUseCase {
                         )
                         .await?;
                     emit_release(values::REASON_TIMER);
-                    released.push(artifact_id);
+                    summary.released.push(artifact_id);
                     // Security-relevant state change: `info!`
                     // with the resolved authority kind. Tracing-only;
                     // no new metric (the existing
@@ -1678,7 +1732,7 @@ impl QuarantineUseCase {
             }
         }
 
-        Ok(released)
+        Ok(summary)
     }
 
     /// Enqueue a FINAL `provenance-verify` for an expired `Required` +
@@ -1888,10 +1942,11 @@ impl hort_domain::ports::quarantine_release::QuarantineReleasePort for Quarantin
     fn release_expired<'a>(
         &'a self,
         artifact_ids: Vec<Uuid>,
-    ) -> hort_domain::ports::BoxFuture<'a, hort_domain::error::DomainResult<Vec<Uuid>>> {
+    ) -> hort_domain::ports::BoxFuture<'a, hort_domain::error::DomainResult<ReleaseExpiredSummary>>
+    {
         Box::pin(async move {
             match QuarantineUseCase::release_expired(self, artifact_ids).await {
-                Ok(ids) => Ok(ids),
+                Ok(summary) => Ok(summary),
                 Err(AppError::Domain(de)) => Err(de),
                 Err(other) => Err(DomainError::Invariant(format!(
                     "release_expired: non-domain failure surfaced through port: {other}"
@@ -4465,7 +4520,7 @@ mod tests {
                     seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Released);
                 let ids = vec![id1, id2, id3];
 
-                let released = uc.release_expired(ids).await.unwrap();
+                let released = uc.release_expired(ids).await.unwrap().released;
 
                 // Nothing is released — no authority is constructible
                 // for any candidate.
@@ -4506,7 +4561,11 @@ mod tests {
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
         seed_stream_with_scan_completed(&events, artifact_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(released, vec![artifact_id]);
         let transitions = lifecycle.committed_transitions();
@@ -4553,7 +4612,11 @@ mod tests {
             ],
         );
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(
             released.is_empty(),
@@ -4581,7 +4644,11 @@ mod tests {
             ],
         );
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(
             released.is_empty(),
@@ -4611,7 +4678,11 @@ mod tests {
             ],
         );
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(
             released,
@@ -4639,7 +4710,11 @@ mod tests {
         let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
         seed_scan_waived_policy(&projections, repo_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(released, vec![artifact_id]);
         let transitions = lifecycle.committed_transitions();
@@ -4679,7 +4754,11 @@ mod tests {
             ],
         );
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(
             released,
@@ -4718,7 +4797,11 @@ mod tests {
             ],
         );
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(released.is_empty());
     }
@@ -4736,7 +4819,11 @@ mod tests {
         let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
         seed_record_enforcement_policy(&projections, repo_id, SeverityThreshold::Critical);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(
             released.is_empty(),
@@ -4766,7 +4853,11 @@ mod tests {
             ],
         );
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(released.is_empty());
     }
@@ -4795,7 +4886,11 @@ mod tests {
         // Degenerate clean scan on the index's own bytes → ScanCompleted.
         seed_stream_with_scan_completed(&events, artifact_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(
             released,
@@ -4935,7 +5030,11 @@ mod tests {
         // ... but the policy is Required and there is NO ProvenanceVerified.
         seed_required_provenance_policy(&projections, repo_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(
             released.is_empty(),
@@ -4945,6 +5044,164 @@ mod tests {
         assert!(
             lifecycle.committed_transitions().is_empty(),
             "fail-closed: no release transition committed"
+        );
+    }
+
+    // -- release_expired per-cause skip attribution ---------------------------
+    //
+    // The counts are what an operator reads off a non-draining backlog,
+    // so they must name the gate that is actually holding each
+    // candidate. `candidates - released` cannot: it conflates the two
+    // gates with each other AND with candidates that are simply no
+    // longer releasable.
+
+    /// A candidate with no scan authority and nothing to clear on the
+    /// provenance side is attributed to the scan counter.
+    #[tokio::test]
+    async fn release_expired_attributes_a_missing_authority_to_the_scan_counter() {
+        let (uc, artifacts, _events, _lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(summary.released.is_empty());
+        assert_eq!(summary.skipped_no_scan_authority, 1);
+        assert_eq!(summary.skipped_provenance_pending, 0);
+        assert_eq!(summary.held_parent_gated, 0);
+    }
+
+    /// Mutual exclusivity: a candidate that fails BOTH gates is
+    /// attributed to provenance only. The provenance gate denies the
+    /// timer arm on its own, so reporting it as a scan-authority skip
+    /// would point the operator at a scanner backlog that is not the
+    /// thing holding the artifact.
+    #[tokio::test]
+    async fn release_expired_attributes_a_pending_provenance_to_provenance_even_without_authority()
+    {
+        let (uc, artifacts, _events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // Required provenance with nothing verified ⇒ Pending, and no
+        // ScanCompleted on the stream ⇒ no release authority either.
+        seed_required_provenance_policy(&projections, repo_id);
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(summary.released.is_empty());
+        assert_eq!(
+            summary.skipped_provenance_pending, 1,
+            "provenance claims the candidate — it blocks the timer arm on its own",
+        );
+        assert_eq!(
+            summary.skipped_no_scan_authority, 0,
+            "the counters are mutually exclusive: one held artifact is counted once",
+        );
+        assert_eq!(
+            summary.held_parent_gated, 0,
+            "no inbound blob edge is seeded — this is the actionable-pending bucket, \
+             not the structural one",
+        );
+    }
+
+    /// A `Pending` candidate that IS a parent-gated blob constituent
+    /// (its only inbound edge is a parent manifest's `oci_layer`/
+    /// `oci_config`) counts as `held_parent_gated` — never as
+    /// `skipped_provenance_pending`, whatever the scan side says. The
+    /// same predicate that decides the S4 enqueue skip decides this
+    /// count, so the two can never disagree.
+    #[tokio::test]
+    async fn release_expired_attributes_a_parent_gated_pending_to_the_structural_bucket() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections, refs) =
+            make_use_case_with_content_refs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+        seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            summary.released.is_empty(),
+            "still not released — Pending denies the timer arm"
+        );
+        assert_eq!(
+            summary.held_parent_gated, 1,
+            "a parent-gated blob constituent is a structural hold, not an actionable one",
+        );
+        assert_eq!(
+            summary.skipped_provenance_pending, 0,
+            "the actionable-pending bucket must not also claim this candidate",
+        );
+        assert_eq!(summary.skipped_no_scan_authority, 0);
+    }
+
+    /// A candidate the domain source-state guard refuses counts towards
+    /// NONE of the three holds: it is not waiting on a gate, it is no
+    /// longer releasable. This is why the counts deliberately do not sum
+    /// to `candidates - released`.
+    #[tokio::test]
+    async fn release_expired_counts_no_hold_for_an_already_released_candidate() {
+        let (uc, artifacts, _events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Released);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // Authority IS constructible (scanning waived by policy); the
+        // release fails on the source-state guard instead.
+        seed_scan_waived_policy(&projections, repo_id);
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(summary.released.is_empty());
+        assert_eq!(summary.skipped_no_scan_authority, 0);
+        assert_eq!(summary.skipped_provenance_pending, 0);
+        assert_eq!(summary.held_parent_gated, 0);
+    }
+
+    /// Over a mixed batch the counters accumulate per candidate and the
+    /// released list stays exactly the authorized ones. The three-way
+    /// split — a release, a scan-authority skip, an actionable pending
+    /// hold, and a structural parent-gated hold — pins that all three
+    /// counters surface independently in the same tick.
+    #[tokio::test]
+    async fn release_expired_accumulates_per_cause_counts_across_a_mixed_batch() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections, refs) =
+            make_use_case_with_content_refs();
+
+        let releasable =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        seed_stream_with_scan_completed(&events, releasable);
+
+        let no_authority =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let pending =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let pending_repo = artifacts.get(pending).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, pending);
+        seed_required_provenance_policy(&projections, pending_repo);
+
+        let parent_gated =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let parent_gated_repo = artifacts.get(parent_gated).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, parent_gated);
+        seed_required_provenance_policy(&projections, parent_gated_repo);
+        seed_inbound_edge(&refs, &artifacts, parent_gated, "oci_config").await;
+
+        let summary = uc
+            .release_expired(vec![releasable, no_authority, pending, parent_gated])
+            .await
+            .unwrap();
+
+        assert_eq!(summary.released, vec![releasable]);
+        assert_eq!(summary.skipped_no_scan_authority, 1);
+        assert_eq!(summary.skipped_provenance_pending, 1);
+        assert_eq!(
+            summary.held_parent_gated, 1,
+            "the structural hold must accumulate independently of the other two",
         );
     }
 
@@ -4963,7 +5220,11 @@ mod tests {
         seed_stream_scanned_and_provenance_verified(&events, artifact_id);
         seed_required_provenance_policy(&projections, repo_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(
             released,
@@ -5118,7 +5379,11 @@ mod tests {
         seed_stream_with_scan_completed(&events, artifact_id);
         seed_required_provenance_policy(&projections, repo_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         // The sweep NEVER releases a Pending candidate.
         assert!(
@@ -5170,7 +5435,11 @@ mod tests {
         // Simulate a first-tick enqueue that is now in-flight.
         jobs.seed_active_provenance(artifact_id, Uuid::new_v4());
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(released.is_empty(), "Pending candidate still not released");
         assert!(
@@ -5192,7 +5461,11 @@ mod tests {
         seed_stream_scanned_and_provenance_verified(&events, artifact_id);
         seed_required_provenance_policy(&projections, repo_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(
             released,
@@ -5224,7 +5497,11 @@ mod tests {
             SeverityThreshold::Critical,
         ));
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(released, vec![artifact_id]);
         assert_eq!(lifecycle.committed_transitions().len(), 1);
@@ -5295,7 +5572,11 @@ mod tests {
         seed_inbound_edge(&refs, &artifacts, artifact_id, "primary_content").await;
         seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(released.is_empty(), "a Pending candidate is never released");
         assert!(
@@ -5431,7 +5712,11 @@ mod tests {
         );
         seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_index_member").await;
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
         // A second tick: the backstop is driven per tick, so quiescing
         // must hold across ticks, not just on the first one.
         uc.release_expired(vec![artifact_id]).await.unwrap();
@@ -5496,7 +5781,11 @@ mod tests {
         seed_required_provenance_policy(&projections, repo_id);
         seed_inbound_edge(&refs, &artifacts, artifact_id, "oci_layer").await;
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(
             released,
@@ -5530,7 +5819,11 @@ mod tests {
         // either: provenance clearance is Pending.
         seed_required_provenance_policy(&projections, repo_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(
             released.is_empty(),
@@ -5572,7 +5865,11 @@ mod tests {
         seed_stream_with_scan_completed(&events, artifact_id);
         seed_required_provenance_policy(&projections, repo_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(
             released.is_empty(),
@@ -5602,7 +5899,11 @@ mod tests {
             SeverityThreshold::Critical,
         ));
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert_eq!(
             released,
@@ -5639,7 +5940,11 @@ mod tests {
         // The authority — a successful ScanCompleted — exists.
         seed_stream_with_scan_completed(&events, artifact_id);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         // Released because authority exists, NOT because of the clock:
         // `release_expired` never reads the window.
@@ -5683,7 +5988,8 @@ mod tests {
         let released = uc
             .release_expired(vec![a_succeeded, c_failclosed, b_waived])
             .await
-            .unwrap();
+            .unwrap()
+            .released;
 
         assert_eq!(released.len(), 2, "exactly the two authorized release");
         assert!(released.contains(&a_succeeded));
@@ -5755,7 +6061,7 @@ mod tests {
     #[tokio::test]
     async fn release_expired_empty_list() {
         let (uc, _artifacts, _events, _lifecycle, _repositories, _projections) = make_use_case();
-        let released = uc.release_expired(vec![]).await.unwrap();
+        let released = uc.release_expired(vec![]).await.unwrap().released;
         assert!(released.is_empty());
     }
 
@@ -6161,7 +6467,11 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
 
-        let released = uc.release_expired(vec![artifact_id]).await.unwrap();
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
 
         assert!(released.is_empty());
         assert!(lifecycle.committed_transitions().is_empty());

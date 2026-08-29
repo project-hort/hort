@@ -107,7 +107,7 @@ members = [
 exclude = ["tools/*"]
 
 [workspace.package]
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 # MSRV — kept in sync with `.clippy.toml` (`msrv = "1.94.0"`) and with
 # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` default (asserted
@@ -194,44 +194,44 @@ unused_qualifications = "warn"
 # version would turn every test-only edge into a publish-time dependency,
 # including edges onto crates that are not published at all. The same guard
 # test asserts that direction too.
-hort-domain = { path = "crates/hort-domain", version = "=0.12.0", registry = "hort-crates" }
-hort-config = { path = "crates/hort-config", version = "=0.12.0", registry = "hort-crates" }
-hort-app = { path = "crates/hort-app", version = "=0.12.0", registry = "hort-crates" }
-hort-attribution = { path = "crates/hort-attribution", version = "=0.12.0", registry = "hort-crates" }
-hort-net-egress = { path = "crates/hort-net-egress", version = "=0.12.0", registry = "hort-crates" }
+hort-domain = { path = "crates/hort-domain", version = "=0.12.1", registry = "hort-crates" }
+hort-config = { path = "crates/hort-config", version = "=0.12.1", registry = "hort-crates" }
+hort-app = { path = "crates/hort-app", version = "=0.12.1", registry = "hort-crates" }
+hort-attribution = { path = "crates/hort-attribution", version = "=0.12.1", registry = "hort-crates" }
+hort-net-egress = { path = "crates/hort-net-egress", version = "=0.12.1", registry = "hort-crates" }
 # Format handling
-hort-formats = { path = "crates/hort-formats", version = "=0.12.0", registry = "hort-crates" }
-hort-formats-upstream = { path = "crates/hort-formats-upstream", version = "=0.12.0", registry = "hort-crates" }
+hort-formats = { path = "crates/hort-formats", version = "=0.12.1", registry = "hort-crates" }
+hort-formats-upstream = { path = "crates/hort-formats-upstream", version = "=0.12.1", registry = "hort-crates" }
 # Inbound HTTP
-hort-http-core = { path = "crates/hort-http-core", version = "=0.12.0", registry = "hort-crates" }
-hort-http-cargo = { path = "crates/hort-http-cargo", version = "=0.12.0", registry = "hort-crates" }
-hort-http-npm = { path = "crates/hort-http-npm", version = "=0.12.0", registry = "hort-crates" }
-hort-http-pypi = { path = "crates/hort-http-pypi", version = "=0.12.0", registry = "hort-crates" }
-hort-http-oci = { path = "crates/hort-http-oci", version = "=0.12.0", registry = "hort-crates" }
-hort-http-maven = { path = "crates/hort-http-maven", version = "=0.12.0", registry = "hort-crates" }
-hort-http-admin-security = { path = "crates/hort-http-admin-security", version = "=0.12.0", registry = "hort-crates" }
-hort-http-admin-tasks = { path = "crates/hort-http-admin-tasks", version = "=0.12.0", registry = "hort-crates" }
-hort-http-subscriptions = { path = "crates/hort-http-subscriptions", version = "=0.12.0", registry = "hort-crates" }
-hort-http-discovery = { path = "crates/hort-http-discovery", version = "=0.12.0", registry = "hort-crates" }
-hort-http-events = { path = "crates/hort-http-events", version = "=0.12.0", registry = "hort-crates" }
+hort-http-core = { path = "crates/hort-http-core", version = "=0.12.1", registry = "hort-crates" }
+hort-http-cargo = { path = "crates/hort-http-cargo", version = "=0.12.1", registry = "hort-crates" }
+hort-http-npm = { path = "crates/hort-http-npm", version = "=0.12.1", registry = "hort-crates" }
+hort-http-pypi = { path = "crates/hort-http-pypi", version = "=0.12.1", registry = "hort-crates" }
+hort-http-oci = { path = "crates/hort-http-oci", version = "=0.12.1", registry = "hort-crates" }
+hort-http-maven = { path = "crates/hort-http-maven", version = "=0.12.1", registry = "hort-crates" }
+hort-http-admin-security = { path = "crates/hort-http-admin-security", version = "=0.12.1", registry = "hort-crates" }
+hort-http-admin-tasks = { path = "crates/hort-http-admin-tasks", version = "=0.12.1", registry = "hort-crates" }
+hort-http-subscriptions = { path = "crates/hort-http-subscriptions", version = "=0.12.1", registry = "hort-crates" }
+hort-http-discovery = { path = "crates/hort-http-discovery", version = "=0.12.1", registry = "hort-crates" }
+hort-http-events = { path = "crates/hort-http-events", version = "=0.12.1", registry = "hort-crates" }
 # Outbound adapters
-hort-adapters-advisory-osv = { path = "crates/hort-adapters-advisory-osv", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-checkpoint-anchor = { path = "crates/hort-adapters-checkpoint-anchor", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-ephemeral-memory = { path = "crates/hort-adapters-ephemeral-memory", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-ephemeral-redis = { path = "crates/hort-adapters-ephemeral-redis", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-kubernetes = { path = "crates/hort-adapters-kubernetes", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-oidc = { path = "crates/hort-adapters-oidc", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-postgres = { path = "crates/hort-adapters-postgres", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-provenance-cosign-key = { path = "crates/hort-adapters-provenance-cosign-key", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-provenance-sigstore = { path = "crates/hort-adapters-provenance-sigstore", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-scanner-osv = { path = "crates/hort-adapters-scanner-osv", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-scanner-trivy = { path = "crates/hort-adapters-scanner-trivy", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-secrets = { path = "crates/hort-adapters-secrets", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-storage = { path = "crates/hort-adapters-storage", version = "=0.12.0", registry = "hort-crates" }
-hort-adapters-upstream-http = { path = "crates/hort-adapters-upstream-http", version = "=0.12.0", registry = "hort-crates" }
+hort-adapters-advisory-osv = { path = "crates/hort-adapters-advisory-osv", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-checkpoint-anchor = { path = "crates/hort-adapters-checkpoint-anchor", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-ephemeral-memory = { path = "crates/hort-adapters-ephemeral-memory", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-ephemeral-redis = { path = "crates/hort-adapters-ephemeral-redis", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-kubernetes = { path = "crates/hort-adapters-kubernetes", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-oidc = { path = "crates/hort-adapters-oidc", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-postgres = { path = "crates/hort-adapters-postgres", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-provenance-cosign-key = { path = "crates/hort-adapters-provenance-cosign-key", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-provenance-sigstore = { path = "crates/hort-adapters-provenance-sigstore", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-scanner-osv = { path = "crates/hort-adapters-scanner-osv", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-scanner-trivy = { path = "crates/hort-adapters-scanner-trivy", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-secrets = { path = "crates/hort-adapters-secrets", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-storage = { path = "crates/hort-adapters-storage", version = "=0.12.1", registry = "hort-crates" }
+hort-adapters-upstream-http = { path = "crates/hort-adapters-upstream-http", version = "=0.12.1", registry = "hort-crates" }
 # Event notifiers
-hort-notifier-nats = { path = "crates/hort-notifier-nats", version = "=0.12.0", registry = "hort-crates" }
-hort-notifier-webhook = { path = "crates/hort-notifier-webhook", version = "=0.12.0", registry = "hort-crates" }
+hort-notifier-nats = { path = "crates/hort-notifier-nats", version = "=0.12.1", registry = "hort-crates" }
+hort-notifier-webhook = { path = "crates/hort-notifier-webhook", version = "=0.12.1", registry = "hort-crates" }
 
 # Async runtime
 tokio = { version = "1.50", features = ["full"] }
@@ -292,6 +292,18 @@ jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # removed from the workspace entirely; a CI grep gate (`no_bcrypt` guard)
 # keeps it out. `password-hash` ships with `argon2` and provides the PHC
 # string format encode/decode the helper module wraps.
+#
+# `argon2` and `password-hash` move together or not at all: `argon2 0.5`
+# requires `password-hash ^0.5`, and the `PasswordHash`/`SaltString` types
+# cross that boundary, so bumping `password-hash` alone is an
+# unresolved-import + duplicate-type build failure. `password-hash 0.6`
+# (which relocates the PHC types to the `phc` crate) needs `argon2 ^0.6`,
+# and `argon2 0.6` has no stable release — it is gated on `blake2 0.11`,
+# itself still pre-release. Pre-release crypto does not belong in the
+# credential path, so this pair stays on 0.5 until `argon2 0.6` ships
+# stable. The stored PHC encoding is byte-identical across that jump, and
+# `hort-app::argon2_hash`'s committed stored-format fixture is the guard
+# that proves it stays that way.
 argon2 = { version = "0.5", features = ["std"] }
 password-hash = { version = "0.5", features = ["alloc"] }
 # Ed25519 keypair used to sign the OCI Distribution-Spec `/v2/auth` token
@@ -546,7 +558,7 @@ async-nats = { version = "0.50", default-features = false }
 # `hort-notifier-nats` to stand up `nats:latest` with JetStream enabled.
 # Workspace-pinned so future adapters that need real-broker fixtures
 # (e.g. a future Kafka relay) share the version.
-testcontainers = "0.27"
+testcontainers = "0.28"
 
 # RustSec-maintained CVSS v3.x vector parser/scorer. Consumers:
 # `hort-adapters-scanner-osv` and `hort-adapters-advisory-osv` compute a

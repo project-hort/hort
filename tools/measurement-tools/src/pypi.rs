@@ -37,9 +37,9 @@
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_formats::pypi::PyPiFormatHandler;
-use anyhow::{Context, Result};
 use serde::Deserialize;
 use tracing::{info, warn};
 

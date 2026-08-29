@@ -1622,7 +1622,8 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
     let released = quarantine_uc
         .release_expired(vec![artifact_id])
         .await
-        .expect("release_expired must not itself error");
+        .expect("release_expired must not itself error")
+        .released;
     assert!(
         released.is_empty(),
         "issue #108 Item 3: the artifact must NOT be timer-releasable — its latest \

@@ -28,9 +28,9 @@
 use std::path::Path;
 use std::time::Duration;
 
+use anyhow::{Context, Result};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_formats::npm::NpmFormatHandler;
-use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::percentile::Summary;

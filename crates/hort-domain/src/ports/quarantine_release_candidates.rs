@@ -13,9 +13,20 @@
 //! exposing the result as a flat `Vec<QuarantineReleaseCandidate>`
 //! lets the handler stay a pure orchestration step (port boundary +
 //! dispatch loop only). The partial index
-//! `idx_artifacts_quarantine_window_start ON (quarantine_window_start)
-//! WHERE quarantine_status='quarantined'` supports
-//! the range scan.
+//! `idx_artifacts_quarantine_release_cursor ON (release_attempt_at NULLS
+//! FIRST, quarantine_window_start) WHERE quarantine_status='quarantined'`
+//! supports the scan and its ordering.
+//!
+//! **Fair candidacy.** Selection is ordered by the
+//! [`mark_attempted`](QuarantineReleaseCandidatesRepository::mark_attempted)
+//! cursor first (never-attempted rows lead), by window start second.
+//! Ordering by window start alone made an unreleasable head of the
+//! backlog — candidates the authority or provenance gate permanently
+//! holds — occupy the whole batch on every tick, so a backlog larger
+//! than one batch starved every other artifact in the deployment
+//! forever. With the cursor, a never-attempted artifact is served on the
+//! very next tick regardless of backlog size, and a backlog of N is
+//! fully re-attempted every `ceil(N / batch_size)` ticks.
 //!
 //! **Authority discipline.** The candidacy query filters by the *computed*
 //! window deadline only. It is **never** evidence of release authority —
@@ -62,7 +73,8 @@ pub struct QuarantineReleaseCandidate {
 /// 3. Issuing one indexed range scan per distinct duration `D`
 ///    (`quarantine_window_start <= $now - D` AND
 ///    `repository_id = ANY($repos_for_D)` AND
-///    `quarantine_status = 'quarantined'`).
+///    `quarantine_status = 'quarantined'`), ordered by
+///    `release_attempt_at NULLS FIRST, quarantine_window_start`.
 /// 4. Union-ing the per-duration result sets and applying the
 ///    global `LIMIT $batch_size` to bound per-tick load.
 pub trait QuarantineReleaseCandidatesRepository: Send + Sync {
@@ -81,6 +93,30 @@ pub trait QuarantineReleaseCandidatesRepository: Send + Sync {
         batch_size: u32,
         now: chrono::DateTime<chrono::Utc>,
     ) -> BoxFuture<'a, DomainResult<Vec<QuarantineReleaseCandidate>>>;
+
+    /// Stamp `at` on every id in `ids` as the moment the sweep last
+    /// *attempted* to release it — the cursor `select_expired` orders by.
+    ///
+    /// Called once per tick with the whole candidate batch (released rows
+    /// included; they leave the candidacy pool anyway, so excluding them
+    /// would only cost a second statement). Bulk by contract: one
+    /// round-trip for the batch, never one per id.
+    ///
+    /// The stamp is **operational scheduling metadata, not lifecycle
+    /// state** — it records that a decision was attempted, never what the
+    /// decision was, and nothing reads it outside candidacy ordering. It
+    /// is therefore deliberately not event-sourced (the same class as the
+    /// task-queue's own scheduling columns); the artifact's lifecycle
+    /// remains exactly the events on its stream.
+    ///
+    /// Callers treat a failure as non-fatal: the tick's release work
+    /// already stands, and an unstamped batch merely re-serves next tick
+    /// — the pre-cursor behaviour, never a wrong release.
+    fn mark_attempted<'a>(
+        &'a self,
+        ids: &'a [Uuid],
+        at: chrono::DateTime<chrono::Utc>,
+    ) -> BoxFuture<'a, DomainResult<()>>;
 }
 
 #[cfg(test)]
@@ -115,20 +151,39 @@ mod tests {
     /// `Box<dyn>` to prove dispatch + the `BoxFuture` signature compile.
     #[tokio::test]
     async fn select_expired_dispatches_through_trait_object() {
-        use chrono::DateTime;
-        struct Stub;
-        impl QuarantineReleaseCandidatesRepository for Stub {
-            fn select_expired<'a>(
-                &'a self,
-                _batch_size: u32,
-                _now: DateTime<Utc>,
-            ) -> BoxFuture<'a, DomainResult<Vec<QuarantineReleaseCandidate>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-        }
-
         let port: Box<dyn QuarantineReleaseCandidatesRepository> = Box::new(Stub);
         let out = port.select_expired(1000, Utc::now()).await.expect("Ok");
         assert!(out.is_empty());
+    }
+
+    /// `mark_attempted` takes the batch as a borrowed slice and returns
+    /// unit — proving the bulk-stamp shape survives trait-object dispatch
+    /// (the handler calls it with the candidate ids it already owns).
+    #[tokio::test]
+    async fn mark_attempted_dispatches_through_trait_object() {
+        let port: Box<dyn QuarantineReleaseCandidatesRepository> = Box::new(Stub);
+        port.mark_attempted(&[Uuid::nil()], Utc::now())
+            .await
+            .expect("Ok");
+    }
+
+    struct Stub;
+
+    impl QuarantineReleaseCandidatesRepository for Stub {
+        fn select_expired<'a>(
+            &'a self,
+            _batch_size: u32,
+            _now: chrono::DateTime<Utc>,
+        ) -> BoxFuture<'a, DomainResult<Vec<QuarantineReleaseCandidate>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn mark_attempted<'a>(
+            &'a self,
+            _ids: &'a [Uuid],
+            _at: chrono::DateTime<Utc>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 }

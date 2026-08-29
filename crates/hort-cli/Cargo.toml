@@ -24,7 +24,7 @@ hort-attribution = { workspace = true }
 # HTTP client — pure HTTP, no DSN, no hort-domain / hort-app / hort-adapters-* deps.
 reqwest    = { workspace = true, features = ["rustls", "json", "form"] }
 clap       = { workspace = true, features = ["derive", "env"] }
-clap_complete = { version = "=4.6.8", features = ["unstable-dynamic"] }
+clap_complete = { version = "=4.6.9", features = ["unstable-dynamic"] }
 tokio      = { workspace = true, features = ["rt-multi-thread", "macros"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
