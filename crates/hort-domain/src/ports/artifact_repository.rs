@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::entities::artifact::{Artifact, QuarantineStatus};
-use crate::error::DomainResult;
+use crate::error::{DomainError, DomainResult};
 use crate::events::Actor;
 use crate::types::{ContentHash, LimitedList, Page, PageRequest};
 
@@ -118,6 +118,34 @@ pub trait ArtifactRepository: Send + Sync {
         repository_id: Uuid,
         page: PageRequest,
     ) -> BoxFuture<'_, DomainResult<Page<String>>>;
+
+    /// Keyset-paginated distinct-name listing ordered by `name`
+    /// ascending — the same byte-stable order [`Self::list_distinct_names`]
+    /// already produces, since names are unique per repository. `after`
+    /// excludes names lexicographically `<= after`; `None` starts at the
+    /// beginning. Powers `PrefetchTickHandler`'s cross-tick rotation:
+    /// resuming a repo's package walk `after` a saved cursor degrades
+    /// gracefully if that exact name was since deleted (the `>`
+    /// comparison simply lands on the next existing name). Returns a
+    /// plain `Vec` — no `total` needed by a cursor walker.
+    ///
+    /// **Default implementation:** returns
+    /// `Err(DomainError::Invariant("list_distinct_names_after not
+    /// implemented"))` so existing mocks compile without modification.
+    /// The Postgres adapter overrides with the real keyset query.
+    fn list_distinct_names_after(
+        &self,
+        repository_id: Uuid,
+        after: Option<&str>,
+        limit: u64,
+    ) -> BoxFuture<'_, DomainResult<Vec<String>>> {
+        let _ = (repository_id, after, limit);
+        Box::pin(async {
+            Err(DomainError::Invariant(
+                "list_distinct_names_after not implemented".into(),
+            ))
+        })
+    }
 
     /// Find artifacts with a given normalized name in a repository,
     /// paginated.
@@ -510,7 +538,7 @@ mod tests {
     impl ArtifactRepository for Stub {
         fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
             Box::pin(async {
-                Err(crate::error::DomainError::NotFound {
+                Err(DomainError::NotFound {
                     entity: "Artifact",
                     id: String::new(),
                 })

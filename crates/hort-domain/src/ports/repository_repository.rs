@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use crate::entities::repository::Repository;
-use crate::error::DomainResult;
+use crate::error::{DomainError, DomainResult};
 use crate::types::{Page, PageRequest};
 
 use super::BoxFuture;
@@ -15,6 +15,28 @@ pub trait RepositoryRepository: Send + Sync {
         page: PageRequest,
         search: Option<&str>,
     ) -> BoxFuture<'_, DomainResult<Page<Repository>>>;
+
+    /// Keyset-paginated repository listing ordered by `id` ascending —
+    /// the stable total order a cross-tick rotation walk resumes
+    /// against (`PrefetchTickHandler`). `after` excludes rows with
+    /// `id <= after`; `None` starts at the beginning. Unlike
+    /// [`Self::list`], this ignores `search` — a rotation walks every
+    /// repository, not a filtered subset — and returns a plain `Vec`
+    /// rather than a [`Page`] (no `total` needed by a cursor walker;
+    /// mirrors `RetentionCandidateReader::list_candidates`'s shape).
+    ///
+    /// **Default implementation:** returns
+    /// `Err(DomainError::Invariant("list_after not implemented"))` so
+    /// existing mocks compile without modification. The Postgres
+    /// adapter overrides with the real keyset query.
+    fn list_after(
+        &self,
+        after: Option<Uuid>,
+        limit: u64,
+    ) -> BoxFuture<'_, DomainResult<Vec<Repository>>> {
+        let _ = (after, limit);
+        Box::pin(async { Err(DomainError::Invariant("list_after not implemented".into())) })
+    }
     fn save(&self, repository: &Repository) -> BoxFuture<'_, DomainResult<()>>;
     fn delete(&self, id: Uuid) -> BoxFuture<'_, DomainResult<()>>;
     fn get_virtual_members(

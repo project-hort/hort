@@ -45,13 +45,20 @@
 //!   "repos_walked":          u64,
 //!   "packages_walked":       u64,
 //!   "prefetches_planned":    u64,
+//!   "prefetches_enqueued":   u64,
+//!   "prefetches_deduped":    u64,
+//!   "budget_exhausted":      bool,
 //!   "skipped_disabled":      u64,
 //!   "skipped_no_trigger":    u64,
 //!   "upstream_fetch_errors": u64,
 //!   "upstream_parse_errors": u64,
-//!   "no_mapping":            u64
+//!   "no_mapping":            u64,
+//!   "cursor":                { "position": "after_repo" | "within_repo", … } | null
 //! }
 //! ```
+//!
+//! `cursor` is the rotation's own progress marker — see "Cross-tick
+//! rotation" below.
 //!
 //! # Upstream discovery
 //!
@@ -70,15 +77,64 @@
 //! format) are non-fatal — a `warn!` is emitted and the walk moves on.
 //! One bad repo cannot starve the rest of the walk.
 //!
+//! # Cross-tick rotation
+//!
+//! No repo or tracked package is page-1-locked out. The walk is a
+//! **single flattened total order** — repos in stable `ORDER BY id`,
+//! packages within a repo in [`ArtifactRepository::list_distinct_names`]'s
+//! byte-stable `ORDER BY name` — and the tick persists a keyset cursor
+//! (`(repository_id, package_name)`, [`TickCursor`]) marking the last
+//! position fully processed. The NEXT tick's fresh job row (every
+//! recurring tick is a brand-new `jobs` INSERT — see
+//! `enqueue-prefetch-tick`) reads that cursor back via
+//! [`JobsRepository::last_result_summary_by_kind`] and resumes strictly
+//! after it — no new table, no column on `repositories`; the cursor
+//! rides the tick's own `result_summary`, which is already durable
+//! per-row state. A cursor naming a since-deleted repo or package
+//! degrades gracefully: the keyset `>` comparison simply resumes at the
+//! next existing entry. Reaching the true end of the repo table wraps
+//! the walk back to the beginning for free — the same "fetch after the
+//! cursor; if short, fetch the remainder from the start" keyset step
+//! that resumes a mid-table cutover also closes a completed cycle,
+//! without a separate "did we finish everything" check.
+//!
+//! [`MAX_REPOS_PER_TICK`] and [`MAX_PACKAGES_PER_REPO`] are **per-tick
+//! page sizes of the rotation, not hard visibility ceilings**: a
+//! repository count or a single repo's tracked-package count beyond
+//! either cap no longer stops that repo (or those packages) from ever
+//! being visited — it only stops the CURRENT tick there, and the
+//! persisted cursor picks the walk back up on the next one. Concretely,
+//! hitting [`MAX_PACKAGES_PER_REPO`] mid-repo — its per-tick package
+//! page comes back full — halts the *entire* tick at that point (not
+//! just that repo): the flattened total order has exactly one active
+//! cursor position, so continuing on to other repos in the same tick
+//! would either advance past this repo's remaining names with nothing
+//! recording where to resume, or require tracking more than one
+//! in-flight cursor. Concretely too: with the per-tick enqueue budget
+//! [`MAX_PREFETCHES_PER_TICK`] = B and total plannable work (the
+//! repo×package space actually walked before a fresh divergence stops
+//! appearing) W, a full traversal completes in `⌈W / B⌉` ticks in the
+//! common case where the enqueue budget binds before either page-size
+//! cap does; a deployment with more than [`MAX_REPOS_PER_TICK`] repos
+//! or a repo with more than [`MAX_PACKAGES_PER_REPO`] tracked names
+//! simply takes the page-size cap as its per-tick stride instead, still
+//! monotonically covering everything — never a permanent visibility
+//! ceiling.
+//!
 //! # Batch discipline
 //!
 //! The handler bounds per-tick work two ways:
 //!
-//! 1. Repository walk uses [`MAX_REPOS_PER_TICK`] as the page-1 limit.
+//! 1. Repository walk uses [`MAX_REPOS_PER_TICK`] as the per-tick page
+//!    size (field `max_repos_per_tick`, unit-testable independent of
+//!    the const).
 //! 2. Per-repo package walk uses [`MAX_PACKAGES_PER_REPO`] as the
-//!    per-tick cap.
+//!    per-tick page size (field `max_packages_per_repo`).
 //!
-//! Both caps mirror `QuarantineReleaseSweepHandler::BATCH_SIZE`.
+//! Both caps mirror `QuarantineReleaseSweepHandler::BATCH_SIZE`'s
+//! shape; neither bounds *total* visibility any more (see "Cross-tick
+//! rotation" above) — only how much of the rotation a single tick
+//! advances.
 //!
 //! # Composition + delivery
 //!
@@ -92,14 +148,16 @@
 //! the runtime DSN — same delivery contract as the
 //! quarantine-release sweep.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::repository::{PrefetchTrigger, Repository, RepositoryFormat};
-use hort_domain::error::DomainResult;
+use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::{JobsRepository, PrefetchEnqueueRow};
@@ -108,7 +166,6 @@ use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstre
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::BoxFuture;
-use hort_domain::types::PageRequest;
 
 use crate::use_cases::index_serve_filter::{
     CargoSemverOrdering, NpmSemverOrdering, Pep440Ordering, VersionOrdering,
@@ -119,19 +176,29 @@ use crate::use_cases::prefetch_use_case::PrefetchUseCase;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Hard cap on repositories walked per tick. Mirrors the
+/// Default per-tick page size for the repository rotation. Mirrors the
 /// `BATCH_SIZE = 1000` discipline in
 /// [`super::quarantine_release_sweep::QuarantineReleaseSweepHandler`].
-/// A single tick visits at most this many repos; subsequent CronJob runs
-/// drain any backlog. Pinning as a `u64` constant (rather than wiring
-/// through env) follows the v1 sweep precedent — ENV-tuning is out of
-/// scope here.
+/// A single tick visits at most this many repos (default value for
+/// [`PrefetchTickHandler::max_repos_per_tick`]); the persisted
+/// [`TickCursor`] resumes the rotation on the next tick, so this is a
+/// per-tick stride, not a hard visibility ceiling — see "Cross-tick
+/// rotation" in the module docs. Pinning as a `u64` constant (rather
+/// than wiring through env) follows the v1 sweep precedent — ENV-tuning
+/// is out of scope here.
 const MAX_REPOS_PER_TICK: u64 = 1000;
 
-/// Soft cap on distinct package names walked per repository per tick.
-/// `list_distinct_names` is paginated; the handler reads page 1 with
-/// this limit and stops. A repo with more packages walks across multiple
-/// ticks — the planner is idempotent so the partition is harmless.
+/// Default per-tick page size for a single repository's tracked-package
+/// walk (default value for
+/// [`PrefetchTickHandler::max_packages_per_repo`]).
+/// [`ArtifactRepository::list_distinct_names_after`] is keyset-paginated;
+/// the handler reads one page of this size, resuming after the
+/// persisted cursor. A repo with more packages than this page size
+/// halts the ENTIRE tick at the page boundary (not just this repo — see
+/// "Cross-tick rotation" in the module docs) and resumes the same repo,
+/// same position, on the next tick; the planner is idempotent so
+/// re-walking is always harmless, it simply never happens for a
+/// completed name.
 const MAX_PACKAGES_PER_REPO: u64 = 1000;
 
 /// Per-tick enqueue budget. The walk is bulk
@@ -182,6 +249,14 @@ pub struct PrefetchTickHandler {
     /// field (not a bare const read) so the budget boundary is
     /// unit-testable without a 5000-row fixture.
     max_prefetches_per_tick: usize,
+    /// Per-tick repository-rotation page size. Defaults to
+    /// [`MAX_REPOS_PER_TICK`]; a field so the > cap rotation/wrap
+    /// behaviour is unit-testable without a 1000+-repo fixture.
+    max_repos_per_tick: u64,
+    /// Per-tick per-repository package-rotation page size. Defaults to
+    /// [`MAX_PACKAGES_PER_REPO`]; a field so the > cap resume behaviour
+    /// is unit-testable without a 1000+-name fixture.
+    max_packages_per_repo: u64,
 }
 
 impl PrefetchTickHandler {
@@ -207,6 +282,79 @@ impl PrefetchTickHandler {
             upstream_mappings,
             format_handlers,
             max_prefetches_per_tick: MAX_PREFETCHES_PER_TICK,
+            max_repos_per_tick: MAX_REPOS_PER_TICK,
+            max_packages_per_repo: MAX_PACKAGES_PER_REPO,
+        }
+    }
+
+    /// Read the rotation cursor persisted by the most recently completed
+    /// `prefetch-tick` run's `result_summary.cursor`. Every failure mode
+    /// — the kind has never completed, the port read failed, the prior
+    /// summary carries no `cursor` key, or the value fails to
+    /// deserialise — collapses to `None` (walk from the beginning): a
+    /// missing or malformed cursor is a resumability optimisation lost,
+    /// never a reason to fail the tick.
+    async fn read_cursor(&self) -> Option<TickCursor> {
+        let summary = match self.jobs.last_result_summary_by_kind(self.kind()).await {
+            Ok(s) => s?,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "prefetch-tick: last_result_summary_by_kind failed; walking from the beginning",
+                );
+                return None;
+            }
+        };
+        let cursor = summary.get("cursor")?.clone();
+        if cursor.is_null() {
+            return None;
+        }
+        match serde_json::from_value::<TickCursor>(cursor.clone()) {
+            Ok(c) => Some(c),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    %cursor,
+                    "prefetch-tick: malformed cursor in prior result_summary; \
+                     walking from the beginning",
+                );
+                None
+            }
+        }
+    }
+}
+
+/// Cross-tick keyset cursor for the repo × package rotation.
+/// Persisted as the tick's own `result_summary.cursor` — see the module
+/// docs' "Cross-tick rotation" section for why the state lives there
+/// rather than a new table or a column on `repositories`.
+///
+/// `AfterRepo` means "this repo's rotation slot is fully spent — resume
+/// at the next repo in id order, packages from the top." `WithinRepo`
+/// means "this repo's per-tick package page was not fully drained —
+/// resume the SAME repo, at the next name after `package_name`."
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "position", rename_all = "snake_case")]
+enum TickCursor {
+    AfterRepo {
+        repository_id: Uuid,
+    },
+    WithinRepo {
+        repository_id: Uuid,
+        package_name: String,
+    },
+}
+
+impl TickCursor {
+    /// The repository-id keyset bound for the rotation's NEXT-repo
+    /// query. Both variants resume subsequent repos strictly after this
+    /// id — a `WithinRepo` cursor's own repo is re-fetched separately
+    /// (by id, not through this keyset bound) so its package walk can
+    /// resume mid-repo.
+    fn repository_id(&self) -> Uuid {
+        match self {
+            TickCursor::AfterRepo { repository_id }
+            | TickCursor::WithinRepo { repository_id, .. } => *repository_id,
         }
     }
 }
@@ -235,6 +383,11 @@ struct TickSummary {
     upstream_fetch_errors: u64,
     upstream_parse_errors: u64,
     no_mapping: u64,
+    /// Rotation progress: the last `(repository_id, package_name)`
+    /// position fully processed this tick, or `None` when nothing was
+    /// walked (e.g. an empty repository table). Read back by the next
+    /// tick via `JobsRepository::last_result_summary_by_kind`.
+    cursor: Option<TickCursor>,
 }
 
 impl TickSummary {
@@ -251,6 +404,7 @@ impl TickSummary {
             "upstream_fetch_errors": self.upstream_fetch_errors,
             "upstream_parse_errors": self.upstream_parse_errors,
             "no_mapping":            self.no_mapping,
+            "cursor":                self.cursor,
         })
     }
 }
@@ -267,36 +421,105 @@ impl TaskHandler for PrefetchTickHandler {
         _ctx: TaskContext,
     ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
         Box::pin(async move {
-            // ----- Step 1: page-1 read of all repositories -------------
-            let page = match self
-                .repositories
-                .list(PageRequest::new(0, MAX_REPOS_PER_TICK), None)
-                .await
+            let cursor = self.read_cursor().await;
+
+            // ----- Step 1: resolve this tick's repo rotation page -----
+            //
+            // A `WithinRepo` cursor's own repo is re-fetched by id (its
+            // package walk resumes mid-repo, below); every other repo
+            // comes from the keyset page, strictly after the cursor's
+            // repo id. Reaching the true end of the repo table (a short
+            // page) wraps by fetching the remainder from the start,
+            // deduped against what this tick already selected — a repo
+            // count at or below the page size is never double-visited
+            // in one tick, and a repo count above it wraps for free on
+            // whichever tick's cursor first reaches the tail.
+            let mut repos_to_walk: Vec<(Repository, Option<String>)> = Vec::new();
+            let mut repo_budget = self.max_repos_per_tick;
+
+            if let Some(TickCursor::WithinRepo {
+                repository_id,
+                package_name,
+            }) = &cursor
             {
-                Ok(p) => p,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "prefetch-tick: repositories.list failed; will retry on next tick",
-                    );
-                    return Ok(TaskOutcome::fail(
-                        format!("repositories.list failed: {err}"),
-                        true,
-                    ));
+                match self.repositories.find_by_id(*repository_id).await {
+                    Ok(repo) => {
+                        repos_to_walk.push((repo, Some(package_name.clone())));
+                        repo_budget = repo_budget.saturating_sub(1);
+                    }
+                    Err(DomainError::NotFound { .. }) => {
+                        tracing::debug!(
+                            repository_id = %repository_id,
+                            "prefetch-tick: cursor's repo was deleted; resuming past it",
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            repository_id = %repository_id,
+                            "prefetch-tick: find_by_id failed resolving the cursor's repo; \
+                             resuming past it",
+                        );
+                    }
                 }
-            };
+            }
+
+            if repo_budget > 0 {
+                let after_id = cursor.as_ref().map(TickCursor::repository_id);
+                let page = match self.repositories.list_after(after_id, repo_budget).await {
+                    Ok(p) => p,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "prefetch-tick: repositories.list_after failed; will retry on next tick",
+                        );
+                        return Ok(TaskOutcome::fail(
+                            format!("repositories.list_after failed: {err}"),
+                            true,
+                        ));
+                    }
+                };
+                let short_by = repo_budget.saturating_sub(page.len() as u64);
+                let mut page = page;
+                if short_by > 0 && after_id.is_some() {
+                    let wrap = match self.repositories.list_after(None, short_by).await {
+                        Ok(w) => w,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "prefetch-tick: repositories.list_after (wrap) failed; \
+                                 continuing with the partial page",
+                            );
+                            Vec::new()
+                        }
+                    };
+                    let seen: HashSet<Uuid> = repos_to_walk
+                        .iter()
+                        .map(|(r, _)| r.id)
+                        .chain(page.iter().map(|r| r.id))
+                        .collect();
+                    page.extend(wrap.into_iter().filter(|r| !seen.contains(&r.id)));
+                }
+                repos_to_walk.extend(page.into_iter().map(|r| (r, None)));
+            }
 
             let mut summary = TickSummary::default();
 
-            'walk: for repo in page.items.iter() {
+            'walk: for (repo, resume_after) in repos_to_walk.iter() {
                 // ----- Per-repo candidacy filter -----------------------
                 let policy = &repo.prefetch_policy;
                 if !policy.enabled {
                     summary.skipped_disabled += 1;
+                    summary.cursor = Some(TickCursor::AfterRepo {
+                        repository_id: repo.id,
+                    });
                     continue;
                 }
                 if !policy.triggers.contains(&PrefetchTrigger::Scheduled) {
                     summary.skipped_no_trigger += 1;
+                    summary.cursor = Some(TickCursor::AfterRepo {
+                        repository_id: repo.id,
+                    });
                     continue;
                 }
                 let Some(handler) = self.format_handlers.get(&repo.format.to_string()) else {
@@ -308,6 +531,9 @@ impl TaskHandler for PrefetchTickHandler {
                          a Phase-2 format with an ordering but no handler is a \
                          composition oversight)",
                     );
+                    summary.cursor = Some(TickCursor::AfterRepo {
+                        repository_id: repo.id,
+                    });
                     continue;
                 };
                 // Pre-flight: the format must participate in the
@@ -326,6 +552,9 @@ impl TaskHandler for PrefetchTickHandler {
                         "prefetch-tick: format does not implement VersionDiscovery — \
                          skipping repo",
                     );
+                    summary.cursor = Some(TickCursor::AfterRepo {
+                        repository_id: repo.id,
+                    });
                     continue;
                 };
 
@@ -348,6 +577,9 @@ impl TaskHandler for PrefetchTickHandler {
                             repository = %repo.key,
                             "prefetch-tick: list_for_repository failed; continuing",
                         );
+                        summary.cursor = Some(TickCursor::AfterRepo {
+                            repository_id: repo.id,
+                        });
                         continue;
                     }
                 };
@@ -359,15 +591,22 @@ impl TaskHandler for PrefetchTickHandler {
                          upstream mapping is a config gap)",
                     );
                     summary.no_mapping += 1;
+                    summary.cursor = Some(TickCursor::AfterRepo {
+                        repository_id: repo.id,
+                    });
                     continue;
                 };
 
                 summary.repos_walked += 1;
 
-                // ----- Step 3: page-1 read of tracked package names ----
+                // ----- Step 3: keyset page of tracked package names ----
                 let names_page = match self
                     .artifacts
-                    .list_distinct_names(repo.id, PageRequest::new(0, MAX_PACKAGES_PER_REPO))
+                    .list_distinct_names_after(
+                        repo.id,
+                        resume_after.as_deref(),
+                        self.max_packages_per_repo,
+                    )
                     .await
                 {
                     Ok(p) => p,
@@ -375,14 +614,18 @@ impl TaskHandler for PrefetchTickHandler {
                         tracing::warn!(
                             error = %err,
                             repository = %repo.key,
-                            "prefetch-tick: list_distinct_names failed for repo; continuing",
+                            "prefetch-tick: list_distinct_names_after failed for repo; continuing",
                         );
+                        summary.cursor = Some(TickCursor::AfterRepo {
+                            repository_id: repo.id,
+                        });
                         continue;
                     }
                 };
+                let names_page_full = names_page.len() as u64 == self.max_packages_per_repo;
 
                 // ----- Step 4: per-package upstream-fetch + plan --------
-                for package in names_page.items.iter() {
+                for package in names_page.iter() {
                     // The port returns a 3-tuple
                     // `(version, status, quarantine_until)`. The pure
                     // planner ignores `quarantine_until`; strip the
@@ -571,9 +814,15 @@ impl TaskHandler for PrefetchTickHandler {
 
                     // Per-tick budget, checked BETWEEN packages so each
                     // walked package's cohort enqueues whole (keeps the
-                    // plan-time metric aligned per package).
+                    // plan-time metric aligned per package). The cursor
+                    // saves the EXACT stopping point — the next tick
+                    // resumes at this package, not at page 1.
                     if summary.prefetches_enqueued >= self.max_prefetches_per_tick as u64 {
                         summary.budget_exhausted = true;
+                        summary.cursor = Some(TickCursor::WithinRepo {
+                            repository_id: repo.id,
+                            package_name: package.clone(),
+                        });
                         tracing::warn!(
                             enqueued = summary.prefetches_enqueued,
                             budget = self.max_prefetches_per_tick,
@@ -583,6 +832,30 @@ impl TaskHandler for PrefetchTickHandler {
                         break 'walk;
                     }
                 }
+
+                if names_page_full {
+                    // This repo's per-tick package page came back full —
+                    // there may be more names beyond it. Stop the ENTIRE
+                    // tick here (not just this repo) so the single
+                    // cursor resumes this repo's remaining names next
+                    // tick: the flattened (repo, package) total order
+                    // has exactly one active position, so continuing on
+                    // to other repos this tick would either strand this
+                    // repo's remainder unrecorded or require tracking
+                    // more than one in-flight cursor.
+                    summary.cursor = Some(TickCursor::WithinRepo {
+                        repository_id: repo.id,
+                        package_name: names_page
+                            .last()
+                            .cloned()
+                            .expect("names_page_full implies max_packages_per_repo > 0 names"),
+                    });
+                    break 'walk;
+                }
+
+                summary.cursor = Some(TickCursor::AfterRepo {
+                    repository_id: repo.id,
+                });
             }
 
             tracing::info!(
@@ -597,6 +870,7 @@ impl TaskHandler for PrefetchTickHandler {
                 upstream_fetch_errors = summary.upstream_fetch_errors,
                 upstream_parse_errors = summary.upstream_parse_errors,
                 no_mapping = summary.no_mapping,
+                cursor = ?summary.cursor,
                 "prefetch-tick complete",
             );
 
@@ -657,6 +931,7 @@ fn ordering_for_format(format: &RepositoryFormat) -> Option<&'static dyn Version
 mod tests {
     use super::*;
 
+    use hort_domain::types::PageRequest;
     use std::sync::Mutex;
 
     use chrono::{DateTime, Utc};
@@ -1069,49 +1344,86 @@ mod tests {
 
     // ---------- mock RepositoryRepository --------------------------------
     //
-    // Only `list` is exercised; every other method is a `panic!`.
+    // `find_by_id` and `list_after` are exercised (the rotation's two
+    // read paths); every other method is a `panic!`. Backed by a plain
+    // `Vec` (not a one-shot result) so a test can drive the handler
+    // across multiple simulated ticks against a stable repo set.
 
     struct MockRepoRepo {
-        list_result: Mutex<Option<DomainResult<Page<Repository>>>>,
-        last_page: Mutex<Option<PageRequest>>,
+        repos: Mutex<Vec<Repository>>,
+        /// When `Some`, the NEXT `list_after` call returns this error
+        /// instead of querying `repos` (one-shot).
+        list_after_err: Mutex<Option<DomainError>>,
+        /// Recorded `(after, limit)` argument pairs from every
+        /// `list_after` call, in call order.
+        list_after_calls: Mutex<Vec<(Option<Uuid>, u64)>>,
     }
 
     impl MockRepoRepo {
         fn returning(rows: Vec<Repository>) -> Self {
             Self {
-                list_result: Mutex::new(Some(Ok(Page {
-                    total: rows.len() as u64,
-                    items: rows,
-                }))),
-                last_page: Mutex::new(None),
+                repos: Mutex::new(rows),
+                list_after_err: Mutex::new(None),
+                list_after_calls: Mutex::new(Vec::new()),
             }
         }
 
         fn failing(err: DomainError) -> Self {
             Self {
-                list_result: Mutex::new(Some(Err(err))),
-                last_page: Mutex::new(None),
+                repos: Mutex::new(Vec::new()),
+                list_after_err: Mutex::new(Some(err)),
+                list_after_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn list_after_calls(&self) -> Vec<(Option<Uuid>, u64)> {
+            self.list_after_calls.lock().unwrap().clone()
         }
     }
 
     impl RepositoryRepository for MockRepoRepo {
-        fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<Repository>> {
-            panic!("find_by_id should not be called by the prefetch-tick handler")
+        fn find_by_id(&self, id: Uuid) -> BoxFuture<'_, DomainResult<Repository>> {
+            let found = self
+                .repos
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == id)
+                .cloned();
+            Box::pin(async move {
+                found.ok_or_else(|| DomainError::NotFound {
+                    entity: "Repository",
+                    id: id.to_string(),
+                })
+            })
         }
         fn find_by_key(&self, _key: &str) -> BoxFuture<'_, DomainResult<Repository>> {
             panic!("find_by_key should not be called by the prefetch-tick handler")
         }
         fn list(
             &self,
-            page: PageRequest,
+            _page: PageRequest,
             _search: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Page<Repository>>> {
-            *self.last_page.lock().unwrap() = Some(page);
-            let res = self.list_result.lock().unwrap().take();
-            Box::pin(async move {
-                res.expect("list called more than once in test; programme additional results")
-            })
+            panic!("list should not be called by the prefetch-tick handler — it rotates via list_after")
+        }
+        fn list_after(
+            &self,
+            after: Option<Uuid>,
+            limit: u64,
+        ) -> BoxFuture<'_, DomainResult<Vec<Repository>>> {
+            self.list_after_calls.lock().unwrap().push((after, limit));
+            if let Some(err) = self.list_after_err.lock().unwrap().take() {
+                return Box::pin(async move { Err(err) });
+            }
+            let mut sorted: Vec<Repository> = self.repos.lock().unwrap().clone();
+            sorted.sort_by_key(|r| r.id);
+            let items: Vec<Repository> = sorted
+                .into_iter()
+                .filter(|r| after.is_none_or(|a| r.id > a))
+                .take(limit as usize)
+                .collect();
+            Box::pin(async move { Ok(items) })
         }
         fn save(&self, _repository: &Repository) -> BoxFuture<'_, DomainResult<()>> {
             panic!("save should not be called by the prefetch-tick handler")
@@ -1156,6 +1468,11 @@ mod tests {
         per_package_status: Mutex<PackageStatusMap>,
         list_names_err: Mutex<Option<DomainError>>,
         package_status_err: Mutex<Option<DomainError>>,
+        /// Every `repository_id` passed to `list_distinct_names_after`,
+        /// in call order — a rotation test's window into exactly which
+        /// (and how many times each) repo was visited across simulated
+        /// ticks, independent of the opaque per-tick summary counters.
+        list_distinct_names_after_calls: Mutex<Vec<Uuid>>,
     }
 
     impl MockArtRepo {
@@ -1165,7 +1482,12 @@ mod tests {
                 per_package_status: Mutex::new(HashMap::new()),
                 list_names_err: Mutex::new(None),
                 package_status_err: Mutex::new(None),
+                list_distinct_names_after_calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn list_distinct_names_after_calls(&self) -> Vec<Uuid> {
+            self.list_distinct_names_after_calls.lock().unwrap().clone()
         }
 
         fn with_names(self, repo_id: Uuid, names: Vec<&str>) -> Self {
@@ -1243,26 +1565,43 @@ mod tests {
         }
         fn list_distinct_names(
             &self,
-            repository_id: Uuid,
+            _repository_id: Uuid,
             _page: PageRequest,
         ) -> BoxFuture<'_, DomainResult<Page<String>>> {
+            panic!(
+                "list_distinct_names should not be called by the prefetch-tick handler — \
+                 it rotates via list_distinct_names_after"
+            )
+        }
+        fn list_distinct_names_after(
+            &self,
+            repository_id: Uuid,
+            after: Option<&str>,
+            limit: u64,
+        ) -> BoxFuture<'_, DomainResult<Vec<String>>> {
+            self.list_distinct_names_after_calls
+                .lock()
+                .unwrap()
+                .push(repository_id);
             let maybe_err = self.list_names_err.lock().unwrap().take();
             if let Some(err) = maybe_err {
                 return Box::pin(async move { Err(err) });
             }
-            let names = self
+            let mut names: Vec<String> = self
                 .distinct_names
                 .lock()
                 .unwrap()
                 .get(&repository_id)
                 .cloned()
                 .unwrap_or_default();
-            Box::pin(async move {
-                Ok(Page {
-                    total: names.len() as u64,
-                    items: names,
-                })
-            })
+            names.sort();
+            let after = after.map(str::to_string);
+            let items: Vec<String> = names
+                .into_iter()
+                .filter(|n| after.as_deref().is_none_or(|a| n.as_str() > a))
+                .take(limit as usize)
+                .collect();
+            Box::pin(async move { Ok(items) })
         }
         fn find_by_name_in_repo(
             &self,
@@ -1577,9 +1916,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repositories_list_failure_returns_failed_retry() {
+    async fn repositories_list_after_failure_returns_failed_retry() {
         let repos = Arc::new(MockRepoRepo::failing(DomainError::Invariant(
-            "simulated repositories.list failure".into(),
+            "simulated repositories.list_after failure".into(),
         )));
         let arts = Arc::new(MockArtRepo::new());
         let proxy = Arc::new(MockUpstreamProxy::new());
@@ -1589,13 +1928,13 @@ mod tests {
         let outcome = handler
             .run(&serde_json::Value::Null, make_context())
             .await
-            .expect("Ok — repositories.list errors surface via TaskOutcome::Failed");
+            .expect("Ok — repositories.list_after errors surface via TaskOutcome::Failed");
 
         match outcome {
             TaskOutcome::Failed { retry, reason } => {
-                assert!(retry, "list failure must retry");
+                assert!(retry, "list_after failure must retry");
                 assert!(
-                    reason.contains("repositories.list"),
+                    reason.contains("repositories.list_after"),
                     "reason should name the failing call: {reason}"
                 );
             }
@@ -1966,6 +2305,17 @@ mod tests {
                     result_summary["packages_walked"], 1,
                     "walk stopped before the 2nd package"
                 );
+                // The cursor saves the EXACT stopping point — "alpha"
+                // (the package whose enqueue tripped the budget), not a
+                // page-1 restart.
+                assert_eq!(
+                    result_summary["cursor"],
+                    serde_json::json!({
+                        "position": "within_repo",
+                        "repository_id": repo_id,
+                        "package_name": "alpha",
+                    }),
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -2302,11 +2652,12 @@ mod tests {
     }
 
     // =====================================================================
-    // MAX_REPOS_PER_TICK — handler asks list for exactly 1000.
+    // MAX_REPOS_PER_TICK — handler asks list_after for exactly 1000, with
+    // no cursor on the very first tick.
     // =====================================================================
 
     #[tokio::test]
-    async fn run_asks_list_for_exactly_max_repos_per_tick() {
+    async fn run_asks_list_after_for_exactly_max_repos_per_tick() {
         let repos = Arc::new(MockRepoRepo::returning(Vec::new()));
         let arts = Arc::new(MockArtRepo::new());
         let proxy = Arc::new(MockUpstreamProxy::new());
@@ -2320,14 +2671,13 @@ mod tests {
             .await
             .expect("Ok");
 
-        let page = repos_for_assert
-            .last_page
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("list called");
-        assert_eq!(page.offset, 0);
-        assert_eq!(page.limit, MAX_REPOS_PER_TICK);
+        let calls = repos_for_assert.list_after_calls();
+        assert_eq!(calls.len(), 1, "list_after called exactly once");
+        assert_eq!(
+            calls[0],
+            (None, MAX_REPOS_PER_TICK),
+            "no cursor yet, full page size"
+        );
         assert_eq!(
             MAX_REPOS_PER_TICK, 1000,
             "design pin: MAX_REPOS_PER_TICK = 1000"
@@ -2336,5 +2686,201 @@ mod tests {
             MAX_PACKAGES_PER_REPO, 1000,
             "design pin: MAX_PACKAGES_PER_REPO = 1000"
         );
+    }
+
+    // =====================================================================
+    // Cross-tick rotation. These fixtures drive the handler across
+    // multiple simulated ticks, wiring each tick's `result_summary`
+    // into the next tick's `last_result_summary_by_kind` read — exactly
+    // what the real dispatcher + a fresh job row do.
+    // =====================================================================
+
+    /// Fixture with > `max_repos_per_tick` fully-eligible repos: every
+    /// repo is visited within a bounded number of simulated ticks, and
+    /// reaching the end of the repo table wraps the walk back to the
+    /// beginning instead of starving the tail forever. Each repo is
+    /// fully eligible (enabled, `Scheduled` trigger, npm handler, a
+    /// catch-all mapping) but carries zero tracked package names, so
+    /// `list_distinct_names_after` is reached — and its `repository_id`
+    /// argument recorded — for every repo the walk visits, without any
+    /// upstream I/O.
+    #[tokio::test]
+    async fn cross_tick_rotation_covers_every_repo_beyond_the_per_tick_cap() {
+        const TOTAL_REPOS: usize = 5;
+        let repo_rows: Vec<Repository> = (0..TOTAL_REPOS)
+            .map(|i| {
+                repo_with(
+                    &format!("repo-{i}"),
+                    RepositoryFormat::Npm,
+                    enabled_scheduled_policy(),
+                )
+            })
+            .collect();
+        let all_ids: HashSet<Uuid> = repo_rows.iter().map(|r| r.id).collect();
+
+        let repos = Arc::new(MockRepoRepo::returning(repo_rows.clone()));
+        let arts = Arc::new(MockArtRepo::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        for repo in &repo_rows {
+            mappings
+                .upsert(catchall_mapping(repo.id))
+                .await
+                .expect("upsert");
+        }
+        let jobs = Arc::new(MockJobsRepository::default());
+        let mut handler = make_handler_with_jobs(
+            repos,
+            arts.clone(),
+            proxy,
+            mappings,
+            handlers_for_npm(),
+            jobs.clone(),
+        );
+        handler.max_repos_per_tick = 2; // cap well below TOTAL_REPOS
+
+        // ceil(TOTAL_REPOS / cap) ticks already reaches full coverage;
+        // a couple of extra ticks are slack against the greedy
+        // wrap-fetch (a short post-cursor page immediately spends
+        // leftover per-tick budget on the next cycle rather than idling
+        // it, so a cycle can finish a tick "early").
+        for _ in 0..5 {
+            let outcome = handler
+                .run(&serde_json::Value::Null, make_context())
+                .await
+                .expect("Ok");
+            let TaskOutcome::Completed { result_summary } = outcome else {
+                panic!("expected Completed");
+            };
+            assert!(
+                result_summary["repos_walked"].as_u64().unwrap() > 0,
+                "every tick with repos remaining must make progress",
+            );
+            jobs.set_last_result_summary_by_kind("prefetch-tick", result_summary);
+        }
+
+        let visited: HashSet<Uuid> = arts.list_distinct_names_after_calls().into_iter().collect();
+        assert_eq!(
+            visited, all_ids,
+            "every repo must be visited at least once across the rotation"
+        );
+    }
+
+    /// Fixture with one repo carrying > `max_packages_per_repo` tracked
+    /// names: every name is visited across ticks, and the tick after a
+    /// full per-tick page resumes at the saved cursor — not at page 1.
+    #[tokio::test]
+    async fn cross_tick_package_rotation_resumes_at_saved_cursor_not_page_one() {
+        let r = repo_with(
+            "npm-mirror",
+            RepositoryFormat::Npm,
+            enabled_scheduled_policy(),
+        );
+        let repo_id = r.id;
+        let names: Vec<String> = (0..7).map(|i| format!("pkg-{i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let repos = Arc::new(MockRepoRepo::returning(vec![r]));
+        let arts = Arc::new(MockArtRepo::new().with_names(repo_id, name_refs));
+        // No upstream metadata is seeded for any package — each walked
+        // package fails `fetch_metadata` and is counted
+        // `upstream_fetch_errors`, isolating this test to the
+        // package-rotation cursor (cap 2) rather than the planner path.
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        mappings
+            .upsert(catchall_mapping(repo_id))
+            .await
+            .expect("upsert");
+        let jobs = Arc::new(MockJobsRepository::default());
+        let mut handler = make_handler_with_jobs(
+            repos,
+            arts,
+            proxy,
+            mappings,
+            handlers_for_npm(),
+            jobs.clone(),
+        );
+        handler.max_packages_per_repo = 3; // cap well below the 7 seeded names
+
+        let expected_cursors = [
+            serde_json::json!({
+                "position": "within_repo", "repository_id": repo_id, "package_name": "pkg-2",
+            }),
+            serde_json::json!({
+                "position": "within_repo", "repository_id": repo_id, "package_name": "pkg-5",
+            }),
+            serde_json::json!({
+                "position": "after_repo", "repository_id": repo_id,
+            }),
+        ];
+        let mut total_packages_walked = 0u64;
+        for expected_cursor in expected_cursors {
+            let outcome = handler
+                .run(&serde_json::Value::Null, make_context())
+                .await
+                .expect("Ok");
+            let TaskOutcome::Completed { result_summary } = outcome else {
+                panic!("expected Completed");
+            };
+            assert_eq!(result_summary["cursor"], expected_cursor);
+            total_packages_walked += result_summary["packages_walked"].as_u64().unwrap();
+            jobs.set_last_result_summary_by_kind("prefetch-tick", result_summary);
+        }
+        assert_eq!(
+            total_packages_walked,
+            names.len() as u64,
+            "every name is visited exactly once across the three ticks"
+        );
+    }
+
+    /// A cursor naming a since-deleted repo degrades gracefully: the
+    /// keyset `>` comparison simply resumes at the next existing repo,
+    /// rather than erroring or stalling the rotation.
+    #[tokio::test]
+    async fn deleted_repo_under_cursor_degrades_gracefully() {
+        let mut deleted = repo_with("gone", RepositoryFormat::Npm, PrefetchPolicy::default());
+        deleted.id = Uuid::from_u128(1);
+        let mut next = repo_with("next", RepositoryFormat::Npm, PrefetchPolicy::default());
+        next.id = Uuid::from_u128(2);
+        let next_id = next.id;
+
+        // `deleted` is NOT in the backing store — simulating it was
+        // removed after the cursor was saved pointing at it.
+        let repos = Arc::new(MockRepoRepo::returning(vec![next]));
+        let arts = Arc::new(MockArtRepo::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        let jobs = Arc::new(MockJobsRepository::default());
+        jobs.set_last_result_summary_by_kind(
+            "prefetch-tick",
+            serde_json::json!({
+                "cursor": {
+                    "position": "within_repo",
+                    "repository_id": deleted.id,
+                    "package_name": "whatever",
+                }
+            }),
+        );
+        let handler =
+            make_handler_with_jobs(repos, arts, proxy, mappings, HashMap::new(), jobs.clone());
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(
+                    result_summary["skipped_disabled"], 1,
+                    "the next existing repo (past the deleted cursor) is still reached"
+                );
+                assert_eq!(
+                    result_summary["cursor"],
+                    serde_json::json!({ "position": "after_repo", "repository_id": next_id }),
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 }
