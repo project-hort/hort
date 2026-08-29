@@ -1,0 +1,76 @@
+{{- if .Values.prePull.enabled -}}
+{{/*
+Pre-pull wait/cleanup Job.
+
+Helm hook: pre-install,pre-upgrade, weight -9 — strictly after the two
+prepull DaemonSets (weight -10) are created, strictly before the
+migrate hook (job-migrate.yaml, weight -5). This is the resource that
+actually gates the upgrade: Helm's own hook-readiness wait does not
+track DaemonSet rollout (see prepull-daemonset.yaml), so this Job
+blocks on `kubectl rollout status` per DaemonSet — bounded by
+`prePull.timeoutSeconds` — and fails (backoffLimit exhausted, hook
+fails, upgrade stops before the schema is touched) if any eligible
+node has not pulled its image in time.
+
+`set -eu` with no pipe means the FIRST failing `rollout status` exits
+the script immediately, before the delete step: a failed pre-pull
+leaves its DaemonSet (and every other one already checked) in place
+for inspection, mirroring job-migrate's
+`hook-delete-policy: ...,hook-succeeded` — failures stay visible, only
+success cleans up.
+
+Distroless hort-server/hort-worker images ship no kubectl; the
+established pattern (svc-token-bootstrap-job.yaml) is a companion
+`bitnamilegacy/kubectl` container rather than adding tooling to the
+runtime image. No explicit `-n`/`--namespace` flag: kubectl's
+in-cluster config resolves the current namespace from the mounted
+ServiceAccount token, same as the bootstrap Job's script.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "hort-server.fullname" . }}-prepull
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-9"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "hort-server.selectorLabels" . | nindent 8 }}
+        hort-server.io/job: prepull
+    spec:
+      serviceAccountName: {{ include "hort-server.fullname" . }}-prepull
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: OnFailure
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: wait-and-cleanup
+          image: {{ .Values.prePull.kubectlImage | default "bitnamilegacy/kubectl:1.33" | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              kubectl rollout status daemonset/{{ include "hort-server.fullname" . }}-prepull-server --timeout={{ .Values.prePull.timeoutSeconds }}s
+              {{- if .Values.worker.enabled }}
+              kubectl rollout status daemonset/{{ include "hort-server.fullname" . }}-prepull-worker --timeout={{ .Values.prePull.timeoutSeconds }}s
+              {{- end }}
+              # Every eligible node has the image cached — the placeholder
+              # pods have no further purpose.
+              kubectl delete daemonset/{{ include "hort-server.fullname" . }}-prepull-server
+              {{- if .Values.worker.enabled }}
+              kubectl delete daemonset/{{ include "hort-server.fullname" . }}-prepull-worker
+              {{- end }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+{{- end -}}

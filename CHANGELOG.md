@@ -42,6 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   chart rollback against a forward-only contraction pins the outage instead of
   clearing it.
 
+- **Chart pre-upgrade image pre-pull hook.** A new `prePull.enabled`
+  (default true) pre-install/pre-upgrade hook pre-pulls the release's
+  `hort-server` / `hort-worker` images onto every node eligible to run
+  those Deployments, strictly before the migrate hook runs. Closes the
+  node-cache-miss window where the migrate hook pulls the new image onto
+  its own node while a different node still needs it for the real
+  Deployment pod, inside the degraded upgrade window.
+
 ### Changed
 
 - **`RELEASING.md`'s promotion checklist gains a Migration-notice step.** A

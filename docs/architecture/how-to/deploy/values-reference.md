@@ -832,9 +832,37 @@ artifact/token-gen clients, and — when `control.bindAddr` is set —
 `service.controlPort` (9443) restricted to the operator namespace.
 Egress: open to Postgres / S3 / Redis / OIDC issuer / upstream registries
 plus the known webhook-forwarder set. A separate Job-scoped policy
-auto-renders to grant the migrate/bootstrap Jobs DNS + egress.
+auto-renders to grant the migrate/bootstrap/pre-pull Jobs DNS + egress
+(selected by the `hort-server.io/job` label every Job/CronJob/pre-pull
+pod carries — no per-Job policy edit was needed to add pre-pull to this
+allowance). The pre-pull DaemonSets' own pods need no egress at all:
+image pulls happen via the node's container runtime, outside the pod
+network namespace NetworkPolicy governs.
 See [`control-plane-tiers.md`](./control-plane-tiers.md) for a
 worked three-tier example.
+
+### `prePull`
+
+| sub-key | type | default | required |
+|---|---|---|---|
+| `prePull.enabled` | boolean | `true` | no |
+| `prePull.timeoutSeconds` | integer | `300` | no |
+| `prePull.kubectlImage` | string | `bitnamilegacy/kubectl:1.33` | no |
+| `prePull.pauseImage` | string | `registry.k8s.io/pause:3.9` | no |
+
+Pre-install/pre-upgrade hook (weight -10 for the DaemonSets, -9 for the
+wait/cleanup Job — both strictly before the migrate hook's -5) that
+pre-pulls the release's `hort-server` / `hort-worker` images onto every
+node eligible to run those Deployments, closing the node-cache-miss
+window a mid-upgrade node can otherwise hit. **Default on.** Set
+`prePull.enabled: false` to opt out (e.g. an external registry the
+operator already trusts to be node-fast, or an air-gapped cluster where
+`prePull.pauseImage` cannot be mirrored). `timeoutSeconds` bounds the
+`kubectl rollout status` wait — a pull that has not completed by then
+fails the upgrade before the migrate hook runs, rather than hanging.
+See [helm-chart.md](../../reference/helm-chart.md), §4 "Helm hooks,
+install ordering & workload wiring", for the full hook-ordering
+rationale.
 
 ### `extraEnv` / `extraVolumes` / `extraVolumeMounts`
 

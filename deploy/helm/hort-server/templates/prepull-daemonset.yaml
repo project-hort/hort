@@ -1,0 +1,81 @@
+{{- if .Values.prePull.enabled -}}
+{{/*
+Pre-upgrade image pre-pull DaemonSet — server image.
+
+Helm hook: pre-install,pre-upgrade, weight -10 — strictly before the
+migrate hook's -5 (job-migrate.yaml), so every node eligible to run the
+server Deployment already holds the release image before the schema is
+touched. Uses the SAME nodeSelector/tolerations/affinity values as
+deployment.yaml so the pre-pull lands exactly where the real server pods
+can land — no more, no less.
+
+A DaemonSet is not hook-friendly on its own: Helm's hook-readiness wait
+tracks Job/Pod completion, not DaemonSet rollout, so a DaemonSet hook
+would report "succeeded" the instant it is created, before any pod has
+actually pulled anything. templates/prepull-job.yaml (weight -9) is the
+resource that genuinely blocks on rollout via `kubectl rollout status`;
+this DaemonSet only needs `before-hook-creation` so a leftover object
+from a previous failed attempt cannot collide with the new one.
+
+Pod shape: an init container runs the server image's `--version` (a
+clap-provided flag handled before any config/DB access — forces the
+pull and exits, no new binary surface) then exits; the main container
+is the `pause` placeholder — the sandbox image every node already
+pulls to run ANY pod at all, so it adds no new pull dependency while
+satisfying the DaemonSet API's `restartPolicy: Always` requirement and
+giving the wait Job a steady Ready pod to observe.
+*/}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "hort-server.fullname" . }}-prepull-server
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  selector:
+    matchLabels:
+      {{- include "hort-server.selectorLabels" . | nindent 6 }}
+      hort-server.io/job: prepull-server
+  template:
+    metadata:
+      labels:
+        {{- include "hort-server.selectorLabels" . | nindent 8 }}
+        hort-server.io/job: prepull-server
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Always
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: pull
+          image: {{ include "hort-server.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--version"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+      containers:
+        - name: pause
+          image: {{ .Values.prePull.pauseImage | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+{{- end -}}
