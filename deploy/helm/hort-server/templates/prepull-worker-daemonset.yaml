@@ -1,0 +1,71 @@
+{{- if and .Values.prePull.enabled .Values.worker.enabled -}}
+{{/*
+Pre-upgrade image pre-pull DaemonSet — worker image.
+
+Mirrors prepull-daemonset.yaml exactly, but for the worker image and
+worker.{nodeSelector,tolerations,affinity} — the worker Deployment can
+have a DIFFERENT node placement than the server (separate node pool,
+taints, etc.), so it gets its OWN DaemonSet rather than being folded
+into the server one; each pre-pull lands exactly where its own
+workload can land. Gated additionally on worker.enabled: NO worker
+Deployment renders, so pre-pulling its image would just be a pull with
+nothing waiting to use it.
+
+See prepull-daemonset.yaml for the full rationale (hook weight -10,
+why a bare DaemonSet hook can't self-report readiness, the
+init-container-pull + pause-placeholder pod shape).
+*/}}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "hort-server.fullname" . }}-prepull-worker
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  selector:
+    matchLabels:
+      {{- include "hort-server.selectorLabels" . | nindent 6 }}
+      hort-server.io/job: prepull-worker
+  template:
+    metadata:
+      labels:
+        {{- include "hort-server.selectorLabels" . | nindent 8 }}
+        hort-server.io/job: prepull-worker
+    spec:
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Always
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.worker.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.worker.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        - name: pull
+          image: {{ include "hort-server.worker.image" . | quote }}
+          imagePullPolicy: {{ .Values.worker.image.pullPolicy }}
+          args: ["--version"]
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+      containers:
+        - name: pause
+          image: {{ .Values.prePull.pauseImage | quote }}
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+{{- end -}}

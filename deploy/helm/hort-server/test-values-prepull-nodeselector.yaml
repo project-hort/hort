@@ -1,0 +1,35 @@
+# Pre-pull node-placement fixture (item 146). Server and worker use
+# DISTINCT nodeSelector values — asserts each pre-pull DaemonSet inherits
+# ONLY its own workload's placement (server pre-pull never carries the
+# worker's selector and vice versa), so pre-pull lands exactly where the
+# real pods can land, not a union of both.
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+  filesystem:
+    pvc:
+      enabled: true
+      size: 50Gi
+
+ephemeralStore:
+  backend: memory
+
+nodeSelector:
+  hort.rs/pool: server-pool
+
+worker:
+  nodeSelector:
+    hort.rs/pool: worker-pool

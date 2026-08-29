@@ -839,6 +839,17 @@
     "tolerations": {"type": "array"},
     "affinity": {"type": "object"},
     "topologySpreadConstraints": {"type": "array"},
+    "prePull": {
+      "description": "Pre-install/pre-upgrade image pre-pull hook (weight -10, before the migrate hook's -5) that warms the hort-server / hort-worker images on every node eligible for those workloads.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "kubectlImage": {"type": "string"},
+        "pauseImage": {"type": "string"}
+      }
+    },
     "service": {
       "type": "object",
       "additionalProperties": false,

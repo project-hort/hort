@@ -139,6 +139,11 @@ test-values-svc-tokens-rotate-entry.yaml|^            - --rotate$|1|per-entry ro
 test-values-svc-tokens-rotate-global.yaml|^            - --rotate$|2|blanket scheduledTasks.rotateSvcToken=true reaches EVERY entry's init container as --rotate, even with no per-entry rotate set
 test-values-svc-tokens-repository.yaml|^            - --repository=maven-proxy$|1|per-entry repository:maven-proxy on only the second entry reaches ONLY that entry's init container as --repository
 test-values-svc-tokens-repository.yaml|repository=maven-proxy|1|exactly one entry declares repository — the first (unscoped) entry renders NO --repository flag at all
+test-values.yaml|helm.sh/hook-weight: "-10"|2|both pre-pull DaemonSets (server + worker) render at weight -10, strictly before the migrate hook's -5 (prePull.enabled + worker.enabled default true)
+test-values.yaml|helm.sh/hook-weight: "-9"|1|the pre-pull wait/cleanup Job renders at weight -9 — between the DaemonSets (-10) and the migrate hook (-5)
+test-values.yaml|^kind: DaemonSet$|2|both prepull DaemonSets (server + worker) render by default
+test-values-prepull-disabled.yaml|prepull|0|prePull.enabled=false renders NEITHER DaemonSet, NOR the wait Job, NOR its RBAC (all four resource names contain "prepull")
+test-values-prepull-disabled.yaml|^kind: NetworkPolicy$|2|prePull.enabled=false has no effect on the unrelated NetworkPolicy pair (still networkPolicy.enabled default true)
 EOF
 }
 
@@ -156,6 +161,15 @@ test-values-cronjobs.yaml|templates/worker-deployment.yaml|mountPath: /var/lib/h
 test-values-ha.yaml|templates/deployment.yaml|app.kubernetes.io/component: server|2|server Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the existing pod-template label (1) — matchLabels stays a subset of the pod labels
 test-values-ha.yaml|templates/worker-deployment.yaml|app.kubernetes.io/component: worker|3|worker Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the Deployment metadata label (1) + pod-template label (1)
 test-values-ha.yaml|templates/pdb.yaml|app.kubernetes.io/component: server|1|the server-only PDB's selector.matchLabels carries the component discriminator so it no longer also matches worker pods, which have no PDB of their own
+test-values.yaml|templates/prepull-daemonset.yaml|ghcr.io/project-hort/hort-server:|1|the server pre-pull DaemonSet's init container pulls the SAME image repository as the server Deployment
+test-values.yaml|templates/prepull-daemonset.yaml|args: \["--version"\]|1|the init container forces the pull via the no-op --version command (no new binary surface)
+test-values.yaml|templates/prepull-worker-daemonset.yaml|ghcr.io/project-hort/hort-worker:|1|the worker pre-pull DaemonSet's init container pulls the SAME image repository as the worker Deployment
+test-values.yaml|templates/prepull-job.yaml|rollout status daemonset/.*-prepull-server|1|the wait Job blocks on the server pre-pull DaemonSet's rollout before it can succeed
+test-values.yaml|templates/prepull-job.yaml|rollout status daemonset/.*-prepull-worker|1|the wait Job blocks on the worker pre-pull DaemonSet's rollout before it can succeed
+test-values-prepull-nodeselector.yaml|templates/prepull-daemonset.yaml|server-pool|1|the server pre-pull DaemonSet inherits the top-level nodeSelector (same placement as the server Deployment)
+test-values-prepull-nodeselector.yaml|templates/prepull-daemonset.yaml|worker-pool|0|the server pre-pull DaemonSet does NOT inherit the worker's nodeSelector
+test-values-prepull-nodeselector.yaml|templates/prepull-worker-daemonset.yaml|worker-pool|1|the worker pre-pull DaemonSet inherits worker.nodeSelector (same placement as the worker Deployment)
+test-values-prepull-nodeselector.yaml|templates/prepull-worker-daemonset.yaml|server-pool|0|the worker pre-pull DaemonSet does NOT inherit the top-level (server) nodeSelector
 EOF
 }
 

@@ -813,6 +813,37 @@ affinity: {}
 # topology keys (zones, hosts) for HA. List of full TSC entries.
 topologySpreadConstraints: []
 
+# -------------------- Pre-upgrade image pre-pull --------------------
+# A pre-install/pre-upgrade hook (weight -10, strictly before the migrate
+# hook's -5) that pre-pulls the release's hort-server / hort-worker images
+# onto every node eligible to run those workloads, BEFORE the schema is
+# touched. Closes the node-cache-miss window where the migrate hook (which
+# runs the new image) pulls it onto its own node while a DIFFERENT node
+# still needs to pull it for the new Deployment pod, inside the degraded
+# upgrade window. See templates/prepull-daemonset.yaml.
+prePull:
+  # Default ON. An operator on an external registry that already
+  # guarantees node-local image availability (or who has accepted the
+  # node-cache-miss risk) can opt out.
+  enabled: true
+  # Bounded wait (kubectl rollout status --timeout) for every eligible
+  # node to report a Ready pre-pull pod. A pull that has not completed by
+  # this deadline fails the upgrade before the migrate hook runs, rather
+  # than hanging indefinitely.
+  timeoutSeconds: 300
+  # kubectl image used by the wait/cleanup Job (see
+  # templates/prepull-job.yaml). Mirrors
+  # scheduledTasks.svcTokenKubectlImage — same rationale (Bitnami's
+  # mid-2025 repackaging moved older minor-version tags under
+  # `bitnamilegacy/`); override to match your cluster's API version.
+  kubectlImage: "bitnamilegacy/kubectl:1.33"
+  # Placeholder image for the pre-pull DaemonSets' long-running
+  # container. `registry.k8s.io/pause` is the sandbox image every node
+  # already pulls to run ANY pod at all — using it here adds NO new
+  # pull dependency while satisfying the DaemonSet API's
+  # `restartPolicy: Always` requirement.
+  pauseImage: "registry.k8s.io/pause:3.9"
+
 # -------------------- Service --------------------
 service:
   type: ClusterIP
