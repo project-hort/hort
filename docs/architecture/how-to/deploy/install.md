@@ -711,6 +711,7 @@ Operator's namespace selector covers the release namespace.
 
 ## See also
 
+- [`upgrade.md`](upgrade.md) — moving an installed release forward, and what changes for a release carrying a `### Migration notice`.
 - [`values-reference.md`](values-reference.md) — every chart key documented.
 - [`examples-overlays.md`](examples-overlays.md) — edge-wiring overlays.
 - [`security-hardening-checklist.md`](security-hardening-checklist.md) — chart hardening posture.

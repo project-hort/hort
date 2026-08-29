@@ -43,6 +43,7 @@ pub mod heartbeat;
 /// Tokio runtime of its own.
 pub mod license;
 pub mod metrics_server;
+pub mod pg_identity;
 pub mod poll_loop;
 /// Bounded startup retry with backoff, used by `main.rs` around the
 /// one-shot composition-root app-context build (issue #86).

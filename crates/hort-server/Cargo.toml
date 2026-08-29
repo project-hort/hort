@@ -142,6 +142,10 @@ sqlx                         = { workspace = true }
 # runtime composition root doesn't otherwise serialise JSON itself —
 # handlers in the http-* crates do — so the dep is small-surface.
 serde_json                   = { workspace = true }
+# `crate::contractions` parses the embedded `migrations/CONTRACTIONS.toml`
+# at runtime for the `migrate` fleet fence (backlog 145).
+serde                        = { workspace = true }
+toml                         = { workspace = true }
 thiserror                    = { workspace = true }
 tokio                        = { workspace = true }
 tracing                      = { workspace = true }
@@ -211,8 +215,9 @@ temp-env = "0.3"
 # member manifest to assert the intra-workspace dependency declarations
 # stay publishable. A hand-rolled line scanner would be fail-open — a
 # dependency written as a `[dependencies.hort-x]` sub-table would slip
-# past it silently — so the guard parses real TOML.
-toml = { workspace = true }
+# past it silently — so the guard parses real TOML. `toml` is a normal
+# dependency above (`crate::contractions` needs it at runtime too), which
+# already makes it available here.
 # `tests/publish_topology_guard.rs` builds the published-crate dependency
 # graph from `cargo metadata --no-deps` — the same data source
 # `scripts/ci/publishable-crates-in-order.sh` reads via `jq`. The typed

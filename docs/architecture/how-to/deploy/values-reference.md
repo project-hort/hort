@@ -588,6 +588,25 @@ The binary still honors bare `DATABASE_URL` as a fallback (sqlx-cli / Tier-2
 tests / 12-factor), so changing `secretKey` only changes the Secret's data-key,
 not the env-var name the chart injects.
 
+### `migrate`
+
+Before applying, the `migrate` subcommand runs a runtime fleet fence
+(backlog 145, ADR 0030 amendment (c)): every hort Postgres connection is
+stamped with a version-tagged `application_name`
+(`hort-{server|worker}/<workspace-version>`), and the migrate Job refuses
+to apply a pending destructive migration
+(`migrations/CONTRACTIONS.toml`) while `pg_stat_activity` still shows a
+connected client on an older (or unversioned) release.
+
+| sub-key | type | default | required |
+|---|---|---|---|
+| `migrate.allowRunningFleet` | bool | `false` | no |
+
+Maps to `HORT_ALLOW_RUNNING_FLEET` on the migrate Job only. Leave this off
+for routine rolling upgrades — the fence is supposed to make you wait for
+the old fleet to roll off. Set `true` only for the rare forced-migration
+case; the Job logs loudly (`tracing::warn!`) when the override is active.
+
 ### `storage`
 
 Artifact CAS backend.

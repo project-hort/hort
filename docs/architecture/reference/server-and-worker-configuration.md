@@ -46,7 +46,7 @@ and `args: ["serve"]` (k8s) are therefore correct and identical.
 | Subcommand | Purpose | Config parsed |
 |---|---|---|
 | _(none)_ / `serve` | Start the HTTP service; run until SIGTERM/SIGINT. | **full `Config`** |
-| `migrate` | Apply pending DB migrations + re-assert events-role hardening, then exit. Init-container / pre-install-Job pattern. | `MinimalConfig` |
+| `migrate [--allow-running-fleet]` | Apply pending DB migrations + re-assert events-role hardening, then exit. Init-container / pre-install-Job pattern. Before applying, refuses when a pending migration is a declared contraction (`migrations/CONTRACTIONS.toml`) and `pg_stat_activity` shows an older (or unversioned) hort-shaped client still connected (backlog 145, ADR 0030 amendment (c)); `--allow-running-fleet` (env `HORT_ALLOW_RUNNING_FLEET`) overrides, loudly logged. | `MinimalConfig` |
 | `scrub [FLAGS]` | CAS integrity scrubber — re-hash stored blobs, detect drift. | **full `Config`** |
 | `admin <SUB>` | Admin-user / service-token management (nested, required). | `MinimalConfig` |
 | `reconcile-groups [--since]` | Heal artifacts whose ingest-path group commit dropped between the `ArtifactIngested` and `ArtifactGroupMemberAdded` transactions. | `MinimalConfig` |
