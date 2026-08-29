@@ -1666,6 +1666,46 @@ async fn record_outcome_failed_at_max_attempts_quarantined_artifact_commits_no_t
         "no ScanIndeterminate (or any) transition must be committed \
          when a Quarantined artifact's scan retries exhaust"
     );
+    // `artifacts.last_scan_at` is written ONLY by `commit_scan_result`
+    // (the `ScanCompleted` path) — never by a Failed outcome. A
+    // permanently-failing artifact must not have its rescan-eligibility
+    // clock reset, or `RescanCandidatesRepository::select_eligible`'s
+    // `last_scan_at < now - interval` predicate would treat it as
+    // freshly scanned instead of leaving it for `select_stranded` to
+    // re-pick.
+    assert!(
+        lifecycle.last_scan_at_writes().is_empty(),
+        "a Failed scan outcome must never advance last_scan_at"
+    );
+}
+
+/// Companion to the test above for the *other* prior-status branch: a
+/// `None`-status artifact that hard-blocks to `ScanIndeterminate` on
+/// retry exhaustion also must not advance `last_scan_at` — the only
+/// call site for that denorm write is `commit_scan_result`
+/// (the `ScanCompleted` path), and `record_scan_indeterminate` never
+/// reaches it. This is the same load-bearing fact backlog item 143 (Q1)
+/// asked to establish: a FAILED scan does not advance the candidacy
+/// projection, on either prior-status branch.
+#[tokio::test]
+async fn record_outcome_failed_at_max_attempts_hard_block_does_not_advance_last_scan_at() {
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    let (uc, _jobs, artifacts, repositories, lifecycle) =
+        make_uc_with_lifecycle(policy_projections);
+    let artifact_id = seed_none_status_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 5); // == default max_attempts.
+
+    uc.record_outcome(&job, ScanRunOutcome::Failed("all backends down".into()))
+        .await
+        .expect("record_outcome");
+
+    let saved = artifacts.get(artifact_id).unwrap();
+    assert_eq!(saved.quarantine_status, QuarantineStatus::ScanIndeterminate);
+    assert!(
+        lifecycle.last_scan_at_writes().is_empty(),
+        "a Failed scan outcome must never advance last_scan_at, even when it \
+         hard-blocks the artifact to ScanIndeterminate"
+    );
 }
 
 /// The *other* prior-status branch is unchanged: a `None`-status
