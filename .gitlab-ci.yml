@@ -1288,11 +1288,10 @@ quality:sonar:
   image:
     name: hort.kdp.kloni.cloud/docker-io/sonarsource/sonar-scanner-cli:12.1@sha256:23ca0f137965d9dff2198074043fd48d386280bc5d0ccac8c8349cea4cf096a9
     entrypoint: [""]
-  # The gate verdict is advisory while the project's quality-gate baseline is
-  # unestablished: a dead/expired token or a red gate no longer kills the
-  # pipeline. Re-tightening (removing allow_failure) is a deliberate later
-  # change once the gate runs green on the integration trunk.
-  allow_failure: true
+  # The gate verdict blocks: a red gate means the change is not done.
+  # `quality:sonar-findings` (below, still allow_failure + when: always) names
+  # what to fix; a dead/expired token now fails the pipeline loudly too, and
+  # that job explains it as an auth failure.
   rules:
     # Skip Sonar on merge-request pipelines. Its quality gate scores coverage +
     # duplication on "new code", which has no meaning for the many MRs that

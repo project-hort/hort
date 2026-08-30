@@ -82,14 +82,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`quality:sonar` reads back its own quality-gate verdict, and clippy
   findings now reach Sonar.** `sonar.qualitygate.wait=true` makes the
-  scanner wait on the server-side gate computation; the job stays
-  `allow_failure: true` (advisory posture until the gate baseline is
-  established), and a new `quality:sonar-findings` job prints the gate's
-  failing conditions, open issues, and unreviewed security hotspots to the
-  log so a red gate is never silent. `test:lint` now emits
-  `clippy-report.json`, which `sonar-project.properties` imports via
-  `sonar.rust.clippyReport.reportPaths`. The scanner image is pinned by
-  digest through the internal mirror instead of tracking `:latest`.
+  scanner wait on the server-side gate computation, and a `quality:sonar-findings`
+  job (still `allow_failure: true`) prints the gate's failing conditions, open
+  issues, and unreviewed security hotspots to the log so a red gate is never
+  silent. `test:lint` now emits `clippy-report.json`, which
+  `sonar-project.properties` imports via `sonar.rust.clippyReport.reportPaths`.
+  The scanner image is pinned by digest through the internal mirror instead of
+  tracking `:latest`.
+- **`quality:sonar` is now blocking.** The gate baseline is established and
+  clean on the integration trunk, so `allow_failure` is removed: a red gate
+  now fails the pipeline, and a dead/expired Sonar token fails it too (with
+  `quality:sonar-findings` explaining it as an auth failure) instead of
+  passing silently.
 - **`RELEASING.md`'s promotion checklist gains a Migration-notice step.** A
   release whose migration set contains a contraction now carries a
   `### Migration notice` changelog entry naming the dropped or narrowed
