@@ -751,6 +751,32 @@ impl ArtifactRepository for MockArtifactRepository {
         Box::pin(async move { Ok(triples) })
     }
 
+    fn package_version_publish_times(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> BoxFut<'_, DomainResult<Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)>>> {
+        // Cargo-pubtime-only read. Mirrors the SQL adapter's
+        // `package_version_publish_times`: row presence in the map is
+        // the "locally ingested" signal — a version with no matching
+        // artifact produces no row.
+        let pkg = package.to_owned();
+        let mut rows: Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)> = self
+            .artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.repository_id == repository_id && a.name == pkg)
+            .filter_map(|a| {
+                a.version
+                    .clone()
+                    .map(|v| (v, a.created_at, a.upstream_published_at))
+            })
+            .collect();
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        Box::pin(async move { Ok(rows) })
+    }
+
     /// Mock for the backfill candidacy query. Mirrors
     /// the SQL contract:
     /// - `path LIKE '%.whl'` (wheel-shaped artifacts only)

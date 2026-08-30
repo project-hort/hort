@@ -38,6 +38,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::repository::{IndexMode, RepositoryType};
 use hort_domain::types::ContentHash;
@@ -300,7 +301,8 @@ pub struct PypiVersionFile {
 /// ```text
 /// {"name":"<name>","vers":"<vers>","deps":[...],"cksum":"<sha256>",
 ///  "features":{...},"yanked":<bool>,"links":<string|null>,
-///  "rust_version":<string|null>,"v":<int|null>,"features2":{...}}
+///  "rust_version":<string|null>,"v":<int|null>,"features2":{...},
+///  "pubtime":"<RFC 3339>"}
 /// ```
 ///
 /// The fields the existing emission / parse code reads are a
@@ -362,6 +364,18 @@ pub struct PypiVersionFile {
 /// - `features2` — the v2-extra features map (namespaced /
 ///   weak-dep features). Preserved verbatim from upstream on proxy;
 ///   on hosted, the extended-syntax half of the stored feature map.
+/// - `pubtime` — the version's publish timestamp, RFC 3339 UTC.
+///   `Some` → emitted; `None` → the key is omitted entirely (never
+///   emitted as `null` — cargo clients ignore an absent key the same
+///   way, and omission keeps the wire shape identical to the pre-field
+///   shape for every version this hort instance has no timestamp for).
+///   Source per repository kind: hosted uses the artifact's `created_at`
+///   (always `Some`); proxy uses the artifact's `upstream_published_at`
+///   when present, else `created_at`, else `None` for a version hort has
+///   never locally ingested (hort has no knowledge and must not invent
+///   one); virtual passes through the winning member's value untouched.
+///   One-way outward only: nothing in the release/quarantine gate reads
+///   this field back.
 #[derive(Debug, Clone)]
 pub struct CargoVersionPayload {
     /// Per-version `name` field — the cargo-published crate name.
@@ -402,6 +416,10 @@ pub struct CargoVersionPayload {
     /// `features2` — v2-extra features map. `None` → omitted from
     /// the line.
     pub features2: Option<serde_json::Value>,
+    /// `pubtime` — publish timestamp, RFC 3339 UTC. `None` → omitted
+    /// from the line (never emitted as `null`). See the struct-level
+    /// doc for the per-repo-kind source and precedence.
+    pub pubtime: Option<DateTime<Utc>>,
 }
 
 /// Maven `maven-metadata.xml` per-version data.
@@ -1130,6 +1148,11 @@ mod tests {
             rust_version: Some("1.70".into()),
             v: None,
             features2: None,
+            pubtime: Some(
+                DateTime::parse_from_rfc3339("2024-01-02T03:04:05Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
         };
         let wrapped = PerVersionPayload::Cargo(payload.clone());
         match wrapped {
@@ -1144,6 +1167,7 @@ mod tests {
                 assert_eq!(p.rust_version.as_deref(), Some("1.70"));
                 assert!(p.v.is_none());
                 assert!(p.features2.is_none());
+                assert!(p.pubtime.is_some());
             }
             PerVersionPayload::Npm(_)
             | PerVersionPayload::Pypi(_)

@@ -27,6 +27,26 @@ use super::BoxFuture;
 /// only the anchor (migration `003_artifacts_cas.sql`).
 pub type PackageVersionStatusRow = (String, QuarantineStatus, Option<DateTime<Utc>>);
 
+/// Per-`(repository, package)` publish-timestamp row: `(version,
+/// created_at, upstream_published_at)`.
+///
+/// Row presence carries the same meaning documented on
+/// [`ArtifactRepository::package_version_status`]: a returned row
+/// asserts locally-ingested content. A queried version with no row is
+/// "never locally ingested", not "timestamp unknown" — callers computing
+/// a served publish time must read absence as "omit the field", never
+/// as a zero or invented timestamp.
+///
+/// Deliberately its own port method rather than a widening of
+/// [`PackageVersionStatusRow`] / [`ArtifactRepository::package_version_status`]:
+/// that method is the hot, index-only-scan serve path shared by every
+/// format's quarantine-aware filtering, and folding two more timestamp
+/// columns into it would (a) force a heap fetch onto that highest-QPS
+/// read for every format, not just cargo, and (b) leak a cargo-only
+/// concern into a cross-format row shape. This method is a separate,
+/// lower-QPS read exercised only by the cargo sparse-index proxy source.
+pub type PackageVersionPublishTimeRow = (String, DateTime<Utc>, Option<DateTime<Utc>>);
+
 /// Outbound port for artifact persistence (read-only + delete).
 ///
 /// Artifact writes go through [`ArtifactLifecyclePort::commit_transition`],
@@ -366,6 +386,27 @@ pub trait ArtifactRepository: Send + Sync {
         _repository_id: Uuid,
         _package: &str,
     ) -> BoxFuture<'_, DomainResult<Vec<PackageVersionStatusRow>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Per-version `(version, created_at, upstream_published_at)` for
+    /// every locally-ingested artifact row in `(repository_id,
+    /// package)` — the timestamp source for the cargo sparse-index
+    /// `pubtime` field. `created_at` is the row's own NOT NULL column
+    /// (hort's first-seen-here observation); `upstream_published_at` is
+    /// the untrusted, best-effort upstream-asserted timestamp captured
+    /// at ingest (see `Artifact.upstream_published_at`). A version
+    /// hort has never ingested for this `(repository_id, package)`
+    /// produces no row at all.
+    ///
+    /// Default impl returns empty so existing test doubles that never
+    /// exercise cargo pubtime need not override it (mirrors
+    /// [`Self::package_version_anchors`]).
+    fn package_version_publish_times(
+        &self,
+        _repository_id: Uuid,
+        _package: &str,
+    ) -> BoxFuture<'_, DomainResult<Vec<PackageVersionPublishTimeRow>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 

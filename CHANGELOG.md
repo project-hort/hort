@@ -50,6 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own node while a different node still needs it for the real
   Deployment pod, inside the degraded upgrade window.
 
+- **Cargo sparse-index lines now carry an optional `pubtime`** (#217),
+  the version's publish timestamp in RFC 3339 UTC — omitted, never
+  invented, when hort has no timestamp for a version. Hosted repositories
+  serve the artifact's own `created_at`; proxy repositories serve the
+  upstream-asserted publish time when hort has it, else the artifact's
+  own first-seen-here `created_at`, else omit the field entirely for a
+  version hort has never pulled through; virtual repositories pass the
+  winning member's value through unchanged. Closes the gap where
+  Renovate's crate datasource, finding no `pubtime`, fell back to an
+  unimplemented per-version API route and lost the timestamp
+  `minimumReleaseAge`-style rules depend on. One-way outward only: the
+  served field is derived from data hort already owns and is never read
+  back into any release or quarantine decision.
+
 ### Changed
 
 - **`RELEASING.md`'s promotion checklist gains a Migration-notice step.** A

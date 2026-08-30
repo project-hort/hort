@@ -208,6 +208,10 @@ impl IndexSource for HostedCargoSource {
                 rust_version: index_fields.rust_version,
                 v: index_fields.v,
                 features2: index_fields.features2,
+                // Hosted: the artifact's own `created_at` — publish
+                // time at THIS registry, authoritative (always `Some`;
+                // every hosted artifact row has one).
+                pubtime: Some(artifact.created_at),
             };
             entries.push(VersionEntry {
                 version,
@@ -359,7 +363,34 @@ impl IndexSource for ProxyCargoSource {
             hort_domain::entities::artifact::QuarantineStatus,
         > = pkg_status.into_iter().collect();
 
-        let entries = projection_to_entries(projection, &status_map);
+        // `pubtime` timestamp source. Row presence (like `pkg_status`
+        // above) means "locally ingested"; a version with no row here
+        // is never-ingested and must serve no `pubtime` at all — never
+        // an invented value. A read failure degrades to "no timestamps
+        // known" (every entry omits `pubtime`), matching the
+        // `pkg_status` degradation above: this field is a served
+        // convenience, never load-bearing for gate/policy decisions.
+        let publish_times = ctx
+            .artifact_use_case
+            .package_version_publish_times(repo.id, &normalized)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "cargo proxy source: package_version_publish_times failed; degrading to no pubtime");
+                Vec::new()
+            });
+        let pubtime_map: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+            publish_times
+                .into_iter()
+                .map(|(version, created_at, upstream_published_at)| {
+                    // Precedence: upstream-asserted → first-seen-here.
+                    // Row presence already guarantees "locally
+                    // ingested"; `created_at` is NOT NULL, so this is
+                    // always `Some`.
+                    (version, upstream_published_at.unwrap_or(created_at))
+                })
+                .collect();
+
+        let entries = projection_to_entries(projection, &status_map, &pubtime_map);
 
         Ok(IndexSourceOutput {
             entries,
@@ -373,6 +404,11 @@ impl IndexSource for ProxyCargoSource {
 /// one entry with `payload.Cargo` carrying the line's fields. The
 /// `status_map` hydrates the entry's `status` field via
 /// `(version, status)` lookup; absent → `None` (unknown tier).
+/// `pubtime_map` hydrates `payload.pubtime` the same way; absent → the
+/// version is never-ingested, so `pubtime` stays `None` — never a
+/// `line.pubtime` fallback (that field is upstream-sourced forward-compat
+/// scaffolding, unrelated to the precedence this backlog defines; see
+/// `CargoVersionLine::pubtime`'s doc-comment).
 ///
 /// The projection is already computed (the helper
 /// `crate::index_cache::fetch_raw_with_cache` streamed the body through
@@ -388,10 +424,12 @@ fn projection_to_entries(
         String,
         hort_domain::entities::artifact::QuarantineStatus,
     >,
+    pubtime_map: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
 ) -> Vec<VersionEntry> {
     let mut entries: Vec<VersionEntry> = Vec::new();
     for line in lines {
         let status = status_map.get(&line.vers).copied();
+        let pubtime = pubtime_map.get(&line.vers).copied();
         entries.push(VersionEntry {
             version: line.vers.clone(),
             status,
@@ -406,6 +444,7 @@ fn projection_to_entries(
                 rust_version: line.rust_version,
                 v: line.v,
                 features2: line.features2,
+                pubtime,
             }),
         });
     }
@@ -468,5 +507,123 @@ pub(crate) fn select_source(repo: &Repository) -> Box<dyn IndexSource> {
         RepositoryType::Proxy => Box::new(ProxyCargoSource),
         RepositoryType::Virtual => Box::new(VirtualCargoSource),
         RepositoryType::Hosted | RepositoryType::Staging => Box::new(HostedCargoSource),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — `projection_to_entries`'s `pubtime` precedence (backlog 148: cargo
+// sparse-index `pubtime`). The proxy source's three-way precedence
+// (upstream-asserted → first-seen-here → omitted) is pinned directly against
+// this pure mapping function rather than through the full HTTP serve stack,
+// since it needs no I/O and the precedence table is exactly this function's
+// contract.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use chrono::{DateTime, Utc};
+
+    use super::*;
+
+    fn line(vers: &str) -> CargoVersionLine {
+        CargoVersionLine {
+            name: "serde".to_string(),
+            vers: vers.to_string(),
+            cksum: "a".repeat(64),
+            deps: serde_json::json!([]),
+            features: serde_json::json!({}),
+            yanked: false,
+            links: None,
+            rust_version: None,
+            v: None,
+            features2: None,
+            pubtime: None,
+        }
+    }
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn pubtime_present_in_map_is_used_verbatim() {
+        let lines = vec![line("1.0.0")];
+        let status_map = HashMap::new();
+        let mut pubtime_map = HashMap::new();
+        pubtime_map.insert("1.0.0".to_string(), ts("2020-01-01T00:00:00Z"));
+
+        let entries = projection_to_entries(lines, &status_map, &pubtime_map);
+        let PerVersionPayload::Cargo(payload) = &entries[0].payload else {
+            panic!("expected Cargo payload");
+        };
+        assert_eq!(payload.pubtime, Some(ts("2020-01-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn pubtime_absent_from_map_omits_never_ingested_version() {
+        // A version present in the upstream projection but with no row
+        // in `pubtime_map` (never locally ingested) MUST serve no
+        // `pubtime` — hort has no knowledge and must not invent one.
+        let lines = vec![line("9.9.9")];
+        let status_map = HashMap::new();
+        let pubtime_map = HashMap::new();
+
+        let entries = projection_to_entries(lines, &status_map, &pubtime_map);
+        let PerVersionPayload::Cargo(payload) = &entries[0].payload else {
+            panic!("expected Cargo payload");
+        };
+        assert!(payload.pubtime.is_none());
+    }
+
+    #[test]
+    fn line_own_pubtime_field_is_never_consulted() {
+        // `CargoVersionLine::pubtime` is upstream-sourced forward-compat
+        // scaffolding (no real cargo upstream serves it today); the
+        // proxy source's served `pubtime` comes exclusively from
+        // `pubtime_map` (hort's own artifact record), even when the
+        // line itself carries a value.
+        let mut l = line("1.0.0");
+        l.pubtime = Some(ts("1999-01-01T00:00:00Z"));
+        let status_map = HashMap::new();
+        let pubtime_map = HashMap::new();
+
+        let entries = projection_to_entries(vec![l], &status_map, &pubtime_map);
+        let PerVersionPayload::Cargo(payload) = &entries[0].payload else {
+            panic!("expected Cargo payload");
+        };
+        assert!(
+            payload.pubtime.is_none(),
+            "the line's own pubtime must never leak through when the version \
+             is absent from pubtime_map (never-ingested)"
+        );
+    }
+
+    #[test]
+    fn multiple_versions_each_resolve_independently() {
+        let lines = vec![line("1.0.0"), line("1.1.0"), line("1.2.0")];
+        let status_map = HashMap::new();
+        let mut pubtime_map = HashMap::new();
+        pubtime_map.insert("1.0.0".to_string(), ts("2020-01-01T00:00:00Z"));
+        // "1.1.0" deliberately absent — never-ingested.
+        pubtime_map.insert("1.2.0".to_string(), ts("2022-06-15T00:00:00Z"));
+
+        let entries = projection_to_entries(lines, &status_map, &pubtime_map);
+        let pubtimes: Vec<Option<DateTime<Utc>>> = entries
+            .iter()
+            .map(|e| match &e.payload {
+                PerVersionPayload::Cargo(p) => p.pubtime,
+                _ => panic!("expected Cargo payload"),
+            })
+            .collect();
+        assert_eq!(
+            pubtimes,
+            vec![
+                Some(ts("2020-01-01T00:00:00Z")),
+                None,
+                Some(ts("2022-06-15T00:00:00Z")),
+            ]
+        );
     }
 }

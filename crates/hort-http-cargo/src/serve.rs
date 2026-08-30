@@ -1117,6 +1117,44 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // `pubtime` — hosted source uses the artifact's own `created_at`
+    // (backlog 148 — cargo sparse-index `pubtime`).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn hosted_pubtime_uses_artifact_created_at() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "cargo-test", IndexMode::ReleasedOnly);
+        let mut artifact = insert_artifact(
+            &mocks,
+            repo.id,
+            "serde",
+            "1.0.0",
+            1,
+            QuarantineStatus::Released,
+        );
+        // Give the artifact a distinct, easily-recognised `created_at`
+        // (`insert_artifact` uses `Utc::now()`, indistinguishable from
+        // "the test forgot to check the value").
+        artifact.created_at = "2022-03-04T05:06:07Z".parse().unwrap();
+        mocks.artifacts.insert(artifact.clone());
+
+        let res = serve_index_unified(&ctx, "cargo-test", "serde", None)
+            .await
+            .unwrap_or_else(|_| panic!("unified serve must succeed"));
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let lines = parse_lines(&body);
+        assert_eq!(
+            lines[0]["pubtime"].as_str().unwrap(),
+            "2022-03-04T05:06:07+00:00",
+            "hosted pubtime must be the artifact's own created_at"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Virtual (aggregating) serve — ADR 0031. The serve handler is
     // transparent (no `Virtual` branch); these drive it end-to-end through
     // `select_source` → `VirtualCargoSource` → `aggregate_virtual_index`.
@@ -1180,6 +1218,40 @@ mod tests {
         let versions = served_versions(res).await;
         assert!(versions.contains(&"1.0.0".to_string()), "member a served");
         assert!(versions.contains(&"2.0.0".to_string()), "member b served");
+    }
+
+    #[tokio::test]
+    async fn virtual_pubtime_passes_through_winning_member() {
+        // Confirmed design point 2 (virtual): the winning member's
+        // `pubtime` passes through untouched — no aggregation-level
+        // synthesis.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let a = insert_hosted_repo(&mocks, "cargo-a", IndexMode::ReleasedOnly);
+        let mut artifact = insert_artifact(
+            &mocks,
+            a.id,
+            "serde",
+            "1.0.0",
+            1,
+            QuarantineStatus::Released,
+        );
+        artifact.created_at = "2021-07-08T09:10:11Z".parse().unwrap();
+        mocks.artifacts.insert(artifact.clone());
+        insert_virtual_repo(&mocks, "cargo-virt", &[&a]);
+
+        let res = serve_index_unified(&ctx, "cargo-virt", "serde", None)
+            .await
+            .unwrap_or_else(|_| panic!("virtual serve must succeed"));
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let lines = parse_lines(&body);
+        assert_eq!(
+            lines[0]["pubtime"].as_str().unwrap(),
+            "2021-07-08T09:10:11+00:00",
+            "virtual read must pass the winning member's pubtime through unchanged"
+        );
     }
 
     #[tokio::test]
@@ -1468,8 +1540,10 @@ mod tests {
                 "yanked": false,
                 "links": null,
                 "rust_version": null,
+                "pubtime": artifact.created_at.to_rfc3339(),
             }),
-            "a version with no stored metadata serves the pre-metadata entry verbatim"
+            "a version with no stored metadata serves the pre-metadata entry verbatim \
+             (plus the always-present hosted `pubtime`)"
         );
     }
 
