@@ -385,6 +385,171 @@ fn action_narrows(tokens: &[Token], idx: usize) -> Option<&'static str> {
 /// no binary breaks when they change: `DROP INDEX`, `DROP CONSTRAINT`,
 /// `RENAME CONSTRAINT`. Constraint drops on a security-critical table are
 /// covered unconditionally by the sibling `no_sensitive_drops` guard.
+/// `DROP TABLE [IF EXISTS] <t>` at `i`, unless `t` was created earlier in the
+/// same migration (create-then-drop is not a contraction of prior releases).
+fn scan_drop_table(
+    tokens: &[Token],
+    i: usize,
+    created: &BTreeSet<String>,
+    stripped: &str,
+) -> Option<Contraction> {
+    if !(kw(tokens, i, "drop") && kw(tokens, i + 1, "table")) {
+        return None;
+    }
+    let name_idx = skip_if_exists(tokens, i + 2);
+    let (name, _) = parse_table_name(tokens, name_idx)?;
+    if created.contains(&name) {
+        return None;
+    }
+    Some(Contraction {
+        identifier: name,
+        reach: Reach::Removed,
+        shape: "DROP TABLE",
+        line: line_of(stripped, tokens[i].offset),
+    })
+}
+
+/// `DROP COLUMN [IF EXISTS] <c>` inside an `ALTER TABLE` body at `k`.
+/// Returns the index to resume scanning from when this shape matched.
+fn scan_drop_column(
+    tokens: &[Token],
+    k: usize,
+    table: &str,
+    stripped: &str,
+    out: &mut Vec<Contraction>,
+) -> Option<usize> {
+    if !(kw(tokens, k, "drop") && kw(tokens, k + 1, "column")) {
+        return None;
+    }
+    let cn = skip_if_exists(tokens, k + 2);
+    if let Some((column, _)) = parse_table_name(tokens, cn) {
+        out.push(Contraction {
+            identifier: format!("{table}.{column}"),
+            reach: Reach::Removed,
+            shape: "ALTER TABLE ... DROP COLUMN",
+            line: line_of(stripped, tokens[k].offset),
+        });
+    }
+    Some(cn + 1)
+}
+
+/// `RENAME TO <new>` | `RENAME [COLUMN] <c> TO <new>` inside an `ALTER TABLE`
+/// body at `k`. Returns the index to resume scanning from when this shape
+/// matched.
+fn scan_rename_clause(
+    tokens: &[Token],
+    k: usize,
+    table: &str,
+    stripped: &str,
+    out: &mut Vec<Contraction>,
+) -> Option<usize> {
+    if !kw(tokens, k, "rename") {
+        return None;
+    }
+    if kw(tokens, k + 1, "to") {
+        out.push(Contraction {
+            identifier: table.to_string(),
+            reach: Reach::Removed,
+            shape: "ALTER TABLE ... RENAME TO",
+            line: line_of(stripped, tokens[k].offset),
+        });
+    } else if !kw(tokens, k + 1, "constraint") {
+        let cn = if kw(tokens, k + 1, "column") {
+            k + 2
+        } else {
+            k + 1
+        };
+        if let Some((column, _)) = parse_table_name(tokens, cn) {
+            out.push(Contraction {
+                identifier: format!("{table}.{column}"),
+                reach: Reach::Removed,
+                shape: "ALTER TABLE ... RENAME COLUMN",
+                line: line_of(stripped, tokens[k].offset),
+            });
+        }
+    }
+    Some(k + 2)
+}
+
+/// `ALTER [COLUMN] <c> … TYPE …` | `… SET NOT NULL` inside an `ALTER TABLE`
+/// body at `k`. Returns the index to resume scanning from when this shape
+/// matched.
+fn scan_column_alter(
+    tokens: &[Token],
+    k: usize,
+    table: &str,
+    stripped: &str,
+    out: &mut Vec<Contraction>,
+) -> Option<usize> {
+    if !kw(tokens, k, "alter") {
+        return None;
+    }
+    let cn = if kw(tokens, k + 1, "column") {
+        k + 2
+    } else {
+        k + 1
+    };
+    let Some((column, after_col)) = parse_table_name(tokens, cn) else {
+        return Some(cn + 1);
+    };
+    if let Some(shape) = action_narrows(tokens, after_col) {
+        out.push(Contraction {
+            identifier: format!("{table}.{column}"),
+            reach: Reach::Narrowed,
+            shape,
+            line: line_of(stripped, tokens[k].offset),
+        });
+    }
+    Some(cn + 1)
+}
+
+/// The full clause body of one `ALTER TABLE <table> …` statement, from just
+/// after the table name to the terminating `;`.
+fn scan_alter_table_body(
+    tokens: &[Token],
+    start: usize,
+    n: usize,
+    table: &str,
+    stripped: &str,
+) -> Vec<Contraction> {
+    let mut out = Vec::new();
+    let mut k = start;
+    while k < n && tokens[k].text != ";" {
+        if let Some(next) = scan_drop_column(tokens, k, table, stripped, &mut out) {
+            k = next;
+            continue;
+        }
+        if let Some(next) = scan_rename_clause(tokens, k, table, stripped, &mut out) {
+            k = next;
+            continue;
+        }
+        if let Some(next) = scan_column_alter(tokens, k, table, stripped, &mut out) {
+            k = next;
+            continue;
+        }
+        k += 1;
+    }
+    out
+}
+
+/// `ALTER TABLE [ONLY] <t> …` starting at `i`; resolves the table name and
+/// delegates the clause body to [`scan_alter_table_body`].
+fn scan_alter_table_statement(
+    tokens: &[Token],
+    i: usize,
+    n: usize,
+    stripped: &str,
+) -> Vec<Contraction> {
+    let mut name_idx = skip_if_exists(tokens, i + 2);
+    if kw(tokens, name_idx, "only") {
+        name_idx += 1;
+    }
+    let Some((table, after_name)) = parse_table_name(tokens, name_idx) else {
+        return Vec::new();
+    };
+    scan_alter_table_body(tokens, after_name, n, &table, stripped)
+}
+
 fn scan_migration(sql: &str) -> Vec<Contraction> {
     let stripped = strip_comments_and_strings(sql);
     let tokens = tokenize(&stripped);
@@ -392,102 +557,14 @@ fn scan_migration(sql: &str) -> Vec<Contraction> {
     let mut out: Vec<Contraction> = Vec::new();
     let n = tokens.len();
 
-    let mut push = |identifier: String, reach: Reach, shape: &'static str, offset: usize| {
-        out.push(Contraction {
-            identifier,
-            reach,
-            shape,
-            line: line_of(&stripped, offset),
-        });
-    };
-
     let mut i = 0;
     while i < n {
-        // ---- DROP TABLE [IF EXISTS] <t> -----------------------------------
-        if kw(&tokens, i, "drop") && kw(&tokens, i + 1, "table") {
-            let name_idx = skip_if_exists(&tokens, i + 2);
-            if let Some((name, _)) = parse_table_name(&tokens, name_idx) {
-                if !created.contains(&name) {
-                    push(name, Reach::Removed, "DROP TABLE", tokens[i].offset);
-                }
-            }
+        if let Some(c) = scan_drop_table(&tokens, i, &created, &stripped) {
+            out.push(c);
         }
-
-        // ---- ALTER TABLE <t> … --------------------------------------------
         if kw(&tokens, i, "alter") && kw(&tokens, i + 1, "table") {
-            let mut name_idx = skip_if_exists(&tokens, i + 2);
-            if kw(&tokens, name_idx, "only") {
-                name_idx += 1;
-            }
-            if let Some((table, after_name)) = parse_table_name(&tokens, name_idx) {
-                let mut k = after_name;
-                while k < n && tokens[k].text != ";" {
-                    // DROP COLUMN [IF EXISTS] <c>
-                    if kw(&tokens, k, "drop") && kw(&tokens, k + 1, "column") {
-                        let cn = skip_if_exists(&tokens, k + 2);
-                        if let Some((column, _)) = parse_table_name(&tokens, cn) {
-                            push(
-                                format!("{table}.{column}"),
-                                Reach::Removed,
-                                "ALTER TABLE ... DROP COLUMN",
-                                tokens[k].offset,
-                            );
-                        }
-                        k = cn + 1;
-                        continue;
-                    }
-                    // RENAME TO <new> | RENAME [COLUMN] <c> TO <new>
-                    if kw(&tokens, k, "rename") {
-                        if kw(&tokens, k + 1, "to") {
-                            push(
-                                table.clone(),
-                                Reach::Removed,
-                                "ALTER TABLE ... RENAME TO",
-                                tokens[k].offset,
-                            );
-                        } else if !kw(&tokens, k + 1, "constraint") {
-                            let cn = if kw(&tokens, k + 1, "column") {
-                                k + 2
-                            } else {
-                                k + 1
-                            };
-                            if let Some((column, _)) = parse_table_name(&tokens, cn) {
-                                push(
-                                    format!("{table}.{column}"),
-                                    Reach::Removed,
-                                    "ALTER TABLE ... RENAME COLUMN",
-                                    tokens[k].offset,
-                                );
-                            }
-                        }
-                        k += 2;
-                        continue;
-                    }
-                    // ALTER [COLUMN] <c> … TYPE … | … SET NOT NULL
-                    if kw(&tokens, k, "alter") {
-                        let cn = if kw(&tokens, k + 1, "column") {
-                            k + 2
-                        } else {
-                            k + 1
-                        };
-                        if let Some((column, after_col)) = parse_table_name(&tokens, cn) {
-                            if let Some(shape) = action_narrows(&tokens, after_col) {
-                                push(
-                                    format!("{table}.{column}"),
-                                    Reach::Narrowed,
-                                    shape,
-                                    tokens[k].offset,
-                                );
-                            }
-                        }
-                        k = cn + 1;
-                        continue;
-                    }
-                    k += 1;
-                }
-            }
+            out.extend(scan_alter_table_statement(&tokens, i, n, &stripped));
         }
-
         i += 1;
     }
 
@@ -508,111 +585,160 @@ fn scan_migration(sql: &str) -> Vec<Contraction> {
 /// perfectly ordinary Rust token and, read naively, its quote would open a
 /// bogus "string" that swallows the rest of the file. Lifetimes (`'a`) are
 /// distinguished from char literals by looking for the closing quote.
+/// A `//` line comment starting at `i`; returns the index just past its
+/// trailing newline (or end of input).
+fn skip_line_comment(chars: &[char], i: usize, n: usize) -> Option<usize> {
+    if !(chars[i] == '/' && i + 1 < n && chars[i + 1] == '/') {
+        return None;
+    }
+    let mut i = i;
+    while i < n && chars[i] != '\n' {
+        i += 1;
+    }
+    Some(i)
+}
+
+/// A (possibly nested) `/* … */` block comment starting at `i`; returns the
+/// index just past its close.
+fn skip_block_comment(chars: &[char], i: usize, n: usize) -> Option<usize> {
+    if !(chars[i] == '/' && i + 1 < n && chars[i + 1] == '*') {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut i = i + 2;
+    while i < n && depth > 0 {
+        if chars[i] == '/' && i + 1 < n && chars[i + 1] == '*' {
+            depth += 1;
+            i += 2;
+        } else if chars[i] == '*' && i + 1 < n && chars[i + 1] == '/' {
+            depth -= 1;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Some(i)
+}
+
+/// A raw string `r` then zero or more `#` then `"…"` starting at `i`; pushes
+/// its body onto `out` and returns the index just past the closing quote.
+fn scan_raw_string(chars: &[char], i: usize, n: usize, out: &mut Vec<String>) -> Option<usize> {
+    if chars[i] != 'r' {
+        return None;
+    }
+    let mut j = i + 1;
+    let mut hashes = 0usize;
+    while j < n && chars[j] == '#' {
+        hashes += 1;
+        j += 1;
+    }
+    if j >= n || chars[j] != '"' {
+        return None;
+    }
+    let body_start = j + 1;
+    let mut k = body_start;
+    let mut end = None;
+    while k < n {
+        if chars[k] == '"' {
+            let mut h = 0usize;
+            while h < hashes && k + 1 + h < n && chars[k + 1 + h] == '#' {
+                h += 1;
+            }
+            if h == hashes {
+                end = Some(k);
+                break;
+            }
+        }
+        k += 1;
+    }
+    let stop = end.unwrap_or(n);
+    out.push(chars[body_start..stop].iter().collect());
+    Some(stop + 1 + hashes)
+}
+
+/// A char literal or lifetime starting at `i` — `'"'`, `'\\''`, or a bare
+/// `'a` lifetime. Returns the index just past whichever was consumed.
+///
+/// Skipping char literals matters for correctness, not tidiness: `'"'` is a
+/// perfectly ordinary Rust token and, read naively, its quote would open a
+/// bogus "string" that swallows the rest of the file. Lifetimes (`'a`) are
+/// distinguished from char literals by looking for the closing quote.
+fn scan_char_or_lifetime(chars: &[char], i: usize, n: usize) -> Option<usize> {
+    if chars[i] != '\'' {
+        return None;
+    }
+    if i + 1 < n && chars[i + 1] == '\\' {
+        // Escaped char literal — skip to the closing quote.
+        let mut k = i + 2;
+        while k < n && chars[k] != '\'' {
+            k += 1;
+        }
+        return Some(k + 1);
+    }
+    if i + 2 < n && chars[i + 2] == '\'' {
+        // Simple char literal such as `'"'`.
+        return Some(i + 3);
+    }
+    // A lifetime — consume only the quote.
+    Some(i + 1)
+}
+
+/// A normal `"…"` string literal starting at `i`, honouring backslash
+/// escapes; pushes its body onto `out` and returns the index just past the
+/// closing quote (or end of input if unterminated).
+fn scan_normal_string(chars: &[char], i: usize, n: usize, out: &mut Vec<String>) -> Option<usize> {
+    if chars[i] != '"' {
+        return None;
+    }
+    let mut body = String::new();
+    let mut k = i + 1;
+    while k < n {
+        if chars[k] == '\\' {
+            // Keep the escaped character verbatim; we only ever tokenize
+            // the result, so an unresolved `\n` is a harmless `n`.
+            if k + 1 < n {
+                body.push(chars[k + 1]);
+            }
+            k += 2;
+            continue;
+        }
+        if chars[k] == '"' {
+            break;
+        }
+        body.push(chars[k]);
+        k += 1;
+    }
+    out.push(body);
+    Some(k + 1)
+}
+
+/// Extract every Rust string literal from `src` — normal `"…"` (honouring
+/// backslash escapes) and raw `r"…"` / `r#"…"#` forms — skipping Rust line
+/// and block comments and char literals.
 fn rust_string_literals(src: &str) -> Vec<String> {
     let chars: Vec<char> = src.chars().collect();
     let n = chars.len();
     let mut out = Vec::new();
     let mut i = 0;
     while i < n {
-        let c = chars[i];
-        // Line comment.
-        if c == '/' && i + 1 < n && chars[i + 1] == '/' {
-            while i < n && chars[i] != '\n' {
-                i += 1;
-            }
+        if let Some(next) = skip_line_comment(&chars, i, n) {
+            i = next;
             continue;
         }
-        // Block comment (Rust block comments nest).
-        if c == '/' && i + 1 < n && chars[i + 1] == '*' {
-            let mut depth = 1usize;
-            i += 2;
-            while i < n && depth > 0 {
-                if chars[i] == '/' && i + 1 < n && chars[i + 1] == '*' {
-                    depth += 1;
-                    i += 2;
-                } else if chars[i] == '*' && i + 1 < n && chars[i + 1] == '/' {
-                    depth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
+        if let Some(next) = skip_block_comment(&chars, i, n) {
+            i = next;
             continue;
         }
-        // Raw string: `r` then zero or more `#` then `"`.
-        if c == 'r' {
-            let mut j = i + 1;
-            let mut hashes = 0usize;
-            while j < n && chars[j] == '#' {
-                hashes += 1;
-                j += 1;
-            }
-            if j < n && chars[j] == '"' {
-                let body_start = j + 1;
-                let mut k = body_start;
-                let mut end = None;
-                while k < n {
-                    if chars[k] == '"' {
-                        let mut h = 0usize;
-                        while h < hashes && k + 1 + h < n && chars[k + 1 + h] == '#' {
-                            h += 1;
-                        }
-                        if h == hashes {
-                            end = Some(k);
-                            break;
-                        }
-                    }
-                    k += 1;
-                }
-                let stop = end.unwrap_or(n);
-                out.push(chars[body_start..stop].iter().collect());
-                i = stop + 1 + hashes;
-                continue;
-            }
-        }
-        // Char literal or lifetime.
-        if c == '\'' {
-            if i + 1 < n && chars[i + 1] == '\\' {
-                // Escaped char literal — skip to the closing quote.
-                let mut k = i + 2;
-                while k < n && chars[k] != '\'' {
-                    k += 1;
-                }
-                i = k + 1;
-                continue;
-            }
-            if i + 2 < n && chars[i + 2] == '\'' {
-                // Simple char literal such as `'"'`.
-                i += 3;
-                continue;
-            }
-            // A lifetime — consume only the quote.
-            i += 1;
+        if let Some(next) = scan_raw_string(&chars, i, n, &mut out) {
+            i = next;
             continue;
         }
-        // Normal string literal.
-        if c == '"' {
-            let mut body = String::new();
-            let mut k = i + 1;
-            while k < n {
-                if chars[k] == '\\' {
-                    // Keep the escaped character verbatim; we only ever
-                    // tokenize the result, so an unresolved `\n` is a
-                    // harmless `n`.
-                    if k + 1 < n {
-                        body.push(chars[k + 1]);
-                    }
-                    k += 2;
-                    continue;
-                }
-                if chars[k] == '"' {
-                    break;
-                }
-                body.push(chars[k]);
-                k += 1;
-            }
-            out.push(body);
-            i = k + 1;
+        if let Some(next) = scan_char_or_lifetime(&chars, i, n) {
+            i = next;
+            continue;
+        }
+        if let Some(next) = scan_normal_string(&chars, i, n, &mut out) {
+            i = next;
             continue;
         }
         i += 1;

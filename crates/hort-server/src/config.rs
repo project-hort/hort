@@ -1916,64 +1916,27 @@ impl Config {
         // endpoint always requires `Permission::ReadMetrics`.)
         let metrics_public_bind = parse_bool("HORT_METRICS_PUBLIC_BIND", false)?;
 
-        let metrics_bind_addr = match std::env::var("HORT_METRICS_BIND") {
-            Ok(ref v) if !v.is_empty() => {
-                let addr = v
-                    .parse::<SocketAddr>()
-                    .map_err(|source| ConfigError::InvalidAddr {
-                        var: "HORT_METRICS_BIND",
-                        source,
-                    })?;
-                // Refuse unspecified-address
-                // bind unless the operator opts in. `is_unspecified`
-                // matches `0.0.0.0` (IPv4) and `::` (IPv6); loopback
-                // and concrete interface IPs always pass through.
-                if addr.ip().is_unspecified() && !metrics_public_bind {
-                    return Err(ConfigError::MetricsPublicBindRefused {
-                        var: "HORT_METRICS_BIND",
-                        opt_in_var: "HORT_METRICS_PUBLIC_BIND",
-                        addr: addr.to_string(),
-                        port: addr.port(),
-                    });
-                }
-                Some(addr)
-            }
-            _ => None,
-        };
+        let metrics_bind_addr = parse_guarded_bind_addr(
+            "HORT_METRICS_BIND",
+            "HORT_METRICS_PUBLIC_BIND",
+            metrics_public_bind,
+        )?;
 
         // `HORT_CONTROL_BIND` internal-only
         // control-plane listener. Parsed with the SAME shape as
         // `HORT_METRICS_BIND` above (concrete-addr parse + the
         // unspecified-address "0.0.0.0 footgun" refusal, opt-out via
-        // `HORT_CONTROL_PUBLIC_BIND`). When unset, `control_bind_addr`
+        // `HORT_CONTROL_PUBLIC_BIND`) via the shared
+        // `parse_guarded_bind_addr` helper. When unset, `control_bind_addr`
         // is `None` and the control routes stay on the main listener —
         // byte-identical to today, no migration. See
         // `docs/architecture/how-to/deploy/security-hardening-checklist.md`.
         let control_public_bind = parse_bool("HORT_CONTROL_PUBLIC_BIND", false)?;
-        let control_bind_addr = match std::env::var("HORT_CONTROL_BIND") {
-            Ok(ref v) if !v.is_empty() => {
-                let addr = v
-                    .parse::<SocketAddr>()
-                    .map_err(|source| ConfigError::InvalidAddr {
-                        var: "HORT_CONTROL_BIND",
-                        source,
-                    })?;
-                // Same `is_unspecified` gate as the metrics listener:
-                // `0.0.0.0` (IPv4) / `::` (IPv6) is refused unless the
-                // operator explicitly opts in; loopback and concrete
-                // interface IPs always pass through.
-                if addr.ip().is_unspecified() && !control_public_bind {
-                    return Err(ConfigError::MetricsPublicBindRefused {
-                        var: "HORT_CONTROL_BIND",
-                        opt_in_var: "HORT_CONTROL_PUBLIC_BIND",
-                        addr: addr.to_string(),
-                        port: addr.port(),
-                    });
-                }
-                Some(addr)
-            }
-            _ => None,
-        };
+        let control_bind_addr = parse_guarded_bind_addr(
+            "HORT_CONTROL_BIND",
+            "HORT_CONTROL_PUBLIC_BIND",
+            control_public_bind,
+        )?;
 
         // `log_format`, `include_repository_label`,
         // `pg_statement_timeout_ms`, `pg_acquire_timeout_secs` are
@@ -2105,23 +2068,7 @@ impl Config {
         // Upstream-resolver refresh cadence.
         // Default 60s; clamp at 5s to bound DB load if an operator
         // typos a tiny value.
-        let upstream_resolver_refresh_secs =
-            match std::env::var("HORT_UPSTREAM_RESOLVER_REFRESH_SECS") {
-                Ok(v) if !v.is_empty() => {
-                    let parsed: u32 = v.parse().map_err(|source| ConfigError::InvalidInt {
-                        var: "HORT_UPSTREAM_RESOLVER_REFRESH_SECS",
-                        source,
-                    })?;
-                    if parsed < 5 {
-                        return Err(ConfigError::InvalidValue {
-                            var: "HORT_UPSTREAM_RESOLVER_REFRESH_SECS",
-                            reason: format!("must be >= 5 (got {parsed})"),
-                        });
-                    }
-                    parsed
-                }
-                _ => 60,
-            };
+        let upstream_resolver_refresh_secs = parse_upstream_resolver_refresh_secs()?;
 
         // Three storage-backstop knobs
         // (metadata 64 MiB, manifest 16 MiB, per-version-object 2 MiB),
@@ -2152,69 +2099,12 @@ impl Config {
         // override may only ever *raise* a floor: an override below its
         // documented minimum is a hard startup failure (mirrors the
         // `HORT_UPSTREAM_RESOLVER_REFRESH_SECS` `>= 5` reject pattern
-        // above). Unset → the default.
-        let audit_retention_floors = {
-            let d = AuditRetentionFloors::c1_defaults();
-            AuditRetentionFloors {
-                authentication: resolve_retention_floor_days(
-                    "HORT_RETENTION_FLOOR_AUTHENTICATION_DAYS",
-                    AuditRetentionFloors::MIN_AUTHENTICATION_DAYS,
-                    d.authentication(),
-                )?,
-                policy_authz_admin: resolve_retention_floor_days(
-                    "HORT_RETENTION_FLOOR_POLICY_AUTHZ_ADMIN_DAYS",
-                    AuditRetentionFloors::MIN_POLICY_AUTHZ_ADMIN_DAYS,
-                    d.policy_authz_admin(),
-                )?,
-                artifact_downloaded: resolve_retention_floor_days(
-                    "HORT_RETENTION_FLOOR_ARTIFACT_DOWNLOADED_DAYS",
-                    AuditRetentionFloors::MIN_ARTIFACT_DOWNLOADED_DAYS,
-                    d.artifact_downloaded(),
-                )?,
-                api_token_used: resolve_retention_floor_days(
-                    "HORT_RETENTION_FLOOR_API_TOKEN_USED_DAYS",
-                    AuditRetentionFloors::MIN_API_TOKEN_USED_DAYS,
-                    d.api_token_used(),
-                )?,
-                artifact_lifecycle: resolve_retention_floor_days(
-                    "HORT_RETENTION_FLOOR_ARTIFACT_LIFECYCLE_DAYS",
-                    AuditRetentionFloors::MIN_ARTIFACT_LIFECYCLE_DAYS,
-                    d.artifact_lifecycle(),
-                )?,
-            }
-        };
+        // above). Unset → the default. See `parse_audit_retention_floors`.
+        let audit_retention_floors = parse_audit_retention_floors()?;
 
-        // The ONE global stream
-        // retention mode for v1. `delete` (default) or `archive`;
-        // `archive` requires a non-empty `HORT_RETENTION_ARCHIVE_TARGET`
-        // prefix (a missing/empty target with `archive` is a startup
-        // hard-fail — silently degrading to delete would be data loss).
-        let retention_stream_mode = match std::env::var("HORT_RETENTION_STREAM_MODE") {
-            Ok(v) if !v.is_empty() => match v.to_ascii_lowercase().as_str() {
-                "delete" => StreamRetentionMode::Delete,
-                "archive" => {
-                    let target = std::env::var("HORT_RETENTION_ARCHIVE_TARGET")
-                        .ok()
-                        .filter(|t| !t.is_empty())
-                        .ok_or_else(|| ConfigError::InvalidValue {
-                            var: "HORT_RETENTION_ARCHIVE_TARGET",
-                            reason: "HORT_RETENTION_STREAM_MODE=archive requires a non-empty \
-                                     HORT_RETENTION_ARCHIVE_TARGET prefix"
-                                .to_owned(),
-                        })?;
-                    StreamRetentionMode::Archive {
-                        target_prefix: target,
-                    }
-                }
-                other => {
-                    return Err(ConfigError::InvalidValue {
-                        var: "HORT_RETENTION_STREAM_MODE",
-                        reason: format!("expected one of [delete, archive], got {other:?}"),
-                    });
-                }
-            },
-            _ => StreamRetentionMode::Delete,
-        };
+        // The ONE global stream retention mode for v1 — see
+        // `parse_retention_stream_mode`.
+        let retention_stream_mode = parse_retention_stream_mode()?;
 
         // Unconditional startup failure when the operator has pinned
         // neither a public URL nor a trusted-proxy allowlist.
@@ -2225,29 +2115,13 @@ impl Config {
             return Err(ConfigError::TrustUnconfigured);
         }
 
-        // `HORT_REQUIRE_HTTPS` opt-in
-        // gate. When the operator has set the gate AND the binary has
-        // no positive evidence the public connection is TLS, refuse
-        // to start so the misconfiguration is loud. Positive evidence
-        // is either:
-        //   1. `HORT_PUBLIC_BASE_URL` is `https://...`, OR
-        //   2. `HORT_TRUSTED_PROXY_CIDRS` is non-empty (operator wired a
-        //      proxy and trusts its `X-Forwarded-Proto`).
-        // The AND-condition means the gate fires only on the silent
-        // plaintext-deployment case (forgot the proxy, exposed 8080
-        // directly, used HTTP-only ingress) — exactly the trap the
-        // gate exists to close. Default `false` keeps existing
-        // local-dev setups booting without changes.
+        // `HORT_REQUIRE_HTTPS` opt-in gate — see `enforce_require_https`.
         let require_https = parse_bool("HORT_REQUIRE_HTTPS", false)?;
-        if require_https {
-            let base_url_is_http = public_base_url
-                .as_ref()
-                .map(|u| u.scheme() == "http")
-                .unwrap_or(false);
-            if base_url_is_http && trusted_proxy_cidrs.is_empty() {
-                return Err(ConfigError::InsecureHttp);
-            }
-        }
+        enforce_require_https(
+            require_https,
+            public_base_url.as_ref(),
+            &trusted_proxy_cidrs,
+        )?;
 
         // `HORT_CONFIG_DIR`.
         let config_dir = parse_config_dir()?;
@@ -2261,29 +2135,9 @@ impl Config {
         let auth = parse_auth_provider()?;
         let claim_mappings: Vec<ClaimMapping> = Vec::new();
 
-        // Startup log — one structured emission summarising the auth
-        // surface. Token signing key is NEVER logged; issuer URL is shown
-        // for OIDC only. If this fires before the tracing subscriber is
-        // installed (as it currently does in `main.rs`) the emission is a
-        // no-op, which is fine — the Debug impl on `Config` surfaces the
-        // same fields if a caller prints it later.
-        let auth_provider_label = match &auth {
-            AuthConfig::Disabled => "disabled",
-            AuthConfig::Oidc(_) => "oidc",
-        };
-        let oidc_issuer_url: Option<&str> = match &auth {
-            AuthConfig::Oidc(o) => Some(o.issuer_url.as_str()),
-            AuthConfig::Disabled => None,
-        };
-        tracing::info!(
-            auth_provider = auth_provider_label,
-            claim_mappings_count = claim_mappings.len(),
-            oidc_issuer_url = oidc_issuer_url,
-            "auth configuration loaded"
-        );
-        if matches!(auth, AuthConfig::Oidc(_)) && claim_mappings.is_empty() {
-            tracing::warn!("claim mappings empty — no users will receive claims via OIDC");
-        }
+        // Startup log summarising the auth surface — see
+        // `log_auth_configuration`.
+        log_auth_configuration(&auth, &claim_mappings);
 
         // Native API token + PAT-cache + PAT-lockout knobs. Defaults:
         // feature flag OFF, plaintext-PAT refused, cache 10k entries,
@@ -2312,25 +2166,8 @@ impl Config {
             .filter(|v| !v.is_empty());
         let allow_pat_over_http = parse_bool("HORT_BEARER_ALLOW_OVER_HTTP", false)?;
         // Hard-fail a self-contradictory "bearer over plaintext HTTP" + TLS
-        // posture (INFRA-13). When the operator both relaxes the
-        // bearer-token transport guard (`HORT_BEARER_ALLOW_OVER_HTTP=true`)
-        // AND advertises an `https://` public base URL — i.e. the deployment
-        // is clearly TLS-terminated (directly or behind a proxy) — the two
-        // settings cancel each other out: a TLS-terminated registry has no
-        // legitimate need for the plaintext relaxation. Treat it as a
-        // misconfiguration and refuse to boot rather than only warning. A
-        // genuinely plaintext-internal deploy (`public_base_url` is `None` or
-        // `http://...`) keeps the existing WARN-only behaviour
-        // (`emit_pat_over_http_signal`, emitted later in composition).
-        if allow_pat_over_http {
-            if let Some(url) = public_base_url.as_ref() {
-                if url.scheme() == "https" {
-                    return Err(ConfigError::BearerOverHttpContradictsTls {
-                        public_base_url: url.as_str().to_string(),
-                    });
-                }
-            }
-        }
+        // posture (INFRA-13) — see `enforce_pat_over_http_tls_contradiction`.
+        enforce_pat_over_http_tls_contradiction(allow_pat_over_http, public_base_url.as_ref())?;
         let pat_cache_size = parse_pat_cache_size()?;
         let pat_lockout_threshold = parse_pat_lockout_threshold()?;
         let pat_lockout_window_secs = parse_pat_lockout_window_secs()?;
@@ -2354,66 +2191,22 @@ impl Config {
         let refcount_reconcile_on_startup = parse_bool("HORT_REFCOUNT_RECONCILE_ON_STARTUP", true)?;
 
         // Fail-closed when the feature is on and the interactive-OIDC
-        // path would be served with missing fields. The
-        // `/.well-known/hort-client-config` discovery doc renders three
-        // dependent values straight from process env; serving a
-        // half-formed document would silently downgrade `hort-cli` into
-        // guessing IdP coordinates out-of-band. Mirrors the
-        // fail-closed pattern of `OciPublicBaseUrlMissing`.
-        //
-        // Under `AuthConfig::Disabled` + federation, these three vars
-        // are NOT required — the federation branch validates JWTs
-        // against gitops `OidcIssuer` rows, not the interactive IdP
-        // config. The discovery doc is simply not served in that mode.
-        if enable_token_exchange {
-            // Interactive-OIDC-path requirements: issuer URL, CLI client
-            // ID, and public base URL are only needed when
-            // `AuthConfig::Oidc` is in use (they back the
-            // `/.well-known/hort-client-config` discovery doc + the
-            // device-flow path). Under `AuthConfig::Disabled` +
-            // federation, none of these are consulted — the federation
-            // branch validates JWTs against gitops `OidcIssuer` rows,
-            // not the interactive IdP config.
-            if let AuthConfig::Oidc(o) = &auth {
-                let mut missing: Vec<&str> = Vec::new();
-                if o.issuer_url.is_empty() {
-                    missing.push("HORT_OIDC_ISSUER_URL");
-                }
-                if o.cli_client_id.as_deref().unwrap_or("").is_empty() {
-                    missing.push("HORT_OIDC_CLI_CLIENT_ID");
-                }
-                if public_base_url.is_none() {
-                    missing.push("HORT_PUBLIC_BASE_URL");
-                }
-                if !missing.is_empty() {
-                    return Err(ConfigError::TokenExchangeRequiresVars {
-                        missing: missing.join(", "),
-                    });
-                }
-            }
-            // Token-exchange mints `hort_cli_*`
-            // (PAT-shape) tokens via `issue_cli_session`. Validation
-            // of those tokens at request-time goes through
-            // `PatValidationUseCase`, which the composition root
-            // only wires when `enable_native_tokens=true`. Without
-            // this gate, operators flipping HORT_TOKEN_EXCHANGE_ENABLED
-            // alone produce a server that issues tokens it cannot
-            // validate — login succeeds, every subsequent call 401s.
-            // Fail-closed at boot so the misconfig surfaces as a
-            // single startup error instead of a confusing runtime
-            // pattern. This gate applies regardless of `AuthConfig`
-            // variant — both the interactive and federated branches
-            // mint `hort_*` native tokens.
-            if !enable_native_tokens {
-                return Err(ConfigError::TokenExchangeRequiresNativeTokens);
-            }
-        }
+        // path (or the native-token surface it depends on) would be
+        // served with missing fields — see
+        // `enforce_token_exchange_requirements`.
+        enforce_token_exchange_requirements(
+            enable_token_exchange,
+            &auth,
+            public_base_url.as_ref(),
+            enable_native_tokens,
+        )?;
 
         // OCI token signing keys. `_FILE`
         // takes precedence over inline; setting both with non-empty
-        // values is `AmbiguousSigningKeySource` (boot-fail). When
-        // `enable_native_tokens=true` and no key is configured,
-        // surface `OciTokenSigningKeyMissing`.
+        // values is `AmbiguousSigningKeySource` (boot-fail, enforced
+        // inside `parse_secret_env`). See
+        // `validate_oci_token_signing_keys` for the enabled/missing and
+        // disabled/configured-but-unused checks.
         let oci_token_signing_key_pem = parse_secret_env(
             "HORT_OCI_TOKEN_SIGNING_KEY_FILE",
             "HORT_OCI_TOKEN_SIGNING_KEY",
@@ -2422,17 +2215,11 @@ impl Config {
             "HORT_OCI_TOKEN_SIGNING_KEY_PREV_FILE",
             "HORT_OCI_TOKEN_SIGNING_KEY_PREV",
         )?;
-        if enable_native_tokens && oci_token_signing_key_pem.is_none() {
-            return Err(ConfigError::OciTokenSigningKeyMissing);
-        }
-        if !enable_native_tokens
-            && (oci_token_signing_key_pem.is_some() || oci_token_signing_key_prev_pem.is_some())
-        {
-            tracing::debug!(
-                "HORT_OCI_TOKEN_SIGNING_KEY (and/or _PREV) configured but \
-                HORT_NATIVE_TOKENS_ENABLED=false — keys held but unused"
-            );
-        }
+        validate_oci_token_signing_keys(
+            enable_native_tokens,
+            oci_token_signing_key_pem.as_ref(),
+            oci_token_signing_key_prev_pem.as_ref(),
+        )?;
 
         // Parsed at the full-Config boundary
         // (NOT in `MinimalConfig`, which is DB-only). Default `true`
@@ -2518,6 +2305,303 @@ impl Config {
             retention_stream_mode,
         })
     }
+}
+
+/// Parse a listener bind address that is refused when it is an
+/// unspecified address (`0.0.0.0` / `::`) unless the operator opts in.
+///
+/// Shared by `HORT_METRICS_BIND` (opt-in `HORT_METRICS_PUBLIC_BIND`) and
+/// `HORT_CONTROL_BIND` (opt-in `HORT_CONTROL_PUBLIC_BIND`) — both listeners
+/// apply the identical "0.0.0.0 footgun" refusal. Unset / empty env var →
+/// `None` (the caller's listener stays on the main bind address, or is not
+/// mounted at all).
+fn parse_guarded_bind_addr(
+    var: &'static str,
+    opt_in_var: &'static str,
+    public_bind: bool,
+) -> Result<Option<SocketAddr>, ConfigError> {
+    match std::env::var(var) {
+        Ok(ref v) if !v.is_empty() => {
+            let addr = v
+                .parse::<SocketAddr>()
+                .map_err(|source| ConfigError::InvalidAddr { var, source })?;
+            // Refuse unspecified-address
+            // bind unless the operator opts in. `is_unspecified`
+            // matches `0.0.0.0` (IPv4) and `::` (IPv6); loopback
+            // and concrete interface IPs always pass through.
+            if addr.ip().is_unspecified() && !public_bind {
+                return Err(ConfigError::MetricsPublicBindRefused {
+                    var,
+                    opt_in_var,
+                    addr: addr.to_string(),
+                    port: addr.port(),
+                });
+            }
+            Ok(Some(addr))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Parse `HORT_UPSTREAM_RESOLVER_REFRESH_SECS`.
+///
+/// Default 60s; a set value below 5 is
+/// [`ConfigError::InvalidValue`] — clamps the floor so an operator typo
+/// (e.g. a bare `0`) cannot hammer the database with a tight refresh loop.
+fn parse_upstream_resolver_refresh_secs() -> Result<u32, ConfigError> {
+    const VAR: &str = "HORT_UPSTREAM_RESOLVER_REFRESH_SECS";
+    match std::env::var(VAR) {
+        Ok(v) if !v.is_empty() => {
+            let parsed: u32 = v
+                .parse()
+                .map_err(|source| ConfigError::InvalidInt { var: VAR, source })?;
+            if parsed < 5 {
+                return Err(ConfigError::InvalidValue {
+                    var: VAR,
+                    reason: format!("must be >= 5 (got {parsed})"),
+                });
+            }
+            Ok(parsed)
+        }
+        _ => Ok(60),
+    }
+}
+
+/// Resolve the audit-retention floors from
+/// their `HORT_RETENTION_FLOOR_*_DAYS` overrides — see
+/// [`resolve_retention_floor_days`] for the per-field parse/validation rule.
+fn parse_audit_retention_floors() -> Result<AuditRetentionFloors, ConfigError> {
+    let d = AuditRetentionFloors::c1_defaults();
+    Ok(AuditRetentionFloors {
+        authentication: resolve_retention_floor_days(
+            "HORT_RETENTION_FLOOR_AUTHENTICATION_DAYS",
+            AuditRetentionFloors::MIN_AUTHENTICATION_DAYS,
+            d.authentication(),
+        )?,
+        policy_authz_admin: resolve_retention_floor_days(
+            "HORT_RETENTION_FLOOR_POLICY_AUTHZ_ADMIN_DAYS",
+            AuditRetentionFloors::MIN_POLICY_AUTHZ_ADMIN_DAYS,
+            d.policy_authz_admin(),
+        )?,
+        artifact_downloaded: resolve_retention_floor_days(
+            "HORT_RETENTION_FLOOR_ARTIFACT_DOWNLOADED_DAYS",
+            AuditRetentionFloors::MIN_ARTIFACT_DOWNLOADED_DAYS,
+            d.artifact_downloaded(),
+        )?,
+        api_token_used: resolve_retention_floor_days(
+            "HORT_RETENTION_FLOOR_API_TOKEN_USED_DAYS",
+            AuditRetentionFloors::MIN_API_TOKEN_USED_DAYS,
+            d.api_token_used(),
+        )?,
+        artifact_lifecycle: resolve_retention_floor_days(
+            "HORT_RETENTION_FLOOR_ARTIFACT_LIFECYCLE_DAYS",
+            AuditRetentionFloors::MIN_ARTIFACT_LIFECYCLE_DAYS,
+            d.artifact_lifecycle(),
+        )?,
+    })
+}
+
+/// Parse `HORT_RETENTION_STREAM_MODE`.
+///
+/// `delete` (default) or `archive`; `archive` requires a non-empty
+/// `HORT_RETENTION_ARCHIVE_TARGET` prefix — a missing/empty target with
+/// `archive` is a startup hard-fail, since silently degrading to delete
+/// would be data loss.
+fn parse_retention_stream_mode() -> Result<StreamRetentionMode, ConfigError> {
+    match std::env::var("HORT_RETENTION_STREAM_MODE") {
+        Ok(v) if !v.is_empty() => match v.to_ascii_lowercase().as_str() {
+            "delete" => Ok(StreamRetentionMode::Delete),
+            "archive" => {
+                let target = std::env::var("HORT_RETENTION_ARCHIVE_TARGET")
+                    .ok()
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| ConfigError::InvalidValue {
+                        var: "HORT_RETENTION_ARCHIVE_TARGET",
+                        reason: "HORT_RETENTION_STREAM_MODE=archive requires a non-empty \
+                                 HORT_RETENTION_ARCHIVE_TARGET prefix"
+                            .to_owned(),
+                    })?;
+                Ok(StreamRetentionMode::Archive {
+                    target_prefix: target,
+                })
+            }
+            other => Err(ConfigError::InvalidValue {
+                var: "HORT_RETENTION_STREAM_MODE",
+                reason: format!("expected one of [delete, archive], got {other:?}"),
+            }),
+        },
+        _ => Ok(StreamRetentionMode::Delete),
+    }
+}
+
+/// Enforce the `HORT_REQUIRE_HTTPS` opt-in gate.
+///
+/// When the operator has set the gate AND the binary has no positive
+/// evidence the public connection is TLS, refuse to start so the
+/// misconfiguration is loud. Positive evidence is either:
+///   1. `HORT_PUBLIC_BASE_URL` is `https://...`, OR
+///   2. `HORT_TRUSTED_PROXY_CIDRS` is non-empty (operator wired a
+///      proxy and trusts its `X-Forwarded-Proto`).
+///
+/// The AND-condition means the gate fires only on the silent
+/// plaintext-deployment case (forgot the proxy, exposed 8080
+/// directly, used HTTP-only ingress) — exactly the trap the
+/// gate exists to close. `require_https = false` keeps existing
+/// local-dev setups booting without changes.
+fn enforce_require_https(
+    require_https: bool,
+    public_base_url: Option<&url::Url>,
+    trusted_proxy_cidrs: &[IpNet],
+) -> Result<(), ConfigError> {
+    if !require_https {
+        return Ok(());
+    }
+    let base_url_is_http = public_base_url
+        .map(|u| u.scheme() == "http")
+        .unwrap_or(false);
+    if base_url_is_http && trusted_proxy_cidrs.is_empty() {
+        return Err(ConfigError::InsecureHttp);
+    }
+    Ok(())
+}
+
+/// Startup log — one structured emission summarising the auth surface.
+///
+/// Token signing key is NEVER logged; issuer URL is shown for OIDC only.
+/// If this fires before the tracing subscriber is installed (as it
+/// currently does in `main.rs`) the emission is a no-op, which is fine —
+/// the `Debug` impl on `Config` surfaces the same fields if a caller
+/// prints it later.
+fn log_auth_configuration(auth: &AuthConfig, claim_mappings: &[ClaimMapping]) {
+    let auth_provider_label = match auth {
+        AuthConfig::Disabled => "disabled",
+        AuthConfig::Oidc(_) => "oidc",
+    };
+    let oidc_issuer_url: Option<&str> = match auth {
+        AuthConfig::Oidc(o) => Some(o.issuer_url.as_str()),
+        AuthConfig::Disabled => None,
+    };
+    tracing::info!(
+        auth_provider = auth_provider_label,
+        claim_mappings_count = claim_mappings.len(),
+        oidc_issuer_url = oidc_issuer_url,
+        "auth configuration loaded"
+    );
+    if matches!(auth, AuthConfig::Oidc(_)) && claim_mappings.is_empty() {
+        tracing::warn!("claim mappings empty — no users will receive claims via OIDC");
+    }
+}
+
+/// Hard-fail a self-contradictory "bearer over plaintext HTTP" + TLS
+/// posture (INFRA-13).
+///
+/// When the operator both relaxes the bearer-token transport guard
+/// (`HORT_BEARER_ALLOW_OVER_HTTP=true`) AND advertises an `https://`
+/// public base URL — i.e. the deployment is clearly TLS-terminated
+/// (directly or behind a proxy) — the two settings cancel each other
+/// out: a TLS-terminated registry has no legitimate need for the
+/// plaintext relaxation. Treat it as a misconfiguration and refuse to
+/// boot rather than only warning. A genuinely plaintext-internal deploy
+/// (`public_base_url` is `None` or `http://...`) keeps the existing
+/// WARN-only behaviour (`emit_pat_over_http_signal`, emitted later in
+/// composition).
+fn enforce_pat_over_http_tls_contradiction(
+    allow_pat_over_http: bool,
+    public_base_url: Option<&url::Url>,
+) -> Result<(), ConfigError> {
+    if !allow_pat_over_http {
+        return Ok(());
+    }
+    let Some(url) = public_base_url else {
+        return Ok(());
+    };
+    if url.scheme() == "https" {
+        return Err(ConfigError::BearerOverHttpContradictsTls {
+            public_base_url: url.as_str().to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Fail-closed when `HORT_TOKEN_EXCHANGE_ENABLED=true` and the
+/// interactive-OIDC path or the native-token surface it depends on is
+/// missing.
+///
+/// Under `AuthConfig::Disabled` + federation, the three interactive-OIDC
+/// vars are NOT required — the federation branch validates JWTs against
+/// gitops `OidcIssuer` rows, not the interactive IdP config, so the
+/// `/.well-known/hort-client-config` discovery doc is simply not served
+/// in that mode. Under `AuthConfig::Oidc`, all three back that discovery
+/// doc plus the device-flow path, so their absence is a startup
+/// hard-fail (mirrors `OciPublicBaseUrlMissing`).
+///
+/// Independently of the auth variant: token-exchange mints `hort_cli_*`
+/// (PAT-shape) tokens via `issue_cli_session`, and validating those at
+/// request time goes through `PatValidationUseCase`, which the
+/// composition root only wires when `enable_native_tokens=true`. Without
+/// this gate, an operator flipping `HORT_TOKEN_EXCHANGE_ENABLED` alone
+/// would produce a server that issues tokens it cannot validate — login
+/// succeeds, every subsequent call 401s. Fail-closed at boot so the
+/// misconfig surfaces as a single startup error instead of a confusing
+/// runtime pattern.
+fn enforce_token_exchange_requirements(
+    enable_token_exchange: bool,
+    auth: &AuthConfig,
+    public_base_url: Option<&url::Url>,
+    enable_native_tokens: bool,
+) -> Result<(), ConfigError> {
+    if !enable_token_exchange {
+        return Ok(());
+    }
+    if let AuthConfig::Oidc(o) = auth {
+        let mut missing: Vec<&str> = Vec::new();
+        if o.issuer_url.is_empty() {
+            missing.push("HORT_OIDC_ISSUER_URL");
+        }
+        if o.cli_client_id.as_deref().unwrap_or("").is_empty() {
+            missing.push("HORT_OIDC_CLI_CLIENT_ID");
+        }
+        if public_base_url.is_none() {
+            missing.push("HORT_PUBLIC_BASE_URL");
+        }
+        if !missing.is_empty() {
+            return Err(ConfigError::TokenExchangeRequiresVars {
+                missing: missing.join(", "),
+            });
+        }
+    }
+    if !enable_native_tokens {
+        return Err(ConfigError::TokenExchangeRequiresNativeTokens);
+    }
+    Ok(())
+}
+
+/// Validate the OCI token signing key pair parsed via `parse_secret_env`.
+///
+/// `_FILE` vs. inline ambiguity is already rejected inside
+/// `parse_secret_env` itself. Here: when native tokens are enabled, an
+/// active key MUST be configured
+/// ([`ConfigError::OciTokenSigningKeyMissing`]). When native tokens are
+/// disabled, a configured key is held but unused — logged at `debug!`,
+/// not an error (an operator may pre-stage the key ahead of an upgrade
+/// that flips the flag).
+fn validate_oci_token_signing_keys(
+    enable_native_tokens: bool,
+    oci_token_signing_key_pem: Option<&String>,
+    oci_token_signing_key_prev_pem: Option<&String>,
+) -> Result<(), ConfigError> {
+    if enable_native_tokens && oci_token_signing_key_pem.is_none() {
+        return Err(ConfigError::OciTokenSigningKeyMissing);
+    }
+    if !enable_native_tokens
+        && (oci_token_signing_key_pem.is_some() || oci_token_signing_key_prev_pem.is_some())
+    {
+        tracing::debug!(
+            "HORT_OCI_TOKEN_SIGNING_KEY (and/or _PREV) configured but \
+            HORT_NATIVE_TOKENS_ENABLED=false — keys held but unused"
+        );
+    }
+    Ok(())
 }
 
 /// Resolve one audit-retention floor
