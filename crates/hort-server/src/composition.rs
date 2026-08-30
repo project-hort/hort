@@ -116,6 +116,7 @@ use hort_domain::ports::upstream_proxy::{
     UpstreamProxy, UpstreamProxyByFormat, READ_PATH_PROXY_FORMATS,
 };
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
+use hort_domain::ports::user_repository::UserRepository;
 
 use crate::config::ConfigError;
 use hort_config::ExtraTrustAnchors;
@@ -971,6 +972,856 @@ async fn build_ephemeral_stores(
     }
 }
 
+/// Wrap the event store in an
+/// `EventStorePublisher`. The publisher impls `EventStore`, so use
+/// cases keep their `Arc<EventStorePublisher>` field shape, and the
+/// call sites (`self.events.append(...)`, `self.events.read_*(...)`)
+/// continue to resolve through the same trait dispatch. The
+/// Pg-specific lifecycle adapters
+/// (`PgRefLifecycle`, `PgArtifactLifecycle`,
+/// `PgArtifactGroupLifecycle`) still hold the concrete
+/// `Arc<PgEventStore>` directly because they need the
+/// `begin_unit_of_work` Postgres-specific surface that does NOT
+/// live on the `EventStore` port. Lifecycle appends therefore do
+/// NOT broadcast (intentional — the dispatcher subscribes once per
+/// process and the broadcast hook exists at the per-use-case
+/// `EventStore::append` boundary;
+/// lifecycle ports own their own transactional append paths and
+/// surface persisted events back to callers via `AppendResult` which
+/// the use cases re-emit through the publisher when they need
+/// notification fan-out — see the design rationale in
+/// `docs/architecture/explanation/event-notifications.md`).
+fn build_event_publisher(
+    event_store: &Arc<hort_adapters_postgres::event_store::PgEventStore>,
+    notify_config: &NotifyConfig,
+) -> Arc<EventStorePublisher> {
+    if notify_config.enabled {
+        let (sender, initial_receiver) =
+            tokio::sync::broadcast::channel(notify_config.channel_capacity as usize);
+        // The initial receiver is dropped immediately — the
+        // dispatcher creates its own subscription via
+        // `publisher.subscribe()` at task spawn time. Without dropping
+        // the initial receiver here, the broadcast channel would never
+        // signal SendError(no_receivers) and the publisher's silent-drop
+        // contract would be untestable in a single-thread harness.
+        drop(initial_receiver);
+        Arc::new(EventStorePublisher::new(event_store.clone(), sender))
+    } else {
+        Arc::new(EventStorePublisher::without_broadcast(event_store.clone()))
+    }
+}
+
+/// Format-agnostic stateful-upload staging
+/// (filesystem) boot-time fail-loud gate. "Wired unconditionally; an
+/// unhealthy adapter does NOT block startup — handlers surface
+/// misconfiguration as request-time errors" is the *silent-degradation*
+/// anti-pattern: under the chart's S3 defaults + `readOnlyRootFilesystem:
+/// true`, a staging root on the read-only rootfs would only `warn!` in
+/// `new()` while every `append()` "retried" forever — OCI `docker push` /
+/// Git LFS non-functional with NO readiness signal. The chart sets a
+/// writable staging dir;
+/// the binary additionally fails LOUD so the *next* such gap (any
+/// deployment whose staging root is non-writable) is a fatal boot
+/// condition (the pod never enters the Service), not a silent 5xx.
+///
+/// Mechanism mirrors the `KubernetesSecretWriterImpl::try_in_cluster()`
+/// fatal-boot precedent below: construct the
+/// concrete adapter, run an inherent fail-loud probe, `error!` once +
+/// `return Err` on failure. `verify_writable_and_ownable()` is an
+/// *inherent* method on the concrete adapter, NOT a
+/// `StatefulUploadStagingPort` trait method — the port signature is
+/// unchanged. The per-`append()`
+/// `warn!` in the adapter stays as transient-case defense-in-depth
+/// (a root that goes bad *after* a healthy boot); this gate is the
+/// boot-time fail-loud addition.
+///
+/// Capability-gated: the gate is active iff a stateful-upload-
+/// capable format/route is enabled. In the `hort-server` binary the
+/// OCI Distribution router (`hort_http_oci::oci_routes_with_config`,
+/// the canonical StatefulUpload capability — OCI chunked blob upload
+/// and Git LFS) is merged UNCONDITIONALLY in `http::build_router_with_oci_config`;
+/// there is no format/OCI disable knob (OCI/Git LFS are Tier C
+/// compiled-in adapters, always present). So this boolean is a
+/// structural constant `true` for this binary — the gate is always
+/// active here. The named seam is kept (not hardcoded inline) so a
+/// future format-disable knob can make this honestly conditional
+/// without re-deriving the reasoning; today there is no
+/// deployment where stateful upload is unreachable, so failing the
+/// gate on an unusable root never penalises a deployment that would
+/// never use it.
+async fn verify_stateful_upload_staging_or_fail(
+    adapter: &FilesystemStatefulUploadStaging,
+    staging_dir: &std::path::Path,
+) -> DomainResult<()> {
+    const STATEFUL_UPLOAD_FORMATS_ENABLED: bool = true;
+    if !STATEFUL_UPLOAD_FORMATS_ENABLED {
+        return Ok(());
+    }
+    if let Err(err) = adapter.verify_writable_and_ownable().await {
+        // Logged ONCE here at the gate (not per-`append()`), with
+        // the staging root + the io-error kind carried in `err`'s
+        // message. Deliberately NO session id / UUID anywhere —
+        // session-id enumeration is an information leak,
+        // and a cardinality hazard.
+        tracing::error!(
+            staging_root = %staging_dir.display(),
+            error = %err,
+            "stateful-upload staging root is not writable/ownable — \
+             refusing to boot. Chunked upload (OCI `docker push`, \
+             Git LFS) would be silently non-functional. Point \
+             HORT_STATEFUL_UPLOAD_STAGING_DIR at a writable, \
+             owner-restrictable path (the Helm chart sets this to a \
+             writable emptyDir subdir)"
+        );
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Optional containment root for the
+/// mounted-file secret adapter. When `HORT_SECRETS_FILE_ROOT` is set,
+/// the file adapter rejects any secret_ref whose canonical path falls
+/// outside the root — symlink-escape protection. Unset → legacy
+/// unconstrained behaviour. The env var is read here at the
+/// composition root so the rest of the binary stays generic over
+/// `SecretPort`.
+fn resolve_secrets_file_root() -> Option<std::path::PathBuf> {
+    let secrets_file_root = match std::env::var("HORT_SECRETS_FILE_ROOT") {
+        Ok(s) if !s.is_empty() => Some(std::path::PathBuf::from(s)),
+        _ => None,
+    };
+    if let Some(root) = secrets_file_root.as_ref() {
+        tracing::info!(
+            secrets_file_root = %root.display(),
+            "HORT_SECRETS_FILE_ROOT configured — mounted-file adapter will enforce \
+             containment (paths whose canonical form escapes this root will be rejected)",
+        );
+    }
+    secrets_file_root
+}
+
+/// Outputs of [`build_pat_wiring`]. Named
+/// struct rather than a 3-tuple to satisfy `clippy::type_complexity` —
+/// behaviour is identical to the equivalent tuple form.
+struct PatWiring {
+    cache: Option<Arc<PatCache>>,
+    validation_use_case: Option<Arc<PatValidationUseCase>>,
+    revocation_listener: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// PAT cache + validator + listener
+/// wiring. Built BEFORE the auth context so the
+/// `AuthenticateUseCase` builder can carry the `Arc<PatValidationUseCase>`
+/// without a downstream re-bind. All three artefacts (cache,
+/// validator, listener) are gated on `native_token_config.enabled`
+/// — when off, none of them are constructed, the auth middleware's
+/// PAT branch is a no-op, and `AppContext.pat_cache = None`.
+fn build_pat_wiring(
+    native_token_config: &NativeTokenConfig,
+    api_token_repo: Arc<dyn ApiTokenRepository>,
+    user_repo: Arc<dyn UserRepository>,
+    ephemeral_durable: Arc<dyn EphemeralStore>,
+    event_publisher: Arc<EventStorePublisher>,
+    db: PgPool,
+) -> PatWiring {
+    if !native_token_config.enabled {
+        return PatWiring {
+            cache: None,
+            validation_use_case: None,
+            revocation_listener: None,
+        };
+    }
+    let cache = Arc::new(PatCache::new(
+        native_token_config.cache_size,
+        std::time::Duration::from_secs(300),
+    ));
+    let pat_lockout = PatLockoutConfig {
+        threshold: native_token_config.lockout_threshold,
+        window: std::time::Duration::from_secs(native_token_config.lockout_window_secs),
+        duration: std::time::Duration::from_secs(native_token_config.lockout_duration_secs),
+    };
+    let validator = Arc::new(
+        PatValidationUseCase::new(
+            api_token_repo,
+            user_repo,
+            // PAT brute-force lockout writes to
+            // the `pat-attempt:` / `pat-attempt-counter:`
+            // keyspaces, both registered as Durable in
+            // `KEYSPACE_REGISTRY`. The token-use audit
+            // throttle (`token_use:audit:throttle:`) reuses this
+            // same Durable handle (no second store handle).
+            ephemeral_durable,
+            cache.clone(),
+            Arc::new(SystemClock),
+            pat_lockout,
+        )
+        // Throttled per-use
+        // token-use audit emit. Same `Arc<EventStorePublisher>`
+        // wired onto `ArtifactUseCase::with_audit_events`.
+        .with_audit_events(event_publisher),
+    );
+    let invalidator: Arc<dyn ApiTokenCacheInvalidator> = cache.clone();
+    let listener = hort_adapters_postgres::api_token_revocation_listener::spawn_revocation_listener(
+        db,
+        invalidator,
+        hort_adapters_postgres::api_token_revocation_listener::REVOCATION_CHANNEL.to_string(),
+    );
+    PatWiring {
+        cache: Some(cache),
+        validation_use_case: Some(validator),
+        revocation_listener: Some(listener),
+    }
+}
+
+/// Boot-time liveness check for the
+/// `staging-sweep` task. Thin composition-root shell around
+/// [`emit_staging_sweep_liveness_signal`]: parses the two env-var knobs
+/// (owns its own opt-in surface), fetches the last-completed timestamp,
+/// and emits the gauge. A query failure is logged and treated as
+/// "unknown" (gauge left unset, debug log) — it must not block an
+/// otherwise-serviceable boot.
+async fn run_staging_sweep_liveness_check(jobs_repo: &PgJobsRepository) {
+    use hort_domain::ports::jobs_repository::JobsRepository as _;
+    let staging_sweep_expected_interval = std::time::Duration::from_secs(
+        std::env::var("HORT_STAGING_SWEEP_EXPECTED_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(300),
+    );
+    let staging_sweep_staleness_multiplier =
+        std::env::var("HORT_STAGING_SWEEP_STALENESS_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3);
+    match jobs_repo.last_completed_at_by_kind("staging-sweep").await {
+        Ok(last_completed_at) => {
+            emit_staging_sweep_liveness_signal(
+                last_completed_at,
+                chrono::Utc::now(),
+                staging_sweep_expected_interval,
+                staging_sweep_staleness_multiplier,
+            );
+        }
+        Err(e) => {
+            // The boot path stays serviceable even if this read fails —
+            // the signal is observability, not a fail-closed control.
+            tracing::debug!(
+                error = %e,
+                "staging-sweep liveness check skipped — last-completed query failed; \
+                 hort_staging_sweep_overdue not emitted this boot"
+            );
+        }
+    }
+}
+
+/// Boot-time liveness check for the
+/// `verify-event-chain` task. Mirrors
+/// [`run_staging_sweep_liveness_check`]: parses its two env-var knobs,
+/// fetches the last-completed timestamp, and emits
+/// [`emit_event_chain_verify_liveness_signal`]. A query failure is
+/// logged and treated as "unknown"; it must not block an otherwise-
+/// serviceable boot.
+async fn run_event_chain_verify_liveness_check(jobs_repo: &PgJobsRepository) {
+    use hort_domain::ports::jobs_repository::JobsRepository as _;
+    let event_chain_verify_expected_interval = std::time::Duration::from_secs(
+        std::env::var("HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(86_400),
+    );
+    let event_chain_verify_staleness_multiplier =
+        std::env::var("HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(3);
+    match jobs_repo
+        .last_completed_at_by_kind("verify-event-chain")
+        .await
+    {
+        Ok(last_completed_at) => {
+            emit_event_chain_verify_liveness_signal(
+                last_completed_at,
+                chrono::Utc::now(),
+                event_chain_verify_expected_interval,
+                event_chain_verify_staleness_multiplier,
+            );
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "event-chain verify liveness check skipped — last-completed query failed; \
+                 hort_event_chain_verify_overdue not emitted this boot"
+            );
+        }
+    }
+}
+
+/// Boot-time quarantine-posture log. Reports
+/// the resolved `DefaultPolicy` quarantine window (the
+/// out-of-the-box hold — ADR 0007), the count of operator `ScanPolicy`
+/// rows
+/// overriding to permissive (`quarantineDuration=0`, the explicit
+/// operator override — `warn!` when `> 0` so dashboards can surface
+/// it alongside the quarantine-by-default posture), and the count of
+/// `RepositoryUpstreamMapping` rows with
+/// `trust_upstream_publish_time = true` (a
+/// purely informational `info!`-level "how many operators opted in"
+/// signal). Counts are derived in memory from existing `list_active`
+/// / `list_all` port reads — no new port method, no new metric
+/// (the startup log is the entire observability surface
+/// here). A query failure is logged and treated as "unknown"
+/// (posture log skipped — same pattern as the staging-sweep liveness
+/// check above); it must not block an otherwise-serviceable boot.
+async fn run_quarantine_posture_log(
+    policy_projections: &Arc<dyn PolicyProjectionRepository>,
+    repository_upstream_mappings: &Arc<dyn RepositoryUpstreamMappingRepository>,
+) {
+    match policy_projections.list_active().await {
+        Ok(scan_policies) => match repository_upstream_mappings.list_all().await {
+            Ok(upstream_mappings) => {
+                evaluate_quarantine_posture(&scan_policies, &upstream_mappings);
+            }
+            Err(e) => {
+                tracing::debug!(
+                    error = %e,
+                    "quarantine posture log skipped — list_all() on \
+                     repository_upstream_mappings failed; posture not emitted this boot"
+                );
+            }
+        },
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "quarantine posture log skipped — list_active() on policy_projections \
+                 failed; posture not emitted this boot"
+            );
+        }
+    }
+}
+
+/// Load the OCI Distribution-Spec `/v2/auth`
+/// signing key from `NativeTokenConfig`. Construction is
+/// gated on `enabled=true`: when off, returns `None` so the
+/// challenge middleware emits the legacy Basic
+/// challenge and `/v2/auth` returns 404. When on, the config layer
+/// already guaranteed the active PEM is `Some(_)` via
+/// `OciTokenSigningKeyMissing`; here we PARSE it.
+fn build_oci_signing_key(
+    native_token_config: &NativeTokenConfig,
+) -> DomainResult<Option<Arc<hort_app::oci_token_signing::OciTokenSigningKey>>> {
+    if !native_token_config.enabled {
+        return Ok(None);
+    }
+    let active_pem = native_token_config
+        .oci_token_signing_key_pem
+        .as_deref()
+        .ok_or_else(|| {
+            hort_domain::error::DomainError::Invariant(
+                "HORT_NATIVE_TOKENS_ENABLED=true but no OCI signing key \
+                in NativeTokenConfig — config layer should have \
+                rejected this earlier (OciTokenSigningKeyMissing)"
+                    .into(),
+            )
+        })?;
+    let prev_pem = native_token_config
+        .oci_token_signing_key_prev_pem
+        .as_deref();
+    let key = hort_app::oci_token_signing::OciTokenSigningKey::from_pem(active_pem, prev_pem)
+        .map_err(|e| {
+            hort_domain::error::DomainError::Invariant(format!("OCI signing key parse failed: {e}"))
+        })?;
+    tracing::info!(
+        prev_configured = prev_pem.is_some(),
+        "OCI token signing key loaded"
+    );
+    Ok(Some(Arc::new(key)))
+}
+
+/// Auth wiring. (`BearerOnly` was once named `LocalOnly`; the
+/// rename followed the end-to-end deletion of the
+/// HTTP-Basic-against-local-admin-row identity path.) Three shapes:
+///
+///   1. `AuthContext::Enabled` — `HORT_AUTH_PROVIDER=oidc`. Full OIDC,
+///      optionally with native tokens too. Existing path; no
+///      behavioural change.
+///   2. `AuthContext::BearerOnly` — `HORT_AUTH_PROVIDER=disabled`
+///      with `HORT_NATIVE_TOKENS_ENABLED=true`. The native-token
+///      validator (`Bearer hort_<kind>_*`) is the inbound identity
+///      surface; the use case carries `idp = None`
+///      (`AuthenticateUseCase::new_local_only`); OIDC-shaped
+///      tokens fail cleanly. Native tokens are independent of
+///      OIDC (ADR 0012).
+///   3. `AuthContext::Disabled` — auth fully off, no OIDC, no
+///      native tokens. The runtime boot gate
+///      (`ensure_auth_enabled`) rejects this combination, so it
+///      is dead in production and only persists for test fixtures.
+#[allow(clippy::too_many_arguments)]
+async fn build_auth_context(
+    auth_enabled: bool,
+    idp: Option<Arc<dyn IdentityProvider>>,
+    permission_grant_repo: Arc<dyn PermissionGrantRepository>,
+    user_repo: Arc<dyn UserRepository>,
+    claim_mappings: Vec<ClaimMapping>,
+    event_publisher: Arc<EventStorePublisher>,
+    ephemeral_durable: Arc<dyn EphemeralStore>,
+    include_service_account_label: bool,
+    pat_validation_uc: Option<Arc<PatValidationUseCase>>,
+    cli_session_signer: Option<Arc<hort_app::cli_session_signing::CliSessionTokenSigner>>,
+    oidc_issuer_url: Option<String>,
+) -> DomainResult<AuthContext> {
+    if auth_enabled {
+        let idp = idp.ok_or_else(|| {
+            hort_domain::error::DomainError::Invariant(
+                "auth_enabled = true but no IdentityProvider was supplied".into(),
+            )
+        })?;
+        // The additive-claims evaluator (ADR 0012) is built from
+        // the flat grant set (`RbacEvaluator::new(grants)`); there is
+        // no role table to pre-index. Load every grant via the
+        // permission-grant port.
+        let grants = permission_grant_repo.list_all().await?;
+        // Wrap the initial snapshot in
+        // `ArcSwap`. The refresh task in `hort-server` swaps the
+        // pointer in-place as grants change; read sites
+        // dereference via `.load()` for lock-free access.
+        let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(grants)));
+        // Audit-event gate: every authentication
+        // failure produces a tamper-resistant
+        // `AuthenticationAttempted` event throttled to ≤ 1 append
+        // per 60s per `(client_ip_bucket, result)` tuple via the
+        // EphemeralStore. Successes stay in tracing only
+        // (audit-value-per-byte).
+        //
+        // Chain the optional PAT validator
+        // onto the same builder so a `Bearer hort_<kind>_<body>` token
+        // routes through the validator before the OIDC port. When
+        // `pat_validation_uc` is `None` (feature flag off), the
+        // `with_pat_validation` builder is skipped and the PAT
+        // routing in `authenticate_bearer` falls through to OIDC.
+        let mut authenticate_builder = AuthenticateUseCase::new(idp, user_repo, claim_mappings)
+            // Auth-event throttle writes to the
+            // `auth:event:` keyspace, registered as Durable.
+            .with_audit_events(event_publisher, ephemeral_durable.clone())
+            // Workspace-wide cardinality
+            // toggle. PAT-side
+            // `hort_service_account_authenticated_total` honours
+            // the same env var as the rotation gauge.
+            .with_include_service_account_label(include_service_account_label);
+        if let Some(uc) = pat_validation_uc {
+            authenticate_builder = authenticate_builder.with_pat_validation(uc);
+        }
+        // Wire the CliSession JWT verifier (ADR 0013) +
+        // its `jti` revocation denylist (the durable EphemeralStore).
+        // Wired iff the signing key exists (native tokens on), which the
+        // boot gate guarantees whenever token-exchange is on.
+        if let Some(signer) = cli_session_signer {
+            authenticate_builder =
+                authenticate_builder.with_cli_session_verification(signer, ephemeral_durable);
+        }
+        let authenticate = Arc::new(authenticate_builder);
+        Ok(AuthContext::Enabled {
+            authenticate,
+            rbac,
+            // Populate the
+            // issuer URL so `www_authenticate_for` can render
+            // `Bearer realm="<issuer>"` on 401s. Threaded in from
+            // `cfg.auth` at the caller; we do not re-read the config
+            // here (composition is the source of truth, not the
+            // env-var loader).
+            issuer_url: oidc_issuer_url,
+        })
+    } else {
+        // HORT_AUTH_PROVIDER=disabled. The
+        // password-identity path is gone end-to-end; the
+        // only inbound auth surface under `disabled` is the native-token
+        // bearer carrier (PAT / SA tokens). `serve::ensure_auth_enabled`
+        // rejects `disabled + native_tokens=false` before composition
+        // runs; this gate is a defense-in-depth backstop.
+        let native_tokens_wired = pat_validation_uc.is_some();
+        if native_tokens_wired {
+            // Build a fully-wired `AuthenticateUseCase` minus the OIDC
+            // IdP. Mirror the `Enabled` arm's audit /
+            // service-account-label / PAT-validator wiring so the
+            // local-only path has the same operational properties.
+            // Flat grant set; no role pre-index (ADR 0012).
+            let grants = permission_grant_repo.list_all().await?;
+            let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(grants)));
+            let mut authenticate_builder =
+                AuthenticateUseCase::new_local_only(user_repo, claim_mappings)
+                    .with_audit_events(event_publisher, ephemeral_durable.clone())
+                    .with_include_service_account_label(include_service_account_label);
+            if let Some(uc) = pat_validation_uc {
+                authenticate_builder = authenticate_builder.with_pat_validation(uc);
+            }
+            // CliSession JWT verifier on the
+            // BearerOnly path too. CliSession *minting* needs OIDC
+            // (`/exchange`), so this arm rarely sees a CliSession token;
+            // wiring it keeps the validate surface uniform and lets a
+            // CliSession JWT issued by an Enabled peer validate here if
+            // the deployment ever runs mixed.
+            if let Some(signer) = cli_session_signer {
+                authenticate_builder =
+                    authenticate_builder.with_cli_session_verification(signer, ephemeral_durable);
+            }
+            let authenticate = Arc::new(authenticate_builder);
+            tracing::info!(
+                native_tokens_wired,
+                "AuthContext::BearerOnly wired (HORT_AUTH_PROVIDER=disabled with native tokens)"
+            );
+            Ok(AuthContext::BearerOnly { authenticate, rbac })
+        } else {
+            tracing::warn!(
+                "AuthContext::Disabled — no OIDC, no native tokens; \
+                 the runtime boot gate (ensure_auth_enabled) should reject this \
+                 combination before requests can reach handlers"
+            );
+            Ok(AuthContext::Disabled)
+        }
+    }
+}
+
+/// Fallback-PAT-rotation reconciler's
+/// outbound k8s Secret writer. Opt-in via
+/// `HORT_K8S_SECRET_WRITER_ENABLED=true` (default off — matches the
+/// Helm chart's `worker.rotation.enabled: false` default). When
+/// the env var is set but in-cluster auth (or kubeconfig fallback)
+/// fails, we surface a loud boot error rather than silently
+/// degrading to a `None` slot — operators want the failure to be
+/// visible, since a `None` slot means the rotation handler
+/// refuses to register and the fallback PATs go
+/// stale.
+async fn build_k8s_secret_writer() -> DomainResult<
+    Option<Arc<dyn hort_domain::ports::kubernetes_secret_writer::KubernetesSecretWriter>>,
+> {
+    let enabled = std::env::var("HORT_K8S_SECRET_WRITER_ENABLED")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(None);
+    }
+    match hort_adapters_kubernetes::KubernetesSecretWriterImpl::try_in_cluster().await {
+        Ok(impl_) => {
+            tracing::info!(
+                "k8s Secret writer wired — \
+                 ServiceAccountRotationHandler may register"
+            );
+            Ok(Some(Arc::new(impl_)
+                as Arc<
+                    dyn hort_domain::ports::kubernetes_secret_writer::KubernetesSecretWriter,
+                >))
+        }
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "HORT_K8S_SECRET_WRITER_ENABLED=true but kube::Client::try_default() \
+                 failed — refusing to boot (set the env var to false to disable, \
+                 or ensure the in-cluster ServiceAccount token / kubeconfig is mounted)"
+            );
+            Err(hort_domain::error::DomainError::Invariant(format!(
+                "kubernetes client construction failed: {err}"
+            )))
+        }
+    }
+}
+
+/// Resolve the live `Arc<ArcSwap<RbacEvaluator>>` snapshot for a given
+/// `AuthContext` — `Disabled` gets a fresh empty-grants evaluator
+/// (production never runs auth-disabled; this only matters for dev /
+/// bootstrap), `Enabled` and `BearerOnly` share the SAME pointer the
+/// per-request authorize path uses, so a use case built from this
+/// tracks the live-refresh task in real time. Shared by every use case
+/// below that needs its own `ArcSwap<RbacEvaluator>` handle.
+fn rbac_swap_from_auth(auth: &AuthContext) -> Arc<ArcSwap<RbacEvaluator>> {
+    match auth {
+        AuthContext::Disabled => Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(Vec::new()))),
+        AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => rbac.clone(),
+    }
+}
+
+/// `RbacAccess` view of a given `AuthContext` — mirrors
+/// [`rbac_swap_from_auth`] but wraps the result in the `RbacAccess`
+/// shape `RepositoryAccessUseCase` (and its dependents) consume.
+/// `RbacAccess` is kept distinct from `AuthContext` because `hort-app`
+/// cannot depend on `hort-http-core`.
+fn rbac_access_from_auth(auth: &AuthContext) -> RbacAccess {
+    match auth {
+        AuthContext::Disabled => RbacAccess::Disabled,
+        AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => {
+            RbacAccess::Enabled(rbac.clone())
+        }
+    }
+}
+
+/// `ApiTokenUseCase` construction with its two optional builder
+/// attachments (replay guard, CliSession signing). Pulled out of
+/// `build_app_context` so the two independent `Option` gates don't add
+/// to the composition root's own branching.
+#[allow(clippy::too_many_arguments)]
+fn build_api_token_use_case(
+    api_token_repo: Arc<dyn ApiTokenRepository>,
+    user_repo: Arc<dyn UserRepository>,
+    event_publisher: Arc<EventStorePublisher>,
+    api_token_rbac: Arc<ArcSwap<RbacEvaluator>>,
+    issuance_config: hort_app::use_cases::api_token_use_case::ApiTokenIssuanceConfig,
+    replay_guard: Option<Arc<dyn hort_domain::ports::replay_guard::ReplayGuardPort>>,
+    cli_session_signer: Option<Arc<hort_app::cli_session_signing::CliSessionTokenSigner>>,
+    ephemeral_durable: Arc<dyn EphemeralStore>,
+) -> Arc<hort_app::use_cases::api_token_use_case::ApiTokenUseCase> {
+    let uc = hort_app::use_cases::api_token_use_case::ApiTokenUseCase::new(
+        api_token_repo,
+        user_repo,
+        event_publisher,
+        api_token_rbac,
+        issuance_config,
+    );
+    // Attach the durable
+    // replay guard iff federation is enabled. The federation
+    // system-mint path then always has a `Some` guard; a `None`
+    // guard reached on that path (composition bug) fails CLOSED.
+    let uc = match replay_guard {
+        Some(g) => uc.with_replay_guard(g),
+        None => uc,
+    };
+    // Attach the CliSession JWT signer (ADR 0013) +
+    // its revocation denylist so `issue_cli_session` mints a signed
+    // JWT (carrying the caller's resolved claims) instead of an
+    // opaque `hort_cli_*` row. The signer + denylist ship together
+    // (the denylist is the server-side immediate-revocation layer
+    // the signed JWT otherwise lacks).
+    let uc = match cli_session_signer {
+        Some(signer) => uc.with_cli_session_signing(signer, ephemeral_durable),
+        None => uc,
+    };
+    Arc::new(uc)
+}
+
+/// OCI Distribution-Spec `/v2/auth` token
+/// exchange. Built after the access use case (which the exchange
+/// calls into to resolve scoped repo names → ids) and the rbac
+/// ArcSwap (extracted out of the auth context for the use case to
+/// call `authorize` directly). `Some(_)` only when both
+/// `enable_native_tokens` AND a signing key landed AND auth is
+/// `Enabled`; any side missing collapses to `None` and the route
+/// handler 404s.
+fn build_oci_token_exchange_use_case(
+    pat_validation_uc: &Option<Arc<PatValidationUseCase>>,
+    oci_signing_key: &Option<Arc<hort_app::oci_token_signing::OciTokenSigningKey>>,
+    rbac_access: &RbacAccess,
+    user_repo: Arc<dyn UserRepository>,
+    repository_access_use_case: Arc<RepositoryAccessUseCase>,
+    public_base_url: Option<&url::Url>,
+) -> DomainResult<
+    Option<Arc<hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase>>,
+> {
+    match (pat_validation_uc, oci_signing_key, rbac_access) {
+        (Some(pat_uc), Some(sk), RbacAccess::Enabled(rbac_swap)) => {
+            // Derive `(issuer, audience)` from
+            // `HORT_PUBLIC_BASE_URL`. The helper boot-fails when the URL
+            // is unset or has no host component; silent fallbacks
+            // (`localhost` aud + relative `/v2/auth` iss) would issue JWTs
+            // that real OCI clients can't consume.
+            let (issuer, host_str) = derive_oci_token_endpoint_strings(public_base_url)
+                .map_err(|e| hort_domain::error::DomainError::Invariant(e.to_string()))?;
+            let cfg = hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeConfig::new(
+                issuer, host_str,
+            );
+            Ok(Some(Arc::new(
+                hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase::new(
+                    pat_uc.clone(),
+                    user_repo,
+                    rbac_swap.clone(),
+                    repository_access_use_case,
+                    sk.clone(),
+                    cfg,
+                ),
+            )))
+        }
+        // Auth Disabled is incompatible with `/v2/auth` (no rbac to
+        // intersect against); leave the slot empty.
+        _ => Ok(None),
+    }
+}
+
+/// Boot-time unsafe-config gauges for the two
+/// webhook-safety operator opt-ins. Both default
+/// OFF; flipping either flag sets the corresponding gauge to `1.0`
+/// so SREs see the misconfig on every dashboard. Mirrors the
+/// `emit_pat_over_http_signal` precedent — emit `0.0` on
+/// the safe path so a fresh scrape sees the metric anyway
+/// (absence vs `0.0` would be ambiguous to dashboards).
+fn emit_webhook_unsafe_config_gauges(notify_config: &NotifyConfig) {
+    if notify_config.allow_plaintext_webhooks {
+        tracing::warn!(
+            "HORT_WEBHOOK_ALLOW_PLAINTEXT active — webhook URLs may use http:// scheme; \
+             use only on a trusted internal network"
+        );
+        metrics::gauge!("hort_unsafe_config_active", "kind" => "plaintext_webhooks").set(1.0);
+    } else {
+        metrics::gauge!("hort_unsafe_config_active", "kind" => "plaintext_webhooks").set(0.0);
+    }
+    if notify_config.allow_nonroutable_webhook_targets {
+        tracing::warn!(
+            "HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS active — webhook target SSRF check skipped; \
+             use only with operator-trusted internal receivers"
+        );
+        metrics::gauge!(
+            "hort_unsafe_config_active",
+            "kind" => "webhook_nonroutable_targets"
+        )
+        .set(1.0);
+    } else {
+        metrics::gauge!(
+            "hort_unsafe_config_active",
+            "kind" => "webhook_nonroutable_targets"
+        )
+        .set(0.0);
+    }
+}
+
+/// Assemble the `NotificationDispatcher`
+/// when `enable_notifications=true`. The dispatcher itself is NOT
+/// spawned here (composition does not own the cancellation token —
+/// `cli::serve` does); instead we package the dispatcher + the
+/// `subscription_changes` LISTEN task's `JoinHandle` into
+/// `NotificationRuntime` and `cli::serve` calls `dispatcher.run(
+/// shutdown_handle.token())`. This mirrors the
+/// `api_token_revocation` listener pattern, where composition
+/// returns the `JoinHandle` for the serve loop to hold.
+///
+/// When `enable_notifications=false`, the publisher was constructed
+/// without a broadcast sender; spawning the dispatcher in that
+/// branch would yield a task with a closed receiver doing no useful
+/// work. We skip it entirely so the no-notifications shape stays
+/// zero-overhead.
+#[allow(clippy::too_many_arguments)]
+async fn build_notification_runtime(
+    notify_config: &NotifyConfig,
+    extra_trust_anchors: Option<&ExtraTrustAnchors>,
+    db: PgPool,
+    event_publisher: Arc<EventStorePublisher>,
+    subscription_use_case: Arc<SubscriptionUseCase>,
+    subscription_rbac: Arc<ArcSwap<RbacEvaluator>>,
+    user_repo: Arc<dyn UserRepository>,
+    subscription_repo: Arc<dyn hort_domain::ports::subscription_repository::SubscriptionRepository>,
+    repo_repo: Arc<dyn hort_domain::ports::repository_repository::RepositoryRepository>,
+    webhook_notifier: Arc<hort_notifier_webhook::WebhookNotifier>,
+) -> Option<NotificationRuntime> {
+    if !notify_config.enabled {
+        return None;
+    }
+    // Notifier registry: webhook always, NATS optional.
+    let mut notifiers: Vec<Arc<dyn hort_domain::ports::event_notifier::EventNotifier>> =
+        Vec::with_capacity(2);
+    notifiers.push(webhook_notifier);
+
+    if let Some(nats_url) = notify_config.nats_url.as_deref() {
+        // Thread the process-wide
+        // `HORT_EXTRA_CA_BUNDLE` into the NATS TLS leg the same way
+        // every other TLS surface (upstream-http/webhook/S3/OIDC)
+        // already receives it (ADR 0010). `None` keeps the plain-
+        // connect behaviour byte-for-byte.
+        match hort_notifier_nats::NatsNotifier::connect(nats_url, extra_trust_anchors).await {
+            Ok(nats) => {
+                tracing::info!("NATS JetStream notifier wired");
+                notifiers.push(Arc::new(nats));
+            }
+            Err(e) => {
+                // Continue without NATS — webhook-only deployments still
+                // work; subscriptions targeting NATS will fail delivery
+                // until the URL is reachable, but that is a per-
+                // subscription failure not a global boot failure.
+                tracing::error!(
+                    error = %e,
+                    "failed to connect to NATS at HORT_NATS_URL; notifications to NATS \
+                     targets will fail until reachable"
+                );
+            }
+        }
+    }
+
+    // Spawn the `subscription_changes` LISTEN task. Returns the
+    // listener handle (consumed by the dispatcher) and the task's
+    // JoinHandle (held for shutdown).
+    let (change_listener, change_listener_handle) =
+        hort_adapters_postgres::subscription_change_listener::spawn_subscription_change_listener(
+            db,
+            hort_adapters_postgres::subscription_change_listener::SUBSCRIPTION_CHANGES_CHANNEL
+                .to_string(),
+        );
+
+    let dispatcher = hort_app::dispatcher::dispatcher::NotificationDispatcher::new(
+        event_publisher,
+        subscription_use_case,
+        subscription_rbac,
+        user_repo,
+        subscription_repo,
+        repo_repo,
+        change_listener,
+        notifiers,
+    );
+
+    Some(NotificationRuntime {
+        dispatcher,
+        change_listener_handle,
+    })
+}
+
+/// Trust-config mode label for the startup log
+/// line. Operators need the MODE for dashboards — NOT the CIDR values
+/// (those are operator secrets / internal-net topology).
+fn trust_mode_label(trust_config: &hort_http_core::middleware::trust::TrustConfig) -> &'static str {
+    match (
+        trust_config.public_base_url.is_some(),
+        !trust_config.trusted_proxy_cidrs.is_empty(),
+    ) {
+        (true, false) => "public_url_pinned",
+        (false, true) => "trusted_proxy_forwarding",
+        (true, true) => "BOTH",
+        // Unreachable — `hort-server::config::Config` rejects this combo
+        // at startup. Defensive fallback keeps the log structured.
+        (false, false) => "UNSET",
+    }
+}
+
+/// Per-class startup log lines so
+/// operators can see, at boot, which backend each ephemeral-store class
+/// is wired to. For Redis, a short `url_hash` (SHA-256 prefix of the
+/// URL) lets operators correlate "two log lines, same `url_hash`" →
+/// single-Redis topology, without leaking credentials. The Memory
+/// arm omits the URL hash (no URL).
+fn log_ephemeral_store_wired(backend_label: &str, url_hashes: Option<&(String, String)>) {
+    match url_hashes {
+        Some((evictable_hash, durable_hash)) => {
+            tracing::info!(
+                class = "evictable",
+                backend = backend_label,
+                url_hash = evictable_hash,
+                "ephemeral_store wired"
+            );
+            tracing::info!(
+                class = "durable",
+                backend = backend_label,
+                url_hash = durable_hash,
+                "ephemeral_store wired"
+            );
+        }
+        None => {
+            tracing::info!(
+                class = "evictable",
+                backend = backend_label,
+                "ephemeral_store wired"
+            );
+            tracing::info!(
+                class = "durable",
+                backend = backend_label,
+                "ephemeral_store wired"
+            );
+        }
+    }
+}
+
 /// Wire all adapters and use cases together.
 ///
 /// Async and fallible because `PgEventStore::new()` verifies the
@@ -1156,39 +2007,9 @@ pub async fn build_app_context(
     // for the admin apply-status endpoint (ADR 0058).
     gitops_apply_status: Option<GitopsApplyStatus>,
 ) -> DomainResult<BuildAppContextOutput> {
-    // Wrap the event store in an
-    // `EventStorePublisher`. The publisher impls `EventStore`, so use
-    // cases keep their `Arc<EventStorePublisher>` field shape, and the
-    // call sites (`self.events.append(...)`, `self.events.read_*(...)`)
-    // continue to resolve through the same trait dispatch. The
-    // Pg-specific lifecycle adapters
-    // (`PgRefLifecycle`, `PgArtifactLifecycle`,
-    // `PgArtifactGroupLifecycle`) still hold the concrete
-    // `Arc<PgEventStore>` directly because they need the
-    // `begin_unit_of_work` Postgres-specific surface that does NOT
-    // live on the `EventStore` port. Lifecycle appends therefore do
-    // NOT broadcast (intentional — the dispatcher subscribes once per
-    // process and the broadcast hook exists at the per-use-case
-    // `EventStore::append` boundary;
-    // lifecycle ports own their own transactional append paths and
-    // surface persisted events back to callers via `AppendResult` which
-    // the use cases re-emit through the publisher when they need
-    // notification fan-out — see the design rationale in
-    // `docs/architecture/explanation/event-notifications.md`).
-    let event_publisher: Arc<EventStorePublisher> = if notify_config.enabled {
-        let (sender, _initial_receiver) =
-            tokio::sync::broadcast::channel(notify_config.channel_capacity as usize);
-        // The initial receiver is dropped immediately — the
-        // dispatcher creates its own subscription via
-        // `publisher.subscribe()` at task spawn time. Without dropping
-        // the initial receiver here, the broadcast channel would never
-        // signal SendError(no_receivers) and the publisher's silent-drop
-        // contract would be untestable in a single-thread harness.
-        drop(_initial_receiver);
-        Arc::new(EventStorePublisher::new(event_store.clone(), sender))
-    } else {
-        Arc::new(EventStorePublisher::without_broadcast(event_store.clone()))
-    };
+    // See `build_event_publisher` for the publisher/lifecycle-adapter
+    // split rationale (why lifecycle appends do NOT broadcast).
+    let event_publisher = build_event_publisher(&event_store, &notify_config);
 
     let repo_repo = Arc::new(PgRepositoryRepository::new(db.clone()));
     let artifact_repo = Arc::new(PgArtifactRepository::new(db.clone(), event_store.clone()));
@@ -1219,72 +2040,16 @@ pub async fn build_app_context(
     // Format-agnostic stateful-upload staging
     // (filesystem). Upload session state lives in the EphemeralStore
     // below; only the chunk payloads land on
-    // the filesystem under `stateful_upload_staging_dir`.
-    //
-    // Binary fail-loud gate. "Wired unconditionally; an unhealthy
-    // adapter does NOT block startup — handlers surface misconfiguration
-    // as request-time errors" is the
-    // *silent-degradation* anti-pattern: under the chart's S3
-    // defaults + `readOnlyRootFilesystem: true`, a staging root on
-    // the read-only rootfs would only `warn!` in `new()` while every
-    // `append()` "retried" forever — OCI `docker push` / Git LFS
-    // non-functional with NO readiness signal. The chart sets a
-    // writable staging dir;
-    // the binary additionally fails LOUD so the *next* such gap (any
-    // deployment whose staging root is non-writable) is a fatal boot
-    // condition (the pod never enters the Service), not a silent 5xx.
-    //
-    // Mechanism mirrors the `KubernetesSecretWriterImpl::try_in_cluster()`
-    // fatal-boot precedent below: construct the
-    // concrete adapter, run an inherent fail-loud probe, `error!` once +
-    // `return Err` on failure. `verify_writable_and_ownable()` is an
-    // *inherent* method on the concrete adapter, NOT a
-    // `StatefulUploadStagingPort` trait method — the port signature is
-    // unchanged. The per-`append()`
-    // `warn!` in the adapter stays as transient-case defense-in-depth
-    // (a root that goes bad *after* a healthy boot); this gate is the
-    // boot-time fail-loud addition.
-    //
-    // Capability-gated: the gate is active iff a stateful-upload-
-    // capable format/route is enabled. In the `hort-server` binary the
-    // OCI Distribution router (`hort_http_oci::oci_routes_with_config`,
-    // the canonical StatefulUpload capability — OCI chunked blob upload
-    // + Git LFS) is merged UNCONDITIONALLY in `http::build_router_with_oci_config`;
-    // there is no format/OCI disable knob (OCI/Git LFS are Tier C
-    // compiled-in adapters, always present). So this boolean is a
-    // structural constant `true` for this binary — the gate is always
-    // active here. The named seam is kept (not hardcoded inline) so a
-    // future format-disable knob can make this honestly conditional
-    // without re-deriving the reasoning; today there is no
-    // deployment where stateful upload is unreachable, so failing the
-    // gate on an unusable root never penalises a deployment that would
-    // never use it.
-    const STATEFUL_UPLOAD_FORMATS_ENABLED: bool = true;
+    // the filesystem under `stateful_upload_staging_dir`. See
+    // `verify_stateful_upload_staging_or_fail` for the boot-time
+    // fail-loud gate rationale.
     let stateful_upload_staging_adapter =
         FilesystemStatefulUploadStaging::new(stateful_upload_staging_dir.clone());
-    if STATEFUL_UPLOAD_FORMATS_ENABLED {
-        if let Err(err) = stateful_upload_staging_adapter
-            .verify_writable_and_ownable()
-            .await
-        {
-            // Logged ONCE here at the gate (not per-`append()`), with
-            // the staging root + the io-error kind carried in `err`'s
-            // message. Deliberately NO session id / UUID anywhere —
-            // session-id enumeration is an information leak,
-            // and a cardinality hazard.
-            tracing::error!(
-                staging_root = %stateful_upload_staging_dir.display(),
-                error = %err,
-                "stateful-upload staging root is not writable/ownable — \
-                 refusing to boot. Chunked upload (OCI `docker push`, \
-                 Git LFS) would be silently non-functional. Point \
-                 HORT_STATEFUL_UPLOAD_STAGING_DIR at a writable, \
-                 owner-restrictable path (the Helm chart sets this to a \
-                 writable emptyDir subdir)"
-            );
-            return Err(err);
-        }
-    }
+    verify_stateful_upload_staging_or_fail(
+        &stateful_upload_staging_adapter,
+        &stateful_upload_staging_dir,
+    )
+    .await?;
     let stateful_upload_staging: Arc<dyn StatefulUploadStagingPort> =
         Arc::new(stateful_upload_staging_adapter);
 
@@ -1375,24 +2140,8 @@ pub async fn build_app_context(
     // vars or mounted files. See docs/architecture/how-to/wire-secrets.md
     // for operator examples.
     //
-    // Optional containment root.
-    // When `HORT_SECRETS_FILE_ROOT` is set, the file adapter rejects any
-    // secret_ref whose canonical path falls outside the root —
-    // symlink-escape protection. Unset → legacy unconstrained
-    // behaviour. The env var is read here at the composition root so
-    // the rest of the binary stays generic over `SecretPort`.
-    let secrets_file_root: Option<std::path::PathBuf> =
-        match std::env::var("HORT_SECRETS_FILE_ROOT") {
-            Ok(s) if !s.is_empty() => Some(std::path::PathBuf::from(s)),
-            _ => None,
-        };
-    if let Some(root) = secrets_file_root.as_ref() {
-        tracing::info!(
-            secrets_file_root = %root.display(),
-            "HORT_SECRETS_FILE_ROOT configured — mounted-file adapter will enforce \
-             containment (paths whose canonical form escapes this root will be rejected)",
-        );
-    }
+    // Optional containment root — see `resolve_secrets_file_root`.
+    let secrets_file_root = resolve_secrets_file_root();
     let secret_port: Arc<dyn SecretPort> = Arc::new(hort_adapters_secrets::DispatchSecretPort {
         env: Arc::new(hort_adapters_secrets::EnvVarSecretAdapter),
         file: Arc::new(
@@ -1604,54 +2353,21 @@ pub async fn build_app_context(
     let url_resolver = hort_http_core::url_resolver::UrlResolver;
 
     // PAT cache + validator + listener
-    // wiring. Built BEFORE the auth context so the
-    // `AuthenticateUseCase` builder can carry the `Arc<PatValidationUseCase>`
-    // without a downstream re-bind. All three artefacts (cache,
-    // validator, listener) are gated on `native_token_config.enabled`
-    // — when off, none of them are constructed, the auth middleware's
-    // PAT branch is a no-op, and `AppContext.pat_cache = None`.
-    let (pat_cache, pat_validation_uc, pat_listener_handle) = if native_token_config.enabled {
-        let cache = Arc::new(PatCache::new(
-            native_token_config.cache_size,
-            std::time::Duration::from_secs(300),
-        ));
-        let pat_lockout = PatLockoutConfig {
-            threshold: native_token_config.lockout_threshold,
-            window: std::time::Duration::from_secs(native_token_config.lockout_window_secs),
-            duration: std::time::Duration::from_secs(native_token_config.lockout_duration_secs),
-        };
-        let validator = Arc::new(
-            PatValidationUseCase::new(
-                api_token_repo.clone(),
-                user_repo.clone(),
-                // PAT brute-force lockout writes to
-                // the `pat-attempt:` / `pat-attempt-counter:`
-                // keyspaces, both registered as Durable in
-                // `KEYSPACE_REGISTRY`. The token-use audit
-                // throttle (`token_use:audit:throttle:`) reuses this
-                // same Durable handle (no second store handle).
-                ephemeral_durable.clone(),
-                cache.clone(),
-                Arc::new(SystemClock),
-                pat_lockout,
-            )
-            // Throttled per-use
-            // token-use audit emit. Same `Arc<EventStorePublisher>`
-            // wired onto `ArtifactUseCase::with_audit_events`.
-            .with_audit_events(event_publisher.clone()),
-        );
-        let invalidator: Arc<dyn ApiTokenCacheInvalidator> = cache.clone();
-        let listener =
-            hort_adapters_postgres::api_token_revocation_listener::spawn_revocation_listener(
-                db.clone(),
-                invalidator,
-                hort_adapters_postgres::api_token_revocation_listener::REVOCATION_CHANNEL
-                    .to_string(),
-            );
-        (Some(cache), Some(validator), Some(listener))
-    } else {
-        (None, None, None)
-    };
+    // wiring — see `build_pat_wiring`. Built BEFORE the auth context so
+    // the `AuthenticateUseCase` builder can carry the
+    // `Arc<PatValidationUseCase>` without a downstream re-bind.
+    let PatWiring {
+        cache: pat_cache,
+        validation_use_case: pat_validation_uc,
+        revocation_listener: pat_listener_handle,
+    } = build_pat_wiring(
+        &native_token_config,
+        api_token_repo.clone(),
+        user_repo.clone(),
+        ephemeral_durable.clone(),
+        event_publisher.clone(),
+        db.clone(),
+    );
 
     // Boot-time warn + unsafe-config gauge
     // for the PAT-over-HTTP override. Factored into
@@ -1676,186 +2392,19 @@ pub async fn build_app_context(
         .unwrap_or(false);
     evaluate_test_clock_guard(test_clock_enabled, cfg!(feature = "test-clock"))?;
 
-    // Boot-time staging-sweep liveness
-    // signal. `staging-sweep` runs as a worker CronJob that is
-    // `cronJobs.enabled:false` by default; a deployment that upgrades
-    // without enabling it (or runs non-k8s) gets no sweep and
-    // accumulates orphaned staging entries unbounded with nothing
-    // alerting. We query the newest completed `staging-sweep` row, run
-    // the pure liveness predicate, and emit the
-    // `hort_staging_sweep_overdue` gauge + a `warn!` when overdue. This is
-    // a single boot-time emit (NOT a periodic loop — a loop would be
-    // an in-process scheduler, which `hort-server` deliberately has
-    // none of — ADR 0028); Prometheus alarms on
-    // the scraped gauge, mirroring the other boot signals. The two knobs are
-    // parsed here (owns its own opt-in surface, like the test-clock
-    // guard above): expected CronJob cadence (default 300 s — matches the
-    // documented `staging-sweep` schedule) and a staleness multiplier
-    // (default 3 — tolerates two missed ticks before alarming so a
-    // single skipped fire does not page). A query failure is logged
-    // and treated as "unknown" (gauge left unset, debug log) — it must
-    // not block an otherwise-serviceable boot.
-    let staging_sweep_expected_interval = std::time::Duration::from_secs(
-        std::env::var("HORT_STAGING_SWEEP_EXPECTED_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(300),
-    );
-    let staging_sweep_staleness_multiplier =
-        std::env::var("HORT_STAGING_SWEEP_STALENESS_MULTIPLIER")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3);
-    use hort_domain::ports::jobs_repository::JobsRepository as _;
-    match jobs_repo.last_completed_at_by_kind("staging-sweep").await {
-        Ok(last_completed_at) => {
-            emit_staging_sweep_liveness_signal(
-                last_completed_at,
-                chrono::Utc::now(),
-                staging_sweep_expected_interval,
-                staging_sweep_staleness_multiplier,
-            );
-        }
-        Err(e) => {
-            // The boot path stays serviceable even if this read fails —
-            // the signal is observability, not a fail-closed control.
-            tracing::debug!(
-                error = %e,
-                "staging-sweep liveness check skipped — last-completed query failed; \
-                 hort_staging_sweep_overdue not emitted this boot"
-            );
-        }
-    }
-
-    // Boot-time event-chain-verifier
-    // liveness signal. The verifier (`hort-server verify-event-chain`)
-    // ships CLI-only and is scheduled by the default-disabled
-    // `cronJobs.verifyEventChain` CronJob; a deployment that never enabled
-    // it (or enabled it and it then stopped) gets no audit-log tamper
-    // detection and, without this signal, nothing would flag it. We query
-    // the
-    // newest completed `verify-event-chain` row (written by the CLI's
-    // `record_run_completion`), run the pure liveness predicate, and emit
-    // the `hort_event_chain_verify_overdue` gauge + a `warn!` when overdue.
-    // Single boot-time emit (NOT a periodic loop — `hort-server` is
-    // scheduler-free, ADR 0028); Prometheus alarms on the scraped gauge,
-    // mirroring the staging-sweep signal above. The two knobs are parsed
-    // here (owns its own opt-in surface): expected CronJob cadence
-    // (default 86400 s = daily — matches the `cronJobs.verifyEventChain`
-    // default schedule) and a staleness multiplier (default 3 — tolerates
-    // two missed ticks before alarming). A query failure is logged and
-    // treated as "unknown" (gauge left unset, debug log) — it must not
-    // block an otherwise-serviceable boot.
-    let event_chain_verify_expected_interval = std::time::Duration::from_secs(
-        std::env::var("HORT_EVENT_CHAIN_VERIFY_EXPECTED_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(86_400),
-    );
-    let event_chain_verify_staleness_multiplier =
-        std::env::var("HORT_EVENT_CHAIN_VERIFY_STALENESS_MULTIPLIER")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3);
-    match jobs_repo
-        .last_completed_at_by_kind("verify-event-chain")
-        .await
-    {
-        Ok(last_completed_at) => {
-            emit_event_chain_verify_liveness_signal(
-                last_completed_at,
-                chrono::Utc::now(),
-                event_chain_verify_expected_interval,
-                event_chain_verify_staleness_multiplier,
-            );
-        }
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                "event-chain verify liveness check skipped — last-completed query failed; \
-                 hort_event_chain_verify_overdue not emitted this boot"
-            );
-        }
-    }
-
-    // Boot-time quarantine-posture log. Reports
-    // the resolved `DefaultPolicy` quarantine window (the
-    // out-of-the-box hold — ADR 0007), the count of operator `ScanPolicy`
-    // rows
-    // overriding to permissive (`quarantineDuration=0`, the explicit
-    // operator override — `warn!` when `> 0` so dashboards can surface
-    // it alongside the quarantine-by-default posture), and the count of
-    // `RepositoryUpstreamMapping` rows with
-    // `trust_upstream_publish_time = true` (a
-    // purely informational `info!`-level "how many operators opted in"
-    // signal). Counts are derived in memory from existing `list_active`
-    // / `list_all` port reads — no new port method, no new metric
-    // (the startup log is the entire observability surface
-    // here). A query failure is logged and treated as "unknown"
-    // (posture log skipped — same pattern as the staging-sweep liveness
-    // check above); it must not block an otherwise-serviceable boot.
-    match policy_projections.list_active().await {
-        Ok(scan_policies) => match repository_upstream_mappings.list_all().await {
-            Ok(upstream_mappings) => {
-                evaluate_quarantine_posture(&scan_policies, &upstream_mappings);
-            }
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    "quarantine posture log skipped — list_all() on \
-                     repository_upstream_mappings failed; posture not emitted this boot"
-                );
-            }
-        },
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                "quarantine posture log skipped — list_active() on policy_projections \
-                 failed; posture not emitted this boot"
-            );
-        }
-    }
+    // Boot-time liveness + posture signals — see
+    // `run_staging_sweep_liveness_check`, `run_event_chain_verify_liveness_check`,
+    // and `run_quarantine_posture_log` for the rationale behind each.
+    // None of these block boot: a query failure degrades to a debug
+    // log, not a startup error.
+    run_staging_sweep_liveness_check(&jobs_repo).await;
+    run_event_chain_verify_liveness_check(&jobs_repo).await;
+    run_quarantine_posture_log(&policy_projections, &repository_upstream_mappings).await;
 
     // Load the OCI Distribution-Spec `/v2/auth`
-    // signing key + previous public half (rotation). Construction is
-    // gated on `enable_native_tokens=true`: when off, we leave the
-    // slots `None` so the challenge middleware emits the legacy Basic
-    // challenge and `/v2/auth` returns 404. When on, the config layer
-    // already guaranteed the active PEM is `Some(_)` via
-    // `OciTokenSigningKeyMissing`; here we PARSE it.
-    let oci_signing_key: Option<Arc<hort_app::oci_token_signing::OciTokenSigningKey>> =
-        if native_token_config.enabled {
-            let active_pem = native_token_config
-                .oci_token_signing_key_pem
-                .as_deref()
-                .ok_or_else(|| {
-                    hort_domain::error::DomainError::Invariant(
-                        "HORT_NATIVE_TOKENS_ENABLED=true but no OCI signing key \
-                        in NativeTokenConfig — config layer should have \
-                        rejected this earlier (OciTokenSigningKeyMissing)"
-                            .into(),
-                    )
-                })?;
-            let prev_pem = native_token_config
-                .oci_token_signing_key_prev_pem
-                .as_deref();
-            let key =
-                hort_app::oci_token_signing::OciTokenSigningKey::from_pem(active_pem, prev_pem)
-                    .map_err(|e| {
-                        hort_domain::error::DomainError::Invariant(format!(
-                            "OCI signing key parse failed: {e}"
-                        ))
-                    })?;
-            tracing::info!(
-                prev_configured = prev_pem.is_some(),
-                "OCI token signing key loaded"
-            );
-            Some(Arc::new(key))
-        } else {
-            None
-        };
+    // signing key + previous public half (rotation) — see
+    // `build_oci_signing_key`.
+    let oci_signing_key = build_oci_signing_key(&native_token_config)?;
 
     // CliSession access-token JWT signer (ADR 0013).
     //
@@ -1883,134 +2432,22 @@ pub async fn build_app_context(
             ))
         });
 
-    // Auth wiring. (`BearerOnly` was once named `LocalOnly`; the
-    // rename followed the end-to-end deletion of the
-    // HTTP-Basic-against-local-admin-row identity path.) Three shapes:
-    //
-    //   1. `AuthContext::Enabled` — `HORT_AUTH_PROVIDER=oidc`. Full OIDC
-    //      + optional native tokens. Existing path; no behavioural
-    //      change.
-    //   2. `AuthContext::BearerOnly` — `HORT_AUTH_PROVIDER=disabled`
-    //      with `HORT_NATIVE_TOKENS_ENABLED=true`. The native-token
-    //      validator (`Bearer hort_<kind>_*`) is the inbound identity
-    //      surface; the use case carries `idp = None`
-    //      (`AuthenticateUseCase::new_local_only`); OIDC-shaped
-    //      tokens fail cleanly. Native tokens are independent of
-    //      OIDC (ADR 0012).
-    //   3. `AuthContext::Disabled` — auth fully off, no OIDC, no
-    //      native tokens. The runtime boot gate
-    //      (`ensure_auth_enabled`) rejects this combination, so it
-    //      is dead in production and only persists for test fixtures.
-    let auth = if auth_enabled {
-        let idp = idp.ok_or_else(|| {
-            hort_domain::error::DomainError::Invariant(
-                "auth_enabled = true but no IdentityProvider was supplied".into(),
-            )
-        })?;
-        // The additive-claims evaluator (ADR 0012) is built from
-        // the flat grant set (`RbacEvaluator::new(grants)`); there is
-        // no role table to pre-index. Load every grant via the
-        // permission-grant port.
-        let grants = permission_grant_repo.list_all().await?;
-        // Wrap the initial snapshot in
-        // `ArcSwap`. The refresh task in `hort-server` swaps the
-        // pointer in-place as grants change; read sites
-        // dereference via `.load()` for lock-free access.
-        let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(grants)));
-        // Audit-event gate: every authentication
-        // failure produces a tamper-resistant
-        // `AuthenticationAttempted` event throttled to ≤ 1 append
-        // per 60s per `(client_ip_bucket, result)` tuple via the
-        // EphemeralStore. Successes stay in tracing only
-        // (audit-value-per-byte).
-        //
-        // Chain the optional PAT validator
-        // onto the same builder so a `Bearer hort_<kind>_<body>` token
-        // routes through the validator before the OIDC port. When
-        // `pat_validation_uc` is `None` (feature flag off), the
-        // `with_pat_validation` builder is skipped and the PAT
-        // routing in `authenticate_bearer` falls through to OIDC.
-        let mut authenticate_builder =
-            AuthenticateUseCase::new(idp, user_repo.clone(), claim_mappings)
-                // Auth-event throttle writes to the
-                // `auth:event:` keyspace, registered as Durable.
-                .with_audit_events(event_publisher.clone(), ephemeral_durable.clone())
-                // Workspace-wide cardinality
-                // toggle. PAT-side
-                // `hort_service_account_authenticated_total` honours
-                // the same env var as the rotation gauge.
-                .with_include_service_account_label(include_service_account_label);
-        if let Some(uc) = pat_validation_uc.clone() {
-            authenticate_builder = authenticate_builder.with_pat_validation(uc);
-        }
-        // Wire the CliSession JWT verifier (ADR 0013) +
-        // its `jti` revocation denylist (the durable EphemeralStore).
-        // Wired iff the signing key exists (native tokens on), which the
-        // boot gate guarantees whenever token-exchange is on.
-        if let Some(signer) = cli_session_signer.clone() {
-            authenticate_builder = authenticate_builder
-                .with_cli_session_verification(signer, ephemeral_durable.clone());
-        }
-        let authenticate = Arc::new(authenticate_builder);
-        AuthContext::Enabled {
-            authenticate,
-            rbac,
-            // Populate the
-            // issuer URL so `www_authenticate_for` can render
-            // `Bearer realm="<issuer>"` on 401s. Threaded in from
-            // `cfg.auth` at the caller; we do not re-read the config
-            // here (composition is the source of truth, not the
-            // env-var loader).
-            issuer_url: oidc_issuer_url,
-        }
-    } else {
-        // HORT_AUTH_PROVIDER=disabled. The
-        // password-identity path is gone end-to-end; the
-        // only inbound auth surface under `disabled` is the native-token
-        // bearer carrier (PAT / SA tokens). `serve::ensure_auth_enabled`
-        // rejects `disabled + native_tokens=false` before composition
-        // runs; this gate is a defense-in-depth backstop.
-        let native_tokens_wired = pat_validation_uc.is_some();
-        if native_tokens_wired {
-            // Build a fully-wired `AuthenticateUseCase` minus the OIDC
-            // IdP. Mirror the `Enabled` arm's audit /
-            // service-account-label / PAT-validator wiring so the
-            // local-only path has the same operational properties.
-            // Flat grant set; no role pre-index (ADR 0012).
-            let grants = permission_grant_repo.list_all().await?;
-            let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(grants)));
-            let mut authenticate_builder =
-                AuthenticateUseCase::new_local_only(user_repo.clone(), claim_mappings)
-                    .with_audit_events(event_publisher.clone(), ephemeral_durable.clone())
-                    .with_include_service_account_label(include_service_account_label);
-            if let Some(uc) = pat_validation_uc.clone() {
-                authenticate_builder = authenticate_builder.with_pat_validation(uc);
-            }
-            // CliSession JWT verifier on the
-            // BearerOnly path too. CliSession *minting* needs OIDC
-            // (`/exchange`), so this arm rarely sees a CliSession token;
-            // wiring it keeps the validate surface uniform and lets a
-            // CliSession JWT issued by an Enabled peer validate here if
-            // the deployment ever runs mixed.
-            if let Some(signer) = cli_session_signer.clone() {
-                authenticate_builder = authenticate_builder
-                    .with_cli_session_verification(signer, ephemeral_durable.clone());
-            }
-            let authenticate = Arc::new(authenticate_builder);
-            tracing::info!(
-                native_tokens_wired,
-                "AuthContext::BearerOnly wired (HORT_AUTH_PROVIDER=disabled with native tokens)"
-            );
-            AuthContext::BearerOnly { authenticate, rbac }
-        } else {
-            tracing::warn!(
-                "AuthContext::Disabled — no OIDC, no native tokens; \
-                 the runtime boot gate (ensure_auth_enabled) should reject this \
-                 combination before requests can reach handlers"
-            );
-            AuthContext::Disabled
-        }
-    };
+    // Auth wiring — see `build_auth_context` for the three-shape
+    // rationale (`Enabled` / `BearerOnly` / `Disabled`).
+    let auth = build_auth_context(
+        auth_enabled,
+        idp,
+        permission_grant_repo.clone(),
+        user_repo.clone(),
+        claim_mappings,
+        event_publisher.clone(),
+        ephemeral_durable.clone(),
+        include_service_account_label,
+        pat_validation_uc.clone(),
+        cli_session_signer.clone(),
+        oidc_issuer_url,
+    )
+    .await?;
 
     // Multi-issuer JWT validator (ADR 0018) for the
     // federation branch of `/auth/token-exchange`.
@@ -2086,59 +2523,15 @@ pub async fn build_app_context(
     ));
 
     // Fallback-PAT-rotation reconciler's
-    // outbound k8s Secret writer. Opt-in via
-    // `HORT_K8S_SECRET_WRITER_ENABLED=true` (default off — matches the
-    // Helm chart's `worker.rotation.enabled: false` default). When
-    // the env var is set but in-cluster auth (or kubeconfig fallback)
-    // fails, we surface a loud boot error rather than silently
-    // degrading to a `None` slot — operators want the failure to be
-    // visible, since a `None` slot means the rotation handler
-    // refuses to register and the fallback PATs go
-    // stale.
-    let k8s_secret_writer: Option<
-        Arc<dyn hort_domain::ports::kubernetes_secret_writer::KubernetesSecretWriter>,
-    > = if std::env::var("HORT_K8S_SECRET_WRITER_ENABLED")
-        .map(|v| v == "true")
-        .unwrap_or(false)
-    {
-        match hort_adapters_kubernetes::KubernetesSecretWriterImpl::try_in_cluster().await {
-            Ok(impl_) => {
-                tracing::info!(
-                    "k8s Secret writer wired — \
-                     ServiceAccountRotationHandler may register"
-                );
-                Some(Arc::new(impl_)
-                    as Arc<
-                        dyn hort_domain::ports::kubernetes_secret_writer::KubernetesSecretWriter,
-                    >)
-            }
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    "HORT_K8S_SECRET_WRITER_ENABLED=true but kube::Client::try_default() \
-                     failed — refusing to boot (set the env var to false to disable, \
-                     or ensure the in-cluster ServiceAccount token / kubeconfig is mounted)"
-                );
-                return Err(hort_domain::error::DomainError::Invariant(format!(
-                    "kubernetes client construction failed: {err}"
-                )));
-            }
-        }
-    } else {
-        None
-    };
+    // outbound k8s Secret writer — see `build_k8s_secret_writer`.
+    let k8s_secret_writer = build_k8s_secret_writer().await?;
 
     // `RepositoryAccessUseCase` (ADR 0008). Constructed AFTER
     // `auth` so the same `Arc<ArcSwap<RbacEvaluator>>` snapshot powers
     // both the legacy extractors and the new use case. `RbacAccess`
     // mirrors the two `AuthContext` variants — kept distinct because
     // `hort-app` cannot depend on `hort-http-core`.
-    let rbac_access = match &auth {
-        AuthContext::Disabled => RbacAccess::Disabled,
-        AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => {
-            RbacAccess::Enabled(rbac.clone())
-        }
-    };
+    let rbac_access = rbac_access_from_auth(&auth);
 
     // `ApiTokenUseCase` consumes the SAME
     // `Arc<ArcSwap<RbacEvaluator>>` pointer the per-request authorize
@@ -2165,41 +2558,20 @@ pub async fn build_app_context(
     // issuance/list/revoke surface is always reachable from
     // authenticated handlers; only the validator's bearer-routing
     // branch is gated on `HORT_NATIVE_TOKENS_ENABLED`.
-    let api_token_rbac: Arc<ArcSwap<RbacEvaluator>> = match &auth {
-        AuthContext::Disabled => Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(Vec::new()))),
-        AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => rbac.clone(),
-    };
-    let api_token_use_case = {
-        let uc = hort_app::use_cases::api_token_use_case::ApiTokenUseCase::new(
-            api_token_repo.clone(),
-            user_repo.clone(),
-            event_publisher.clone(),
-            api_token_rbac,
-            hort_app::use_cases::api_token_use_case::ApiTokenIssuanceConfig {
-                allow_admin_tokens: native_token_config.allow_admin_tokens,
-                allow_unbounded_svc_tokens: native_token_config.allow_unbounded_svc_tokens,
-            },
-        );
-        // Attach the durable
-        // replay guard iff federation is enabled. The federation
-        // system-mint path then always has a `Some` guard; a `None`
-        // guard reached on that path (composition bug) fails CLOSED.
-        let uc = match replay_guard.clone() {
-            Some(g) => uc.with_replay_guard(g),
-            None => uc,
-        };
-        // Attach the CliSession JWT signer (ADR 0013) +
-        // its revocation denylist so `issue_cli_session` mints a signed
-        // JWT (carrying the caller's resolved claims) instead of an
-        // opaque `hort_cli_*` row. The signer + denylist ship together
-        // (the denylist is the server-side immediate-revocation layer
-        // the signed JWT otherwise lacks).
-        let uc = match cli_session_signer.clone() {
-            Some(signer) => uc.with_cli_session_signing(signer, ephemeral_durable.clone()),
-            None => uc,
-        };
-        Arc::new(uc)
-    };
+    let api_token_rbac = rbac_swap_from_auth(&auth);
+    let api_token_use_case = build_api_token_use_case(
+        api_token_repo.clone(),
+        user_repo.clone(),
+        event_publisher.clone(),
+        api_token_rbac,
+        hort_app::use_cases::api_token_use_case::ApiTokenIssuanceConfig {
+            allow_admin_tokens: native_token_config.allow_admin_tokens,
+            allow_unbounded_svc_tokens: native_token_config.allow_unbounded_svc_tokens,
+        },
+        replay_guard.clone(),
+        cli_session_signer.clone(),
+        ephemeral_durable.clone(),
+    );
     let repository_access_use_case = Arc::new(RepositoryAccessUseCase::new(
         repo_repo.clone(),
         rbac_access.clone(),
@@ -2243,10 +2615,7 @@ pub async fn build_app_context(
     // `jobs_repo` was already wired above (just before `IngestUseCase`)
     // because the ingest-time scan auto-enqueue needs
     // it earlier than this admin-task site.
-    let task_rbac: Arc<ArcSwap<RbacEvaluator>> = match &auth {
-        AuthContext::Disabled => Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(Vec::new()))),
-        AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => rbac.clone(),
-    };
+    let task_rbac = rbac_swap_from_auth(&auth);
     let task_use_case = Arc::new(TaskUseCase::new(
         jobs_repo.clone(),
         event_publisher.clone(),
@@ -2321,10 +2690,7 @@ pub async fn build_app_context(
     // RBAC snapshot reuses the same `Arc<ArcSwap<RbacEvaluator>>` the
     // subscription / api-token / task use cases hold — admin enforcement
     // is consistent across surfaces.
-    let discovery_rbac: Arc<ArcSwap<RbacEvaluator>> = match &auth {
-        AuthContext::Disabled => Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(Vec::new()))),
-        AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => rbac.clone(),
-    };
+    let discovery_rbac = rbac_swap_from_auth(&auth);
     let discovery_use_case = Arc::new(DiscoveryUseCase::new(
         repo_repo.clone(),
         artifact_repo.clone(),
@@ -2404,10 +2770,7 @@ pub async fn build_app_context(
     let subscription_repo: Arc<
         dyn hort_domain::ports::subscription_repository::SubscriptionRepository,
     > = Arc::new(PgSubscriptionRepository::new(db.clone()));
-    let subscription_rbac: Arc<ArcSwap<RbacEvaluator>> = match &auth {
-        AuthContext::Disabled => Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(Vec::new()))),
-        AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => rbac.clone(),
-    };
+    let subscription_rbac = rbac_swap_from_auth(&auth);
     // Construct the real webhook notifier ONCE and
     // expose it via two trait views. The shared `Arc<WebhookNotifier>`
     // is also held by the dispatcher's notifier registry below.
@@ -2441,152 +2804,38 @@ pub async fn build_app_context(
         },
     ));
 
-    // Boot-time unsafe-config gauges. Both default
-    // OFF; flipping either flag sets the corresponding gauge to `1.0`
-    // so SREs see the misconfig on every dashboard. Mirrors the
-    // `emit_pat_over_http_signal` precedent — emit `0.0` on
-    // the safe path so a fresh scrape sees the metric anyway
-    // (absence vs `0.0` would be ambiguous to dashboards).
-    if notify_config.allow_plaintext_webhooks {
-        tracing::warn!(
-            "HORT_WEBHOOK_ALLOW_PLAINTEXT active — webhook URLs may use http:// scheme; \
-             use only on a trusted internal network"
-        );
-        metrics::gauge!("hort_unsafe_config_active", "kind" => "plaintext_webhooks").set(1.0);
-    } else {
-        metrics::gauge!("hort_unsafe_config_active", "kind" => "plaintext_webhooks").set(0.0);
-    }
-    if notify_config.allow_nonroutable_webhook_targets {
-        tracing::warn!(
-            "HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS active — webhook target SSRF check skipped; \
-             use only with operator-trusted internal receivers"
-        );
-        metrics::gauge!(
-            "hort_unsafe_config_active",
-            "kind" => "webhook_nonroutable_targets"
-        )
-        .set(1.0);
-    } else {
-        metrics::gauge!(
-            "hort_unsafe_config_active",
-            "kind" => "webhook_nonroutable_targets"
-        )
-        .set(0.0);
-    }
+    // Boot-time unsafe-config gauges for the two webhook-safety
+    // operator opt-ins — see `emit_webhook_unsafe_config_gauges`.
+    emit_webhook_unsafe_config_gauges(&notify_config);
 
-    // Assemble the `NotificationDispatcher`
-    // when `enable_notifications=true`. The dispatcher itself is NOT
-    // spawned here (composition does not own the cancellation token —
-    // `cli::serve` does); instead we package the dispatcher + the
-    // `subscription_changes` LISTEN task's `JoinHandle` into
-    // `NotificationRuntime` and `cli::serve` calls `dispatcher.run(
-    // shutdown_handle.token())`. This mirrors the
-    // `api_token_revocation` listener pattern, where composition
-    // returns the `JoinHandle` for the serve loop to hold.
-    //
-    // When `enable_notifications=false`, the publisher was constructed
-    // without a broadcast sender; spawning the dispatcher in that
-    // branch would yield a task with a closed receiver doing no useful
-    // work. We skip it entirely so the no-notifications shape stays
-    // zero-overhead.
-    let notification_runtime: Option<NotificationRuntime> = if notify_config.enabled {
-        // Notifier registry: webhook always, NATS optional.
-        let mut notifiers: Vec<Arc<dyn hort_domain::ports::event_notifier::EventNotifier>> =
-            Vec::with_capacity(2);
-        notifiers.push(webhook_notifier.clone());
-
-        if let Some(nats_url) = notify_config.nats_url.as_deref() {
-            // Thread the process-wide
-            // `HORT_EXTRA_CA_BUNDLE` into the NATS TLS leg the same way
-            // every other TLS surface (upstream-http/webhook/S3/OIDC)
-            // already receives it (ADR 0010). `None` keeps the plain-
-            // connect behaviour byte-for-byte.
-            match hort_notifier_nats::NatsNotifier::connect(nats_url, extra_trust_anchors.as_ref())
-                .await
-            {
-                Ok(nats) => {
-                    tracing::info!("NATS JetStream notifier wired");
-                    notifiers.push(Arc::new(nats));
-                }
-                Err(e) => {
-                    // Continue without NATS — webhook-only deployments still
-                    // work; subscriptions targeting NATS will fail delivery
-                    // until the URL is reachable, but that is a per-
-                    // subscription failure not a global boot failure.
-                    tracing::error!(
-                        error = %e,
-                        "failed to connect to NATS at HORT_NATS_URL; notifications to NATS \
-                         targets will fail until reachable"
-                    );
-                }
-            }
-        }
-
-        // Spawn the `subscription_changes` LISTEN task. Returns the
-        // listener handle (consumed by the dispatcher) and the task's
-        // JoinHandle (held for shutdown).
-        let (change_listener, change_listener_handle) =
-            hort_adapters_postgres::subscription_change_listener::spawn_subscription_change_listener(
-                db.clone(),
-                hort_adapters_postgres::subscription_change_listener::SUBSCRIPTION_CHANGES_CHANNEL
-                    .to_string(),
-            );
-
-        let dispatcher = hort_app::dispatcher::dispatcher::NotificationDispatcher::new(
-            event_publisher.clone(),
-            subscription_use_case.clone(),
-            subscription_rbac.clone(),
-            user_repo.clone(),
-            subscription_repo.clone(),
-            repo_repo.clone(),
-            change_listener,
-            notifiers,
-        );
-
-        Some(NotificationRuntime {
-            dispatcher,
-            change_listener_handle,
-        })
-    } else {
-        None
-    };
+    // Assemble the `NotificationDispatcher` when `enable_notifications=true`
+    // — see `build_notification_runtime`. `cli::serve` spawns the returned
+    // dispatcher under the same shutdown token used by every other
+    // long-lived background task.
+    let notification_runtime = build_notification_runtime(
+        &notify_config,
+        extra_trust_anchors.as_ref(),
+        db.clone(),
+        event_publisher.clone(),
+        subscription_use_case.clone(),
+        subscription_rbac.clone(),
+        user_repo.clone(),
+        subscription_repo.clone(),
+        repo_repo.clone(),
+        webhook_notifier.clone(),
+    )
+    .await;
 
     // OCI Distribution-Spec `/v2/auth` token
-    // exchange. Built after the access use case (which the exchange
-    // calls into to resolve scoped repo names → ids) and the rbac
-    // ArcSwap (extracted out of the auth context for the use case to
-    // call `authorize` directly). `Some(_)` only when both
-    // `enable_native_tokens` AND a signing key landed; either-side
-    // missing collapses to `None` and the route handler 404s.
-    let oci_token_exchange_use_case: Option<
-        Arc<hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase>,
-    > = match (&pat_validation_uc, &oci_signing_key, &rbac_access) {
-        (Some(pat_uc), Some(sk), RbacAccess::Enabled(rbac_swap)) => {
-            // Derive `(issuer, audience)` from
-            // `HORT_PUBLIC_BASE_URL`. The helper boot-fails when the URL
-            // is unset or has no host component; silent fallbacks
-            // (`localhost` aud + relative `/v2/auth` iss) would issue JWTs
-            // that real OCI clients can't consume.
-            let (issuer, host_str) = derive_oci_token_endpoint_strings(public_base_url.as_ref())
-                .map_err(|e| hort_domain::error::DomainError::Invariant(e.to_string()))?;
-            let cfg = hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeConfig::new(
-                issuer, host_str,
-            );
-            Some(Arc::new(
-                hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase::new(
-                    pat_uc.clone(),
-                    user_repo.clone(),
-                    rbac_swap.clone(),
-                    repository_access_use_case.clone(),
-                    sk.clone(),
-                    cfg,
-                ),
-            ))
-        }
-        // Auth Disabled is incompatible with `/v2/auth` (no rbac to
-        // intersect against); leave the slot empty.
-        _ => None,
-    };
+    // exchange — see `build_oci_token_exchange_use_case`.
+    let oci_token_exchange_use_case = build_oci_token_exchange_use_case(
+        &pat_validation_uc,
+        &oci_signing_key,
+        &rbac_access,
+        user_repo.clone(),
+        repository_access_use_case.clone(),
+        public_base_url.as_ref(),
+    )?;
     let oci_public_base_url_str = public_base_url.as_ref().map(|u| u.as_str().to_string());
     // Wire the access + metadata ports into the
     // existing artifact use case so the `find_visible_*` /
@@ -2707,20 +2956,10 @@ pub async fn build_app_context(
         storage.clone(),
     ));
 
-    // Trust-config mode string. Operators need the MODE for dashboards
-    // — NOT the CIDR values (those are operator secrets / internal-net
-    // topology).
-    let trust_mode = match (
-        trust_config.public_base_url.is_some(),
-        !trust_config.trusted_proxy_cidrs.is_empty(),
-    ) {
-        (true, false) => "public_url_pinned",
-        (false, true) => "trusted_proxy_forwarding",
-        (true, true) => "BOTH",
-        // Unreachable — `hort-server::config::Config` rejects this combo
-        // at startup. Defensive fallback keeps the log structured.
-        (false, false) => "UNSET",
-    };
+    // Trust-config mode string — see `trust_mode_label`. Operators need
+    // the MODE for dashboards — NOT the CIDR values (those are operator
+    // secrets / internal-net topology).
+    let trust_mode = trust_mode_label(&trust_config);
 
     // Coarse label for the ephemeral-store backend; the URL is never
     // logged (contains credentials on non-local deployments).
@@ -2729,40 +2968,8 @@ pub async fn build_app_context(
         crate::config::EphemeralStoreBackend::Redis => "redis",
     };
 
-    // Per-class startup log lines so
-    // operators can see, at boot, which backend each class is wired
-    // to. For Redis, a short `url_hash` (SHA-256 prefix of the URL)
-    // lets operators correlate "two log lines, same `url_hash`" →
-    // single-Redis topology, without leaking credentials. The Memory
-    // arm omits the URL hash (no URL).
-    match ephemeral_url_hashes.as_ref() {
-        Some((evictable_hash, durable_hash)) => {
-            tracing::info!(
-                class = "evictable",
-                backend = ephemeral_backend_label,
-                url_hash = evictable_hash,
-                "ephemeral_store wired"
-            );
-            tracing::info!(
-                class = "durable",
-                backend = ephemeral_backend_label,
-                url_hash = durable_hash,
-                "ephemeral_store wired"
-            );
-        }
-        None => {
-            tracing::info!(
-                class = "evictable",
-                backend = ephemeral_backend_label,
-                "ephemeral_store wired"
-            );
-            tracing::info!(
-                class = "durable",
-                backend = ephemeral_backend_label,
-                "ephemeral_store wired"
-            );
-        }
-    }
+    // Per-class startup log lines — see `log_ephemeral_store_wired`.
+    log_ephemeral_store_wired(ephemeral_backend_label, ephemeral_url_hashes.as_ref());
 
     // Single startup line per `PullDedup`
     // construction. Mirrors the `ephemeral_store wired` precedent above
