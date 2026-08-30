@@ -84,9 +84,9 @@ use hort_app::task_handlers::{
     EventstoreCheckpointHandler, NoopTaskHandler, OciMembershipEdgeBackfillHandler,
     PrefetchDependenciesHandler, PrefetchIngestHandler, PrefetchRowRetentionSweepHandler,
     PrefetchTickHandler, ProvenanceVerifyHandler, QuarantineReleaseSweepHandler,
-    ReplaySeenPruneHandler, RetentionEvaluateHandler, RetentionPurgeHandler, ScanTaskHandler,
-    ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
-    StagingSweepHandler, WheelMetadataBackfillHandler,
+    ReplaySeenPruneHandler, RetentionEvaluateHandler, RetentionPurgeHandler,
+    ScanRowRetentionSweepHandler, ScanTaskHandler, ScannerRegistryPruneHandler, SeedImportHandler,
+    ServiceAccountRotationHandler, StagingSweepHandler, WheelMetadataBackfillHandler,
 };
 use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
 // IngestUseCase + ArtifactGroupUseCase are the dep subtree the worker
@@ -835,6 +835,12 @@ pub async fn build_app_context(
         Arc::new(PrefetchRowRetentionSweepHandler::new(cascade_jobs)),
         1,
     );
+
+    // Terminal `kind='scan'` row retention sweep — unrelated to the
+    // prefetch cascade above (registered here only for proximity to its
+    // sibling row-retention sweep); single-active per worker replica,
+    // same as every other sweep in this file.
+    dispatcher.register(Arc::new(ScanRowRetentionSweepHandler::new(jobs.clone())), 1);
 
     // -----------------------------------------------------------------
     // 12.e.tris Register the WheelMetadataBackfillHandler (kind

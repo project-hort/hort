@@ -64,6 +64,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   served field is derived from data hort already owns and is never read
   back into any release or quarantine decision.
 
+- **Terminal scan-job rows are garbage-collected.** Every scan — each
+  periodic rescan included — left a terminal row in the jobs table
+  forever, and a scanner outage grew permanent `failed` rows at roughly
+  one per stranded artifact per retry-exhaustion cycle, with no ceiling
+  and no cleanup. A new `scan-row-retention-sweep` (worker task + daily
+  Helm CronJob, enabled by default, `horizon_seconds` operator knob with
+  a 7-day default) deletes terminal `kind='scan'` rows past the horizon —
+  scoped to exactly that kind, because other kinds keep their newest
+  terminal row as durable state (the event-chain verifier's checkpoint).
+  Candidacy semantics are untouched: the rescan queries never read
+  terminal rows, and a stranded artifact selects identically whether its
+  last failed row exists or was swept. Migration 023 widens the
+  jobs-kind check for the new task kind (additive only). (#216)
+
 ### Changed
 
 - **`RELEASING.md`'s promotion checklist gains a Migration-notice step.** A
