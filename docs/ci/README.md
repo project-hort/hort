@@ -59,11 +59,8 @@ OIDC issuer and bind `VAULT_JWT_ROLE` to this project.
 
 `sonar-project.properties` sets `sonar.qualitygate.wait=true`, so
 `quality:sonar` waits for the server-side quality-gate computation and fails
-the scanner step on a red gate. The job itself is `allow_failure: true`,
-though: the verdict is advisory while the project's gate baseline is
-unestablished, so a red gate or an expired token no longer blocks the
-pipeline. Re-tightening (removing `allow_failure`) is a deliberate later
-change, made once the gate runs green on the integration trunk.
+the scanner step on a red gate. The job blocks the pipeline: a red gate means
+the change is not done, and an expired token fails the pipeline the same way.
 
 A second job, `quality:sonar-findings`, reads the gate verdict back and
 prints it to the job log — the failing conditions, open issues (worst
