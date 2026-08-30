@@ -688,18 +688,16 @@ pub(crate) async fn put_manifest_dispatch(
     let group_coords = oci_group_coords(&name, &manifest_digest);
     let actor_any = Actor::Api(actor.clone());
 
-    // #73 step 1 (diagnosability): a failure here used to fold into a
-    // silent `OciError::Internal` at `warn!` — undiagnosable from the
-    // logs on a genuine error (prod-confirmed: a worker image's index
-    // PUT 500s with no ERROR logged). `add_member`'s own idempotent-
-    // duplicate case (same artifact_id + same role re-add) is ALREADY
-    // absorbed as `Ok` by the adapter (see
-    // `ArtifactGroupLifecyclePort::commit_member_added`'s documented
-    // step 4: "same role → idempotent no-op ... return Ok(Committed)")
-    // — it never reaches this call site as an `Err`. So any `Conflict`
-    // seen here is by construction a GENUINE divergence (a different
-    // primary role already claimed, or the same artifact already a
-    // member under a different role) and must never be swallowed.
+    // ADR 0060 contract (`hort_app::append_conflict`): a same-member
+    // replay (same artifact_id + same role re-add) is an idempotent
+    // non-error — the adapter's `ON CONFLICT DO NOTHING` absorbs it on
+    // the first attempt, or `add_member`'s own retry cycle absorbs it
+    // after a conflict. A different-member (or different-role) append
+    // that loses a real version race is retried inside `add_member`,
+    // bounded; exhaustion surfaces `DomainError::Contended`, mapped to
+    // 503 + `Retry-After` below — never swallowed, never a bare 500.
+    // Any OTHER error reaching this site is a genuine infrastructure
+    // failure and stays a logged 500.
     if let Err(e) = ctx
         .artifact_group_use_case
         .add_member(
@@ -716,6 +714,9 @@ pub(crate) async fn put_manifest_dispatch(
         )
         .await
     {
+        if let Some(busy) = manifest_write_contention(&e, "group_attach_manifest") {
+            return busy.into_response();
+        }
         tracing::error!(
             manifest_artifact_id = %manifest_artifact.id,
             manifest_digest = %manifest_digest,
@@ -745,6 +746,9 @@ pub(crate) async fn put_manifest_dispatch(
             )
             .await
         {
+            if let Some(busy) = manifest_write_contention(&e, "group_attach_config") {
+                return busy.into_response();
+            }
             tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
                 manifest_digest = %manifest_digest,
@@ -776,6 +780,9 @@ pub(crate) async fn put_manifest_dispatch(
             )
             .await
         {
+            if let Some(busy) = manifest_write_contention(&e, "group_attach_layer") {
+                return busy.into_response();
+            }
             tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
                 manifest_digest = %manifest_digest,
@@ -794,14 +801,13 @@ pub(crate) async fn put_manifest_dispatch(
     // Tag-ref PUT: set the ref. Digest-ref PUT: skip — the digest is
     // self-naming; creating a ref would be redundant.
     //
-    // #73 step 1: `RefUseCase::set` already short-circuits to `Ok` when
-    // the target is unchanged (`try_set`'s "same_target" no-op) and its
-    // only race outcome (`RefCommitOutcome::RefAlreadyExists`) is
-    // retried internally, never surfaced as `Err` — `set` structurally
-    // cannot return `DomainError::Conflict` today (see
-    // `RefLifecyclePort`, which has no Conflict-shaped outcome). Any
-    // error reaching here is therefore a genuine infrastructure failure,
-    // not an idempotency case to collapse.
+    // ADR 0060 contract: `RefUseCase::set` short-circuits to `Ok` when
+    // the target is unchanged, retries `RefCommitOutcome::RefAlreadyExists`
+    // internally (never surfaced as `Err`), and now also retries a
+    // losing append `Conflict` against the refreshed ref state, bounded;
+    // exhaustion surfaces `DomainError::Contended`, mapped to 503 +
+    // `Retry-After` below. Any OTHER error reaching here is a genuine
+    // infrastructure failure, not an idempotency case to collapse.
     if !reference_is_digest {
         if let Err(e) = ctx
             .ref_use_case
@@ -815,6 +821,9 @@ pub(crate) async fn put_manifest_dispatch(
             )
             .await
         {
+            if let Some(busy) = manifest_write_contention(&e, "ref_set") {
+                return busy.into_response();
+            }
             tracing::error!(
                 manifest_artifact_id = %manifest_artifact.id,
                 manifest_digest = %manifest_digest,
@@ -822,7 +831,7 @@ pub(crate) async fn put_manifest_dispatch(
                 reference = %reference,
                 stage = "ref_set",
                 error = ?e,
-                "ref set failed; RefUseCase::set has no idempotent-Conflict path — \
+                "ref set failed; not idempotent-shaped (see RefUseCase::set contract) — \
                  this is a genuine error"
             );
             return OciError::Internal.into_response();
@@ -1694,6 +1703,7 @@ mod tests {
         MockRepositoryRepository, MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
+    use hort_domain::entities::artifact_group::ArtifactGroup;
     use hort_domain::entities::caller::CallerPrincipal;
     use hort_domain::entities::mutable_ref::MutableRef;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
@@ -3565,6 +3575,127 @@ mod tests {
             status,
             StatusCode::INTERNAL_SERVER_ERROR,
             "only a contention abort is retryable; a real fault must stay a 500"
+        );
+    }
+
+    /// ADR 0060 adoption: a member-append `Conflict` that survives
+    /// every retry attempt inside `ArtifactGroupUseCase::add_member`
+    /// surfaces as `DomainError::Contended`, which the
+    /// `group_attach_manifest` site must map to 503 + `Retry-After` —
+    /// never a bare 500. Pre-seeding the group with the SAME primary
+    /// role the manifest attach claims means `decide_primary_role`
+    /// resolves to `None` (already primary, no assignment), so the
+    /// injected `Conflict`s land on the retry-eligible member-append
+    /// path rather than the unretried primary-role-claim path.
+    #[test]
+    fn group_attach_exhausted_contention_returns_503_not_500() {
+        let (status, retry_after) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, &[layer_hash]);
+            let manifest_digest = compute_sha256(&body);
+
+            h.artifact_groups.insert(ArtifactGroup {
+                id: Uuid::new_v4(),
+                repository_id: repo_id,
+                coords: oci_group_coords("library/nginx", &manifest_digest),
+                primary_role: "manifest".into(),
+                members: Vec::new(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+            // Comfortably more than hort-app's retry bound (5) so
+            // exhaustion is reached regardless of the exact count.
+            for _ in 0..10 {
+                h.group_lifecycle.inject(GroupCommitInjection::Conflict {
+                    reason: "persistent member-append contention".into(),
+                });
+            }
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            (status, retry_after)
+        });
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "exhausted member-append contention is a busy registry, not a broken one"
+        );
+        assert_eq!(
+            retry_after.as_deref(),
+            Some(MANIFEST_CONTENTION_RETRY_AFTER_SECS.to_string().as_str()),
+            "a contention 503 must tell the client when to come back"
+        );
+    }
+
+    /// ADR 0060 adoption: an append `Conflict` that survives every
+    /// retry attempt inside `RefUseCase::set` surfaces as
+    /// `DomainError::Contended`, which the `ref_set` site must map to
+    /// 503 + `Retry-After` — never a bare 500.
+    #[test]
+    fn ref_set_exhausted_contention_returns_503_not_500() {
+        let (status, retry_after) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, &[layer_hash]);
+
+            // Seed the tag at a target the PUT's digest will differ
+            // from, so `RefUseCase::set` actually dispatches a move
+            // (not a same-target no-op) and reaches `move_ref`.
+            h.refs.insert(MutableRef {
+                id: Uuid::new_v4(),
+                repository_id: repo_id,
+                namespace: "library/nginx".into(),
+                ref_name: "v1".into(),
+                target: RefTarget::Version("stale".into()),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            });
+            // Comfortably more than hort-app's retry bound (5).
+            for _ in 0..10 {
+                h.ref_lifecycle
+                    .inject_move_conflict("persistent ref-append contention");
+            }
+
+            let router = router().with_state(h.ctx.clone());
+            let resp = router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            (status, retry_after)
+        });
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "exhausted ref-append contention is a busy registry, not a broken one"
+        );
+        assert_eq!(
+            retry_after.as_deref(),
+            Some(MANIFEST_CONTENTION_RETRY_AFTER_SECS.to_string().as_str()),
+            "a contention 503 must tell the client when to come back"
         );
     }
 

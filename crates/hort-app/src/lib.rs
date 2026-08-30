@@ -16,6 +16,11 @@
 //! concrete adapter types (sqlx, S3, wasmtime). Those are wired at startup
 //! in the composition root in `hort-server`.
 
+// Bounded read-decide-append combinator for the append-conflict reaction
+// contract (ADR 0060). Pure orchestration, no I/O of its own — the
+// caller's closure owns the read + intent-recheck + rebuild + append
+// cycle for each attempt.
+pub mod append_conflict;
 // Single Argon2id facade used by both the PAT validator and the
 // user-password / admin-bootstrap paths (Argon2id, not bcrypt — the
 // invariant is pinned by the `no_bcrypt` guard test).

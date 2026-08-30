@@ -5,6 +5,20 @@
 //! case's read-then-compare is an optimisation that keeps the fast path
 //! free of a transaction round-trip. See
 //! `docs/architecture/explanation/domain-model.md` (refs and groups).
+//!
+//! **ADR 0060 adoption.** [`RefUseCase::set`]'s dispatch onto an existing
+//! ref adopts the bounded read-decide-append contract: a `Conflict` from
+//! [`RefLifecyclePort::move_ref`] is re-read, re-checked against the
+//! caller's original intent (same target already set → idempotent
+//! success), and otherwise rebuilt and re-appended against the refreshed
+//! state — bounded by
+//! [`crate::use_cases::EVENT_APPEND_RETRY_ATTEMPTS`]. Exhaustion surfaces
+//! `DomainError::Contended`. This mirrors
+//! [`ArtifactGroupUseCase::add_member`](super::artifact_group_use_case::ArtifactGroupUseCase::add_member)'s
+//! adoption; the **`RefAlreadyExists` single retry (create race) is
+//! UNCHANGED** — it is the same ADR-0060-sanctioned prior-art shape as
+//! `ArtifactGroupUseCase`'s `GroupAlreadyExists` retry, and is never
+//! threaded through the new bounded primitive.
 
 use std::sync::Arc;
 
@@ -19,8 +33,10 @@ use hort_domain::ports::ref_lifecycle::{RefCommitOutcome, RefLifecyclePort};
 use hort_domain::ports::ref_registry::RefRegistryPort;
 use hort_domain::types::StringPage;
 
+use crate::append_conflict::{append_with_conflict_retry, ConflictCycleOutcome};
 use crate::error::AppResult;
 use crate::metrics::{emit_ref_moved, values, RefMetricResult};
+use crate::use_cases::{event_append_backoff, EVENT_APPEND_RETRY_ATTEMPTS};
 
 /// Default `n` when the caller passes `0` (e.g. a client that elides
 /// `?n=` entirely). Matches Docker Registry V2 / OCI client defaults.
@@ -105,15 +121,27 @@ impl RefUseCase {
     /// lifecycle call returns
     /// [`RefCommitOutcome::RefAlreadyExists`] — another writer
     /// created this ref between our read and our adapter call — we
-    /// retry ONCE. The second attempt sees the winner's row and
-    /// dispatches as a move, so it cannot hit the same race again.
+    /// retry ONCE. The second attempt re-reads the winner's row (fresh)
+    /// and dispatches as a move, so it cannot hit the same race again.
     /// A second `RefAlreadyExists` is an adapter contract violation
-    /// and surfaces as [`DomainError::Invariant`].
+    /// and surfaces as [`DomainError::Invariant`]. This shape is
+    /// UNCHANGED by the ADR 0060 adoption below — it is the ref
+    /// analogue of `ArtifactGroupUseCase`'s `GroupAlreadyExists` single
+    /// retry, sanctioned prior art that the new bounded primitive does
+    /// not subsume.
     ///
-    /// The adapter's in-transaction `FOR UPDATE` re-read is the
-    /// authoritative same-target idempotence guard — the use-case
-    /// check is an optimisation that avoids a transaction round-trip
-    /// on the happy path.
+    /// **ADR 0060 adoption.** Once an existing ref is known (either
+    /// from the read above, or from the winner's row on the
+    /// first-placement retry), the append onto it adopts the bounded
+    /// read-decide-append contract via
+    /// [`Self::set_existing_with_retry`]: a `Conflict` from
+    /// [`RefLifecyclePort::move_ref`] is re-read, re-checked (same
+    /// target now set → idempotent success), and otherwise rebuilt and
+    /// re-appended — bounded, with `Contended` on exhaustion. The
+    /// adapter's in-transaction `FOR UPDATE` re-read is still the
+    /// authoritative same-target idempotence guard on the FIRST
+    /// attempt; the use-case's own re-check only runs on a retry,
+    /// after a `Conflict` has already happened.
     ///
     /// `repo_key` is used only for the metric label; pass `None` if the
     /// caller has not resolved the key (the metric emits
@@ -128,18 +156,42 @@ impl RefUseCase {
         actor: ApiActor,
         repo_key: Option<&str>,
     ) -> AppResult<()> {
+        // Read-side lookup. A NotFound on `find` means the ref doesn't
+        // exist yet (first-placement path); any other error surfaces.
+        let current = match self.refs.find(repo, namespace, ref_name).await {
+            Ok(r) => Some(r),
+            Err(DomainError::NotFound { .. }) => None,
+            Err(e) => return Err(e.into()),
+        };
+
         // Attempt 1 — may observe a concurrent create race.
-        match self
-            .try_set(
-                repo,
-                namespace,
-                ref_name,
-                target.clone(),
-                actor.clone(),
-                repo_key,
-            )
-            .await?
-        {
+        let first_outcome = match current {
+            None => {
+                self.try_first_placement(
+                    repo,
+                    namespace,
+                    ref_name,
+                    target.clone(),
+                    actor.clone(),
+                    repo_key,
+                )
+                .await?
+            }
+            Some(c) => {
+                self.set_existing_with_retry(
+                    repo,
+                    namespace,
+                    ref_name,
+                    target.clone(),
+                    actor.clone(),
+                    repo_key,
+                    Some(c),
+                )
+                .await?
+            }
+        };
+
+        match first_outcome {
             RefCommitOutcome::Committed => Ok(()),
             RefCommitOutcome::RefAlreadyExists { existing_id } => {
                 tracing::debug!(
@@ -148,11 +200,14 @@ impl RefUseCase {
                     retry = 1,
                     "retrying ref set after concurrent create"
                 );
-                // Attempt 2 — re-reads the winner's row and dispatches
-                // as a move. Second RefAlreadyExists would mean the
-                // adapter contract is broken.
+                // Attempt 2 — re-reads the winner's row (fresh) and
+                // dispatches as append-to-existing (never
+                // first-placement again). Second RefAlreadyExists
+                // would mean the adapter contract is broken.
                 match self
-                    .try_set(repo, namespace, ref_name, target, actor, repo_key)
+                    .set_existing_with_retry(
+                        repo, namespace, ref_name, target, actor, repo_key, None,
+                    )
                     .await?
                 {
                     RefCommitOutcome::Committed => Ok(()),
@@ -165,11 +220,15 @@ impl RefUseCase {
         }
     }
 
-    /// Single-attempt implementation of [`set`](Self::set): read the
-    /// current ref (if any), decide create vs move vs no-op, dispatch
-    /// once. Returns the raw [`RefCommitOutcome`] so [`set`] can
-    /// decide whether to retry.
-    async fn try_set(
+    /// First-placement dispatch: the ref does not exist yet. Mints a
+    /// fresh `ref_id`, appends `RefMoved { from: None, to: target }`
+    /// with `ExpectedVersion::NoStream`. Returns the raw
+    /// [`RefCommitOutcome`] so [`Self::set`] can decide whether to
+    /// retry on a concurrent-create race — this branch never sees a
+    /// member-append-shaped `Conflict` (a brand-new stream has nothing
+    /// to conflict against), so it is not wrapped in the ADR 0060
+    /// retry primitive.
+    async fn try_first_placement(
         &self,
         repo: Uuid,
         namespace: &str,
@@ -178,58 +237,8 @@ impl RefUseCase {
         actor: ApiActor,
         repo_key: Option<&str>,
     ) -> AppResult<RefCommitOutcome> {
-        // Read-side lookup. A NotFound on `find` means the ref doesn't
-        // exist yet (first-placement path); any other error surfaces.
-        let current = match self.refs.find(repo, namespace, ref_name).await {
-            Ok(r) => Some(r),
-            Err(DomainError::NotFound { .. }) => None,
-            Err(e) => return Err(e.into()),
-        };
-
         let repo_label = self.repo_label(repo_key);
-
-        // No-op short-circuit — use case-level optimisation. Adapter's
-        // FOR UPDATE re-read is the authoritative race defence; missing
-        // this short-circuit is a perf regression, not a correctness bug.
-        if let Some(ref c) = current {
-            if c.target == target {
-                tracing::debug!(
-                    ref_id = %c.id,
-                    namespace = %namespace,
-                    ref_name = %ref_name,
-                    reason = "same_target",
-                    "set: no-op short-circuit"
-                );
-                emit_ref_moved(&repo_label, RefMetricResult::NoOp);
-                return Ok(RefCommitOutcome::Committed);
-            }
-        }
-
-        // Choose `ref_id`: reuse the existing row's id (ensures the
-        // same stream carries the whole history) or mint a fresh one on
-        // first placement.
-        let (ref_id, from, expected_version, result_label, created_at) = match &current {
-            Some(c) => (
-                c.id,
-                Some(c.target.clone()),
-                // The adapter's `FOR UPDATE` serialises concurrent moves
-                // on the same row, so `Any` at the event-store layer is
-                // safe — same-ref concurrent appenders are forced to wait
-                // for the row lock and the loser sees the winner's new
-                // target on re-read.
-                ExpectedVersion::Any,
-                RefMetricResult::Moved,
-                c.created_at,
-            ),
-            None => (
-                Uuid::new_v4(),
-                None,
-                ExpectedVersion::NoStream,
-                RefMetricResult::Created,
-                Utc::now(),
-            ),
-        };
-
+        let ref_id = Uuid::new_v4();
         let now = Utc::now();
         let new_ref = MutableRef {
             id: ref_id,
@@ -237,43 +246,168 @@ impl RefUseCase {
             namespace: namespace.to_string(),
             ref_name: ref_name.to_string(),
             target: target.clone(),
-            created_at,
+            created_at: now,
             updated_at: now,
         };
-
         let moved = RefMoved {
             ref_id,
             repository_id: repo,
             namespace: namespace.to_string(),
             ref_name: ref_name.to_string(),
-            from,
+            from: None,
             to: target,
         };
-
         let batch = AppendEvents {
             stream_id: StreamId::ref_(ref_id),
-            expected_version,
+            expected_version: ExpectedVersion::NoStream,
             events: vec![EventToAppend::new(DomainEvent::RefMoved(moved))],
             correlation_id: Uuid::new_v4(),
             causation_id: None,
             actor: Actor::Api(actor),
         };
-
         let outcome = self.ref_lifecycle.move_ref(new_ref, batch).await?;
-
-        // Only emit the success metric on Committed. On the race-lost
-        // path the caller (`set`) retries and the retry fires the
-        // metric with the terminal result.
         if matches!(outcome, RefCommitOutcome::Committed) {
-            emit_ref_moved(&repo_label, result_label);
-            tracing::info!(
-                %ref_id,
-                namespace,
-                ref_name,
-                "ref set"
-            );
+            emit_ref_moved(&repo_label, RefMetricResult::Created);
+            tracing::info!(%ref_id, namespace, ref_name, "ref set");
         }
         Ok(outcome)
+    }
+
+    /// Adopts ADR 0060's bounded read-decide-append contract for
+    /// setting a ref that is believed to already exist.
+    ///
+    /// Each retry attempt re-reads the ref (`RefRegistryPort::find`),
+    /// checks whether it is already at the requested target (idempotent
+    /// success — last-writer-wins means a caller whose desired write
+    /// already landed has nothing left to do), and otherwise dispatches
+    /// [`RefLifecyclePort::move_ref`]. A `Conflict` from that call
+    /// retries; a `RefAlreadyExists` (only reachable in production if a
+    /// caller mis-threads a fresh `ref_id` here — this call always
+    /// reuses the read's id) is returned to the caller unretried —
+    /// [`Self::set`]'s own single-retry / `Invariant` logic owns that
+    /// shape, exactly mirroring `ArtifactGroupUseCase`'s handling of
+    /// `GroupAlreadyExists`.
+    ///
+    /// The FIRST attempt never re-checks intent before dispatching — it
+    /// either uses `known` (the caller's already-fetched read, when
+    /// supplied) or a fresh read, and always calls the port directly.
+    /// This preserves the adapter's `FOR UPDATE` re-read as the
+    /// authoritative same-target idempotence guard for the common case.
+    /// Only a RETRY attempt (after a `Conflict`) re-checks the target
+    /// before deciding to re-append.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_existing_with_retry(
+        &self,
+        repo: Uuid,
+        namespace: &str,
+        ref_name: &str,
+        target: RefTarget,
+        actor: ApiActor,
+        repo_key: Option<&str>,
+        known: Option<MutableRef>,
+    ) -> AppResult<RefCommitOutcome> {
+        let repo_label = self.repo_label(repo_key);
+        let mut pending = known;
+        append_with_conflict_retry(EVENT_APPEND_RETRY_ATTEMPTS as u8, move |attempt| {
+            let cached = pending.take();
+            let target = target.clone();
+            let actor = actor.clone();
+            let repo_label = repo_label.clone();
+            async move {
+                let current = if attempt == 1 {
+                    match cached {
+                        Some(c) => c,
+                        None => self.refs.find(repo, namespace, ref_name).await?,
+                    }
+                } else {
+                    tokio::time::sleep(event_append_backoff(u32::from(attempt - 1))).await;
+                    let refreshed = self.refs.find(repo, namespace, ref_name).await?;
+                    if refreshed.target == target {
+                        tracing::debug!(
+                            ref_id = %refreshed.id,
+                            namespace,
+                            ref_name,
+                            attempt,
+                            "ref-append conflict resolved by a concurrent writer; \
+                             idempotent success on recheck"
+                        );
+                        emit_ref_moved(&repo_label, RefMetricResult::NoOp);
+                        return Ok(ConflictCycleOutcome::Satisfied(RefCommitOutcome::Committed));
+                    }
+                    refreshed
+                };
+
+                if current.target == target {
+                    tracing::debug!(
+                        ref_id = %current.id,
+                        namespace,
+                        ref_name,
+                        reason = "same_target",
+                        attempt,
+                        "set: no-op short-circuit"
+                    );
+                    emit_ref_moved(&repo_label, RefMetricResult::NoOp);
+                    return Ok(ConflictCycleOutcome::Satisfied(RefCommitOutcome::Committed));
+                }
+
+                let now = Utc::now();
+                let new_ref = MutableRef {
+                    id: current.id,
+                    repository_id: repo,
+                    namespace: namespace.to_string(),
+                    ref_name: ref_name.to_string(),
+                    target: target.clone(),
+                    created_at: current.created_at,
+                    updated_at: now,
+                };
+                let moved = RefMoved {
+                    ref_id: current.id,
+                    repository_id: repo,
+                    namespace: namespace.to_string(),
+                    ref_name: ref_name.to_string(),
+                    from: Some(current.target.clone()),
+                    to: target,
+                };
+                let batch = AppendEvents {
+                    stream_id: StreamId::ref_(current.id),
+                    // The adapter's `FOR UPDATE` serialises concurrent
+                    // moves on the same row, so `Any` at the event-store
+                    // layer is safe — same-ref concurrent appenders are
+                    // forced to wait for the row lock and the loser sees
+                    // the winner's new target on re-read.
+                    expected_version: ExpectedVersion::Any,
+                    events: vec![EventToAppend::new(DomainEvent::RefMoved(moved))],
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: Actor::Api(actor),
+                };
+
+                let result: AppResult<ConflictCycleOutcome<RefCommitOutcome>> =
+                    match self.ref_lifecycle.move_ref(new_ref, batch).await {
+                        Ok(RefCommitOutcome::Committed) => {
+                            emit_ref_moved(&repo_label, RefMetricResult::Moved);
+                            tracing::info!(ref_id = %current.id, namespace, ref_name, attempt, "ref set");
+                            Ok(ConflictCycleOutcome::Satisfied(RefCommitOutcome::Committed))
+                        }
+                        Ok(outcome @ RefCommitOutcome::RefAlreadyExists { .. }) => {
+                            Ok(ConflictCycleOutcome::Satisfied(outcome))
+                        }
+                        Err(DomainError::Conflict(_)) => {
+                            tracing::debug!(
+                                ref_id = %current.id,
+                                namespace,
+                                ref_name,
+                                attempt,
+                                "ref-append conflict; retrying against refreshed state"
+                            );
+                            Ok(ConflictCycleOutcome::Retry)
+                        }
+                        Err(e) => Err(e.into()),
+                    };
+                result
+            }
+        })
+        .await
     }
 
     /// Retire (delete) an existing ref.
@@ -925,6 +1059,191 @@ mod tests {
         }
         // Exactly two attempts — no unbounded retry loop.
         assert_eq!(lifecycle.move_call_count(), 2);
+    }
+
+    // ----- ADR 0060 adoption: append-conflict retry ---------------------
+
+    /// A `Conflict` on the first attempt is retried; the retry's
+    /// re-read finds the ref already at the requested target (a
+    /// concurrent writer's commit — deterministically simulated via
+    /// `inject_move_conflict_with_concurrent_write` — is exactly why
+    /// this call lost) and succeeds idempotently WITHOUT a second
+    /// port call.
+    #[tokio::test]
+    async fn set_conflict_retries_to_idempotent_recheck() {
+        let (refs, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let existing_id = Uuid::new_v4();
+        let desired = RefTarget::Version("2.0.0".into());
+        refs.insert(MutableRef {
+            id: existing_id,
+            repository_id: repo,
+            namespace: "library/nginx".into(),
+            ref_name: "latest".into(),
+            target: RefTarget::Version("1.0.0".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        lifecycle.inject_move_conflict_with_concurrent_write(
+            "concurrent move already landed",
+            MutableRef {
+                id: existing_id,
+                repository_id: repo,
+                namespace: "library/nginx".into(),
+                ref_name: "latest".into(),
+                target: desired.clone(),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        );
+
+        uc.set(
+            repo,
+            "library/nginx",
+            "latest",
+            desired,
+            api_actor(),
+            Some("my-repo"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lifecycle.move_call_count(),
+            1,
+            "the retry's idempotent recheck must short-circuit BEFORE a second port call"
+        );
+    }
+
+    /// A `Conflict` on the first attempt is retried; the retry's
+    /// re-read finds the ref still at a different target, so it
+    /// rebuilds and re-appends — succeeding on the second port call.
+    #[tokio::test]
+    async fn set_conflict_retries_and_succeeds_on_rebuild() {
+        let (refs, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let existing_id = Uuid::new_v4();
+        refs.insert(MutableRef {
+            id: existing_id,
+            repository_id: repo,
+            namespace: "library/nginx".into(),
+            ref_name: "latest".into(),
+            target: RefTarget::Version("1.0.0".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        lifecycle.inject_move_conflict("transient contention");
+
+        uc.set(
+            repo,
+            "library/nginx",
+            "latest",
+            RefTarget::Version("2.0.0".into()),
+            api_actor(),
+            Some("my-repo"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lifecycle.move_call_count(),
+            2,
+            "first attempt (injected Conflict) + retry (succeeds)"
+        );
+        let moves = lifecycle.recorded_moves();
+        assert_eq!(moves.len(), 1, "the injected call did not record");
+        assert_eq!(moves[0].0.target, RefTarget::Version("2.0.0".into()));
+    }
+
+    /// Every attempt loses to `Conflict` — exhaustion surfaces as
+    /// `DomainError::Contended`, never a raw `Conflict` and never a
+    /// silent success.
+    #[tokio::test]
+    async fn set_conflict_exhausts_to_contended() {
+        let (refs, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let existing_id = Uuid::new_v4();
+        refs.insert(MutableRef {
+            id: existing_id,
+            repository_id: repo,
+            namespace: "library/nginx".into(),
+            ref_name: "latest".into(),
+            target: RefTarget::Version("1.0.0".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        for _ in 0..EVENT_APPEND_RETRY_ATTEMPTS {
+            lifecycle.inject_move_conflict("persistent contention");
+        }
+
+        let err = uc
+            .set(
+                repo,
+                "library/nginx",
+                "latest",
+                RefTarget::Version("2.0.0".into()),
+                api_actor(),
+                Some("my-repo"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::error::AppError::Domain(DomainError::Contended(_))
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            lifecycle.move_call_count(),
+            EVENT_APPEND_RETRY_ATTEMPTS as usize
+        );
+    }
+
+    /// A non-`Conflict` error from `move_ref` on the existing-ref retry
+    /// path propagates immediately, unretried — only `Conflict` is
+    /// eligible for the ADR 0060 append-conflict retry.
+    #[tokio::test]
+    async fn set_existing_non_conflict_error_is_not_retried() {
+        let (refs, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let existing_id = Uuid::new_v4();
+        refs.insert(MutableRef {
+            id: existing_id,
+            repository_id: repo,
+            namespace: "library/nginx".into(),
+            ref_name: "latest".into(),
+            target: RefTarget::Version("1.0.0".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        lifecycle.inject_move_error(DomainError::Validation("bad input".into()));
+
+        let err = uc
+            .set(
+                repo,
+                "library/nginx",
+                "latest",
+                RefTarget::Version("2.0.0".into()),
+                api_actor(),
+                Some("my-repo"),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::error::AppError::Domain(DomainError::Validation(_))
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            lifecycle.move_call_count(),
+            1,
+            "a non-Conflict error must not be retried"
+        );
     }
 
     // -----------------------------------------------------------------

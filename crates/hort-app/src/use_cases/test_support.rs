@@ -4048,6 +4048,36 @@ impl RefRegistryPort for MockRefRegistryPort {
 // MockRefLifecyclePort — records move/retire calls + applies projection.
 // ---------------------------------------------------------------------------
 
+/// One-shot injection queue entry for `move_ref`. Each successive call
+/// to the port consumes the front of the queue (if any); when the queue
+/// is empty the port proceeds with the default `Committed` path.
+///
+/// Mirrors [`GroupCommitInjection`] — `RefAlreadyExists` exercises the
+/// concurrent-create retry, `Conflict` exercises the ADR 0060
+/// append-conflict retry adopted by `RefUseCase::set_existing_with_retry`.
+#[derive(Debug, Clone)]
+pub enum RefCommitInjection {
+    /// Short-circuit the next `move_ref` call with the given outcome
+    /// (`Committed` or `RefAlreadyExists`). No projection or event
+    /// application happens.
+    Outcome(RefCommitOutcome),
+    /// Short-circuit the next `move_ref` call with
+    /// `Err(DomainError::Conflict(reason))`. When `concurrent_write` is
+    /// `Some`, it is written into the shared [`MockRefRegistryPort`]
+    /// BEFORE the error is returned — simulating the concurrent
+    /// writer whose commit is the reason for this conflict, so a
+    /// caller's subsequent re-read observes it deterministically
+    /// (no real concurrency / sleep-based timing needed in tests).
+    Conflict {
+        reason: String,
+        concurrent_write: Option<MutableRef>,
+    },
+    /// Short-circuit the next `move_ref` call with an arbitrary
+    /// non-`Conflict` [`DomainError`] — exercises the passthrough
+    /// (non-retried) error path.
+    Error(DomainError),
+}
+
 /// Records each `move_ref` / `retire_ref` call and applies the projection
 /// write against a shared [`MockRefRegistryPort`] so assertions can inspect
 /// the post-state.
@@ -4067,11 +4097,9 @@ pub struct MockRefLifecyclePort {
     retires: Mutex<Vec<(Uuid, String, String, AppendEvents)>>,
     move_calls: AtomicUsize,
     retire_calls: AtomicUsize,
-    /// FIFO queue of outcomes to return from `move_ref`. A
-    /// `RefAlreadyExists` entry short-circuits: nothing is recorded,
-    /// the projection is untouched, the outcome is returned verbatim.
-    /// An empty queue falls through to the default `Committed` path.
-    move_injections: Mutex<Vec<RefCommitOutcome>>,
+    /// FIFO queue of injections to apply to `move_ref`. See
+    /// [`RefCommitInjection`].
+    move_injections: Mutex<Vec<RefCommitInjection>>,
 }
 
 impl MockRefLifecyclePort {
@@ -4088,7 +4116,49 @@ impl MockRefLifecyclePort {
 
     /// Enqueue the outcome for the next `move_ref` call. Fires FIFO.
     pub fn inject_move_outcome(&self, outcome: RefCommitOutcome) {
-        self.move_injections.lock().unwrap().push(outcome);
+        self.move_injections
+            .lock()
+            .unwrap()
+            .push(RefCommitInjection::Outcome(outcome));
+    }
+
+    /// Enqueue a `DomainError::Conflict` for the next `move_ref` call.
+    /// Fires FIFO alongside [`Self::inject_move_outcome`]'s queue.
+    pub fn inject_move_conflict(&self, reason: impl Into<String>) {
+        self.move_injections
+            .lock()
+            .unwrap()
+            .push(RefCommitInjection::Conflict {
+                reason: reason.into(),
+                concurrent_write: None,
+            });
+    }
+
+    /// Enqueue an arbitrary non-`Conflict` [`DomainError`] for the next
+    /// `move_ref` call.
+    pub fn inject_move_error(&self, err: DomainError) {
+        self.move_injections
+            .lock()
+            .unwrap()
+            .push(RefCommitInjection::Error(err));
+    }
+
+    /// Enqueue a `DomainError::Conflict` for the next `move_ref` call
+    /// that ALSO writes `concurrent_write` into the shared registry
+    /// before returning — deterministically simulating "a concurrent
+    /// writer's commit is why this call lost."
+    pub fn inject_move_conflict_with_concurrent_write(
+        &self,
+        reason: impl Into<String>,
+        concurrent_write: MutableRef,
+    ) {
+        self.move_injections
+            .lock()
+            .unwrap()
+            .push(RefCommitInjection::Conflict {
+                reason: reason.into(),
+                concurrent_write: Some(concurrent_write),
+            });
     }
 
     /// Snapshot of every `(ref_post_state, batch)` produced by `move_ref`.
@@ -4132,19 +4202,31 @@ impl RefLifecyclePort for MockRefLifecyclePort {
                 Some(q.remove(0))
             }
         };
-        if let Some(outcome) = injection {
-            match outcome {
-                RefCommitOutcome::Committed => {
+        if let Some(injection) = injection {
+            match injection {
+                RefCommitInjection::Outcome(RefCommitOutcome::Committed) => {
                     // Inject a no-op Committed (unused today, but cheap
                     // to support): still records + applies the projection.
                     self.moves.lock().unwrap().push((r.clone(), batch));
                     self.refs.insert(r);
                     return Box::pin(async move { Ok(RefCommitOutcome::Committed) });
                 }
-                RefCommitOutcome::RefAlreadyExists { existing_id } => {
+                RefCommitInjection::Outcome(RefCommitOutcome::RefAlreadyExists { existing_id }) => {
                     return Box::pin(async move {
                         Ok(RefCommitOutcome::RefAlreadyExists { existing_id })
                     });
+                }
+                RefCommitInjection::Conflict {
+                    reason,
+                    concurrent_write,
+                } => {
+                    if let Some(winner) = concurrent_write {
+                        self.refs.insert(winner);
+                    }
+                    return Box::pin(async move { Err(DomainError::Conflict(reason)) });
+                }
+                RefCommitInjection::Error(err) => {
+                    return Box::pin(async move { Err(err) });
                 }
             }
         }
