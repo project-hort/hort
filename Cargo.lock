@@ -2639,7 +2639,7 @@ dependencies = [
  "lru",
  "metrics",
  "metrics-util",
- "password-hash 0.5.0",
+ "password-hash 0.6.1",
  "rand 0.10.2",
  "serde",
  "serde_json",
