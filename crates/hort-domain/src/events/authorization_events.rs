@@ -433,6 +433,26 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // tuning on `public.jobs` (migration 009) — the sweep deletes
     // the rows, autovacuum reclaims the page space.
     "prefetch-row-retention-sweep",
+    // Terminal `kind='scan'` row retention sweep. Consumed by
+    // `ScanRowRetentionSweepHandler` in the worker. Periodically
+    // deletes `kind = 'scan'` rows whose `status IN ('completed',
+    // 'failed')` and whose `updated_at < now() - $horizon` (default
+    // 7 days). Every successful scan — including every periodic
+    // rescan — and every stranded-requeue exhaustion failure leaves a
+    // terminal row forever without this sweep; it bounds `jobs`-table
+    // growth the same way `prefetch-row-retention-sweep` bounds the
+    // cascade's growth. **`kind = 'scan'` exactly** — every other
+    // `jobs.kind` keeps its newest terminal row as durable state (the
+    // `verify-event-chain` liveness checkpoint being the canonical
+    // example), so this sweep's scope is deliberately narrower than
+    // `kind LIKE 'prefetch%'`. Non-destructive at the artifact level —
+    // only garbage-collects historical job rows; the row's absence
+    // does not change `select_eligible` (reads `artifacts.last_scan_at`
+    // + pending/running job existence, never terminal rows) or
+    // `select_stranded` (a deleted terminal `failed` row makes
+    // `last_job.status` resolve to `NULL`, which the widened stranded
+    // predicate already treats identically to `'failed'`) candidacy.
+    "scan-row-retention-sweep",
     // PEP 658 wheel-metadata backfill — consumed by
     // `WheelMetadataBackfillHandler` in the worker. The ingest
     // hook extracts wheel METADATA into CAS + a
@@ -593,6 +613,7 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
     "prefetch",
     "prefetch-dependencies",
     "prefetch-row-retention-sweep",
+    "scan-row-retention-sweep",
     "wheel-metadata-backfill",
     "provenance-verify",
     "scanner-registry-prune",

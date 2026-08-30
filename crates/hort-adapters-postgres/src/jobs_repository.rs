@@ -1311,6 +1311,27 @@ impl JobsRepository for PgJobsRepository {
             Ok(res.rows_affected())
         })
     }
+
+    fn delete_terminal_scan_rows_older_than<'a>(
+        &'a self,
+        horizon: Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        let interval = duration_to_pg_interval(horizon);
+        Box::pin(async move {
+            tracing::debug!(?horizon, "delete_terminal_scan_rows_older_than");
+            let res = sqlx::query(
+                "DELETE FROM public.jobs \
+                  WHERE kind = 'scan' \
+                    AND status IN ('completed', 'failed') \
+                    AND updated_at < now() - $1::interval",
+            )
+            .bind(interval)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Job", "delete_terminal_scan_rows_older_than"))?;
+            Ok(res.rows_affected())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2015,6 +2036,72 @@ mod tests {
         assert_eq!(
             deleted, 2,
             "exactly the two old-terminal rows are deleted (not pending/running, not fresh)",
+        );
+
+        // Cleanup: drop the remaining seeded rows for isolation.
+        let keys: Vec<String> = fixtures.into_iter().map(|(_, _, k, _)| k).collect();
+        sqlx::query("DELETE FROM public.jobs WHERE target_key = ANY($1)")
+            .bind(&keys)
+            .execute(&pool)
+            .await
+            .expect("cleanup seeded rows");
+    }
+
+    /// Retention sweep deletes only terminal `kind='scan'` rows older
+    /// than the horizon. Seeds an aged+fresh terminal scan row, a
+    /// pending and a running scan row (never touched regardless of
+    /// age), plus an aged terminal `verify-event-chain` row and an
+    /// aged terminal `prefetch` row (foreign kinds, never touched) —
+    /// pins the exact-kind scope: only `kind = 'scan'` terminal rows
+    /// are eligible, never another kind's durable state.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn scan_retention_sweep_deletes_only_terminal_scan_rows_older_than_horizon() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        let suffix = Uuid::new_v4();
+        let mk = |status: &str, kind: &str, age_secs: i64| {
+            let key = format!("{suffix}|{kind}|{status}");
+            (status.to_string(), kind.to_string(), key, age_secs)
+        };
+        let fixtures = vec![
+            mk("completed", "scan", 1_000_000), // aged terminal scan — deleted
+            mk("failed", "scan", 1_000_000),    // aged terminal scan — deleted
+            mk("completed", "scan", 0),         // fresh terminal scan — kept
+            mk("pending", "scan", 1_000_000),   // non-terminal — kept regardless of age
+            mk("running", "scan", 1_000_000),   // non-terminal — kept regardless of age
+            mk("completed", "verify-event-chain", 1_000_000), // foreign kind — kept
+            mk("completed", "prefetch", 1_000_000), // foreign kind — kept
+        ];
+        for (status, kind, key, age_secs) in &fixtures {
+            sqlx::query(
+                "INSERT INTO public.jobs \
+                   (kind, params, priority, trigger_source, target_key, status, \
+                    created_at, updated_at) \
+                 VALUES ($1, '{}'::jsonb, 0, 'cron', $2, $3::text, \
+                         now() - ($4::int || ' seconds')::interval, \
+                         now() - ($4::int || ' seconds')::interval)",
+            )
+            .bind(kind)
+            .bind(key)
+            .bind(status)
+            .bind(*age_secs)
+            .execute(&pool)
+            .await
+            .expect("seed row");
+        }
+
+        let deleted = repo
+            .delete_terminal_scan_rows_older_than(Duration::from_secs(86_400))
+            .await
+            .expect("retention sweep");
+        assert_eq!(
+            deleted, 2,
+            "exactly the two aged-terminal scan rows are deleted (not pending/running scan, \
+             not fresh scan, not foreign kinds)",
         );
 
         // Cleanup: drop the remaining seeded rows for isolation.

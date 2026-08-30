@@ -55,8 +55,8 @@ fi
 expectations() {
     cat <<'EOF'
 test-values-extra-ca-with-cm.yaml|HORT_EXTRA_CA_BUNDLE|2|Recipe A: env var rendered on BOTH server + worker (auto-mount source set ⇒ env set)
-test-values-extra-ca-with-cm.yaml|extra-ca-bundle|9|Recipe A: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2) + checksum annotation (1)
-test-values-extra-ca-with-cm.yaml|defaultMode: 0444|4|Recipe A: read-only 0444 ConfigMap volume on server + worker + scrub + quarantineReleaseSweep
+test-values-extra-ca-with-cm.yaml|extra-ca-bundle|11|Recipe A: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2) + scanRowRetentionSweep mount+vol (2) + checksum annotation (1)
+test-values-extra-ca-with-cm.yaml|defaultMode: 0444|5|Recipe A: read-only 0444 ConfigMap volume on server + worker + scrub + quarantineReleaseSweep + scanRowRetentionSweep
 test-values-extra-ca-with-cm.yaml|checksum/extra-ca-bundle:|1|Pod-template checksum annotation rendered for the ConfigMap source
 test-values-extra-ca-unset.yaml|HORT_EXTRA_CA_BUNDLE|0|env var NOT rendered when no auto-mount source set
 test-values-extra-ca-unset.yaml|extra-ca-bundle|0|volume NOT rendered when no auto-mount source set
@@ -66,10 +66,10 @@ test-values-extra-ca-path-only.yaml|HORT_EXTRA_CA_BUNDLE|0|manual recipe: chart 
 test-values-extra-ca-path-only.yaml|extra-ca-bundle|0|manual recipe: chart mounts NOTHING (no dangling volumeMount — the prior path-only cronjob volumeMount bug is fixed)
 test-values-extra-ca-path-only.yaml|checksum/extra-ca-bundle:|0|annotation NOT rendered when no auto-mount source is set
 test-values-extra-ca-with-secret.yaml|HORT_EXTRA_CA_BUNDLE|2|Recipe A-Secret: env var rendered on BOTH server + worker (secretName auto-mount ⇒ env set), symmetric with configMapName
-test-values-extra-ca-with-secret.yaml|extra-ca-bundle|8|Recipe A-Secret: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2); NO checksum annotation (Secret path)
-test-values-extra-ca-with-secret.yaml|defaultMode: 0444|4|Recipe A-Secret: read-only 0444 Secret volume on server + worker + scrub + quarantineReleaseSweep
+test-values-extra-ca-with-secret.yaml|extra-ca-bundle|10|Recipe A-Secret: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2) + scanRowRetentionSweep mount+vol (2); NO checksum annotation (Secret path)
+test-values-extra-ca-with-secret.yaml|defaultMode: 0444|5|Recipe A-Secret: read-only 0444 Secret volume on server + worker + scrub + quarantineReleaseSweep + scanRowRetentionSweep
 test-values-extra-ca-with-secret.yaml|checksum/extra-ca-bundle:|0|Recipe A-Secret: no checksum annotation for the Secret source (Secret updates propagate via Kubernetes, not via helm-upgrade re-render)
-test-values-extra-ca-with-secret.yaml|corporate-ca-bundle-secret|4|Recipe A-Secret: the Secret name renders in the volume secretName on server + worker + scrub + quarantineReleaseSweep
+test-values-extra-ca-with-secret.yaml|corporate-ca-bundle-secret|5|Recipe A-Secret: the Secret name renders in the volume secretName on server + worker + scrub + quarantineReleaseSweep + scanRowRetentionSweep
 test-values-worker-extra-ca-recipe-b.yaml|HORT_EXTRA_CA_BUNDLE|1|manual recipe: ONLY the operator-supplied worker.extraEnv sets the env (chart sets none; server has no extraEnv ⇒ 0 there)
 test-values-worker-extra-ca-recipe-b.yaml|extra-ca-bundle|0|manual recipe: NO chart-managed extra-ca-bundle volume/mount
 test-values-worker-extra-ca-recipe-b.yaml|recipe-b-worker-ca|2|operator-supplied worker.extraVolumes name renders as both volumeMount and volume
@@ -91,7 +91,7 @@ test-values-ephemeral-secret-split.yaml|key: "DURABLE_URL"|1|durable secretKeyRe
 test-values-rotation.yaml|name: .*-service-account-rotation|1|rotation CronJob renders from the SINGLE toggle scheduledTasks.serviceAccountRotation.enabled (under scheduledTasks.adminTasksEnabled)
 test-values-rotation.yaml|name: hort-server-rotation-|6|per-namespace Role + RoleBinding render for both target namespaces (2 namespaces × 3 name refs each — Role metadata.name + RoleBinding metadata.name + RoleBinding roleRef.name)
 test-values-rotation.yaml|HORT_K8S_SECRET_WRITER_ENABLED|1|the SINGLE toggle scheduledTasks.serviceAccountRotation.enabled ALSO drives the worker-side wiring — HORT_K8S_SECRET_WRITER_ENABLED renders on the worker (no separate worker.rotation.enabled)
-test-values-cronjobs.yaml|^kind: CronJob$|13|thirteen CronJobs render — the eleven scheduledTasks.adminTasksEnabled-gated admin-task entries (noop, staging-sweep, cron-rescan-tick, advisory-watch-tick, eventstore-checkpoint, replay-seen-prune, scanner-registry-prune, retention-evaluate, retention-purge, eventstore-archive, verify-event-chain — the last now default-on, ADR 0057) PLUS the always-on dsn-direct quarantineReleaseSweep (gated on scheduledTasks.quarantineReleaseSweep.enabled, default true) PLUS the always-on dsn-direct CAS scrub (gated on scheduledTasks.scrub.enabled, default true). wheelMetadataBackfill stays default-disabled and does NOT count.
+test-values-cronjobs.yaml|^kind: CronJob$|14|fourteen CronJobs render — the eleven scheduledTasks.adminTasksEnabled-gated admin-task entries (noop, staging-sweep, cron-rescan-tick, advisory-watch-tick, eventstore-checkpoint, replay-seen-prune, scanner-registry-prune, retention-evaluate, retention-purge, eventstore-archive, verify-event-chain — the last now default-on, ADR 0057) PLUS the always-on dsn-direct quarantineReleaseSweep (gated on scheduledTasks.quarantineReleaseSweep.enabled, default true) PLUS the always-on dsn-direct CAS scrub (gated on scheduledTasks.scrub.enabled, default true) PLUS the always-on dsn-direct scanRowRetentionSweep (gated on scheduledTasks.scanRowRetentionSweep.enabled, default true). prefetchRowRetentionSweep and wheelMetadataBackfill stay default-disabled and do NOT count.
 test-values-cronjobs.yaml|name: hort-server-cron-rescan-tick$|1|cron-rescan-tick CronJob renders with conventional release-name suffix
 test-values-cronjobs.yaml|name: hort-server-advisory-watch-tick$|1|advisory-watch-tick CronJob renders with conventional release-name suffix
 test-values-cronjobs.yaml|name: hort-server-staging-sweep$|1|staging-sweep CronJob renders with conventional release-name suffix
@@ -103,7 +103,7 @@ test-values-cronjobs.yaml|^                - retention-evaluate$|1|retention-eva
 test-values-cronjobs.yaml|^                - retention-purge$|1|retention-purge CronJob invokes the correct hort-cli task kind
 test-values-cronjobs.yaml|^                - eventstore-archive$|1|eventstore-archive CronJob invokes the correct hort-cli task kind
 test-values-cronjobs.yaml|^                - day$|3|exactly the three retention CronJobs carry --idempotency-key-window day (<UTC-date>:<kind> contract; cron-rescan/svc-rotation use minute)
-test-values-cronjobs.yaml|^  concurrencyPolicy: Forbid$|13|every CronJob (incl. the 3 retention + the always-on quarantineReleaseSweep + the always-on scrub + scanner-registry-prune + the now-default-on verify-event-chain, ADR 0057) sets concurrencyPolicy: Forbid (single-active layer 1; worker semaphore is layer 2)
+test-values-cronjobs.yaml|^  concurrencyPolicy: Forbid$|14|every CronJob (incl. the 3 retention + the always-on quarantineReleaseSweep + the always-on scrub + the always-on scanRowRetentionSweep + scanner-registry-prune + the now-default-on verify-event-chain, ADR 0057) sets concurrencyPolicy: Forbid (single-active layer 1; worker semaphore is layer 2)
 test-values-cronjobs.yaml|name: hort-server-job-bootstrap-egress$|1|additive Job-scoped bootstrap-egress NetworkPolicy renders when networkPolicy.enabled (chart default true)
 test-values-cronjobs.yaml|^kind: NetworkPolicy$|2|BOTH the app-pod NetworkPolicy and the additive Job-scoped policy render with the chart-default networkPolicy.enabled: true
 test-values-cronjobs.yaml|key: hort-server.io/job|1|the Job-scoped policy selects by the hort-server.io/job label Exists (never the app pods)
@@ -124,8 +124,8 @@ test-values-worker-metrics.yaml|app.kubernetes.io/component: worker|7|the `-work
 test-values-dex.yaml|hort-server.io/component: dex|6|auth.dex.enabled renders the Dex sidecar trio (ConfigMap + Service + Deployment) — 6 component-label lines: ConfigMap metadata (1) + Service metadata + podSelector (2) + Deployment metadata + selector + pod-template (3)
 test-values-dex.yaml|ghcr.io/dexidp/dex|1|auth.dex.enabled renders the Dex Deployment with the configured Dex image
 test-values-dex.yaml|/etc/dex/config.yaml|1|the Dex Deployment serves the mounted config (dex serve /etc/dex/config.yaml)
-test-values-dex.yaml|value: "https://registry.example.com/dex"|3|auth.dex.enabled overrides HORT_OIDC_ISSUER_URL to auth.dex.issuerUrl on the server Deployment AND the two DSN-direct runtimeEnv CronJobs (scrub + quarantineReleaseSweep)
-test-values-dex.yaml|^ +value: "hort-cli"$|3|auth.dex.enabled overrides HORT_OIDC_AUDIENCE to auth.dex.cliClientId (Dex mints the cli-flow token; its aud is the Dex client id, NOT auth.oidc.audience) — on the server Deployment AND the two DSN-direct runtimeEnv CronJobs; mirrors the issuer override and the Ansible flavor
+test-values-dex.yaml|value: "https://registry.example.com/dex"|4|auth.dex.enabled overrides HORT_OIDC_ISSUER_URL to auth.dex.issuerUrl on the server Deployment AND the three DSN-direct runtimeEnv CronJobs (scrub + quarantineReleaseSweep + scanRowRetentionSweep)
+test-values-dex.yaml|^ +value: "hort-cli"$|4|auth.dex.enabled overrides HORT_OIDC_AUDIENCE to auth.dex.cliClientId (Dex mints the cli-flow token; its aud is the Dex client id, NOT auth.oidc.audience) — on the server Deployment AND the three DSN-direct runtimeEnv CronJobs; mirrors the issuer override and the Ansible flavor
 test-values-token-exchange-happy.yaml|hort-server.io/component: dex|0|auth.dex.enabled default false ⇒ NO Dex sidecar renders (negative counterpart to test-values-dex.yaml)
 test-values-svc-tokens-multi.yaml|name: issue-token$|1|two-entry svcTokens: exactly one bare `issue-token` init container (the first, backward-compatible entry)
 test-values-svc-tokens-multi.yaml|name: issue-token-uat-smoke$|1|two-entry svcTokens: the second entry gets its own suffixed init container

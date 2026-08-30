@@ -1622,6 +1622,36 @@ scheduledTasks:
     # lower the sweep cadence, the more aggressive autovacuum must be).
     schedule: "0 2 * * *"
 
+  # -- Terminal-scan-row retention sweep --------------------
+  # Periodic scan-row-retention-sweep CronJob. Inserts ONE
+  # `kind='scan-row-retention-sweep'` row into `public.jobs` every tick
+  # using the RUNTIME DSN; the worker picks it up and dispatches to
+  # `ScanRowRetentionSweepHandler`, which deletes terminal
+  # `kind='scan'` rows older than the configured horizon (default 7
+  # days). Pairs with the per-table autovacuum tuning on `public.jobs`
+  # (migration 009: `autovacuum_vacuum_scale_factor = 0.02`). Every
+  # artifact scan — ingest plus every periodic rescan — leaves a
+  # terminal row forever without this sweep.
+  #
+  # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
+  # umbrella. Manual operator invocation still works via the
+  # `hort-http-admin-tasks` HTTP route.
+  scanRowRetentionSweep:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default true.** Unlike the prefetch cascade
+    # (opt-in per-repo), every artifact scan leaves a terminal
+    # `kind='scan'` row from day one — a fresh out-of-the-box
+    # deployment already accumulates rows, so the sweep ships enabled.
+    enabled: true
+    # Cron schedule. Default: daily at 03:00 UTC (offset from the
+    # prefetch-row sweep's 02:00 UTC so the two DSN-only CronJobs do
+    # not contend for the same minute). The 7-day retention horizon
+    # gives 6 days of headroom even after a missed run; daily cadence +
+    # autovacuum tuning is sufficient for production loads. Operators
+    # tightening below daily should also tighten
+    # `autovacuum_vacuum_scale_factor` on `public.jobs`.
+    schedule: "0 3 * * *"
+
   # -- Wheel-metadata backfill -----------------------------
   # Periodic wheel-metadata-backfill CronJob. Inserts ONE
   # `kind='wheel-metadata-backfill'` row into `public.jobs` every tick
