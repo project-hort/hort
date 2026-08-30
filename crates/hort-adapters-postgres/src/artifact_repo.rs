@@ -754,6 +754,40 @@ impl ArtifactRepository for PgArtifactRepository {
         })
     }
 
+    fn package_version_publish_times(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> BoxFuture<'_, DomainResult<Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)>>> {
+        let pkg = package.to_owned();
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Artifact",
+                %repository_id,
+                package = %pkg,
+                "package_version_publish_times"
+            );
+            // Cargo-pubtime-only read: a heap fetch for `created_at` /
+            // `upstream_published_at`, deliberately NOT folded into the
+            // `package_version_status` covering-index scan (see the port
+            // doc-comment). Low-QPS — called once per cargo proxy
+            // sparse-index serve, not on every format's serve path.
+            let rows: Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+                "SELECT version, created_at, upstream_published_at \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND name = $2 \
+                   AND version IS NOT NULL \
+                   AND deleted_at IS NULL",
+            )
+            .bind(repository_id)
+            .bind(&pkg)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", &pkg))?;
+            Ok(rows)
+        })
+    }
+
     fn find_pypi_wheels_without_kind(
         &self,
         kind: &str,
@@ -1668,6 +1702,102 @@ mod tests {
             .await
             .expect("package_version_status");
         assert!(triples.is_empty());
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Seeds one artifact row with an explicit `upstream_published_at`
+    /// (vs. [`seed_artifact_status`], which always leaves it NULL) — the
+    /// fixture [`package_version_publish_times_precedence`] needs to
+    /// exercise both the `Some` and `None` cases.
+    async fn seed_artifact_with_publish_time(
+        pool: &PgPool,
+        repo: Uuid,
+        name: &str,
+        version: &str,
+        upstream_published_at: Option<DateTime<Utc>>,
+        seed: usize,
+    ) {
+        let id = Uuid::new_v4();
+        let path = format!("simple/{name}/{name}-{version}-{seed:04}.tar.gz");
+        let sha256 = deterministic_hex64(seed ^ 0x5EED_0000_usize);
+        sqlx::query(
+            r#"INSERT INTO artifacts (
+                   id, repository_id, name, name_as_published, version, path,
+                   size_bytes, checksum_sha256, content_type, storage_key,
+                   quarantine_status, upstream_published_at
+               ) VALUES (
+                   $1, $2, $3, $3, $4, $5,
+                   0, $6, 'application/octet-stream', $6,
+                   'released', $7
+               )"#,
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(name)
+        .bind(version)
+        .bind(&path)
+        .bind(&sha256)
+        .bind(upstream_published_at)
+        .execute(pool)
+        .await
+        .expect("seed publish-time artifact");
+    }
+
+    /// Round-trip test for
+    /// [`ArtifactRepository::package_version_publish_times`] — the
+    /// timestamp source for the cargo sparse-index `pubtime` field.
+    ///
+    /// Three versions: one with `upstream_published_at` set (precedence
+    /// winner), one with it NULL (falls back to `created_at` at the
+    /// use-case layer — this adapter just returns both columns
+    /// verbatim), and a third version that is NEVER seeded at all —
+    /// proving "never locally ingested" surfaces as row absence, not a
+    /// `None`-valued row.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn package_version_publish_times_precedence() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        // Deterministic, microsecond-precision timestamp — TIMESTAMPTZ
+        // round-trips at microsecond resolution; `Utc::now()` raw carries
+        // nanosecond precision and can fail equality after round-trip.
+        let upstream_ts: DateTime<Utc> = "2026-01-15T09:20:00Z".parse().unwrap();
+        seed_artifact_with_publish_time(&pool, repo, "leftpad", "1.0.0", Some(upstream_ts), 0)
+            .await;
+        seed_artifact_with_publish_time(&pool, repo, "leftpad", "1.1.0", None, 1).await;
+        // "1.2.0" is deliberately never seeded — never-ingested.
+
+        let r = repo_under_test(&pool).await;
+        let mut rows = r
+            .package_version_publish_times(repo, "leftpad")
+            .await
+            .expect("package_version_publish_times");
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(rows.len(), 2, "only the two seeded versions have rows");
+        assert_eq!(rows[0].0, "1.0.0");
+        assert_eq!(
+            rows[0].2,
+            Some(upstream_ts),
+            "upstream_published_at round-trips verbatim"
+        );
+        assert_eq!(rows[1].0, "1.1.0");
+        assert_eq!(
+            rows[1].2, None,
+            "NULL upstream_published_at round-trips as None"
+        );
+        assert!(
+            rows.iter()
+                .all(|(_, created_at, _)| *created_at <= Utc::now()),
+            "created_at is always populated (NOT NULL column)"
+        );
+        assert!(
+            rows.iter().all(|(v, ..)| v != "1.2.0"),
+            "a never-ingested version produces no row at all"
+        );
+
         cleanup_repo(&pool, repo).await;
     }
 

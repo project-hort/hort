@@ -280,6 +280,7 @@ mod tests {
                 rust_version: None,
                 v: None,
                 features2: None,
+                pubtime: None,
             }),
         }
     }

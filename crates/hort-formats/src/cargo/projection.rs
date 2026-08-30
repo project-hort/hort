@@ -23,6 +23,7 @@
 //! No new workspace dep — `serde_json::Deserializer::into_iter` is
 //! stock serde_json.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use hort_domain::error::{DomainError, DomainResult};
@@ -57,6 +58,23 @@ pub struct CargoVersionLine {
     pub v: Option<u32>,
     #[serde(default)]
     pub features2: Option<serde_json::Value>,
+    /// Publish timestamp, straight from whatever the upstream NDJSON
+    /// line supplies under this key. No cargo registry serves this
+    /// field today (that gap is the reason hort synthesises its own
+    /// `pubtime` for the served index — see `ProxyCargoSource::fetch`),
+    /// so this is always `None` from every current upstream; it exists
+    /// so a future upstream that does serve `pubtime` (a chained hort
+    /// mirror, or cargo's own eventual native support) round-trips
+    /// without a schema change. The served index's `pubtime` value is
+    /// computed independently, downstream of the projection, from
+    /// hort's own artifact record — this field is never read for that
+    /// computation.
+    ///
+    /// `#[serde(default)]` like every other optional field above: a
+    /// projection cached before this field existed decodes as `None`,
+    /// no forced cache invalidation needed.
+    #[serde(default)]
+    pub pubtime: Option<DateTime<Utc>>,
 }
 
 /// Streaming projector.
@@ -165,6 +183,47 @@ not json at all
         let body = b"{\"name\":\"a\",\"vers\":\"1.0.0\",\"cksum\":\"x\",\"yanked\":false}\n{ not json \n{\"name\":\"a\",\"vers\":\"2.0.0\",\"cksum\":\"y\",\"yanked\":false}\n";
         let err = project(&body[..]).unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn pubtime_absent_on_line_defaults_to_none() {
+        // No real cargo upstream serves `pubtime` today; a line without
+        // the key must still parse.
+        let body = br#"{"name":"foo","vers":"1.0.0","cksum":"a"}"#;
+        let p = project(body).unwrap();
+        assert!(p[0].pubtime.is_none());
+    }
+
+    #[test]
+    fn pubtime_present_on_line_round_trips() {
+        // Forward-compat: a future upstream (or a chained hort mirror)
+        // that does serve `pubtime` round-trips it verbatim through the
+        // projector, even though the served proxy index's own `pubtime`
+        // is computed independently downstream (see
+        // `ProxyCargoSource::fetch`).
+        let body = br#"{"name":"foo","vers":"1.0.0","cksum":"a","pubtime":"2024-01-02T03:04:05Z"}"#;
+        let p = project(body).unwrap();
+        assert_eq!(
+            p[0].pubtime.map(|t| t.to_rfc3339()),
+            Some("2024-01-02T03:04:05+00:00".to_string())
+        );
+    }
+
+    #[test]
+    fn old_cached_projection_json_without_pubtime_key_still_deserializes() {
+        // Simulates decoding a `CachedCargoProjection` entry written by a
+        // pre-amendment binary: the serialized `CargoVersionLine` array
+        // has no `pubtime` key at all. `#[serde(default)]` must make this
+        // a non-event — no forced cache invalidation, no decode failure.
+        let old_cache_json = r#"[{"name":"foo","vers":"1.0.0","cksum":"a","deps":[],
+            "features":{},"yanked":false,"links":null,"rust_version":null}]"#;
+        let lines: Vec<CargoVersionLine> = serde_json::from_str(old_cache_json)
+            .expect("pre-amendment cached projection JSON must still decode");
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].pubtime.is_none(),
+            "a pre-amendment cache entry has no pubtime data to offer"
+        );
     }
 
     #[test]
