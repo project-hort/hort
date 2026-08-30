@@ -141,6 +141,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enqueues still consume no budget. The summary's new `cursor` field makes
   the walk's progress operator-visible. (#212)
 
+- **Concurrent OCI manifest/tag pushes no longer 500 on group/ref append
+  races; Maven group links no longer silently lost on concurrent
+  same-GAV uploads.** `ArtifactGroupUseCase::add_member` and
+  `RefUseCase::set` now adopt the bounded read-decide-append contract
+  (ADR 0060): a losing append conflict re-reads the refreshed state,
+  succeeds idempotently if the caller's intent is already satisfied, and
+  otherwise rebuilds and re-appends — bounded, with a busy signal on
+  exhaustion instead of an unbounded loop. The OCI `group_attach_*` /
+  `ref_set` sites map that exhaustion to `503` + `Retry-After` instead of
+  `500`. (#221)
+
 ## [0.12.1] - 2026-08-29
 
 ### Fixed

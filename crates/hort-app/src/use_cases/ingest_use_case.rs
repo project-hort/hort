@@ -3336,12 +3336,18 @@ impl IngestUseCase {
         // Runs AFTER `ArtifactIngested` has landed. Crucially, the
         // `ArtifactLifecyclePort::commit_transition` above and the
         // `ArtifactGroupUseCase::add_member` call below are TWO
-        // separate transactions. If the group commit fails here, the
-        // artifact is already persisted-and-valid; it is just unlinked
-        // from any group. We log `warn!` and return `Ok` from `ingest`
-        // (the ingest itself succeeded). The group-reconcile sweep heals
-        // orphaned-membership artifacts at rest by replaying
-        // `ArtifactIngested` events and re-running `classify_group_member`.
+        // separate transactions. `add_member` itself now retries a
+        // losing member-append conflict against the refreshed group
+        // state (bounded), so an ordinary concurrent-membership race
+        // resolves inside this call and never reaches the warn branch
+        // below. The warn branch below is the CRASH-WINDOW backstop:
+        // if the process dies between the two transactions, or the
+        // retry budget is genuinely exhausted, the artifact is already
+        // persisted-and-valid and just unlinked from its group. We log
+        // `warn!` and return `Ok` from `ingest` (the ingest itself
+        // succeeded). The group-reconcile sweep remains the healing
+        // path for that crash window — it replays `ArtifactIngested`
+        // events and re-runs `classify_group_member` at rest.
         //
         // Do NOT try to merge the two transactions or compensate on
         // failure. Cross-aggregate atomicity is not worth the coupling cost.

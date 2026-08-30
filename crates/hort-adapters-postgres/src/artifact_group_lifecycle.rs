@@ -322,6 +322,7 @@ mod tests {
         Actor, ApiActor, ArtifactGroupInitiated, ArtifactGroupMemberAdded,
         ArtifactGroupMemberRemoved, DomainEvent, StreamId,
     };
+    use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
     use hort_domain::ports::event_store::{EventToAppend, ExpectedVersion};
     use hort_domain::types::ArtifactCoords;
     use sqlx::PgPool;
@@ -1044,6 +1045,226 @@ mod tests {
         assert_eq!(
             loser_leak, 0,
             "rolled-back loser sentinel must not appear in events"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    // ---------------------------------------------------------------
+    // ADR 0060 adoption: use-case-level concurrency (real Postgres)
+    // ---------------------------------------------------------------
+
+    /// `N` real-concurrent `ArtifactGroupUseCase::add_member` calls for
+    /// DISTINCT members of ONE already-existing group. Every call must
+    /// resolve with zero `Conflict` escaping to the caller — the
+    /// bounded read-decide-append retry inside `add_member` absorbs
+    /// the member-row races the concurrent `INSERT ... ON CONFLICT`
+    /// naturally produces. Asserts: every task returns `Ok(())`, every
+    /// member is present in the read-side projection, and the group's
+    /// event stream is version-consistent (contiguous `stream_position`
+    /// values, no gaps, no duplicates — exactly one event per landed
+    /// append).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn concurrent_add_member_for_distinct_members_absorbs_all_conflicts() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        let lifecycle: Arc<dyn ArtifactGroupLifecyclePort> =
+            Arc::new(PgArtifactGroupLifecycle::new(event_store.clone()));
+        let groups: Arc<dyn ArtifactGroupRepository> = Arc::new(
+            crate::artifact_group_repo::PgArtifactGroupRepository::new(pool.clone()),
+        );
+        let uc = Arc::new(
+            hort_app::use_cases::artifact_group_use_case::ArtifactGroupUseCase::new(
+                groups.clone(),
+                lifecycle,
+                true,
+            ),
+        );
+
+        let coords = maven_coords("com.example:concurrent-race", "1.0.0");
+
+        // Sequential first-placement: creates the group with a primary
+        // "jar" member, out of band from the concurrency under test —
+        // the GroupAlreadyExists create-race is a SEPARATE, already-
+        // tested sanctioned shape (see the test above).
+        let primary_artifact = seed_artifact(&pool, repo, "concurrent-race-primary.jar").await;
+        uc.add_member(
+            repo,
+            coords.clone(),
+            "jar".into(),
+            primary_artifact,
+            true,
+            Actor::Api(ApiActor {
+                user_id: Uuid::new_v4(),
+            }),
+            Uuid::new_v4(),
+            None,
+            None,
+            "maven",
+        )
+        .await
+        .expect("sequential first-placement succeeds");
+
+        const N: usize = 8;
+        let mut artifacts = Vec::with_capacity(N);
+        for i in 0..N {
+            artifacts.push(seed_artifact(&pool, repo, &format!("concurrent-race-{i}.jar")).await);
+        }
+
+        let mut handles = Vec::with_capacity(N);
+        for (i, artifact_id) in artifacts.iter().copied().enumerate() {
+            let uc = uc.clone();
+            let coords = coords.clone();
+            handles.push(tokio::spawn(async move {
+                uc.add_member(
+                    repo,
+                    coords,
+                    format!("layer-{i}"),
+                    artifact_id,
+                    false,
+                    Actor::Api(ApiActor {
+                        user_id: Uuid::new_v4(),
+                    }),
+                    Uuid::new_v4(),
+                    None,
+                    None,
+                    "maven",
+                )
+                .await
+            }));
+        }
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle
+                .await
+                .expect("task did not panic")
+                .unwrap_or_else(|e| {
+                    panic!("add_member for layer-{i} must not surface Conflict: {e}")
+                });
+        }
+
+        // Every member landed — the primary plus all N concurrent
+        // additions.
+        let group = groups
+            .find_by_coords(repo, &coords)
+            .await
+            .unwrap()
+            .expect("group exists");
+        assert_eq!(
+            group.members.len(),
+            N + 1,
+            "primary + every concurrent member must be present, got {:?}",
+            group.members
+        );
+        for artifact_id in &artifacts {
+            assert!(
+                group.members.iter().any(|m| m.artifact_id == *artifact_id),
+                "artifact {artifact_id} missing from group membership"
+            );
+        }
+
+        // Stream version-consistency: contiguous stream_position values
+        // with no gaps and no duplicates — the SAME invariant a real
+        // `EventStore::append` under `ExpectedVersion::Any` guarantees
+        // is preserved end to end through the retry cycle.
+        let stream_id = format!("artifact_group-{}", group.id);
+        let positions: Vec<i64> = sqlx::query_scalar(
+            "SELECT stream_position FROM events WHERE stream_id = $1 ORDER BY stream_position",
+        )
+        .bind(&stream_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let expected: Vec<i64> = (0..(N as i64 + 2)).collect(); // Initiated + (N+1) MemberAdded
+        assert_eq!(
+            positions, expected,
+            "stream_position must be contiguous with no gaps or duplicates"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Two real-concurrent `RefUseCase::set` calls target the SAME ref
+    /// with DIFFERENT targets. Neither call may surface an error — the
+    /// loser's `Conflict` (or `RefAlreadyExists`, on the create race)
+    /// is absorbed by the retry inside `RefUseCase::set` — and the
+    /// ref's final stored target deterministically equals ONE of the
+    /// two racers' targets (last-writer-wins, not an interleaved or
+    /// corrupted value).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn concurrent_ref_set_on_same_ref_is_deterministic() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        let ref_lifecycle: Arc<dyn hort_domain::ports::ref_lifecycle::RefLifecyclePort> = Arc::new(
+            crate::ref_lifecycle::PgRefLifecycle::new(event_store.clone()),
+        );
+        let refs: Arc<dyn hort_domain::ports::ref_registry::RefRegistryPort> =
+            Arc::new(crate::ref_registry_repo::PgRefRegistry::new(pool.clone()));
+        let uc = Arc::new(hort_app::use_cases::ref_use_case::RefUseCase::new(
+            refs.clone(),
+            ref_lifecycle,
+            true,
+        ));
+
+        let namespace = format!("concurrent-ref-race-{}", Uuid::new_v4().simple());
+        let target_a = hort_domain::entities::mutable_ref::RefTarget::Version("a".into());
+        let target_b = hort_domain::entities::mutable_ref::RefTarget::Version("b".into());
+
+        let uc_a = uc.clone();
+        let ns_a = namespace.clone();
+        let target_a2 = target_a.clone();
+        let handle_a = tokio::spawn(async move {
+            uc_a.set(
+                repo,
+                &ns_a,
+                "latest",
+                target_a2,
+                ApiActor {
+                    user_id: Uuid::new_v4(),
+                },
+                None,
+            )
+            .await
+        });
+        let uc_b = uc.clone();
+        let ns_b = namespace.clone();
+        let target_b2 = target_b.clone();
+        let handle_b = tokio::spawn(async move {
+            uc_b.set(
+                repo,
+                &ns_b,
+                "latest",
+                target_b2,
+                ApiActor {
+                    user_id: Uuid::new_v4(),
+                },
+                None,
+            )
+            .await
+        });
+
+        handle_a
+            .await
+            .expect("task a did not panic")
+            .expect("racer a must not surface an error");
+        handle_b
+            .await
+            .expect("task b did not panic")
+            .expect("racer b must not surface an error");
+
+        let stored = refs.find(repo, &namespace, "latest").await.unwrap();
+        assert!(
+            stored.target == target_a || stored.target == target_b,
+            "final target must equal one of the two racers' targets, got {:?}",
+            stored.target
         );
 
         cleanup_repo(&pool, repo).await;
