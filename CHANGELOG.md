@@ -80,6 +80,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`quality:sonar` reads back its own quality-gate verdict, and clippy
+  findings now reach Sonar.** `sonar.qualitygate.wait=true` makes the
+  scanner wait on the server-side gate computation; the job stays
+  `allow_failure: true` (advisory posture until the gate baseline is
+  established), and a new `quality:sonar-findings` job prints the gate's
+  failing conditions, open issues, and unreviewed security hotspots to the
+  log so a red gate is never silent. `test:lint` now emits
+  `clippy-report.json`, which `sonar-project.properties` imports via
+  `sonar.rust.clippyReport.reportPaths`. The scanner image is pinned by
+  digest through the internal mirror instead of tracking `:latest`.
 - **`RELEASING.md`'s promotion checklist gains a Migration-notice step.** A
   release whose migration set contains a contraction now carries a
   `### Migration notice` changelog entry naming the dropped or narrowed
