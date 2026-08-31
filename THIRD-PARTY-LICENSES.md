@@ -95,7 +95,7 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.25.0 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.26.0 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -326,7 +326,7 @@ the result instead.
 | crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.18.2 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.18.3 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -5664,7 +5664,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.25.0 — MIT
+### uuid 1.26.0 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -12908,7 +12908,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.18.2 — MIT
+### lru 0.18.3 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
