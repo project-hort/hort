@@ -34,6 +34,7 @@ metadata:
     hort-server.io/job: cron-rescan-tick
 spec:
   schedule: {{ .Values.scheduledTasks.cronRescanTick.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3

@@ -1,0 +1,77 @@
+# Test fixture: enable EVERY chart CronJob template (all 18) for the
+# generic `scheduledTasks.timeZone` template-test check.
+#
+# Usage:
+#   helm template deploy/helm/hort-server/ \
+#       -f deploy/helm/hort-server/test-values-cronjob-timezone.yaml
+#
+# This is the default-timeZone half of the pair with
+# test-values-cronjob-timezone-override.yaml: `scheduledTasks.timeZone`
+# is left unset here, so every rendered CronJob must carry the chart
+# default `timeZone: "Etc/UTC"`. The companion fixture sets an explicit
+# override and asserts it propagates to every CronJob instead.
+#
+# Not a production values file — the point is maximum CronJob template
+# coverage for the timeZone assertion, not a realistic deployment.
+
+worker:
+  enabled: true
+  rotation:
+    targetNamespaces:
+      - ci-system
+    publicRegistryHost: "registry.example.com:5443"
+
+scheduledTasks:
+  adminTasksEnabled: true
+  svcTokenKubectlImage: "bitnamilegacy/kubectl:1.30"
+  noop:
+    enabled: true
+  stagingSweep:
+    enabled: true
+  cronRescanTick:
+    enabled: true
+  advisoryWatchTick:
+    enabled: true
+  eventstoreCheckpoint:
+    enabled: true
+  replaySeenPrune:
+    enabled: true
+  retentionEvaluate:
+    enabled: true
+  retentionPurge:
+    enabled: true
+  eventstoreArchive:
+    enabled: true
+  serviceAccountRotation:
+    enabled: true
+  prefetchTick:
+    enabled: true
+  prefetchRowRetentionSweep:
+    enabled: true
+  wheelMetadataBackfill:
+    enabled: true
+  # scrub, quarantineReleaseSweep, scanRowRetentionSweep, scannerRegistryPrune
+  # and verifyEventChain all render at their own chart defaults already
+  # (always-on dsn-direct, or default-enabled admin-task) — no override
+  # needed to reach all 18.
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

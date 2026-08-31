@@ -1,0 +1,73 @@
+# Test fixture: enable EVERY chart CronJob template (all 18) AND override
+# `scheduledTasks.timeZone` away from its "Etc/UTC" default.
+#
+# Usage:
+#   helm template deploy/helm/hort-server/ \
+#       -f deploy/helm/hort-server/test-values-cronjob-timezone-override.yaml
+#
+# Companion to test-values-cronjob-timezone.yaml (which exercises the
+# default). This fixture proves the override reaches EVERY rendered
+# CronJob — the shared value has no per-job override, so one setting
+# controls all 18.
+#
+# Not a production values file — the point is maximum CronJob template
+# coverage for the timeZone assertion, not a realistic deployment.
+
+worker:
+  enabled: true
+  rotation:
+    targetNamespaces:
+      - ci-system
+    publicRegistryHost: "registry.example.com:5443"
+
+scheduledTasks:
+  timeZone: "America/Los_Angeles"
+  adminTasksEnabled: true
+  svcTokenKubectlImage: "bitnamilegacy/kubectl:1.30"
+  noop:
+    enabled: true
+  stagingSweep:
+    enabled: true
+  cronRescanTick:
+    enabled: true
+  advisoryWatchTick:
+    enabled: true
+  eventstoreCheckpoint:
+    enabled: true
+  replaySeenPrune:
+    enabled: true
+  retentionEvaluate:
+    enabled: true
+  retentionPurge:
+    enabled: true
+  eventstoreArchive:
+    enabled: true
+  serviceAccountRotation:
+    enabled: true
+  prefetchTick:
+    enabled: true
+  prefetchRowRetentionSweep:
+    enabled: true
+  wheelMetadataBackfill:
+    enabled: true
+
+# Minimal required values to pass helm lint (schema validation).
+publicBaseUrl: "https://example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+    secretKey: DATABASE_URL
+  admin:
+    existingSecret: "hort-admin-db-secret"
+    secretKey: DATABASE_URL
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+    groupsClaim: "groups"
+    jwksCacheTtlSeconds: 600
+storage:
+  backend: filesystem
+secrets:
+  fileRoot: "/var/run/secrets/hort-server"

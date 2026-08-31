@@ -36,6 +36,7 @@ metadata:
     hort-server.io/job: advisory-watch-tick
 spec:
   schedule: {{ .Values.scheduledTasks.advisoryWatchTick.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3

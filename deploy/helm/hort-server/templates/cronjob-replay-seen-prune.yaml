@@ -70,6 +70,7 @@ metadata:
     hort-server.io/job: replay-seen-prune
 spec:
   schedule: {{ .Values.scheduledTasks.replaySeenPrune.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3

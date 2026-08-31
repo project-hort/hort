@@ -60,6 +60,7 @@ metadata:
     hort-server.io/job: scan-row-retention-sweep
 spec:
   schedule: {{ .Values.scheduledTasks.scanRowRetentionSweep.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   # `Forbid` is the cron-conventional choice for "this job is
   # idempotent but must not overlap itself." The enqueue is one row
   # insert, so a missed tick is fine — the next tick picks up the
