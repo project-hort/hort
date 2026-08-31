@@ -842,7 +842,7 @@ prePull:
   # already pulls to run ANY pod at all — using it here adds NO new
   # pull dependency while satisfying the DaemonSet API's
   # `restartPolicy: Always` requirement.
-  pauseImage: "registry.k8s.io/pause:3.9"
+  pauseImage: "registry.k8s.io/pause:3.10"
 
 # -------------------- Service --------------------
 service:
