@@ -58,6 +58,7 @@ metadata:
     hort-server.io/job: prefetch-tick
 spec:
   schedule: {{ .Values.scheduledTasks.prefetchTick.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   # `Forbid` is the cron-conventional choice for "this job is
   # idempotent but must not overlap itself." The enqueue is one row
   # insert, so a missed tick is fine — the next 15-minute tick picks

@@ -1312,6 +1312,15 @@ gitopsConfig: {}
 # minute-granularity could merge two distinct windows into the same key.
 # Treat the 5-minute period as a hard floor on `schedule:` values.
 scheduledTasks:
+  # IANA time zone applied to EVERY chart CronJob's `spec.timeZone`
+  # (Kubernetes >= 1.27, stable). Changing this value shifts ALL chart
+  # schedules at once — there is no per-job override. Must be a
+  # non-empty IANA zone name (e.g. "Etc/UTC", "America/New_York").
+  # Default: "Etc/UTC" — every `schedule:` comment in this chart states
+  # its wall-clock time in UTC, and this default makes that promise true
+  # regardless of the kube-controller-manager's local time zone.
+  timeZone: "Etc/UTC"
+
   # Global master toggle for the `executionPath: admin-task` tasks
   # (replaces the pre-078 `cronJobs.enabled`). Must be true for any
   # admin-task CronJob template AND the service-account token bootstrap Job
@@ -1936,8 +1945,8 @@ scheduledTasks:
   # anything.
   #
   # UPGRADE NOTE: an existing install that never set this key GAINS this
-  # CronJob on upgrade. It runs daily at 02:00 by default. Set
-  # `enabled: false` to opt out.
+  # CronJob on upgrade. It runs daily at 02:00 by default
+  # (scheduledTasks.timeZone, default UTC). Set `enabled: false` to opt out.
   #
   # A deployment with no checkpoint anchor stays GREEN. The verifier
   # derives whether an anchor is expected from the same predicate the

@@ -31,6 +31,7 @@ metadata:
     hort-server.io/job: noop
 spec:
   schedule: {{ .Values.scheduledTasks.noop.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   # Prevent concurrent runs. A noop is cheap but overlapping invocations
   # would produce duplicate `TaskInvoked` audit events.
   concurrencyPolicy: Forbid

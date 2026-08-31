@@ -209,6 +209,25 @@ test-values-svc-tokens-repository-typo.yaml|[Aa]dditional propert|a mistyped sch
 EOF
 }
 
+# Generic per-CronJob `spec.timeZone` check.
+#
+# Unlike `expectations()` above (which pins an exact match count), this
+# does NOT hard-code how many CronJob templates the chart has — it
+# derives the expected count from the SAME render by counting
+# `kind: CronJob` documents, then asserts the `timeZone:` value shows up
+# once per CronJob document. A future `templates/cronjob-*.yaml` that
+# forgets to set `timeZone` under `schedule:` lowers the timeZone count
+# below the CronJob count and fails this check with no fixture-file edit
+# required — the opposite of a hard-coded template-name enumeration,
+# which a new template would silently bypass.
+# Format: `<fixture>|<expected timeZone value>|<human label>`.
+cronjob_timezone_checks() {
+    cat <<'EOF'
+test-values-cronjob-timezone.yaml|Etc/UTC|every rendered CronJob carries the chart-default scheduledTasks.timeZone
+test-values-cronjob-timezone-override.yaml|America/Los_Angeles|an overridden scheduledTasks.timeZone reaches every rendered CronJob (no per-job override exists)
+EOF
+}
+
 failed=0
 checked_fixtures=()
 
@@ -370,6 +389,46 @@ while IFS='|' read -r fixture tmpl golden label; do
         failed=$((failed + 1))
     fi
 done < <(golden_checks)
+
+# Process the generic CronJob timeZone checks (see cronjob_timezone_checks()
+# above): count CronJob documents and timeZone occurrences in the SAME
+# render and assert they match, rather than pinning either count.
+while IFS='|' read -r fixture expected_tz label; do
+    [[ -z "${fixture}" ]] && continue
+    fixture_path="${chart_dir}/${fixture}"
+
+    if [[ ! -f "${fixture_path}" ]]; then
+        echo "FAIL: fixture missing: ${fixture}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" 2>&1); then
+        echo "FAIL: helm template failed for ${fixture}:" >&2
+        echo "${rendered}" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+        checked_fixtures+=("${fixture}")
+        continue
+    fi
+    checked_fixtures+=("${fixture}")
+
+    cronjob_count=$(printf '%s\n' "${rendered}" | grep -cE '^kind: CronJob$' || true)
+    timezone_count=$(printf '%s\n' "${rendered}" | grep -cF "timeZone: \"${expected_tz}\"" || true)
+
+    if [[ "${cronjob_count}" -eq 0 ]]; then
+        echo "FAIL: ${fixture} → ${label}" >&2
+        echo "    fixture rendered NO CronJob documents — nothing was checked" >&2
+        failed=$((failed + 1))
+    elif [[ "${cronjob_count}" -ne "${timezone_count}" ]]; then
+        echo "FAIL: ${fixture} → ${label}" >&2
+        echo "    kind: CronJob documents: ${cronjob_count}" >&2
+        echo "    timeZone: \"${expected_tz}\" occurrences: ${timezone_count}" >&2
+        echo "    at least one rendered CronJob is missing the expected timeZone" >&2
+        failed=$((failed + 1))
+    else
+        echo "PASS: ${fixture} → ${label} (${cronjob_count}/${cronjob_count} CronJobs)"
+    fi
+done < <(cronjob_timezone_checks)
 
 # Catch fixtures that have no expectations row — silently rendering
 # without any assertion is a regression magnet (someone adds a fixture,

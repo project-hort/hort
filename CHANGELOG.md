@@ -103,6 +103,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Chart CronJob schedules are now anchored to UTC by default instead of
+  controller-local time.** None of the chart's 18 CronJob templates set
+  `spec.timeZone`, so Kubernetes interpreted every `schedule:` in the
+  kube-controller-manager's local time zone — a template comment promising
+  "daily at 03:00 UTC" could fire at a different wall-clock hour depending on
+  the cluster. Every chart CronJob now renders `spec.timeZone` from the new
+  shared value `scheduledTasks.timeZone` (default `"Etc/UTC"`); operators
+  relying on the old local-time behavior can set `scheduledTasks.timeZone` to
+  their controller's zone.
+
 - **The wheel-metadata and OCI membership-edge backfills no longer
   starve on permanent skips.** Both admin-task backfills walked
   candidates `ORDER BY id LIMIT batch_size` with no cursor, and a

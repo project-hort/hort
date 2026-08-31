@@ -42,6 +42,7 @@ metadata:
     hort-server.io/job: scrub
 spec:
   schedule: {{ .Values.scheduledTasks.scrub.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   # Keep at most one scrub run at a time. A long scrub against a large
   # CAS can run for hours; concurrent invocations would hammer the
   # serving path with redundant `get()` calls and the event-store with

@@ -867,6 +867,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "timeZone": {
+          "description": "IANA time zone applied to EVERY chart CronJob's `spec.timeZone` (Kubernetes >= 1.27, stable). Changing this value shifts ALL chart schedules at once — there is no per-job override. Default \"Etc/UTC\".",
+          "type": "string",
+          "minLength": 1
+        },
         "adminTasksEnabled": {
           "description": "Global master toggle for the `executionPath: admin-task` tasks + the service-account token bootstrap Job (+ its RBAC). Replaces the pre-078 `cronJobs.enabled`. Default: disabled. Does NOT gate the `executionPath: dsn-direct` tasks (those keep their own per-task `enabled`).",
           "type": "boolean"

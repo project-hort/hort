@@ -59,6 +59,7 @@ metadata:
     hort-server.io/job: scanner-registry-prune
 spec:
   schedule: {{ .Values.scheduledTasks.scannerRegistryPrune.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3
