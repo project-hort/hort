@@ -59,16 +59,15 @@ pub struct CargoVersionLine {
     #[serde(default)]
     pub features2: Option<serde_json::Value>,
     /// Publish timestamp, straight from whatever the upstream NDJSON
-    /// line supplies under this key. No cargo registry serves this
-    /// field today (that gap is the reason hort synthesises its own
-    /// `pubtime` for the served index — see `ProxyCargoSource::fetch`),
-    /// so this is always `None` from every current upstream; it exists
-    /// so a future upstream that does serve `pubtime` (a chained hort
-    /// mirror, or cargo's own eventual native support) round-trips
-    /// without a schema change. The served index's `pubtime` value is
-    /// computed independently, downstream of the projection, from
-    /// hort's own artifact record — this field is never read for that
-    /// computation.
+    /// line supplies under this key, in cargo's strict `serde_pubtime`
+    /// wire format (`yyyy-mm-ddThh:mm:ssZ`) rather than general RFC
+    /// 3339. crates.io now serves this field in exactly that shape, but
+    /// it is deliberately unread here: the served index's `pubtime`
+    /// value is computed independently, downstream of the projection,
+    /// from hort's own artifact record (see `ProxyCargoSource::fetch`)
+    /// — this field is never read for that computation. It exists so a
+    /// future upstream-passthrough amendment can round-trip the
+    /// upstream value without a schema change.
     ///
     /// `#[serde(default)]` like every other optional field above: a
     /// projection cached before this field existed decodes as `None`,
@@ -187,8 +186,8 @@ not json at all
 
     #[test]
     fn pubtime_absent_on_line_defaults_to_none() {
-        // No real cargo upstream serves `pubtime` today; a line without
-        // the key must still parse.
+        // A line without the key must still parse — pre-`pubtime`
+        // upstream snapshots and any upstream that omits it stay valid.
         let body = br#"{"name":"foo","vers":"1.0.0","cksum":"a"}"#;
         let p = project(body).unwrap();
         assert!(p[0].pubtime.is_none());

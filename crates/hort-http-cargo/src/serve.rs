@@ -1117,8 +1117,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `pubtime` — hosted source uses the artifact's own `created_at`
-    // (backlog 148 — cargo sparse-index `pubtime`).
+    // `pubtime` — hosted source uses the artifact's own `created_at`.
     // -----------------------------------------------------------------
 
     #[tokio::test]
@@ -1149,7 +1148,7 @@ mod tests {
         let lines = parse_lines(&body);
         assert_eq!(
             lines[0]["pubtime"].as_str().unwrap(),
-            "2022-03-04T05:06:07+00:00",
+            "2022-03-04T05:06:07Z",
             "hosted pubtime must be the artifact's own created_at"
         );
     }
@@ -1249,7 +1248,7 @@ mod tests {
         let lines = parse_lines(&body);
         assert_eq!(
             lines[0]["pubtime"].as_str().unwrap(),
-            "2021-07-08T09:10:11+00:00",
+            "2021-07-08T09:10:11Z",
             "virtual read must pass the winning member's pubtime through unchanged"
         );
     }
@@ -1540,7 +1539,7 @@ mod tests {
                 "yanked": false,
                 "links": null,
                 "rust_version": null,
-                "pubtime": artifact.created_at.to_rfc3339(),
+                "pubtime": artifact.created_at.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             }),
             "a version with no stored metadata serves the pre-metadata entry verbatim \
              (plus the always-present hosted `pubtime`)"

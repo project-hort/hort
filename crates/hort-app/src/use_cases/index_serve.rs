@@ -302,7 +302,7 @@ pub struct PypiVersionFile {
 /// {"name":"<name>","vers":"<vers>","deps":[...],"cksum":"<sha256>",
 ///  "features":{...},"yanked":<bool>,"links":<string|null>,
 ///  "rust_version":<string|null>,"v":<int|null>,"features2":{...},
-///  "pubtime":"<RFC 3339>"}
+///  "pubtime":"<yyyy-mm-ddThh:mm:ssZ>"}
 /// ```
 ///
 /// The fields the existing emission / parse code reads are a
@@ -364,7 +364,11 @@ pub struct PypiVersionFile {
 /// - `features2` — the v2-extra features map (namespaced /
 ///   weak-dep features). Preserved verbatim from upstream on proxy;
 ///   on hosted, the extended-syntax half of the stored feature map.
-/// - `pubtime` — the version's publish timestamp, RFC 3339 UTC.
+/// - `pubtime` — the version's publish timestamp, emitted in cargo's
+///   strict `serde_pubtime` wire format (`yyyy-mm-ddThh:mm:ssZ`, 20
+///   characters, zero-padded, `Z` only, no fractional seconds — cargo's
+///   deserializer since 1.93 rejects anything else, and a field-level
+///   parse failure invalidates the whole index line).
 ///   `Some` → emitted; `None` → the key is omitted entirely (never
 ///   emitted as `null` — cargo clients ignore an absent key the same
 ///   way, and omission keeps the wire shape identical to the pre-field
@@ -416,9 +420,11 @@ pub struct CargoVersionPayload {
     /// `features2` — v2-extra features map. `None` → omitted from
     /// the line.
     pub features2: Option<serde_json::Value>,
-    /// `pubtime` — publish timestamp, RFC 3339 UTC. `None` → omitted
-    /// from the line (never emitted as `null`). See the struct-level
-    /// doc for the per-repo-kind source and precedence.
+    /// `pubtime` — publish timestamp, emitted in cargo's strict
+    /// `serde_pubtime` wire format (`yyyy-mm-ddThh:mm:ssZ`), truncating
+    /// any sub-second precision. `None` → omitted from the line (never
+    /// emitted as `null`). See the struct-level doc for the per-repo-kind
+    /// source and precedence.
     pub pubtime: Option<DateTime<Utc>>,
 }
 
