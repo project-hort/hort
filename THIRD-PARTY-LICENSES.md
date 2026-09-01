@@ -226,7 +226,7 @@ the result instead.
 | universal-hash | 0.5.1 | MIT | https://github.com/RustCrypto/traits |
 | cvss | 2.2.0 | MIT | https://github.com/rustsec/rustsec |
 | tower-http | 0.6.10 | MIT | https://github.com/tower-rs/tower-http |
-| tower-http | 0.7.0 | MIT | https://github.com/tower-rs/tower-http |
+| tower-http | 0.7.1 | MIT | https://github.com/tower-rs/tower-http |
 | crypto_secretbox | 0.1.1 | MIT | https://github.com/RustCrypto/nacl-compat/tree/master/crypto_secretbox |
 | http-body | 1.0.1 | MIT | https://github.com/hyperium/http-body |
 | http-body-util | 0.1.3 | MIT | https://github.com/hyperium/http-body |
@@ -9898,7 +9898,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### tower-http 0.7.0 — MIT
+### tower-http 0.7.1 — MIT
 
 Repository: https://github.com/tower-rs/tower-http
 
