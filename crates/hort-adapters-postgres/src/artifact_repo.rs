@@ -411,6 +411,43 @@ impl ArtifactRepository for PgArtifactRepository {
         })
     }
 
+    fn list_distinct_names_after(
+        &self,
+        repository_id: Uuid,
+        after: Option<&str>,
+        limit: u64,
+    ) -> BoxFuture<'_, DomainResult<Vec<String>>> {
+        let after = after.map(str::to_string);
+        let limit = limit as i64;
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Artifact",
+                %repository_id,
+                has_cursor = after.is_some(),
+                "list_distinct_names_after"
+            );
+            // Same byte-stable `ORDER BY name` as `list_distinct_names`;
+            // `$2 IS NULL` starts at the beginning, otherwise the keyset
+            // `name > $2` resumes strictly after the cursor. A cursor
+            // naming a since-deleted artifact degrades gracefully — the
+            // comparison simply lands on the next existing name.
+            let names: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT name FROM artifacts \
+                 WHERE repository_id = $1 AND deleted_at IS NULL \
+                   AND ($2::text IS NULL OR name > $2) \
+                 ORDER BY name \
+                 LIMIT $3",
+            )
+            .bind(repository_id)
+            .bind(&after)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", "distinct_names_after"))?;
+            Ok(names)
+        })
+    }
+
     fn find_by_name_in_repo(
         &self,
         repository_id: Uuid,
@@ -717,15 +754,59 @@ impl ArtifactRepository for PgArtifactRepository {
         })
     }
 
+    fn package_version_publish_times(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> BoxFuture<'_, DomainResult<Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)>>> {
+        let pkg = package.to_owned();
+        Box::pin(async move {
+            tracing::debug!(
+                entity = "Artifact",
+                %repository_id,
+                package = %pkg,
+                "package_version_publish_times"
+            );
+            // Cargo-pubtime-only read: a heap fetch for `created_at` /
+            // `upstream_published_at`, deliberately NOT folded into the
+            // `package_version_status` covering-index scan (see the port
+            // doc-comment). Low-QPS — called once per cargo proxy
+            // sparse-index serve, not on every format's serve path.
+            let rows: Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
+                "SELECT version, created_at, upstream_published_at \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND name = $2 \
+                   AND version IS NOT NULL \
+                   AND deleted_at IS NULL",
+            )
+            .bind(repository_id)
+            .bind(&pkg)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", &pkg))?;
+            Ok(rows)
+        })
+    }
+
     fn find_pypi_wheels_without_kind(
         &self,
         kind: &str,
         limit: u32,
+        after: Option<Uuid>,
+        skip_marker_kind: Option<&str>,
     ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
         let kind = kind.to_owned();
         let limit = limit as i64;
+        let skip_marker_kind = skip_marker_kind.map(str::to_owned);
         Box::pin(async move {
-            tracing::debug!(entity = "Artifact", %kind, %limit, "find_pypi_wheels_without_kind");
+            tracing::debug!(
+                entity = "Artifact",
+                %kind,
+                %limit,
+                has_cursor = after.is_some(),
+                has_skip_marker_kind = skip_marker_kind.is_some(),
+                "find_pypi_wheels_without_kind"
+            );
             // Backfill candidacy. Wheels-only (`path LIKE '%.whl'`) AND
             // no `content_references` row of the given kind. The
             // `NOT EXISTS` correlated subquery is index-friendly —
@@ -733,18 +814,36 @@ impl ArtifactRepository for PgArtifactRepository {
             // `(repository_id, source_artifact_id, kind)`, so the EXISTS
             // probe is a single index dive per candidate row.
             //
-            // Resumable by construction (no cursor, no "claimed" marker):
-            // a failed batch leaves the candidate set unchanged; the next
-            // invocation re-derives the same set minus rows that landed
-            // a `wheel_metadata` ContentReference during this run.
+            // `$3::uuid` keyset cursor: NULL means no lower bound (the
+            // first page of a run); otherwise `id > $3`. `$4::text`
+            // durable-skip-marker exclusion: NULL (the operator's
+            // `ignore_skip_markers: true`) applies no second predicate;
+            // otherwise a second NOT EXISTS excludes rows already marked
+            // permanently unprocessable under that kind.
+            //
+            // Resumable across invocations by construction: a fresh
+            // invocation starts with `after = NULL`; a failed page leaves
+            // the candidate set unchanged, and the next invocation
+            // re-derives the same set minus rows that landed a
+            // `wheel_metadata` (processed) or skip-marker (structurally
+            // unprocessable) ContentReference.
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE path LIKE '%.whl' \
                    AND deleted_at IS NULL \
+                   AND ($3::uuid IS NULL OR id > $3) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM content_references \
                        WHERE source_artifact_id = artifacts.id \
                          AND kind = $1 \
+                   ) \
+                   AND ( \
+                       $4::text IS NULL \
+                       OR NOT EXISTS ( \
+                           SELECT 1 FROM content_references \
+                           WHERE source_artifact_id = artifacts.id \
+                             AND kind = $4 \
+                       ) \
                    ) \
                  ORDER BY id \
                  LIMIT $2"
@@ -752,6 +851,8 @@ impl ArtifactRepository for PgArtifactRepository {
             let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(&kind)
                 .bind(limit)
+                .bind(after)
+                .bind(&skip_marker_kind)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Artifact", "find_pypi_wheels_without_kind"))?;
@@ -767,14 +868,19 @@ impl ArtifactRepository for PgArtifactRepository {
         &self,
         kind: &str,
         limit: u32,
+        after: Option<Uuid>,
+        skip_marker_kind: Option<&str>,
     ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
         let kind = kind.to_owned();
         let limit = limit as i64;
+        let skip_marker_kind = skip_marker_kind.map(str::to_owned);
         Box::pin(async move {
             tracing::debug!(
                 entity = "Artifact",
                 %kind,
                 %limit,
+                has_cursor = after.is_some(),
+                has_skip_marker_kind = skip_marker_kind.is_some(),
                 "find_oci_image_manifests_without_kind"
             );
             // Backfill candidacy. Manifest-shaped rows only (`path LIKE
@@ -789,14 +895,27 @@ impl ArtifactRepository for PgArtifactRepository {
             // mirrors `resolve_media_type`'s own fallback to the
             // single-image default and is exactly the pre-metadata-
             // migration shape this backfill targets.
+            //
+            // `$5::uuid` keyset cursor and `$6::text` durable-skip-marker
+            // exclusion mirror `find_pypi_wheels_without_kind`'s `$3`/`$4`
+            // — see that method's doc for the resumability contract.
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
                  WHERE path LIKE 'manifests/sha256:%' \
                    AND deleted_at IS NULL \
+                   AND ($5::uuid IS NULL OR id > $5) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM content_references \
                        WHERE source_artifact_id = artifacts.id \
                          AND kind = $1 \
+                   ) \
+                   AND ( \
+                       $6::text IS NULL \
+                       OR NOT EXISTS ( \
+                           SELECT 1 FROM content_references \
+                           WHERE source_artifact_id = artifacts.id \
+                             AND kind = $6 \
+                       ) \
                    ) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM artifact_metadata \
@@ -811,6 +930,8 @@ impl ArtifactRepository for PgArtifactRepository {
                 .bind(limit)
                 .bind(hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE)
                 .bind(hort_domain::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE)
+                .bind(after)
+                .bind(&skip_marker_kind)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| {
@@ -1584,6 +1705,102 @@ mod tests {
         cleanup_repo(&pool, repo).await;
     }
 
+    /// Seeds one artifact row with an explicit `upstream_published_at`
+    /// (vs. [`seed_artifact_status`], which always leaves it NULL) — the
+    /// fixture [`package_version_publish_times_precedence`] needs to
+    /// exercise both the `Some` and `None` cases.
+    async fn seed_artifact_with_publish_time(
+        pool: &PgPool,
+        repo: Uuid,
+        name: &str,
+        version: &str,
+        upstream_published_at: Option<DateTime<Utc>>,
+        seed: usize,
+    ) {
+        let id = Uuid::new_v4();
+        let path = format!("simple/{name}/{name}-{version}-{seed:04}.tar.gz");
+        let sha256 = deterministic_hex64(seed ^ 0x5EED_0000_usize);
+        sqlx::query(
+            r#"INSERT INTO artifacts (
+                   id, repository_id, name, name_as_published, version, path,
+                   size_bytes, checksum_sha256, content_type, storage_key,
+                   quarantine_status, upstream_published_at
+               ) VALUES (
+                   $1, $2, $3, $3, $4, $5,
+                   0, $6, 'application/octet-stream', $6,
+                   'released', $7
+               )"#,
+        )
+        .bind(id)
+        .bind(repo)
+        .bind(name)
+        .bind(version)
+        .bind(&path)
+        .bind(&sha256)
+        .bind(upstream_published_at)
+        .execute(pool)
+        .await
+        .expect("seed publish-time artifact");
+    }
+
+    /// Round-trip test for
+    /// [`ArtifactRepository::package_version_publish_times`] — the
+    /// timestamp source for the cargo sparse-index `pubtime` field.
+    ///
+    /// Three versions: one with `upstream_published_at` set (precedence
+    /// winner), one with it NULL (falls back to `created_at` at the
+    /// use-case layer — this adapter just returns both columns
+    /// verbatim), and a third version that is NEVER seeded at all —
+    /// proving "never locally ingested" surfaces as row absence, not a
+    /// `None`-valued row.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn package_version_publish_times_precedence() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        // Deterministic, microsecond-precision timestamp — TIMESTAMPTZ
+        // round-trips at microsecond resolution; `Utc::now()` raw carries
+        // nanosecond precision and can fail equality after round-trip.
+        let upstream_ts: DateTime<Utc> = "2026-01-15T09:20:00Z".parse().unwrap();
+        seed_artifact_with_publish_time(&pool, repo, "leftpad", "1.0.0", Some(upstream_ts), 0)
+            .await;
+        seed_artifact_with_publish_time(&pool, repo, "leftpad", "1.1.0", None, 1).await;
+        // "1.2.0" is deliberately never seeded — never-ingested.
+
+        let r = repo_under_test(&pool).await;
+        let mut rows = r
+            .package_version_publish_times(repo, "leftpad")
+            .await
+            .expect("package_version_publish_times");
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        assert_eq!(rows.len(), 2, "only the two seeded versions have rows");
+        assert_eq!(rows[0].0, "1.0.0");
+        assert_eq!(
+            rows[0].2,
+            Some(upstream_ts),
+            "upstream_published_at round-trips verbatim"
+        );
+        assert_eq!(rows[1].0, "1.1.0");
+        assert_eq!(
+            rows[1].2, None,
+            "NULL upstream_published_at round-trips as None"
+        );
+        assert!(
+            rows.iter()
+                .all(|(_, created_at, _)| *created_at <= Utc::now()),
+            "created_at is always populated (NOT NULL column)"
+        );
+        assert!(
+            rows.iter().all(|(v, ..)| v != "1.2.0"),
+            "a never-ingested version produces no row at all"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
     /// `upstream_published_at` round-trips through the
     /// `bind_artifact_params` write path and the `SELECT_COLS` +
     /// `ArtifactRow` read path. Two artifacts in one serial test: one
@@ -2055,6 +2272,37 @@ mod tests {
         .expect("seed wheel_metadata content_reference");
     }
 
+    /// Insert a `content_references` row of an arbitrary `kind` pointing
+    /// the given source artifact at an arbitrary (well-formed) content
+    /// hash. Generalises [`seed_wheel_metadata_ref`] (fixed at
+    /// `kind = 'wheel_metadata'`) so the skip-marker exclusion tests can
+    /// seed `'wheel_metadata_skipped'` / `'oci_membership_skipped'` rows
+    /// without a bespoke helper per marker kind.
+    async fn seed_content_reference(
+        pool: &PgPool,
+        repo_id: Uuid,
+        source_artifact_id: Uuid,
+        kind: &str,
+        seed: usize,
+    ) {
+        let target_hash = deterministic_hex64(seed ^ 0xB16B_00B5_usize);
+        sqlx::query(
+            r#"INSERT INTO content_references (
+                   repository_id, source_artifact_id, target_content_hash,
+                   kind, metadata, recorded_at
+               ) VALUES (
+                   $1, $2, $3, $4, '{}'::jsonb, now()
+               )"#,
+        )
+        .bind(repo_id)
+        .bind(source_artifact_id)
+        .bind(&target_hash)
+        .bind(kind)
+        .execute(pool)
+        .await
+        .expect("seed content_reference");
+    }
+
     /// Empty result on a repo with no wheels at all. Pins the cold-start
     /// no-op (the simplest contract the handler relies on: an empty
     /// candidate set yields summary all-zero).
@@ -2067,7 +2315,7 @@ mod tests {
         let repo = seed_repo(&pool).await;
         let r = repo_under_test(&pool).await;
         let got = r
-            .find_pypi_wheels_without_kind("wheel_metadata", 100)
+            .find_pypi_wheels_without_kind("wheel_metadata", 100, None, None)
             .await
             .expect("query");
         assert!(got.is_empty(), "no wheels seeded → empty candidate set");
@@ -2102,7 +2350,7 @@ mod tests {
 
         let r = repo_under_test(&pool).await;
         let got = r
-            .find_pypi_wheels_without_kind("wheel_metadata", 100)
+            .find_pypi_wheels_without_kind("wheel_metadata", 100, None, None)
             .await
             .expect("query");
 
@@ -2136,7 +2384,7 @@ mod tests {
 
         let r = repo_under_test(&pool).await;
         let got = r
-            .find_pypi_wheels_without_kind("wheel_metadata", 3)
+            .find_pypi_wheels_without_kind("wheel_metadata", 3, None, None)
             .await
             .expect("query");
         assert_eq!(got.len(), 3, "LIMIT 3 must yield exactly 3 candidates");
@@ -2199,7 +2447,7 @@ mod tests {
         let repo = seed_repo(&pool).await;
         let r = repo_under_test(&pool).await;
         let got = r
-            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .find_oci_image_manifests_without_kind("oci_config", 100, None, None)
             .await
             .expect("query");
         assert!(got.is_empty(), "no manifests seeded → empty candidate set");
@@ -2258,7 +2506,7 @@ mod tests {
 
         let r = repo_under_test(&pool).await;
         let got = r
-            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .find_oci_image_manifests_without_kind("oci_config", 100, None, None)
             .await
             .expect("query");
         let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
@@ -2314,7 +2562,7 @@ mod tests {
 
         let r = repo_under_test(&pool).await;
         let got = r
-            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .find_oci_image_manifests_without_kind("oci_config", 100, None, None)
             .await
             .expect("query");
         assert!(
@@ -2349,7 +2597,7 @@ mod tests {
 
         let r = repo_under_test(&pool).await;
         let got = r
-            .find_oci_image_manifests_without_kind("oci_config", 100)
+            .find_oci_image_manifests_without_kind("oci_config", 100, None, None)
             .await
             .expect("query");
         let got_ids: std::collections::HashSet<Uuid> = got.iter().map(|a| a.id).collect();
@@ -2378,10 +2626,211 @@ mod tests {
 
         let r = repo_under_test(&pool).await;
         let got = r
-            .find_oci_image_manifests_without_kind("oci_config", 3)
+            .find_oci_image_manifests_without_kind("oci_config", 3, None, None)
             .await
             .expect("query");
         assert_eq!(got.len(), 3, "LIMIT 3 must yield exactly 3 candidates");
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `after` keyset cursor for the OCI candidacy query — mirrors
+    /// `find_pypi_wheels_without_kind_after_cursor_excludes_lower_ids`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_after_cursor_excludes_lower_ids() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        for seed in 520..525 {
+            let hex = deterministic_hex64(seed);
+            let _ =
+                seed_artifact_at_path(&pool, repo, &format!("manifests/sha256:{hex}"), seed).await;
+        }
+
+        let r = repo_under_test(&pool).await;
+        let page1 = r
+            .find_oci_image_manifests_without_kind("oci_config", 3, None, None)
+            .await
+            .expect("page 1 query");
+        assert_eq!(page1.len(), 3, "first page honours LIMIT 3");
+        let cursor = page1.iter().map(|a| a.id).max();
+
+        let page2 = r
+            .find_oci_image_manifests_without_kind("oci_config", 3, cursor, None)
+            .await
+            .expect("page 2 query");
+        assert_eq!(page2.len(), 2, "second page drains the remaining 2");
+
+        let page1_ids: std::collections::HashSet<Uuid> = page1.iter().map(|a| a.id).collect();
+        let page2_ids: std::collections::HashSet<Uuid> = page2.iter().map(|a| a.id).collect();
+        assert!(
+            page1_ids.is_disjoint(&page2_ids),
+            "the cursor MUST NOT re-return a row from the prior page"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `skip_marker_kind` for the OCI candidacy query — mirrors
+    /// `find_pypi_wheels_without_kind_skip_marker_kind_excludes_marked_rows`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_skip_marker_kind_excludes_marked_rows() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let marked = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:1111000000000000000000000000000000000000000000000000000000000000",
+            530,
+        )
+        .await;
+        seed_content_reference(&pool, repo, marked, "oci_membership_skipped", 530).await;
+
+        let unmarked = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:2222000000000000000000000000000000000000000000000000000000000000",
+            531,
+        )
+        .await;
+
+        let r = repo_under_test(&pool).await;
+
+        let excluding = r
+            .find_oci_image_manifests_without_kind(
+                "oci_config",
+                100,
+                None,
+                Some("oci_membership_skipped"),
+            )
+            .await
+            .expect("query with marker exclusion");
+        let excluding_ids: std::collections::HashSet<Uuid> =
+            excluding.iter().map(|a| a.id).collect();
+        assert_eq!(
+            excluding_ids,
+            [unmarked].into_iter().collect(),
+            "the marked row must be excluded when skip_marker_kind is Some"
+        );
+
+        let ignoring = r
+            .find_oci_image_manifests_without_kind("oci_config", 100, None, None)
+            .await
+            .expect("query with marker exclusion lifted");
+        let ignoring_ids: std::collections::HashSet<Uuid> = ignoring.iter().map(|a| a.id).collect();
+        assert_eq!(
+            ignoring_ids,
+            [marked, unmarked].into_iter().collect(),
+            "ignore_skip_markers (skip_marker_kind = None) re-surfaces the marked row"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `after` keyset cursor: seed 5 candidates, page through with a
+    /// LIMIT smaller than the total, and confirm the cursor excludes
+    /// every row already returned — the in-run keyset advance a single
+    /// task run relies on to walk past a full page of skips without
+    /// re-reading it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_pypi_wheels_without_kind_after_cursor_excludes_lower_ids() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        for seed in 500..505 {
+            let _ =
+                seed_artifact_at_path(&pool, repo, &format!("files/cursor-{seed}.whl"), seed).await;
+        }
+
+        let r = repo_under_test(&pool).await;
+        let page1 = r
+            .find_pypi_wheels_without_kind("wheel_metadata", 3, None, None)
+            .await
+            .expect("page 1 query");
+        assert_eq!(page1.len(), 3, "first page honours LIMIT 3");
+        let cursor = page1.iter().map(|a| a.id).max();
+
+        let page2 = r
+            .find_pypi_wheels_without_kind("wheel_metadata", 3, cursor, None)
+            .await
+            .expect("page 2 query");
+        assert_eq!(page2.len(), 2, "second page drains the remaining 2");
+
+        let page1_ids: std::collections::HashSet<Uuid> = page1.iter().map(|a| a.id).collect();
+        let page2_ids: std::collections::HashSet<Uuid> = page2.iter().map(|a| a.id).collect();
+        assert!(
+            page1_ids.is_disjoint(&page2_ids),
+            "the cursor MUST NOT re-return a row from the prior page"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// `skip_marker_kind`: a row carrying the marker kind is excluded
+    /// when the marker kind is passed as `Some(..)`, and re-surfaces
+    /// when the caller passes `None` (the operator's
+    /// `ignore_skip_markers: true`) — the durable structural-skip
+    /// exclusion and its explicit override.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_pypi_wheels_without_kind_skip_marker_kind_excludes_marked_rows() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        let marked =
+            seed_artifact_at_path(&pool, repo, "files/skip-marked-1.0.0-py3-none-any.whl", 510)
+                .await;
+        // Seeded under a distinct kind literal — the marker row, not the
+        // `wheel_metadata` "already processed" row.
+        seed_content_reference(&pool, repo, marked, "wheel_metadata_skipped", 510).await;
+
+        let unmarked = seed_artifact_at_path(
+            &pool,
+            repo,
+            "files/skip-unmarked-1.0.0-py3-none-any.whl",
+            511,
+        )
+        .await;
+
+        let r = repo_under_test(&pool).await;
+
+        let excluding = r
+            .find_pypi_wheels_without_kind(
+                "wheel_metadata",
+                100,
+                None,
+                Some("wheel_metadata_skipped"),
+            )
+            .await
+            .expect("query with marker exclusion");
+        let excluding_ids: std::collections::HashSet<Uuid> =
+            excluding.iter().map(|a| a.id).collect();
+        assert_eq!(
+            excluding_ids,
+            [unmarked].into_iter().collect(),
+            "the marked row must be excluded when skip_marker_kind is Some"
+        );
+
+        let ignoring = r
+            .find_pypi_wheels_without_kind("wheel_metadata", 100, None, None)
+            .await
+            .expect("query with marker exclusion lifted");
+        let ignoring_ids: std::collections::HashSet<Uuid> = ignoring.iter().map(|a| a.id).collect();
+        assert_eq!(
+            ignoring_ids,
+            [marked, unmarked].into_iter().collect(),
+            "ignore_skip_markers (skip_marker_kind = None) re-surfaces the marked row"
+        );
 
         cleanup_repo(&pool, repo).await;
     }
@@ -3042,6 +3491,70 @@ mod tests {
             err.to_string().to_lowercase().contains("unique"),
             "expected a unique-violation, got {err}"
         );
+
+        cleanup_repo(&pool, repo_id).await;
+    }
+
+    /// `list_distinct_names_after` — the keyset variant `PrefetchTickHandler`
+    /// rotates against. Byte-stable `ORDER BY name`, resumes strictly
+    /// after the cursor, and a cursor naming a since-deleted (here:
+    /// never-existed) name degrades gracefully to the next existing
+    /// entry rather than erroring or getting stuck.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn list_distinct_names_after_orders_by_name_and_resumes_past_cursor() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let adapter = repo_under_test(&pool).await;
+
+        for (i, name) in ["alpha", "beta", "gamma"].iter().enumerate() {
+            let path = format!("simple/{name}/{name}-0.tar.gz");
+            let sha256 = deterministic_hex64(i ^ 0xD157_1000);
+            sqlx::query(
+                r#"INSERT INTO artifacts (
+                       id, repository_id, name, name_as_published, version, path,
+                       size_bytes, checksum_sha256, content_type, storage_key
+                   ) VALUES (
+                       $1, $2, $3, $3, '0', $4,
+                       0, $5, 'application/octet-stream', $5
+                   )"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo_id)
+            .bind(name)
+            .bind(&path)
+            .bind(&sha256)
+            .execute(&pool)
+            .await
+            .expect("seed named artifact");
+        }
+
+        let all = adapter
+            .list_distinct_names_after(repo_id, None, 100)
+            .await
+            .expect("list_distinct_names_after");
+        assert_eq!(
+            all,
+            vec!["alpha", "beta", "gamma"],
+            "byte-stable ORDER BY name"
+        );
+
+        let after_alpha = adapter
+            .list_distinct_names_after(repo_id, Some("alpha"), 100)
+            .await
+            .expect("list_distinct_names_after cursor");
+        assert_eq!(after_alpha, vec!["beta", "gamma"]);
+
+        // "alp" never existed as a name (it sorts strictly between
+        // nothing and "alpha") — a cursor at a gap degrades gracefully
+        // to every entry actually greater than it.
+        let after_gap = adapter
+            .list_distinct_names_after(repo_id, Some("alp"), 100)
+            .await
+            .expect("list_distinct_names_after cursor on gap");
+        assert_eq!(after_gap, vec!["alpha", "beta", "gamma"]);
 
         cleanup_repo(&pool, repo_id).await;
     }

@@ -49,7 +49,7 @@ use hort_formats::npm::NpmFormatHandler;
 use hort_formats::pypi::PyPiFormatHandler;
 
 use crate::config::MinimalConfig;
-use crate::telemetry;
+use crate::{pg_identity, telemetry};
 
 /// Arguments to `hort-server reconcile-groups`.
 #[derive(Debug, Args)]
@@ -84,7 +84,7 @@ async fn run_async(args: ReconcileGroupsArgs) -> anyhow::Result<ReconcileReport>
     );
 
     let pool = PgPoolOptions::new()
-        .connect(&cfg.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.database_url)?)
         .await
         .context("connecting to postgres")?;
 

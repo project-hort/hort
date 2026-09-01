@@ -135,6 +135,26 @@ pub struct MockArtifactRepository {
     /// caller's identity actually reaches the port instead of being
     /// dropped on the way — the event attribution depends on it.
     deletions: Mutex<Vec<(Uuid, Actor)>>,
+    /// Every
+    /// [`find_pypi_wheels_without_kind`](ArtifactRepository::find_pypi_wheels_without_kind)
+    /// call, in order, with its full argument set. Lets a test assert the
+    /// in-run keyset cursor advances correctly across the handler's
+    /// internal page loop, and that `ignore_skip_markers` reaches the
+    /// port call as the documented `skip_marker_kind` toggle.
+    pypi_calls: Mutex<Vec<CandidacyCall>>,
+    /// Mirrors [`Self::pypi_calls`] for
+    /// [`find_oci_image_manifests_without_kind`](ArtifactRepository::find_oci_image_manifests_without_kind).
+    oci_calls: Mutex<Vec<CandidacyCall>>,
+}
+
+/// One recorded call to either backfill-candidacy query. See
+/// [`MockArtifactRepository::pypi_calls`] / `oci_calls`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidacyCall {
+    pub kind: String,
+    pub limit: u32,
+    pub after: Option<Uuid>,
+    pub skip_marker_kind: Option<String>,
 }
 
 impl MockArtifactRepository {
@@ -147,6 +167,8 @@ impl MockArtifactRepository {
             oci_image_manifests_without_kind_filter: Mutex::new(None),
             first_seen_errors: Mutex::new(std::collections::VecDeque::new()),
             deletions: Mutex::new(Vec::new()),
+            pypi_calls: Mutex::new(Vec::new()),
+            oci_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -190,6 +212,21 @@ impl MockArtifactRepository {
         allowed: Option<std::collections::HashSet<Uuid>>,
     ) {
         *self.oci_image_manifests_without_kind_filter.lock().unwrap() = allowed;
+    }
+
+    /// Every recorded call to `find_pypi_wheels_without_kind`, in order.
+    /// Used to assert the in-run keyset cursor sequence
+    /// (`after` advancing page over page within one handler `run()`) and
+    /// that `ignore_skip_markers` reaches the port call as the documented
+    /// `skip_marker_kind` toggle.
+    pub fn pypi_calls(&self) -> Vec<CandidacyCall> {
+        self.pypi_calls.lock().unwrap().clone()
+    }
+
+    /// Mirrors [`Self::pypi_calls`] for
+    /// `find_oci_image_manifests_without_kind`.
+    pub fn oci_calls(&self) -> Vec<CandidacyCall> {
+        self.oci_calls.lock().unwrap().clone()
     }
 
     pub fn insert(&self, artifact: Artifact) {
@@ -714,6 +751,32 @@ impl ArtifactRepository for MockArtifactRepository {
         Box::pin(async move { Ok(triples) })
     }
 
+    fn package_version_publish_times(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> BoxFut<'_, DomainResult<Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)>>> {
+        // Cargo-pubtime-only read. Mirrors the SQL adapter's
+        // `package_version_publish_times`: row presence in the map is
+        // the "locally ingested" signal — a version with no matching
+        // artifact produces no row.
+        let pkg = package.to_owned();
+        let mut rows: Vec<(String, DateTime<Utc>, Option<DateTime<Utc>>)> = self
+            .artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|a| a.repository_id == repository_id && a.name == pkg)
+            .filter_map(|a| {
+                a.version
+                    .clone()
+                    .map(|v| (v, a.created_at, a.upstream_published_at))
+            })
+            .collect();
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        Box::pin(async move { Ok(rows) })
+    }
+
     /// Mock for the backfill candidacy query. Mirrors
     /// the SQL contract:
     /// - `path LIKE '%.whl'` (wheel-shaped artifacts only)
@@ -735,9 +798,17 @@ impl ArtifactRepository for MockArtifactRepository {
     /// to inject a per-test allowlist of artifact ids.
     fn find_pypi_wheels_without_kind(
         &self,
-        _kind: &str,
+        kind: &str,
         limit: u32,
+        after: Option<Uuid>,
+        skip_marker_kind: Option<&str>,
     ) -> BoxFut<'_, DomainResult<Vec<Artifact>>> {
+        self.pypi_calls.lock().unwrap().push(CandidacyCall {
+            kind: kind.to_string(),
+            limit,
+            after,
+            skip_marker_kind: skip_marker_kind.map(str::to_owned),
+        });
         let filter = self.pypi_wheels_without_kind_filter.lock().unwrap().clone();
         let mut items: Vec<Artifact> = self
             .artifacts
@@ -751,9 +822,13 @@ impl ArtifactRepository for MockArtifactRepository {
                         None => true,
                         // Filter seeded — only ids in the set are candidates
                         // (i.e. the test is modelling "these artifacts
-                        // have no `wheel_metadata` row").
+                        // have no `wheel_metadata` row" — and, once a
+                        // structural-skip marker lands, "no marker row
+                        // either").
                         Some(allowed) => allowed.contains(&a.id),
                     }
+                    // Keyset cursor — mirrors the adapter's `id > $after`.
+                    && after.is_none_or(|cursor| a.id > cursor)
             })
             .cloned()
             .collect();
@@ -773,9 +848,17 @@ impl ArtifactRepository for MockArtifactRepository {
     /// via [`Self::set_oci_image_manifests_without_kind_filter`].
     fn find_oci_image_manifests_without_kind(
         &self,
-        _kind: &str,
+        kind: &str,
         limit: u32,
+        after: Option<Uuid>,
+        skip_marker_kind: Option<&str>,
     ) -> BoxFut<'_, DomainResult<Vec<Artifact>>> {
+        self.oci_calls.lock().unwrap().push(CandidacyCall {
+            kind: kind.to_string(),
+            limit,
+            after,
+            skip_marker_kind: skip_marker_kind.map(str::to_owned),
+        });
         let filter = self
             .oci_image_manifests_without_kind_filter
             .lock()
@@ -792,6 +875,8 @@ impl ArtifactRepository for MockArtifactRepository {
                         None => true,
                         Some(allowed) => allowed.contains(&a.id),
                     }
+                    // Keyset cursor — mirrors the adapter's `id > $after`.
+                    && after.is_none_or(|cursor| a.id > cursor)
             })
             .cloned()
             .collect();
@@ -3963,6 +4048,36 @@ impl RefRegistryPort for MockRefRegistryPort {
 // MockRefLifecyclePort — records move/retire calls + applies projection.
 // ---------------------------------------------------------------------------
 
+/// One-shot injection queue entry for `move_ref`. Each successive call
+/// to the port consumes the front of the queue (if any); when the queue
+/// is empty the port proceeds with the default `Committed` path.
+///
+/// Mirrors [`GroupCommitInjection`] — `RefAlreadyExists` exercises the
+/// concurrent-create retry, `Conflict` exercises the ADR 0060
+/// append-conflict retry adopted by `RefUseCase::set_existing_with_retry`.
+#[derive(Debug, Clone)]
+pub enum RefCommitInjection {
+    /// Short-circuit the next `move_ref` call with the given outcome
+    /// (`Committed` or `RefAlreadyExists`). No projection or event
+    /// application happens.
+    Outcome(RefCommitOutcome),
+    /// Short-circuit the next `move_ref` call with
+    /// `Err(DomainError::Conflict(reason))`. When `concurrent_write` is
+    /// `Some`, it is written into the shared [`MockRefRegistryPort`]
+    /// BEFORE the error is returned — simulating the concurrent
+    /// writer whose commit is the reason for this conflict, so a
+    /// caller's subsequent re-read observes it deterministically
+    /// (no real concurrency / sleep-based timing needed in tests).
+    Conflict {
+        reason: String,
+        concurrent_write: Option<MutableRef>,
+    },
+    /// Short-circuit the next `move_ref` call with an arbitrary
+    /// non-`Conflict` [`DomainError`] — exercises the passthrough
+    /// (non-retried) error path.
+    Error(DomainError),
+}
+
 /// Records each `move_ref` / `retire_ref` call and applies the projection
 /// write against a shared [`MockRefRegistryPort`] so assertions can inspect
 /// the post-state.
@@ -3982,11 +4097,9 @@ pub struct MockRefLifecyclePort {
     retires: Mutex<Vec<(Uuid, String, String, AppendEvents)>>,
     move_calls: AtomicUsize,
     retire_calls: AtomicUsize,
-    /// FIFO queue of outcomes to return from `move_ref`. A
-    /// `RefAlreadyExists` entry short-circuits: nothing is recorded,
-    /// the projection is untouched, the outcome is returned verbatim.
-    /// An empty queue falls through to the default `Committed` path.
-    move_injections: Mutex<Vec<RefCommitOutcome>>,
+    /// FIFO queue of injections to apply to `move_ref`. See
+    /// [`RefCommitInjection`].
+    move_injections: Mutex<Vec<RefCommitInjection>>,
 }
 
 impl MockRefLifecyclePort {
@@ -4003,7 +4116,49 @@ impl MockRefLifecyclePort {
 
     /// Enqueue the outcome for the next `move_ref` call. Fires FIFO.
     pub fn inject_move_outcome(&self, outcome: RefCommitOutcome) {
-        self.move_injections.lock().unwrap().push(outcome);
+        self.move_injections
+            .lock()
+            .unwrap()
+            .push(RefCommitInjection::Outcome(outcome));
+    }
+
+    /// Enqueue a `DomainError::Conflict` for the next `move_ref` call.
+    /// Fires FIFO alongside [`Self::inject_move_outcome`]'s queue.
+    pub fn inject_move_conflict(&self, reason: impl Into<String>) {
+        self.move_injections
+            .lock()
+            .unwrap()
+            .push(RefCommitInjection::Conflict {
+                reason: reason.into(),
+                concurrent_write: None,
+            });
+    }
+
+    /// Enqueue an arbitrary non-`Conflict` [`DomainError`] for the next
+    /// `move_ref` call.
+    pub fn inject_move_error(&self, err: DomainError) {
+        self.move_injections
+            .lock()
+            .unwrap()
+            .push(RefCommitInjection::Error(err));
+    }
+
+    /// Enqueue a `DomainError::Conflict` for the next `move_ref` call
+    /// that ALSO writes `concurrent_write` into the shared registry
+    /// before returning — deterministically simulating "a concurrent
+    /// writer's commit is why this call lost."
+    pub fn inject_move_conflict_with_concurrent_write(
+        &self,
+        reason: impl Into<String>,
+        concurrent_write: MutableRef,
+    ) {
+        self.move_injections
+            .lock()
+            .unwrap()
+            .push(RefCommitInjection::Conflict {
+                reason: reason.into(),
+                concurrent_write: Some(concurrent_write),
+            });
     }
 
     /// Snapshot of every `(ref_post_state, batch)` produced by `move_ref`.
@@ -4047,19 +4202,31 @@ impl RefLifecyclePort for MockRefLifecyclePort {
                 Some(q.remove(0))
             }
         };
-        if let Some(outcome) = injection {
-            match outcome {
-                RefCommitOutcome::Committed => {
+        if let Some(injection) = injection {
+            match injection {
+                RefCommitInjection::Outcome(RefCommitOutcome::Committed) => {
                     // Inject a no-op Committed (unused today, but cheap
                     // to support): still records + applies the projection.
                     self.moves.lock().unwrap().push((r.clone(), batch));
                     self.refs.insert(r);
                     return Box::pin(async move { Ok(RefCommitOutcome::Committed) });
                 }
-                RefCommitOutcome::RefAlreadyExists { existing_id } => {
+                RefCommitInjection::Outcome(RefCommitOutcome::RefAlreadyExists { existing_id }) => {
                     return Box::pin(async move {
                         Ok(RefCommitOutcome::RefAlreadyExists { existing_id })
                     });
+                }
+                RefCommitInjection::Conflict {
+                    reason,
+                    concurrent_write,
+                } => {
+                    if let Some(winner) = concurrent_write {
+                        self.refs.insert(winner);
+                    }
+                    return Box::pin(async move { Err(DomainError::Conflict(reason)) });
+                }
+                RefCommitInjection::Error(err) => {
+                    return Box::pin(async move { Err(err) });
                 }
             }
         }
@@ -5882,6 +6049,19 @@ pub struct MockJobsRepository {
     /// When `Some`, the retention sweep returns
     /// this row count instead of the seeded list.
     prefetch_retention_deleted_count: Mutex<Option<u64>>,
+    /// Recorded calls to `delete_terminal_scan_rows_older_than`. Each
+    /// call appends the `Duration` argument.
+    scan_retention_calls: Mutex<Vec<std::time::Duration>>,
+    /// When `Some`, the scan-row retention sweep returns this row
+    /// count instead of the default 0.
+    scan_retention_deleted_count: Mutex<Option<u64>>,
+    /// Seed map for `last_result_summary_by_kind`, keyed by `kind`. A
+    /// cross-tick rotation test drives the handler repeatedly and calls
+    /// [`Self::set_last_result_summary_by_kind`] between simulated
+    /// ticks with the previous tick's `TaskOutcome::Completed.result_summary`
+    /// — mirroring what the real dispatcher persists via
+    /// `mark_completed` and the next tick's fresh job row reads back.
+    last_result_summary_by_kind: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 /// Recorded call to `enqueue_scan` — used by the manual-rescan use case
@@ -5922,6 +6102,9 @@ impl Default for MockJobsRepository {
             prefetch_batch_error: Mutex::new(None),
             prefetch_retention_calls: Mutex::new(Vec::new()),
             prefetch_retention_deleted_count: Mutex::new(None),
+            scan_retention_calls: Mutex::new(Vec::new()),
+            scan_retention_deleted_count: Mutex::new(None),
+            last_result_summary_by_kind: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -6082,6 +6265,33 @@ impl MockJobsRepository {
     pub fn set_prefetch_retention_deleted_count(&self, count: u64) {
         *self.prefetch_retention_deleted_count.lock().unwrap() = Some(count);
     }
+
+    /// Recorded calls to `delete_terminal_scan_rows_older_than`. Each
+    /// call appends the horizon argument the sweep ran with.
+    pub fn scan_retention_calls(&self) -> Vec<std::time::Duration> {
+        self.scan_retention_calls.lock().unwrap().clone()
+    }
+
+    /// Make `delete_terminal_scan_rows_older_than`
+    /// return the configured row count on the next call. Default is 0.
+    pub fn set_scan_retention_deleted_count(&self, count: u64) {
+        *self.scan_retention_deleted_count.lock().unwrap() = Some(count);
+    }
+
+    /// Seed the value `last_result_summary_by_kind(kind)` returns.
+    /// A cross-tick rotation test calls this between simulated ticks
+    /// with the previous tick's `result_summary`, standing in for the
+    /// dispatcher's `mark_completed` write the real worker performs.
+    pub fn set_last_result_summary_by_kind(
+        &self,
+        kind: impl Into<String>,
+        value: serde_json::Value,
+    ) {
+        self.last_result_summary_by_kind
+            .lock()
+            .unwrap()
+            .insert(kind.into(), value);
+    }
 }
 
 impl JobsRepository for MockJobsRepository {
@@ -6126,6 +6336,19 @@ impl JobsRepository for MockJobsRepository {
             .unwrap()
             .push((job_id, last_error.to_string()));
         Box::pin(async { Ok(()) })
+    }
+
+    fn last_result_summary_by_kind<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, DomainResult<Option<serde_json::Value>>> {
+        let value = self
+            .last_result_summary_by_kind
+            .lock()
+            .unwrap()
+            .get(kind)
+            .cloned();
+        Box::pin(async move { Ok(value) })
     }
 
     fn enqueue_scan<'a>(
@@ -6336,6 +6559,19 @@ impl JobsRepository for MockJobsRepository {
         self.prefetch_retention_calls.lock().unwrap().push(horizon);
         let count = self
             .prefetch_retention_deleted_count
+            .lock()
+            .unwrap()
+            .unwrap_or(0);
+        Box::pin(async move { Ok(count) })
+    }
+
+    fn delete_terminal_scan_rows_older_than<'a>(
+        &'a self,
+        horizon: std::time::Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        self.scan_retention_calls.lock().unwrap().push(horizon);
+        let count = self
+            .scan_retention_deleted_count
             .lock()
             .unwrap()
             .unwrap_or(0);

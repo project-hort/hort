@@ -62,6 +62,7 @@ metadata:
     hort-server.io/job: eventstore-checkpoint
 spec:
   schedule: {{ .Values.scheduledTasks.eventstoreCheckpoint.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3

@@ -57,6 +57,28 @@ OIDC issuer and bind `VAULT_JWT_ROLE` to this project.
 | `SONAR_HOST_URL` | *(unset)* | SonarQube/SonarCloud base URL. |
 | `SONAR_PROJECT_KEY` / `SONAR_ORGANIZATION` | *(unset)* | Optional — point at a specific Sonar project. Static analysis config lives in `sonar-project.properties`. |
 
+`sonar-project.properties` sets `sonar.qualitygate.wait=true`, so
+`quality:sonar` waits for the server-side quality-gate computation and fails
+the scanner step on a red gate. The job blocks the pipeline: a red gate means
+the change is not done, and an expired token fails the pipeline the same way.
+
+A second job, `quality:sonar-findings`, reads the gate verdict back and
+prints it to the job log — the failing conditions, open issues (worst
+severity first), and unreviewed security hotspots — since nothing else in
+the pipeline surfaces what the scanner uploaded. It runs even when
+`quality:sonar` fails, needs that job's `.scannerwork/report-task.txt`
+artifact for the project key, and exits cleanly with a one-line explanation
+if that artifact is missing (scanner skipped or died before upload). The
+script lives at `scripts/ci/sonar-findings.sh`.
+
+Clippy findings reach Sonar via import rather than a second in-scanner run:
+`test:lint` writes `cargo clippy`'s JSON output to `clippy-report.json` and
+exports it as an artifact; `sonar-project.properties` points
+`sonar.rust.clippyReport.reportPaths` at that file and sets
+`sonar.rust.clippy.enabled=false` (the community-rust analyzer would
+otherwise try to run `cargo clippy` itself inside the scanner image, where
+there is no cargo, and fail).
+
 ## Runner prerequisites
 
 - **Executor.** The `KUBERNETES_*` resource requests/limits apply to the GitLab

@@ -55,8 +55,8 @@ fi
 expectations() {
     cat <<'EOF'
 test-values-extra-ca-with-cm.yaml|HORT_EXTRA_CA_BUNDLE|2|Recipe A: env var rendered on BOTH server + worker (auto-mount source set ⇒ env set)
-test-values-extra-ca-with-cm.yaml|extra-ca-bundle|9|Recipe A: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2) + checksum annotation (1)
-test-values-extra-ca-with-cm.yaml|defaultMode: 0444|4|Recipe A: read-only 0444 ConfigMap volume on server + worker + scrub + quarantineReleaseSweep
+test-values-extra-ca-with-cm.yaml|extra-ca-bundle|11|Recipe A: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2) + scanRowRetentionSweep mount+vol (2) + checksum annotation (1)
+test-values-extra-ca-with-cm.yaml|defaultMode: 0444|5|Recipe A: read-only 0444 ConfigMap volume on server + worker + scrub + quarantineReleaseSweep + scanRowRetentionSweep
 test-values-extra-ca-with-cm.yaml|checksum/extra-ca-bundle:|1|Pod-template checksum annotation rendered for the ConfigMap source
 test-values-extra-ca-unset.yaml|HORT_EXTRA_CA_BUNDLE|0|env var NOT rendered when no auto-mount source set
 test-values-extra-ca-unset.yaml|extra-ca-bundle|0|volume NOT rendered when no auto-mount source set
@@ -66,10 +66,10 @@ test-values-extra-ca-path-only.yaml|HORT_EXTRA_CA_BUNDLE|0|manual recipe: chart 
 test-values-extra-ca-path-only.yaml|extra-ca-bundle|0|manual recipe: chart mounts NOTHING (no dangling volumeMount — the prior path-only cronjob volumeMount bug is fixed)
 test-values-extra-ca-path-only.yaml|checksum/extra-ca-bundle:|0|annotation NOT rendered when no auto-mount source is set
 test-values-extra-ca-with-secret.yaml|HORT_EXTRA_CA_BUNDLE|2|Recipe A-Secret: env var rendered on BOTH server + worker (secretName auto-mount ⇒ env set), symmetric with configMapName
-test-values-extra-ca-with-secret.yaml|extra-ca-bundle|8|Recipe A-Secret: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2); NO checksum annotation (Secret path)
-test-values-extra-ca-with-secret.yaml|defaultMode: 0444|4|Recipe A-Secret: read-only 0444 Secret volume on server + worker + scrub + quarantineReleaseSweep
+test-values-extra-ca-with-secret.yaml|extra-ca-bundle|10|Recipe A-Secret: server mount+vol (2) + worker mount+vol (2) + scrub mount+vol (2) + quarantineReleaseSweep mount+vol (2) + scanRowRetentionSweep mount+vol (2); NO checksum annotation (Secret path)
+test-values-extra-ca-with-secret.yaml|defaultMode: 0444|5|Recipe A-Secret: read-only 0444 Secret volume on server + worker + scrub + quarantineReleaseSweep + scanRowRetentionSweep
 test-values-extra-ca-with-secret.yaml|checksum/extra-ca-bundle:|0|Recipe A-Secret: no checksum annotation for the Secret source (Secret updates propagate via Kubernetes, not via helm-upgrade re-render)
-test-values-extra-ca-with-secret.yaml|corporate-ca-bundle-secret|4|Recipe A-Secret: the Secret name renders in the volume secretName on server + worker + scrub + quarantineReleaseSweep
+test-values-extra-ca-with-secret.yaml|corporate-ca-bundle-secret|5|Recipe A-Secret: the Secret name renders in the volume secretName on server + worker + scrub + quarantineReleaseSweep + scanRowRetentionSweep
 test-values-worker-extra-ca-recipe-b.yaml|HORT_EXTRA_CA_BUNDLE|1|manual recipe: ONLY the operator-supplied worker.extraEnv sets the env (chart sets none; server has no extraEnv ⇒ 0 there)
 test-values-worker-extra-ca-recipe-b.yaml|extra-ca-bundle|0|manual recipe: NO chart-managed extra-ca-bundle volume/mount
 test-values-worker-extra-ca-recipe-b.yaml|recipe-b-worker-ca|2|operator-supplied worker.extraVolumes name renders as both volumeMount and volume
@@ -91,7 +91,7 @@ test-values-ephemeral-secret-split.yaml|key: "DURABLE_URL"|1|durable secretKeyRe
 test-values-rotation.yaml|name: .*-service-account-rotation|1|rotation CronJob renders from the SINGLE toggle scheduledTasks.serviceAccountRotation.enabled (under scheduledTasks.adminTasksEnabled)
 test-values-rotation.yaml|name: hort-server-rotation-|6|per-namespace Role + RoleBinding render for both target namespaces (2 namespaces × 3 name refs each — Role metadata.name + RoleBinding metadata.name + RoleBinding roleRef.name)
 test-values-rotation.yaml|HORT_K8S_SECRET_WRITER_ENABLED|1|the SINGLE toggle scheduledTasks.serviceAccountRotation.enabled ALSO drives the worker-side wiring — HORT_K8S_SECRET_WRITER_ENABLED renders on the worker (no separate worker.rotation.enabled)
-test-values-cronjobs.yaml|^kind: CronJob$|13|thirteen CronJobs render — the eleven scheduledTasks.adminTasksEnabled-gated admin-task entries (noop, staging-sweep, cron-rescan-tick, advisory-watch-tick, eventstore-checkpoint, replay-seen-prune, scanner-registry-prune, retention-evaluate, retention-purge, eventstore-archive, verify-event-chain — the last now default-on, ADR 0057) PLUS the always-on dsn-direct quarantineReleaseSweep (gated on scheduledTasks.quarantineReleaseSweep.enabled, default true) PLUS the always-on dsn-direct CAS scrub (gated on scheduledTasks.scrub.enabled, default true). wheelMetadataBackfill stays default-disabled and does NOT count.
+test-values-cronjobs.yaml|^kind: CronJob$|14|fourteen CronJobs render — the eleven scheduledTasks.adminTasksEnabled-gated admin-task entries (noop, staging-sweep, cron-rescan-tick, advisory-watch-tick, eventstore-checkpoint, replay-seen-prune, scanner-registry-prune, retention-evaluate, retention-purge, eventstore-archive, verify-event-chain — the last now default-on, ADR 0057) PLUS the always-on dsn-direct quarantineReleaseSweep (gated on scheduledTasks.quarantineReleaseSweep.enabled, default true) PLUS the always-on dsn-direct CAS scrub (gated on scheduledTasks.scrub.enabled, default true) PLUS the always-on dsn-direct scanRowRetentionSweep (gated on scheduledTasks.scanRowRetentionSweep.enabled, default true). prefetchRowRetentionSweep and wheelMetadataBackfill stay default-disabled and do NOT count.
 test-values-cronjobs.yaml|name: hort-server-cron-rescan-tick$|1|cron-rescan-tick CronJob renders with conventional release-name suffix
 test-values-cronjobs.yaml|name: hort-server-advisory-watch-tick$|1|advisory-watch-tick CronJob renders with conventional release-name suffix
 test-values-cronjobs.yaml|name: hort-server-staging-sweep$|1|staging-sweep CronJob renders with conventional release-name suffix
@@ -103,7 +103,7 @@ test-values-cronjobs.yaml|^                - retention-evaluate$|1|retention-eva
 test-values-cronjobs.yaml|^                - retention-purge$|1|retention-purge CronJob invokes the correct hort-cli task kind
 test-values-cronjobs.yaml|^                - eventstore-archive$|1|eventstore-archive CronJob invokes the correct hort-cli task kind
 test-values-cronjobs.yaml|^                - day$|3|exactly the three retention CronJobs carry --idempotency-key-window day (<UTC-date>:<kind> contract; cron-rescan/svc-rotation use minute)
-test-values-cronjobs.yaml|^  concurrencyPolicy: Forbid$|13|every CronJob (incl. the 3 retention + the always-on quarantineReleaseSweep + the always-on scrub + scanner-registry-prune + the now-default-on verify-event-chain, ADR 0057) sets concurrencyPolicy: Forbid (single-active layer 1; worker semaphore is layer 2)
+test-values-cronjobs.yaml|^  concurrencyPolicy: Forbid$|14|every CronJob (incl. the 3 retention + the always-on quarantineReleaseSweep + the always-on scrub + the always-on scanRowRetentionSweep + scanner-registry-prune + the now-default-on verify-event-chain, ADR 0057) sets concurrencyPolicy: Forbid (single-active layer 1; worker semaphore is layer 2)
 test-values-cronjobs.yaml|name: hort-server-job-bootstrap-egress$|1|additive Job-scoped bootstrap-egress NetworkPolicy renders when networkPolicy.enabled (chart default true)
 test-values-cronjobs.yaml|^kind: NetworkPolicy$|2|BOTH the app-pod NetworkPolicy and the additive Job-scoped policy render with the chart-default networkPolicy.enabled: true
 test-values-cronjobs.yaml|key: hort-server.io/job|1|the Job-scoped policy selects by the hort-server.io/job label Exists (never the app pods)
@@ -124,8 +124,8 @@ test-values-worker-metrics.yaml|app.kubernetes.io/component: worker|7|the `-work
 test-values-dex.yaml|hort-server.io/component: dex|6|auth.dex.enabled renders the Dex sidecar trio (ConfigMap + Service + Deployment) — 6 component-label lines: ConfigMap metadata (1) + Service metadata + podSelector (2) + Deployment metadata + selector + pod-template (3)
 test-values-dex.yaml|ghcr.io/dexidp/dex|1|auth.dex.enabled renders the Dex Deployment with the configured Dex image
 test-values-dex.yaml|/etc/dex/config.yaml|1|the Dex Deployment serves the mounted config (dex serve /etc/dex/config.yaml)
-test-values-dex.yaml|value: "https://registry.example.com/dex"|3|auth.dex.enabled overrides HORT_OIDC_ISSUER_URL to auth.dex.issuerUrl on the server Deployment AND the two DSN-direct runtimeEnv CronJobs (scrub + quarantineReleaseSweep)
-test-values-dex.yaml|^ +value: "hort-cli"$|3|auth.dex.enabled overrides HORT_OIDC_AUDIENCE to auth.dex.cliClientId (Dex mints the cli-flow token; its aud is the Dex client id, NOT auth.oidc.audience) — on the server Deployment AND the two DSN-direct runtimeEnv CronJobs; mirrors the issuer override and the Ansible flavor
+test-values-dex.yaml|value: "https://registry.example.com/dex"|4|auth.dex.enabled overrides HORT_OIDC_ISSUER_URL to auth.dex.issuerUrl on the server Deployment AND the three DSN-direct runtimeEnv CronJobs (scrub + quarantineReleaseSweep + scanRowRetentionSweep)
+test-values-dex.yaml|^ +value: "hort-cli"$|4|auth.dex.enabled overrides HORT_OIDC_AUDIENCE to auth.dex.cliClientId (Dex mints the cli-flow token; its aud is the Dex client id, NOT auth.oidc.audience) — on the server Deployment AND the three DSN-direct runtimeEnv CronJobs; mirrors the issuer override and the Ansible flavor
 test-values-token-exchange-happy.yaml|hort-server.io/component: dex|0|auth.dex.enabled default false ⇒ NO Dex sidecar renders (negative counterpart to test-values-dex.yaml)
 test-values-svc-tokens-multi.yaml|name: issue-token$|1|two-entry svcTokens: exactly one bare `issue-token` init container (the first, backward-compatible entry)
 test-values-svc-tokens-multi.yaml|name: issue-token-uat-smoke$|1|two-entry svcTokens: the second entry gets its own suffixed init container
@@ -139,6 +139,11 @@ test-values-svc-tokens-rotate-entry.yaml|^            - --rotate$|1|per-entry ro
 test-values-svc-tokens-rotate-global.yaml|^            - --rotate$|2|blanket scheduledTasks.rotateSvcToken=true reaches EVERY entry's init container as --rotate, even with no per-entry rotate set
 test-values-svc-tokens-repository.yaml|^            - --repository=maven-proxy$|1|per-entry repository:maven-proxy on only the second entry reaches ONLY that entry's init container as --repository
 test-values-svc-tokens-repository.yaml|repository=maven-proxy|1|exactly one entry declares repository — the first (unscoped) entry renders NO --repository flag at all
+test-values.yaml|helm.sh/hook-weight: "-10"|2|both pre-pull DaemonSets (server + worker) render at weight -10, strictly before the migrate hook's -5 (prePull.enabled + worker.enabled default true)
+test-values.yaml|helm.sh/hook-weight: "-9"|1|the pre-pull wait/cleanup Job renders at weight -9 — between the DaemonSets (-10) and the migrate hook (-5)
+test-values.yaml|^kind: DaemonSet$|2|both prepull DaemonSets (server + worker) render by default
+test-values-prepull-disabled.yaml|prepull|0|prePull.enabled=false renders NEITHER DaemonSet, NOR the wait Job, NOR its RBAC (all four resource names contain "prepull")
+test-values-prepull-disabled.yaml|^kind: NetworkPolicy$|2|prePull.enabled=false has no effect on the unrelated NetworkPolicy pair (still networkPolicy.enabled default true)
 EOF
 }
 
@@ -156,6 +161,19 @@ test-values-cronjobs.yaml|templates/worker-deployment.yaml|mountPath: /var/lib/h
 test-values-ha.yaml|templates/deployment.yaml|app.kubernetes.io/component: server|2|server Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the existing pod-template label (1) — matchLabels stays a subset of the pod labels
 test-values-ha.yaml|templates/worker-deployment.yaml|app.kubernetes.io/component: worker|3|worker Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the Deployment metadata label (1) + pod-template label (1)
 test-values-ha.yaml|templates/pdb.yaml|app.kubernetes.io/component: server|1|the server-only PDB's selector.matchLabels carries the component discriminator so it no longer also matches worker pods, which have no PDB of their own
+test-values.yaml|templates/prepull-daemonset.yaml|ghcr.io/project-hort/hort-server:|1|the server pre-pull DaemonSet's init container pulls the SAME image repository as the server Deployment
+test-values.yaml|templates/prepull-daemonset.yaml|args: \["--version"\]|1|the init container forces the pull via the no-op --version command (no new binary surface)
+test-values.yaml|templates/prepull-worker-daemonset.yaml|ghcr.io/project-hort/hort-worker:|1|the worker pre-pull DaemonSet's init container pulls the SAME image repository as the worker Deployment
+test-values.yaml|templates/prepull-job.yaml|rollout status daemonset/.*-prepull-server|1|the wait Job blocks on the server pre-pull DaemonSet's rollout before it can succeed
+test-values.yaml|templates/prepull-job.yaml|rollout status daemonset/.*-prepull-worker|1|the wait Job blocks on the worker pre-pull DaemonSet's rollout before it can succeed
+test-values-prepull-nodeselector.yaml|templates/prepull-daemonset.yaml|server-pool|1|the server pre-pull DaemonSet inherits the top-level nodeSelector (same placement as the server Deployment)
+test-values-prepull-nodeselector.yaml|templates/prepull-daemonset.yaml|worker-pool|0|the server pre-pull DaemonSet does NOT inherit the worker's nodeSelector
+test-values-prepull-nodeselector.yaml|templates/prepull-worker-daemonset.yaml|worker-pool|1|the worker pre-pull DaemonSet inherits worker.nodeSelector (same placement as the worker Deployment)
+test-values-prepull-nodeselector.yaml|templates/prepull-worker-daemonset.yaml|server-pool|0|the worker pre-pull DaemonSet does NOT inherit the top-level (server) nodeSelector
+test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook: pre-install,pre-upgrade|3|all three pre-pull RBAC resources (ServiceAccount, Role, RoleBinding) are hook resources — a regular (non-hook) resource is only applied AFTER hooks complete, which is exactly the ordering bug this fixes
+test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook-weight: "-11"|3|all three pre-pull RBAC resources render at weight -11 — strictly before the pre-pull DaemonSets (-10) and the wait Job (-9), so the ServiceAccount exists before anything that needs it
+test-values.yaml|templates/prepull-rbac.yaml|helm.sh/hook-delete-policy: before-hook-creation$|3|all three pre-pull RBAC resources use before-hook-creation ONLY — pinning the failure mode: adding hook-succeeded here would delete the ServiceAccount before the weight -9 Job ever runs (non-workload kinds "succeed" the instant they're created)
+test-values.yaml|templates/prepull-rbac.yaml|hook-succeeded|0|none of the three pre-pull RBAC resources may carry hook-succeeded in their delete-policy (see row above for why)
 EOF
 }
 
@@ -188,6 +206,25 @@ test-values-strict-schema-typo.yaml|[Aa]dditional propert|the strict schema (add
 test-values-worker-metrics-no-scrapers.yaml|scrapeFrom|worker.metrics.enabled=true with an empty scrapeFrom must be rejected — an empty NetworkPolicy `from: []` means ALL sources (fail-OPEN) per the k8s spec, so the schema's `if enabled then scrapeFrom minItems 1` rule must fail the render rather than open the metrics port cluster-wide
 test-values-dex-broken.yaml|auth.dex.issuerUrl|auth.dex.enabled=true with an empty auth.dex.issuerUrl must fail schema validation — the chart points HORT_OIDC_ISSUER_URL at Dex so an empty issuer is rejected at render time
 test-values-svc-tokens-repository-typo.yaml|[Aa]dditional propert|a mistyped scheduledTasks.svcTokens[].repository key (repositroy) must fail schema validation — additionalProperties:false on the svcTokens item schema, mirroring the top-level strict-schema typo fixture
+EOF
+}
+
+# Generic per-CronJob `spec.timeZone` check.
+#
+# Unlike `expectations()` above (which pins an exact match count), this
+# does NOT hard-code how many CronJob templates the chart has — it
+# derives the expected count from the SAME render by counting
+# `kind: CronJob` documents, then asserts the `timeZone:` value shows up
+# once per CronJob document. A future `templates/cronjob-*.yaml` that
+# forgets to set `timeZone` under `schedule:` lowers the timeZone count
+# below the CronJob count and fails this check with no fixture-file edit
+# required — the opposite of a hard-coded template-name enumeration,
+# which a new template would silently bypass.
+# Format: `<fixture>|<expected timeZone value>|<human label>`.
+cronjob_timezone_checks() {
+    cat <<'EOF'
+test-values-cronjob-timezone.yaml|Etc/UTC|every rendered CronJob carries the chart-default scheduledTasks.timeZone
+test-values-cronjob-timezone-override.yaml|America/Los_Angeles|an overridden scheduledTasks.timeZone reaches every rendered CronJob (no per-job override exists)
 EOF
 }
 
@@ -352,6 +389,46 @@ while IFS='|' read -r fixture tmpl golden label; do
         failed=$((failed + 1))
     fi
 done < <(golden_checks)
+
+# Process the generic CronJob timeZone checks (see cronjob_timezone_checks()
+# above): count CronJob documents and timeZone occurrences in the SAME
+# render and assert they match, rather than pinning either count.
+while IFS='|' read -r fixture expected_tz label; do
+    [[ -z "${fixture}" ]] && continue
+    fixture_path="${chart_dir}/${fixture}"
+
+    if [[ ! -f "${fixture_path}" ]]; then
+        echo "FAIL: fixture missing: ${fixture}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" 2>&1); then
+        echo "FAIL: helm template failed for ${fixture}:" >&2
+        echo "${rendered}" | sed 's/^/    /' >&2
+        failed=$((failed + 1))
+        checked_fixtures+=("${fixture}")
+        continue
+    fi
+    checked_fixtures+=("${fixture}")
+
+    cronjob_count=$(printf '%s\n' "${rendered}" | grep -cE '^kind: CronJob$' || true)
+    timezone_count=$(printf '%s\n' "${rendered}" | grep -cF "timeZone: \"${expected_tz}\"" || true)
+
+    if [[ "${cronjob_count}" -eq 0 ]]; then
+        echo "FAIL: ${fixture} → ${label}" >&2
+        echo "    fixture rendered NO CronJob documents — nothing was checked" >&2
+        failed=$((failed + 1))
+    elif [[ "${cronjob_count}" -ne "${timezone_count}" ]]; then
+        echo "FAIL: ${fixture} → ${label}" >&2
+        echo "    kind: CronJob documents: ${cronjob_count}" >&2
+        echo "    timeZone: \"${expected_tz}\" occurrences: ${timezone_count}" >&2
+        echo "    at least one rendered CronJob is missing the expected timeZone" >&2
+        failed=$((failed + 1))
+    else
+        echo "PASS: ${fixture} → ${label} (${cronjob_count}/${cronjob_count} CronJobs)"
+    fi
+done < <(cronjob_timezone_checks)
 
 # Catch fixtures that have no expectations row — silently rendering
 # without any assertion is a regression magnet (someone adds a fixture,

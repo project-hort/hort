@@ -492,6 +492,17 @@ postgres:
     existingSecret: ""
     secretKey: DATABASE_URL
 
+# -------------------- Migrate Job --------------------
+migrate:
+  # HORT_ALLOW_RUNNING_FLEET — emergency override for the pre-install/
+  # pre-upgrade migrate Job's runtime fleet fence (ADR 0030 amendment (c)).
+  # The fence refuses to apply a pending contraction
+  # (migrations/CONTRACTIONS.toml) while an older-release hort-server/
+  # hort-worker is still connected. Default OFF: a rolling upgrade should
+  # let the old fleet roll off on its own. Set true only to force a
+  # migration through anyway — the Job logs loudly when it does.
+  allowRunningFleet: false
+
 # -------------------- Storage --------------------
 storage:
   # filesystem (PVC, RWO) | s3
@@ -801,6 +812,37 @@ affinity: {}
 # topologySpreadConstraints — pod placement: spread replicas across
 # topology keys (zones, hosts) for HA. List of full TSC entries.
 topologySpreadConstraints: []
+
+# -------------------- Pre-upgrade image pre-pull --------------------
+# A pre-install/pre-upgrade hook (weight -10, strictly before the migrate
+# hook's -5) that pre-pulls the release's hort-server / hort-worker images
+# onto every node eligible to run those workloads, BEFORE the schema is
+# touched. Closes the node-cache-miss window where the migrate hook (which
+# runs the new image) pulls it onto its own node while a DIFFERENT node
+# still needs to pull it for the new Deployment pod, inside the degraded
+# upgrade window. See templates/prepull-daemonset.yaml.
+prePull:
+  # Default ON. An operator on an external registry that already
+  # guarantees node-local image availability (or who has accepted the
+  # node-cache-miss risk) can opt out.
+  enabled: true
+  # Bounded wait (kubectl rollout status --timeout) for every eligible
+  # node to report a Ready pre-pull pod. A pull that has not completed by
+  # this deadline fails the upgrade before the migrate hook runs, rather
+  # than hanging indefinitely.
+  timeoutSeconds: 300
+  # kubectl image used by the wait/cleanup Job (see
+  # templates/prepull-job.yaml). Mirrors
+  # scheduledTasks.svcTokenKubectlImage — same rationale (Bitnami's
+  # mid-2025 repackaging moved older minor-version tags under
+  # `bitnamilegacy/`); override to match your cluster's API version.
+  kubectlImage: "bitnamilegacy/kubectl:1.33"
+  # Placeholder image for the pre-pull DaemonSets' long-running
+  # container. `registry.k8s.io/pause` is the sandbox image every node
+  # already pulls to run ANY pod at all — using it here adds NO new
+  # pull dependency while satisfying the DaemonSet API's
+  # `restartPolicy: Always` requirement.
+  pauseImage: "registry.k8s.io/pause:3.10"
 
 # -------------------- Service --------------------
 service:
@@ -1270,6 +1312,15 @@ gitopsConfig: {}
 # minute-granularity could merge two distinct windows into the same key.
 # Treat the 5-minute period as a hard floor on `schedule:` values.
 scheduledTasks:
+  # IANA time zone applied to EVERY chart CronJob's `spec.timeZone`
+  # (Kubernetes >= 1.27, stable). Changing this value shifts ALL chart
+  # schedules at once — there is no per-job override. Must be a
+  # non-empty IANA zone name (e.g. "Etc/UTC", "America/New_York").
+  # Default: "Etc/UTC" — every `schedule:` comment in this chart states
+  # its wall-clock time in UTC, and this default makes that promise true
+  # regardless of the kube-controller-manager's local time zone.
+  timeZone: "Etc/UTC"
+
   # Global master toggle for the `executionPath: admin-task` tasks
   # (replaces the pre-078 `cronJobs.enabled`). Must be true for any
   # admin-task CronJob template AND the service-account token bootstrap Job
@@ -1580,6 +1631,36 @@ scheduledTasks:
     # lower the sweep cadence, the more aggressive autovacuum must be).
     schedule: "0 2 * * *"
 
+  # -- Terminal-scan-row retention sweep --------------------
+  # Periodic scan-row-retention-sweep CronJob. Inserts ONE
+  # `kind='scan-row-retention-sweep'` row into `public.jobs` every tick
+  # using the RUNTIME DSN; the worker picks it up and dispatches to
+  # `ScanRowRetentionSweepHandler`, which deletes terminal
+  # `kind='scan'` rows older than the configured horizon (default 7
+  # days). Pairs with the per-table autovacuum tuning on `public.jobs`
+  # (migration 009: `autovacuum_vacuum_scale_factor = 0.02`). Every
+  # artifact scan — ingest plus every periodic rescan — leaves a
+  # terminal row forever without this sweep.
+  #
+  # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
+  # umbrella. Manual operator invocation still works via the
+  # `hort-http-admin-tasks` HTTP route.
+  scanRowRetentionSweep:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default true.** Unlike the prefetch cascade
+    # (opt-in per-repo), every artifact scan leaves a terminal
+    # `kind='scan'` row from day one — a fresh out-of-the-box
+    # deployment already accumulates rows, so the sweep ships enabled.
+    enabled: true
+    # Cron schedule. Default: daily at 03:00 UTC (offset from the
+    # prefetch-row sweep's 02:00 UTC so the two DSN-only CronJobs do
+    # not contend for the same minute). The 7-day retention horizon
+    # gives 6 days of headroom even after a missed run; daily cadence +
+    # autovacuum tuning is sufficient for production loads. Operators
+    # tightening below daily should also tighten
+    # `autovacuum_vacuum_scale_factor` on `public.jobs`.
+    schedule: "0 3 * * *"
+
   # -- Wheel-metadata backfill -----------------------------
   # Periodic wheel-metadata-backfill CronJob. Inserts ONE
   # `kind='wheel-metadata-backfill'` row into `public.jobs` every tick
@@ -1864,8 +1945,8 @@ scheduledTasks:
   # anything.
   #
   # UPGRADE NOTE: an existing install that never set this key GAINS this
-  # CronJob on upgrade. It runs daily at 02:00 by default. Set
-  # `enabled: false` to opt out.
+  # CronJob on upgrade. It runs daily at 02:00 by default
+  # (scheduledTasks.timeZone, default UTC). Set `enabled: false` to opt out.
   #
   # A deployment with no checkpoint anchor stays GREEN. The verifier
   # derives whether an anchor is expected from the same predicate the

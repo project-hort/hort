@@ -1,0 +1,30 @@
+# Pre-pull opt-out fixture (item 146). Same baseline as test-values.yaml
+# plus prePull.enabled=false — asserts the hook (both DaemonSets, the
+# wait/cleanup Job, and its RBAC) disables cleanly, with no NetworkPolicy
+# side effects (the additive Job-scoped policy is unrelated to this toggle).
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+  filesystem:
+    pvc:
+      enabled: true
+      size: 50Gi
+
+ephemeralStore:
+  backend: memory
+
+prePull:
+  enabled: false

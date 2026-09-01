@@ -433,6 +433,26 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // tuning on `public.jobs` (migration 009) — the sweep deletes
     // the rows, autovacuum reclaims the page space.
     "prefetch-row-retention-sweep",
+    // Terminal `kind='scan'` row retention sweep. Consumed by
+    // `ScanRowRetentionSweepHandler` in the worker. Periodically
+    // deletes `kind = 'scan'` rows whose `status IN ('completed',
+    // 'failed')` and whose `updated_at < now() - $horizon` (default
+    // 7 days). Every successful scan — including every periodic
+    // rescan — and every stranded-requeue exhaustion failure leaves a
+    // terminal row forever without this sweep; it bounds `jobs`-table
+    // growth the same way `prefetch-row-retention-sweep` bounds the
+    // cascade's growth. **`kind = 'scan'` exactly** — every other
+    // `jobs.kind` keeps its newest terminal row as durable state (the
+    // `verify-event-chain` liveness checkpoint being the canonical
+    // example), so this sweep's scope is deliberately narrower than
+    // `kind LIKE 'prefetch%'`. Non-destructive at the artifact level —
+    // only garbage-collects historical job rows; the row's absence
+    // does not change `select_eligible` (reads `artifacts.last_scan_at`
+    // + pending/running job existence, never terminal rows) or
+    // `select_stranded` (a deleted terminal `failed` row makes
+    // `last_job.status` resolve to `NULL`, which the widened stranded
+    // predicate already treats identically to `'failed'`) candidacy.
+    "scan-row-retention-sweep",
     // PEP 658 wheel-metadata backfill — consumed by
     // `WheelMetadataBackfillHandler` in the worker. The ingest
     // hook extracts wheel METADATA into CAS + a
@@ -449,11 +469,20 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // destructive — no artifact / event mutation; only derived-projection
     // rows are added. Operators run it once per deployment after upgrade;
     // the Helm CronJob ships default-disabled (no urgency to retrofit —
-    // pip's fallback is correct, just slower). Params:
-    // `{"batch_size": <int>}` (default 100, capped at 1000 per
-    // invocation). Run summary in `result_summary`:
-    // `{ artifacts_walked, metadata_extracted, skipped_no_metadata,
-    // errors }`.
+    // pip's fallback is correct, just slower). A single invocation walks
+    // its full candidate set via an in-run keyset cursor (paged at
+    // `batch_size`) rather than one page per invocation, so a run of
+    // permanently-unprocessable wheels ahead of a valid one cannot strand
+    // it; a structural skip (corrupt ZIP, no METADATA member, oversized
+    // METADATA) additionally writes a durable `wheel_metadata_skipped`
+    // marker so it leaves candidacy for good, while a transient skip
+    // (CAS/DB error) writes no marker and is retried on the next
+    // invocation. Params: `{"batch_size": <int>}` (default 100, capped at
+    // 1000 per page — bounds page size, not total run work) and
+    // `{"ignore_skip_markers": <bool>}` (default false; `true`
+    // re-surfaces previously-marked wheels). Run summary in
+    // `result_summary`: `{ artifacts_walked, metadata_extracted,
+    // skipped_structural, skipped_transient }`.
     "wheel-metadata-backfill",
     // Sigstore/cosign provenance verification (ADR 0027) — consumed
     // by `ProvenanceVerifyHandler` in the worker. Enqueued by the ingest
@@ -525,9 +554,16 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // `wheel-metadata-backfill`, this repairs a defect the ingest path can
     // no longer produce, so a recurring schedule would be permanent
     // scaffolding; operators invoke it once via the admin-tasks route.
-    // Params: `{"batch_size": <int>}` (default 100, capped at 1000). Run
-    // summary in `result_summary`: `{ rows_scanned, rows_repaired,
-    // edges_written, skipped_cas_missing, skipped_unparseable, errors }`.
+    // Mirrors `wheel-metadata-backfill`'s in-run keyset advance (a run
+    // walks its full candidate set across pages of `batch_size`, cursor
+    // advancing regardless of outcome) and durable structural-skip marker
+    // (`oci_membership_skipped`, excluded from candidacy unless the
+    // operator sets `ignore_skip_markers: true`) — see that task's doc
+    // comment above for the shared rationale. Params:
+    // `{"batch_size": <int>}` (default 100, capped at 1000 per page) and
+    // `{"ignore_skip_markers": <bool>}` (default false). Run summary in
+    // `result_summary`: `{ rows_scanned, rows_repaired, edges_written,
+    // skipped_structural, skipped_transient }`.
     "oci-membership-edge-backfill",
 ];
 
@@ -577,6 +613,7 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
     "prefetch",
     "prefetch-dependencies",
     "prefetch-row-retention-sweep",
+    "scan-row-retention-sweep",
     "wheel-metadata-backfill",
     "provenance-verify",
     "scanner-registry-prune",

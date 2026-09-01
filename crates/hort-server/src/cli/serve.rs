@@ -37,7 +37,7 @@ use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
 use crate::cli::rbac_refresh;
 use crate::config::{AuthConfig, Config, ConfigError};
 use crate::shutdown_deadline::{make_prometheus_inflight_reader, run_with_shutdown_deadline};
-use crate::{migrate, shutdown, storage, telemetry};
+use crate::{migrate, pg_identity, shutdown, storage, telemetry};
 
 /// Refuse to boot the server unless admin
 /// routes have an authenticator. The admin surface is mounted
@@ -206,7 +206,7 @@ async fn run_async() -> anyhow::Result<()> {
         });
     }
     let pool = pool_options
-        .connect(&cfg.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.database_url)?)
         .await
         .context("connecting to postgres")?;
     info!(

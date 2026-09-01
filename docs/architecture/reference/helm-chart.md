@@ -96,6 +96,10 @@ flipped on).
 | Deployment — server (`deployment.yaml`) | **Always** | runs `hort-server serve`. |
 | Service, ClusterIP (`service.yaml`) | **Always** | fronts the `http` port (and `metrics` port iff `metrics.bindAddr` non-empty). |
 | Job — migrate (`job-migrate.yaml`) | **Always** (pre-install/pre-upgrade hook) | `hort-server migrate` under the admin DSN. |
+| DaemonSet — pre-pull server (`prepull-daemonset.yaml`) | `prePull.enabled` (default **true**, pre-install/pre-upgrade hook) | pre-pulls the server image onto every node `deployment.yaml` can schedule onto. |
+| DaemonSet — pre-pull worker (`prepull-worker-daemonset.yaml`) | `prePull.enabled` **and** `worker.enabled` (pre-install/pre-upgrade hook) | pre-pulls the worker image onto every node `worker-deployment.yaml` can schedule onto. |
+| Job — pre-pull wait/cleanup (`prepull-job.yaml`) | `prePull.enabled` (pre-install/pre-upgrade hook) | blocks on both DaemonSets' rollout, then deletes them. |
+| SA+Role+RoleBinding — pre-pull (`prepull-rbac.yaml`) | `prePull.enabled` (pre-install/pre-upgrade hook) | lets the wait Job read/delete the pre-pull DaemonSets. |
 | ServiceAccount — server (`serviceaccount.yaml`) | `serviceAccount.create` (default **true**) | identity for server pods + scrub CronJob. |
 | PVC (`pvc.yaml`) | `storage.backend=filesystem` **and** `storage.filesystem.pvc.enabled` (default true) | CAS data volume; annotated `helm.sh/resource-policy: keep`. |
 | CronJob — scrub (`cronjob-scrub.yaml`) | `scheduledTasks.scrub.enabled` (default **true**) | `hort-server scrub` CAS integrity sweep. **`executionPath: dsn-direct`: gated by `scheduledTasks.scrub.enabled` alone — not by `scheduledTasks.adminTasksEnabled`.** |
@@ -114,6 +118,7 @@ flipped on).
 | CronJob — service-account-rotation (`cronjob-service-account-rotation.yaml`) | `scheduledTasks.adminTasksEnabled` **and** `scheduledTasks.serviceAccountRotation.enabled` | `hort-cli admin task invoke service-account-rotation`. |
 | CronJob — noop (`cronjob-noop.yaml`) | `scheduledTasks.adminTasksEnabled` **and** `scheduledTasks.noop.enabled` | `hort-cli admin task invoke noop` heartbeat. |
 | CronJob — quarantine-release-sweep (`cronjob-quarantine-release-sweep.yaml`) | `scheduledTasks.quarantineReleaseSweep.enabled` (default **true**) | `executionPath: dsn-direct` — `hort-server enqueue-quarantine-release-sweep`; not gated by `adminTasksEnabled`. |
+| CronJob — scan-row-retention-sweep (`cronjob-scan-row-retention-sweep.yaml`) | `scheduledTasks.scanRowRetentionSweep.enabled` (default **true**) | `executionPath: dsn-direct` — `hort-server enqueue-scan-row-retention-sweep`; not gated by `adminTasksEnabled`. |
 | CronJobs — prefetch-tick / prefetch-row-retention-sweep / wheel-metadata-backfill | each task's own `scheduledTasks.<task>.enabled` (all default **false**) | `executionPath: dsn-direct` — `hort-server enqueue-<task>`; not gated by `adminTasksEnabled`. |
 | CronJobs — retention-evaluate / retention-purge / eventstore-archive / eventstore-checkpoint / replay-seen-prune (default **true**) / scanner-registry-prune (default **true**) / verify-event-chain | `scheduledTasks.adminTasksEnabled` **and** the task's own `scheduledTasks.<task>.enabled` | `executionPath: admin-task` (`verify-event-chain` runs `hort-server verify-event-chain` directly but shares the `adminTasksEnabled` gate). |
 | Job — helm test (`tests/test-connection.yaml`) | only under `helm test` (test hook) | busybox `wget` poll of `/healthz`. |
@@ -126,23 +131,47 @@ does not appear in `helm template` output.
 
 ## 4. Helm hooks, install ordering & workload wiring
 
-Only three templates carry `helm.sh/hook` annotations:
+Seven templates carry `helm.sh/hook` annotations:
 
-| Job | Hook | Weight | Delete policy |
+| Job/DaemonSet | Hook | Weight | Delete policy |
 |---|---|---|---|
+| pre-pull RBAC (`<fullname>-prepull` SA+Role+RoleBinding) | `pre-install,pre-upgrade` | `-11` | `before-hook-creation` |
+| pre-pull DaemonSets (`<fullname>-prepull-server`, `<fullname>-prepull-worker`) | `pre-install,pre-upgrade` | `-10` | `before-hook-creation` |
+| pre-pull wait/cleanup (`<fullname>-prepull`) | `pre-install,pre-upgrade` | `-9` | `before-hook-creation,hook-succeeded` |
 | migrate (`<fullname>-migrate`) | `pre-install,pre-upgrade` | `-5` | `before-hook-creation,hook-succeeded` |
 | svc-token bootstrap (`<fullname>-svc-token-bootstrap`) | `post-install,post-upgrade` | `5` | `before-hook-creation` |
 | test-connection | `test` | — | `before-hook-creation,hook-succeeded` |
 
-**Ordering guarantee:** migrate Job (`pre-install`, w=-5) → all
-non-hook resources incl. server Deployment + bootstrap RBAC (w=0) →
-svc-token bootstrap Job (`post-install`, w=5). Net effect: the schema
-is migrated **before** the server serves; the service-account row and
-its RBAC exist before the token bootstrap runs; CronJobs are created in
-the main phase but only fire on schedule, by which time the bootstrap
-Job has populated the `-svc-token` Secret they mount. The migrate Job
-runs under the namespace `default` ServiceAccount on purpose — as a
-pre-install hook it precedes the SA template.
+**Ordering guarantee:** pre-pull RBAC (`pre-install`, w=-11) → pre-pull
+DaemonSets (w=-10) → pre-pull wait Job (w=-9) → migrate Job (w=-5) →
+all non-hook resources incl. server Deployment + bootstrap RBAC (w=0)
+→ svc-token bootstrap Job (`post-install`, w=5). Net effect: the
+pre-pull ServiceAccount exists before anything that needs it — Helm
+applies regular (non-hook) release resources only AFTER hooks
+complete, so without its own hook annotation the pre-pull RBAC would
+not exist yet when the weight -9 wait Job's pod is scheduled, on both
+upgrades and fresh installs; every node eligible to run the
+server/worker Deployments already holds the release image (the
+pre-pull wait Job blocked on it) **before** the migrate Job even
+starts — closing the node-cache-miss window where the migrate Job
+pulls the new image onto its own node while a different node still
+needs it for the real Deployment pod, inside the degraded upgrade
+window; the schema is migrated before the server serves; the
+service-account row and its RBAC exist before the token bootstrap
+runs; CronJobs are created in the main phase but only fire on
+schedule, by which time the bootstrap Job has populated the
+`-svc-token` Secret they mount. Helm's own hook-readiness wait tracks
+Job/Pod completion, not DaemonSet rollout, so the DaemonSets carry only
+`before-hook-creation` — the wait Job at w=-9 is the resource that
+actually blocks the upgrade, via `kubectl rollout status` bounded by
+`prePull.timeoutSeconds`. The pre-pull RBAC carries only
+`before-hook-creation` too, and deliberately never `hook-succeeded`:
+non-workload kinds count as "succeeded" the instant they're created, so
+`hook-succeeded` would delete the ServiceAccount before the weight -9
+Job ever runs — these resources linger between upgrades by design,
+replaced idempotently on the next attempt. The migrate Job runs under
+the namespace `default` ServiceAccount on purpose — as a pre-install
+hook it precedes the SA template.
 
 **What each workload runs** (`hort-server` / `hort-worker` / `hort-cli`):
 
@@ -150,6 +179,8 @@ pre-install hook it precedes the SA template.
 |---|---|
 | Deployment — server | `hort-server serve` (`args: ["serve"]`) |
 | Deployment — worker | `hort-worker` (image entrypoint = dispatcher default; no args) |
+| DaemonSet — pre-pull (server + worker) | init: `hort-server --version` / `hort-worker --version` (`--version` is a clap-provided flag handled before any config/DB access — forces the image pull and exits); main: `registry.k8s.io/pause` (keeps the pod Ready for `kubectl rollout status`, no new pull dependency) |
+| Job — pre-pull wait/cleanup | `kubectl rollout status daemonset/<fullname>-prepull-{server,worker} --timeout=<prePull.timeoutSeconds>s`, then `kubectl delete` both on success (image `prePull.kubectlImage`, default `bitnamilegacy/kubectl:1.33`) |
 | Job — migrate | `hort-server migrate` (`args: ["migrate"]`) under the **admin** DSN |
 | Job — svc-token bootstrap | init: `hort-server admin issue-svc-token --name=cronjob-tasks --permission=admin_task_invoke --output=file:/run/bootstrap/token`; main: `kubectl apply` of the Secret (image `scheduledTasks.svcTokenKubectlImage`, default `bitnamilegacy/kubectl:1.30`) |
 | CronJob — scrub | `hort-server scrub [--sample-fraction <scheduledTasks.scrub.samplingRate>] [--concurrency <scheduledTasks.scrub.concurrency>]` |

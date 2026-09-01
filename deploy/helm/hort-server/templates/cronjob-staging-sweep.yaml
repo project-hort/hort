@@ -33,6 +33,7 @@ metadata:
     hort-server.io/job: staging-sweep
 spec:
   schedule: {{ .Values.scheduledTasks.stagingSweep.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   # Forbid concurrent sweeps. A sweep that runs long (large staging table)
   # should not be interrupted by the next tick — the second run would see
   # the same expired uploads and perform duplicate work.

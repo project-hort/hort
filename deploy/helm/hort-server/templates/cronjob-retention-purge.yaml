@@ -42,6 +42,7 @@ metadata:
     hort-server.io/job: retention-purge
 spec:
   schedule: {{ .Values.scheduledTasks.retentionPurge.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3

@@ -113,7 +113,7 @@ use hort_domain::ports::event_chain_reader::EventChainReaderPort;
 
 use crate::composition;
 use crate::config::{MinimalConfig, StorageConfig};
-use crate::telemetry;
+use crate::{pg_identity, telemetry};
 
 /// The `result` label values for `hort_event_chain_verify_total`. The
 /// enum lives **with the emitting layer** (this `hort-server` subcommand),
@@ -414,7 +414,7 @@ async fn run_async(args: VerifyEventChainArgs) -> anyhow::Result<VerifySummary> 
     }
 
     let pool = PgPoolOptions::new()
-        .connect(&cfg.database_url)
+        .connect_with(pg_identity::connect_options(&cfg.database_url)?)
         .await
         .context("connecting to postgres (runtime DML DSN)")?;
 

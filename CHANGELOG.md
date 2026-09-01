@@ -7,6 +7,167 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.2] - 2026-09-01
+
+### Added
+
+- **Expand/contract policy for schema migrations, enforced by a structural
+  guard** (#214; incident record #215). Destructive DDL — `DROP COLUMN`,
+  `DROP TABLE`, a table/column `RENAME`, a column type change, `SET NOT NULL`
+  on an existing column — may now ship only in a release strictly *after* the
+  last release whose code referenced the identifier; expand and contract never
+  share a release. A migration set has to be applicable while the previous
+  release's binaries are still serving, and migration
+  `020_drop_artifacts_is_deleted.sql` was not: it dropped `artifacts.is_deleted`
+  in the same release (0.12.0) that removed the last code reference, so the
+  still-running 0.11.0 fleet failed every artifact query the moment the
+  pre-upgrade hook completed.
+
+  The policy is now mechanical. A new DB-free, git-free, sub-second guard
+  (`cargo test -p hort-app --test expand_contract_guard`, part of
+  `cargo test --workspace`) scans `migrations/` for destructive DDL and
+  cross-checks it against a checked-in manifest,
+  `migrations/CONTRACTIONS.toml`. It fails when a contraction is undeclared or
+  declared inexactly, when the workspace version is not strictly greater than
+  the entry's `reference_removed_in`, or when the workspace's production
+  sources still name a removed identifier. The manifest is seeded with the
+  tree's existing destructive migrations, with `020` recorded as the incident
+  exemplar. See [ADR
+  0030](docs/adr/0030-sensitive-surface-structural-guards.md).
+
+- **`docs/architecture/how-to/deploy/upgrade.md`** — operator upgrade how-to:
+  what the expand/contract guarantee buys on a routine upgrade, how to handle
+  a release carrying a `### Migration notice` (two-step upgrade, or a
+  maintenance window), why self-hosting deployments that mirror their own
+  images have no safety net during an API-degrading window, and why automated
+  Flux remediation must be suspended for a flagged release — an automatic
+  chart rollback against a forward-only contraction pins the outage instead of
+  clearing it.
+
+- **Chart pre-upgrade image pre-pull hook.** A new `prePull.enabled`
+  (default true) pre-install/pre-upgrade hook pre-pulls the release's
+  `hort-server` / `hort-worker` images onto every node eligible to run
+  those Deployments, strictly before the migrate hook runs. Closes the
+  node-cache-miss window where the migrate hook pulls the new image onto
+  its own node while a different node still needs it for the real
+  Deployment pod, inside the degraded upgrade window.
+
+- **Cargo sparse-index lines now carry an optional `pubtime`** (#217),
+  the version's publish timestamp in RFC 3339 UTC — omitted, never
+  invented, when hort has no timestamp for a version. Hosted repositories
+  serve the artifact's own `created_at`; proxy repositories serve the
+  upstream-asserted publish time when hort has it, else the artifact's
+  own first-seen-here `created_at`, else omit the field entirely for a
+  version hort has never pulled through; virtual repositories pass the
+  winning member's value through unchanged. Closes the gap where
+  Renovate's crate datasource, finding no `pubtime`, fell back to an
+  unimplemented per-version API route and lost the timestamp
+  `minimumReleaseAge`-style rules depend on. One-way outward only: the
+  served field is derived from data hort already owns and is never read
+  back into any release or quarantine decision.
+
+- **Terminal scan-job rows are garbage-collected.** Every scan — each
+  periodic rescan included — left a terminal row in the jobs table
+  forever, and a scanner outage grew permanent `failed` rows at roughly
+  one per stranded artifact per retry-exhaustion cycle, with no ceiling
+  and no cleanup. A new `scan-row-retention-sweep` (worker task + daily
+  Helm CronJob, enabled by default, `horizon_seconds` operator knob with
+  a 7-day default) deletes terminal `kind='scan'` rows past the horizon —
+  scoped to exactly that kind, because other kinds keep their newest
+  terminal row as durable state (the event-chain verifier's checkpoint).
+  Candidacy semantics are untouched: the rescan queries never read
+  terminal rows, and a stranded artifact selects identically whether its
+  last failed row exists or was swept. Migration 023 widens the
+  jobs-kind check for the new task kind (additive only). (#216)
+
+### Changed
+
+- **`quality:sonar` reads back its own quality-gate verdict, and clippy
+  findings now reach Sonar.** `sonar.qualitygate.wait=true` makes the
+  scanner wait on the server-side gate computation, and a `quality:sonar-findings`
+  job (still `allow_failure: true`) prints the gate's failing conditions, open
+  issues, and unreviewed security hotspots to the log so a red gate is never
+  silent. `test:lint` now emits `clippy-report.json`, which
+  `sonar-project.properties` imports via `sonar.rust.clippyReport.reportPaths`.
+  The scanner image is pinned by digest through the internal mirror instead of
+  tracking `:latest`.
+- **`quality:sonar` is now blocking.** The gate baseline is established and
+  clean on the integration trunk, so `allow_failure` is removed: a red gate
+  now fails the pipeline, and a dead/expired Sonar token fails it too (with
+  `quality:sonar-findings` explaining it as an auth failure) instead of
+  passing silently.
+- **`RELEASING.md`'s promotion checklist gains a Migration-notice step.** A
+  release whose migration set contains a contraction now carries a
+  `### Migration notice` changelog entry naming the dropped or narrowed
+  object, the minimum binary version that tolerates the change, and the
+  operator action, so a maintenance window can be planned rather than
+  discovered.
+
+### Fixed
+
+- **Chart CronJob schedules are now anchored to UTC by default instead of
+  controller-local time.** None of the chart's 18 CronJob templates set
+  `spec.timeZone`, so Kubernetes interpreted every `schedule:` in the
+  kube-controller-manager's local time zone — a template comment promising
+  "daily at 03:00 UTC" could fire at a different wall-clock hour depending on
+  the cluster. Every chart CronJob now renders `spec.timeZone` from the new
+  shared value `scheduledTasks.timeZone` (default `"Etc/UTC"`); operators
+  relying on the old local-time behavior can set `scheduledTasks.timeZone` to
+  their controller's zone.
+
+- **The wheel-metadata and OCI membership-edge backfills no longer
+  starve on permanent skips.** Both admin-task backfills walked
+  candidates `ORDER BY id LIMIT batch_size` with no cursor, and a
+  skipped item (corrupt wheel ZIP, no METADATA member, oversized
+  METADATA; an OCI manifest whose bytes don't parse or carry no
+  config-role reference) wrote nothing — so it never left candidacy nor
+  its position at the batch head. A backlog of ≥ `batch_size`
+  permanently-unprocessable rows with low ids meant the backfill never
+  progressed past them, reporting `Completed` every invocation while a
+  valid item behind them was never reached — the same starvation shape
+  as the quarantine-release sweep fixed for `#208`, here without a
+  release-authority stake. Each run now walks its full candidate set via
+  an in-run keyset cursor (`WHERE id > $after ORDER BY id LIMIT
+  $batch_size`, paged, cursor advanced after every page regardless of
+  outcome), and a **structural** skip (one re-running cannot change,
+  since CAS content is immutable) additionally writes a durable
+  `content_references` marker (`wheel_metadata_skipped` /
+  `oci_membership_skipped`) that permanently excludes the row from
+  candidacy — a **transient** skip (CAS/DB error) writes no marker and
+  is retried on the next invocation. New task param
+  `ignore_skip_markers` (default `false`) re-surfaces marked rows, e.g.
+  after a parser fix. Run-summary skip counters split into
+  `skipped_structural` / `skipped_transient` for both tasks (replacing
+  `skipped_no_metadata`/`errors` and
+  `skipped_cas_missing`/`skipped_unparseable`/`errors` respectively). No
+  migration — the marker rows use the existing `content_references`
+  table. (#211)
+
+- **The scheduled prefetch tick now rotates across the whole repo × package
+  space instead of re-reading page 1 forever.** The walk read the first
+  1000 prefetch-enabled repositories and the first 1000 package names per
+  repository every tick, with no cross-tick cursor — deployments beyond
+  either ceiling silently never refreshed the remainder (the doc comment's
+  claimed multi-tick walk had no mechanism behind it). The tick now
+  persists a keyset cursor (last fully-processed repository/package) in its
+  completion summary and resumes strictly after it each tick, wrapping to
+  the start after a full traversal, so a traversal of W plannable prefetches
+  completes within ⌈W / 5000⌉ ticks and the per-tick caps are page sizes,
+  not visibility ceilings. Budget semantics are unchanged: deduplicated
+  enqueues still consume no budget. The summary's new `cursor` field makes
+  the walk's progress operator-visible. (#212)
+
+- **Concurrent OCI manifest/tag pushes no longer 500 on group/ref append
+  races; Maven group links no longer silently lost on concurrent
+  same-GAV uploads.** `ArtifactGroupUseCase::add_member` and
+  `RefUseCase::set` now adopt the bounded read-decide-append contract
+  (ADR 0060): a losing append conflict re-reads the refreshed state,
+  succeeds idempotently if the caller's intent is already satisfied, and
+  otherwise rebuilds and re-appends — bounded, with a busy signal on
+  exhaustion instead of an unbounded loop. The OCI `group_attach_*` /
+  `ref_set` sites map that exhaustion to `503` + `Retry-After` instead of
+  `500`. (#221)
+
 ## [0.12.1] - 2026-08-29
 
 ### Fixed

@@ -596,6 +596,35 @@ pub trait JobsRepository: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Return the `result_summary` of the most-recently-completed
+    /// (`completed_at DESC`) row with `kind = $1 AND status =
+    /// 'completed'`, or `Ok(None)` when no such row exists.
+    ///
+    /// A recurring, single-active task kind (e.g. `prefetch-tick`) gets
+    /// a brand-new `jobs` row on every scheduled invocation (there is
+    /// no in-place row reuse), so cross-tick state cannot live on
+    /// `params`, which is fixed at enqueue time. `result_summary`,
+    /// however, is exactly the durable state each tick already writes
+    /// on completion — this method is how the NEXT tick's fresh row
+    /// reads the PREVIOUS row's summary back to resume a rotation
+    /// (e.g. a keyset walk cursor) without a dedicated table or a
+    /// column on the entity being walked. Mirrors
+    /// [`Self::last_completed_at_by_kind`]'s read-only,
+    /// `completed_at`-ordered shape.
+    ///
+    /// **Default implementation:** returns `Ok(None)` so existing
+    /// mocks compile without modification — a handler reading `None`
+    /// degrades to "start from the beginning," which is correct for a
+    /// kind that has never completed. The Postgres adapter overrides
+    /// with the real query.
+    fn last_result_summary_by_kind<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, DomainResult<Option<serde_json::Value>>> {
+        let _ = kind;
+        Box::pin(async { Ok(None) })
+    }
+
     /// Record that a recurring,
     /// non-worker-dispatched run (e.g. the `verify-event-chain` CLI
     /// invoked by its CronJob) completed at `at`. Inserts a single
@@ -769,6 +798,47 @@ pub trait JobsRepository: Send + Sync {
         Box::pin(async {
             Err(DomainError::Invariant(
                 "delete_terminal_prefetch_rows_older_than not implemented".into(),
+            ))
+        })
+    }
+
+    /// Retention sweep for `kind='scan'` rows — delete terminal
+    /// (`status IN ('completed', 'failed')`) scan rows whose
+    /// `updated_at < now() - $horizon`. Returns the number of rows
+    /// deleted.
+    ///
+    /// ```sql
+    /// DELETE FROM public.jobs
+    ///  WHERE kind = 'scan'
+    ///    AND status IN ('completed', 'failed')
+    ///    AND updated_at < now() - $1::interval
+    /// ```
+    ///
+    /// **`kind = 'scan'` exactly** — every other `jobs.kind` keeps its
+    /// newest terminal row as durable state (e.g. `verify-event-chain`'s
+    /// liveness breadcrumb; the transitive-cascade `prefetch%` rows have
+    /// their own sweep in [`Self::delete_terminal_prefetch_rows_older_than`]).
+    /// Widening the `WHERE kind = 'scan'` predicate would delete another
+    /// kind's durable state out from under it.
+    ///
+    /// `pending`/`running` rows are deliberately excluded — they are
+    /// either claim-pending or in flight; deleting either would tank
+    /// in-progress scan work. Every successful and every permanently-
+    /// failed scan leaves a terminal row forever without this sweep —
+    /// a periodic rescan cadence or a scanner outage (stranded-requeue
+    /// exhaustion) both accumulate rows unbounded.
+    ///
+    /// **Default implementation:** returns
+    /// `Err(DomainError::Invariant("delete_terminal_scan_rows_older_than not implemented"))`
+    /// so existing test fixtures compile without modification.
+    fn delete_terminal_scan_rows_older_than<'a>(
+        &'a self,
+        horizon: Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        let _ = horizon;
+        Box::pin(async {
+            Err(DomainError::Invariant(
+                "delete_terminal_scan_rows_older_than not implemented".into(),
             ))
         })
     }
@@ -1792,6 +1862,68 @@ mod tests {
         assert!(
             matches!(err, DomainError::Invariant(_)),
             "expected Invariant for delete_terminal_prefetch_rows_older_than default impl, got {err:?}"
+        );
+    }
+
+    /// `delete_terminal_scan_rows_older_than` default impl surfaces
+    /// `Invariant` for the same reason as
+    /// `delete_terminal_prefetch_rows_older_than` — a mock that returns
+    /// `Ok(0)` would silently pass the retention sweep tests.
+    #[tokio::test]
+    async fn delete_terminal_scan_rows_older_than_default_impl_returns_invariant_error() {
+        struct Bare;
+        impl JobsRepository for Bare {
+            fn claim_scan_jobs<'a>(
+                &'a self,
+                _w: &'a str,
+                _b: u32,
+                _l: Duration,
+            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn mark_completed<'a>(
+                &'a self,
+                _id: Uuid,
+                _result_summary: serde_json::Value,
+            ) -> BoxFuture<'a, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn reschedule<'a>(
+                &'a self,
+                _id: Uuid,
+                _b: Duration,
+                _e: &'a str,
+            ) -> BoxFuture<'a, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn mark_failed<'a>(
+                &'a self,
+                _id: Uuid,
+                _e: &'a str,
+            ) -> BoxFuture<'a, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn enqueue_scan<'a>(
+                &'a self,
+                _aid: Uuid,
+                _rid: Uuid,
+                _ch: &'a ContentHash,
+                _f: &'a str,
+                _p: i16,
+                _ts: &'a str,
+            ) -> BoxFuture<'a, DomainResult<Uuid>> {
+                Box::pin(async { Ok(Uuid::nil()) })
+            }
+        }
+
+        let repo: Box<dyn JobsRepository> = Box::new(Bare);
+        let err = repo
+            .delete_terminal_scan_rows_older_than(Duration::from_secs(86_400 * 7))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DomainError::Invariant(_)),
+            "expected Invariant for delete_terminal_scan_rows_older_than default impl, got {err:?}"
         );
     }
 

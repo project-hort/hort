@@ -242,6 +242,16 @@
         }
       }
     },
+    "migrate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allowRunningFleet": {
+          "description": "HORT_ALLOW_RUNNING_FLEET override for the migrate Job's runtime fleet fence (ADR 0030 amendment (c)). Default false.",
+          "type": "boolean"
+        }
+      }
+    },
     "storage": {
       "type": "object",
       "additionalProperties": false,
@@ -829,6 +839,17 @@
     "tolerations": {"type": "array"},
     "affinity": {"type": "object"},
     "topologySpreadConstraints": {"type": "array"},
+    "prePull": {
+      "description": "Pre-install/pre-upgrade image pre-pull hook (weight -10, before the migrate hook's -5) that warms the hort-server / hort-worker images on every node eligible for those workloads.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "timeoutSeconds": {"type": "integer", "minimum": 1},
+        "kubectlImage": {"type": "string"},
+        "pauseImage": {"type": "string"}
+      }
+    },
     "service": {
       "type": "object",
       "additionalProperties": false,
@@ -846,6 +867,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "timeZone": {
+          "description": "IANA time zone applied to EVERY chart CronJob's `spec.timeZone` (Kubernetes >= 1.27, stable). Changing this value shifts ALL chart schedules at once — there is no per-job override. Default \"Etc/UTC\".",
+          "type": "string",
+          "minLength": 1
+        },
         "adminTasksEnabled": {
           "description": "Global master toggle for the `executionPath: admin-task` tasks + the service-account token bootstrap Job (+ its RBAC). Replaces the pre-078 `cronJobs.enabled`. Default: disabled. Does NOT gate the `executionPath: dsn-direct` tasks (those keep their own per-task `enabled`).",
           "type": "boolean"
@@ -946,6 +972,16 @@
         },
         "prefetchRowRetentionSweep": {
           "description": "executionPath: dsn-direct. Periodic prefetch-row retention-sweep CronJob. Inserts a `kind='prefetch-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `PrefetchRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` rows older than a configurable horizon (default 7 days). Default-disabled (the cascade is opt-in per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`; if no repo opts in the table accumulates nothing). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "scanRowRetentionSweep": {
+          "description": "executionPath: dsn-direct. Periodic terminal-scan-row retention-sweep CronJob. Inserts a `kind='scan-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `ScanRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind = 'scan'` rows older than a configurable horizon (default 7 days). Default-enabled (unlike the prefetch cascade sweep, every artifact scan — ingest plus every periodic rescan — leaves a terminal row from day one, so a fresh deployment already accumulates rows). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
           "type": "object",
           "additionalProperties": false,
           "properties": {

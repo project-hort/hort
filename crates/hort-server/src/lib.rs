@@ -15,9 +15,11 @@
 pub mod cli;
 pub mod composition;
 pub mod config;
+pub mod contractions;
 pub mod gitops_boot;
 pub mod http;
 pub mod migrate;
+pub mod pg_identity;
 pub mod serve_loop;
 pub mod shutdown;
 pub mod shutdown_deadline;

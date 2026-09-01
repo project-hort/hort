@@ -320,34 +320,40 @@ fn pick_cvss_score(groups: &[OsvGroup], vuln: &OsvVulnerability) -> Option<f32> 
     None
 }
 
-/// Lower one [`OsvVulnerability`] into a [`Finding`]. Pure; no
-/// validation — caller filters via [`Finding::validate`].
-fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerability) -> Finding {
-    let purl = build_purl(&pkg.ecosystem, &pkg.name, &pkg.version);
-
-    // Informational discriminator: store the raw OSV
-    // `affected[].database_specific.informational` value verbatim (the
-    // fact), taking the first one present. The boolean interpretation and
-    // the severity routing derive from it via the domain recognizer
-    // `is_informational_class` — a recognised RustSec class (`unmaintained`
-    // / `unsound` / `notice`) marks an informational advisory: a maintenance
-    // signal published without a CVSS score by design, not a scored
-    // vulnerability. A record with no marker → `informational_class: None`.
-    let informational_class: Option<String> = vuln.affected.iter().find_map(|aff| {
+/// Informational discriminator: store the raw OSV
+/// `affected[].database_specific.informational` value verbatim (the
+/// fact), taking the first one present. The boolean interpretation and
+/// the severity routing derive from it via the domain recognizer
+/// `is_informational_class` — a recognised RustSec class (`unmaintained`
+/// / `unsound` / `notice`) marks an informational advisory: a maintenance
+/// signal published without a CVSS score by design, not a scored
+/// vulnerability. A record with no marker → `None`.
+fn informational_class(vuln: &OsvVulnerability) -> Option<String> {
+    vuln.affected.iter().find_map(|aff| {
         aff.database_specific
             .as_ref()
             .and_then(|ds| ds.informational.clone())
-    });
-    let informational = informational_class
-        .as_deref()
-        .is_some_and(is_informational_class);
+    })
+}
 
+/// The severity we could actually *read* (`None` means no reading was
+/// possible at all), the numeric CVSS score behind it, and the basis
+/// (`Assessed` vs `Unassessed`) that records whether the returned severity
+/// is a real assessment or the SUP-4 fail-closed floor.
+///
+/// Precedence: computed CVSS score → labelled severity inside a CVSS
+/// vector string → (informational advisories only) the non-enforcing `Low`
+/// floor → (everything else) the SUP-4 `Critical` fail-closed floor. An
+/// unparseable-severity finding must still trip the default Critical block
+/// threshold rather than slip under it — unified with the advisory-osv and
+/// trivy adapters. `severity_basis` lets the cross-backend merge (ADR 0059)
+/// prefer a better-informed sibling over an unassessed floor.
+fn resolve_severity(
+    groups: &[OsvGroup],
+    vuln: &OsvVulnerability,
+    informational: bool,
+) -> (Option<f32>, SeverityThreshold, SeverityBasis) {
     let cvss_score = pick_cvss_score(groups, vuln);
-    // The severity we could actually *read*. `None` means no reading was
-    // possible at all — the SUP-4 fallback below supplies a `Critical`
-    // floor, and `severity_basis` records that it is a floor rather than
-    // an assessment so the cross-backend merge can prefer a
-    // better-informed sibling for the same advisory (ADR 0059).
     let assessed_severity = cvss_score
         .and_then(cvss_score_to_severity)
         // Fallback: try labelled severity inside the CVSS vector. Some
@@ -367,53 +373,41 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
         } else {
             None
         });
-    // Final fallback (SUP-4): a finding whose severity we cannot
-    // determine — AND which is not an informational advisory — maps to
-    // the HIGHEST tier (`Critical`), fail-closed: an
-    // unparseable-severity finding must still trip the default Critical
-    // block threshold rather than slip under it. Unified with the
-    // advisory-osv and trivy adapters.
     let severity = assessed_severity.unwrap_or(SeverityThreshold::Critical);
     let severity_basis = match assessed_severity {
         Some(_) => SeverityBasis::Assessed,
         None => SeverityBasis::Unassessed,
     };
+    (cvss_score, severity, severity_basis)
+}
 
-    let title = vuln
-        .summary
-        .clone()
-        .or_else(|| vuln.details.clone())
-        .unwrap_or_else(|| vuln.id.clone());
-
-    // fixed_versions: gather every `fixed` event across all
-    // `affected[].ranges[].events[]`, dedupe in input order, cap at
-    // 32. Mirrors the advisory adapter's fixed-version logic.
+/// Gather every `fixed` event across all `affected[].ranges[].events[]`,
+/// dedupe in input order, cap at 32. Mirrors the advisory adapter's
+/// fixed-version logic.
+fn collect_fixed_versions(vuln: &OsvVulnerability) -> Vec<String> {
     let mut fixed_versions: Vec<String> = Vec::new();
-    for aff in &vuln.affected {
+    'outer: for aff in &vuln.affected {
         for rng in &aff.ranges {
             for ev in &rng.events {
                 if let Some(v) = &ev.fixed {
                     if !v.is_empty() && !fixed_versions.contains(v) {
                         fixed_versions.push(v.clone());
                         if fixed_versions.len() >= 32 {
-                            break;
+                            break 'outer;
                         }
                     }
                 }
             }
-            if fixed_versions.len() >= 32 {
-                break;
-            }
-        }
-        if fixed_versions.len() >= 32 {
-            break;
         }
     }
+    fixed_versions
+}
 
-    // references: deduped URL list from `references[].url`, plus any
-    // CVE-shaped aliases (so operators see the CVE id even when the
-    // primary id is GHSA), plus the canonical OSV vulnerability page.
-    // Cap at 32 — the canonical page is reserved a slot at the end.
+/// Deduped URL list from `references[].url`, plus any CVE-shaped aliases
+/// (so operators see the CVE id even when the primary id is GHSA), plus the
+/// canonical OSV vulnerability page. Cap at 32 — the canonical page is
+/// reserved a slot at the end.
+fn collect_references(vuln: &OsvVulnerability) -> Vec<String> {
     let mut references: Vec<String> = Vec::new();
     for r in &vuln.references {
         if !r.url.is_empty() && !references.contains(&r.url) {
@@ -450,20 +444,22 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
             references.push(osv_page);
         }
     }
+    references
+}
 
-    // aliases: dedup-trimmed copy of `vuln.aliases`. OSV uses GHSA / OSV-* as the primary `vuln.id`, with
-    // any CVE id in `aliases`. The exclusion matcher
-    // (`hort_domain::policy::exclusion::cve_matches`) checks both the
-    // primary id and this list so an operator-typed `cveId:
-    // CVE-2021-23337` exclusion clears the corresponding GHSA-keyed
-    // finding. Trimmed to a small dedup'd set so a malicious upstream
-    // can't blow up the per-finding wire shape; the domain validator
-    // caps at `MAX_ALIASES`.
-    //
-    // The ids osv-scanner put in the same `groups[]` entry are appended
-    // after the record's own aliases: they name the same advisory, and
-    // carrying them here is what lets the shared alias-group collapse see
-    // a link that a sparse `aliases` array would have hidden.
+/// Dedup-trimmed copy of `vuln.aliases`. OSV uses GHSA / OSV-* as the
+/// primary `vuln.id`, with any CVE id in `aliases`. The exclusion matcher
+/// (`hort_domain::policy::exclusion::cve_matches`) checks both the primary
+/// id and this list so an operator-typed `cveId: CVE-2021-23337` exclusion
+/// clears the corresponding GHSA-keyed finding. Trimmed to a small dedup'd
+/// set so a malicious upstream can't blow up the per-finding wire shape;
+/// the domain validator caps at `MAX_ALIASES`.
+///
+/// The ids osv-scanner put in the same `groups[]` entry are appended after
+/// the record's own aliases: they name the same advisory, and carrying
+/// them here is what lets the shared alias-group collapse see a link that
+/// a sparse `aliases` array would have hidden.
+fn collect_aliases(groups: &[OsvGroup], vuln: &OsvVulnerability) -> Vec<String> {
     let mut aliases: Vec<String> = Vec::new();
     for a in vuln
         .aliases
@@ -491,6 +487,26 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
             break;
         }
     }
+    aliases
+}
+
+/// Lower one [`OsvVulnerability`] into a [`Finding`]. Pure; no
+/// validation — caller filters via [`Finding::validate`].
+fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerability) -> Finding {
+    let purl = build_purl(&pkg.ecosystem, &pkg.name, &pkg.version);
+
+    let informational_class = informational_class(vuln);
+    let informational = informational_class
+        .as_deref()
+        .is_some_and(is_informational_class);
+
+    let (cvss_score, severity, severity_basis) = resolve_severity(groups, vuln, informational);
+
+    let title = vuln
+        .summary
+        .clone()
+        .or_else(|| vuln.details.clone())
+        .unwrap_or_else(|| vuln.id.clone());
 
     Finding {
         purl,
@@ -498,10 +514,10 @@ fn vuln_to_finding(pkg: &OsvPackage, groups: &[OsvGroup], vuln: &OsvVulnerabilit
         severity,
         cvss_score,
         title,
-        fixed_versions,
+        fixed_versions: collect_fixed_versions(vuln),
         source_scanner: "osv".to_string(),
-        references,
-        aliases,
+        references: collect_references(vuln),
+        aliases: collect_aliases(groups, vuln),
         informational_class,
         severity_basis,
     }

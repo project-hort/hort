@@ -68,6 +68,12 @@ pub mod prefetch_ingest;
 // the high-churn `jobs` table does not grow unbounded under cascade
 // load.
 pub mod prefetch_row_retention_sweep;
+// `jobs`-row retention sweep
+// (`scan-row-retention-sweep`). Periodically deletes terminal
+// `kind='scan'` rows older than a configurable horizon (default 7d) —
+// every successful and every permanently-failed scan otherwise leaves
+// a terminal row forever.
+pub mod scan_row_retention_sweep;
 // Scanner-worker registry housekeeping (kind
 // `scanner-registry-prune`). Deletes `scanner_registry` rows whose
 // `last_heartbeat` is older than the retention horizon so pod churn does
@@ -108,6 +114,7 @@ pub use replay_seen_prune::ReplaySeenPruneHandler;
 pub use retention_evaluate::RetentionEvaluateHandler;
 pub use retention_purge::RetentionPurgeHandler;
 pub use scan::ScanTaskHandler;
+pub use scan_row_retention_sweep::ScanRowRetentionSweepHandler;
 pub use scanner_registry_prune::ScannerRegistryPruneHandler;
 pub use seed_import::SeedImportHandler;
 pub use service_account_rotation::ServiceAccountRotationHandler;

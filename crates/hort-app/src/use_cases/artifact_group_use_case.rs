@@ -35,6 +35,23 @@
 //!    `is_primary = false` automatically — the caller chose a
 //!    privileged role and needs to know the assignment didn't stick.
 //!
+//! 4. **Member-append conflict adopts the bounded read-decide-append
+//!    contract.** A `Conflict` from the member-row step (an artifact
+//!    already belongs to the group under a different role) is
+//!    re-read, re-checked against the caller's original intent, and
+//!    — if not already satisfied — rebuilt and re-appended against
+//!    the refreshed group state, bounded by
+//!    [`crate::use_cases::EVENT_APPEND_RETRY_ATTEMPTS`]. This is the
+//!    generic contract's shape, not a fourth ad-hoc answer: a
+//!    `Conflict` that arises from claiming the primary-role slot
+//!    (decision 3 above) is excluded — it stays unretried, since it
+//!    can only ever repeat the identical outcome. The very first
+//!    attempt at an existing group always calls the port directly
+//!    with no client-side pre-check, so a same-role idempotent re-add
+//!    still delegates to the adapter's own `ON CONFLICT DO NOTHING`
+//!    absorption exactly as before; the re-check only runs on a
+//!    retry, after a `Conflict` already happened.
+//!
 //! # Event payload integrity
 //!
 //! The use case is the SOLE constructor of `DomainEvent` payloads on
@@ -60,10 +77,12 @@ use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::types::{ArtifactCoords, StringPage};
 
+use crate::append_conflict::{append_with_conflict_retry, ConflictCycleOutcome};
 use crate::error::AppResult;
 use crate::metrics::{
     emit_artifact_group_created, emit_artifact_group_member_added, values, GroupMemberRole,
 };
+use crate::use_cases::{event_append_backoff, EVENT_APPEND_RETRY_ATTEMPTS};
 
 /// Default `n` substituted when the caller passes `0` (unspecified
 /// `?n=` on OCI `_catalog` / `tags/list`). Matches OCI client defaults.
@@ -148,10 +167,12 @@ impl ArtifactGroupUseCase {
     ///   does not classify.
     ///
     /// Returns `Ok(())` on success, `DomainError::Conflict` on a
-    /// different-role-same-artifact add, on a primary-role mismatch,
-    /// or on a primary-assign race, and `DomainError::Invariant` if
-    /// the adapter contract is broken (second-attempt
-    /// `GroupAlreadyExists`).
+    /// primary-role mismatch or primary-assign race (ADR 0060
+    /// sanctioned exceptions — never retried), `DomainError::Contended`
+    /// if a member-append conflict (an artifact re-added under a
+    /// different role) survives every retry attempt, and
+    /// `DomainError::Invariant` if the adapter contract is broken
+    /// (second-attempt `GroupAlreadyExists`).
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, actor))]
     pub async fn add_member(
@@ -220,7 +241,11 @@ impl ArtifactGroupUseCase {
 
     /// Build + dispatch the first-attempt commit. Returns the raw
     /// [`GroupCommitOutcome`] so the caller can decide whether to
-    /// retry.
+    /// retry. Delegates to [`Self::commit_member_with_conflict_retry`]
+    /// on the existing-group branch (ADR 0060 adoption); the
+    /// first-placement branch is unchanged — a `Conflict` there can
+    /// only be the sanctioned primary-role case, never the
+    /// member-append case (a brand-new group has no prior members).
     #[allow(clippy::too_many_arguments)]
     async fn try_add_member_first(
         &self,
@@ -238,41 +263,20 @@ impl ArtifactGroupUseCase {
         let existing = self.groups.find_by_coords(repo, group_coords).await?;
         match existing {
             Some(existing_group) => {
-                // Group already exists — we will not emit Initiated.
-                let primary_role_assigned =
-                    Self::decide_primary_role(&existing_group.primary_role, role, is_primary)?;
-                let change = GroupMemberCommit {
-                    new_group: None,
-                    member: ArtifactGroupMember {
-                        role: role.to_string(),
-                        artifact_id,
-                        added_at: Utc::now(),
-                    },
-                    primary_role_assigned: primary_role_assigned.clone(),
-                };
-                let batch = Self::build_batch(
-                    existing_group.id,
+                self.commit_member_with_conflict_retry(
                     repo,
-                    None, // no Initiated event — group already exists
+                    group_coords,
                     role,
                     artifact_id,
-                    primary_role_assigned,
-                    actor.clone(),
+                    is_primary,
+                    Some(existing_group),
+                    actor,
                     correlation_id,
                     causation_id,
-                );
-                let outcome = self.lifecycle.commit_member_added(change, batch).await?;
-                // Only emit member-added on Committed — the race-lost
-                // path will retry and emit then.
-                if matches!(outcome, GroupCommitOutcome::Committed) {
-                    Self::emit_member_added_metric(self, repo_key, format_label, role);
-                    tracing::debug!(
-                        group_id = %existing_group.id,
-                        role,
-                        "member attached to existing group"
-                    );
-                }
-                Ok(outcome)
+                    repo_key,
+                    format_label,
+                )
+                .await
             }
             None => {
                 // First-placement branch. Mint a fresh group id; the
@@ -338,17 +342,21 @@ impl ArtifactGroupUseCase {
     }
 
     /// Retry path — the first attempt observed a concurrent winner.
-    /// Re-fetches `find_by_coords` (to pick up the winner's current
-    /// `primary_role`) and rebuilds a fresh batch against the winner's
-    /// `existing_id`. The use case never patches the original events;
-    /// the adapter MUST NEVER touch them either.
+    /// Re-reads via [`Self::commit_member_with_conflict_retry`] (which
+    /// picks up the winner's current `primary_role`) and rebuilds a
+    /// fresh batch against the winner's `existing_id`. The use case
+    /// never patches the original events; the adapter MUST NEVER touch
+    /// them either.
     ///
     /// The caller (`add_member`) threads `group_coords` through so
     /// the re-read hits the same row the adapter observed.
     #[allow(clippy::too_many_arguments)]
     async fn try_add_member_to_existing(
         &self,
-        existing_id: Uuid,
+        // The winner's id is only useful for the caller's own log line
+        // (already emitted in `add_member`) — the retry re-reads by
+        // `group_coords`, the same key the adapter's unique index uses.
+        _existing_id: Uuid,
         repo: Uuid,
         group_coords: &ArtifactCoords,
         role: &str,
@@ -360,51 +368,173 @@ impl ArtifactGroupUseCase {
         repo_key: Option<&str>,
         format_label: &str,
     ) -> AppResult<GroupCommitOutcome> {
-        // Re-read to pick up the winner's `primary_role`. A stale
-        // read (winner committed after our adapter call but before
-        // our re-read) is not a correctness problem — the adapter's
-        // primary-role UPDATE is gated on `primary_role = ''` and
-        // will surface `Conflict` if the slot was filled in the
-        // meantime. The re-read is an optimisation that keeps the
-        // common case (no primary yet) fast.
-        let observed = self.groups.find_by_coords(repo, group_coords).await?;
-        let existing_primary = observed
-            .as_ref()
-            .map(|g| g.primary_role.as_str())
-            .unwrap_or("");
-        let primary_role_assigned = Self::decide_primary_role(existing_primary, role, is_primary)?;
-
-        let change = GroupMemberCommit {
-            new_group: None,
-            member: ArtifactGroupMember {
-                role: role.to_string(),
-                artifact_id,
-                added_at: Utc::now(),
-            },
-            primary_role_assigned: primary_role_assigned.clone(),
-        };
-        let batch = Self::build_batch(
-            existing_id,
+        self.commit_member_with_conflict_retry(
             repo,
-            None,
+            group_coords,
             role,
             artifact_id,
-            primary_role_assigned,
-            actor.clone(),
+            is_primary,
+            None, // always re-read fresh — this call exists BECAUSE the prior read was stale.
+            actor,
             correlation_id,
             causation_id,
-        );
-        let outcome = self.lifecycle.commit_member_added(change, batch).await?;
-        if matches!(outcome, GroupCommitOutcome::Committed) {
-            Self::emit_member_added_metric(self, repo_key, format_label, role);
-            tracing::debug!(
-                group_id = %existing_id,
-                role,
-                retry = 1,
-                "member attached to existing group (retry)"
-            );
-        }
-        Ok(outcome)
+            repo_key,
+            format_label,
+        )
+        .await
+    }
+
+    /// Adopts ADR 0060's bounded read-decide-append contract for
+    /// adding a member to a group that is believed to already exist.
+    ///
+    /// Each retry attempt re-reads the group (`find_by_coords`),
+    /// decides the primary-role outcome against the refreshed state,
+    /// and dispatches [`ArtifactGroupLifecyclePort::commit_member_added`].
+    /// A `Conflict` from that call retries — UNLESS the call also
+    /// requested a primary-role assignment (`primary_role_assigned`
+    /// resolved to `Some`), in which case the conflict is the
+    /// sanctioned primary-role race (decision 3 on the module
+    /// docstring) and propagates immediately, unretried: the adapter
+    /// structurally cannot raise the member-row `Conflict` on the SAME
+    /// call that also races for the primary slot (the primary-role
+    /// `UPDATE` runs first and aborts the whole transaction on loss),
+    /// so `primary_role_assigned.is_some()` unambiguously identifies
+    /// which of the two `Conflict` sources fired.
+    ///
+    /// A `GroupCommitOutcome::GroupAlreadyExists` from the port (only
+    /// reachable in production when a caller mis-threads `new_group`;
+    /// this call always passes `None`) is returned to the caller
+    /// unretried — `add_member`'s own single-retry / `Invariant` logic
+    /// owns that shape.
+    ///
+    /// The FIRST attempt never re-checks intent before dispatching —
+    /// it either uses `known` (the caller's already-fetched read, when
+    /// supplied) or a fresh read, and always calls the port directly.
+    /// This preserves the existing "the use case always delegates;
+    /// the adapter decides idempotent no-ops via `ON CONFLICT DO
+    /// NOTHING`" contract for the common case. Only a RETRY attempt
+    /// (after a `Conflict`) re-checks whether the member is now
+    /// present with the requested role before deciding to re-append —
+    /// that is the "already satisfied" half of the contract, and it
+    /// only has anything to check once a conflicting write has
+    /// actually happened.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_member_with_conflict_retry(
+        &self,
+        repo: Uuid,
+        group_coords: &ArtifactCoords,
+        role: &str,
+        artifact_id: Uuid,
+        is_primary: bool,
+        known: Option<ArtifactGroup>,
+        actor: &Actor,
+        correlation_id: Uuid,
+        causation_id: Option<Uuid>,
+        repo_key: Option<&str>,
+        format_label: &str,
+    ) -> AppResult<GroupCommitOutcome> {
+        let mut pending = known;
+        append_with_conflict_retry(EVENT_APPEND_RETRY_ATTEMPTS as u8, move |attempt| {
+            let cached = pending.take();
+            async move {
+                let group: Option<ArtifactGroup> = if attempt == 1 {
+                    match cached {
+                        Some(g) => Some(g),
+                        None => self.groups.find_by_coords(repo, group_coords).await?,
+                    }
+                } else {
+                    tokio::time::sleep(event_append_backoff(u32::from(attempt - 1))).await;
+                    let refreshed = self.groups.find_by_coords(repo, group_coords).await?;
+                    if let Some(g) = &refreshed {
+                        if g.members
+                            .iter()
+                            .any(|m| m.artifact_id == artifact_id && m.role == role)
+                        {
+                            tracing::debug!(
+                                group_id = %g.id,
+                                role,
+                                attempt,
+                                "member-append conflict resolved by a concurrent writer; \
+                                 idempotent success on recheck"
+                            );
+                            return Ok(ConflictCycleOutcome::Satisfied(
+                                GroupCommitOutcome::Committed,
+                            ));
+                        }
+                    }
+                    refreshed
+                };
+                let existing_primary = group
+                    .as_ref()
+                    .map(|g| g.primary_role.as_str())
+                    .unwrap_or("");
+                let primary_role_assigned =
+                    Self::decide_primary_role(existing_primary, role, is_primary)?;
+                let is_primary_claim = primary_role_assigned.is_some();
+                let group_id = group.as_ref().map(|g| g.id);
+                let change = GroupMemberCommit {
+                    new_group: None,
+                    member: ArtifactGroupMember {
+                        role: role.to_string(),
+                        artifact_id,
+                        added_at: Utc::now(),
+                    },
+                    primary_role_assigned: primary_role_assigned.clone(),
+                };
+                // A `None` group here means the caller believed the
+                // group existed but it vanished — groups are never
+                // deleted, so this is an adapter/use-case contract
+                // violation, not a race to retry.
+                let Some(target_group_id) = group_id else {
+                    return Err(DomainError::Invariant(format!(
+                        "commit_member_with_conflict_retry: group at coords {group_coords:?} \
+                         not found on attempt {attempt} — groups are never deleted"
+                    ))
+                    .into());
+                };
+                let batch = Self::build_batch(
+                    target_group_id,
+                    repo,
+                    None,
+                    role,
+                    artifact_id,
+                    primary_role_assigned,
+                    actor.clone(),
+                    correlation_id,
+                    causation_id,
+                );
+                let result: AppResult<ConflictCycleOutcome<GroupCommitOutcome>> =
+                    match self.lifecycle.commit_member_added(change, batch).await {
+                        Ok(GroupCommitOutcome::Committed) => {
+                            Self::emit_member_added_metric(self, repo_key, format_label, role);
+                            tracing::debug!(
+                                group_id = %target_group_id,
+                                role,
+                                attempt,
+                                "member attached to existing group"
+                            );
+                            Ok(ConflictCycleOutcome::Satisfied(
+                                GroupCommitOutcome::Committed,
+                            ))
+                        }
+                        Ok(outcome @ GroupCommitOutcome::GroupAlreadyExists { .. }) => {
+                            Ok(ConflictCycleOutcome::Satisfied(outcome))
+                        }
+                        Err(DomainError::Conflict(_)) if !is_primary_claim => {
+                            tracing::debug!(
+                                group_id = %target_group_id,
+                                role,
+                                attempt,
+                                "member-append conflict; retrying against refreshed group state"
+                            );
+                            Ok(ConflictCycleOutcome::Retry)
+                        }
+                        Err(e) => Err(e.into()),
+                    };
+                result
+            }
+        })
+        .await
     }
 
     /// Classify `role` into a bounded-cardinality label value and
@@ -1051,6 +1181,264 @@ mod tests {
             "got: {err}"
         );
         assert_eq!(lifecycle.commit_call_count(), 2);
+    }
+
+    // ----- ADR 0060 adoption: member-append conflict retry ---------------
+
+    /// A member-append `Conflict` on the first attempt is retried; the
+    /// retry's re-read finds the member already present with the
+    /// requested role (a concurrent writer won) and succeeds
+    /// idempotently WITHOUT a second port call.
+    #[tokio::test]
+    async fn add_member_conflict_retries_to_idempotent_recheck() {
+        let (groups, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let coords = maven_coords("com.example:widget", "1.2.3");
+        let existing_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        groups.insert(ArtifactGroup {
+            id: existing_id,
+            repository_id: repo,
+            coords: coords.clone(),
+            primary_role: "jar".into(),
+            // The member is present from the start — attempt 1 never
+            // pre-checks (it always delegates), so the injected
+            // Conflict still fires on attempt 1 regardless; only the
+            // RETRY's re-read benefits from seeing it.
+            members: vec![ArtifactGroupMember {
+                role: "layer".into(),
+                artifact_id,
+                added_at: Utc::now(),
+            }],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        lifecycle.inject(GroupCommitInjection::Conflict {
+            reason: "artifact already belongs to group with role `layer`, cannot re-add".into(),
+        });
+
+        uc.add_member(
+            repo,
+            coords,
+            "layer".into(),
+            artifact_id,
+            false,
+            actor(),
+            Uuid::new_v4(),
+            None,
+            None,
+            "maven",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lifecycle.commit_call_count(),
+            1,
+            "the retry's idempotent recheck must short-circuit BEFORE a second port call"
+        );
+    }
+
+    /// A member-append `Conflict` on the first attempt is retried; the
+    /// retry's re-read finds the member still absent, so it rebuilds
+    /// the batch against the refreshed state and re-appends —
+    /// succeeding on the second port call.
+    #[tokio::test]
+    async fn add_member_conflict_retries_and_succeeds_on_rebuild() {
+        let (groups, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let coords = maven_coords("com.example:widget", "1.2.3");
+        let existing_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        groups.insert(ArtifactGroup {
+            id: existing_id,
+            repository_id: repo,
+            coords: coords.clone(),
+            primary_role: "jar".into(),
+            members: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        lifecycle.inject(GroupCommitInjection::Conflict {
+            reason: "transient contention".into(),
+        });
+
+        uc.add_member(
+            repo,
+            coords,
+            "layer".into(),
+            artifact_id,
+            false,
+            actor(),
+            Uuid::new_v4(),
+            None,
+            None,
+            "maven",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            lifecycle.commit_call_count(),
+            2,
+            "first attempt (injected Conflict) + retry (succeeds)"
+        );
+        let commits = lifecycle.recorded_commits();
+        assert_eq!(commits.len(), 1, "the injected call did not record");
+        assert_eq!(commits[0].member_artifact_id, artifact_id);
+    }
+
+    /// Every attempt loses to `Conflict` — exhaustion surfaces as
+    /// `DomainError::Contended`, never a raw `Conflict` and never a
+    /// silent success.
+    #[tokio::test]
+    async fn add_member_conflict_exhausts_to_contended() {
+        let (groups, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let coords = maven_coords("com.example:widget", "1.2.3");
+        let existing_id = Uuid::new_v4();
+        groups.insert(ArtifactGroup {
+            id: existing_id,
+            repository_id: repo,
+            coords: coords.clone(),
+            primary_role: "jar".into(),
+            members: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        for _ in 0..EVENT_APPEND_RETRY_ATTEMPTS {
+            lifecycle.inject(GroupCommitInjection::Conflict {
+                reason: "persistent contention".into(),
+            });
+        }
+
+        let err = uc
+            .add_member(
+                repo,
+                coords,
+                "layer".into(),
+                Uuid::new_v4(),
+                false,
+                actor(),
+                Uuid::new_v4(),
+                None,
+                None,
+                "maven",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::error::AppError::Domain(DomainError::Contended(_))
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            lifecycle.commit_call_count(),
+            EVENT_APPEND_RETRY_ATTEMPTS as usize
+        );
+    }
+
+    /// A `Conflict` from a call that ALSO requested a primary-role
+    /// assignment (the sanctioned primary-role race, ADR 0060) is
+    /// never retried — it propagates immediately as `Conflict`, with
+    /// exactly one port call.
+    #[tokio::test]
+    async fn add_member_primary_claim_conflict_is_not_retried() {
+        let (groups, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let coords = maven_coords("com.example:widget", "1.2.3");
+        let existing_id = Uuid::new_v4();
+        groups.insert(ArtifactGroup {
+            id: existing_id,
+            repository_id: repo,
+            coords: coords.clone(),
+            primary_role: String::new(), // empty — claimable
+            members: vec![],
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        // Also queue a second injection to prove it is NEVER consumed —
+        // a retry would eat it.
+        lifecycle.inject(GroupCommitInjection::Conflict {
+            reason: "primary_role already assigned on group (race lost)".into(),
+        });
+        lifecycle.inject(GroupCommitInjection::Conflict {
+            reason: "must not be consumed".into(),
+        });
+
+        let err = uc
+            .add_member(
+                repo,
+                coords,
+                "jar".into(),
+                Uuid::new_v4(),
+                true, // is_primary — claiming the empty slot
+                actor(),
+                Uuid::new_v4(),
+                None,
+                None,
+                "maven",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::error::AppError::Domain(DomainError::Conflict(_))
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            lifecycle.commit_call_count(),
+            1,
+            "a primary-role-claim Conflict must not be retried"
+        );
+    }
+
+    /// Defensive guard: a `GroupAlreadyExists` outcome with NO matching
+    /// row in the registry (the adapter reports a winner a subsequent
+    /// read cannot find) surfaces as `Invariant`, not an infinite/
+    /// silent retry — groups are never deleted, so this can only be an
+    /// adapter contract violation.
+    #[tokio::test]
+    async fn add_member_existing_group_vanished_is_invariant() {
+        let (_groups, lifecycle, uc) = build();
+        let repo = Uuid::new_v4();
+        let coords = maven_coords("com.example:widget", "1.2.3");
+        let winner_id = Uuid::new_v4();
+        // No matching group row is ever inserted into the registry —
+        // the retry's re-read will find nothing.
+        lifecycle.inject(GroupCommitInjection::AlreadyExists {
+            existing_id: winner_id,
+        });
+
+        let err = uc
+            .add_member(
+                repo,
+                coords,
+                "pom".into(),
+                Uuid::new_v4(),
+                false,
+                actor(),
+                Uuid::new_v4(),
+                None,
+                None,
+                "maven",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                crate::error::AppError::Domain(DomainError::Invariant(_))
+            ),
+            "got: {err}"
+        );
     }
 
     // ----- Idempotent same-role add — adapter is responsible; the use

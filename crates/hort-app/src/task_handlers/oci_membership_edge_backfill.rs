@@ -46,17 +46,46 @@
 //!
 //! # Params
 //!
-//! `{"batch_size": <int>}` — defaults to [`DEFAULT_BATCH_SIZE`] = 100,
-//! capped at [`MAX_BATCH_SIZE`] = 1000. Mirrors
-//! [`super::wheel_metadata_backfill`]'s batch-size contract verbatim.
+//! - `batch_size` (int) — the in-run keyset page size; defaults to
+//!   [`DEFAULT_BATCH_SIZE`] = 100, capped at [`MAX_BATCH_SIZE`] = 1000.
+//!   Mirrors [`super::wheel_metadata_backfill`]'s batch-size contract
+//!   verbatim, including the "bounds page size, not total run work"
+//!   posture — see Resumability below.
+//! - `ignore_skip_markers` (bool) — defaults to `false`. When `true`, the
+//!   candidacy query re-surfaces manifests already carrying an
+//!   `oci_membership_skipped` durable marker (see "Durable
+//!   structural-skip marker" below).
 //!
 //! # Resumability
 //!
-//! Stateless, exactly like the wheel retrofit: no checkpoint, no cursor —
-//! the candidacy predicate (manifest-shaped, image-typed, no `oci_config`
-//! row) is the cursor. A failed batch leaves it unchanged; the next
-//! invocation re-derives the same work. Two concurrent runs walk
-//! overlapping sets; the upsert-on-PK semantics of
+//! **In-run keyset advance.** A single invocation walks candidates in
+//! pages of `batch_size`, using an in-memory keyset cursor
+//! (`after = max(id)` of the previous page, advanced regardless of that
+//! page's outcome). The candidacy query is otherwise stateless
+//! (manifest-shaped, image-typed, no `oci_config` row, further narrowed
+//! by the durable skip marker below); a run keeps fetching pages until
+//! one comes back short of `batch_size`, so it visits every current
+//! candidate exactly once and always terminates — a page of
+//! 100%-skipped manifests no longer stalls the run at the same rows
+//! forever.
+//!
+//! **Durable structural-skip marker.** A *structural* skip (see "Failure
+//! modes" below) additionally inserts a `content_references` row
+//! (`kind = "oci_membership_skipped"`, target = the manifest's own
+//! content hash — the same self-referential shape the `primary_content`
+//! refcount row uses) and the candidacy query's `NOT EXISTS` is extended
+//! to exclude marked rows. Re-deriving from the same immutable CAS
+//! content cannot change a structural outcome, so a structurally
+//! unprocessable manifest leaves the candidate pool permanently. A
+//! *transient* skip writes no marker — the manifest remains a candidate,
+//! and the in-run keyset advance above already keeps it from starving
+//! the current run.
+//!
+//! Across invocations: a failed page leaves the candidate set unchanged;
+//! the next invocation starts a fresh cursor at `after = None` and
+//! re-derives the same work minus whatever a prior successful invocation
+//! completed (repaired, or structurally marked). Two concurrent runs walk
+//! overlapping sets harmlessly; the upsert-on-PK semantics of
 //! `ContentReferenceIndex::insert` absorb the duplicate work.
 //!
 //! # Per-row write ordering — config last
@@ -73,39 +102,47 @@
 //!
 //! # Failure modes per artifact
 //!
-//! - No `oci_config`-role reference in the derived set (the stored bytes
-//!   do not parse as a manifest declaring a config blob — corrupt CAS
-//!   content, or a genuinely index-shaped row that slipped past the
-//!   media-type filter) → silent skip, counts in `skipped_unparseable`.
-//! - `extract_oci_manifest_blob_refs` returns `Err` (malformed JSON) →
-//!   same bucket, `skipped_unparseable`.
-//! - CAS read failure (`StoragePort::get` or the subsequent stream read)
-//!   → `skipped_cas_missing`.
-//! - A `content_references` insert fails for any layer edge, or for the
-//!   config edge → `errors`; whatever edges DID land are still counted
-//!   in `edges_written` (partial credit, honestly reported) and the row
-//!   remains a candidate on the next invocation (see write-ordering
-//!   above).
+//! Split by the transient/structural criterion that decides
+//! marker-writing (see Resumability above):
+//!
+//! - **Structural** (re-deriving cannot change the outcome for the same
+//!   immutable bytes — a durable marker is written): no `oci_config`-role
+//!   reference in the derived set (the stored bytes do not parse as a
+//!   manifest declaring a config blob — corrupt CAS content, or a
+//!   genuinely index-shaped row that slipped past the media-type filter),
+//!   or `extract_oci_manifest_blob_refs` returns `Err` (malformed JSON) →
+//!   counts in `skipped_structural`. If the marker insert itself fails,
+//!   the manifest remains a candidate for the next run — counted in
+//!   `skipped_transient` instead (see below), since what determines the
+//!   bucket is whether the manifest stays a candidate, not the
+//!   parse-level cause.
+//! - **Transient** (infrastructure-class — CAS read failure, any
+//!   `content_references` insert failure including a failed marker
+//!   insert) → counts in `skipped_transient`; whatever edges DID land
+//!   before the failure are still counted in `edges_written` (partial
+//!   credit, honestly reported), and the row remains a candidate on the
+//!   next invocation (see write-ordering above). No marker is written.
 //! - Full success (every edge, including config, written) →
 //!   `rows_repaired` + `edges_written` (config + every layer).
 //!
 //! An operator reading `result_summary` can therefore distinguish
 //! "nothing to repair" (`rows_scanned = 0`) from "could not repair"
-//! (`skipped_cas_missing > 0` / `skipped_unparseable > 0` / `errors > 0`).
+//! (`skipped_structural > 0` / `skipped_transient > 0`).
 //!
 //! # No new domain event, no new metrics
 //!
 //! Same posture as [`super::wheel_metadata_backfill`]: the backfill
 //! produces only derived-projection rows (`ContentReference kind in
-//! {oci_config, oci_layer}`), not domain facts, and emits no metrics —
-//! the per-tick `result_summary` JSON on the `jobs` row is the
-//! operator-visible signal.
+//! {oci_config, oci_layer, oci_membership_skipped}`), not domain facts,
+//! and emits no metrics — the per-tick `result_summary` JSON on the
+//! `jobs` row is the operator-visible signal.
 
 use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::json;
 use tokio::io::AsyncReadExt;
+use uuid::Uuid;
 
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::error::{DomainError, DomainResult};
@@ -122,7 +159,8 @@ use hort_domain::ports::BoxFuture;
 // ---------------------------------------------------------------------------
 
 /// Default `batch_size` when the operator omits it from `params`.
-/// Mirrors [`super::wheel_metadata_backfill::DEFAULT_BATCH_SIZE`].
+/// Mirrors [`super::wheel_metadata_backfill::DEFAULT_BATCH_SIZE`]. Bounds
+/// page size only — see the module doc's Resumability section.
 pub(crate) const DEFAULT_BATCH_SIZE: u32 = 100;
 
 /// Hard cap on `batch_size` regardless of operator input. Mirrors
@@ -137,6 +175,10 @@ pub(crate) const OCI_CONFIG_KIND: &str = "oci_config";
 /// `content_references.kind` written for each layer blob.
 pub(crate) const OCI_LAYER_KIND: &str = "oci_layer";
 
+/// `content_references.kind` value written for a **structural** skip —
+/// see the module doc's "Durable structural-skip marker" section.
+pub(crate) const OCI_MEMBERSHIP_SKIPPED_KIND: &str = "oci_membership_skipped";
+
 // ---------------------------------------------------------------------------
 // Handler
 // ---------------------------------------------------------------------------
@@ -146,13 +188,13 @@ pub(crate) const OCI_LAYER_KIND: &str = "oci_layer";
 enum RepairOutcome {
     /// Every derived edge (config + all layers) landed.
     Repaired { edges_written: u64 },
-    /// CAS read failed (missing content or a stream error).
-    SkippedCasMissing,
-    /// The stored bytes did not yield a config-role reference.
-    SkippedUnparseable,
-    /// At least one edge write failed; `edges_written` counts the ones
-    /// that did land (partial credit).
-    Error { edges_written: u64 },
+    /// Structural skip, durable marker written — the manifest leaves
+    /// candidacy permanently.
+    SkippedStructural,
+    /// Transient skip (CAS read failure, or any edge/marker insert
+    /// failure) — no marker; `edges_written` counts whatever DID land
+    /// before the failure (partial credit).
+    SkippedTransient { edges_written: u64 },
 }
 
 /// [`TaskHandler`] for the one-shot OCI membership-edge backfill.
@@ -218,6 +260,40 @@ impl OciMembershipEdgeBackfillHandler {
             .await
     }
 
+    /// Insert the durable `oci_membership_skipped` marker row for a
+    /// structural skip. Target = the manifest's own content hash —
+    /// self-referential, mirroring [`Self::write_edge`]'s sibling shape
+    /// in [`super::wheel_metadata_backfill::WheelMetadataBackfillHandler::write_skip_marker`].
+    ///
+    /// A failed insert downgrades the outcome to
+    /// [`RepairOutcome::SkippedTransient`]: what decides the bucket is
+    /// whether the manifest remains a candidate on the next run, and if
+    /// the marker did not land, it does.
+    async fn write_skip_marker(&self, artifact: &Artifact) -> RepairOutcome {
+        match self
+            .content_references
+            .insert(ContentReference {
+                source_artifact_id: artifact.id,
+                target_content_hash: artifact.sha256_checksum.clone(),
+                kind: OCI_MEMBERSHIP_SKIPPED_KIND.to_string(),
+                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                repository_id: artifact.repository_id,
+                recorded_at: Utc::now(),
+            })
+            .await
+        {
+            Ok(()) => RepairOutcome::SkippedStructural,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "oci-membership-edge-backfill: oci_membership_skipped marker insert \
+                     failed; manifest remains a candidate (transient)"
+                );
+                RepairOutcome::SkippedTransient { edges_written: 0 }
+            }
+        }
+    }
+
     /// Per-artifact re-derive + persist sequence. See the module doc's
     /// "Per-row write ordering" and "Failure modes per artifact" sections
     /// for the full contract.
@@ -228,9 +304,9 @@ impl OciMembershipEdgeBackfillHandler {
             Err(err) => {
                 tracing::debug!(
                     error = %err,
-                    "oci-membership-edge-backfill: CAS read failed; skipping"
+                    "oci-membership-edge-backfill: CAS read failed; skipping (transient)"
                 );
-                return RepairOutcome::SkippedCasMissing;
+                return RepairOutcome::SkippedTransient { edges_written: 0 };
             }
         };
 
@@ -251,9 +327,9 @@ impl OciMembershipEdgeBackfillHandler {
             Err(err) => {
                 tracing::debug!(
                     error = %err,
-                    "oci-membership-edge-backfill: manifest did not parse; skipping"
+                    "oci-membership-edge-backfill: manifest did not parse; skipping (structural)"
                 );
-                return RepairOutcome::SkippedUnparseable;
+                return self.write_skip_marker(artifact).await;
             }
         };
 
@@ -267,9 +343,10 @@ impl OciMembershipEdgeBackfillHandler {
         }
         let Some(config_hash) = config_hash else {
             tracing::debug!(
-                "oci-membership-edge-backfill: no config-role reference derived; skipping"
+                "oci-membership-edge-backfill: no config-role reference derived; \
+                 skipping (structural)"
             );
-            return RepairOutcome::SkippedUnparseable;
+            return self.write_skip_marker(artifact).await;
         };
 
         let mut edges_written: u64 = 0;
@@ -288,7 +365,7 @@ impl OciMembershipEdgeBackfillHandler {
             }
         }
         if layer_failed {
-            return RepairOutcome::Error { edges_written };
+            return RepairOutcome::SkippedTransient { edges_written };
         }
 
         match self
@@ -303,7 +380,7 @@ impl OciMembershipEdgeBackfillHandler {
                     error = %err,
                     "oci-membership-edge-backfill: oci_config insert failed"
                 );
-                RepairOutcome::Error { edges_written }
+                RepairOutcome::SkippedTransient { edges_written }
             }
         }
     }
@@ -322,50 +399,70 @@ impl TaskHandler for OciMembershipEdgeBackfillHandler {
     ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
         Box::pin(async move {
             let batch_size = resolve_batch_size(params);
-
-            let candidates = match self
-                .artifacts
-                .find_oci_image_manifests_without_kind(OCI_CONFIG_KIND, batch_size)
-                .await
-            {
-                Ok(c) => c,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "oci-membership-edge-backfill: find_oci_image_manifests_without_kind \
-                         failed; will retry on next invocation",
-                    );
-                    return Ok(TaskOutcome::fail(
-                        format!("find_oci_image_manifests_without_kind failed: {err}"),
-                        true,
-                    ));
-                }
-            };
+            let ignore_skip_markers = resolve_ignore_skip_markers(params);
+            let skip_marker_kind = (!ignore_skip_markers).then_some(OCI_MEMBERSHIP_SKIPPED_KIND);
 
             let mut rows_scanned: u64 = 0;
             let mut rows_repaired: u64 = 0;
             let mut edges_written: u64 = 0;
-            let mut skipped_cas_missing: u64 = 0;
-            let mut skipped_unparseable: u64 = 0;
-            let mut errors: u64 = 0;
+            let mut skipped_structural: u64 = 0;
+            let mut skipped_transient: u64 = 0;
+            let mut cursor: Option<Uuid> = None;
 
-            for artifact in &candidates {
-                rows_scanned += 1;
-                match self.repair(artifact).await {
-                    RepairOutcome::Repaired {
-                        edges_written: n, ..
-                    } => {
-                        rows_repaired += 1;
-                        edges_written += n;
+            loop {
+                let candidates = match self
+                    .artifacts
+                    .find_oci_image_manifests_without_kind(
+                        OCI_CONFIG_KIND,
+                        batch_size,
+                        cursor,
+                        skip_marker_kind,
+                    )
+                    .await
+                {
+                    Ok(c) => c,
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "oci-membership-edge-backfill: find_oci_image_manifests_without_kind \
+                             failed; will retry on next invocation",
+                        );
+                        return Ok(TaskOutcome::fail(
+                            format!("find_oci_image_manifests_without_kind failed: {err}"),
+                            true,
+                        ));
                     }
-                    RepairOutcome::SkippedCasMissing => skipped_cas_missing += 1,
-                    RepairOutcome::SkippedUnparseable => skipped_unparseable += 1,
-                    RepairOutcome::Error {
-                        edges_written: n, ..
-                    } => {
-                        errors += 1;
-                        edges_written += n;
+                };
+                if candidates.is_empty() {
+                    break;
+                }
+                // Advance the cursor to the last page's max id
+                // REGARDLESS of per-artifact outcome — the in-run keyset
+                // advance the module doc describes.
+                cursor = candidates.last().map(|a| a.id);
+                let short_page = (candidates.len() as u32) < batch_size;
+
+                for artifact in &candidates {
+                    rows_scanned += 1;
+                    match self.repair(artifact).await {
+                        RepairOutcome::Repaired {
+                            edges_written: n, ..
+                        } => {
+                            rows_repaired += 1;
+                            edges_written += n;
+                        }
+                        RepairOutcome::SkippedStructural => skipped_structural += 1,
+                        RepairOutcome::SkippedTransient {
+                            edges_written: n, ..
+                        } => {
+                            skipped_transient += 1;
+                            edges_written += n;
+                        }
                     }
+                }
+
+                if short_page {
+                    break;
                 }
             }
 
@@ -373,9 +470,8 @@ impl TaskHandler for OciMembershipEdgeBackfillHandler {
                 rows_scanned,
                 rows_repaired,
                 edges_written,
-                skipped_cas_missing,
-                skipped_unparseable,
-                errors,
+                skipped_structural,
+                skipped_transient,
                 "oci-membership-edge-backfill complete"
             );
 
@@ -384,9 +480,8 @@ impl TaskHandler for OciMembershipEdgeBackfillHandler {
                     "rows_scanned":         rows_scanned,
                     "rows_repaired":        rows_repaired,
                     "edges_written":        edges_written,
-                    "skipped_cas_missing":  skipped_cas_missing,
-                    "skipped_unparseable":  skipped_unparseable,
-                    "errors":               errors,
+                    "skipped_structural":   skipped_structural,
+                    "skipped_transient":    skipped_transient,
                 }),
             })
         })
@@ -408,6 +503,16 @@ pub(crate) fn resolve_batch_size(params: &serde_json::Value) -> u32 {
     } else {
         requested as u32
     }
+}
+
+/// Parse `params.ignore_skip_markers` (bool). Identical contract to
+/// [`super::wheel_metadata_backfill::resolve_ignore_skip_markers`] — see
+/// that function's doc.
+pub(crate) fn resolve_ignore_skip_markers(params: &serde_json::Value) -> bool {
+    params
+        .get("ignore_skip_markers")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -599,9 +704,8 @@ mod tests {
                 assert_eq!(result_summary["rows_scanned"], 0);
                 assert_eq!(result_summary["rows_repaired"], 0);
                 assert_eq!(result_summary["edges_written"], 0);
-                assert_eq!(result_summary["skipped_cas_missing"], 0);
-                assert_eq!(result_summary["skipped_unparseable"], 0);
-                assert_eq!(result_summary["errors"], 0);
+                assert_eq!(result_summary["skipped_structural"], 0);
+                assert_eq!(result_summary["skipped_transient"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -642,9 +746,8 @@ mod tests {
                 assert_eq!(result_summary["rows_scanned"], 1);
                 assert_eq!(result_summary["rows_repaired"], 1);
                 assert_eq!(result_summary["edges_written"], 3);
-                assert_eq!(result_summary["skipped_cas_missing"], 0);
-                assert_eq!(result_summary["skipped_unparseable"], 0);
-                assert_eq!(result_summary["errors"], 0);
+                assert_eq!(result_summary["skipped_structural"], 0);
+                assert_eq!(result_summary["skipped_transient"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -689,11 +792,11 @@ mod tests {
     }
 
     // =====================================================================
-    // CAS-missing skip
+    // CAS-missing skip (transient)
     // =====================================================================
 
     #[tokio::test]
-    async fn run_cas_get_failure_counts_skipped_cas_missing() {
+    async fn run_cas_get_failure_counts_skipped_transient() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -706,6 +809,7 @@ mod tests {
         artifacts.insert(a);
         artifacts.set_oci_image_manifests_without_kind_filter(Some([id].into_iter().collect()));
 
+        let refs_for_assert = refs.clone();
         let handler = make_handler_with(
             artifacts,
             refs,
@@ -721,18 +825,28 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["rows_scanned"], 1);
                 assert_eq!(result_summary["rows_repaired"], 0);
-                assert_eq!(result_summary["skipped_cas_missing"], 1);
-                assert_eq!(result_summary["errors"], 0);
+                assert_eq!(result_summary["skipped_transient"], 1);
+                assert_eq!(result_summary["skipped_structural"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+        assert_eq!(
+            refs_for_assert.entry_count(),
+            0,
+            "a transient skip MUST NOT write a marker row"
+        );
+        assert!(refs_for_assert
+            .find_by_source_and_kind(repo_id, id, OCI_MEMBERSHIP_SKIPPED_KIND)
+            .await
+            .expect("query")
+            .is_none());
     }
 
     /// A CAS stream that fails mid-read (get succeeds, the body errors)
-    /// hits the same `skipped_cas_missing` bucket via the second `?` in
+    /// hits the same `skipped_transient` bucket via the second `?` in
     /// `read_manifest_bytes`.
     #[tokio::test]
-    async fn run_cas_stream_read_failure_counts_skipped_cas_missing() {
+    async fn run_cas_stream_read_failure_counts_skipped_transient() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -758,18 +872,18 @@ mod tests {
             .expect("Ok");
         match outcome {
             TaskOutcome::Completed { result_summary } => {
-                assert_eq!(result_summary["skipped_cas_missing"], 1);
+                assert_eq!(result_summary["skipped_transient"], 1);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
     }
 
     // =====================================================================
-    // Unparseable skips
+    // Structural skips (marker written)
     // =====================================================================
 
     #[tokio::test]
-    async fn run_extract_error_counts_skipped_unparseable() {
+    async fn run_extract_error_counts_skipped_structural_and_writes_marker() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -781,6 +895,7 @@ mod tests {
         artifacts.insert(a);
         artifacts.set_oci_image_manifests_without_kind_filter(Some([id].into_iter().collect()));
 
+        let refs_for_assert = refs.clone();
         let handler = make_handler_with(
             artifacts,
             refs,
@@ -794,18 +909,26 @@ mod tests {
             .expect("Ok");
         match outcome {
             TaskOutcome::Completed { result_summary } => {
-                assert_eq!(result_summary["skipped_unparseable"], 1);
-                assert_eq!(result_summary["errors"], 0);
+                assert_eq!(result_summary["skipped_structural"], 1);
+                assert_eq!(result_summary["skipped_transient"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+        assert!(
+            refs_for_assert
+                .find_by_source_and_kind(repo_id, id, OCI_MEMBERSHIP_SKIPPED_KIND)
+                .await
+                .expect("query")
+                .is_some(),
+            "marker row present for the unparseable manifest"
+        );
     }
 
     /// Derived refs with no `Config`-role entry (e.g. an index-shaped
-    /// body that slipped past the media-type filter) is a skip, not a
-    /// panic or a silent no-op success.
+    /// body that slipped past the media-type filter) is a structural
+    /// skip, not a panic or a silent no-op success.
     #[tokio::test]
-    async fn run_no_config_role_derived_counts_skipped_unparseable() {
+    async fn run_no_config_role_derived_counts_skipped_structural_and_writes_marker() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -821,6 +944,7 @@ mod tests {
             hash: deterministic_sha(1),
             role: ManifestBlobRole::Layer,
         }];
+        let refs_for_assert = refs.clone();
         let handler = make_handler_with(
             artifacts,
             refs,
@@ -834,12 +958,17 @@ mod tests {
             .expect("Ok");
         match outcome {
             TaskOutcome::Completed { result_summary } => {
-                assert_eq!(result_summary["skipped_unparseable"], 1);
+                assert_eq!(result_summary["skipped_structural"], 1);
                 assert_eq!(result_summary["rows_repaired"], 0);
                 assert_eq!(result_summary["edges_written"], 0);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+        assert!(refs_for_assert
+            .find_by_source_and_kind(repo_id, id, OCI_MEMBERSHIP_SKIPPED_KIND)
+            .await
+            .expect("query")
+            .is_some());
     }
 
     // =====================================================================
@@ -880,8 +1009,9 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["rows_repaired"], 0);
                 assert_eq!(
-                    result_summary["errors"], 1,
-                    "layer write failure must count as an error, not a silent skip"
+                    result_summary["skipped_transient"], 1,
+                    "layer write failure must count as a transient skip, not a silent \
+                     structural one — it may succeed on retry"
                 );
                 assert_eq!(
                     result_summary["edges_written"], 0,
@@ -899,7 +1029,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_config_insert_failure_counts_error_with_partial_credit() {
+    async fn run_config_insert_failure_counts_transient_with_partial_credit() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -931,7 +1061,7 @@ mod tests {
         match outcome {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["rows_repaired"], 0);
-                assert_eq!(result_summary["errors"], 1);
+                assert_eq!(result_summary["skipped_transient"], 1);
                 assert_eq!(
                     result_summary["edges_written"], 2,
                     "the two layer writes that succeeded before the config write failed \
@@ -983,8 +1113,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn resolve_ignore_skip_markers_defaults_false() {
+        assert!(!resolve_ignore_skip_markers(&serde_json::Value::Null));
+        assert!(resolve_ignore_skip_markers(
+            &serde_json::json!({"ignore_skip_markers": true})
+        ));
+        assert!(!resolve_ignore_skip_markers(
+            &serde_json::json!({"ignore_skip_markers": "yes"})
+        ));
+    }
+
+    /// The `skip_marker_kind` argument reaching the candidacy port call
+    /// reflects `ignore_skip_markers` — mirrors the wheel-metadata
+    /// handler's equivalent test.
     #[tokio::test]
-    async fn run_with_batch_size_above_cap_clamps_to_max() {
+    async fn run_passes_skip_marker_kind_per_ignore_skip_markers_param() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let refs = Arc::new(MockContentReferenceIndex::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let artifacts_for_assert = artifacts.clone();
+        let handler = make_handler_with(
+            artifacts,
+            refs,
+            storage,
+            OciMembershipEdgesStubBehaviour::Edges(Vec::new()),
+        );
+
+        handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        let default_calls = artifacts_for_assert.oci_calls();
+        assert_eq!(default_calls.len(), 1);
+        assert_eq!(
+            default_calls[0].skip_marker_kind.as_deref(),
+            Some(OCI_MEMBERSHIP_SKIPPED_KIND)
+        );
+
+        handler
+            .run(
+                &serde_json::json!({"ignore_skip_markers": true}),
+                make_context(),
+            )
+            .await
+            .expect("Ok");
+        let calls_after_ignore = artifacts_for_assert.oci_calls();
+        assert_eq!(calls_after_ignore.last().unwrap().skip_marker_kind, None);
+    }
+
+    #[tokio::test]
+    async fn run_with_batch_size_above_cap_clamps_page_size_but_drains_all_candidates() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -994,6 +1173,7 @@ mod tests {
         for seed in 0..1_500u32 {
             artifacts.insert(make_manifest(repo_id, seed, shared_sha.clone()));
         }
+        let artifacts_for_assert = artifacts.clone();
 
         let handler = make_handler_with(
             artifacts,
@@ -1009,18 +1189,210 @@ mod tests {
         match outcome {
             TaskOutcome::Completed { result_summary } => {
                 let walked = result_summary["rows_scanned"].as_u64().unwrap();
-                assert_eq!(walked, 1_000);
+                assert_eq!(
+                    walked, 1_500,
+                    "the in-run keyset advance drains every candidate across pages"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        let calls = artifacts_for_assert.oci_calls();
+        assert!(calls.iter().all(|c| c.limit == 1_000));
+        assert_eq!(calls.len(), 2);
+    }
+
+    // =====================================================================
+    // In-run keyset advance — a repairable manifest behind > batch-size
+    // structurally-skipped manifests is still repaired in the FIRST run.
+    // =====================================================================
+
+    /// Name-keyed OCI [`FormatHandler`] stub — mirrors
+    /// `NameKeyedWheelMetadataHandler` in the wheel-metadata handler's
+    /// tests. Returns a real config+layer ref set for one distinguished
+    /// manifest name and an empty (structural-skip-triggering) set for
+    /// everything else.
+    struct NameKeyedOciHandler {
+        repairable_name: String,
+    }
+    impl FormatHandler for NameKeyedOciHandler {
+        fn format_key(&self) -> &str {
+            "oci"
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> DomainResult<hort_domain::types::ArtifactCoords> {
+            unimplemented!()
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn extract_oci_manifest_blob_refs(
+            &self,
+            coords: &hort_domain::types::ArtifactCoords,
+            _content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<ManifestBlobRef>> {
+            if coords.name == self.repairable_name {
+                Ok(config_and_layer_refs(1))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn run_repairs_valid_manifest_behind_more_than_batch_size_structural_skips() {
+        let repo_id = Uuid::new_v4();
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let refs = Arc::new(MockContentReferenceIndex::new());
+        let storage = Arc::new(MockStoragePort::new());
+
+        let mut skip_ids: Vec<Uuid> = Vec::new();
+        for seed in 0..5u32 {
+            let bytes = format!("skip-manifest-{seed}");
+            let sha = put_into_cas(&storage, bytes.as_bytes()).await;
+            let a = make_manifest(repo_id, seed, sha);
+            skip_ids.push(a.id);
+            artifacts.insert(a);
+        }
+        let repairable_sha = put_into_cas(&storage, b"repairable-manifest-bytes").await;
+        let repairable = make_manifest(repo_id, 5, repairable_sha);
+        let repairable_id = repairable.id;
+        let repairable_name = repairable.name.clone();
+        artifacts.insert(repairable);
+
+        let artifacts_for_assert = artifacts.clone();
+        let oci_handler: Arc<dyn FormatHandler> = Arc::new(NameKeyedOciHandler { repairable_name });
+        let handler = OciMembershipEdgeBackfillHandler::new(
+            artifacts as Arc<dyn ArtifactRepository>,
+            refs.clone() as Arc<dyn ContentReferenceIndex>,
+            storage as Arc<dyn StoragePort>,
+            oci_handler,
+        );
+
+        let outcome = handler
+            .run(&serde_json::json!({"batch_size": 3}), make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["rows_scanned"], 6);
+                assert_eq!(result_summary["skipped_structural"], 5);
+                assert_eq!(
+                    result_summary["rows_repaired"], 1,
+                    "the repairable manifest behind the > batch-size skip run IS repaired \
+                     in the first run"
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        for id in &skip_ids {
+            assert!(refs
+                .find_by_source_and_kind(repo_id, *id, OCI_MEMBERSHIP_SKIPPED_KIND)
+                .await
+                .expect("query")
+                .is_some());
+        }
+        assert!(refs
+            .find_by_source_and_kind(repo_id, repairable_id, OCI_CONFIG_KIND)
+            .await
+            .expect("query")
+            .is_some());
+
+        // A full-length page never short-circuits the loop on its own
+        // (only a page shorter than `batch_size` does), so 6 candidates
+        // at batch_size 3 costs a third, empty, draining page.
+        let calls = artifacts_for_assert.oci_calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "6 candidates at batch_size 3 → two full pages then a draining empty page"
+        );
+        assert_eq!(calls[0].after, None);
+        assert!(calls[1].after.is_some());
+        assert!(calls[2].after > calls[1].after);
+    }
+
+    // =====================================================================
+    // Marker persistence proof — run 2 does not re-read structural skips
+    // =====================================================================
+
+    #[tokio::test]
+    async fn run_two_does_not_reread_structural_skips_once_marked() {
+        let repo_id = Uuid::new_v4();
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let refs = Arc::new(MockContentReferenceIndex::new());
+        let storage = Arc::new(MockStoragePort::new());
+
+        let mut ids: Vec<Uuid> = Vec::new();
+        for seed in 0..3u32 {
+            let bytes = format!("skip-manifest-{seed}");
+            let sha = put_into_cas(&storage, bytes.as_bytes()).await;
+            let a = make_manifest(repo_id, seed, sha);
+            ids.push(a.id);
+            artifacts.insert(a);
+        }
+
+        let refs_for_assert = refs.clone();
+        let handler = make_handler_with(
+            artifacts.clone(),
+            refs,
+            storage,
+            OciMembershipEdgesStubBehaviour::Edges(Vec::new()),
+        );
+
+        let first = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        match first {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["rows_scanned"], 3);
+                assert_eq!(result_summary["skipped_structural"], 3);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        for id in &ids {
+            assert!(refs_for_assert
+                .find_by_source_and_kind(repo_id, *id, OCI_MEMBERSHIP_SKIPPED_KIND)
+                .await
+                .expect("query")
+                .is_some());
+        }
+
+        // Mirrors what the real adapter's NOT EXISTS predicate on
+        // `oci_membership_skipped` would enforce on a second invocation
+        // — see the equivalent wheel-metadata-backfill test for the full
+        // rationale (this mock's candidacy is an explicit allowlist, not
+        // a live read of `MockContentReferenceIndex`; the DB-level proof
+        // lives in the `hort-adapters-postgres` `skip_marker_kind` tests).
+        artifacts
+            .set_oci_image_manifests_without_kind_filter(Some(std::collections::HashSet::new()));
+
+        let second = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        match second {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(
+                    result_summary["rows_scanned"], 0,
+                    "the second run must not re-read the now-marked structural skips"
+                );
             }
             other => panic!("expected Completed, got {other:?}"),
         }
     }
 
     // =====================================================================
-    // Resumability
+    // Resumability — retry after a candidacy-query failure re-derives
+    // the same work (unit-level: the port call shape, not full drain).
     // =====================================================================
 
     #[tokio::test]
-    async fn run_is_resumable_across_invocations() {
+    async fn run_is_resumable_after_transient_candidate_shrink() {
         let repo_id = Uuid::new_v4();
         let artifacts = Arc::new(MockArtifactRepository::new());
         let refs = Arc::new(MockContentReferenceIndex::new());
@@ -1044,38 +1416,38 @@ mod tests {
             OciMembershipEdgesStubBehaviour::Edges(config_and_layer_refs(0)),
         );
 
+        // A single run now fully drains the candidate set via the
+        // in-run keyset advance (unlike the pre-#141 one-page-per-run
+        // shape) — all 5 land `oci_config` rows in one invocation.
         let first = handler
             .run(&serde_json::json!({"batch_size": 3}), make_context())
             .await
             .expect("Ok");
-        let first_walked = match &first {
+        let first_scanned = match &first {
             TaskOutcome::Completed { result_summary } => {
                 result_summary["rows_scanned"].as_u64().unwrap()
             }
             other => panic!("expected Completed, got {other:?}"),
         };
-        assert_eq!(first_walked, 3);
+        assert_eq!(first_scanned, 5, "the run drains the full candidate set");
 
-        let mut sorted_ids = all_ids.clone();
-        sorted_ids.sort();
-        let remaining_after_first: std::collections::HashSet<Uuid> =
-            sorted_ids[3..].iter().copied().collect();
-        artifacts.set_oci_image_manifests_without_kind_filter(Some(remaining_after_first));
-
+        // A second invocation against the SAME (unchanged) allowlist
+        // re-derives the same candidates — this mock's allowlist does
+        // not read `MockContentReferenceIndex`, so it does not model the
+        // adapter's own NOT-EXISTS-on-`oci_config` pruning. The point
+        // here is the port call shape: a fresh invocation starts with a
+        // fresh `after = None` cursor.
         let second = handler
             .run(&serde_json::json!({"batch_size": 3}), make_context())
             .await
             .expect("Ok");
-        let second_walked = match second {
+        let second_scanned = match second {
             TaskOutcome::Completed { result_summary } => {
                 result_summary["rows_scanned"].as_u64().unwrap()
             }
             other => panic!("expected Completed, got {other:?}"),
         };
-        assert_eq!(
-            second_walked, 2,
-            "second invocation drains the remaining 2 (candidate set shrunk)"
-        );
+        assert_eq!(second_scanned, 5);
     }
 
     // =====================================================================
@@ -1175,6 +1547,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -1182,6 +1556,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             Box::pin(async {
                 Err(DomainError::Invariant(

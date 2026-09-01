@@ -22,12 +22,27 @@
 //!  "rust_version":<string|null>}\n
 //! ```
 //!
-//! The `v` (schema version) and `features2` (v2-extra features map)
-//! keys are emitted only when the payload supplies a `Some(...)`
-//! value — matching the upstream-fidelity contract (cargo clients
-//! perform version-resolution against this body; carrying `null`
-//! v2-extras for hosted lines that never had them would diverge
-//! from the upstream wire shape).
+//! The `v` (schema version), `features2` (v2-extra features map), and
+//! `pubtime` (publish timestamp) keys are emitted only when the payload
+//! supplies a `Some(...)` value — matching the upstream-fidelity
+//! contract (cargo clients perform version-resolution against this
+//! body; carrying `null` v2-extras for hosted lines that never had them
+//! would diverge from the upstream wire shape) and, for `pubtime`,
+//! honouring the "hort has no knowledge, must not invent one" contract
+//! for never-ingested proxy versions.
+//!
+//! # `pubtime`
+//!
+//! `Some(...)` emits an RFC 3339 UTC string; `None` omits the key
+//! entirely (cargo clients — and Renovate's crate datasource, the
+//! consumer this field exists for — ignore unknown/absent keys
+//! identically, so omission and a hypothetical `null` are
+//! indistinguishable to every consumer; omission is chosen to keep the
+//! wire shape identical to the pre-field shape wherever hort has no
+//! timestamp to offer). The builder never computes this value itself —
+//! it renders exactly what [`CargoVersionPayload::pubtime`] carries; the
+//! per-repo-kind source and precedence live in the sources
+//! (`HostedCargoSource`, `ProxyCargoSource` in `hort-http-cargo`).
 //!
 //! # NDJSON ordering policy
 //!
@@ -216,6 +231,15 @@ impl IndexBuilder for CargoIndexBuilder {
             if let Some(f2) = &payload.features2 {
                 obj.insert("features2".to_string(), f2.clone());
             }
+            // `pubtime` omitted entirely on `None` — see module rustdoc
+            // ("hort has no knowledge, must not invent one" for a
+            // never-ingested proxy version).
+            if let Some(pubtime) = payload.pubtime {
+                obj.insert(
+                    "pubtime".to_string(),
+                    serde_json::Value::String(pubtime.to_rfc3339()),
+                );
+            }
 
             // `serde_json::to_string` on a `serde_json::Map` containing
             // owned `Value::{String, Bool, Number, Object, Array, Null}`
@@ -267,6 +291,7 @@ mod tests {
             rust_version: None,
             v: None,
             features2: None,
+            pubtime: None,
         }
     }
 
@@ -420,6 +445,11 @@ mod tests {
             rust_version: Some("1.65".into()),
             v: Some(2),
             features2: Some(serde_json::json!({"weak-dep": ["dep:tokio?/full"]})),
+            pubtime: Some(
+                "2024-06-15T12:30:00Z"
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .unwrap(),
+            ),
         };
         let body = build(vec![entry("2.0.0", payload)]);
         let lines = parse_lines(&body);
@@ -454,6 +484,50 @@ mod tests {
                 .as_str()
                 .unwrap(),
             "dep:tokio?/full"
+        );
+        assert_eq!(
+            v["pubtime"].as_str().unwrap(),
+            "2024-06-15T12:30:00+00:00",
+            "pubtime must round-trip as RFC 3339 UTC"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 11. `pubtime` omitted entirely on `None` — mirrors the `v` /
+    //     `features2` omission contract, and the "hort has no
+    //     knowledge, must not invent one" rule for never-ingested
+    //     proxy versions.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pubtime_omitted_on_none() {
+        let p = minimal_payload("serde", "1.0.0", &"a".repeat(64));
+        let body = build(vec![entry("1.0.0", p)]);
+        let lines = parse_lines(&body);
+        assert!(
+            lines[0].get("pubtime").is_none(),
+            "`pubtime` MUST be omitted on None, never emitted as null: {}",
+            lines[0]
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // 12. `pubtime` emitted as RFC 3339 UTC when `Some`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pubtime_emitted_as_rfc3339_when_present() {
+        let mut p = minimal_payload("serde", "1.0.0", &"a".repeat(64));
+        p.pubtime = Some(
+            "2023-11-05T08:15:30Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+        );
+        let body = build(vec![entry("1.0.0", p)]);
+        let lines = parse_lines(&body);
+        assert_eq!(
+            lines[0]["pubtime"].as_str().unwrap(),
+            "2023-11-05T08:15:30+00:00"
         );
     }
 

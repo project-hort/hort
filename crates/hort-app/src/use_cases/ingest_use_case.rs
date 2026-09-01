@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -7,6 +8,7 @@ use tokio::io::AsyncRead;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
+use hort_domain::entities::repository::Repository;
 use hort_domain::entities::scan_policy::{ProvenanceMode, ScanPolicyProjection};
 use hort_domain::error::DomainError;
 use hort_domain::events::{
@@ -29,7 +31,7 @@ use hort_domain::ports::format_handler::{FormatHandler, MetadataStrategy};
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
-use hort_domain::ports::storage::StoragePort;
+use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{ArtifactCoords, ContentHash, PayloadAccess};
 use tokio::io::AsyncReadExt;
@@ -484,6 +486,34 @@ enum InnerIngestError {
     /// curation block, etc. Outer layer propagates without emitting
     /// `ChecksumMismatch`.
     Other(AppError),
+}
+
+/// `ingest_inner`'s error shape: the classified error, the repository key
+/// once resolved (`None` before that), and the `IngestResult` metric label
+/// for the arms that need one.
+type IngestInnerError = (InnerIngestError, Option<String>, Option<IngestResult>);
+
+/// `ingest_inner`'s success shape: `(artifact, was_duplicate, repo_key,
+/// ingested_event_id)` — see [`IngestUseCase::ingest_inner`] docstring.
+type IngestInnerOk = (Artifact, bool, String, Uuid);
+
+/// Output of [`IngestUseCase::resolve_scan_and_provenance_decision`]: the
+/// scan/provenance decisions for one ingest, resolved from a single
+/// `ScanPolicy` snapshot so the appended events and the post-commit job
+/// enqueues never race against a policy change.
+struct ScanProvenanceDecision {
+    /// `Some(ScanRequested)` iff `scan_will_run` — ready to push onto the
+    /// ingest's `events` batch.
+    scan_requested_event: Option<EventToAppend>,
+    scan_will_run: bool,
+    provenance_mode: ProvenanceMode,
+    provenance_will_run: bool,
+    /// `true` iff no operator `ScanPolicy` matched and the hardcoded
+    /// `DefaultPolicy` resolved this ingest's decisions.
+    policy_source_is_default: bool,
+    /// The quarantine-window duration this ingest's decision resolved to;
+    /// `> 0` means [`IngestUseCase::decide_and_apply_quarantine`] fires.
+    effective_duration_secs: i64,
 }
 
 impl InnerIngestError {
@@ -2304,6 +2334,1068 @@ impl IngestUseCase {
         Ok(())
     }
 
+    /// Steps 1-2: verify repository exists and the format matches — a PyPI
+    /// handler must not ingest into an npm repository. Reject BEFORE
+    /// `storage.put` so a mismatched request cannot create a CAS orphan.
+    /// The caller controls both `coords.format` (derived from the route)
+    /// and the target repo (its key), so the mismatch is a clean
+    /// `Validation` error. The repo is needed both for the `repository`
+    /// metric label and for downstream quarantine emission.
+    async fn verify_repository_and_format(
+        &self,
+        repository_id: Uuid,
+        coords: &ArtifactCoords,
+    ) -> Result<Repository, IngestInnerError> {
+        let repo = self
+            .repositories
+            .find_by_id(repository_id)
+            .await
+            .map_err(|e| (InnerIngestError::Other(AppError::Domain(e)), None, None))?;
+
+        if coords.format != repo.format {
+            return Err((
+                InnerIngestError::Other(AppError::Domain(DomainError::Validation(format!(
+                    "format mismatch: repository {} is {}, coords declare {}",
+                    repo.key, repo.format, coords.format
+                )))),
+                Some(repo.key.clone()),
+                None,
+            ));
+        }
+
+        Ok(repo)
+    }
+
+    /// Step 3: look up any existing artifact at the same logical path
+    /// BEFORE writing bytes. When the caller supplies `declared_sha256`,
+    /// this short-circuits both the dedup and conflict decisions with zero
+    /// storage I/O — and, critically, a conflict decision no longer
+    /// requires uploading the content first (the most common source of
+    /// avoidable orphans). When the caller supplies no declared hash, the
+    /// existing post-put comparison in [`Self::put_and_check_post_dedup`]
+    /// still runs as before. See
+    /// `docs/architecture/explanation/cas-storage.md` §"Orphaned content".
+    ///
+    /// Returns `ControlFlow::Break` with `ingest_inner`'s full success
+    /// tuple on a declared-hash dedup hit, `ControlFlow::Continue` with the
+    /// looked-up (possibly `None`) existing artifact otherwise.
+    async fn find_existing_and_check_declared_dedup(
+        &self,
+        repository_id: Uuid,
+        coords: &ArtifactCoords,
+        declared_sha256: Option<&ContentHash>,
+        repo_key: &str,
+    ) -> Result<ControlFlow<IngestInnerOk, Option<Artifact>>, IngestInnerError> {
+        let existing = self
+            .artifacts
+            .find_by_path(repository_id, &coords.path)
+            .await
+            .map_err(|e| {
+                (
+                    InnerIngestError::Other(AppError::Domain(e)),
+                    Some(repo_key.to_string()),
+                    None,
+                )
+            })?;
+
+        if let (Some(existing), Some(declared)) = (existing.as_ref(), declared_sha256) {
+            if existing.sha256_checksum == *declared {
+                tracing::debug!(
+                    artifact_id = %existing.id,
+                    "deduplicated via declared hash"
+                );
+                return Ok(ControlFlow::Break((
+                    existing.clone(),
+                    true,
+                    repo_key.to_string(),
+                    Uuid::new_v4(),
+                )));
+            }
+            return Err((
+                InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
+                    "path {} already exists with different content (existing={}, declared={})",
+                    coords.path, existing.sha256_checksum, declared
+                )))),
+                Some(repo_key.to_string()),
+                None,
+            ));
+        }
+
+        Ok(ControlFlow::Continue(existing))
+    }
+
+    /// Step 4: store content — CAS computes hash + size. Wrap the storage
+    /// error explicitly so metric classification can distinguish storage
+    /// failures from domain errors.
+    ///
+    /// Step 5: post-put duplicate check by path — only reached when the
+    /// caller supplied no `declared_sha256` (or when `declared_sha256` was
+    /// set but [`Self::find_existing_and_check_declared_dedup`] found no
+    /// existing row to compare against). Behaviour unchanged from the
+    /// original flow.
+    ///
+    /// Returns `ControlFlow::Break` with `ingest_inner`'s full success
+    /// tuple on a post-put dedup hit, `ControlFlow::Continue` with the
+    /// `PutResult` otherwise.
+    async fn put_and_check_post_dedup(
+        &self,
+        stream: Box<dyn AsyncRead + Send + Unpin>,
+        existing: Option<Artifact>,
+        coords_path: &str,
+        repo_key: &str,
+    ) -> Result<ControlFlow<IngestInnerOk, PutResult>, IngestInnerError> {
+        let put_result = self.storage.put(stream).await.map_err(|e| {
+            (
+                InnerIngestError::Other(AppError::Storage(e.to_string())),
+                Some(repo_key.to_string()),
+                None,
+            )
+        })?;
+
+        if let Some(existing) = existing {
+            if existing.sha256_checksum == put_result.hash {
+                tracing::debug!(
+                    artifact_id = %existing.id,
+                    "deduplicated"
+                );
+                return Ok(ControlFlow::Break((
+                    existing,
+                    true,
+                    repo_key.to_string(),
+                    Uuid::new_v4(),
+                )));
+            }
+            return Err((
+                InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
+                    "path {} already exists with different content (existing={}, new={})",
+                    coords_path, existing.sha256_checksum, put_result.hash
+                )))),
+                Some(repo_key.to_string()),
+                None,
+            ));
+        }
+
+        Ok(ControlFlow::Continue(put_result))
+    }
+
+    /// Step 5a: fresh-insert path — verify the caller-declared hash matches
+    /// the hash just computed while streaming to CAS. `declared_sha256` is
+    /// a client-side integrity contract — the OCI monolithic PUT, PUT
+    /// finalize, and manifest-digest PUT all depend on this check
+    /// returning `Conflict` on mismatch.
+    ///
+    /// On mismatch: roll back the freshly-written CAS blob via
+    /// `StoragePort::delete` ONLY IF no other artifact row references the
+    /// hash. The dedup guard uses `ArtifactRepository::find_by_checksum`; a
+    /// hit means the hash is shared with another repository (cross-mount,
+    /// organic re-upload) and deleting would corrupt the referencing row.
+    /// Rollback failures (backend I/O, port lookup error) log `warn!` and
+    /// continue — the uncommitted blob is left unreferenced. No orphan
+    /// reaper exists (`CasScrubUseCase` is integrity-only, never deletes);
+    /// a content-addressed blob is collision-free so this accumulates
+    /// harmlessly. This row-less orphan is an accepted bounded residual:
+    /// storage-GC walks expired artifact rows and does NOT reclaim a blob
+    /// with no row; a reaper was considered and rejected — see
+    /// `rollback_unreferenced_cas` docs.
+    ///
+    /// Typed-variant dispatch on mismatch: the outer
+    /// `ingest_with_verification` peels `VerificationMismatch` to decide
+    /// whether to emit `ChecksumMismatch` to the repository audit stream. A
+    /// string discriminator like `msg.contains("computed=")` would
+    /// silently disable audit emission on any reword of the inner Conflict
+    /// message. The `source` field is preserved verbatim so wire-response
+    /// shape, metric labels, and `classify_ingest_error` taxonomy do not
+    /// change.
+    async fn verify_declared_sha256(
+        &self,
+        declared_sha256: Option<&ContentHash>,
+        put_hash: &ContentHash,
+        repo_key: &str,
+    ) -> Result<(), IngestInnerError> {
+        let Some(declared) = declared_sha256 else {
+            return Ok(());
+        };
+        if *declared == *put_hash {
+            return Ok(());
+        }
+        self.rollback_unreferenced_cas(put_hash, "declared_sha256 mismatch")
+            .await;
+        let source = AppError::Domain(DomainError::Conflict(format!(
+            "declared sha256 does not match computed hash (declared={declared}, computed={put_hash})",
+        )));
+        Err((
+            InnerIngestError::VerificationMismatch {
+                algorithm: HashAlgorithm::Sha256,
+                upstream_value: declared.to_string(),
+                computed_value: put_hash.to_string(),
+                source,
+            },
+            Some(repo_key.to_string()),
+            Some(IngestResult::DeclaredHashMismatch),
+        ))
+    }
+
+    /// Step 5b: SHA-512 verification arm. Reached only for the npm SRI
+    /// path; SHA-256 verification piggybacks on the `declared_sha256`
+    /// machinery in [`Self::verify_declared_sha256`]. Finalising the
+    /// digest handle here also resets the shared hasher (see
+    /// `Sha512DigestHandle::finalize` docstring), so the value is returned
+    /// for reuse when constructing `ChecksumVerified` further down. See
+    /// [`Self::verify_declared_sha256`] for the mismatch/rollback
+    /// rationale, which this arm mirrors.
+    async fn verify_sha512_upstream(
+        &self,
+        verification: Option<&VerificationContext>,
+        put_hash: &ContentHash,
+        repo_key: &str,
+    ) -> Result<Option<String>, IngestInnerError> {
+        let Some(VerificationContext {
+            sha512_handle: Some(handle),
+            upstream_value,
+            ..
+        }) = verification
+        else {
+            return Ok(None);
+        };
+        let computed = lower_hex(&handle.finalize());
+        if computed == *upstream_value {
+            return Ok(Some(computed));
+        }
+        self.rollback_unreferenced_cas(put_hash, "sha512 upstream mismatch")
+            .await;
+        let source = AppError::Domain(DomainError::Conflict(format!(
+            "upstream sha512 does not match computed hash \
+             (upstream={upstream_value}, computed={computed})"
+        )));
+        Err((
+            InnerIngestError::VerificationMismatch {
+                algorithm: HashAlgorithm::Sha512,
+                upstream_value: upstream_value.clone(),
+                computed_value: computed.clone(),
+                source,
+            },
+            Some(repo_key.to_string()),
+            Some(IngestResult::DeclaredHashMismatch),
+        ))
+    }
+
+    /// Step 5c: SHA-1 transfer-verification *floor* arm (ADR 0033 — the
+    /// Maven `.sha1` sidecar). The SHA-1 sibling of
+    /// [`Self::verify_sha512_upstream`]; reached only for the
+    /// `UpstreamPublished(Sha1)` path. The CAS key remains SHA-256 — SHA-1
+    /// is the transfer comparison only, never a content-address.
+    /// Finalising the handle resets the shared hasher (see
+    /// `Sha1DigestHandle::finalize`), so the value is returned for reuse
+    /// when constructing `ChecksumVerified`. At most one of
+    /// `sha512_handle` / `sha1_handle` is `Some`, so the two arms are
+    /// mutually exclusive.
+    async fn verify_sha1_upstream(
+        &self,
+        verification: Option<&VerificationContext>,
+        put_hash: &ContentHash,
+        repo_key: &str,
+    ) -> Result<Option<String>, IngestInnerError> {
+        let Some(VerificationContext {
+            sha1_handle: Some(handle),
+            upstream_value,
+            ..
+        }) = verification
+        else {
+            return Ok(None);
+        };
+        let computed = lower_hex(&handle.finalize());
+        if computed == *upstream_value {
+            return Ok(Some(computed));
+        }
+        self.rollback_unreferenced_cas(put_hash, "sha1 upstream mismatch")
+            .await;
+        let source = AppError::Domain(DomainError::Conflict(format!(
+            "upstream sha1 does not match computed hash \
+             (upstream={upstream_value}, computed={computed})"
+        )));
+        Err((
+            InnerIngestError::VerificationMismatch {
+                algorithm: HashAlgorithm::Sha1,
+                upstream_value: upstream_value.clone(),
+                computed_value: computed.clone(),
+                source,
+            },
+            Some(repo_key.to_string()),
+            Some(IngestResult::DeclaredHashMismatch),
+        ))
+    }
+
+    /// Resolve the deferred metadata decision. The blob's `storage.put`
+    /// happens HERE — AFTER both dedup returns in
+    /// [`Self::find_existing_and_check_declared_dedup`] /
+    /// [`Self::put_and_check_post_dedup`] — so a duplicate re-publish never
+    /// orphans a fresh CAS object. See `MetadataDecision` docstring.
+    async fn resolve_metadata_decision(
+        &self,
+        metadata_decision: MetadataDecision,
+        repo_key: &str,
+    ) -> Result<(serde_json::Value, Option<ContentHash>, &'static str), IngestInnerError> {
+        match metadata_decision {
+            MetadataDecision::Inline(value) => Ok((value, None, values::STRATEGY_INLINE)),
+            MetadataDecision::Pending { bytes, summary } => {
+                let put_result = self
+                    .storage
+                    .put(Box::new(std::io::Cursor::new(bytes)))
+                    .await
+                    .map_err(|e| {
+                        (
+                            InnerIngestError::Other(AppError::Storage(e.to_string())),
+                            Some(repo_key.to_string()),
+                            None,
+                        )
+                    })?;
+                Ok((
+                    summary,
+                    Some(put_result.hash),
+                    values::STRATEGY_HASH_REFERENCE,
+                ))
+            }
+        }
+    }
+
+    /// Resolve the `ScanPolicy` governing this ingest and the decisions
+    /// derived from it: whether a scan runs and its `ScanRequested`
+    /// event, the provenance mode/gate, whether the resolved policy is the
+    /// hardcoded default, and the effective quarantine-window duration. A
+    /// repo-scoped or global operator policy wins; no operator policy
+    /// means the hardcoded `DefaultPolicy` applies. Captured in one place
+    /// so the appended `ScanRequested` event and the post-commit
+    /// `enqueue_scan` / quarantine decision all see the same policy
+    /// snapshot (no race where the policy is archived in between).
+    ///
+    /// Policy-lookup failure is non-fatal: log + treat as "no policy
+    /// applies". The artifact still ingests; an operator can manually
+    /// rescan once the projection is back. Aborting the ingest on a
+    /// projection-read failure would make scanning a hard dependency of
+    /// ingest, which the design explicitly avoids.
+    ///
+    /// Scan resolution: a matched operator policy decides via its own
+    /// `scan_backends` (an empty list = scanning waived by the operator);
+    /// with no operator policy the hardcoded `DefaultPolicy` applies
+    /// (`["trivy"]`), so out-of-the-box deployments scan with Trivy.
+    /// Mirrors the already-correct resolution in
+    /// `ScanOrchestrationUseCase`.
+    ///
+    /// Provenance gate mirrors ADR 0027: enqueue iff `mode != Off` AND a
+    /// registered verifier `applies_to(format)` — gating on `mode != Off`
+    /// alone would enqueue a no-op for every non-OCI ingest under the
+    /// default `VerifyIfPresent` (Tier-1 cosign applies only to `"oci"`);
+    /// the `provenance_capable_formats` set carries exactly the formats
+    /// some registered port can act on, and the gate auto-activates when a
+    /// Tier-2 verifier later registers (no migration). An absent policy
+    /// resolves to the `ProvenanceMode` default (`VerifyIfPresent`).
+    ///
+    /// Quarantine-by-default (ADR 0007): the matched
+    /// `ScanPolicy.quarantine_duration_secs` is the single source of truth
+    /// for the observation-window length; with NO matched policy,
+    /// [`DefaultPolicy::quarantine_duration_secs`] (24h) fires. `Some(0)`
+    /// on an operator policy is the explicit **permissive** opt-out and is
+    /// honoured verbatim — it does NOT fall back to the default. The
+    /// `.map(...).unwrap_or_else(default)` shape below is what ensures
+    /// `Some(0)` on an operator policy stays at 0 — only an *absent*
+    /// policy falls through to the Default.
+    async fn resolve_scan_and_provenance_decision(
+        &self,
+        repository_id: Uuid,
+        artifact_id: Uuid,
+        scan_enqueue_format: &str,
+    ) -> ScanProvenanceDecision {
+        let matched_policy: Option<ScanPolicyProjection> =
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        artifact_id = %artifact_id,
+                        repository_id = %repository_id,
+                        error = %e,
+                        "ingest: policy_projections.list_active failed; \
+                         skipping scan auto-enqueue (artifact still ingests)",
+                    );
+                    None
+                });
+
+        let scan_will_run = match matched_policy.as_ref() {
+            Some(p) => !p.scan_backends.is_empty(),
+            None => !DefaultPolicy::block_on_critical_default_backends().is_empty(),
+        };
+        // `scanner` is informational on the event payload; the actual
+        // backends resolve at orchestration time from the resolved
+        // policy's `scan_backends`. Use the operator policy name, or
+        // "default" when the hardcoded `DefaultPolicy` drove the scan, so
+        // a reader of the event log can correlate the request.
+        let scan_requested_event = scan_will_run.then(|| EventToAppend {
+            event_id: Uuid::new_v4(),
+            event: DomainEvent::ScanRequested(ScanRequested {
+                artifact_id,
+                scanner: matched_policy
+                    .as_ref()
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "default".to_string()),
+            }),
+        });
+
+        let provenance_mode = matched_policy
+            .as_ref()
+            .map(|p| p.provenance_mode)
+            .unwrap_or_default();
+        let provenance_will_run = provenance_mode != ProvenanceMode::Off
+            && self
+                .provenance_capable_formats
+                .contains(scan_enqueue_format);
+
+        let policy_source_is_default = matched_policy.is_none();
+        let effective_duration_secs: i64 = matched_policy
+            .as_ref()
+            .map(|p| p.quarantine_duration_secs)
+            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
+
+        ScanProvenanceDecision {
+            scan_requested_event,
+            scan_will_run,
+            provenance_mode,
+            provenance_will_run,
+            policy_source_is_default,
+            effective_duration_secs,
+        }
+    }
+
+    /// Step 6: quarantine decision — resolved BEFORE the first commit so
+    /// `ArtifactIngested` + `ScanRequested` (+ provenance-gate enqueue) +
+    /// `ArtifactQuarantined` land in ONE atomic transition (issue #90,
+    /// TOCTOU fix). This used to be a SEPARATE commit made after the
+    /// ingest transition had already landed; a scan/provenance-verify
+    /// worker could pick up the just-enqueued job in the gap between the
+    /// two commits and observe an anchor-less, `None`-status artifact that
+    /// was actually seconds away from being quarantined — the no-strand
+    /// crash-gap guarantee `commit_transition_with_enqueues` gives the
+    /// enqueues now also covers this transition, since it rides the same
+    /// append. Mutates `artifact` in place (via `Artifact::quarantine`)
+    /// and pushes `ArtifactQuarantined` onto `events` when it fires;
+    /// returns `None` in permissive mode (`effective_duration_secs == 0`
+    /// on an operator policy) — the artifact stays in `None`, downloadable,
+    /// per `Artifact::is_downloadable`.
+    ///
+    /// Referenced-tree descendant zero-window carve-out (#46 Item 2,
+    /// design doc §4 final shape + §4a). A SCOPED carve-out of ADR 0007,
+    /// NOT a reversal. This artifact is a "referenced-tree descendant" iff
+    /// it is already a `content_references` **target** of some other,
+    /// already-ingested artifact — a child manifest (`kind =
+    /// "oci_index_member"`), a referrer's subject (`kind = "oci_subject"`),
+    /// or a config/layer blob (`kind = "oci_config"` / `"oci_layer"`, #46
+    /// Item 1). The predicate itself lives in
+    /// [`crate::use_cases::referenced_descendant::is_referenced_tree_descendant`]
+    /// — shared verbatim with the provenance orchestrator's `NoAttestation
+    /// × Required` hold (issue #115 item 3) so the two can never drift;
+    /// see that module for why the self-referential kinds are excluded.
+    /// The lookup + its fail-safe-on-error posture are shared with
+    /// `register_by_hash_inner`'s identical carve-out through
+    /// `resolve_referenced_tree_descendant_fail_safe`, so the two minting
+    /// paths cannot drift either. This lookup does NOT depend on this
+    /// ingest's OWN `content_references` rows (written post-commit) — it
+    /// only ever matches rows written by OTHER, already-ingested
+    /// artifacts, so resolving it before this ingest's own commit is
+    /// safe.
+    ///
+    /// Resolves the quarantine-window anchor (`quarantine_window_start`)
+    /// as the MINIMUM of the applicable age sources (ADR 0054), in the one
+    /// shared pure function `register_by_hash_inner` also calls — which is
+    /// what makes the two minting paths derive identically. Every source
+    /// is a "the world has already had this long to look" argument, so
+    /// the honest composition is the earliest deadline any applicable
+    /// rule would set on its own; see
+    /// `hort_domain::policy::quarantine_anchor` for the full rationale,
+    /// including why the descendant carve-out composes rather than
+    /// overrides. The sources assembled:
+    ///
+    /// - The ingest instant, unconditional — so a missing or unreadable
+    ///   source degrades to a FULL window, never a shorter one.
+    /// - The live content-level age evidence: the earliest moment hort
+    ///   observed these bytes in ANY of its own repositories. An
+    ///   observation hort generates itself, so it needs no operator
+    ///   opt-in — an upstream claim can be backdated, an observation
+    ///   cannot.
+    /// - The upstream publish hint, but ONLY when the serving
+    ///   `RepositoryUpstreamMapping` — THIS repository's own mapping — has
+    ///   `trust_upstream_publish_time` enabled. The opt-in is a
+    ///   per-mapping trust statement and does not transit repositories:
+    ///   passing `None` when the flag is off is the whole of that rule,
+    ///   because the derivation has no other channel for an upstream
+    ///   assertion. An unfiltered minimum over every repository's claims
+    ///   would let a repository proxying an untrusted mirror shorten the
+    ///   window of one proxying the genuine upstream — the ADR 0016
+    ///   cross-opt-in collapse pattern, in the weakening direction.
+    /// - The referenced-tree-descendant carve-out's `ingested_at -
+    ///   effective_duration`, i.e. a window that is already over. The
+    ///   RELEASE PREDICATE is completely unchanged (`Artifact::release`
+    ///   still requires its own `ScanSucceeded`/`ScanWaived` authority —
+    ///   ADR 0007's two impossible failure modes stay impossible); this
+    ///   only removes the *timer* wait, so the descendant's own clean scan
+    ///   trips the existing event-driven fast-path release in
+    ///   `QuarantineUseCase::record_scan_result` instead of waiting out a
+    ///   window that provides no additional observation (§4a: no
+    ///   in-window rescan exists, so the window is pure latency for every
+    ///   artifact, not protection).
+    ///
+    /// Invariant: store the **anchor**, never a precomputed deadline. The
+    /// release sweep and the proxy-503 read path compute the deadline live
+    /// via `effective_quarantine_deadline(anchor, duration)`, so a later
+    /// policy edit of `quarantineDuration` takes effect on the existing
+    /// artifact's window without a backfill migration.
+    #[allow(clippy::too_many_arguments)]
+    async fn decide_and_apply_quarantine(
+        &self,
+        artifact: &mut Artifact,
+        now: DateTime<Utc>,
+        effective_duration_secs: i64,
+        repository_id: Uuid,
+        trust_upstream_publish_time: bool,
+        upstream_published_at: Option<DateTime<Utc>>,
+        events: &mut Vec<EventToAppend>,
+        repo_key: &str,
+    ) -> Result<Option<DerivedAnchor>, IngestInnerError> {
+        if effective_duration_secs <= 0 {
+            return Ok(None);
+        }
+
+        let is_referenced_descendant = resolve_referenced_tree_descendant_fail_safe(
+            &*self.content_references,
+            repository_id,
+            artifact.id,
+            &artifact.sha256_checksum,
+        )
+        .await;
+
+        let derived = derive_quarantine_anchor(&AnchorEvidence {
+            minted_at: now,
+            window: chrono::Duration::seconds(effective_duration_secs),
+            // `ingest_inner` never carries the seed-import override (the
+            // request field is destructured away above and threaded to
+            // `register_by_hash` instead).
+            explicit_override: None,
+            first_seen_at: read_content_age_evidence(&*self.artifacts, &artifact.sha256_checksum)
+                .await,
+            trusted_upstream_published_at: trust_upstream_publish_time
+                .then_some(upstream_published_at)
+                .flatten(),
+            is_referenced_descendant,
+        });
+        let anchor = derived.anchor;
+
+        let quarantine_event = artifact.quarantine(anchor).map_err(|e| {
+            (
+                InnerIngestError::Other(AppError::Domain(e)),
+                Some(repo_key.to_string()),
+                None,
+            )
+        })?;
+        events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
+            quarantine_event,
+        )));
+
+        Ok(Some(derived))
+    }
+
+    /// Refcount projection writes. Run AFTER `commit_transition` succeeds
+    /// (the artifact is persisted-and-valid by this point). Insert failure
+    /// is recoverable: the refcount row is eventual; an operator-side
+    /// reconcile sweep catches any divergence. We do NOT abort the ingest
+    /// on refcount-insert failure — the artifact is already alive and
+    /// downloadable, and a missing refcount row only delays GC, it doesn't
+    /// break correctness. Mirrors the warn shape used by the OCI
+    /// manifest-PUT content_references insert (see
+    /// `crates/hort-http-oci/src/manifests_write.rs` near `stage =
+    /// "content_references_insert"`).
+    async fn write_ingest_refcounts(
+        &self,
+        artifact: &Artifact,
+        repository_id: Uuid,
+        metadata_blob_for_refcount: Option<ContentHash>,
+        now_for_refcount: DateTime<Utc>,
+    ) {
+        if let Err(e) = self
+            .content_references
+            .insert(ContentReference {
+                source_artifact_id: artifact.id,
+                target_content_hash: artifact.sha256_checksum.clone(),
+                kind: "primary_content".to_string(),
+                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                repository_id,
+                recorded_at: now_for_refcount,
+            })
+            .await
+        {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                kind = "primary_content",
+                error = %e,
+                stage = "content_references_insert",
+                "content_references insert failed; refcount eventual — operator reconcile is future work"
+            );
+        }
+        if let Some(blob_hash) = metadata_blob_for_refcount {
+            if let Err(e) = self
+                .content_references
+                .insert(ContentReference {
+                    source_artifact_id: artifact.id,
+                    target_content_hash: blob_hash,
+                    kind: "metadata_blob".to_string(),
+                    metadata: serde_json::Value::Object(serde_json::Map::new()),
+                    repository_id,
+                    recorded_at: now_for_refcount,
+                })
+                .await
+            {
+                tracing::warn!(
+                    artifact_id = %artifact.id,
+                    kind = "metadata_blob",
+                    error = %e,
+                    stage = "content_references_insert",
+                    "content_references insert failed; refcount eventual — operator reconcile is future work"
+                );
+            }
+        }
+    }
+
+    /// PEP 658 wheel-metadata extraction hook.
+    ///
+    /// After `ArtifactIngested` lands and the refcount rows are written,
+    /// re-read the just-stored content from CAS, hand it to
+    /// `FormatHandler::extract_wheel_metadata_bytes`, and on a
+    /// `Some(bytes)` return: stream the bytes into CAS via
+    /// `StoragePort::put` and link them back to the parent wheel via a
+    /// `kind = "wheel_metadata"` row on the `content_references`
+    /// projection.
+    ///
+    /// The re-read from CAS is unavoidable: the upstream `storage.put`
+    /// consumed the inbound stream, and the existing
+    /// `prefetch-dependencies` task handler establishes the same
+    /// precedent (read the just-ingested bytes back from CAS by
+    /// `artifact.sha256_checksum`).
+    ///
+    /// **Path-gated** — only `.whl`-suffixed paths invoke the trait
+    /// method. Sdists, non-PyPI artifacts, and any other path skip the
+    /// re-read entirely (the default `extract_wheel_metadata_bytes`
+    /// returns `Ok(None)` anyway, so the only thing avoided is the CAS
+    /// round-trip cost). This matches the PyPI handler's own first-line
+    /// `.whl` short-circuit and keeps non-wheel ingests paying zero new
+    /// I/O.
+    ///
+    /// **No new domain event.** The metadata blob is a *derived
+    /// projection* of the wheel content — re-derivable on demand from
+    /// `ArtifactIngested` + `content_references`; the event stream
+    /// deliberately stays lean.
+    ///
+    /// **Failure semantics:**
+    /// - `Ok(None)` (sdist / corrupt wheel / no METADATA member) → silent
+    ///   no-op; the wheel ingest itself succeeded and PEP 658 simply does
+    ///   not apply for this artifact.
+    /// - `Err(DomainError::Validation(_))` (oversized METADATA per the
+    ///   extractor's 1 MiB cap) → `warn!` + tick
+    ///   `hort_ingest_total{result="wheel_metadata_extract_failed"}`.
+    ///   Non-fatal — the wheel ingest stays successful.
+    /// - `Err(_)` (infrastructure-class) → propagate. This surfaces the
+    ///   failure to the caller even though `ArtifactIngested` is already
+    ///   durable; reads as "the wheel-metadata pipeline did not complete."
+    ///   Same shape for CAS `storage.put` failure and ContentReference
+    ///   `insert` failure on the wheel-metadata blob.
+    #[allow(clippy::too_many_arguments)]
+    async fn extract_and_link_wheel_metadata(
+        &self,
+        coords: &ArtifactCoords,
+        handler: &dyn FormatHandler,
+        artifact: &Artifact,
+        repository_id: Uuid,
+        repo_key: &str,
+        format: &str,
+        now_for_refcount: DateTime<Utc>,
+    ) -> Result<(), IngestInnerError> {
+        if !coords.path.ends_with(".whl") {
+            return Ok(());
+        }
+
+        // Re-read the just-ingested content. The 1 MiB cap on METADATA is
+        // enforced *inside* `extract_wheel_metadata_bytes` on the ZIP
+        // entry's header — the raw wheel bytes here are bounded only by
+        // the per-format ingest cap that already applied to the primary
+        // `storage.put` above.
+        let mut wheel_bytes: Vec<u8> = Vec::new();
+        let read_result = match self.storage.get(&artifact.sha256_checksum).await {
+            Ok(mut stream) => stream
+                .read_to_end(&mut wheel_bytes)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    DomainError::Invariant(format!(
+                        "wheel-metadata extract: CAS re-read stream failed: {e}"
+                    ))
+                }),
+            Err(e) => Err(e),
+        };
+        match read_result {
+            Ok(()) => {
+                let extract = handler
+                    .extract_wheel_metadata_bytes(coords, PayloadAccess::Bytes(&wheel_bytes));
+                match extract {
+                    Ok(Some(metadata_bytes)) => {
+                        let metadata_len = metadata_bytes.len();
+                        // CAS-write the METADATA bytes (idempotent on
+                        // identical content per `StoragePort::put`
+                        // contract).
+                        let metadata_hash = match self
+                            .storage
+                            .put(Box::new(std::io::Cursor::new(metadata_bytes.to_vec())))
+                            .await
+                        {
+                            Ok(put_result) => put_result.hash,
+                            Err(e) => {
+                                return Err((
+                                    InnerIngestError::Other(AppError::Storage(e.to_string())),
+                                    Some(repo_key.to_string()),
+                                    None,
+                                ));
+                            }
+                        };
+                        // Link to parent wheel — kind="wheel_metadata".
+                        // Upsert on `(repo, source, kind)` per the
+                        // existing port semantics.
+                        if let Err(e) = self
+                            .content_references
+                            .insert(ContentReference {
+                                source_artifact_id: artifact.id,
+                                target_content_hash: metadata_hash.clone(),
+                                kind: "wheel_metadata".to_string(),
+                                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                                repository_id,
+                                recorded_at: now_for_refcount,
+                            })
+                            .await
+                        {
+                            return Err((
+                                InnerIngestError::Other(AppError::Domain(e)),
+                                Some(repo_key.to_string()),
+                                None,
+                            ));
+                        }
+                        tracing::info!(
+                            artifact_id = %artifact.id,
+                            repository_id = %repository_id,
+                            metadata_hash = %metadata_hash,
+                            metadata_bytes = metadata_len,
+                            "wheel_metadata extracted and persisted (PEP 658)"
+                        );
+                    }
+                    Ok(None) => {
+                        // Sdist / corrupt wheel / no METADATA member —
+                        // silent no-op. Wheel ingest succeeded; PEP 658 is
+                        // simply not advertised for this artifact.
+                    }
+                    Err(DomainError::Validation(reason)) => {
+                        tracing::warn!(
+                            artifact_id = %artifact.id,
+                            repository_id = %repository_id,
+                            reason = %reason,
+                            "wheel_metadata extract failed (validation); \
+                             PEP 658 advertisement unavailable for this wheel"
+                        );
+                        metrics::counter!(
+                            "hort_ingest_total",
+                            labels::FORMAT => format.to_string(),
+                            labels::REPOSITORY => self.repo_label(Some(repo_key)),
+                            labels::RESULT => IngestResult::WheelMetadataExtractFailed.as_str(),
+                        )
+                        .increment(1);
+                    }
+                    Err(e) => {
+                        return Err((
+                            InnerIngestError::Other(AppError::Domain(e)),
+                            Some(repo_key.to_string()),
+                            None,
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                // Infrastructure-class CAS read failure — propagate. The
+                // `ArtifactIngested` event is durable but the
+                // wheel-metadata extraction pipeline could not run.
+                return Err((
+                    InnerIngestError::Other(AppError::Domain(e)),
+                    Some(repo_key.to_string()),
+                    None,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Post-commit group-membership hook.
+    ///
+    /// Runs AFTER `ArtifactIngested` has landed. Crucially, the
+    /// `ArtifactLifecyclePort::commit_transition` in `ingest_inner` and
+    /// the `ArtifactGroupUseCase::add_member` call here are TWO separate
+    /// transactions. `add_member` itself now retries a losing
+    /// member-append conflict against the refreshed group state (bounded),
+    /// so an ordinary concurrent-membership race resolves inside this call
+    /// and never reaches the warn branch below. The warn branch is the
+    /// CRASH-WINDOW backstop: if the process dies between the two
+    /// transactions, or the retry budget is genuinely exhausted, the
+    /// artifact is already persisted-and-valid and just unlinked from its
+    /// group. We log `warn!` and return `Ok` from `ingest` (the ingest
+    /// itself succeeded). The group-reconcile sweep remains the healing
+    /// path for that crash window — it replays `ArtifactIngested` events
+    /// and re-runs `classify_group_member` at rest.
+    ///
+    /// Do NOT try to merge the two transactions or compensate on failure.
+    /// Cross-aggregate atomicity is not worth the coupling cost.
+    #[allow(clippy::too_many_arguments)]
+    async fn link_group_membership(
+        &self,
+        handler: &dyn FormatHandler,
+        coords: &ArtifactCoords,
+        repository_id: Uuid,
+        artifact: &Artifact,
+        actor_for_group: ApiActor,
+        correlation_id: Uuid,
+        artifact_ingested_event_id: Uuid,
+        repo_key: &str,
+        format: &str,
+    ) {
+        let Some(membership) = handler.classify_group_member(coords, &coords.path) else {
+            return;
+        };
+        let group_result = self
+            .group_use_case
+            .add_member(
+                repository_id,
+                membership.group_coords.clone(),
+                membership.role.clone(),
+                artifact.id,
+                membership.is_primary,
+                Actor::Api(actor_for_group),
+                correlation_id,
+                Some(artifact_ingested_event_id),
+                Some(repo_key),
+                format,
+            )
+            .await;
+        match group_result {
+            Ok(()) => tracing::info!(
+                artifact_id = %artifact.id,
+                group_coords_name = %membership.group_coords.name,
+                role = %membership.role,
+                "group membership committed post-ingest"
+            ),
+            Err(e) => tracing::warn!(
+                artifact_id = %artifact.id,
+                error = %e,
+                "group membership commit failed; artifact ingested but unlinked"
+            ),
+        }
+    }
+
+    /// Quarantine observability. The transition itself already landed
+    /// atomically with `ArtifactIngested` (+ `ScanRequested` /
+    /// provenance-gate enqueue) in the single commit in `ingest_inner` —
+    /// see [`Self::decide_and_apply_quarantine`] (issue #90). Only the
+    /// logs/metrics fire here, gated on whether that decision actually
+    /// quarantined (`Some`).
+    ///
+    /// The default-policy fire gets a distinct `policy_source` tag so
+    /// operators can dashboard "how many repos still have no ScanPolicy
+    /// and are leaning on the default 24h window" — the field is
+    /// `policy_source`, NOT `source`; the `source` axis is reserved for
+    /// the *anchor-source* distinction (`ingest` vs `upstream` under
+    /// `trust_upstream_publish_time`).
+    ///
+    /// The `anchor_source` debug line fires whenever a source OTHER than
+    /// the ingest instant won the minimum — rare per-artifact but
+    /// high-volume on busy upstreams, so it stays at `debug!`; the
+    /// policy-source `info!` lines above already carry the resolved
+    /// `anchor` for the default observability dashboard. The axis reports
+    /// which source WON the minimum, not merely which one was applicable —
+    /// with a minimum, several can apply at once and only one decides.
+    /// `upstream_clamp_fired` is reported independently, because a claimed
+    /// publish time after the ingest instant is an operator signal about
+    /// the upstream whether or not the clamped value went on to win.
+    #[allow(clippy::too_many_arguments)]
+    fn log_quarantine_observability(
+        &self,
+        quarantine_fired: Option<DerivedAnchor>,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+        effective_duration_secs: i64,
+        policy_source_is_default: bool,
+        now: DateTime<Utc>,
+        upstream_published_at: Option<DateTime<Utc>>,
+        format: String,
+        repo_key: &str,
+    ) {
+        let Some(DerivedAnchor {
+            anchor,
+            source: anchor_source,
+            upstream_clamp_fired,
+        }) = quarantine_fired
+        else {
+            return;
+        };
+
+        if policy_source_is_default {
+            tracing::info!(
+                %artifact_id,
+                %repository_id,
+                window_duration_secs = effective_duration_secs,
+                anchor = %anchor,
+                policy_source = "default_policy",
+                "quarantine triggered on ingest (default policy)"
+            );
+        } else {
+            tracing::info!(
+                %artifact_id,
+                anchor = %anchor,
+                window_duration_secs = effective_duration_secs,
+                "quarantine triggered on ingest"
+            );
+        }
+
+        match anchor_source {
+            AnchorSource::Mint | AnchorSource::Override => {}
+            AnchorSource::FirstSeen => tracing::debug!(
+                %artifact_id,
+                %repository_id,
+                ingested_at = %now,
+                chosen_anchor = %anchor,
+                anchor_source = "content_first_seen",
+                "quarantine anchor resolved via hort's own earlier observation of this \
+                 content (release still requires this artifact's own \
+                 ScanSucceeded/ScanWaived)"
+            ),
+            AnchorSource::TrustedUpstreamPublish => tracing::debug!(
+                %artifact_id,
+                %repository_id,
+                upstream_published_at = ?upstream_published_at,
+                ingested_at = %now,
+                chosen_anchor = %anchor,
+                clamp_fired = upstream_clamp_fired,
+                anchor_source = "upstream_published",
+                "quarantine anchor resolved via upstream publish time \
+                 (trust_upstream_publish_time opt-in)"
+            ),
+            // The referenced-tree-descendant zero-window fire. The
+            // release predicate is untouched — this only records that the
+            // *window*, not the *release authority*, collapsed.
+            AnchorSource::ReferencedDescendant => tracing::debug!(
+                %artifact_id,
+                %repository_id,
+                ingested_at = %now,
+                chosen_anchor = %anchor,
+                window_duration_secs = effective_duration_secs,
+                anchor_source = "referenced_descendant",
+                "quarantine window collapsed to zero: artifact is a content_references \
+                 target of an already-ingested manifest/index (#46 Item 2 scoped carve-out; \
+                 release still requires this artifact's own ScanSucceeded/ScanWaived)"
+            ),
+        }
+
+        // A future-dated upstream claim is worth surfacing on its own
+        // axis: it says the upstream's clock or its metadata is wrong,
+        // regardless of which source ended up anchoring the window.
+        if upstream_clamp_fired {
+            tracing::debug!(
+                %artifact_id,
+                %repository_id,
+                upstream_published_at = ?upstream_published_at,
+                ingested_at = %now,
+                "trusted upstream publish time claimed an instant after ingest and was \
+                 clamped; it cannot extend this artifact's quarantine into the future"
+            );
+        }
+
+        metrics::counter!(
+            "hort_quarantine_triggered_total",
+            labels::FORMAT => format,
+            labels::REPOSITORY => self.repo_label(Some(repo_key)),
+        )
+        .increment(1);
+    }
+
+    /// Transitive prefetch cascade enqueue hook. Fires per-ingest when the
+    /// repository's `prefetch_policy.triggers` contained `TransitiveDeps`
+    /// (`prefetch_transitive_deps_triggered`, precomputed by the caller
+    /// before `repo.format` is moved into `ArtifactMetadata`); enqueues a
+    /// root `prefetch-dependencies` job that the worker dispatches to
+    /// `PrefetchDependenciesHandler` to walk the just-ingested artifact's
+    /// manifest, resolve declared runtime deps, and seed the cascade.
+    ///
+    /// The trigger absence (the default `PrefetchPolicy`) is the absence
+    /// of the enqueue — operators opt in per-repo. Best-effort: enqueue
+    /// failure logs `warn!` and the ingest's success path is unaffected
+    /// (the cascade is eventually-consistent — the next pull re-triggers).
+    /// Mirrors the shape of the `content_references_insert` and
+    /// group-membership post-hooks (warn-and-continue, runs strictly after
+    /// `commit_transition` so a failed commit does not leak a cascade
+    /// enqueue).
+    ///
+    /// `suppress_cascade_seed` is set by a CASCADE-INTERNAL `prefetch`
+    /// leaf-ingest (trigger_source "prefetch"): the artifact it just
+    /// ingested is already covered by its parent walk's depth-carrying
+    /// child `prefetch-dependencies` row, so firing this depth-0 seed hook
+    /// would double-walk it AND reset the cascade depth to 0 (defeating
+    /// the transitive_depth / max_descendants caps). Seeds (client pulls,
+    /// self-service ROOT leaves) leave it `false` so the hook fires as
+    /// before.
+    async fn enqueue_prefetch_cascade(
+        &self,
+        suppress_cascade_seed: bool,
+        prefetch_transitive_deps_triggered: bool,
+        artifact_id: Uuid,
+        repository_id: Uuid,
+    ) {
+        if suppress_cascade_seed || !prefetch_transitive_deps_triggered {
+            return;
+        }
+
+        let params = serde_json::json!({
+            "artifact_id": artifact_id,
+            "current_depth": 0u32,
+        });
+        // `priority = 0` — cascade rows drain after operator/cron work.
+        // `trigger_source = "ingest"` — the cascade is event-driven by the
+        // ingest; the CHECK in migration 009 lists `ingest` as a valid
+        // trigger source.
+        match self
+            .jobs
+            .enqueue_task(
+                "prefetch-dependencies",
+                &params,
+                None, // actor_id: system-driven post-ingest hook
+                0i16,
+                "ingest",
+                None, // non-destructive task — no DB-side idempotency key (ADR 0028)
+            )
+            .await
+        {
+            Ok(outcome) => tracing::debug!(
+                artifact_id = %artifact_id,
+                repository_id = %repository_id,
+                ?outcome,
+                "prefetch cascade: enqueued prefetch-dependencies root job",
+            ),
+            Err(e) => tracing::warn!(
+                artifact_id = %artifact_id,
+                repository_id = %repository_id,
+                error = %e,
+                "prefetch cascade: prefetch-dependencies enqueue failed; \
+                 cascade skipped (best-effort — next pull re-triggers)",
+            ),
+        }
+    }
+
     /// Inner ingest implementation. Returns
     /// `(artifact, was_duplicate, repo_key, ingested_event_id)` on success
     /// and `(error, Some(repo_key))` on failure once the repository has been
@@ -2323,6 +3415,11 @@ impl IngestUseCase {
     /// is put to CAS ONLY AFTER the dedup checks below have cleared, so
     /// a duplicate re-publish does not orphan a just-written CAS
     /// object.
+    ///
+    /// The body below is a flat pipeline over the numbered steps
+    /// documented on the extracted stage methods (`verify_repository_and_format`
+    /// through `enqueue_prefetch_cascade`); their call order is the
+    /// load-bearing gate/event/commit sequence.
     #[allow(clippy::too_many_arguments)]
     async fn ingest_inner(
         &self,
@@ -2402,275 +3499,45 @@ impl IngestUseCase {
         // `false` (they ARE the seed). Derived from the verified request's
         // `payload_metadata.cascade_internal` in `ingest_with_verification`.
         suppress_cascade_seed: bool,
-    ) -> Result<
-        (Artifact, bool, String, Uuid),
-        (InnerIngestError, Option<String>, Option<IngestResult>),
-    > {
-        // 1. Verify repository exists. The repo is needed both for the
-        // `repository` metric label and for downstream quarantine emission.
+    ) -> Result<IngestInnerOk, IngestInnerError> {
         let repo = self
-            .repositories
-            .find_by_id(repository_id)
-            .await
-            .map_err(|e| (InnerIngestError::Other(AppError::Domain(e)), None, None))?;
+            .verify_repository_and_format(repository_id, &coords)
+            .await?;
         let repo_key = repo.key.clone();
 
-        // 2. Verify the format matches — a PyPI handler must not ingest into
-        // an npm repository. Reject BEFORE `storage.put` so a mismatched
-        // request cannot create a CAS orphan. The caller controls both
-        // `coords.format` (derived from the route) and the target repo
-        // (its key), so the mismatch is a clean `Validation` error.
-        if coords.format != repo.format {
-            return Err((
-                InnerIngestError::Other(AppError::Domain(DomainError::Validation(format!(
-                    "format mismatch: repository {} is {}, coords declare {}",
-                    repo_key, repo.format, coords.format
-                )))),
-                Some(repo_key),
-                None,
-            ));
-        }
-
-        // 3. Look up any existing artifact at the same logical path BEFORE
-        // writing bytes. When the caller supplies `declared_sha256`, this
-        // short-circuits both the dedup and conflict decisions with zero
-        // storage I/O — and, critically, a conflict decision no longer
-        // requires uploading the content first (the most common source of
-        // avoidable orphans). When the caller supplies no declared hash, the
-        // existing post-put comparison below still runs as before.
-        // See `docs/architecture/explanation/cas-storage.md` §"Orphaned
-        // content".
-        let existing = self
-            .artifacts
-            .find_by_path(repository_id, &coords.path)
-            .await
-            .map_err(|e| {
-                (
-                    InnerIngestError::Other(AppError::Domain(e)),
-                    Some(repo_key.clone()),
-                    None,
-                )
-            })?;
-
-        if let (Some(existing), Some(declared)) = (existing.as_ref(), declared_sha256.as_ref()) {
-            if existing.sha256_checksum == *declared {
-                tracing::debug!(
-                    artifact_id = %existing.id,
-                    "deduplicated via declared hash"
-                );
-                return Ok((existing.clone(), true, repo_key, Uuid::new_v4()));
-            }
-            return Err((
-                InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
-                    "path {} already exists with different content (existing={}, declared={})",
-                    coords.path, existing.sha256_checksum, declared
-                )))),
-                Some(repo_key),
-                None,
-            ));
-        }
-
-        // 4. Store content — CAS computes hash + size. Wrap the storage
-        // error explicitly so metric classification can distinguish storage
-        // failures from domain errors.
-        let put_result = self.storage.put(stream).await.map_err(|e| {
-            (
-                InnerIngestError::Other(AppError::Storage(e.to_string())),
-                Some(repo_key.clone()),
-                None,
+        let existing = match self
+            .find_existing_and_check_declared_dedup(
+                repository_id,
+                &coords,
+                declared_sha256.as_ref(),
+                &repo_key,
             )
-        })?;
-
-        // 5. Post-put duplicate check by path — only reached when the caller
-        // supplied no `declared_sha256` (or when `declared_sha256` was set
-        // but `find_by_path` returned `None` at step 3, meaning no existing
-        // row to compare against). Behaviour unchanged from the original
-        // flow.
-        if let Some(existing) = existing {
-            if existing.sha256_checksum == put_result.hash {
-                tracing::debug!(
-                    artifact_id = %existing.id,
-                    "deduplicated"
-                );
-                return Ok((existing, true, repo_key, Uuid::new_v4()));
-            }
-            return Err((
-                InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
-                    "path {} already exists with different content (existing={}, new={})",
-                    coords.path, existing.sha256_checksum, put_result.hash
-                )))),
-                Some(repo_key),
-                None,
-            ));
-        }
-
-        // 5a. Fresh-insert path: verify the caller-declared hash matches
-        // the hash we just computed while streaming to CAS.
-        // `declared_sha256` is a client-side integrity
-        // contract — the OCI monolithic PUT, PUT finalize, and
-        // manifest-digest PUT all depend on this check returning
-        // `Conflict` on mismatch.
-        //
-        // On mismatch: roll back the freshly-written CAS blob via
-        // `StoragePort::delete` ONLY IF no other artifact row
-        // references the hash. The dedup guard uses
-        // `ArtifactRepository::find_by_checksum`; a hit means the hash
-        // is shared with another repository (cross-mount, organic
-        // re-upload) and deleting would corrupt the referencing row.
-        // Rollback failures (backend I/O, port lookup error) log
-        // `warn!` and continue — the uncommitted blob is left
-        // unreferenced. No orphan reaper exists (`CasScrubUseCase` is
-        // integrity-only, never deletes); a content-addressed blob is
-        // collision-free so this accumulates harmlessly. This row-less
-        // orphan is an accepted bounded residual:
-        // storage-GC walks expired artifact
-        // rows and does NOT reclaim a blob with no row; a reaper was
-        // considered and rejected — see `rollback_unreferenced_cas` docs.
-        if let Some(declared) = declared_sha256.as_ref() {
-            if *declared != put_result.hash {
-                self.rollback_unreferenced_cas(&put_result.hash, "declared_sha256 mismatch")
-                    .await;
-                let source = AppError::Domain(DomainError::Conflict(format!(
-                    "declared sha256 does not match computed hash \
-                     (declared={declared}, computed={})",
-                    put_result.hash
-                )));
-                // Typed-variant dispatch: the
-                // outer `ingest_with_verification` peels this variant
-                // to decide whether to emit `ChecksumMismatch` to the
-                // repository audit stream. A string discriminator
-                // like `msg.contains("computed=")` would silently
-                // disable audit emission on any reword of the inner
-                // Conflict message. The `source` field is preserved
-                // verbatim so wire-response shape, metric labels, and
-                // `classify_ingest_error` taxonomy do not change.
-                return Err((
-                    InnerIngestError::VerificationMismatch {
-                        algorithm: HashAlgorithm::Sha256,
-                        upstream_value: declared.to_string(),
-                        computed_value: put_result.hash.to_string(),
-                        source,
-                    },
-                    Some(repo_key),
-                    Some(IngestResult::DeclaredHashMismatch),
-                ));
-            }
-        }
-
-        // 5b. SHA-512 verification arm. Reached only
-        // for the npm SRI path; SHA-256 verification piggybacks on the
-        // `declared_sha256` machinery above. Finalising the digest
-        // handle here also resets the shared hasher (see
-        // `Sha512DigestHandle::finalize` docstring), so the value is
-        // captured into a local variable for reuse when constructing
-        // `ChecksumVerified` further down.
-        let computed_sha512_hex: Option<String> = match verification.as_ref() {
-            Some(VerificationContext {
-                sha512_handle: Some(handle),
-                upstream_value,
-                ..
-            }) => {
-                let computed = lower_hex(&handle.finalize());
-                if computed != *upstream_value {
-                    self.rollback_unreferenced_cas(&put_result.hash, "sha512 upstream mismatch")
-                        .await;
-                    let source = AppError::Domain(DomainError::Conflict(format!(
-                        "upstream sha512 does not match computed hash \
-                         (upstream={upstream_value}, computed={computed})"
-                    )));
-                    // Typed-variant dispatch. See
-                    // the SHA-256 site above for the rationale: outer
-                    // layer matches on `VerificationMismatch`, not on
-                    // the message string.
-                    return Err((
-                        InnerIngestError::VerificationMismatch {
-                            algorithm: HashAlgorithm::Sha512,
-                            upstream_value: upstream_value.clone(),
-                            computed_value: computed.clone(),
-                            source,
-                        },
-                        Some(repo_key),
-                        Some(IngestResult::DeclaredHashMismatch),
-                    ));
-                }
-                Some(computed)
-            }
-            _ => None,
+            .await?
+        {
+            ControlFlow::Break(early_ok) => return Ok(early_ok),
+            ControlFlow::Continue(existing) => existing,
         };
 
-        // 5c. SHA-1 transfer-verification *floor* arm (ADR 0033 — the
-        // Maven `.sha1` sidecar). The SHA-1 sibling of the SHA-512 arm
-        // above; reached only for the `UpstreamPublished(Sha1)` path. The
-        // CAS key remains SHA-256 — SHA-1 is the transfer comparison only,
-        // never a content-address. Finalising the handle resets the shared
-        // hasher (see `Sha1DigestHandle::finalize`), so the value is
-        // captured here for reuse when constructing `ChecksumVerified`.
-        // At most one of `sha512_handle` / `sha1_handle` is `Some`, so
-        // these two arms are mutually exclusive.
-        let computed_sha1_hex: Option<String> = match verification.as_ref() {
-            Some(VerificationContext {
-                sha1_handle: Some(handle),
-                upstream_value,
-                ..
-            }) => {
-                let computed = lower_hex(&handle.finalize());
-                if computed != *upstream_value {
-                    self.rollback_unreferenced_cas(&put_result.hash, "sha1 upstream mismatch")
-                        .await;
-                    let source = AppError::Domain(DomainError::Conflict(format!(
-                        "upstream sha1 does not match computed hash \
-                         (upstream={upstream_value}, computed={computed})"
-                    )));
-                    // Typed-variant dispatch. See
-                    // the SHA-256 site above for the rationale: outer
-                    // layer matches on `VerificationMismatch`, not on
-                    // the message string.
-                    return Err((
-                        InnerIngestError::VerificationMismatch {
-                            algorithm: HashAlgorithm::Sha1,
-                            upstream_value: upstream_value.clone(),
-                            computed_value: computed.clone(),
-                            source,
-                        },
-                        Some(repo_key),
-                        Some(IngestResult::DeclaredHashMismatch),
-                    ));
-                }
-                Some(computed)
-            }
-            _ => None,
+        let put_result = match self
+            .put_and_check_post_dedup(stream, existing, &coords.path, &repo_key)
+            .await?
+        {
+            ControlFlow::Break(early_ok) => return Ok(early_ok),
+            ControlFlow::Continue(put_result) => put_result,
         };
 
-        // Resolve the deferred
-        // metadata decision. The blob's `storage.put` happens HERE —
-        // AFTER both dedup returns above — so a duplicate re-publish
-        // never orphans a fresh CAS object. See `MetadataDecision`
-        // docstring.
-        let (final_metadata, final_blob, strategy_label): (
-            serde_json::Value,
-            Option<ContentHash>,
-            &'static str,
-        ) = match metadata_decision {
-            MetadataDecision::Inline(value) => (value, None, values::STRATEGY_INLINE),
-            MetadataDecision::Pending { bytes, summary } => {
-                let put_result = self
-                    .storage
-                    .put(Box::new(std::io::Cursor::new(bytes)))
-                    .await
-                    .map_err(|e| {
-                        (
-                            InnerIngestError::Other(AppError::Storage(e.to_string())),
-                            Some(repo_key.clone()),
-                            None,
-                        )
-                    })?;
-                (
-                    summary,
-                    Some(put_result.hash),
-                    values::STRATEGY_HASH_REFERENCE,
-                )
-            }
-        };
+        self.verify_declared_sha256(declared_sha256.as_ref(), &put_result.hash, &repo_key)
+            .await?;
+        let computed_sha512_hex = self
+            .verify_sha512_upstream(verification.as_ref(), &put_result.hash, &repo_key)
+            .await?;
+        let computed_sha1_hex = self
+            .verify_sha1_upstream(verification.as_ref(), &put_result.hash, &repo_key)
+            .await?;
+
+        let (final_metadata, final_blob, strategy_label) = self
+            .resolve_metadata_decision(metadata_decision, &repo_key)
+            .await?;
 
         // 4. Build Artifact entity.
         //
@@ -2774,6 +3641,17 @@ impl IngestUseCase {
         // make `repo.format` unreachable from here on.
         let scan_enqueue_format = repo.format.to_string();
 
+        // `prefetch_transitive_deps_triggered` MUST be captured before
+        // `repo.format` is moved into `artifact_metadata` below —
+        // `RepositoryFormat` is `!Copy`, so that move partially consumes
+        // `repo` and a later `&repo` (e.g. for a whole-struct borrow) would
+        // no longer compile. Direct field access to `repo.prefetch_policy`
+        // stays legal after the move; this just does it early.
+        let prefetch_transitive_deps_triggered = repo
+            .prefetch_policy
+            .triggers
+            .contains(&hort_domain::entities::repository::PrefetchTrigger::TransitiveDeps);
+
         let artifact_metadata = ArtifactMetadata {
             artifact_id,
             format: repo.format,
@@ -2815,59 +3693,50 @@ impl IngestUseCase {
             });
         }
 
-        // Resolve the `ScanPolicy` governing
-        // this ingest. A repo-scoped or global operator policy wins;
-        // `None` means no operator policy, in which case the hardcoded
-        // `DefaultPolicy` applies (see `scan_will_run` below —
-        // resolution tier 3). The decision is captured here so the
-        // post-commit `enqueue_scan` call sees the same outcome as the
-        // appended `ScanRequested` event (no race where the policy is
-        // archived between event-append and jobs-row insert).
-        let matched_policy: Option<ScanPolicyProjection> =
-            resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
-                .await
-                .unwrap_or_else(|e| {
-                    // Policy-lookup failure is non-fatal: log + treat as
-                    // "no policy applies". The artifact still ingests; an
-                    // operator can manually rescan once the projection is
-                    // back. Aborting the ingest on a projection-read
-                    // failure would make scanning a hard dependency of
-                    // ingest, which the design explicitly avoids.
-                    tracing::warn!(
-                        artifact_id = %artifact_id,
-                        repository_id = %repository_id,
-                        error = %e,
-                        "ingest: policy_projections.list_active failed; \
-                         skipping scan auto-enqueue (artifact still ingests)",
-                    );
-                    None
-                });
-        // Does a scan run for this ingest? A matched
-        // operator policy decides via its own `scan_backends` (an empty
-        // list = scanning waived by the operator); with no operator
-        // policy the hardcoded `DefaultPolicy` applies (`["trivy"]`), so
-        // out-of-the-box deployments scan with Trivy. Mirrors the
-        // already-correct resolution in `ScanOrchestrationUseCase`.
-        let scan_will_run = match matched_policy.as_ref() {
-            Some(p) => !p.scan_backends.is_empty(),
-            None => !DefaultPolicy::block_on_critical_default_backends().is_empty(),
-        };
-        if scan_will_run {
-            events.push(EventToAppend {
-                event_id: Uuid::new_v4(),
-                event: DomainEvent::ScanRequested(ScanRequested {
-                    artifact_id,
-                    // `scanner` is informational on the event payload;
-                    // the actual backends resolve at orchestration time
-                    // from the resolved policy's `scan_backends`. Use
-                    // the operator policy name, or "default" when the
-                    // hardcoded `DefaultPolicy` drove the scan, so a
-                    // reader of the event log can correlate the request.
-                    scanner: matched_policy
-                        .as_ref()
-                        .map(|p| p.name.clone())
-                        .unwrap_or_else(|| "default".to_string()),
-                }),
+        // Resolve the scan/provenance decisions the appended events and
+        // the ingest-time job enqueues both derive from — captured once so
+        // `ScanRequested` (pushed into `events` below) and the `jobs` rows
+        // enqueued below see the same policy snapshot (no race where the
+        // policy is archived in between). See
+        // `resolve_scan_and_provenance_decision` for the full resolution
+        // rationale.
+        let scan_decision = self
+            .resolve_scan_and_provenance_decision(repository_id, artifact_id, &scan_enqueue_format)
+            .await;
+        events.extend(scan_decision.scan_requested_event);
+
+        // `Some(derived_anchor)` iff this ingest quarantines. Threaded to
+        // the post-commit observability call further down — the
+        // transition itself lands atomically with `ArtifactIngested` in
+        // the single commit below; only the logs/metrics fire late. See
+        // `decide_and_apply_quarantine` for the full quarantine-by-default
+        // (ADR 0007) rationale and the referenced-tree-descendant
+        // zero-window carve-out (#46 Item 2).
+        let quarantine_fired = self
+            .decide_and_apply_quarantine(
+                &mut artifact,
+                now,
+                scan_decision.effective_duration_secs,
+                repository_id,
+                trust_upstream_publish_time,
+                upstream_published_at,
+                &mut events,
+                &repo_key,
+            )
+            .await?;
+
+        let mut enqueues: Vec<IngestEnqueue> = Vec::new();
+        if scan_decision.scan_will_run {
+            enqueues.push(IngestEnqueue::Scan {
+                format: scan_enqueue_format.clone(),
+                priority: 0, // default tier for ingest-time enqueue
+                trigger_source: "ingest".to_string(),
+            });
+        }
+        if scan_decision.provenance_will_run {
+            enqueues.push(IngestEnqueue::ProvenanceVerify {
+                priority: 0, // default tier for ingest-time enqueue
+                trigger_source: "ingest".to_string(),
             });
         }
 
@@ -2880,208 +3749,6 @@ impl IngestUseCase {
         // rescan to recover). The scan enqueue is idempotent at the adapter
         // (`ON CONFLICT DO NOTHING`); any other enqueue failure aborts the
         // whole ingest (retriable by the client), never a partial commit.
-        //
-        // Both gates resolve from the same `matched_policy` snapshot the
-        // `events` batch above used (no race). `scan_will_run` already decided
-        // whether `ScanRequested` is in `events`. The provenance gate mirrors
-        // ADR 0027: enqueue iff `mode != Off` AND a registered verifier
-        // `applies_to(format)` — gating on `mode != Off` alone would enqueue a
-        // no-op for every non-OCI ingest under the default `VerifyIfPresent`
-        // (Tier-1 cosign applies only to `"oci"`); the `provenance_capable_formats`
-        // set carries exactly the formats some registered port can act on, and
-        // the gate auto-activates when a Tier-2 verifier later registers (no
-        // migration). An absent policy resolves to the `ProvenanceMode` default
-        // (`VerifyIfPresent`).
-        let provenance_mode = matched_policy
-            .as_ref()
-            .map(|p| p.provenance_mode)
-            .unwrap_or_default();
-        let provenance_will_run = provenance_mode != ProvenanceMode::Off
-            && self
-                .provenance_capable_formats
-                .contains(&scan_enqueue_format);
-
-        // 6. Quarantine decision — resolved BEFORE the first commit so
-        // `ArtifactIngested` + `ScanRequested` (+ provenance-gate enqueue) +
-        // `ArtifactQuarantined` land in ONE atomic transition (issue #90,
-        // TOCTOU fix). This used to be a SEPARATE commit made after the
-        // ingest transition had already landed; a scan/provenance-verify
-        // worker could pick up the just-enqueued job in the gap between the
-        // two commits and observe an anchor-less, `None`-status artifact
-        // that was actually seconds away from being quarantined — the
-        // no-strand crash-gap guarantee `commit_transition_with_enqueues`
-        // gives the enqueues now also covers this transition, since it
-        // rides the same append.
-        //
-        // Quarantine-by-default (ADR 0007). The matched
-        // `ScanPolicy.quarantine_duration_secs` is the single source of
-        // truth for the observation-window length; with NO matched
-        // policy, [`DefaultPolicy::quarantine_duration_secs`] (24h)
-        // fires. The artifact transitions `None → Quarantined` whenever
-        // the resolved duration is `> 0`. `Some(0)` on an operator
-        // policy is the explicit **permissive** opt-out and is honoured
-        // verbatim — it does NOT fall back to the default.
-        //
-        // **Permissive mode** (operator `quarantine_duration_secs == 0`):
-        // skip the quarantine step entirely. The artifact stays in
-        // `None` — downloadable per `Artifact::is_downloadable` — and
-        // the scan runs concurrently. Bad findings transition the
-        // artifact straight to `Rejected` via the relaxed
-        // `Artifact::reject_from_scan`. This is the only way to
-        // honour `quarantineDuration: 0` literally without forcing a
-        // race between the scan and the `release_expired` sweep.
-        //
-        // `matched_policy.map(...).unwrap_or_else(default)` is shaped
-        // to ensure `Some(0)` on an operator policy stays at 0 — only
-        // an *absent* policy falls through to the Default.
-        let policy_source_is_default = matched_policy.is_none();
-        let effective_duration_secs: i64 = matched_policy
-            .as_ref()
-            .map(|p| p.quarantine_duration_secs)
-            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
-
-        // `Some(derived_anchor)` iff this ingest quarantines. Threaded to
-        // the post-commit observability block further down — the
-        // transition itself lands atomically with `ArtifactIngested` in
-        // the single commit below; only the logs/metrics fire late.
-        let mut quarantine_fired: Option<DerivedAnchor> = None;
-
-        if effective_duration_secs > 0 {
-            // Referenced-tree descendant zero-window carve-out (#46 Item
-            // 2, design doc §4 final shape + §4a). A SCOPED carve-out of
-            // ADR 0007, NOT a reversal — see the anchor resolution below.
-            //
-            // This artifact is a "referenced-tree descendant" iff it is
-            // already a `content_references` **target** of some other,
-            // already-ingested artifact — a child manifest (`kind =
-            // "oci_index_member"`), a referrer's subject (`kind =
-            // "oci_subject"`), or a config/layer blob (`kind =
-            // "oci_config"` / `"oci_layer"`, #46 Item 1). The predicate
-            // itself lives in
-            // [`crate::use_cases::referenced_descendant::is_referenced_tree_descendant`]
-            // — shared verbatim with the provenance orchestrator's
-            // `NoAttestation × Required` hold (issue #115 item 3) so the
-            // two can never drift; see that module for why the
-            // self-referential kinds are excluded. The lookup + its
-            // fail-safe-on-error posture are shared with
-            // `register_by_hash_inner`'s identical carve-out through
-            // `resolve_referenced_tree_descendant_fail_safe`, so the two
-            // minting paths cannot drift either. This lookup does NOT
-            // depend on this ingest's OWN `content_references` rows
-            // (written post-commit, below) — it only ever matches rows
-            // written by OTHER, already-ingested artifacts, so resolving
-            // it before this ingest's own commit is safe.
-            let is_referenced_descendant = resolve_referenced_tree_descendant_fail_safe(
-                &*self.content_references,
-                repository_id,
-                artifact.id,
-                &artifact.sha256_checksum,
-            )
-            .await;
-
-            // Resolve the quarantine-window anchor
-            // (`quarantine_window_start`) as the MINIMUM of the
-            // applicable age sources (ADR 0054), in the one shared pure
-            // function `register_by_hash_inner` also calls — which is
-            // what makes the two minting paths derive identically. Every
-            // source is a "the world has already had this long to look"
-            // argument, so the honest composition is the earliest
-            // deadline any applicable rule would set on its own; see
-            // `hort_domain::policy::quarantine_anchor` for the full
-            // rationale, including why the descendant carve-out composes
-            // rather than overrides.
-            //
-            // The sources assembled here:
-            //
-            // - The ingest instant, unconditional — so a missing or
-            //   unreadable source degrades to a FULL window, never a
-            //   shorter one.
-            // - The live content-level age evidence: the earliest moment
-            //   hort observed these bytes in ANY of its own repositories.
-            //   An observation hort generates itself, so it needs no
-            //   operator opt-in — an upstream claim can be backdated, an
-            //   observation cannot.
-            // - The upstream publish hint, but ONLY when the serving
-            //   `RepositoryUpstreamMapping` — THIS repository's own
-            //   mapping — has `trust_upstream_publish_time` enabled. The
-            //   opt-in is a per-mapping trust statement and does not
-            //   transit repositories: passing `None` when the flag is off
-            //   is the whole of that rule, because the derivation has no
-            //   other channel for an upstream assertion. An unfiltered
-            //   minimum over every repository's claims would let a
-            //   repository proxying an untrusted mirror shorten the
-            //   window of one proxying the genuine upstream — the ADR
-            //   0016 cross-opt-in collapse pattern, in the weakening
-            //   direction.
-            // - The referenced-tree-descendant carve-out's
-            //   `ingested_at - effective_duration`, i.e. a window that is
-            //   already over. The RELEASE PREDICATE is completely
-            //   unchanged (`Artifact::release` still requires its own
-            //   `ScanSucceeded`/`ScanWaived` authority — ADR 0007's two
-            //   impossible failure modes stay impossible); this only
-            //   removes the *timer* wait, so the descendant's own clean
-            //   scan trips the existing event-driven fast-path release in
-            //   `QuarantineUseCase::record_scan_result` instead of
-            //   waiting out a window that provides no additional
-            //   observation (§4a: no in-window rescan exists, so the
-            //   window is pure latency for every artifact, not
-            //   protection).
-            //
-            // Invariant: store the **anchor**, never a precomputed
-            // deadline. The release sweep and the proxy-503 read
-            // path compute the deadline live via
-            // `effective_quarantine_deadline(anchor, duration)`, so a
-            // later policy edit of `quarantineDuration` takes effect on
-            // the existing artifact's window without a backfill
-            // migration.
-            let derived = derive_quarantine_anchor(&AnchorEvidence {
-                minted_at: now,
-                window: chrono::Duration::seconds(effective_duration_secs),
-                // `ingest_inner` never carries the seed-import override
-                // (the request field is destructured away above and
-                // threaded to `register_by_hash` instead).
-                explicit_override: None,
-                first_seen_at: read_content_age_evidence(
-                    &*self.artifacts,
-                    &artifact.sha256_checksum,
-                )
-                .await,
-                trusted_upstream_published_at: trust_upstream_publish_time
-                    .then_some(upstream_published_at)
-                    .flatten(),
-                is_referenced_descendant,
-            });
-            let anchor = derived.anchor;
-
-            let quarantine_event = artifact.quarantine(anchor).map_err(|e| {
-                (
-                    InnerIngestError::Other(AppError::Domain(e)),
-                    Some(repo_key.clone()),
-                    None,
-                )
-            })?;
-            events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
-                quarantine_event,
-            )));
-
-            quarantine_fired = Some(derived);
-        }
-
-        let mut enqueues: Vec<IngestEnqueue> = Vec::new();
-        if scan_will_run {
-            enqueues.push(IngestEnqueue::Scan {
-                format: scan_enqueue_format.clone(),
-                priority: 0, // default tier for ingest-time enqueue
-                trigger_source: "ingest".to_string(),
-            });
-        }
-        if provenance_will_run {
-            enqueues.push(IngestEnqueue::ProvenanceVerify {
-                priority: 0, // default tier for ingest-time enqueue
-                trigger_source: "ingest".to_string(),
-            });
-        }
-
         self.lifecycle
             .commit_transition_with_enqueues(
                 &artifact,
@@ -3111,270 +3778,44 @@ impl IngestUseCase {
         // `Pending` (see the helper for the full contract).
         self.resolve_late_joiner_clearance(
             &artifact,
-            provenance_mode,
+            scan_decision.provenance_mode,
             quarantine_fired.is_some(),
             &scan_enqueue_format,
         )
         .await;
 
-        // Refcount projection writes. Run AFTER
-        // `commit_transition` succeeds (the artifact is persisted-and-
-        // valid by this point). Insert failure is recoverable: the
-        // refcount row is eventual; an operator-side reconcile
-        // sweep catches any divergence. We do NOT abort the ingest on
-        // refcount-insert failure — the artifact is already alive and
-        // downloadable, and a missing refcount row only delays GC, it
-        // doesn't break correctness.
-        //
-        // Mirrors the warn shape used by the OCI manifest-PUT
-        // content_references insert (see `crates/hort-http-oci/src/
-        // manifests_write.rs` near `stage = "content_references_insert"`).
         let now_for_refcount = Utc::now();
-        if let Err(e) = self
-            .content_references
-            .insert(ContentReference {
-                source_artifact_id: artifact.id,
-                target_content_hash: artifact.sha256_checksum.clone(),
-                kind: "primary_content".to_string(),
-                metadata: serde_json::Value::Object(serde_json::Map::new()),
-                repository_id,
-                recorded_at: now_for_refcount,
-            })
-            .await
-        {
-            tracing::warn!(
-                artifact_id = %artifact.id,
-                kind = "primary_content",
-                error = %e,
-                stage = "content_references_insert",
-                "content_references insert failed; refcount eventual — operator reconcile is future work"
-            );
-        }
-        if let Some(blob_hash) = metadata_blob_for_refcount {
-            if let Err(e) = self
-                .content_references
-                .insert(ContentReference {
-                    source_artifact_id: artifact.id,
-                    target_content_hash: blob_hash,
-                    kind: "metadata_blob".to_string(),
-                    metadata: serde_json::Value::Object(serde_json::Map::new()),
-                    repository_id,
-                    recorded_at: now_for_refcount,
-                })
-                .await
-            {
-                tracing::warn!(
-                    artifact_id = %artifact.id,
-                    kind = "metadata_blob",
-                    error = %e,
-                    stage = "content_references_insert",
-                    "content_references insert failed; refcount eventual — operator reconcile is future work"
-                );
-            }
-        }
+        self.write_ingest_refcounts(
+            &artifact,
+            repository_id,
+            metadata_blob_for_refcount,
+            now_for_refcount,
+        )
+        .await;
 
-        // PEP 658 wheel-metadata extraction hook.
-        //
-        // After `ArtifactIngested` lands and the refcount rows are
-        // written, re-read the just-stored content from CAS, hand it to
-        // `FormatHandler::extract_wheel_metadata_bytes`,
-        // and on a `Some(bytes)` return: stream the bytes into CAS via
-        // `StoragePort::put` and link them back to the parent wheel via
-        // a `kind = "wheel_metadata"` row on the `content_references`
-        // projection.
-        //
-        // The re-read from CAS is unavoidable: the upstream
-        // `storage.put` consumed the inbound stream, and the existing
-        // `prefetch-dependencies` task handler establishes the same
-        // precedent (read the just-ingested bytes back from CAS by
-        // `artifact.sha256_checksum`).
-        //
-        // **Path-gated** — only `.whl`-suffixed paths invoke the trait
-        // method. Sdists, non-PyPI artifacts, and any other path skip
-        // the re-read entirely (the default `extract_wheel_metadata_bytes`
-        // returns `Ok(None)` anyway, so the only thing avoided is the
-        // CAS round-trip cost). This matches the PyPI handler's own
-        // first-line `.whl` short-circuit and keeps non-wheel ingests
-        // paying zero new I/O.
-        //
-        // **No new domain event.** The metadata blob is a *derived
-        // projection* of the wheel content — re-derivable on demand
-        // from `ArtifactIngested` + `content_references`; the event
-        // stream deliberately stays lean.
-        //
-        // **Failure semantics:**
-        // - `Ok(None)` (sdist / corrupt wheel / no METADATA member) →
-        //   silent no-op; the wheel ingest itself succeeded and
-        //   PEP 658 simply does not apply for this artifact.
-        // - `Err(DomainError::Validation(_))` (oversized METADATA per
-        //   the extractor's 1 MiB cap) → `warn!` + tick
-        //   `hort_ingest_total{result="wheel_metadata_extract_failed"}`.
-        //   Non-fatal — the wheel ingest stays successful.
-        // - `Err(_)` (infrastructure-class) → propagate. This
-        //   surfaces the failure to the caller even
-        //   though `ArtifactIngested` is already durable; reads as
-        //   "the wheel-metadata pipeline did not complete." Same
-        //   shape for CAS `storage.put` failure and ContentReference
-        //   `insert` failure on the wheel-metadata blob.
-        if coords.path.ends_with(".whl") {
-            // Re-read the just-ingested content. The 1 MiB cap on
-            // METADATA is enforced *inside*
-            // `extract_wheel_metadata_bytes` on the
-            // ZIP entry's header — the raw wheel bytes here are
-            // bounded only by the per-format ingest cap that
-            // already applied to the primary `storage.put` above.
-            let mut wheel_bytes: Vec<u8> = Vec::new();
-            let read_result = match self.storage.get(&artifact.sha256_checksum).await {
-                Ok(mut stream) => stream
-                    .read_to_end(&mut wheel_bytes)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| {
-                        DomainError::Invariant(format!(
-                            "wheel-metadata extract: CAS re-read stream failed: {e}"
-                        ))
-                    }),
-                Err(e) => Err(e),
-            };
-            match read_result {
-                Ok(()) => {
-                    let extract = handler
-                        .extract_wheel_metadata_bytes(&coords, PayloadAccess::Bytes(&wheel_bytes));
-                    match extract {
-                        Ok(Some(metadata_bytes)) => {
-                            let metadata_len = metadata_bytes.len();
-                            // CAS-write the METADATA bytes (idempotent on
-                            // identical content per `StoragePort::put` contract).
-                            let metadata_hash = match self
-                                .storage
-                                .put(Box::new(std::io::Cursor::new(metadata_bytes.to_vec())))
-                                .await
-                            {
-                                Ok(put_result) => put_result.hash,
-                                Err(e) => {
-                                    return Err((
-                                        InnerIngestError::Other(AppError::Storage(e.to_string())),
-                                        Some(repo_key.clone()),
-                                        None,
-                                    ));
-                                }
-                            };
-                            // Link to parent wheel — kind="wheel_metadata".
-                            // Upsert on `(repo, source, kind)` per the
-                            // existing port semantics.
-                            if let Err(e) = self
-                                .content_references
-                                .insert(ContentReference {
-                                    source_artifact_id: artifact.id,
-                                    target_content_hash: metadata_hash.clone(),
-                                    kind: "wheel_metadata".to_string(),
-                                    metadata: serde_json::Value::Object(serde_json::Map::new()),
-                                    repository_id,
-                                    recorded_at: now_for_refcount,
-                                })
-                                .await
-                            {
-                                return Err((
-                                    InnerIngestError::Other(AppError::Domain(e)),
-                                    Some(repo_key.clone()),
-                                    None,
-                                ));
-                            }
-                            tracing::info!(
-                                artifact_id = %artifact.id,
-                                repository_id = %repository_id,
-                                metadata_hash = %metadata_hash,
-                                metadata_bytes = metadata_len,
-                                "wheel_metadata extracted and persisted (PEP 658)"
-                            );
-                        }
-                        Ok(None) => {
-                            // Sdist / corrupt wheel / no METADATA member —
-                            // silent no-op. Wheel ingest succeeded; PEP 658
-                            // is simply not advertised for this artifact.
-                        }
-                        Err(DomainError::Validation(reason)) => {
-                            tracing::warn!(
-                                artifact_id = %artifact.id,
-                                repository_id = %repository_id,
-                                reason = %reason,
-                                "wheel_metadata extract failed (validation); \
-                                 PEP 658 advertisement unavailable for this wheel"
-                            );
-                            metrics::counter!(
-                                "hort_ingest_total",
-                                labels::FORMAT => format.clone(),
-                                labels::REPOSITORY => self.repo_label(Some(&repo_key)),
-                                labels::RESULT => IngestResult::WheelMetadataExtractFailed.as_str(),
-                            )
-                            .increment(1);
-                        }
-                        Err(e) => {
-                            return Err((
-                                InnerIngestError::Other(AppError::Domain(e)),
-                                Some(repo_key.clone()),
-                                None,
-                            ));
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Infrastructure-class CAS read failure — propagate.
-                    // The `ArtifactIngested` event is durable but the
-                    // wheel-metadata extraction pipeline could not run.
-                    return Err((
-                        InnerIngestError::Other(AppError::Domain(e)),
-                        Some(repo_key.clone()),
-                        None,
-                    ));
-                }
-            }
-        }
+        self.extract_and_link_wheel_metadata(
+            &coords,
+            handler,
+            &artifact,
+            repository_id,
+            &repo_key,
+            &format,
+            now_for_refcount,
+        )
+        .await?;
 
-        // Post-commit group-membership hook.
-        //
-        // Runs AFTER `ArtifactIngested` has landed. Crucially, the
-        // `ArtifactLifecyclePort::commit_transition` above and the
-        // `ArtifactGroupUseCase::add_member` call below are TWO
-        // separate transactions. If the group commit fails here, the
-        // artifact is already persisted-and-valid; it is just unlinked
-        // from any group. We log `warn!` and return `Ok` from `ingest`
-        // (the ingest itself succeeded). The group-reconcile sweep heals
-        // orphaned-membership artifacts at rest by replaying
-        // `ArtifactIngested` events and re-running `classify_group_member`.
-        //
-        // Do NOT try to merge the two transactions or compensate on
-        // failure. Cross-aggregate atomicity is not worth the coupling cost.
-        if let Some(membership) = handler.classify_group_member(&coords, &coords.path) {
-            let group_result = self
-                .group_use_case
-                .add_member(
-                    repository_id,
-                    membership.group_coords.clone(),
-                    membership.role.clone(),
-                    artifact.id,
-                    membership.is_primary,
-                    Actor::Api(actor_for_group),
-                    correlation_id,
-                    Some(artifact_ingested_event_id),
-                    Some(&repo_key),
-                    &format,
-                )
-                .await;
-            match group_result {
-                Ok(()) => tracing::info!(
-                    artifact_id = %artifact.id,
-                    group_coords_name = %membership.group_coords.name,
-                    role = %membership.role,
-                    "group membership committed post-ingest"
-                ),
-                Err(e) => tracing::warn!(
-                    artifact_id = %artifact.id,
-                    error = %e,
-                    "group membership commit failed; artifact ingested but unlinked"
-                ),
-            }
-        }
+        self.link_group_membership(
+            handler,
+            &coords,
+            repository_id,
+            &artifact,
+            actor_for_group,
+            correlation_id,
+            artifact_ingested_event_id,
+            &repo_key,
+            &format,
+        )
+        .await;
 
         // Split-rate observability. Fires ONLY on a
         // successful `commit_transition` that actually carried payload
@@ -3401,192 +3842,25 @@ impl IngestUseCase {
             "ingested"
         );
 
-        // Quarantine observability. The transition itself already landed
-        // atomically with `ArtifactIngested` (+ `ScanRequested` /
-        // provenance-gate enqueue) in the single commit above — see the
-        // quarantine-decision block before that commit (issue #90). Only
-        // the logs/metrics fire here, gated on whether that decision
-        // actually quarantined (`Some`).
-        if let Some(DerivedAnchor {
-            anchor,
-            source: anchor_source,
-            upstream_clamp_fired,
-        }) = quarantine_fired
-        {
-            // Observability for the default-policy fire.
-            // Operator-policy-driven quarantines retain their existing
-            // log line; the default fire gets a distinct `policy_source`
-            // tag so operators can dashboard "how many repos still have
-            // no ScanPolicy and are leaning on the default 24h window".
-            //
-            // The field name is
-            // `policy_source`, NOT `source` — the `source`
-            // axis is reserved for the *anchor-source* distinction
-            // (`ingest` vs `upstream` under `trust_upstream_publish_time`).
-            // `policy_source` is the orthogonal policy-origin axis
-            // (`default_policy` vs operator-defined).
-            if policy_source_is_default {
-                tracing::info!(
-                    %artifact_id,
-                    %repository_id,
-                    window_duration_secs = effective_duration_secs,
-                    anchor = %anchor,
-                    policy_source = "default_policy",
-                    "quarantine triggered on ingest (default policy)"
-                );
-            } else {
-                tracing::info!(
-                    %artifact_id,
-                    anchor = %anchor,
-                    window_duration_secs = effective_duration_secs,
-                    "quarantine triggered on ingest"
-                );
-            }
+        self.log_quarantine_observability(
+            quarantine_fired,
+            artifact_id,
+            repository_id,
+            scan_decision.effective_duration_secs,
+            scan_decision.policy_source_is_default,
+            now,
+            upstream_published_at,
+            format,
+            &repo_key,
+        );
 
-            // Distinct log line whenever a source OTHER than the ingest
-            // instant won the minimum. Emitted at `debug!` — the value is
-            // rare per-artifact but can be high-volume on busy upstreams;
-            // the policy-source log lines above already carry the
-            // (resolved) `anchor` for the default observability
-            // dashboard. `anchor_source` is the axis: the ingest-anchored
-            // path stays silent (`anchor_source = "ingest"` implicitly),
-            // and each competing source reserves a value on it.
-            //
-            // The axis now reports which source WON the minimum, not
-            // merely which one was applicable — with a minimum, several
-            // can apply at once and only one decides. `upstream_clamp_fired`
-            // is reported independently, because a claimed publish time
-            // after the ingest instant is an operator signal about the
-            // upstream whether or not the clamped value went on to win.
-            match anchor_source {
-                AnchorSource::Mint | AnchorSource::Override => {}
-                AnchorSource::FirstSeen => tracing::debug!(
-                    %artifact_id,
-                    %repository_id,
-                    ingested_at = %now,
-                    chosen_anchor = %anchor,
-                    anchor_source = "content_first_seen",
-                    "quarantine anchor resolved via hort's own earlier observation of this \
-                     content (release still requires this artifact's own \
-                     ScanSucceeded/ScanWaived)"
-                ),
-                AnchorSource::TrustedUpstreamPublish => tracing::debug!(
-                    %artifact_id,
-                    %repository_id,
-                    upstream_published_at = ?upstream_published_at,
-                    ingested_at = %now,
-                    chosen_anchor = %anchor,
-                    clamp_fired = upstream_clamp_fired,
-                    anchor_source = "upstream_published",
-                    "quarantine anchor resolved via upstream publish time \
-                     (trust_upstream_publish_time opt-in)"
-                ),
-                // The referenced-tree-descendant zero-window fire. The
-                // release predicate is untouched — this only records that
-                // the *window*, not the *release authority*, collapsed.
-                AnchorSource::ReferencedDescendant => tracing::debug!(
-                    %artifact_id,
-                    %repository_id,
-                    ingested_at = %now,
-                    chosen_anchor = %anchor,
-                    window_duration_secs = effective_duration_secs,
-                    anchor_source = "referenced_descendant",
-                    "quarantine window collapsed to zero: artifact is a content_references \
-                     target of an already-ingested manifest/index (#46 Item 2 scoped carve-out; \
-                     release still requires this artifact's own ScanSucceeded/ScanWaived)"
-                ),
-            }
-
-            // A future-dated upstream claim is worth surfacing on its own
-            // axis: it says the upstream's clock or its metadata is wrong,
-            // regardless of which source ended up anchoring the window.
-            if upstream_clamp_fired {
-                tracing::debug!(
-                    %artifact_id,
-                    %repository_id,
-                    upstream_published_at = ?upstream_published_at,
-                    ingested_at = %now,
-                    "trusted upstream publish time claimed an instant after ingest and was \
-                     clamped; it cannot extend this artifact's quarantine into the future"
-                );
-            }
-
-            metrics::counter!(
-                "hort_quarantine_triggered_total",
-                labels::FORMAT => format,
-                labels::REPOSITORY => self.repo_label(Some(&repo_key)),
-            )
-            .increment(1);
-        }
-
-        // Transitive prefetch cascade
-        // enqueue hook. Fires per-ingest when the repository's
-        // `prefetch_policy.triggers` contains `TransitiveDeps`; enqueues
-        // a root `prefetch-dependencies` job that the worker dispatches
-        // to `PrefetchDependenciesHandler` to walk the just-
-        // ingested artifact's manifest, resolve declared runtime deps,
-        // and seed the cascade.
-        //
-        // The trigger absence (the default `PrefetchPolicy`) is the
-        // absence of the enqueue — operators opt in per-repo. Best-
-        // effort: enqueue failure logs `warn!` and the ingest's
-        // success path is unaffected (the cascade is eventually-
-        // consistent — the next pull re-triggers).
-        //
-        // Mirrors the shape of the `content_references_insert` and
-        // group-membership post-hooks above (warn-and-continue, runs
-        // strictly after `commit_transition` so a failed commit does
-        // not leak a cascade enqueue).
-        //
-        // `suppress_cascade_seed` is set by a CASCADE-INTERNAL
-        // `prefetch` leaf-ingest (trigger_source "prefetch"): the artifact
-        // it just ingested is already covered by its parent walk's
-        // depth-carrying child `prefetch-dependencies` row, so firing this
-        // depth-0 seed hook would double-walk it AND reset the cascade
-        // depth to 0 (defeating the transitive_depth / max_descendants
-        // caps). Seeds (client pulls, self-service ROOT leaves) leave it
-        // `false` so the hook fires as before.
-        if !suppress_cascade_seed
-            && repo
-                .prefetch_policy
-                .triggers
-                .contains(&hort_domain::entities::repository::PrefetchTrigger::TransitiveDeps)
-        {
-            let params = serde_json::json!({
-                "artifact_id": artifact.id,
-                "current_depth": 0u32,
-            });
-            // `priority = 0` — cascade rows drain after
-            // operator/cron work. `trigger_source = "ingest"` — the
-            // cascade is event-driven by the ingest; the CHECK in
-            // migration 009 lists `ingest` as a valid trigger source.
-            match self
-                .jobs
-                .enqueue_task(
-                    "prefetch-dependencies",
-                    &params,
-                    None, // actor_id: system-driven post-ingest hook
-                    0i16,
-                    "ingest",
-                    None, // non-destructive task — no DB-side idempotency key (ADR 0028)
-                )
-                .await
-            {
-                Ok(outcome) => tracing::debug!(
-                    artifact_id = %artifact.id,
-                    repository_id = %repository_id,
-                    ?outcome,
-                    "prefetch cascade: enqueued prefetch-dependencies root job",
-                ),
-                Err(e) => tracing::warn!(
-                    artifact_id = %artifact.id,
-                    repository_id = %repository_id,
-                    error = %e,
-                    "prefetch cascade: prefetch-dependencies enqueue failed; \
-                     cascade skipped (best-effort — next pull re-triggers)",
-                ),
-            }
-        }
+        self.enqueue_prefetch_cascade(
+            suppress_cascade_seed,
+            prefetch_transitive_deps_triggered,
+            artifact_id,
+            repository_id,
+        )
+        .await;
 
         Ok((artifact, false, repo_key, artifact_ingested_event_id))
     }

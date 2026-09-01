@@ -6,12 +6,15 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{
     Artifact, ProvenanceClearance, QuarantineStatus, ReleaseAuthorization,
 };
-use hort_domain::entities::scan_policy::{ExclusionProjection, ScanEnforcement};
+use hort_domain::entities::scan_policy::{
+    ExclusionProjection, ScanEnforcement, ScanPolicyProjection,
+};
 use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, timer_actor};
 use hort_domain::events::{
     Actor, ApiActor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PolicyEvaluated,
-    PolicyResult, ReleaseReason, ScanCompleted, StreamId, NO_POLICY,
+    PolicyResult, PolicyViolation, ReleaseReason, ScanCompleted, SeveritySummary, StreamId,
+    NO_POLICY,
 };
 use hort_domain::policy::scan_delta::compute_added_findings;
 use hort_domain::policy::{
@@ -20,7 +23,9 @@ use hort_domain::policy::{
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ReadFrom};
+use hort_domain::ports::event_store::{
+    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
+};
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::quarantine_release::ReleaseExpiredSummary;
@@ -192,6 +197,33 @@ pub struct QuarantineUseCase {
     jobs: Arc<dyn JobsRepository>,
 }
 
+/// Shared read-only context threaded into the
+/// [`QuarantineUseCase::record_scan_result`] per-outcome branches
+/// ([`QuarantineUseCase::handle_non_rejecting_verdict`] /
+/// [`QuarantineUseCase::handle_reject_verdict`]) — bundled to avoid
+/// repeating the same dozen parameters across both call sites. `artifact`
+/// stays a separate `&mut` parameter on each branch (they mutate it via
+/// `record_clean_scan` / `reject_from_scan`); `violations` and
+/// `new_findings` stay separate parameters too since they are read again
+/// by the caller after the branch returns.
+struct ScanResultContext<'a> {
+    artifact_id: Uuid,
+    repository_id: Uuid,
+    stream_id: StreamId,
+    expected_version: ExpectedVersion,
+    correlation_id: Uuid,
+    actor: Actor,
+    now: DateTime<Utc>,
+    scan_event: ScanCompleted,
+    scan_findings_rows: Vec<ScanFindingsRow>,
+    prior_status: QuarantineStatus,
+    prior: Option<(ScanCompleted, DateTime<Utc>)>,
+    severity: SeveritySummary,
+    enforcement: ScanEnforcement,
+    policy: Option<ScanPolicyProjection>,
+    sbom: Option<&'a Sbom>,
+}
+
 impl QuarantineUseCase {
     /// Construct a fully-wired `QuarantineUseCase`. Threads the
     /// storage port the dual-write path (`record_scan_result`)
@@ -314,6 +346,484 @@ impl QuarantineUseCase {
             .await?;
 
         Ok(())
+    }
+
+    /// Non-rejecting verdict path (clean scan, or a `record`-mode
+    /// blocking verdict) — see [`Self::record_scan_result`] steps 8+.
+    /// Mutates `artifact` via [`Artifact::record_clean_scan`], builds
+    /// the `ScanCompleted` (+ optional `ArtifactBecameVulnerable` /
+    /// `PolicyEvaluated(Fail)` / event-driven fast-path
+    /// `ArtifactReleased`) batch, commits it, and emits the post-commit
+    /// logs/metrics. Returns whether `ArtifactBecameVulnerable` was
+    /// pushed (`became_vulnerable_pushed`).
+    ///
+    /// `record_clean_scan` is the state guard for a scan observation
+    /// that does not transition the artifact — which a clean verdict
+    /// and a `record`-mode blocking verdict both are. It does NOT
+    /// mutate state — the fast-path below may transition `Quarantined →
+    /// Released` inline when the computed deadline has already elapsed;
+    /// the window-completes-last case still leaves the artifact
+    /// `Quarantined` for the `release_expired` sweep. A clean re-scan of
+    /// an artifact ALREADY terminal (`Rejected` / `Released`) is a
+    /// recoverable, idempotent re-scan: record the fresh `ScanCompleted`
+    /// and its findings (so a manual rescan refreshes the stored result),
+    /// but do NOT mutate state — a clean signal must not un-reject a
+    /// terminal artifact (ADR 0007 fail-closed; `record_clean_scan`
+    /// rejects the terminal state for exactly that reason). Propagating
+    /// the invariant instead fails the job and loops it forever — the
+    /// same churn bug the reject branch already fixes.
+    async fn handle_non_rejecting_verdict(
+        &self,
+        artifact: &mut Artifact,
+        ctx: ScanResultContext<'_>,
+        violations: Vec<PolicyViolation>,
+        new_findings: &[Finding],
+    ) -> AppResult<bool> {
+        let already_terminal = match artifact.record_clean_scan() {
+            Ok(()) => false,
+            Err(DomainError::Invariant(msg)) => {
+                tracing::debug!(
+                    artifact_id = %ctx.artifact_id,
+                    status = %artifact.quarantine_status,
+                    reason = %msg,
+                    "clean re-scan of already-terminal artifact: recording \
+                     fresh scan, skipping state transition + score re-count"
+                );
+                true
+            }
+            Err(e) => return Err(AppError::Domain(e)),
+        };
+
+        // A non-rejecting verdict that nonetheless carries violations is
+        // the `record` case; an empty list is a genuinely clean scan.
+        let findings_recorded = !violations.is_empty();
+
+        let mut events_vec = Vec::with_capacity(4);
+        events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
+            ctx.scan_event.clone(),
+        )));
+
+        // Step 7 (continued) — append ArtifactBecameVulnerable when a
+        // prior scan existed AND the delta is non-empty.
+        let became_vulnerable_pushed = self.maybe_push_became_vulnerable(
+            &mut events_vec,
+            ctx.artifact_id,
+            new_findings,
+            ctx.prior.as_ref().map(|(_, ts)| *ts),
+        )?;
+
+        // Under `enforcement: record` the verdict is audited with the
+        // SAME `PolicyEvaluated(Fail, violations)` event the reject
+        // branch appends — the operator's queryable record of "this
+        // artifact violates the policy" must not depend on whether the
+        // policy chose to act on it. What is withheld is only the
+        // `ArtifactRejected` companion.
+        if findings_recorded {
+            let policy_event = PolicyEvaluated {
+                artifact_id: ctx.artifact_id,
+                policy_id: ctx
+                    .policy
+                    .as_ref()
+                    .map(|p| p.policy_id)
+                    .unwrap_or(NO_POLICY),
+                result: PolicyResult::Fail,
+                violations: violations.clone(),
+            };
+            policy_event.validate()?;
+            events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
+                policy_event,
+            )));
+        }
+
+        // Event-driven fast-path release (ADR 0007).
+        //
+        // When the artifact is still `Quarantined` and its computed
+        // deadline (`window_start + effective duration`, resolved from
+        // the matched `ScanPolicy.quarantineDuration` or
+        // `DefaultPolicy::quarantine_duration_secs()`) is at or before
+        // `now`, release it INLINE in the same
+        // `commit_scan_result_with_score` batch as the `ScanCompleted`
+        // append. Not "early release" — the observation window has
+        // elapsed; this collapses the latency from "up to one sweep
+        // interval" to zero.
+        //
+        // Uses the EXISTING accepted pair `(ReleaseReason::Timer,
+        // ReleaseAuthorization::ScanSucceeded)` the `release_expired`
+        // sweep already uses — no new authorization. The atomicity
+        // invariant is the batch: a reader rebuilding the projection
+        // from the event store MUST see `[ScanCompleted,
+        // ArtifactReleased]` as one append, never a
+        // clean-but-still-quarantined intermediate.
+        //
+        // When the deadline is still in the future, behaviour is
+        // unchanged — the artifact stays `Quarantined` and the
+        // `release_expired` sweep releases it after the deadline
+        // passes. When the artifact is not `Quarantined` (`None` —
+        // permissive mode under `quarantineDuration:0`),
+        // `record_clean_scan` is a no-op and the fast-path does not
+        // fire (there is nothing to release).
+        let effective_duration_secs: i64 = ctx
+            .policy
+            .as_ref()
+            .map(|p| p.quarantine_duration_secs)
+            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
+        let fast_path_fires = artifact.quarantine_status == QuarantineStatus::Quarantined
+            && artifact
+                .quarantine_window_start
+                .map(|anchor| {
+                    effective_quarantine_deadline(
+                        anchor,
+                        chrono::Duration::seconds(effective_duration_secs),
+                    ) <= ctx.now
+                })
+                .unwrap_or(false);
+
+        // Tracks whether the inline release ACTUALLY fired (vs.
+        // candidacy alone). The post-commit metric + `info!` below gate
+        // on this, not on `fast_path_fires`, so a release suppressed by
+        // the provenance gate is not mis-reported.
+        let mut fast_path_released = false;
+        // Which scan-axis authority applies (ADR 0007). A clean scan
+        // mints `ScanSucceeded`; a `record`-mode verdict that carried
+        // violations must NOT — that authority asserts `finding_count
+        // == 0`, which is false here. `ScanRecorded` is its own audited
+        // authority so the release event and the `authority` log field
+        // say honestly which one released the artifact. Both carry the
+        // same provenance AND-precondition, re-verified inside
+        // `release`. This mirrors `resolve_release_authority`, which
+        // the sweep uses for the same artifact when the window has not
+        // yet elapsed at scan time.
+        let authority = if findings_recorded {
+            ReleaseAuthorization::ScanRecorded
+        } else {
+            ReleaseAuthorization::ScanSucceeded
+        };
+        if fast_path_fires {
+            // Release-predicate invariant preserved (ADR 0007 + ADR
+            // 0027): the timer arm carries the SAME provenance
+            // AND-precondition the `release_expired` sweep applies.
+            // Resolve the real clearance for this artifact/policy —
+            // `NotRequired` for `provenance_mode ∈ {Off,
+            // VerifyIfPresent}`; under `Required`, `Cleared` iff a
+            // `ProvenanceVerified` event exists on the stream, else
+            // `Pending`. The window-elapsed candidacy check (above) is
+            // the sweep's filter, never authorization;
+            // `Artifact::release`'s deny-by-default predicate
+            // re-verifies the (reason, authority, provenance) triple.
+            let provenance = self
+                .resolve_provenance_clearance(ctx.artifact_id, artifact.repository_id)
+                .await?;
+            match artifact.release(ReleaseReason::Timer, authority, provenance) {
+                Ok(release_event) => {
+                    events_vec.push(EventToAppend::new(DomainEvent::ArtifactReleased(
+                        release_event,
+                    )));
+                    fast_path_released = true;
+                }
+                Err(_) => {
+                    // Fail-closed (ADR 0007 + ADR 0027): the only way
+                    // the predicate denies a `(Timer,
+                    // ScanSucceeded|ScanRecorded)` release from a
+                    // `Quarantined` candidate is a `Pending` provenance
+                    // clearance (Required mode, not yet verified).
+                    // Suppress the inline release — the clean
+                    // `ScanCompleted` still commits and the artifact
+                    // stays `Quarantined`; the `release_expired` sweep
+                    // releases it once a `ProvenanceVerified` lands.
+                    tracing::debug!(
+                        artifact_id = %ctx.artifact_id,
+                        "fast-path release suppressed: provenance gate not cleared (Required, pending)"
+                    );
+                }
+            }
+        }
+
+        // Compute the score delta AFTER any in-batch release so the
+        // (prior → current) transition reflects both the
+        // scan-completion (severity counts) and the potential
+        // `Quarantined → Released` move. For a clean scan severity
+        // counts are all zero; the status delta is non-zero only when
+        // the fast-path fired.
+        let score_delta = RepoSecurityScoreProjector::compute_scan_completed_delta(
+            ctx.prior_status,
+            artifact.quarantine_status,
+            &ctx.severity,
+            ctx.now,
+        );
+
+        // Pass the BOM's subject AND dependencies to the
+        // `sbom_components` projection so the artifact-under-scan is
+        // queryable (leaf packages were previously absent from the
+        // projection because only `components` was forwarded).
+        let sbom_components_owned = ctx.sbom.map(Sbom::all_components_owned);
+        self.commit_scan_result_dual_write(
+            artifact,
+            AppendEvents {
+                stream_id: ctx.stream_id,
+                expected_version: ctx.expected_version,
+                events: events_vec,
+                correlation_id: ctx.correlation_id,
+                causation_id: None,
+                actor: ctx.actor,
+            },
+            &ctx.scan_findings_rows,
+            ctx.now,
+            // Mirror the reject branch: no score re-count on an
+            // already-terminal re-scan — the status is unchanged and
+            // the original reject already counted it.
+            if already_terminal {
+                None
+            } else {
+                Some((ctx.repository_id, score_delta))
+            },
+            sbom_components_owned.as_deref(),
+            ctx.prior_status,
+        )
+        .await?;
+
+        // Post-commit observability for the fast-path release. The
+        // sweep's `release_expired` emits
+        // `hort_quarantine_released_total{reason=timer}` and a
+        // per-release `info!`; mirror that here so dashboards see both
+        // release paths under the same counter. The `source` field
+        // distinguishes this path from the sweep for log readers.
+        // Gated on `fast_path_released` (the release actually fired),
+        // NOT `fast_path_fires` (mere candidacy) — a release suppressed
+        // by the provenance gate must not increment the counter.
+        if fast_path_released {
+            emit_release(values::REASON_TIMER);
+            tracing::info!(
+                artifact_id = %ctx.artifact_id,
+                correlation_id = %ctx.correlation_id,
+                authority = release_authority_label(authority),
+                source = "scan_complete_fast_path",
+                "released expired artifact"
+            );
+        }
+
+        // The `outcome` field is the operator's discriminator between
+        // "nothing to enforce" and "over-threshold findings recorded
+        // but not enforced"; `enforcement` names the mode that produced
+        // it so a reader never has to guess which policy setting was
+        // in play.
+        tracing::info!(
+            artifact_id = %ctx.artifact_id,
+            correlation_id = %ctx.correlation_id,
+            outcome = if findings_recorded { "findings_recorded" } else { "clean" },
+            enforcement = %ctx.enforcement,
+            violations_count = violations.len(),
+            policy_id = ?ctx.policy.as_ref().map(|p| p.policy_id),
+            "scan-result evaluated"
+        );
+
+        emit_policy_evaluation(
+            policy_decision_point::SCAN_RESULT,
+            if findings_recorded {
+                PolicyEvaluationResult::FindingsRecorded
+            } else {
+                PolicyEvaluationResult::Pass
+            },
+        );
+        // Recorded violations feed the same per-rule counter a reject
+        // does — the rule fired either way, and hiding it would make a
+        // `record`-mode scope look violation-free.
+        emit_policy_violations(policy_decision_point::SCAN_RESULT, &violations);
+
+        Ok(became_vulnerable_pushed)
+    }
+
+    /// Reject verdict path — see [`Self::record_scan_result`] steps 8+.
+    /// Mutates `artifact` via [`Artifact::reject_from_scan`], builds the
+    /// `ScanCompleted` + `PolicyEvaluated(Fail)` (+ optional
+    /// `ArtifactBecameVulnerable` / `ArtifactRejected`) batch, commits
+    /// it, runs the post-commit refcount sweep + upstream-index
+    /// invalidation on a fresh transition, and emits the post-commit
+    /// logs/metrics. Returns whether `ArtifactBecameVulnerable` was
+    /// pushed (`became_vulnerable_pushed`).
+    ///
+    /// A re-scan that re-derives a reject on an artifact ALREADY
+    /// terminal (`Rejected` / `Released`) is a recoverable, idempotent
+    /// re-scan: we still record the fresh `ScanCompleted` + findings
+    /// below (so a manual rescan refreshes the stored result instead of
+    /// silently doing nothing), but skip the duplicate `ArtifactRejected`
+    /// event and the score re-count. Propagating the already-terminal
+    /// invariant instead would fail the job and loop it forever (the
+    /// original churn bug).
+    async fn handle_reject_verdict(
+        &self,
+        artifact: &mut Artifact,
+        ctx: ScanResultContext<'_>,
+        violations: Vec<PolicyViolation>,
+        new_findings: &[Finding],
+    ) -> AppResult<bool> {
+        // First-violation message drives the `ArtifactRejected.reason`
+        // string (used only on a fresh reject); the full violation list
+        // is carried by `PolicyEvaluated.violations` for audit.
+        let reason = violations
+            .first()
+            .map(|v| v.message.clone())
+            .unwrap_or_else(|| "policy evaluation rejected scan result".to_string());
+
+        // Transition to `Rejected`. A re-scan that re-derives a reject on
+        // an artifact ALREADY terminal (`Rejected` / `Released`) is a
+        // recoverable, idempotent re-scan: we still record the fresh
+        // `ScanCompleted` + findings below (so a manual rescan refreshes
+        // the stored result instead of silently doing nothing), but skip
+        // the duplicate `ArtifactRejected` event and the score re-count.
+        // Propagating the already-terminal invariant instead would fail
+        // the job and loop it forever (the original churn bug).
+        let already_terminal;
+        let reject_event = match artifact.reject_from_scan(reason) {
+            Ok(ev) => {
+                already_terminal = false;
+                Some(ev)
+            }
+            Err(DomainError::Invariant(msg)) => {
+                already_terminal = true;
+                tracing::debug!(
+                    artifact_id = %ctx.artifact_id,
+                    status = %artifact.quarantine_status,
+                    reason = %msg,
+                    "re-scan of already-terminal artifact: recording fresh \
+                     findings, skipping duplicate reject + score re-count"
+                );
+                None
+            }
+            Err(e) => return Err(AppError::Domain(e)),
+        };
+
+        let policy_event = PolicyEvaluated {
+            artifact_id: ctx.artifact_id,
+            // L3 — when the evaluator fell back to the default policy
+            // (no operator policy resolved for this repository), use
+            // the named `NO_POLICY` sentinel rather than a bare
+            // `Uuid::nil()`. The schema requires NOT NULL; the named
+            // constant is the documentation hook that lets downstream
+            // readers match on the "no policy" case explicitly.
+            policy_id: ctx
+                .policy
+                .as_ref()
+                .map(|p| p.policy_id)
+                .unwrap_or(NO_POLICY),
+            result: PolicyResult::Fail,
+            violations: violations.clone(),
+        };
+        policy_event.validate()?;
+
+        let violations_count = violations.len();
+
+        let mut events_vec = Vec::with_capacity(4);
+        events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
+            ctx.scan_event.clone(),
+        )));
+        let became_vulnerable_pushed = self.maybe_push_became_vulnerable(
+            &mut events_vec,
+            ctx.artifact_id,
+            new_findings,
+            ctx.prior.as_ref().map(|(_, ts)| *ts),
+        )?;
+        events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
+            policy_event,
+        )));
+        if let Some(reject_event) = reject_event {
+            events_vec.push(EventToAppend::new(DomainEvent::ArtifactRejected(
+                reject_event,
+            )));
+        }
+
+        // No score re-count on an already-terminal re-scan: the status
+        // is unchanged and the original reject already counted it.
+        let score_update = if already_terminal {
+            None
+        } else {
+            Some((
+                ctx.repository_id,
+                RepoSecurityScoreProjector::compute_scan_completed_delta(
+                    ctx.prior_status,
+                    artifact.quarantine_status,
+                    &ctx.severity,
+                    ctx.now,
+                ),
+            ))
+        };
+
+        // See the matching block above for the clean-path; same reason.
+        let sbom_components_owned = ctx.sbom.map(Sbom::all_components_owned);
+        self.commit_scan_result_dual_write(
+            artifact,
+            AppendEvents {
+                stream_id: ctx.stream_id,
+                expected_version: ctx.expected_version,
+                events: events_vec,
+                correlation_id: ctx.correlation_id,
+                causation_id: None,
+                actor: ctx.actor,
+            },
+            &ctx.scan_findings_rows,
+            ctx.now,
+            score_update,
+            sbom_components_owned.as_deref(),
+            ctx.prior_status,
+        )
+        .await?;
+
+        // Post-commit refcount sweep + upstream-index invalidation run
+        // only on the FIRST reject (a fresh transition); an
+        // already-terminal re-scan already swept these when it was
+        // originally rejected.
+        if !already_terminal {
+            // Refcount sweep on reject (post-commit, warn-on-fail; see
+            // prior implementation comment).
+            if let Err(e) = self
+                .content_references
+                .delete_by_source(ctx.artifact_id)
+                .await
+            {
+                tracing::warn!(
+                    artifact_id = %ctx.artifact_id,
+                    error = %e,
+                    stage = "content_references_delete_on_reject",
+                    "content_references delete failed on reject; refcount row not deleted \
+                     on reject — refcount eventual, operator reconcile is future work"
+                );
+            }
+
+            // Best-effort upstream-index cache invalidation. Same
+            // post-commit-warn-on-fail posture as the refcount sweep
+            // above: the reject append already committed; the
+            // `NonServableStatusFilter` on the next index build is the
+            // load-bearing close. No-op when the composition root did
+            // not wire an invalidator
+            // (`with_upstream_index_cache_invalidator` not called) —
+            // TTL-only posture.
+            if let Some(invalidator) = self.upstream_index_cache_invalidator.as_ref() {
+                invalidate_after_reject(
+                    invalidator,
+                    ctx.artifact_id,
+                    ctx.repository_id,
+                    &artifact.name,
+                )
+                .await;
+            }
+        }
+
+        tracing::info!(
+            artifact_id = %ctx.artifact_id,
+            correlation_id = %ctx.correlation_id,
+            outcome = "reject",
+            enforcement = %ctx.enforcement,
+            policy_id = ?ctx.policy.as_ref().map(|p| p.policy_id),
+            violations_count,
+            "scan-result evaluated"
+        );
+
+        emit_policy_evaluation(
+            policy_decision_point::SCAN_RESULT,
+            PolicyEvaluationResult::Reject,
+        );
+        emit_policy_violations(policy_decision_point::SCAN_RESULT, &violations);
+
+        Ok(became_vulnerable_pushed)
     }
 
     /// Record a per-finding scan result for a quarantined artifact.
@@ -469,12 +979,6 @@ impl QuarantineUseCase {
         // sentinel rather than blocking the scan-result commit.
         let ingest_source = self.read_ingest_source(artifact_id).await?;
 
-        // `became_vulnerable_pushed` mirrors the bool returned by
-        // [`Self::maybe_push_became_vulnerable`] in the chosen branch.
-        // The metric fires post-commit on this flag —
-        // event-and-metric must rise together (emit-where-you-append rule).
-        let became_vulnerable_pushed: bool;
-
         // Split the verdict into "does it reject?" + the violations it
         // computed. Under `enforcement: record` a BLOCKING verdict takes
         // the SAME non-transitioning path a clean scan takes — the
@@ -489,9 +993,6 @@ impl QuarantineUseCase {
             ScanOutcome::FindingsRecorded(violations) => (false, violations),
             ScanOutcome::Clean => (false, Vec::new()),
         };
-        // A non-rejecting verdict that nonetheless carries violations is
-        // the `record` case; an empty list is a genuinely clean scan.
-        let findings_recorded = !verdict_rejects && !violations.is_empty();
         // The resolved enforcement mode, for the operator-facing log
         // field. Read from the same resolved policy the evaluator used
         // (absent policy ⇒ the enforcing default), so the line reports
@@ -501,436 +1002,35 @@ impl QuarantineUseCase {
             .map(|p| p.enforcement)
             .unwrap_or_else(DefaultPolicy::enforcement);
 
-        if !verdict_rejects {
-            // `record_clean_scan` is the state guard for a scan
-            // observation that does not transition the artifact —
-            // which a clean verdict and a `record`-mode blocking
-            // verdict both are. It
-            // does NOT mutate state — the fast-path
-            // below may transition `Quarantined → Released` inline
-            // when the computed deadline has already elapsed; the
-            // window-completes-last case still leaves the artifact
-            // `Quarantined` for the `release_expired` sweep.
-            // A clean re-scan of an artifact ALREADY terminal (`Rejected` /
-            // `Released`) is a recoverable, idempotent re-scan: record the
-            // fresh `ScanCompleted` + findings below (so a manual rescan
-            // refreshes the stored result), but do NOT mutate state — a
-            // clean signal must not un-reject a terminal artifact (ADR 0007
-            // fail-closed; `record_clean_scan` rejects the terminal state
-            // for exactly that reason). Propagating the invariant instead
-            // fails the job and loops it forever — the same churn bug the
-            // reject branch already fixes (see
-            // `record_scan_result_reject_on_already_rejected_...`).
-            let already_terminal = match artifact.record_clean_scan() {
-                Ok(()) => false,
-                Err(DomainError::Invariant(msg)) => {
-                    tracing::debug!(
-                        artifact_id = %artifact_id,
-                        status = %artifact.quarantine_status,
-                        reason = %msg,
-                        "clean re-scan of already-terminal artifact: recording \
-                         fresh scan, skipping state transition + score re-count"
-                    );
-                    true
-                }
-                Err(e) => return Err(AppError::Domain(e)),
-            };
+        let ctx = ScanResultContext {
+            artifact_id,
+            repository_id,
+            stream_id,
+            expected_version,
+            correlation_id,
+            actor,
+            now,
+            scan_event,
+            scan_findings_rows,
+            prior_status,
+            prior,
+            severity,
+            enforcement,
+            policy,
+            sbom,
+        };
 
-            let mut events_vec = Vec::with_capacity(4);
-            events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
-                scan_event.clone(),
-            )));
-
-            // Step 7 (continued) — append ArtifactBecameVulnerable
-            // when a prior scan existed AND the delta is non-empty.
-            became_vulnerable_pushed = self.maybe_push_became_vulnerable(
-                &mut events_vec,
-                artifact_id,
-                &new_findings,
-                prior.as_ref().map(|(_, ts)| *ts),
-            )?;
-
-            // Under `enforcement: record` the verdict is audited with
-            // the SAME `PolicyEvaluated(Fail, violations)` event the
-            // reject branch appends — the operator's queryable record
-            // of "this artifact violates the policy" must not depend
-            // on whether the policy chose to act on it. What is
-            // withheld is only the `ArtifactRejected` companion.
-            if findings_recorded {
-                let policy_event = PolicyEvaluated {
-                    artifact_id,
-                    policy_id: policy.as_ref().map(|p| p.policy_id).unwrap_or(NO_POLICY),
-                    result: PolicyResult::Fail,
-                    violations: violations.clone(),
-                };
-                policy_event.validate()?;
-                events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
-                    policy_event,
-                )));
-            }
-
-            // Event-driven fast-path release (ADR 0007).
-            //
-            // When the artifact is still `Quarantined` and its
-            // computed deadline (`window_start + effective
-            // duration`, resolved from the matched
-            // `ScanPolicy.quarantineDuration` or
-            // `DefaultPolicy::quarantine_duration_secs()`) is at or
-            // before `now`, release it INLINE in the same
-            // `commit_scan_result_with_score` batch as the
-            // `ScanCompleted` append. Not "early release" — the
-            // observation window has elapsed; this collapses the
-            // latency from "up to one sweep interval" to zero.
-            //
-            // Uses the EXISTING accepted pair
-            // `(ReleaseReason::Timer, ReleaseAuthorization::ScanSucceeded)`
-            // the `release_expired` sweep already uses — no new
-            // authorization. The atomicity invariant is the batch:
-            // a reader rebuilding the projection from the event
-            // store MUST see `[ScanCompleted, ArtifactReleased]`
-            // as one append, never a clean-but-still-quarantined
-            // intermediate.
-            //
-            // When the deadline is still in the future, behaviour
-            // is unchanged — the artifact stays `Quarantined` and
-            // the `release_expired` sweep releases it after the deadline
-            // passes. When the artifact is not `Quarantined`
-            // (`None` — permissive mode under
-            // `quarantineDuration:0`), `record_clean_scan` is a
-            // no-op and the fast-path does not fire (there is
-            // nothing to release).
-            let effective_duration_secs: i64 = policy
-                .as_ref()
-                .map(|p| p.quarantine_duration_secs)
-                .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
-            let fast_path_fires = artifact.quarantine_status == QuarantineStatus::Quarantined
-                && artifact
-                    .quarantine_window_start
-                    .map(|anchor| {
-                        effective_quarantine_deadline(
-                            anchor,
-                            chrono::Duration::seconds(effective_duration_secs),
-                        ) <= now
-                    })
-                    .unwrap_or(false);
-
-            // Tracks whether the inline release ACTUALLY fired (vs.
-            // candidacy alone). The post-commit metric + `info!` below
-            // gate on this, not on `fast_path_fires`, so a release
-            // suppressed by the provenance gate is not mis-reported.
-            let mut fast_path_released = false;
-            // Which scan-axis authority applies (ADR 0007). A clean scan
-            // mints `ScanSucceeded`; a `record`-mode verdict that carried
-            // violations must NOT — that authority asserts
-            // `finding_count == 0`, which is false here. `ScanRecorded`
-            // is its own audited authority so the release event and the
-            // `authority` log field say honestly which one released the
-            // artifact. Both carry the same provenance AND-precondition,
-            // re-verified inside `release`. This mirrors
-            // `resolve_release_authority`, which the sweep uses for the
-            // same artifact when the window has not yet elapsed at scan
-            // time.
-            let authority = if findings_recorded {
-                ReleaseAuthorization::ScanRecorded
-            } else {
-                ReleaseAuthorization::ScanSucceeded
-            };
-            if fast_path_fires {
-                // Release-predicate invariant preserved (ADR 0007 +
-                // ADR 0027): the timer arm carries the SAME provenance
-                // AND-precondition the `release_expired` sweep applies.
-                // Resolve the real clearance for this artifact/policy —
-                // `NotRequired` for `provenance_mode ∈ {Off,
-                // VerifyIfPresent}`; under `Required`, `Cleared` iff a
-                // `ProvenanceVerified` event exists on the stream, else
-                // `Pending`. The window-elapsed candidacy check (above)
-                // is the sweep's filter, never authorization;
-                // `Artifact::release`'s deny-by-default predicate
-                // re-verifies the (reason, authority, provenance) triple.
-                let provenance = self
-                    .resolve_provenance_clearance(artifact_id, artifact.repository_id)
-                    .await?;
-                match artifact.release(ReleaseReason::Timer, authority, provenance) {
-                    Ok(release_event) => {
-                        events_vec.push(EventToAppend::new(DomainEvent::ArtifactReleased(
-                            release_event,
-                        )));
-                        fast_path_released = true;
-                    }
-                    Err(_) => {
-                        // Fail-closed (ADR 0007 + ADR 0027): the only
-                        // way the predicate denies a `(Timer,
-                        // ScanSucceeded|ScanRecorded)` release from a
-                        // `Quarantined`
-                        // candidate is a `Pending` provenance clearance
-                        // (Required mode, not yet verified). Suppress the
-                        // inline release — the clean `ScanCompleted`
-                        // still commits and the artifact stays
-                        // `Quarantined`; the `release_expired` sweep
-                        // releases it once a `ProvenanceVerified` lands.
-                        tracing::debug!(
-                            artifact_id = %artifact_id,
-                            "fast-path release suppressed: provenance gate not cleared (Required, pending)"
-                        );
-                    }
-                }
-            }
-
-            // Compute the score delta AFTER any in-batch release
-            // so the (prior → current) transition reflects both
-            // the scan-completion (severity counts) and the
-            // potential `Quarantined → Released` move. For a clean
-            // scan severity counts are all zero; the status delta
-            // is non-zero only when the fast-path fired.
-            let score_delta = RepoSecurityScoreProjector::compute_scan_completed_delta(
-                prior_status,
-                artifact.quarantine_status,
-                &severity,
-                now,
-            );
-
-            // Pass the BOM's subject AND
-            // dependencies to the `sbom_components` projection so
-            // the artifact-under-scan is queryable (leaf packages
-            // were previously absent from the projection because
-            // only `components` was forwarded).
-            let sbom_components_owned = sbom.map(Sbom::all_components_owned);
-            self.commit_scan_result_dual_write(
-                &artifact,
-                AppendEvents {
-                    stream_id,
-                    expected_version,
-                    events: events_vec,
-                    correlation_id,
-                    causation_id: None,
-                    actor,
-                },
-                &scan_findings_rows,
-                now,
-                // Mirror the reject branch: no score re-count on an
-                // already-terminal re-scan — the status is unchanged and
-                // the original reject already counted it.
-                if already_terminal {
-                    None
-                } else {
-                    Some((repository_id, score_delta))
-                },
-                sbom_components_owned.as_deref(),
-                prior_status,
-            )
-            .await?;
-
-            // Post-commit observability for the fast-path release.
-            // The sweep's `release_expired` emits
-            // `hort_quarantine_released_total{reason=timer}` and a
-            // per-release `info!`; mirror that here so dashboards
-            // see both release paths under the same counter. The
-            // `source` field distinguishes this path from the
-            // sweep for log readers. Gated on `fast_path_released`
-            // (the release actually fired), NOT `fast_path_fires`
-            // (mere candidacy) — a release suppressed by the
-            // provenance gate must not increment the counter.
-            if fast_path_released {
-                emit_release(values::REASON_TIMER);
-                tracing::info!(
-                    artifact_id = %artifact_id,
-                    correlation_id = %correlation_id,
-                    authority = release_authority_label(authority),
-                    source = "scan_complete_fast_path",
-                    "released expired artifact"
-                );
-            }
-
-            // The `outcome` field is the operator's discriminator
-            // between "nothing to enforce" and "over-threshold
-            // findings recorded but not enforced"; `enforcement`
-            // names the mode that produced it so a reader never has
-            // to guess which policy setting was in play.
-            tracing::info!(
-                artifact_id = %artifact_id,
-                correlation_id = %correlation_id,
-                outcome = if findings_recorded { "findings_recorded" } else { "clean" },
-                enforcement = %enforcement,
-                violations_count = violations.len(),
-                policy_id = ?policy.as_ref().map(|p| p.policy_id),
-                "scan-result evaluated"
-            );
-
-            emit_policy_evaluation(
-                policy_decision_point::SCAN_RESULT,
-                if findings_recorded {
-                    PolicyEvaluationResult::FindingsRecorded
-                } else {
-                    PolicyEvaluationResult::Pass
-                },
-            );
-            // Recorded violations feed the same per-rule counter a
-            // reject does — the rule fired either way, and hiding it
-            // would make a `record`-mode scope look violation-free.
-            emit_policy_violations(policy_decision_point::SCAN_RESULT, &violations);
+        // `became_vulnerable_pushed` mirrors the bool returned by
+        // [`Self::maybe_push_became_vulnerable`] in the chosen branch.
+        // The metric fires post-commit on this flag —
+        // event-and-metric must rise together (emit-where-you-append rule).
+        let became_vulnerable_pushed = if verdict_rejects {
+            self.handle_reject_verdict(&mut artifact, ctx, violations, &new_findings)
+                .await?
         } else {
-            // First-violation message drives the `ArtifactRejected.reason`
-            // string (used only on a fresh reject); the full violation list
-            // is carried by `PolicyEvaluated.violations` for audit.
-            let reason = violations
-                .first()
-                .map(|v| v.message.clone())
-                .unwrap_or_else(|| "policy evaluation rejected scan result".to_string());
-
-            // Transition to `Rejected`. A re-scan that re-derives a reject on
-            // an artifact ALREADY terminal (`Rejected` / `Released`) is a
-            // recoverable, idempotent re-scan: we still record the fresh
-            // `ScanCompleted` + findings below (so a manual rescan refreshes
-            // the stored result instead of silently doing nothing), but skip
-            // the duplicate `ArtifactRejected` event and the score re-count.
-            // Propagating the already-terminal invariant instead would fail
-            // the job and loop it forever (the original churn bug).
-            let already_terminal;
-            let reject_event = match artifact.reject_from_scan(reason) {
-                Ok(ev) => {
-                    already_terminal = false;
-                    Some(ev)
-                }
-                Err(DomainError::Invariant(msg)) => {
-                    already_terminal = true;
-                    tracing::debug!(
-                        artifact_id = %artifact_id,
-                        status = %artifact.quarantine_status,
-                        reason = %msg,
-                        "re-scan of already-terminal artifact: recording fresh \
-                         findings, skipping duplicate reject + score re-count"
-                    );
-                    None
-                }
-                Err(e) => return Err(AppError::Domain(e)),
-            };
-
-            let policy_event = PolicyEvaluated {
-                artifact_id,
-                // L3 — when the evaluator fell back to the
-                // default policy (no operator policy resolved
-                // for this repository), use the named
-                // `NO_POLICY` sentinel rather than a bare
-                // `Uuid::nil()`. The schema requires NOT NULL;
-                // the named constant is the documentation hook
-                // that lets downstream readers match on the
-                // "no policy" case explicitly.
-                policy_id: policy.as_ref().map(|p| p.policy_id).unwrap_or(NO_POLICY),
-                result: PolicyResult::Fail,
-                violations: violations.clone(),
-            };
-            policy_event.validate()?;
-
-            let violations_count = violations.len();
-
-            let mut events_vec = Vec::with_capacity(4);
-            events_vec.push(EventToAppend::new(DomainEvent::ScanCompleted(
-                scan_event.clone(),
-            )));
-            became_vulnerable_pushed = self.maybe_push_became_vulnerable(
-                &mut events_vec,
-                artifact_id,
-                &new_findings,
-                prior.as_ref().map(|(_, ts)| *ts),
-            )?;
-            events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
-                policy_event,
-            )));
-            if let Some(reject_event) = reject_event {
-                events_vec.push(EventToAppend::new(DomainEvent::ArtifactRejected(
-                    reject_event,
-                )));
-            }
-
-            // No score re-count on an already-terminal re-scan: the status
-            // is unchanged and the original reject already counted it.
-            let score_update = if already_terminal {
-                None
-            } else {
-                Some((
-                    repository_id,
-                    RepoSecurityScoreProjector::compute_scan_completed_delta(
-                        prior_status,
-                        artifact.quarantine_status,
-                        &severity,
-                        now,
-                    ),
-                ))
-            };
-
-            // See the matching block above
-            // for the clean-path; same reason.
-            let sbom_components_owned = sbom.map(Sbom::all_components_owned);
-            self.commit_scan_result_dual_write(
-                &artifact,
-                AppendEvents {
-                    stream_id,
-                    expected_version,
-                    events: events_vec,
-                    correlation_id,
-                    causation_id: None,
-                    actor,
-                },
-                &scan_findings_rows,
-                now,
-                score_update,
-                sbom_components_owned.as_deref(),
-                prior_status,
-            )
-            .await?;
-
-            // Post-commit refcount sweep + upstream-index invalidation run
-            // only on the FIRST reject (a fresh transition); an
-            // already-terminal re-scan already swept these when it was
-            // originally rejected.
-            if !already_terminal {
-                // Refcount sweep on reject (post-commit,
-                // warn-on-fail; see prior implementation comment).
-                if let Err(e) = self.content_references.delete_by_source(artifact_id).await {
-                    tracing::warn!(
-                        artifact_id = %artifact_id,
-                        error = %e,
-                        stage = "content_references_delete_on_reject",
-                        "content_references delete failed on reject; refcount row not deleted \
-                         on reject — refcount eventual, operator reconcile is future work"
-                    );
-                }
-
-                // Best-effort upstream-index
-                // cache invalidation. Same post-commit-warn-on-fail
-                // posture as the refcount sweep above: the reject
-                // append already committed; the `NonServableStatusFilter`
-                // on the next index build is the load-bearing close.
-                // No-op when the composition root did not wire an
-                // invalidator (`with_upstream_index_cache_invalidator`
-                // not called) — TTL-only posture.
-                if let Some(invalidator) = self.upstream_index_cache_invalidator.as_ref() {
-                    invalidate_after_reject(
-                        invalidator,
-                        artifact_id,
-                        repository_id,
-                        &artifact.name,
-                    )
-                    .await;
-                }
-            }
-
-            tracing::info!(
-                artifact_id = %artifact_id,
-                correlation_id = %correlation_id,
-                outcome = "reject",
-                enforcement = %enforcement,
-                policy_id = ?policy.as_ref().map(|p| p.policy_id),
-                violations_count,
-                "scan-result evaluated"
-            );
-
-            emit_policy_evaluation(
-                policy_decision_point::SCAN_RESULT,
-                PolicyEvaluationResult::Reject,
-            );
-            emit_policy_violations(policy_decision_point::SCAN_RESULT, &violations);
-        }
+            self.handle_non_rejecting_verdict(&mut artifact, ctx, violations, &new_findings)
+                .await?
+        };
 
         // Emit-where-you-append rule — emit
         // `hort_artifact_became_vulnerable_total` exactly when the

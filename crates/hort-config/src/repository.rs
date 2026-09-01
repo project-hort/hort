@@ -406,104 +406,125 @@ pub const VIRTUAL_SERVE_SUPPORTED_FORMATS: &[RepositoryFormat] = &[
 ///
 /// Returns *every* violation rather than first-error-wins, so an
 /// operator gets the full list in one boot pass.
-pub fn validate_repository(env: &Envelope<RepositorySpec>) -> Vec<ValidationError> {
-    let mut errors = Vec::new();
-    let name = &env.metadata.name;
-    let kind = Kind::ArtifactRepository;
-
-    if !name_regex_matches(name) {
-        errors.push(ValidationError::Invalid {
-            kind,
-            name: name.clone(),
-            detail: format!("metadata.name `{name}` must match ^[a-z][a-z0-9-]{{0,62}}$"),
-        });
+/// `metadata.name` shape check.
+fn validate_name_field(name: &str) -> Option<ValidationError> {
+    if name_regex_matches(name) {
+        return None;
     }
+    Some(ValidationError::Invalid {
+        kind: Kind::ArtifactRepository,
+        name: name.to_string(),
+        detail: format!("metadata.name `{name}` must match ^[a-z][a-z0-9-]{{0,62}}$"),
+    })
+}
 
-    // Format must parse and not be `Other(_)`. The admin handler
-    // applies the same rule (handlers/admin.rs:251) — managed repos
-    // get the same guarantee that they reach a real format dispatch.
-    let format: RepositoryFormat = env.spec.format.parse().unwrap_or(RepositoryFormat::Generic);
-    if matches!(format, RepositoryFormat::Other(_)) {
-        errors.push(ValidationError::UnknownEnumValue {
-            field: "spec.format",
-            got: env.spec.format.clone(),
-            // Bounded subset for the error message; the full ~40-name
-            // list would be noise. Operators referencing an unknown
-            // format know what they meant — the message orients them.
-            expected: vec!["npm", "pypi", "cargo", "maven", "docker", "..."],
-        });
+/// Format must parse and not be `Other(_)`. The admin handler applies the
+/// same rule (handlers/admin.rs:251) — managed repos get the same guarantee
+/// that they reach a real format dispatch.
+fn validate_format_field(format: &RepositoryFormat, spec_format: &str) -> Option<ValidationError> {
+    if !matches!(format, RepositoryFormat::Other(_)) {
+        return None;
     }
+    Some(ValidationError::UnknownEnumValue {
+        field: "spec.format",
+        got: spec_format.to_string(),
+        // Bounded subset for the error message; the full ~40-name
+        // list would be noise. Operators referencing an unknown
+        // format know what they meant — the message orients them.
+        expected: vec!["npm", "pypi", "cargo", "maven", "docker", "..."],
+    })
+}
 
-    // type ∈ {hosted, proxy, virtual, staging}.
-    let repo_type = match RepositoryType::from_str(&env.spec.repo_type) {
-        Ok(t) => Some(t),
-        Err(_) => {
-            errors.push(ValidationError::UnknownEnumValue {
+/// `type` ∈ {hosted, proxy, virtual, staging}.
+fn validate_repo_type_field(
+    spec_repo_type: &str,
+) -> (Option<RepositoryType>, Option<ValidationError>) {
+    match RepositoryType::from_str(spec_repo_type) {
+        Ok(t) => (Some(t), None),
+        Err(_) => (
+            None,
+            Some(ValidationError::UnknownEnumValue {
                 field: "spec.type",
-                got: env.spec.repo_type.clone(),
+                got: spec_repo_type.to_string(),
                 expected: vec!["hosted", "proxy", "virtual", "staging"],
-            });
-            None
-        }
-    };
-
-    if ReplicationPriority::from_str(&env.spec.replication_priority).is_err() {
-        errors.push(ValidationError::UnknownEnumValue {
-            field: "spec.replicationPriority",
-            got: env.spec.replication_priority.clone(),
-            expected: vec!["immediate", "scheduled", "on_demand", "local_only"],
-        });
+            }),
+        ),
     }
+}
 
-    // Prefetch-policy upper-bound caps (architect review).
-    //
-    // Migration `002_repositories.sql` stores `prefetch_depth` /
-    // `prefetch_transitive_depth` / `prefetch_max_age_days` as `int`
-    // (PostgreSQL `int4`, i.e. signed 32-bit). The bind path narrows
-    // the domain `u32` to `i32` via `as i32`, so a value above
-    // `i32::MAX` silently wraps to a negative on write; the mapper's
-    // defensive `u32::try_from(i32).ok().unwrap_or(default)` then
-    // rejects the negative and falls back to the in-code default on
-    // read. Net effect without this gate: the operator wrote one
-    // value, the system stored / served another, with no diagnostic.
-    //
-    // Cap at parse-time so the operator sees the typo at apply rather
-    // than discovering the silent fallback by reading metrics later.
-    // The cap is generous (`10_000`) — practical operator values are
-    // 1-100 for depth, 1-3650 for `maxAgeDays` (a decade); the cap is
-    // a wrap-prevention bound, not a tuning suggestion. Mirrors the
-    // existing hand-rolled-validator pattern in this module
-    // (`validate_storage_backend`, `name_regex_matches`).
-    const MAX_REASONABLE_PREFETCH_BOUND: u32 = 10_000;
-    if env.spec.prefetch_policy.depth > MAX_REASONABLE_PREFETCH_BOUND {
+fn validate_replication_priority_field(value: &str) -> Option<ValidationError> {
+    if ReplicationPriority::from_str(value).is_ok() {
+        return None;
+    }
+    Some(ValidationError::UnknownEnumValue {
+        field: "spec.replicationPriority",
+        got: value.to_string(),
+        expected: vec!["immediate", "scheduled", "on_demand", "local_only"],
+    })
+}
+
+// Prefetch-policy upper-bound caps (architect review).
+//
+// Migration `002_repositories.sql` stores `prefetch_depth` /
+// `prefetch_transitive_depth` / `prefetch_max_age_days` as `int`
+// (PostgreSQL `int4`, i.e. signed 32-bit). The bind path narrows the domain
+// `u32` to `i32` via `as i32`, so a value above `i32::MAX` silently wraps to
+// a negative on write; the mapper's defensive
+// `u32::try_from(i32).ok().unwrap_or(default)` then rejects the negative and
+// falls back to the in-code default on read. Net effect without this gate:
+// the operator wrote one value, the system stored / served another, with no
+// diagnostic.
+//
+// Cap at parse-time so the operator sees the typo at apply rather than
+// discovering the silent fallback by reading metrics later. The cap is
+// generous (`10_000`) — practical operator values are 1-100 for depth,
+// 1-3650 for `maxAgeDays` (a decade); the cap is a wrap-prevention bound,
+// not a tuning suggestion. Mirrors the existing hand-rolled-validator
+// pattern in this module (`validate_storage_backend`, `name_regex_matches`).
+const MAX_REASONABLE_PREFETCH_BOUND: u32 = 10_000;
+
+// `maxDescendants` upper bound — distinct from `MAX_REASONABLE_PREFETCH_BOUND`
+// (10_000) because this knob's operator-set values are usually larger
+// (100-10_000 transitive closures are plausible); the cap exists
+// specifically to keep an operator typo (`4_000_000_000`) from effectively
+// disabling the cascade ceiling. `0` is a deliberate operator value
+// (collapse the feature to leaf-prefetch-only) and is accepted.
+const MAX_DESCENDANTS_BOUND: u32 = 100_000;
+
+/// Reject prefetch-policy values above their wrap-prevention caps.
+fn validate_prefetch_policy_bounds(policy: &PrefetchPolicy, name: &str) -> Vec<ValidationError> {
+    let kind = Kind::ArtifactRepository;
+    let mut errors = Vec::new();
+
+    if policy.depth > MAX_REASONABLE_PREFETCH_BOUND {
         errors.push(ValidationError::Invalid {
             kind,
-            name: name.clone(),
+            name: name.to_string(),
             detail: format!(
                 "spec.prefetchPolicy.depth = {} exceeds the configured cap of {}. \
                  Practical operator values are 1-100; the cap exists to catch \
                  i32 wrap-on-write that would silently fall back to the in-code \
                  default on read (architect review).",
-                env.spec.prefetch_policy.depth, MAX_REASONABLE_PREFETCH_BOUND,
+                policy.depth, MAX_REASONABLE_PREFETCH_BOUND,
             ),
         });
     }
-    if env.spec.prefetch_policy.transitive_depth > MAX_REASONABLE_PREFETCH_BOUND {
+    if policy.transitive_depth > MAX_REASONABLE_PREFETCH_BOUND {
         errors.push(ValidationError::Invalid {
             kind,
-            name: name.clone(),
+            name: name.to_string(),
             detail: format!(
                 "spec.prefetchPolicy.transitiveDepth = {} exceeds the configured cap of {}. \
                  Cap mirrors `spec.prefetchPolicy.depth` — architect review.",
-                env.spec.prefetch_policy.transitive_depth, MAX_REASONABLE_PREFETCH_BOUND,
+                policy.transitive_depth, MAX_REASONABLE_PREFETCH_BOUND,
             ),
         });
     }
-    if let Some(days) = env.spec.prefetch_policy.max_age_days {
+    if let Some(days) = policy.max_age_days {
         if days > MAX_REASONABLE_PREFETCH_BOUND {
             errors.push(ValidationError::Invalid {
                 kind,
-                name: name.clone(),
+                name: name.to_string(),
                 detail: format!(
                     "spec.prefetchPolicy.maxAgeDays = {days} exceeds the configured cap of \
                      {MAX_REASONABLE_PREFETCH_BOUND}. A decade is ~3650 days; values above \
@@ -513,211 +534,293 @@ pub fn validate_repository(env: &Envelope<RepositorySpec>) -> Vec<ValidationErro
             });
         }
     }
-
-    // `maxDescendants` upper bound — distinct from
-    // `MAX_REASONABLE_PREFETCH_BOUND` (10_000) because this knob's
-    // operator-set values are usually larger (100-10_000 transitive
-    // closures are plausible); the cap exists specifically to keep an
-    // operator typo (`4_000_000_000`) from effectively disabling the
-    // cascade ceiling. `0` is a deliberate operator value (collapse the
-    // feature to leaf-prefetch-only) and is accepted.
-    const MAX_DESCENDANTS_BOUND: u32 = 100_000;
-    if env.spec.prefetch_policy.max_descendants > MAX_DESCENDANTS_BOUND {
+    if policy.max_descendants > MAX_DESCENDANTS_BOUND {
         errors.push(ValidationError::Invalid {
             kind,
-            name: name.clone(),
+            name: name.to_string(),
             detail: format!(
                 "spec.prefetchPolicy.maxDescendants = {} exceeds the configured cap of {}. \
                  The cap exists so an operator typo cannot effectively disable the cumulative \
                  cascade ceiling. 0 collapses the feature to \
                  leaf-prefetch-only.",
-                env.spec.prefetch_policy.max_descendants, MAX_DESCENDANTS_BOUND,
+                policy.max_descendants, MAX_DESCENDANTS_BOUND,
             ),
         });
     }
 
-    // Cross-field shape rules — only run when the type parsed; an
-    // unknown type already failed loudly above and chaining the rules
-    // on top would produce noise.
-    if let Some(t) = repo_type {
-        match t {
-            RepositoryType::Proxy => {
-                let proxy_present = env.spec.proxy.is_some();
-                let members_present = env.spec.virtual_members.is_some();
-                if !proxy_present {
-                    errors.push(ValidationError::Invalid {
-                        kind,
-                        name: name.clone(),
-                        detail: "type=proxy requires a `proxy:` block".into(),
-                    });
-                }
-                if members_present {
-                    errors.push(ValidationError::Invalid {
-                        kind,
-                        name: name.clone(),
-                        detail: "type=proxy must not declare virtualMembers".into(),
-                    });
-                }
-            }
-            RepositoryType::Virtual => {
-                // ADR 0015 / ADR 0031 inert-field stopgap: reject a
-                // `type: virtual` repo whose format has no serve-time
-                // member resolution yet. `VIRTUAL_SERVE_SUPPORTED_FORMATS`
-                // is the single source of truth (npm/pypi/cargo today); the
-                // set grows per format as resolution ships (see the const's
-                // doc + ADR 0031).
-                // Skip when the format itself is unknown — the
-                // `Other(_)` check above already reported that and adding
-                // this on top is noise.
-                if !matches!(format, RepositoryFormat::Other(_))
-                    && !VIRTUAL_SERVE_SUPPORTED_FORMATS.contains(&format)
-                {
-                    errors.push(ValidationError::Invalid {
-                        kind,
-                        name: name.clone(),
-                        detail: format!(
-                            "type=virtual is not yet serve-supported for format \
-                             `{}` — virtualMembers would be accepted but never \
-                             served (ADR 0015 inert-field). Serve-time aggregation \
-                             ships per format (npm/pypi/cargo today); see ADR 0031 \
-                             and docs/architecture/how-to/declare-gitops-config.md",
-                            env.spec.format
-                        ),
-                    });
-                }
+    errors
+}
 
-                let proxy_present = env.spec.proxy.is_some();
-                let members = env.spec.virtual_members.as_deref().unwrap_or(&[]);
-                if proxy_present {
-                    errors.push(ValidationError::Invalid {
-                        kind,
-                        name: name.clone(),
-                        detail: "type=virtual must not declare a proxy block".into(),
-                    });
-                }
-                if members.is_empty() {
-                    errors.push(ValidationError::Invalid {
-                        kind,
-                        name: name.clone(),
-                        detail: "type=virtual requires non-empty virtualMembers".into(),
-                    });
-                }
-                // Per-entry: regex, no dupes, no self-reference.
-                let mut seen = std::collections::HashSet::new();
-                for member in members {
-                    if !name_regex_matches(member) {
-                        errors.push(ValidationError::Invalid {
-                            kind,
-                            name: name.clone(),
-                            detail: format!(
-                                "virtualMembers entry `{member}` must match \
-                                 ^[a-z][a-z0-9-]{{0,62}}$"
-                            ),
-                        });
-                    }
-                    if member == name {
-                        errors.push(ValidationError::Invalid {
-                            kind,
-                            name: name.clone(),
-                            detail: "virtualMembers must not reference \
-                                     metadata.name (self-reference)"
-                                .into(),
-                        });
-                    }
-                    if !seen.insert(member.clone()) {
-                        errors.push(ValidationError::Invalid {
-                            kind,
-                            name: name.clone(),
-                            detail: format!("duplicate virtualMembers entry `{member}`"),
-                        });
-                    }
-                }
-            }
-            RepositoryType::Hosted | RepositoryType::Staging => {
-                if env.spec.proxy.is_some() {
-                    errors.push(ValidationError::Invalid {
-                        kind,
-                        name: name.clone(),
-                        detail: format!(
-                            "type={t} must not declare a proxy block (only type=proxy may)"
-                        ),
-                    });
-                }
-                if env.spec.virtual_members.is_some() {
-                    errors.push(ValidationError::Invalid {
-                        kind,
-                        name: name.clone(),
-                        detail: format!(
-                            "type={t} must not declare virtualMembers (only type=virtual may)"
-                        ),
-                    });
-                }
-            }
-        }
+/// `type=proxy` requires a `proxy:` block and forbids `virtualMembers`.
+fn validate_proxy_type_shape(env: &Envelope<RepositorySpec>, name: &str) -> Vec<ValidationError> {
+    let kind = Kind::ArtifactRepository;
+    let mut errors = Vec::new();
+    if env.spec.proxy.is_none() {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: "type=proxy requires a `proxy:` block".into(),
+        });
     }
+    if env.spec.virtual_members.is_some() {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: "type=proxy must not declare virtualMembers".into(),
+        });
+    }
+    errors
+}
 
-    if let Some(qb) = env.spec.quota_bytes {
-        if qb <= 0 {
+/// Per-entry `virtualMembers` checks: regex, no dupes, no self-reference.
+fn validate_virtual_members_entries(members: &[String], name: &str) -> Vec<ValidationError> {
+    let kind = Kind::ArtifactRepository;
+    let mut errors = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for member in members {
+        if !name_regex_matches(member) {
             errors.push(ValidationError::Invalid {
                 kind,
-                name: name.clone(),
-                detail: format!("quotaBytes must be > 0, got {qb}"),
-            });
-        }
-    }
-
-    if let Some(p) = env.spec.proxy.as_ref() {
-        if !is_http_url_with_host(&p.upstream_url) {
-            errors.push(ValidationError::Invalid {
-                kind,
-                name: name.clone(),
+                name: name.to_string(),
                 detail: format!(
-                    "proxy.upstreamUrl `{}` must be an http or https URL with a host",
-                    p.upstream_url
+                    "virtualMembers entry `{member}` must match \
+                     ^[a-z][a-z0-9-]{{0,62}}$"
                 ),
             });
         }
-
-        // `indexUpstreamUrl` override: per-spec rule mirrors
-        // `upstream_url`: must be an http(s) URL with a host. The
-        // format / repo-type narrowness is enforced separately below.
-        if let Some(idx) = p.index_upstream_url.as_deref() {
-            if !is_http_url_with_host(idx) {
-                errors.push(ValidationError::Invalid {
-                    kind,
-                    name: name.clone(),
-                    detail: format!(
-                        "proxy.indexUpstreamUrl `{idx}` must be an http or https URL with a host"
-                    ),
-                });
-            }
-
-            // Cross-spec narrowing: `indexUpstreamUrl` is only meaningful
-            // for cargo proxy repositories. The `repo_type != proxy`
-            // arm is structurally unreachable today because the
-            // `Hosted | Staging` arm above already rejects the entire
-            // `proxy:` block on non-proxy types — we restate the rule
-            // explicitly so a future refactor that loosens that guard
-            // does not silently expose an `index_upstream_url` write
-            // path on hosted repos.
-            if env.spec.format != "cargo" {
-                errors.push(ValidationError::Invalid {
-                    kind,
-                    name: name.clone(),
-                    detail: "proxy.indexUpstreamUrl is only valid for cargo proxy repositories"
-                        .into(),
-                });
-            }
-            if env.spec.repo_type != "proxy" {
-                errors.push(ValidationError::Invalid {
-                    kind,
-                    name: name.clone(),
-                    detail: "proxy.indexUpstreamUrl is only valid for cargo proxy repositories"
-                        .into(),
-                });
-            }
+        if member == name {
+            errors.push(ValidationError::Invalid {
+                kind,
+                name: name.to_string(),
+                detail: "virtualMembers must not reference \
+                         metadata.name (self-reference)"
+                    .into(),
+            });
+        }
+        if !seen.insert(member.clone()) {
+            errors.push(ValidationError::Invalid {
+                kind,
+                name: name.to_string(),
+                detail: format!("duplicate virtualMembers entry `{member}`"),
+            });
         }
     }
+    errors
+}
+
+/// `type=virtual` shape: serve-supported format, no `proxy:` block,
+/// non-empty `virtualMembers`, and per-entry validation.
+fn validate_virtual_type_shape(
+    env: &Envelope<RepositorySpec>,
+    format: &RepositoryFormat,
+    name: &str,
+) -> Vec<ValidationError> {
+    let kind = Kind::ArtifactRepository;
+    let mut errors = Vec::new();
+
+    // ADR 0015 / ADR 0031 inert-field stopgap: reject a `type: virtual` repo
+    // whose format has no serve-time member resolution yet.
+    // `VIRTUAL_SERVE_SUPPORTED_FORMATS` is the single source of truth
+    // (npm/pypi/cargo today); the set grows per format as resolution ships
+    // (see the const's doc + ADR 0031). Skip when the format itself is
+    // unknown — the `Other(_)` check already reported that and adding this
+    // on top is noise.
+    if !matches!(format, RepositoryFormat::Other(_))
+        && !VIRTUAL_SERVE_SUPPORTED_FORMATS.contains(format)
+    {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "type=virtual is not yet serve-supported for format \
+                 `{}` — virtualMembers would be accepted but never \
+                 served (ADR 0015 inert-field). Serve-time aggregation \
+                 ships per format (npm/pypi/cargo today); see ADR 0031 \
+                 and docs/architecture/how-to/declare-gitops-config.md",
+                env.spec.format
+            ),
+        });
+    }
+
+    if env.spec.proxy.is_some() {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: "type=virtual must not declare a proxy block".into(),
+        });
+    }
+
+    let members = env.spec.virtual_members.as_deref().unwrap_or(&[]);
+    if members.is_empty() {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: "type=virtual requires non-empty virtualMembers".into(),
+        });
+    }
+
+    errors.extend(validate_virtual_members_entries(members, name));
+    errors
+}
+
+/// `type ∈ {hosted, staging}` forbids both `proxy:` and `virtualMembers`.
+fn validate_hosted_or_staging_type_shape(
+    env: &Envelope<RepositorySpec>,
+    repo_type: RepositoryType,
+    name: &str,
+) -> Vec<ValidationError> {
+    let kind = Kind::ArtifactRepository;
+    let mut errors = Vec::new();
+    if env.spec.proxy.is_some() {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "type={repo_type} must not declare a proxy block (only type=proxy may)"
+            ),
+        });
+    }
+    if env.spec.virtual_members.is_some() {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "type={repo_type} must not declare virtualMembers (only type=virtual may)"
+            ),
+        });
+    }
+    errors
+}
+
+/// Cross-field shape rules keyed on the parsed repo type — only run when the
+/// type parsed; an unknown type already failed loudly above and chaining
+/// the rules on top would produce noise.
+fn validate_type_shape(
+    repo_type: RepositoryType,
+    format: &RepositoryFormat,
+    env: &Envelope<RepositorySpec>,
+    name: &str,
+) -> Vec<ValidationError> {
+    match repo_type {
+        RepositoryType::Proxy => validate_proxy_type_shape(env, name),
+        RepositoryType::Virtual => validate_virtual_type_shape(env, format, name),
+        RepositoryType::Hosted | RepositoryType::Staging => {
+            validate_hosted_or_staging_type_shape(env, repo_type, name)
+        }
+    }
+}
+
+fn validate_quota_bytes_field(quota_bytes: Option<i64>, name: &str) -> Option<ValidationError> {
+    let qb = quota_bytes?;
+    if qb > 0 {
+        return None;
+    }
+    Some(ValidationError::Invalid {
+        kind: Kind::ArtifactRepository,
+        name: name.to_string(),
+        detail: format!("quotaBytes must be > 0, got {qb}"),
+    })
+}
+
+/// `indexUpstreamUrl` override: per-spec rule mirrors `upstream_url` — must
+/// be an http(s) URL with a host — plus the format/repo-type narrowness
+/// below.
+fn validate_index_upstream_url(
+    idx: &str,
+    env: &Envelope<RepositorySpec>,
+    name: &str,
+) -> Vec<ValidationError> {
+    let kind = Kind::ArtifactRepository;
+    let mut errors = Vec::new();
+
+    if !is_http_url_with_host(idx) {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "proxy.indexUpstreamUrl `{idx}` must be an http or https URL with a host"
+            ),
+        });
+    }
+
+    // Cross-spec narrowing: `indexUpstreamUrl` is only meaningful for cargo
+    // proxy repositories. The `repo_type != proxy` check is structurally
+    // unreachable today because `validate_hosted_or_staging_type_shape`
+    // already rejects the entire `proxy:` block on non-proxy types — we
+    // restate the rule explicitly so a future refactor that loosens that
+    // guard does not silently expose an `index_upstream_url` write path on
+    // hosted repos.
+    if env.spec.format != "cargo" {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: "proxy.indexUpstreamUrl is only valid for cargo proxy repositories".into(),
+        });
+    }
+    if env.spec.repo_type != "proxy" {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: "proxy.indexUpstreamUrl is only valid for cargo proxy repositories".into(),
+        });
+    }
+
+    errors
+}
+
+fn validate_proxy_block(env: &Envelope<RepositorySpec>, name: &str) -> Vec<ValidationError> {
+    let Some(p) = env.spec.proxy.as_ref() else {
+        return Vec::new();
+    };
+    let kind = Kind::ArtifactRepository;
+    let mut errors = Vec::new();
+
+    if !is_http_url_with_host(&p.upstream_url) {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "proxy.upstreamUrl `{}` must be an http or https URL with a host",
+                p.upstream_url
+            ),
+        });
+    }
+
+    if let Some(idx) = p.index_upstream_url.as_deref() {
+        errors.extend(validate_index_upstream_url(idx, env, name));
+    }
+
+    errors
+}
+
+pub fn validate_repository(env: &Envelope<RepositorySpec>) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    let name = &env.metadata.name;
+
+    errors.extend(validate_name_field(name));
+
+    let format: RepositoryFormat = env.spec.format.parse().unwrap_or(RepositoryFormat::Generic);
+    errors.extend(validate_format_field(&format, &env.spec.format));
+
+    let (repo_type, repo_type_err) = validate_repo_type_field(&env.spec.repo_type);
+    errors.extend(repo_type_err);
+
+    errors.extend(validate_replication_priority_field(
+        &env.spec.replication_priority,
+    ));
+
+    errors.extend(validate_prefetch_policy_bounds(
+        &env.spec.prefetch_policy,
+        name,
+    ));
+
+    if let Some(t) = repo_type {
+        errors.extend(validate_type_shape(t, &format, env, name));
+    }
+
+    errors.extend(validate_quota_bytes_field(env.spec.quota_bytes, name));
+
+    errors.extend(validate_proxy_block(env, name));
 
     errors
 }

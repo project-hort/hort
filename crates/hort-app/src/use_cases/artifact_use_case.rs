@@ -1013,6 +1013,29 @@ impl ArtifactUseCase {
             .map(|(v, s, _)| (v, s))
             .collect())
     }
+
+    /// Per-`(repository, package)` publish-timestamp read — the cargo
+    /// sparse-index `pubtime` field's timestamp source for the proxy
+    /// serve path.
+    ///
+    /// Thin pass-through to
+    /// [`ArtifactRepository::package_version_publish_times`]. Row
+    /// presence means "hort has locally ingested this version"; a
+    /// version with no row is never-ingested and callers must omit
+    /// `pubtime` rather than invent one (ADR 0016 one-way-outward: the
+    /// served field is derived from data hort already owns, never a
+    /// synthesised value).
+    #[tracing::instrument(skip(self))]
+    pub async fn package_version_publish_times(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> AppResult<Vec<hort_domain::ports::artifact_repository::PackageVersionPublishTimeRow>> {
+        Ok(self
+            .artifacts
+            .package_version_publish_times(repository_id, package)
+            .await?)
+    }
 }
 
 /// Iterate a paginated port-call until exhaustion or the `cap`,
@@ -1881,6 +1904,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -1888,6 +1913,8 @@ mod tests {
             &self,
             _kind: &str,
             _limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
@@ -3236,6 +3263,8 @@ mod visibility_extension_tests {
                 &self,
                 _kind: &str,
                 _limit: u32,
+                _after: Option<Uuid>,
+                _skip_marker_kind: Option<&str>,
             ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<Vec<Artifact>>>
             {
                 Box::pin(async { Ok(Vec::new()) })
@@ -3244,6 +3273,8 @@ mod visibility_extension_tests {
                 &self,
                 _kind: &str,
                 _limit: u32,
+                _after: Option<Uuid>,
+                _skip_marker_kind: Option<&str>,
             ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<Vec<Artifact>>>
             {
                 Box::pin(async { Ok(Vec::new()) })
@@ -3917,6 +3948,66 @@ mod visibility_extension_tests {
             .await
             .expect("ok");
         assert!(pairs.is_empty());
+    }
+
+    // -- package_version_publish_times wrapper ------------------------------
+
+    /// Cargo sparse-index `pubtime` timestamp source. Two versions: one
+    /// with `upstream_published_at` set, one without — the wrapper is a
+    /// thin pass-through, so both rows must round-trip verbatim; the
+    /// upstream-vs-created_at precedence decision is the caller's
+    /// (`hort-http-cargo::index_source::ProxyCargoSource`), not this
+    /// wrapper's.
+    #[tokio::test]
+    async fn package_version_publish_times_passes_through_to_port() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let repo_id = Uuid::new_v4();
+        let upstream_ts = Utc::now() - chrono::Duration::days(30);
+
+        let mut a1 = sample_artifact(QuarantineStatus::Released);
+        a1.id = Uuid::new_v4();
+        a1.repository_id = repo_id;
+        a1.name = "leftpad".into();
+        a1.version = Some("1.0.0".into());
+        a1.upstream_published_at = Some(upstream_ts);
+        artifacts.insert(a1.clone());
+
+        let mut a2 = sample_artifact(QuarantineStatus::Released);
+        a2.id = Uuid::new_v4();
+        a2.repository_id = repo_id;
+        a2.name = "leftpad".into();
+        a2.version = Some("1.1.0".into());
+        a2.upstream_published_at = None;
+        artifacts.insert(a2.clone());
+
+        let uc = ArtifactUseCase::new(artifacts, storage, repos, true);
+        let mut rows = uc
+            .package_version_publish_times(repo_id, "leftpad")
+            .await
+            .expect("ok");
+        rows.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(
+            rows,
+            vec![
+                ("1.0.0".to_string(), a1.created_at, Some(upstream_ts)),
+                ("1.1.0".to_string(), a2.created_at, None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn package_version_publish_times_unknown_package_returns_empty() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let uc = ArtifactUseCase::new(artifacts, storage, repos, true);
+        let rows = uc
+            .package_version_publish_times(Uuid::new_v4(), "never-seen")
+            .await
+            .expect("ok");
+        assert!(rows.is_empty());
     }
 
     // -- builder methods (must_use coverage) ------------------------------

@@ -95,12 +95,12 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.24.1 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.26.0 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
-| flate2 | 1.1.9 | MIT | https://github.com/rust-lang/flate2-rs |
-| hyper | 1.11.0 | MIT | https://github.com/hyperium/hyper |
+| flate2 | 1.1.10 | MIT | https://github.com/rust-lang/flate2-rs |
+| hyper | 1.11.1 | MIT | https://github.com/hyperium/hyper |
 | unicase | 2.9.0 | MIT | https://github.com/seanmonstar/unicase |
 | either | 1.15.0 | MIT | https://github.com/rayon-rs/either |
 | itertools | 0.10.5 | MIT | https://github.com/rust-itertools/itertools |
@@ -326,7 +326,7 @@ the result instead.
 | crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.18.2 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.18.3 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -383,7 +383,7 @@ the result instead.
 | tokio-util | 0.7.19 | MIT | https://github.com/tokio-rs/tokio |
 | tokio | 1.53.1 | MIT | https://github.com/tokio-rs/tokio |
 | simd-adler32 | 0.3.9 | MIT | https://github.com/mcountryman/simd-adler32 |
-| miniz_oxide | 0.8.9 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
+| miniz_oxide | 0.9.1 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
 | ident_case | 1.0.1 | MIT | https://github.com/TedDriggs/ident_case |
 | unscanny | 0.1.0 | MIT | https://github.com/typst/unscanny |
 | olpc-cjson | 0.1.4 | MIT | https://github.com/awslabs/tough |
@@ -5664,7 +5664,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.24.1 — MIT
+### uuid 1.26.0 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -5786,7 +5786,7 @@ IN THE SOFTWARE.
 
 ```
 
-### flate2 1.1.9 — MIT
+### flate2 1.1.10 — MIT
 
 Repository: https://github.com/rust-lang/flate2-rs
 
@@ -5819,7 +5819,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### hyper 1.11.0 — MIT
+### hyper 1.11.1 — MIT
 
 Repository: https://github.com/hyperium/hyper
 
@@ -12908,7 +12908,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.18.2 — MIT
+### lru 0.18.3 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
@@ -14471,7 +14471,7 @@ SOFTWARE.
 
 ```
 
-### miniz_oxide 0.8.9 — MIT
+### miniz_oxide 0.9.1 — MIT
 
 Repository: https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide
 

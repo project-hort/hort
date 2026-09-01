@@ -1,0 +1,88 @@
+{{/*
+RBAC for the pre-pull wait/cleanup Job (templates/prepull-job.yaml).
+
+The Job only needs to observe the two pre-pull DaemonSets' rollout status
+and delete them once every eligible node reports Ready — it never creates
+one (Helm itself created them as hook resources at weight -10, before
+this Job's weight -9 runs).
+
+`resourceNames` scopes get/delete to exactly the DaemonSet(s) this
+release owns. Kubernetes RBAC does NOT support scoping `list`/`watch` by
+resourceNames (only get/delete/update/patch on a single named object can
+be restricted that way) — `kubectl rollout status`'s watch call is
+therefore authorized against the resource TYPE, not narrowed to these two
+names. This is the same collection-verb-can't-be-named-scoped limitation
+svc-bootstrap-rbac.yaml documents for `create secrets`; the blast radius
+here is read+delete on DaemonSets in this namespace, for the lifetime of
+one upgrade's hook window.
+
+Helm hook: pre-install,pre-upgrade, weight -11 — strictly before the
+pre-pull DaemonSets (-10) and the wait Job itself (-9). Regular (non-hook)
+release resources are only applied AFTER hooks complete, so without a
+hook annotation the ServiceAccount this Job's pod needs would not exist
+yet when the weight -9 Job is scheduled — pod creation fails with
+`serviceaccount "<fullname>-prepull" not found` and the hook wait times
+out. `before-hook-creation` ONLY — deliberately NO `hook-succeeded`:
+non-workload kinds (ServiceAccount/Role/RoleBinding) count as "succeeded"
+the instant they are created, so `hook-succeeded` would delete them
+before the weight -9 Job ever runs. These resources linger between
+upgrades by design, same as the DaemonSets above; `before-hook-creation`
+replaces them idempotently on the next attempt.
+*/}}
+{{- if .Values.prePull.enabled }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "hort-server.fullname" . }}-prepull
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-11"
+    helm.sh/hook-delete-policy: before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "hort-server.fullname" . }}-prepull
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-11"
+    helm.sh/hook-delete-policy: before-hook-creation
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames:
+      - {{ include "hort-server.fullname" . }}-prepull-server
+      {{- if .Values.worker.enabled }}
+      - {{ include "hort-server.fullname" . }}-prepull-worker
+      {{- end }}
+    verbs: ["get", "delete"]
+  # list/watch cannot be resourceNames-scoped (see doc comment above) —
+  # a separate rule without resourceNames is the standard workaround.
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "hort-server.fullname" . }}-prepull
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-11"
+    helm.sh/hook-delete-policy: before-hook-creation
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "hort-server.fullname" . }}-prepull
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "hort-server.fullname" . }}-prepull
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

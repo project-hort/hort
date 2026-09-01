@@ -47,6 +47,11 @@ pub mod enqueue_prefetch_row_retention_sweep;
 // (avoid dragging the svc-token-bootstrap chain to
 // default-on).
 pub mod enqueue_quarantine_release_sweep;
+// DB-only enqueue subcommand the Helm
+// CronJob runs to schedule the terminal-scan-row retention sweep.
+// Runtime DSN; no svc-token. Same delivery contract
+// as `enqueue-prefetch-row-retention-sweep`.
+pub mod enqueue_scan_row_retention_sweep;
 // DB-only enqueue subcommand the Helm CronJob
 // runs to retrofit older PyPI wheels with their PEP 658 metadata
 // blob. Runtime DSN; no svc-token. Same delivery contract as
@@ -159,8 +164,10 @@ pub enum Command {
     /// Apply database migrations and exit.
     ///
     /// Useful for k8s init-container patterns where migrations are
-    /// applied once before the serving replicas roll out.
-    Migrate,
+    /// applied once before the serving replicas roll out. Refuses when a
+    /// pending migration is a declared contraction and an older fleet is
+    /// still connected — see [`migrate::MigrateArgs`].
+    Migrate(migrate::MigrateArgs),
     /// CAS integrity scrubber.
     Scrub(scrub::ScrubArgs),
     /// Service-account token management. There is no `bootstrap`
@@ -227,6 +234,20 @@ pub enum Command {
     EnqueuePrefetchRowRetentionSweep(
         enqueue_prefetch_row_retention_sweep::EnqueuePrefetchRowRetentionSweepArgs,
     ),
+    /// Enqueue one
+    /// `scan-row-retention-sweep` job and exit. The Helm CronJob
+    /// runs this daily (operator-tunable) using the runtime DSN (no
+    /// svc-token; no `cronJobs.enabled` umbrella
+    /// dependency). The always-on worker picks the row up and
+    /// dispatches to `ScanRowRetentionSweepHandler`, which
+    /// deletes terminal (`status IN ('completed', 'failed')`)
+    /// `kind = 'scan'` rows older than a configurable horizon
+    /// (default 7 days). Pairs with the per-table
+    /// autovacuum tuning on `public.jobs` (migration 009) so
+    /// scan-lifecycle churn does not grow the table unbounded.
+    EnqueueScanRowRetentionSweep(
+        enqueue_scan_row_retention_sweep::EnqueueScanRowRetentionSweepArgs,
+    ),
     /// Enqueue one `wheel-metadata-backfill`
     /// job and exit. The Helm CronJob runs this on the operator's
     /// chosen schedule (default-disabled — backfill is a one-shot
@@ -274,7 +295,7 @@ pub fn run() -> ExitCode {
 fn dispatch(command: Command) -> ExitCode {
     match command {
         Command::Serve => serve::run(),
-        Command::Migrate => migrate::run(),
+        Command::Migrate(args) => migrate::run(args),
         Command::Scrub(args) => scrub::run(args),
         Command::Admin(cmd) => admin::run(cmd),
         Command::ReconcileGroups(args) => reconcile_groups::run(args),
@@ -285,6 +306,7 @@ fn dispatch(command: Command) -> ExitCode {
         Command::EnqueuePrefetchRowRetentionSweep(args) => {
             enqueue_prefetch_row_retention_sweep::run(args)
         }
+        Command::EnqueueScanRowRetentionSweep(args) => enqueue_scan_row_retention_sweep::run(args),
         Command::EnqueueWheelMetadataBackfill(args) => enqueue_wheel_metadata_backfill::run(args),
         Command::ValidateConfig(args) => validate_config::run(&args),
         Command::License(args) => license::run(&args),
@@ -316,12 +338,31 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Serve)));
     }
 
-    // `migrate` subcommand parses to `Command::Migrate`.
+    // `migrate` subcommand parses to `Command::Migrate`, with
+    // `--allow-running-fleet` defaulting off.
 
     #[test]
     fn migrate_parses() {
         let cli = Cli::try_parse_from(["hort-server", "migrate"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Migrate)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Migrate(migrate::MigrateArgs {
+                allow_running_fleet: false
+            }))
+        ));
+    }
+
+    // `--allow-running-fleet` flips the flag on.
+
+    #[test]
+    fn migrate_allow_running_fleet_flag_parses() {
+        let cli = Cli::try_parse_from(["hort-server", "migrate", "--allow-running-fleet"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Migrate(migrate::MigrateArgs {
+                allow_running_fleet: true
+            }))
+        ));
     }
 
     // `scrub` subcommand parses with empty args.
@@ -400,6 +441,7 @@ mod tests {
         assert!(rendered.contains("seed-import"));
         assert!(rendered.contains("enqueue-prefetch-tick"));
         assert!(rendered.contains("enqueue-prefetch-row-retention-sweep"));
+        assert!(rendered.contains("enqueue-scan-row-retention-sweep"));
         assert!(rendered.contains("validate-config"));
         assert!(rendered.contains("license"));
         assert!(rendered.contains("attribution"));
@@ -464,6 +506,18 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::EnqueuePrefetchRowRetentionSweep(_))
+        ));
+    }
+
+    // `enqueue-scan-row-retention-sweep` subcommand parses.
+    // Accepts bare invocation — the subcommand has no flags.
+
+    #[test]
+    fn enqueue_scan_row_retention_sweep_parses_bare_invocation() {
+        let cli = Cli::try_parse_from(["hort-server", "enqueue-scan-row-retention-sweep"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::EnqueueScanRowRetentionSweep(_))
         ));
     }
 

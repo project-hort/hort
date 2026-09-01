@@ -865,6 +865,37 @@ impl JobsRepository for PgJobsRepository {
         })
     }
 
+    fn last_result_summary_by_kind<'a>(
+        &'a self,
+        kind: &'a str,
+    ) -> BoxFuture<'a, DomainResult<Option<serde_json::Value>>> {
+        let kind = kind.to_string();
+        Box::pin(async move {
+            tracing::debug!(%kind, "last_result_summary_by_kind");
+            // Ordering by completed_at (NOT id — `jobs.id` is a random
+            // uuid), mirroring `last_completed_at_by_kind`. The outer
+            // `Option` is "no completed row of this kind exists yet";
+            // the inner `Option` is `result_summary`'s own nullability
+            // (a completed row with no summary) — `.flatten()` collapses
+            // both "never ran" and "ran with nothing to report" to the
+            // same `None`, which is exactly how callers already treat
+            // "no cursor" (start of the walk).
+            let summary: Option<Option<JsonValue>> = sqlx::query_scalar(
+                "SELECT result_summary \
+                 FROM public.jobs \
+                 WHERE kind = $1 \
+                   AND status = 'completed' \
+                 ORDER BY completed_at DESC \
+                 LIMIT 1",
+            )
+            .bind(&kind)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Job", &kind))?;
+            Ok(summary.flatten())
+        })
+    }
+
     fn record_run_completion<'a>(
         &'a self,
         kind: &'a str,
@@ -1277,6 +1308,27 @@ impl JobsRepository for PgJobsRepository {
             .execute(&self.pool)
             .await
             .map_err(|e| map_sqlx_error(&e, "Job", "delete_terminal_prefetch_rows_older_than"))?;
+            Ok(res.rows_affected())
+        })
+    }
+
+    fn delete_terminal_scan_rows_older_than<'a>(
+        &'a self,
+        horizon: Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        let interval = duration_to_pg_interval(horizon);
+        Box::pin(async move {
+            tracing::debug!(?horizon, "delete_terminal_scan_rows_older_than");
+            let res = sqlx::query(
+                "DELETE FROM public.jobs \
+                  WHERE kind = 'scan' \
+                    AND status IN ('completed', 'failed') \
+                    AND updated_at < now() - $1::interval",
+            )
+            .bind(interval)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Job", "delete_terminal_scan_rows_older_than"))?;
             Ok(res.rows_affected())
         })
     }
@@ -1995,6 +2047,72 @@ mod tests {
             .expect("cleanup seeded rows");
     }
 
+    /// Retention sweep deletes only terminal `kind='scan'` rows older
+    /// than the horizon. Seeds an aged+fresh terminal scan row, a
+    /// pending and a running scan row (never touched regardless of
+    /// age), plus an aged terminal `verify-event-chain` row and an
+    /// aged terminal `prefetch` row (foreign kinds, never touched) —
+    /// pins the exact-kind scope: only `kind = 'scan'` terminal rows
+    /// are eligible, never another kind's durable state.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn scan_retention_sweep_deletes_only_terminal_scan_rows_older_than_horizon() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        let suffix = Uuid::new_v4();
+        let mk = |status: &str, kind: &str, age_secs: i64| {
+            let key = format!("{suffix}|{kind}|{status}");
+            (status.to_string(), kind.to_string(), key, age_secs)
+        };
+        let fixtures = vec![
+            mk("completed", "scan", 1_000_000), // aged terminal scan — deleted
+            mk("failed", "scan", 1_000_000),    // aged terminal scan — deleted
+            mk("completed", "scan", 0),         // fresh terminal scan — kept
+            mk("pending", "scan", 1_000_000),   // non-terminal — kept regardless of age
+            mk("running", "scan", 1_000_000),   // non-terminal — kept regardless of age
+            mk("completed", "verify-event-chain", 1_000_000), // foreign kind — kept
+            mk("completed", "prefetch", 1_000_000), // foreign kind — kept
+        ];
+        for (status, kind, key, age_secs) in &fixtures {
+            sqlx::query(
+                "INSERT INTO public.jobs \
+                   (kind, params, priority, trigger_source, target_key, status, \
+                    created_at, updated_at) \
+                 VALUES ($1, '{}'::jsonb, 0, 'cron', $2, $3::text, \
+                         now() - ($4::int || ' seconds')::interval, \
+                         now() - ($4::int || ' seconds')::interval)",
+            )
+            .bind(kind)
+            .bind(key)
+            .bind(status)
+            .bind(*age_secs)
+            .execute(&pool)
+            .await
+            .expect("seed row");
+        }
+
+        let deleted = repo
+            .delete_terminal_scan_rows_older_than(Duration::from_secs(86_400))
+            .await
+            .expect("retention sweep");
+        assert_eq!(
+            deleted, 2,
+            "exactly the two aged-terminal scan rows are deleted (not pending/running scan, \
+             not fresh scan, not foreign kinds)",
+        );
+
+        // Cleanup: drop the remaining seeded rows for isolation.
+        let keys: Vec<String> = fixtures.into_iter().map(|(_, _, k, _)| k).collect();
+        sqlx::query("DELETE FROM public.jobs WHERE target_key = ANY($1)")
+            .bind(&keys)
+            .execute(&pool)
+            .await
+            .expect("cleanup seeded rows");
+    }
+
     // -----------------------------------------------------------------
     // `record_run_completion` + `last_completed_at_by_kind` round-trip.
     // Carries `#[serial(hort_pg_db)]` per ADR 0019 (the suite runs in
@@ -2069,6 +2187,92 @@ mod tests {
             .expect("last_completed_at_by_kind (newest)")
             .expect("a completion was recorded");
         assert_eq!(newest, later, "MAX(completed_at) tracks the newest run");
+    }
+
+    /// `last_result_summary_by_kind` — the cross-tick rotation-state read
+    /// `PrefetchTickHandler` uses. No completed row yet → `None`; after
+    /// `mark_completed` writes a summary, the SAME kind's next read gets
+    /// it back; a NEWER completion for the kind supersedes the older one.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn last_result_summary_by_kind_round_trips_the_newest_completion() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        let before = repo
+            .last_result_summary_by_kind("prefetch-tick")
+            .await
+            .expect("last_result_summary_by_kind (none)");
+        assert_eq!(
+            before, None,
+            "an isolated DB has no prior prefetch-tick run"
+        );
+
+        let first_summary = serde_json::json!({ "cursor": { "position": "after_repo", "repository_id": Uuid::new_v4() } });
+        let first_id = match repo
+            .enqueue_task(
+                "prefetch-tick",
+                &serde_json::json!({}),
+                None,
+                10,
+                "cron",
+                None,
+            )
+            .await
+            .expect("enqueue_task")
+        {
+            EnqueueOutcome::Enqueued { job_id } => job_id,
+            other => panic!("expected Enqueued, got {other:?}"),
+        };
+        repo.mark_completed(first_id, first_summary.clone())
+            .await
+            .expect("mark_completed (first)");
+
+        let after_first = repo
+            .last_result_summary_by_kind("prefetch-tick")
+            .await
+            .expect("last_result_summary_by_kind (first)");
+        assert_eq!(after_first, Some(first_summary));
+
+        // A second, later completion for the same kind supersedes it —
+        // this is exactly how the next tick's fresh job row reads back
+        // the PREVIOUS tick's cursor. The short sleep guarantees a
+        // distinct `completed_at` (the column is set via `now()`
+        // inside `mark_completed`, not caller-supplied).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let second_summary = serde_json::json!({ "cursor": null });
+        let second_id = match repo
+            .enqueue_task(
+                "prefetch-tick",
+                &serde_json::json!({}),
+                None,
+                10,
+                "cron",
+                None,
+            )
+            .await
+            .expect("enqueue_task")
+        {
+            EnqueueOutcome::Enqueued { job_id } => job_id,
+            other => panic!("expected Enqueued, got {other:?}"),
+        };
+        repo.mark_completed(second_id, second_summary.clone())
+            .await
+            .expect("mark_completed (second)");
+
+        let after_second = repo
+            .last_result_summary_by_kind("prefetch-tick")
+            .await
+            .expect("last_result_summary_by_kind (second)");
+        assert_eq!(after_second, Some(second_summary));
+
+        sqlx::query("DELETE FROM public.jobs WHERE id = ANY($1)")
+            .bind([first_id, second_id])
+            .execute(&pool)
+            .await
+            .expect("cleanup");
     }
 
     /// Regression (admin-task read 500): a completed job's

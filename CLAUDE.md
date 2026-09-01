@@ -182,6 +182,7 @@ The architect skill (`/.claude/commands/hort-architect.md`) maintains the canoni
 - **`ServiceAccount` with empty `federatedIdentities[].claims`** — apply-time validation rejects this; if a code path accepts an envelope with an empty `claims` map, that's a bug. Empty claims = "any JWT from this issuer can assume me" — a privilege-escalation footgun on a misconfigured issuer. (see ADR 0018)
 - **`OidcIssuer` trusts an unverified JWKS** — JWKS must be fetched over TLS verified against the system trust store + `HORT_EXTRA_CA_BUNDLE`. No `insecure_jwks_url` knob. Mirrors the reqwest-builder rule. The HTTP client for JWKS fetches is the shared `internal::build_http_client` in `hort-adapters-oidc`, which means the no-`reqwest::Client::new()` rule applies here too. (see ADR 0018)
 - **Policy field accepted at apply, inert at runtime** — a new field on `PrefetchPolicy` / `ScanPolicy` / `RetentionPolicy` / `RepositoryUpstreamMapping` etc. must be either enforced by the consuming use case or rejected at gitops apply. Accepting the field while the consumer silently ignores it is a hard block — operators set risk-significant values (e.g. `max_age_days: 90`) and make threat-model decisions on the assumption the field is load-bearing. Structural enforcement is an apply-time linter rejection that points the operator at the future enforcement work; `max_age_days` is the canonical exemplar (apply-time linter rejects any non-`None` value). The alternative model is to *remove* the operator surface until the feature is functional. (see ADR 0015)
+- **Destructive DDL in the same release that removed the last code reference** — a migration that drops/renames/narrows a schema identifier ships only in a release strictly *after* the last release whose code referenced it (expand/contract). `expand_contract_guard` rejects it via `migrations/CONTRACTIONS.toml` version arithmetic; the fix is to schedule the contraction one release later, never to edit the manifest into passing. New manifest entries carry a mandatory reviewer step (`git grep <identifier> v<reference_removed_in>` — the hermetic guard cannot see past releases). (see ADR 0030 amendment (c))
 - **Cross-opt-in collapse of a Gate-2-style invariant** — any new operator-opt-in that lets untrusted input influence the release-gate computation (`trust_upstream_publish_time`-shaped, `scan_backends:[]`-shaped, `IndexMode`-shaped) must enumerate its interaction with every other such opt-in in its design doc *before* implementation, via the architect doc's "Cross-opt-in interaction matrix". The canonical exemplar: `trust_upstream_publish_time = true` × `scan_backends: []` together collapse the Gate-2 observation window to ≤ sweep-tick latency (apply-time linter rejects the combination, `trust_upstream_publish_time_requires_scan_backends` rule). The structural close is fail-closed apply-time rejection of the dangerous combination, never a runtime "fallback to a degraded authority" path. (see ADR 0016)
 
 ## Implementation Discipline — when to deviate from the design
@@ -317,7 +318,14 @@ buffering helper on the metadata consumers), `no_sensitive_drops` (ADR 0030 —
 token-aware source-scan of `migrations/` that rejects `DROP TABLE` /
 `DROP TABLE IF EXISTS` / `ALTER TABLE … DROP CONSTRAINT` against a maintained
 sensitive-table list: the authorization model, credential store, event store,
-repository config, and task queue), `retention_registration_guard` (ADR 0030 —
+repository config, and task queue), `expand_contract_guard` (ADR 0030 —
+enforces the expand/contract policy: destructive DDL (`DROP COLUMN` /
+`DROP TABLE` / table-or-column `RENAME` / column type change / `SET NOT NULL`)
+ships only in a release strictly after the last one whose code referenced the
+identifier. Cross-checks every migration's destructive DDL against the
+checked-in manifest `migrations/CONTRACTIONS.toml`, requires the workspace
+version to exceed each entry's `reference_removed_in`, and rejects a
+still-referenced identifier in `crates/*/src`), `retention_registration_guard` (ADR 0030 —
 asserts the code-held eventstore-retention rule set
 (`canonical_retention_rules`) only ever registers the permitted categories
 `{Artifact, AuthAttempts, DownloadAudit, TokenUse}`, with a no-wildcard

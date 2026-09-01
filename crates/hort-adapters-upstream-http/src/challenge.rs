@@ -102,6 +102,129 @@ pub fn parse_www_authenticate(header_value: &str) -> Result<Challenge, Challenge
     })
 }
 
+/// Cursor type threaded through the [`parse_params`] sub-parsers.
+type Chars<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
+
+/// Skip leading whitespace and commas between params.
+fn skip_whitespace_and_commas(chars: &mut Chars<'_>) {
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_whitespace() || c == ',' {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+}
+
+fn skip_whitespace(chars: &mut Chars<'_>) {
+    while let Some(&(_, c)) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Read the key (RFC 7230 token: ASCII letters/digits + a few specials).
+/// Stops at `=`, whitespace, or `,`.
+fn parse_param_key(input: &str, chars: &mut Chars<'_>) -> Result<String, ChallengeParseError> {
+    let key_start = chars.peek().map(|&(i, _)| i).unwrap();
+    let mut key_end = key_start;
+    while let Some(&(i, c)) = chars.peek() {
+        if c == '=' || c.is_whitespace() || c == ',' {
+            break;
+        }
+        key_end = i + c.len_utf8();
+        chars.next();
+    }
+    if key_end == key_start {
+        return Err(ChallengeParseError::Malformed(
+            "empty parameter key".to_string(),
+        ));
+    }
+    Ok(input[key_start..key_end].to_ascii_lowercase())
+}
+
+/// Skip whitespace, require `=`, skip whitespace.
+fn consume_equals(key: &str, chars: &mut Chars<'_>) -> Result<(), ChallengeParseError> {
+    skip_whitespace(chars);
+    match chars.peek() {
+        Some(&(_, '=')) => {
+            chars.next();
+        }
+        _ => {
+            return Err(ChallengeParseError::Malformed(format!(
+                "parameter `{key}` missing `=`"
+            )));
+        }
+    }
+    skip_whitespace(chars);
+    Ok(())
+}
+
+/// A quoted-string value, with `\"` / `\\` escapes per RFC 7230 §3.2.6. The
+/// opening quote is still unconsumed on entry.
+fn parse_quoted_value(chars: &mut Chars<'_>) -> Result<String, ChallengeParseError> {
+    chars.next(); // consume opening quote
+    let mut buf = String::new();
+    let mut closed = false;
+    while let Some((_, c)) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some((_, esc)) => buf.push(esc),
+                None => {
+                    return Err(ChallengeParseError::Malformed(
+                        "trailing backslash in quoted value".to_string(),
+                    ));
+                }
+            }
+        } else if c == '"' {
+            closed = true;
+            break;
+        } else {
+            buf.push(c);
+        }
+    }
+    if !closed {
+        return Err(ChallengeParseError::Malformed(
+            "unterminated quoted value".to_string(),
+        ));
+    }
+    Ok(buf)
+}
+
+/// An unquoted RFC 7230 token value, ending at `,` or whitespace.
+fn parse_token_value(input: &str, chars: &mut Chars<'_>, start: usize) -> String {
+    let mut end = start;
+    while let Some(&(i, c)) = chars.peek() {
+        if c == ',' || c.is_whitespace() {
+            break;
+        }
+        end = i + c.len_utf8();
+        chars.next();
+    }
+    input[start..end].to_string()
+}
+
+/// Value: quoted-string or token.
+fn parse_param_value(input: &str, chars: &mut Chars<'_>) -> Result<String, ChallengeParseError> {
+    match chars.peek() {
+        Some(&(_, '"')) => parse_quoted_value(chars),
+        Some(&(start, _)) => Ok(parse_token_value(input, chars, start)),
+        None => Ok(String::new()),
+    }
+}
+
+/// Insert; duplicate keys overwrite (defensive — last wins).
+fn insert_param(out: &mut Vec<(String, String)>, key: String, value: String) {
+    if let Some(existing) = out.iter_mut().find(|(k, _)| k == &key) {
+        existing.1 = value;
+    } else {
+        out.push((key, value));
+    }
+}
+
 /// Parse a comma-separated `key=value [, key=value]*` list into a
 /// vector of `(lowercased_key, unescaped_value)` pairs preserving
 /// input order. Tolerates whitespace around `=` and `,`. Values may
@@ -112,114 +235,15 @@ fn parse_params(input: &str) -> Result<Vec<(String, String)>, ChallengeParseErro
     let mut chars = input.char_indices().peekable();
 
     loop {
-        // Skip leading whitespace and commas between params.
-        while let Some(&(_, c)) = chars.peek() {
-            if c.is_whitespace() || c == ',' {
-                chars.next();
-            } else {
-                break;
-            }
-        }
+        skip_whitespace_and_commas(&mut chars);
         if chars.peek().is_none() {
             break;
         }
 
-        // Read the key (RFC 7230 token: ASCII letters/digits + a few
-        // specials). Stop at `=`, whitespace, or `,`.
-        let key_start = chars.peek().map(|&(i, _)| i).unwrap();
-        let mut key_end = key_start;
-        while let Some(&(i, c)) = chars.peek() {
-            if c == '=' || c.is_whitespace() || c == ',' {
-                break;
-            }
-            key_end = i + c.len_utf8();
-            chars.next();
-        }
-        if key_end == key_start {
-            return Err(ChallengeParseError::Malformed(
-                "empty parameter key".to_string(),
-            ));
-        }
-        let key = input[key_start..key_end].to_ascii_lowercase();
-
-        // Skip whitespace before `=`.
-        while let Some(&(_, c)) = chars.peek() {
-            if c.is_whitespace() {
-                chars.next();
-            } else {
-                break;
-            }
-        }
-        // Require `=`.
-        match chars.peek() {
-            Some(&(_, '=')) => {
-                chars.next();
-            }
-            _ => {
-                return Err(ChallengeParseError::Malformed(format!(
-                    "parameter `{key}` missing `=`"
-                )));
-            }
-        }
-        // Skip whitespace after `=`.
-        while let Some(&(_, c)) = chars.peek() {
-            if c.is_whitespace() {
-                chars.next();
-            } else {
-                break;
-            }
-        }
-
-        // Value: quoted-string or token.
-        let value = match chars.peek() {
-            Some(&(_, '"')) => {
-                chars.next(); // consume opening quote
-                let mut buf = String::new();
-                let mut closed = false;
-                while let Some((_, c)) = chars.next() {
-                    if c == '\\' {
-                        match chars.next() {
-                            Some((_, esc)) => buf.push(esc),
-                            None => {
-                                return Err(ChallengeParseError::Malformed(
-                                    "trailing backslash in quoted value".to_string(),
-                                ));
-                            }
-                        }
-                    } else if c == '"' {
-                        closed = true;
-                        break;
-                    } else {
-                        buf.push(c);
-                    }
-                }
-                if !closed {
-                    return Err(ChallengeParseError::Malformed(
-                        "unterminated quoted value".to_string(),
-                    ));
-                }
-                buf
-            }
-            Some(&(start, _)) => {
-                let mut end = start;
-                while let Some(&(i, c)) = chars.peek() {
-                    if c == ',' || c.is_whitespace() {
-                        break;
-                    }
-                    end = i + c.len_utf8();
-                    chars.next();
-                }
-                input[start..end].to_string()
-            }
-            None => String::new(),
-        };
-
-        // Insert; duplicate keys overwrite (defensive — last wins).
-        if let Some(existing) = out.iter_mut().find(|(k, _)| k == &key) {
-            existing.1 = value;
-        } else {
-            out.push((key, value));
-        }
+        let key = parse_param_key(input, &mut chars)?;
+        consume_equals(&key, &mut chars)?;
+        let value = parse_param_value(input, &mut chars)?;
+        insert_param(&mut out, key, value);
     }
 
     Ok(out)

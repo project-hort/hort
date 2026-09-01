@@ -43,6 +43,7 @@ metadata:
     hort-server.io/job: eventstore-archive
 spec:
   schedule: {{ .Values.scheduledTasks.eventstoreArchive.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 3

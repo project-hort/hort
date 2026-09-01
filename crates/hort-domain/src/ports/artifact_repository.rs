@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::entities::artifact::{Artifact, QuarantineStatus};
-use crate::error::DomainResult;
+use crate::error::{DomainError, DomainResult};
 use crate::events::Actor;
 use crate::types::{ContentHash, LimitedList, Page, PageRequest};
 
@@ -26,6 +26,26 @@ use super::BoxFuture;
 /// There is no stored `quarantine_deadline` column — the schema persists
 /// only the anchor (migration `003_artifacts_cas.sql`).
 pub type PackageVersionStatusRow = (String, QuarantineStatus, Option<DateTime<Utc>>);
+
+/// Per-`(repository, package)` publish-timestamp row: `(version,
+/// created_at, upstream_published_at)`.
+///
+/// Row presence carries the same meaning documented on
+/// [`ArtifactRepository::package_version_status`]: a returned row
+/// asserts locally-ingested content. A queried version with no row is
+/// "never locally ingested", not "timestamp unknown" — callers computing
+/// a served publish time must read absence as "omit the field", never
+/// as a zero or invented timestamp.
+///
+/// Deliberately its own port method rather than a widening of
+/// [`PackageVersionStatusRow`] / [`ArtifactRepository::package_version_status`]:
+/// that method is the hot, index-only-scan serve path shared by every
+/// format's quarantine-aware filtering, and folding two more timestamp
+/// columns into it would (a) force a heap fetch onto that highest-QPS
+/// read for every format, not just cargo, and (b) leak a cargo-only
+/// concern into a cross-format row shape. This method is a separate,
+/// lower-QPS read exercised only by the cargo sparse-index proxy source.
+pub type PackageVersionPublishTimeRow = (String, DateTime<Utc>, Option<DateTime<Utc>>);
 
 /// Outbound port for artifact persistence (read-only + delete).
 ///
@@ -118,6 +138,34 @@ pub trait ArtifactRepository: Send + Sync {
         repository_id: Uuid,
         page: PageRequest,
     ) -> BoxFuture<'_, DomainResult<Page<String>>>;
+
+    /// Keyset-paginated distinct-name listing ordered by `name`
+    /// ascending — the same byte-stable order [`Self::list_distinct_names`]
+    /// already produces, since names are unique per repository. `after`
+    /// excludes names lexicographically `<= after`; `None` starts at the
+    /// beginning. Powers `PrefetchTickHandler`'s cross-tick rotation:
+    /// resuming a repo's package walk `after` a saved cursor degrades
+    /// gracefully if that exact name was since deleted (the `>`
+    /// comparison simply lands on the next existing name). Returns a
+    /// plain `Vec` — no `total` needed by a cursor walker.
+    ///
+    /// **Default implementation:** returns
+    /// `Err(DomainError::Invariant("list_distinct_names_after not
+    /// implemented"))` so existing mocks compile without modification.
+    /// The Postgres adapter overrides with the real keyset query.
+    fn list_distinct_names_after(
+        &self,
+        repository_id: Uuid,
+        after: Option<&str>,
+        limit: u64,
+    ) -> BoxFuture<'_, DomainResult<Vec<String>>> {
+        let _ = (repository_id, after, limit);
+        Box::pin(async {
+            Err(DomainError::Invariant(
+                "list_distinct_names_after not implemented".into(),
+            ))
+        })
+    }
 
     /// Find artifacts with a given normalized name in a repository,
     /// paginated.
@@ -341,6 +389,27 @@ pub trait ArtifactRepository: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    /// Per-version `(version, created_at, upstream_published_at)` for
+    /// every locally-ingested artifact row in `(repository_id,
+    /// package)` — the timestamp source for the cargo sparse-index
+    /// `pubtime` field. `created_at` is the row's own NOT NULL column
+    /// (hort's first-seen-here observation); `upstream_published_at` is
+    /// the untrusted, best-effort upstream-asserted timestamp captured
+    /// at ingest (see `Artifact.upstream_published_at`). A version
+    /// hort has never ingested for this `(repository_id, package)`
+    /// produces no row at all.
+    ///
+    /// Default impl returns empty so existing test doubles that never
+    /// exercise cargo pubtime need not override it (mirrors
+    /// [`Self::package_version_anchors`]).
+    fn package_version_publish_times(
+        &self,
+        _repository_id: Uuid,
+        _package: &str,
+    ) -> BoxFuture<'_, DomainResult<Vec<PackageVersionPublishTimeRow>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
     /// The earliest ingest observation hort holds for this content hash —
     /// `MIN(created_at)` over every `artifacts` row carrying
     /// `checksum_sha256 = $1`, across **all** repositories of this
@@ -394,33 +463,56 @@ pub trait ArtifactRepository: Send + Sync {
     /// (`WheelMetadataBackfillHandler`)
     /// to retroactively extract metadata for those wheels.
     ///
-    /// SQL contract: a single `SELECT … FROM artifacts WHERE path LIKE
-    /// '%.whl' AND NOT EXISTS (SELECT 1 FROM content_references WHERE
-    /// source_artifact_id = artifacts.id AND kind = $1) LIMIT $2`. The
-    /// task handler bounds `limit` at 1000 (its own cap); the adapter
-    /// MUST NOT silently cap below the request — a future raise of the
-    /// handler cap must surface through unchanged.
+    /// `after`: keyset cursor — when `Some(id)`, only rows with
+    /// `id > after` are considered. `None` starts from the beginning.
+    /// Lets a single task run walk multiple pages without re-reading a
+    /// page it already visited (the in-run advance): a 100%-skipped
+    /// page no longer stalls the run at the same rows forever.
     ///
-    /// **Resumable by construction** — the candidacy query is stateless
-    /// (no cursor, no "claimed" marker). A failed batch leaves the
-    /// candidate set unchanged; the next invocation re-derives the same
-    /// work minus whatever the previous run completed. Two concurrent
-    /// runs would re-walk the same set; the per-CAS `StoragePort::put`
+    /// `skip_marker_kind`: when `Some(marker_kind)`, rows carrying a
+    /// `content_references` row of `marker_kind` are ALSO excluded (a
+    /// second `NOT EXISTS`, alongside the `kind` one) — the durable
+    /// structural-skip marker. `None` (the operator's
+    /// `ignore_skip_markers: true`) lifts that exclusion and re-surfaces
+    /// previously-marked rows, e.g. after a parser fix.
+    ///
+    /// SQL contract: a single `SELECT … FROM artifacts WHERE path LIKE
+    /// '%.whl' AND ($3::uuid IS NULL OR id > $3) AND NOT EXISTS (SELECT 1
+    /// FROM content_references WHERE source_artifact_id = artifacts.id AND
+    /// kind = $1) AND ($4::text IS NULL OR NOT EXISTS (SELECT 1 FROM
+    /// content_references WHERE source_artifact_id = artifacts.id AND kind
+    /// = $4)) ORDER BY id LIMIT $2`. The task handler bounds `limit` at
+    /// 1000 (its own cap); the adapter MUST NOT silently cap below the
+    /// request — a future raise of the handler cap must surface through
+    /// unchanged.
+    ///
+    /// **Resumable across invocations by construction** — a fresh
+    /// invocation starts with `after = None`; the candidacy predicate
+    /// (`kind` NOT EXISTS, plus `skip_marker_kind` NOT EXISTS when
+    /// exclusion is active) is otherwise stateless. A failed page leaves
+    /// the candidate set unchanged; the next invocation re-derives the
+    /// same work minus whatever a prior successful invocation completed
+    /// (extracted, or — for structural skips — marked). Two concurrent
+    /// runs would re-walk overlapping sets; the per-CAS `StoragePort::put`
     /// idempotency on identical content + the upsert semantics of
     /// `ContentReferenceIndex::insert` absorb the duplicate work.
     fn find_pypi_wheels_without_kind(
         &self,
         kind: &str,
         limit: u32,
+        after: Option<Uuid>,
+        skip_marker_kind: Option<&str>,
     ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>>;
 
     /// Find OCI **single-image manifest** artifacts (`path LIKE
     /// 'manifests/sha256:%'`) that have no `content_references` row of the
     /// given `kind` (in practice `"oci_config"`), bounded by `limit`.
     /// Mirrors [`Self::find_pypi_wheels_without_kind`]'s shape and posture
-    /// one-for-one — same candidacy-query contract, same resumability, same
-    /// consumer (an admin-task backfill: `oci-membership-edge-backfill`
-    /// here vs. `wheel-metadata-backfill` there).
+    /// one-for-one — same candidacy-query contract (including the `after`
+    /// keyset cursor and the `skip_marker_kind` durable-exclusion toggle),
+    /// same resumability, same consumer (an admin-task backfill:
+    /// `oci-membership-edge-backfill` here vs. `wheel-metadata-backfill`
+    /// there).
     ///
     /// **Image manifests only — an index must never be returned.** An OCI
     /// image index legitimately carries no `config`/`layers` (it carries
@@ -440,23 +532,27 @@ pub trait ArtifactRepository: Send + Sync {
     /// backfill exists to repair.
     ///
     /// SQL contract: `SELECT … FROM artifacts WHERE path LIKE
-    /// 'manifests/sha256:%' AND NOT EXISTS (SELECT 1
-    /// FROM content_references WHERE source_artifact_id = artifacts.id AND
-    /// kind = $1) AND NOT EXISTS (SELECT 1 FROM artifact_metadata WHERE
-    /// artifact_id = artifacts.id AND metadata->>'oci_media_type' IN
-    /// (<index media types>)) ORDER BY id LIMIT $2`.
+    /// 'manifests/sha256:%' AND ($5::uuid IS NULL OR id > $5) AND NOT
+    /// EXISTS (SELECT 1 FROM content_references WHERE source_artifact_id =
+    /// artifacts.id AND kind = $1) AND ($6::text IS NULL OR NOT EXISTS
+    /// (SELECT 1 FROM content_references WHERE source_artifact_id =
+    /// artifacts.id AND kind = $6)) AND NOT EXISTS (SELECT 1 FROM
+    /// artifact_metadata WHERE artifact_id = artifacts.id AND
+    /// metadata->>'oci_media_type' IN (<index media types>)) ORDER BY id
+    /// LIMIT $2`.
     ///
-    /// **Resumable by construction** — stateless candidacy query, no
-    /// cursor. A failed batch leaves the candidate set unchanged; the next
-    /// invocation re-derives the same work minus whatever the previous run
-    /// completed. Idempotent for the same reason
-    /// [`Self::find_pypi_wheels_without_kind`] is: the upsert-on-PK
-    /// semantics of `ContentReferenceIndex::insert` absorb duplicate work
-    /// from overlapping runs.
+    /// **Resumable across invocations by construction** — same posture as
+    /// [`Self::find_pypi_wheels_without_kind`]: a fresh invocation starts
+    /// with `after = None`, a failed page leaves the candidate set
+    /// unchanged, and the upsert-on-PK semantics of
+    /// `ContentReferenceIndex::insert` absorb duplicate work from
+    /// overlapping runs.
     fn find_oci_image_manifests_without_kind(
         &self,
         kind: &str,
         limit: u32,
+        after: Option<Uuid>,
+        skip_marker_kind: Option<&str>,
     ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>>;
 }
 
@@ -483,7 +579,7 @@ mod tests {
     impl ArtifactRepository for Stub {
         fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<Artifact>> {
             Box::pin(async {
-                Err(crate::error::DomainError::NotFound {
+                Err(DomainError::NotFound {
                     entity: "Artifact",
                     id: String::new(),
                 })
@@ -579,6 +675,8 @@ mod tests {
             &self,
             kind: &str,
             limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             // Pin the input shape: the stub returns nothing but
             // accepts the documented kinds/limits without panicking.
@@ -590,6 +688,8 @@ mod tests {
             &self,
             kind: &str,
             limit: u32,
+            _after: Option<Uuid>,
+            _skip_marker_kind: Option<&str>,
         ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>> {
             // Pin the input shape: the stub accepts the documented
             // kind/limit without panicking.
@@ -643,20 +743,27 @@ mod tests {
     }
 
     /// The `find_pypi_wheels_without_kind` method exists
-    /// on the trait with the documented shape: `(kind: &str, limit: u32)
-    /// -> BoxFuture<DomainResult<Vec<Artifact>>>`. Shape-pin guards
+    /// on the trait with the documented shape: `(kind: &str, limit: u32,
+    /// after: Option<Uuid>, skip_marker_kind: Option<&str>) ->
+    /// BoxFuture<DomainResult<Vec<Artifact>>>`. Shape-pin guards
     /// against a rename / retype that would silently break the
     /// `wheel-metadata-backfill` task handler.
     #[test]
     fn find_pypi_wheels_without_kind_has_documented_shape() {
         let repo = stub();
-        let fut = repo.find_pypi_wheels_without_kind("wheel_metadata", 100);
+        let fut = repo.find_pypi_wheels_without_kind(
+            "wheel_metadata",
+            100,
+            Some(Uuid::new_v4()),
+            Some("wheel_metadata_skipped"),
+        );
         let result = futures::executor::block_on(fut).expect("stub returns Ok");
         assert!(result.is_empty());
     }
 
     /// The `find_oci_image_manifests_without_kind` method exists on the
-    /// trait with the documented shape: `(kind: &str, limit: u32) ->
+    /// trait with the documented shape: `(kind: &str, limit: u32, after:
+    /// Option<Uuid>, skip_marker_kind: Option<&str>) ->
     /// BoxFuture<DomainResult<Vec<Artifact>>>`. Shape-pin guards against a
     /// rename/retype that would silently break the
     /// `oci-membership-edge-backfill` task handler — mirrors
@@ -664,7 +771,12 @@ mod tests {
     #[test]
     fn find_oci_image_manifests_without_kind_has_documented_shape() {
         let repo = stub();
-        let fut = repo.find_oci_image_manifests_without_kind("oci_config", 100);
+        let fut = repo.find_oci_image_manifests_without_kind(
+            "oci_config",
+            100,
+            Some(Uuid::new_v4()),
+            Some("oci_membership_skipped"),
+        );
         let result = futures::executor::block_on(fut).expect("stub returns Ok");
         assert!(result.is_empty());
     }
