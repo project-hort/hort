@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.3] - 2026-09-01
+
+### Fixed
+
+- **cargo sparse index: `pubtime` is now emitted in cargo's strict wire
+  format** (`yyyy-mm-ddThh:mm:ssZ` — 20 characters, `Z` only, no fractional
+  seconds). cargo ≥ 1.93 parses the field with a strict deserializer and
+  treats the **whole index line** as invalid when it fails, so the RFC 3339
+  offset format (plus microsecond precision on stored timestamps) served
+  since 0.12.2 made every locally ingested version unresolvable for modern
+  cargo clients — resolution failed with "version X's index entry is
+  invalid" across hosted, proxy, and virtual cargo repositories. (#225)
+
 ## [0.12.2] - 2026-09-01
 
 ### Added
