@@ -33,16 +33,20 @@
 //!
 //! # `pubtime`
 //!
-//! `Some(...)` emits an RFC 3339 UTC string; `None` omits the key
-//! entirely (cargo clients — and Renovate's crate datasource, the
-//! consumer this field exists for — ignore unknown/absent keys
-//! identically, so omission and a hypothetical `null` are
-//! indistinguishable to every consumer; omission is chosen to keep the
-//! wire shape identical to the pre-field shape wherever hort has no
-//! timestamp to offer). The builder never computes this value itself —
-//! it renders exactly what [`CargoVersionPayload::pubtime`] carries; the
-//! per-repo-kind source and precedence live in the sources
-//! (`HostedCargoSource`, `ProxyCargoSource` in `hort-http-cargo`).
+//! `Some(...)` emits cargo's exact wire format — `yyyy-mm-ddThh:mm:ssZ`,
+//! 20 characters, zero-padded, `Z` only, no fractional seconds (cargo's
+//! `serde_pubtime` deserializer since 1.93 accepts nothing else, and a
+//! field-level parse failure invalidates the whole index line); `None`
+//! omits the key entirely (cargo clients — and Renovate's crate
+//! datasource, the consumer this field exists for — ignore
+//! unknown/absent keys identically, so omission and a hypothetical
+//! `null` are indistinguishable to every consumer; omission is chosen to
+//! keep the wire shape identical to the pre-field shape wherever hort
+//! has no timestamp to offer). The builder never computes this value
+//! itself — it renders exactly what [`CargoVersionPayload::pubtime`]
+//! carries, truncating any sub-second precision; the per-repo-kind
+//! source and precedence live in the sources (`HostedCargoSource`,
+//! `ProxyCargoSource` in `hort-http-cargo`).
 //!
 //! # NDJSON ordering policy
 //!
@@ -237,7 +241,7 @@ impl IndexBuilder for CargoIndexBuilder {
             if let Some(pubtime) = payload.pubtime {
                 obj.insert(
                     "pubtime".to_string(),
-                    serde_json::Value::String(pubtime.to_rfc3339()),
+                    serde_json::Value::String(pubtime.format("%Y-%m-%dT%H:%M:%SZ").to_string()),
                 );
             }
 
@@ -487,8 +491,8 @@ mod tests {
         );
         assert_eq!(
             v["pubtime"].as_str().unwrap(),
-            "2024-06-15T12:30:00+00:00",
-            "pubtime must round-trip as RFC 3339 UTC"
+            "2024-06-15T12:30:00Z",
+            "pubtime must be emitted in cargo's strict wire format"
         );
     }
 
@@ -512,11 +516,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // 12. `pubtime` emitted as RFC 3339 UTC when `Some`.
+    // 12. `pubtime` emitted in cargo's strict wire format when `Some`.
     // -----------------------------------------------------------------
 
     #[test]
-    fn pubtime_emitted_as_rfc3339_when_present() {
+    fn pubtime_emitted_in_cargo_strict_format_when_present() {
         let mut p = minimal_payload("serde", "1.0.0", &"a".repeat(64));
         p.pubtime = Some(
             "2023-11-05T08:15:30Z"
@@ -527,8 +531,59 @@ mod tests {
         let lines = parse_lines(&body);
         assert_eq!(
             lines[0]["pubtime"].as_str().unwrap(),
-            "2023-11-05T08:15:30+00:00"
+            "2023-11-05T08:15:30Z"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // 13. `pubtime` wire format matches cargo's strict `serde_pubtime`
+    //     subset (`yyyy-mm-ddThh:mm:ssZ`, 20 chars) for every emitted
+    //     value, including a Postgres-sourced timestamp carrying
+    //     microsecond precision — cargo's deserializer rejects
+    //     fractional seconds and offset suffixes, and a field-level
+    //     parse failure invalidates the whole index line.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn pubtime_wire_format_matches_cargo_strict_subset_for_microsecond_input() {
+        let mut p = minimal_payload("serde", "1.0.0", &"a".repeat(64));
+        p.pubtime = Some(
+            "2026-08-20T09:09:56.123456Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap(),
+        );
+        let body = build(vec![entry("1.0.0", p)]);
+        let lines = parse_lines(&body);
+        let wire = lines[0]["pubtime"].as_str().unwrap();
+        assert_eq!(
+            wire, "2026-08-20T09:09:56Z",
+            "microsecond input must be truncated to cargo's strict seconds-only wire format"
+        );
+        assert!(
+            is_cargo_strict_pubtime(wire),
+            "pubtime {wire:?} must match cargo's strict serde_pubtime wire format \
+             (yyyy-mm-ddThh:mm:ssZ, 20 chars, no offset, no fractional seconds)"
+        );
+    }
+
+    /// Matches cargo's `serde_pubtime` wire subset: exactly
+    /// `yyyy-mm-ddThh:mm:ssZ`, 20 ASCII bytes, zero-padded digits, no
+    /// offset, no fractional seconds.
+    fn is_cargo_strict_pubtime(s: &str) -> bool {
+        let bytes = s.as_bytes();
+        bytes.len() == 20
+            && bytes[..4].iter().all(u8::is_ascii_digit)
+            && bytes[4] == b'-'
+            && bytes[5..7].iter().all(u8::is_ascii_digit)
+            && bytes[7] == b'-'
+            && bytes[8..10].iter().all(u8::is_ascii_digit)
+            && bytes[10] == b'T'
+            && bytes[11..13].iter().all(u8::is_ascii_digit)
+            && bytes[13] == b':'
+            && bytes[14..16].iter().all(u8::is_ascii_digit)
+            && bytes[16] == b':'
+            && bytes[17..19].iter().all(u8::is_ascii_digit)
+            && bytes[19] == b'Z'
     }
 
     // -----------------------------------------------------------------
