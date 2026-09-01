@@ -305,7 +305,7 @@ jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # `hort-app::argon2_hash`'s committed stored-format fixture is the guard
 # that proves it stays that way.
 argon2 = { version = "0.5", features = ["std"] }
-password-hash = { version = "0.5", features = ["alloc"] }
+password-hash = { version = "0.6", features = ["alloc"] }
 # Ed25519 keypair used to sign the OCI Distribution-Spec `/v2/auth` token
 # JWT. The `pkcs8` feature provides `from_pkcs8_der` / `from_pkcs8_pem` so
 # composition can load the secret from a Kubernetes-mounted file without a
