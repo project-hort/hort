@@ -1115,7 +1115,7 @@ impl PolicyProjectionRepository for MockPolicyProjectionRepository {
             .filter(|p| !p.archived)
             .cloned()
             .collect();
-        res.sort_by(|a, b| (a.created_at, a.policy_id).cmp(&(b.created_at, b.policy_id)));
+        res.sort_by_key(|p| (p.created_at, p.policy_id));
         Box::pin(async move { Ok(res) })
     }
 

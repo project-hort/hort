@@ -109,14 +109,14 @@ exclude = ["tools/*"]
 [workspace.package]
 version = "0.13.0-dev"
 edition = "2021"
-# MSRV — kept in sync with `.clippy.toml` (`msrv = "1.94.0"`) and with
+# MSRV — kept in sync with `.clippy.toml` (`msrv = "1.97.0"`) and with
 # `docker/Dockerfile.hort-server`'s `ARG RUST_VERSION` default (asserted
 # by `scripts/check-rust-version.sh`). The `scripts/check-advisory-sync.sh`
 # CI gate does not check the pair against clippy.toml (it is scoped to
 # advisory-ignore-list parity); a clippy/Cargo divergence is caught by
 # clippy itself, since `.clippy.toml`'s `msrv` enforces the floor at lint
 # time.
-rust-version = "1.94"
+rust-version = "1.97"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/project-hort/hort"
 

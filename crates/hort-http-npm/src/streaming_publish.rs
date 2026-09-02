@@ -497,20 +497,20 @@ impl ParseState {
                 b'{' => {
                     self.brace_depth += 1;
                     match self.seek {
-                        Seek::AwaitingAttachmentsObject => {
-                            // The `{` after `"_attachments":`. We
-                            // are now inside the by-filename map.
-                            if self.brace_depth == self.attachments_outer_depth + 1 {
-                                self.seek = Seek::InAttachmentsObject;
-                            }
+                        // The `{` after `"_attachments":`. We are
+                        // now inside the by-filename map.
+                        Seek::AwaitingAttachmentsObject
+                            if self.brace_depth == self.attachments_outer_depth + 1 =>
+                        {
+                            self.seek = Seek::InAttachmentsObject;
                         }
-                        Seek::AwaitingAttachmentObject => {
-                            // The `{` after the first filename key
-                            // and its `:`. We are now inside the
-                            // first attachment object.
-                            if self.brace_depth == self.first_attachment_outer_depth + 1 {
-                                self.seek = Seek::InFirstAttachment;
-                            }
+                        // The `{` after the first filename key and
+                        // its `:`. We are now inside the first
+                        // attachment object.
+                        Seek::AwaitingAttachmentObject
+                            if self.brace_depth == self.first_attachment_outer_depth + 1 =>
+                        {
+                            self.seek = Seek::InFirstAttachment;
                         }
                         _ => {}
                     }
