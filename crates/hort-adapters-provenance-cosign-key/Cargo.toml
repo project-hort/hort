@@ -21,31 +21,20 @@ tracing    = { workspace = true }
 # parsing. The minimal keyed primitive — NOT the sigstore bundle/PKI crate
 # (ADR 0039 Consequences: a smaller advisory surface on the keyed path). p256
 # and its ecdsa/pkcs8/spki/sec1 deps are already in the locked graph (the
-# sigstore adapter's transitive tree), so this adds no new crate.
+# sigstore adapter's transitive tree).
 #
-# That "adds no new crate" property is the pin's whole point, and it is
-# what holds the major at 0.13: `sigstore 0.14` (and `openidconnect 4`)
-# require `p256 ^0.13`, so bumping here does not replace the old stack —
-# it resolves a second one alongside it, adding ~15 crates (p256 0.14,
-# ecdsa 0.17, elliptic-curve 0.14, crypto-bigint 0.7, primefield/
-# primeorder 0.14, sec1 0.8, rfc6979 0.6, and a second `sha2` major)
-# to the keyed verification path this crate exists to keep small.
-# Verification semantics are identical across the jump — `NistP256` sets
-# `NORMALIZE_S = false` in both, so neither major enforces low-S on
-# verify — so the bump buys no behaviour and costs graph surface. Move it
-# when `sigstore` moves, and the whole ECDSA stack consolidates at once.
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pem", "std"] }
+# `sigstore 0.14` (and `openidconnect 4`) require `p256 ^0.13`, so this 0.14
+# pin resolves a second ECDSA stack alongside the old one (ecdsa 0.17,
+# elliptic-curve 0.14, crypto-bigint 0.7, primefield/primeorder 0.14, sec1
+# 0.8, rfc6979 0.6) until sigstore moves and the two consolidate.
+# Verification semantics are identical across the 0.13 → 0.14 jump —
+# `NistP256` sets `NORMALIZE_S = false` in both, so neither major enforces
+# low-S on verify.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pem", "std"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-# Test-only: generate an ECDSA P-256 keypair + sign a synthetic simplesigning
-# payload, proving the verify path runs the real ECDSA verification (no
-# committed key). Same `p256` already in the build graph + an OS RNG.
-#
-# Held at 0.6 by `p256 0.13`: `SigningKey::random` takes a `rand_core 0.6`
-# `CryptoRngCore`, so this must be the same major `elliptic-curve 0.13`
-# resolves. It is also the last major that *has* an OS RNG — `rand_core`
-# 0.10 is traits-only (no `OsRng`, no `getrandom` feature), so the
-# eventual `p256 0.14` migration drops this dev-dep entirely in favour of
-# `p256::elliptic_curve::Generate::generate()` rather than bumping it.
-rand_core = { version = "0.6", features = ["getrandom"] }
+# Test-only keypair generation (prove the verify path runs real ECDSA against
+# a freshly generated key, no committed key material) goes through
+# `p256::elliptic_curve::Generate::generate()`, which draws from the system
+# RNG via the `std` feature above — no separate RNG dev-dependency.

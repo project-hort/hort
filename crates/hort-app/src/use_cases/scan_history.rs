@@ -550,7 +550,7 @@ mod tests {
             finding("CVE-OTHER", SeverityThreshold::Medium),
         ];
         let bytes = serde_json::to_vec(&findings).unwrap();
-        let hash_hex = format!("{:x}", Sha256::digest(&bytes));
+        let hash_hex = hex::encode(Sha256::digest(&bytes));
         let blob_hash: ContentHash = hash_hex.parse().unwrap();
         mock_storage.insert_content(blob_hash.clone(), bytes);
 

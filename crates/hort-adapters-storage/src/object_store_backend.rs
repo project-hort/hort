@@ -289,7 +289,7 @@ impl StoragePort for ObjectStoreStorage {
                         );
                     }
 
-                    let hash_hex = format!("{:x}", hasher.finalize());
+                    let hash_hex = hex::encode(hasher.finalize());
                     let hash: ContentHash = hash_hex.parse().map_err(|e| {
                         DomainError::Invariant(format!("SHA-256 produced invalid hex: {e}"))
                     })?;

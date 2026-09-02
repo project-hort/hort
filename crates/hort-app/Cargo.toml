@@ -59,6 +59,10 @@ sha2 = { workspace = true }
 # (`Sha1HashingRead`, ADR 0033 — Maven `.sha1` sidecar). SHA-1 is a
 # transfer-verify comparison only; the CAS key stays SHA-256.
 sha1 = { workspace = true }
+# Lowercase-hex rendering of a finalised digest (the CAS `ContentHash`
+# wire form). The `digest` crate's `Output` is a plain byte array with no
+# hex formatting of its own.
+hex = { workspace = true }
 # Probabilistic sampling for the CAS scrub use case.
 # `ScrubOpts::sample_fraction` rolls a uniform `f64` per listed hash.
 rand = { workspace = true }

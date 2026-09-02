@@ -1638,7 +1638,7 @@ mod tests {
         let content = b"hello world".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, headers, body) = run(async {
@@ -1698,7 +1698,7 @@ mod tests {
         let content = b"head parity content".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, headers, body) = run(async {
@@ -1762,7 +1762,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, retry_after, content_type, body) = run(async {
@@ -1841,7 +1841,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, body) = run(async {
@@ -1903,7 +1903,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, elapsed) = run(async {
@@ -1953,7 +1953,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, elapsed) = run(async {
@@ -2023,7 +2023,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         run(async {
             let h = harness();
@@ -2129,7 +2129,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         run(async {
             let h = harness();
@@ -2222,7 +2222,7 @@ mod tests {
         let content = b"bad".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, body) = run(async {
@@ -2290,7 +2290,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         run(async {
             let h = harness();
@@ -2358,7 +2358,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let resp = run(async {
             let h = harness();
@@ -2400,7 +2400,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let resp = run(async {
             let h = harness();
@@ -2444,7 +2444,7 @@ mod tests {
         let content = b"scanning content bytes".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let (status, retry_after) = run(async {
             let h = harness();
@@ -2488,7 +2488,7 @@ mod tests {
         let content = b"foreign content".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, body) = run(async {
@@ -2564,7 +2564,7 @@ mod tests {
         let content: Vec<u8> = vec![];
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, headers, body) = run(async {
@@ -2664,7 +2664,7 @@ mod tests {
         let content = b"hello-from-upstream".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, body, event_batches) = run(async {
@@ -2774,7 +2774,7 @@ mod tests {
         let content = b"layer-with-publish-time".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let last_modified: DateTime<Utc> = DateTime::parse_from_rfc3339("2024-03-15T08:00:00Z")
             .unwrap()
@@ -2859,7 +2859,7 @@ mod tests {
         let content = b"layer-without-publish-time".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let recorded_published_at = run(async {
@@ -2993,7 +2993,7 @@ mod tests {
             let mut hexes = Vec::new();
             for (content, lm) in &blobs {
                 use sha2::Digest;
-                let hex = format!("{:x}", sha2::Sha256::digest(content));
+                let hex = hex::encode(sha2::Sha256::digest(content));
                 mocks.upstream_proxy.insert_blob_with_last_modified(
                     "dockerhub/",
                     "library/nginx",
@@ -3101,7 +3101,7 @@ mod tests {
             let mut hexes = Vec::new();
             for (content, lm) in &bodies {
                 use sha2::Digest;
-                let hex = format!("{:x}", sha2::Sha256::digest(content));
+                let hex = hex::encode(sha2::Sha256::digest(content));
                 mocks.upstream_proxy.insert_blob_with_last_modified(
                     "dockerhub/",
                     "library/nginx",
@@ -3167,7 +3167,7 @@ mod tests {
         let content = b"upstream-bytes-blocked".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, body) = run(async {
@@ -3266,7 +3266,7 @@ mod tests {
         let content = range_fixture_content();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         seed_blob(
             &h.artifacts,
@@ -3529,7 +3529,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let status = run(async {
@@ -3650,7 +3650,7 @@ mod tests {
         // the server advertised on the 206 response — what kubelet
         // verifies after assembling chunks.
         use sha2::Digest;
-        let composed_hex = format!("{:x}", sha2::Sha256::digest(&composed));
+        let composed_hex = hex::encode(sha2::Sha256::digest(&composed));
         assert_eq!(
             composed_hex, expected_hex,
             "sha256(composed) must equal full-blob digest"
@@ -4240,7 +4240,7 @@ mod tests {
             let content = b"cross-repo follower content for item3 regression".to_vec();
             let hex = {
                 use sha2::Digest;
-                format!("{:x}", sha2::Sha256::digest(&content))
+                hex::encode(sha2::Sha256::digest(&content))
             };
             let hash: ContentHash = hex.parse().unwrap();
             mocks.upstream_proxy.insert_blob(
@@ -4359,7 +4359,7 @@ mod tests {
             let content = b"some-oci-blob-bytes-for-coalesce-test".to_vec();
             let hex = {
                 use sha2::Digest;
-                format!("{:x}", sha2::Sha256::digest(&content))
+                hex::encode(sha2::Sha256::digest(&content))
             };
             let hash: ContentHash = hex.parse().unwrap();
             mocks.upstream_proxy.insert_blob(
@@ -4450,7 +4450,7 @@ mod tests {
             let content = b"absent-from-upstream".to_vec();
             let hex = {
                 use sha2::Digest;
-                format!("{:x}", sha2::Sha256::digest(&content))
+                hex::encode(sha2::Sha256::digest(&content))
             };
             let hash: ContentHash = hex.parse().unwrap();
 
@@ -4518,7 +4518,7 @@ mod tests {
         let content = b"oci blob layer bytes".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, batches, repo_id) = run(async {
@@ -4666,7 +4666,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, elapsed) = run(async {
@@ -4721,7 +4721,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, body) = run(async {
@@ -4787,7 +4787,7 @@ mod tests {
         let content = b"scanning".to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, elapsed) = run(async {

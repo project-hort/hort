@@ -352,7 +352,7 @@ async fn multipart_put_roundtrips_large_blob() {
         .filter(|&n| n > 0)
         .unwrap_or(12);
     let content = deterministic_bytes(blob_mib * 1024 * 1024);
-    let expected_hash_hex = format!("{:x}", Sha256::digest(&content));
+    let expected_hash_hex = hex::encode(Sha256::digest(&content));
 
     let content_for_stream = content.clone();
     let put_result = tokio::time::timeout(
@@ -402,7 +402,7 @@ async fn single_part_put_small_blob_control() {
     let (_container_guard, storage) = garage_storage().await;
 
     let content = deterministic_bytes(1024 * 1024); // 1 MiB, well under 5 MiB MIN_PART_SIZE
-    let expected_hash_hex = format!("{:x}", Sha256::digest(&content));
+    let expected_hash_hex = hex::encode(Sha256::digest(&content));
 
     let put_result = tokio::time::timeout(
         Duration::from_secs(45),

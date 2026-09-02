@@ -16,7 +16,7 @@
 
 use std::sync::Arc as StdArc;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use hort_domain::entities::subscription::{SubscriptionId, SubscriptionTarget};
 use hort_domain::error::DomainResult;
 use hort_domain::events::PersistedEvent;
