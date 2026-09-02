@@ -3349,7 +3349,7 @@ mod tests {
     /// of `StoragePort::put`.
     fn sha256_hex(content: &[u8]) -> String {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(content))
+        hex::encode(sha2::Sha256::digest(content))
     }
 
     /// Seed a session and pre-stage `chunks` bytes into it via the

@@ -7154,7 +7154,7 @@ mod tests {
         let serialised = serde_json::to_vec(&payload).unwrap();
         let expected_hash: ContentHash = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&serialised))
+            hex::encode(sha2::Sha256::digest(&serialised))
                 .parse()
                 .unwrap()
         };
@@ -7277,7 +7277,7 @@ mod tests {
         let serialised = serde_json::to_vec(&payload).unwrap();
         let expected_blob_hash: ContentHash = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&serialised))
+            hex::encode(sha2::Sha256::digest(&serialised))
                 .parse()
                 .unwrap()
         };
@@ -7834,7 +7834,7 @@ mod tests {
         let content: &[u8] = b"hello world";
         let hash_hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(content))
+            hex::encode(sha2::Sha256::digest(content))
         };
 
         let payload = serde_json::json!({ "pad": "a".repeat(4096) });
@@ -9620,7 +9620,7 @@ mod tests {
         let expected_blob_hash: ContentHash = {
             let serialised = serde_json::to_vec(&payload).unwrap();
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&serialised))
+            hex::encode(sha2::Sha256::digest(&serialised))
                 .parse()
                 .unwrap()
         };
@@ -9756,7 +9756,7 @@ mod tests {
         let metadata_bytes = b"Metadata-Version: 2.1\nName: my-package\nVersion: 1.0.0\n".to_vec();
         let expected_metadata_hash: ContentHash = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&metadata_bytes))
+            hex::encode(sha2::Sha256::digest(&metadata_bytes))
                 .parse()
                 .unwrap()
         };
@@ -10650,7 +10650,7 @@ mod tests {
 
     fn sha256_of(bytes: &[u8]) -> String {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(bytes))
+        hex::encode(sha2::Sha256::digest(bytes))
     }
 
     /// ProtocolNative: hash matches → success. Asserts that
@@ -12162,7 +12162,7 @@ mod tests {
     /// `computed_value` recorded in the emitted events.
     fn sha512_of(content: &[u8]) -> String {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha512::digest(content))
+        hex::encode(sha2::Sha512::digest(content))
     }
 
     /// UpstreamPublished(Sha512) success: the stream is wrapped in
@@ -12252,7 +12252,7 @@ mod tests {
     /// `computed_value` recorded in the emitted events.
     fn sha1_of(content: &[u8]) -> String {
         use sha1::Digest;
-        format!("{:x}", sha1::Sha1::digest(content))
+        hex::encode(sha1::Sha1::digest(content))
     }
 
     /// UpstreamPublished(**Sha1**) success — the SHA-1 transfer floor

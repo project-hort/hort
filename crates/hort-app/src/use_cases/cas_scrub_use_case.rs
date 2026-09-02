@@ -531,7 +531,7 @@ async fn stream_sha256(
         }
         hasher.update(&buf[..n]);
     }
-    let hex = format!("{:x}", hasher.finalize());
+    let hex = hex::encode(hasher.finalize());
     hex.parse::<ContentHash>().map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1287,7 +1287,7 @@ mod tests {
         // concurrency shouldn't change the counts.
         for i in 0..20u8 {
             let bytes = vec![i];
-            let h_hex = format!("{:x}", Sha256::digest(&bytes));
+            let h_hex = hex::encode(Sha256::digest(&bytes));
             let h: ContentHash = h_hex.parse().unwrap();
             storage.insert_content(h, bytes);
         }

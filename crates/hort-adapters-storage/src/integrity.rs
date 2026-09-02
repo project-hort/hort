@@ -64,7 +64,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for VerifyingReader<R> {
                     // EOF — verify.
                     if !self.finalised {
                         self.finalised = true;
-                        let computed_hex = format!("{:x}", self.hasher.clone().finalize());
+                        let computed_hex = hex::encode(self.hasher.clone().finalize());
                         // SHA-256 always produces 64 lowercase hex chars — the
                         // `ContentHash::from_str` parse is guaranteed to succeed.
                         let computed: ContentHash = computed_hex

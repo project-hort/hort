@@ -1751,7 +1751,7 @@ mod tests {
 
     fn sha256_of(content: &[u8]) -> String {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(content))
+        hex::encode(sha2::Sha256::digest(content))
     }
 
     #[test]
@@ -2959,7 +2959,7 @@ mod tests {
     /// for building finalize request URIs.
     fn hex_of(content: &[u8]) -> String {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(content))
+        hex::encode(sha2::Sha256::digest(content))
     }
 
     /// PATCH `content` into `session_id` against `router` so

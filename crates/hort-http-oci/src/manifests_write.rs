@@ -1860,8 +1860,7 @@ fn extract_media_type(headers: &HeaderMap) -> Result<String, Box<Response>> {
 /// [`ContentHash`] parses the lowercase hex — this matches the `ingest`
 /// path's `declared_sha256` column, which is also `ContentHash`-typed.
 fn compute_sha256(bytes: &[u8]) -> ContentHash {
-    let digest = Sha256::digest(bytes);
-    let hex = format!("{digest:x}");
+    let hex = hex::encode(Sha256::digest(bytes));
     hex.parse()
         .expect("sha2::Sha256::digest produces valid 64-char lowercase hex")
 }
@@ -2028,7 +2027,7 @@ mod tests {
         repo_id: Uuid,
         content: &[u8],
     ) -> ContentHash {
-        let hex = format!("{:x}", Sha256::digest(content));
+        let hex = hex::encode(Sha256::digest(content));
         let hash: ContentHash = hex.parse().unwrap();
         let mut a = sample_artifact(QuarantineStatus::None);
         a.repository_id = repo_id;
@@ -2151,7 +2150,7 @@ mod tests {
             let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
             let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
             let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
-            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -2213,10 +2212,9 @@ mod tests {
                 // Well-formed manifest body over UNSEEDED blobs — never
                 // resolved, because the tag check rejects before blob
                 // resolution / ingest.
-                let config_hash: ContentHash =
-                    format!("{:x}", Sha256::digest(b"cfg")).parse().unwrap();
+                let config_hash: ContentHash = hex::encode(Sha256::digest(b"cfg")).parse().unwrap();
                 let layer_hash: ContentHash =
-                    format!("{:x}", Sha256::digest(b"layer")).parse().unwrap();
+                    hex::encode(Sha256::digest(b"layer")).parse().unwrap();
                 let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
 
                 let router = router().with_state(h.ctx.clone());
@@ -2674,7 +2672,7 @@ mod tests {
             let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
             let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
             let body = build_manifest_json(&config_hash, &[layer_hash]);
-            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{manifest_hex}");
@@ -2872,7 +2870,7 @@ mod tests {
                 &subject_hash,
                 SIGSTORE_BUNDLE_MEDIA_TYPE,
             );
-            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/sha256.sig";
@@ -3108,7 +3106,7 @@ mod tests {
                 },
             });
             let body_bytes = serde_json::to_vec(&body).unwrap();
-            let manifest_hex = format!("{:x}", Sha256::digest(&body_bytes));
+            let manifest_hex = hex::encode(Sha256::digest(&body_bytes));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -3221,10 +3219,10 @@ mod tests {
             let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
             // Build a "missing" layer hash — never seeded.
             let missing_content = b"never-pushed-layer";
-            let missing_hex = format!("{:x}", Sha256::digest(missing_content));
+            let missing_hex = hex::encode(Sha256::digest(missing_content));
             let missing_hash: ContentHash = missing_hex.parse().unwrap();
             let body = build_manifest_json(&config_hash, &[missing_hash]);
-            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -3437,7 +3435,7 @@ mod tests {
                 &[child_a, child_b],
                 "application/vnd.oci.image.index.v1+json",
             );
-            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -3523,7 +3521,7 @@ mod tests {
                 &[child_a.clone(), child_b.clone()],
                 "application/vnd.oci.image.index.v1+json",
             );
-            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -3627,7 +3625,7 @@ mod tests {
             let layer_a = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-a-bytes");
             let layer_b = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-b-bytes");
             let body = build_manifest_json(&config_hash, &[layer_a.clone(), layer_b.clone()]);
-            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -4080,12 +4078,10 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let config_hash: ContentHash = format!("{:x}", Sha256::digest(b"pull-config"))
-                .parse()
-                .unwrap();
-            let layer_hash: ContentHash = format!("{:x}", Sha256::digest(b"pull-layer"))
-                .parse()
-                .unwrap();
+            let config_hash: ContentHash =
+                hex::encode(Sha256::digest(b"pull-config")).parse().unwrap();
+            let layer_hash: ContentHash =
+                hex::encode(Sha256::digest(b"pull-layer")).parse().unwrap();
             let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
             let manifest_artifact_id = Uuid::new_v4();
             let media_type = "application/vnd.oci.image.manifest.v1+json";
@@ -4204,7 +4200,7 @@ mod tests {
             let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
             // Single-image manifest bytes (config + layers, NO manifests[]).
             let single_image_body = build_manifest_json(&config, &[]);
-            let manifest_hex = format!("{:x}", Sha256::digest(&single_image_body));
+            let manifest_hex = hex::encode(Sha256::digest(&single_image_body));
             // ...but declared under an index Content-Type.
             let media = "application/vnd.oci.image.index.v1+json";
 
@@ -4251,7 +4247,7 @@ mod tests {
                 std::slice::from_ref(&child),
                 "application/vnd.oci.image.index.v1+json",
             );
-            let manifest_hex = format!("{:x}", Sha256::digest(&index_body));
+            let manifest_hex = hex::encode(Sha256::digest(&index_body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -4345,13 +4341,13 @@ mod tests {
             h.repositories.insert(repo);
             // A present child + a NEVER-seeded child.
             let present = seed_blob(&h.artifacts, &h.storage, repo_id, b"present-child");
-            let missing_hex = format!("{:x}", Sha256::digest(b"never-pushed-child"));
+            let missing_hex = hex::encode(Sha256::digest(b"never-pushed-child"));
             let missing: ContentHash = missing_hex.parse().unwrap();
             let body = build_index_json(
                 &[present, missing],
                 "application/vnd.oci.image.index.v1+json",
             );
-            let manifest_hex = format!("{:x}", Sha256::digest(&body));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -4635,7 +4631,7 @@ mod tests {
             h.repositories.insert(repo);
             // Seed a manifest artifact at manifests/sha256:<hex>.
             let content = b"manifest-body-bytes";
-            let hex = format!("{:x}", Sha256::digest(content));
+            let hex = hex::encode(Sha256::digest(content));
             let hash: ContentHash = hex.parse().unwrap();
             let mut a = sample_artifact(QuarantineStatus::None);
             let artifact_id = a.id;
@@ -4698,7 +4694,7 @@ mod tests {
             let repo_id = repo.id;
             h.repositories.insert(repo);
             let content = b"attributed-manifest-body";
-            let hex = format!("{:x}", Sha256::digest(content));
+            let hex = hex::encode(Sha256::digest(content));
             let hash: ContentHash = hex.parse().unwrap();
             let mut a = sample_artifact(QuarantineStatus::None);
             a.repository_id = repo_id;
@@ -5081,7 +5077,7 @@ mod tests {
     /// the digest string clients embed in the DELETE URL.
     fn seed_manifest_artifact(h: &Harness, repo_id: Uuid) -> String {
         let content = b"manifest-body-bytes";
-        let hex = format!("{:x}", Sha256::digest(content));
+        let hex = hex::encode(Sha256::digest(content));
         let hash: ContentHash = hex.parse().unwrap();
         let mut a = sample_artifact(QuarantineStatus::None);
         a.repository_id = repo_id;

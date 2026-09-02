@@ -203,7 +203,7 @@ fn build_with_payload(
     artifact.repository_id = repository_id;
     // Pin the CAS hash to the digest of `payload` so the stored bytes
     // round-trip (sha256(payload) == content_hash).
-    let hash_hex = format!("{:x}", sha2::Sha256::digest(payload));
+    let hash_hex = hex::encode(sha2::Sha256::digest(payload));
     let content_hash: ContentHash = hash_hex.parse().expect("valid sha256");
     artifact.sha256_checksum = content_hash.clone();
     let artifact_id = artifact.id;
@@ -1488,7 +1488,7 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
     repositories.insert(repo);
 
     let payload = b"{\"schemaVersion\":2,\"manifest\":true}".to_vec();
-    let content_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(&payload))
+    let content_hash: ContentHash = hex::encode(sha2::Sha256::digest(&payload))
         .parse()
         .expect("valid sha256");
     let mut artifact: Artifact = sample_artifact(QuarantineStatus::Quarantined);
@@ -2377,14 +2377,14 @@ fn referrer_manifest_for(blob_hash: &ContentHash) -> Vec<u8> {
 /// Returns the bundle-blob content hash.
 fn seed_manifest_and_bundle(f: &Fixture, bundle_bytes: &[u8]) -> ContentHash {
     // The bundle blob lives at its own content hash (= the layer digest).
-    let blob_hash_hex = format!("{:x}", sha2::Sha256::digest(bundle_bytes));
+    let blob_hash_hex = hex::encode(sha2::Sha256::digest(bundle_bytes));
     let blob_hash: ContentHash = blob_hash_hex.parse().expect("valid sha256");
     f.storage
         .insert_content(blob_hash.clone(), bundle_bytes.to_vec());
 
     // The referrer manifest references that blob as its (single) layer.
     let manifest_bytes = referrer_manifest_for(&blob_hash);
-    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash_hex = hex::encode(sha2::Sha256::digest(&manifest_bytes));
     let manifest_hash: ContentHash = manifest_hash_hex.parse().expect("valid sha256");
 
     let mut sig_artifact: Artifact = sample_artifact(QuarantineStatus::Released);
@@ -2449,14 +2449,14 @@ fn referrer_manifest_for_simplesigning(
 /// signature annotation, and the `oci_subject` row pointing at the signed
 /// artifact's content hash.
 fn seed_simplesigning(f: &Fixture, payload_bytes: &[u8], signature_b64: &str) {
-    let payload_hash_hex = format!("{:x}", sha2::Sha256::digest(payload_bytes));
+    let payload_hash_hex = hex::encode(sha2::Sha256::digest(payload_bytes));
     let payload_hash: ContentHash = payload_hash_hex.parse().expect("valid sha256");
     f.storage
         .insert_content(payload_hash.clone(), payload_bytes.to_vec());
 
     let manifest_bytes =
         referrer_manifest_for_simplesigning(&payload_hash, signature_b64, payload_bytes.len());
-    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash_hex = hex::encode(sha2::Sha256::digest(&manifest_bytes));
     let manifest_hash: ContentHash = manifest_hash_hex.parse().expect("valid sha256");
 
     let mut sig_artifact: Artifact = sample_artifact(QuarantineStatus::Released);
@@ -2657,7 +2657,7 @@ async fn fetch_resolves_bundle_blob_not_manifest_real_fixture() {
     );
     // Sanity: the blob hash is the sha256 of what the port received.
     assert_eq!(
-        format!("{:x}", sha2::Sha256::digest(&captured[0])),
+        hex::encode(sha2::Sha256::digest(&captured[0])),
         blob_hash.as_ref(),
         "captured bytes hash to the bundle-blob content hash",
     );
@@ -2697,7 +2697,7 @@ async fn referrer_manifest_with_no_bundle_layer_contributes_nothing() {
     })
     .to_string()
     .into_bytes();
-    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash_hex = hex::encode(sha2::Sha256::digest(&manifest_bytes));
     let manifest_hash: ContentHash = manifest_hash_hex.parse().unwrap();
     let mut sig_artifact: Artifact = sample_artifact(QuarantineStatus::Released);
     sig_artifact.repository_id = f.repository_id;
@@ -2758,7 +2758,7 @@ async fn bundle_blob_absent_from_cas_surfaces_fetch_failure_not_panic() {
             .parse()
             .unwrap();
     let manifest_bytes = referrer_manifest_for(&absent_blob);
-    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash_hex = hex::encode(sha2::Sha256::digest(&manifest_bytes));
     let manifest_hash: ContentHash = manifest_hash_hex.parse().unwrap();
     let mut sig_artifact: Artifact = sample_artifact(QuarantineStatus::Released);
     sig_artifact.repository_id = f.repository_id;
@@ -2871,13 +2871,13 @@ fn seed_upstream_referrer(f: &Fixture, bundle_bytes: &[u8]) -> (String, ContentH
 
     // The bundle blob lives at its own content hash (= the manifest's layer
     // digest). `fetch_blob` is keyed on (path_prefix, upstream_name, digest).
-    let blob_hash_hex = format!("{:x}", sha2::Sha256::digest(bundle_bytes));
+    let blob_hash_hex = hex::encode(sha2::Sha256::digest(bundle_bytes));
     let blob_hash: ContentHash = blob_hash_hex.parse().expect("valid sha256");
     let blob_digest = format!("sha256:{blob_hash}");
 
     // The referrer manifest references that blob as its single bundle layer.
     let manifest_bytes = referrer_manifest_for(&blob_hash);
-    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash_hex = hex::encode(sha2::Sha256::digest(&manifest_bytes));
     let manifest_digest = format!("sha256:{manifest_hash_hex}");
 
     let image_digest = image_digest_str(&f.content_hash);
@@ -2926,13 +2926,13 @@ fn seed_upstream_referrer(f: &Fixture, bundle_bytes: &[u8]) -> (String, ContentH
 fn seed_upstream_simplesigning_referrer(f: &Fixture, payload_bytes: &[u8], signature_b64: &str) {
     f.upstream_resolver.insert(proxy_mapping(f.repository_id));
 
-    let payload_hash_hex = format!("{:x}", sha2::Sha256::digest(payload_bytes));
+    let payload_hash_hex = hex::encode(sha2::Sha256::digest(payload_bytes));
     let payload_hash: ContentHash = payload_hash_hex.parse().expect("valid sha256");
     let blob_digest = format!("sha256:{payload_hash}");
 
     let manifest_bytes =
         referrer_manifest_for_simplesigning(&payload_hash, signature_b64, payload_bytes.len());
-    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash_hex = hex::encode(sha2::Sha256::digest(&manifest_bytes));
     let manifest_digest = format!("sha256:{manifest_hash_hex}");
 
     let image_digest = image_digest_str(&f.content_hash);
@@ -3047,7 +3047,7 @@ async fn proxy_fetches_upstream_referrer_writes_oci_subject_and_reaches_verdict(
         "the verifier must receive the upstream bundle blob, not the manifest"
     );
     assert_eq!(
-        format!("{:x}", sha2::Sha256::digest(&captured[0])),
+        hex::encode(sha2::Sha256::digest(&captured[0])),
         blob_hash.as_ref(),
     );
     // The verdict is the verifier's REAL verdict for the fixture (a parsed
@@ -3123,7 +3123,7 @@ async fn hosted_repo_with_no_local_bundle_does_not_fetch_upstream() {
     // orchestrator must NOT consult the proxy.
     let upstream_name = f.artifacts.get(f.artifact_id).unwrap().name;
     let blob = COSIGN_BUNDLE_V03_FIXTURE;
-    let blob_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(blob)).parse().unwrap();
+    let blob_hash: ContentHash = hex::encode(sha2::Sha256::digest(blob)).parse().unwrap();
     f.upstream_proxy.insert_referrers(
         PROXY_PATH_PREFIX,
         &upstream_name,
@@ -3288,12 +3288,12 @@ async fn put_returned_hash_mismatch_skips_referrer_blob_integrity() {
     // upstream serves for that blob hash to a DIFFERENT value — so the
     // `put`-returned hash (sha256 of the served bytes) != the declared digest.
     // The declared-digest integrity check requires the referrer be SKIPPED on mismatch.
-    let declared_blob_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(b"DECLARED-bytes"))
+    let declared_blob_hash: ContentHash = hex::encode(sha2::Sha256::digest(b"DECLARED-bytes"))
         .parse()
         .unwrap();
     let declared_blob_digest = format!("sha256:{declared_blob_hash}");
     let manifest_bytes = referrer_manifest_for(&declared_blob_hash);
-    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash_hex = hex::encode(sha2::Sha256::digest(&manifest_bytes));
     let manifest_digest = format!("sha256:{manifest_hash_hex}");
 
     f.upstream_proxy.insert_referrers(
@@ -3437,7 +3437,7 @@ async fn referrer_manifest_with_no_bundle_layer_is_skipped() {
     })
     .to_string()
     .into_bytes();
-    let manifest_hash_hex = format!("{:x}", sha2::Sha256::digest(&manifest_bytes));
+    let manifest_hash_hex = hex::encode(sha2::Sha256::digest(&manifest_bytes));
     let manifest_digest = format!("sha256:{manifest_hash_hex}");
 
     // Descriptor matched by `media_type` (the artifact_type leg is None).
@@ -3503,9 +3503,7 @@ async fn referrer_manifest_digest_mismatch_is_skipped() {
     // A genuine bundle blob (step c will pass — its put-hash matches the
     // layer digest the manifest declares).
     let bundle = COSIGN_BUNDLE_V03_FIXTURE;
-    let blob_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(bundle))
-        .parse()
-        .unwrap();
+    let blob_hash: ContentHash = hex::encode(sha2::Sha256::digest(bundle)).parse().unwrap();
     let blob_digest = format!("sha256:{blob_hash}");
     let manifest_bytes = referrer_manifest_for(&blob_hash);
 
@@ -3668,7 +3666,7 @@ async fn post_proxy_bundle_reread_error_degrades_to_no_attestation() {
     // unaffected, as is the image-preimage read (a different hash).
     let landed_manifest_bytes = referrer_manifest_for(&blob_hash);
     let landed_manifest_hash: ContentHash =
-        format!("{:x}", sha2::Sha256::digest(&landed_manifest_bytes))
+        hex::encode(sha2::Sha256::digest(&landed_manifest_bytes))
             .parse()
             .expect("valid sha256");
     f.storage.fail_get_persistent(landed_manifest_hash);

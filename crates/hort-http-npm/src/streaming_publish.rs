@@ -234,7 +234,7 @@ pub(crate) async fn stream_decode_body(
     drop(writer);
 
     let envelope = state.into_envelope_bytes()?;
-    let sha1_hex = format!("{:x}", sha1.finalize());
+    let sha1_hex = hex::encode(sha1.finalize());
 
     tracing::debug!(
         tarball_size = decoded_bytes,
@@ -784,10 +784,7 @@ mod tests {
             .expect("decode succeeds on well-formed body");
 
         assert_eq!(result.tarball_size, tarball.len() as u64);
-        assert_eq!(
-            result.sha1_hex,
-            format!("{:x}", Sha1Hasher::digest(tarball))
-        );
+        assert_eq!(result.sha1_hex, hex::encode(Sha1Hasher::digest(tarball)));
 
         // Envelope reparses as JSON with empty `data`; everything
         // else round-trips.
@@ -828,10 +825,7 @@ mod tests {
             .expect("decode succeeds even with tiny chunks");
 
         assert_eq!(result.tarball_size, tarball.len() as u64);
-        assert_eq!(
-            result.sha1_hex,
-            format!("{:x}", Sha1Hasher::digest(&tarball))
-        );
+        assert_eq!(result.sha1_hex, hex::encode(Sha1Hasher::digest(&tarball)));
 
         let mut spooled = Vec::new();
         result

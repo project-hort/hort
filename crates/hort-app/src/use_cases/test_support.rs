@@ -3250,7 +3250,7 @@ impl StoragePort for MockStoragePort {
             }
 
             let size_bytes = buf.len() as u64;
-            let hash_hex = format!("{:x}", Sha256::digest(&buf));
+            let hash_hex = hex::encode(Sha256::digest(&buf));
             let hash: ContentHash = hash_hex
                 .parse()
                 .map_err(|e| DomainError::Invariant(format!("invalid hash: {e}")))?;

@@ -293,19 +293,19 @@ jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # keeps it out. `password-hash` ships with `argon2` and provides the PHC
 # string format encode/decode the helper module wraps.
 #
-# `argon2` and `password-hash` move together or not at all: `argon2 0.5`
-# requires `password-hash ^0.5`, and the `PasswordHash`/`SaltString` types
-# cross that boundary, so bumping `password-hash` alone is an
-# unresolved-import + duplicate-type build failure. `password-hash 0.6`
-# (which relocates the PHC types to the `phc` crate) needs `argon2 ^0.6`,
-# and `argon2 0.6` has no stable release — it is gated on `blake2 0.11`,
-# itself still pre-release. Pre-release crypto does not belong in the
-# credential path, so this pair stays on 0.5 until `argon2 0.6` ships
-# stable. The stored PHC encoding is byte-identical across that jump, and
-# `hort-app::argon2_hash`'s committed stored-format fixture is the guard
-# that proves it stays that way.
-argon2 = { version = "0.5", features = ["std"] }
-password-hash = { version = "0.5", features = ["alloc"] }
+# `argon2` and `password-hash` move together or not at all: the PHC
+# types (`PasswordHash`, `Salt`) cross that boundary, so bumping one
+# alone is an unresolved-import + duplicate-type build failure. From 0.6
+# those types live in the `phc` crate, re-exported as
+# `password_hash::phc` behind the `phc` feature — which `argon2` turns on
+# for its own dependency, so both paths resolve to one type.
+#
+# Any change to the stored PHC encoding silently invalidates every
+# persisted credential; `hort-app::argon2_hash`'s committed
+# stored-format fixture is the guard that catches it at build time
+# rather than at deploy time.
+argon2 = { version = "0.6", features = ["alloc", "getrandom", "password-hash"] }
+password-hash = { version = "0.6", features = ["alloc", "phc", "getrandom"] }
 # Ed25519 keypair used to sign the OCI Distribution-Spec `/v2/auth` token
 # JWT. The `pkcs8` feature provides `from_pkcs8_der` / `from_pkcs8_pem` so
 # composition can load the secret from a Kubernetes-mounted file without a
@@ -314,14 +314,16 @@ password-hash = { version = "0.5", features = ["alloc"] }
 ed25519-dalek = { version = "3", features = ["pkcs8", "rand_core", "pem"] }
 
 # Checksums
-sha2 = "0.10"
-md-5 = "0.10"
-sha1 = "0.10"
-hmac = "0.12"
-# The webhook adapter uses `hex::encode` for the lowercase-hex form of
-# the HMAC-SHA256 signature (`X-Ak-Signature: sha256=<hex>`).
-# Workspace-pinned so future adapters that need hex (e.g. content-addressed
-# cache keys, signature verification helpers) share one resolved version.
+sha2 = "0.11"
+md-5 = "0.11"
+sha1 = "0.11"
+hmac = "0.13"
+# Lowercase-hex rendering, workspace-pinned so every crate resolves one
+# version. `digest`'s `Output` is a plain byte array with no hex
+# formatting of its own, so `hex::encode` is how every finalised digest
+# reaches its wire form: the CAS `ContentHash`, the OCI `sha256:<hex>`
+# digest, npm's `dist.shasum`, and the webhook HMAC-SHA256 signature
+# (`X-Ak-Signature: sha256=<hex>`).
 hex = "0.4"
 # params_digest on TaskInvoked uses BLAKE3-256. BLAKE3 is not
 # cryptographically weaker than SHA-256 for this use case

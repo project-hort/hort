@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Credential-hashing and digest dependency stack moved to the RustCrypto
+  new generation** (argon2 0.6, password-hash 0.6, sha2/sha1/md-5 0.11,
+  hmac 0.13, p256 0.14; #199). Observable behaviour is unchanged: Argon2id
+  parameters and the stored credential format are identical (existing
+  credentials keep verifying), CAS SHA-256 digests are byte-identical, and
+  webhook signatures keep their wire form.
+
 ## [0.12.3] - 2026-09-01
 
 ### Fixed

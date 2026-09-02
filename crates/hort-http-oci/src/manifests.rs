@@ -1979,7 +1979,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
 
@@ -2032,7 +2032,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"tag":"v1"}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
 
@@ -2080,7 +2080,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
 
@@ -2297,7 +2297,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
 
@@ -2383,7 +2383,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let (status, retry_after, content_type, body) = run(async {
             let h = harness();
@@ -2493,7 +2493,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         run(async {
             let h = harness();
@@ -2627,7 +2627,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let (status, digest_header) = run(async {
             let h = harness();
@@ -2695,7 +2695,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         run(async {
             let h = harness();
@@ -2796,7 +2796,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let uid = Uuid::from_u128(0xCA11);
         let status = run(async {
@@ -2846,7 +2846,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let (status, body) = run(async {
             let h = harness();
@@ -2889,7 +2889,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let (status, body) = run(async {
             let h = harness();
@@ -2974,7 +2974,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         run(async {
             let h = harness();
@@ -3043,7 +3043,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let uid = Uuid::from_u128(0xC5CA1);
         let resp = run(async {
@@ -3086,7 +3086,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let uid = Uuid::from_u128(0xC5CA2);
         let resp = run(async {
@@ -3132,7 +3132,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let (status, headers) = run(async {
             let h = harness();
@@ -3197,7 +3197,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
         let (status, content_type) = run(async {
@@ -3377,7 +3377,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"upstream":"yes"}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
 
@@ -3438,7 +3438,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"by":"digest"}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
         let digest_ref = format!("sha256:{hex}");
@@ -3510,7 +3510,7 @@ mod tests {
         let content = sample_index_body(child_hex);
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let digest_ref = format!("sha256:{hex}");
 
@@ -3600,7 +3600,7 @@ mod tests {
         let content = sample_index_body(child_hex);
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let digest_ref = format!("sha256:{hex}");
 
@@ -3681,11 +3681,11 @@ mod tests {
         let layer_bytes = b"layer-bytes".to_vec();
         let config_hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&config_bytes))
+            hex::encode(sha2::Sha256::digest(&config_bytes))
         };
         let layer_hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&layer_bytes))
+            hex::encode(sha2::Sha256::digest(&layer_bytes))
         };
         let single_image_media = "application/vnd.oci.image.manifest.v1+json";
         let content = format!(
@@ -3699,7 +3699,7 @@ mod tests {
         .into_bytes();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let digest_ref = format!("sha256:{hex}");
 
@@ -3809,7 +3809,7 @@ mod tests {
         .into_bytes();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let digest_ref = format!("sha256:{hex}");
 
@@ -3918,7 +3918,7 @@ mod tests {
         .into_bytes();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, config_rows, layer_rows, manifest_artifact_id) = run(async {
@@ -4029,7 +4029,7 @@ mod tests {
         .into_bytes();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let digest_ref = format!("sha256:{hex}");
 
@@ -4147,7 +4147,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"by":"digest-lm"}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
         let digest_ref = format!("sha256:{hex}");
@@ -4216,7 +4216,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"by":"digest-no-lm"}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
         let digest_ref = format!("sha256:{hex}");
@@ -4339,7 +4339,7 @@ mod tests {
         let body_b = br#"{"schemaVersion":2,"b":true}"#.to_vec();
         let hex_a = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&body_a))
+            hex::encode(sha2::Sha256::digest(&body_a))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
         let digest_ref = format!("sha256:{hex_a}");
@@ -4412,7 +4412,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let index_media = "application/vnd.oci.image.index.v1+json";
         // The Accept header containers/image (skopeo) sends by default —
@@ -4498,7 +4498,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let index_media = "application/vnd.oci.image.index.v1+json";
         // The skopeo single-platform copy default — only the
@@ -4573,7 +4573,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.list.v2+json","manifests":[]}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let list_media = "application/vnd.docker.distribution.manifest.list.v2+json";
         let v2_manifest_accept = "application/vnd.docker.distribution.manifest.v2+json";
@@ -4637,7 +4637,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, body) = run(async {
@@ -4996,7 +4996,7 @@ mod tests {
             let content = format!(r#"{{"schemaVersion":2,"mt":"{leader_media}"}}"#).into_bytes();
             let hex = {
                 use sha2::Digest;
-                format!("{:x}", sha2::Sha256::digest(&content))
+                hex::encode(sha2::Sha256::digest(&content))
             };
             // Seed ONLY the leader's row + metadata (in leader_repo). The
             // follower_repo has no row → the Ok(None) branch fires.
@@ -5102,7 +5102,7 @@ mod tests {
             let content = br#"{"schemaVersion":2,"no-metadata":true}"#.to_vec();
             let hex = {
                 use sha2::Digest;
-                format!("{:x}", sha2::Sha256::digest(&content))
+                hex::encode(sha2::Sha256::digest(&content))
             };
             // `None` media_type → no metadata row for the leader's artifact.
             seed_manifest(
@@ -5161,7 +5161,7 @@ mod tests {
             let content = br#"{"schemaVersion":2,"coalesce-test":true}"#.to_vec();
             let hex = {
                 use sha2::Digest;
-                format!("{:x}", sha2::Sha256::digest(&content))
+                hex::encode(sha2::Sha256::digest(&content))
             };
             let media = "application/vnd.oci.image.manifest.v1+json";
             mocks.upstream_proxy.insert_manifest(
@@ -5256,7 +5256,7 @@ mod tests {
         let content = br#"{"schemaVersion":2,"hash-broadcast":true}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
 
@@ -5398,7 +5398,7 @@ mod tests {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         let media = "application/vnd.oci.image.manifest.v1+json";
 
@@ -5522,7 +5522,7 @@ mod tests {
         let content = sample_index_body(child);
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (status, headers, body) = run(async {
@@ -5584,7 +5584,7 @@ mod tests {
         let content = sample_index_body(child);
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
 
         let (get, head) = run(async {
@@ -5696,7 +5696,7 @@ mod tests {
         let content = sample_index_body(child);
         let hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&content))
+            hex::encode(sha2::Sha256::digest(&content))
         };
         run(async {
             let h = harness();
@@ -5798,12 +5798,12 @@ mod tests {
         let child_body = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#.to_vec();
         let child_hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&child_body))
+            hex::encode(sha2::Sha256::digest(&child_body))
         };
         let index_body = sample_index_body(&child_hex);
         let index_hex = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&index_body))
+            hex::encode(sha2::Sha256::digest(&index_body))
         };
         let single_media = "application/vnd.oci.image.manifest.v1+json";
 

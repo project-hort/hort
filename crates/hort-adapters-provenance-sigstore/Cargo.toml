@@ -29,7 +29,14 @@ hort-app    = { workspace = true }
 reqwest    = { workspace = true }
 serde_json = { workspace = true }
 hex        = { workspace = true }
-sha2       = { workspace = true }
+# NOT the workspace `sha2` (0.11). `sigstore`'s only public offline-verify
+# entry point, `Verifier::verify_digest(input_digest: Sha256, …)`, takes a
+# `sha2` hasher *by value* and finalizes it itself, so the hasher this crate
+# constructs must be the very same `sha2` major `sigstore` compiles against
+# (`^0.10`). A workspace-major hasher is a different type and does not
+# satisfy the signature. This pin moves only when `sigstore` moves — the
+# same upstream coupling that holds `x509-cert`/`const-oid` below.
+sha2       = "0.10"
 chrono     = { workspace = true }
 # Adapter-layer observability (ADR 0027 §9): a `debug!` records which
 # fail-closed branch a Rekor-inclusion rejection took (never key bytes).
@@ -50,8 +57,20 @@ tracing    = { workspace = true }
 # sigstore's `bundle`/`verify` core pulls them regardless; `sigstore-trust-root`
 # is kept for the library-blessed `from_trusted_root_json_unchecked` loader
 # rather than hand-rolling a `ManualTrustRoot` over the root of trust.)
+#
+# The `bundle` convenience feature is NOT used: it is exactly `sign + verify`,
+# and hort holds no signing key — it only ever verifies. `sigstore::bundle`
+# itself is gated on `any(sign, verify)`, so `verify` alone still yields
+# `bundle::Bundle` and `bundle::verify::*`, which is the entire surface this
+# adapter touches. Dropping `sign` also drops sigstore's signing-side
+# `ecdsa`/`p256`/`signature` deps. It is load-bearing rather than cosmetic:
+# `sigstore::bundle::sign` calls `der::Any::new(tag, String::as_ref())`, whose
+# `impl Into<Box<[u8]>>` argument becomes inference-ambiguous as soon as
+# `hybrid-array`'s `alloc` feature is active anywhere in the same graph (it
+# adds a competing `From<&Array<T, U>> for Box<[T]>`). The keyed cosign
+# adapter's `p256 0.14` stack turns that feature on, so a graph carrying both
+# cannot compile sigstore's sign module at all.
 sigstore = { version = "0.14.0", default-features = false, features = [
-    "bundle",
     "verify",
     "sigstore-trust-root",
     "rustls-tls",

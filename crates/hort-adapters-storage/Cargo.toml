@@ -19,6 +19,10 @@ tokio-util   = { workspace = true }
 bytes        = { workspace = true }
 futures      = { workspace = true }
 sha2         = { workspace = true }
+# Lowercase-hex rendering of a finalised digest. The `digest` crate's
+# `Output` is a byte array with no hex formatting of its own, so the CAS
+# key's canonical lowercase-hex form is produced here.
+hex          = { workspace = true }
 uuid         = { workspace = true }
 object_store = { workspace = true }
 tracing      = { workspace = true }

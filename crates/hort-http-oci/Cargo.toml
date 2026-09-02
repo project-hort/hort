@@ -39,6 +39,10 @@ urlencoding  = "2"
 # sha2 is used to parse + validate digest strings handed to
 # `GET /v2/<name>/blobs/<digest>`.
 sha2         = { workspace = true }
+# Lowercase-hex rendering of a finalised digest (the `sha256:<hex>` OCI
+# digest wire form). The `digest` crate's `Output` is a plain byte array
+# with no hex formatting of its own.
+hex          = { workspace = true }
 # Stateful upload session records are stored in `EphemeralStore` as
 # postcard-encoded bytes. Small, fixed-shape payloads. The OCI session-
 # key prefix is `stateful_upload:oci_v2:` to keep old bincode-encoded

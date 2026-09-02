@@ -72,7 +72,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use hort_config::ExtraTrustAnchors;
 use hort_domain::entities::subscription::{SsrfBlockReason, SubscriptionId, SubscriptionTarget};
 use hort_domain::error::{DomainError, DomainResult};

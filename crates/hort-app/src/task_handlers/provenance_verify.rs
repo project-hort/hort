@@ -259,7 +259,7 @@ mod tests {
 
         let mut artifact: Artifact = sample_artifact(QuarantineStatus::Quarantined);
         artifact.repository_id = repository_id;
-        let content_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(PAYLOAD))
+        let content_hash: ContentHash = hex::encode(sha2::Sha256::digest(PAYLOAD))
             .parse()
             .expect("valid sha256");
         artifact.sha256_checksum = content_hash.clone();
@@ -293,12 +293,12 @@ mod tests {
 
         if seed_signature {
             let bundle_bytes = b"bundle-bytes".to_vec();
-            let blob_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(&bundle_bytes))
+            let blob_hash: ContentHash = hex::encode(sha2::Sha256::digest(&bundle_bytes))
                 .parse()
                 .expect("valid sha256");
             storage.insert_content(blob_hash.clone(), bundle_bytes);
             let manifest_bytes = referrer_manifest_for(&blob_hash);
-            let manifest_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(&manifest_bytes))
+            let manifest_hash: ContentHash = hex::encode(sha2::Sha256::digest(&manifest_bytes))
                 .parse()
                 .expect("valid sha256");
             let mut sig_artifact: Artifact = sample_artifact(QuarantineStatus::Released);
@@ -422,7 +422,7 @@ mod tests {
         // shape a racing worker would have observed pre-fix.
         let mut artifact: Artifact = sample_artifact(QuarantineStatus::None);
         artifact.repository_id = repository_id;
-        let content_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(PAYLOAD))
+        let content_hash: ContentHash = hex::encode(sha2::Sha256::digest(PAYLOAD))
             .parse()
             .expect("valid sha256");
         artifact.sha256_checksum = content_hash.clone();

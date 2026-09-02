@@ -532,7 +532,7 @@ mod tests {
         let payload = b"Metadata-Version: 2.1\nName: example\nVersion: 1.0.0\n";
         let mut h = Sha256::new();
         h.update(payload);
-        let hex = format!("{:x}", h.finalize());
+        let hex = hex::encode(h.finalize());
         let hash: ContentHash = hex.parse().unwrap();
         let header = format_content_digest_sha256(&hash);
         // Structural shape: `sha256=:` + 44 base64 chars + `:`.
