@@ -470,8 +470,7 @@ async fn read_stream_rows(pool: &PgPool, store: &PgEventStore, stream: &StreamId
          (both ORDER BY stream_position ASC)"
     );
     let mut out = Vec::with_capacity(events.len());
-    for (persisted, (pos, cat, atype, aid, asrc, adig, prev, hash)) in
-        events.into_iter().zip(cols.into_iter())
+    for (persisted, (pos, cat, atype, aid, asrc, adig, prev, hash)) in events.into_iter().zip(cols)
     {
         assert_eq!(
             persisted.stream_position as i64, pos,

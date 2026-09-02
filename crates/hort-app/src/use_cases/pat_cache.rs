@@ -199,20 +199,18 @@ impl PatCache {
         let now = self.clock.now();
         let mut guard = self.inner.lock().ok()?;
         // Peek first to avoid bumping LRU recency on an expired hit.
-        let expired = match guard.primary.peek(cache_key) {
-            Some(entry) => {
-                let age = now.signed_duration_since(entry.inserted_at);
-                // `to_std()` fails for negative durations — clock skew
-                // backward. Treat that as "not expired" (we refuse to
-                // reason about a clock running backwards) so the entry
-                // survives until either capacity-evicted or
-                // explicit-invalidated.
-                match age.to_std() {
-                    Ok(age) => age > self.ttl,
-                    Err(_) => false,
-                }
+        let expired = {
+            let entry = guard.primary.peek(cache_key)?;
+            let age = now.signed_duration_since(entry.inserted_at);
+            // `to_std()` fails for negative durations — clock skew
+            // backward. Treat that as "not expired" (we refuse to
+            // reason about a clock running backwards) so the entry
+            // survives until either capacity-evicted or
+            // explicit-invalidated.
+            match age.to_std() {
+                Ok(age) => age > self.ttl,
+                Err(_) => false,
             }
-            None => return None,
         };
         if expired {
             // Side-effect eviction. Both halves of the dual-index get

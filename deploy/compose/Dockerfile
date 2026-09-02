@@ -9,8 +9,8 @@
 
 # ---------- Stage 1: builder ----------
 # Digest-pinned (B10/INFRA-8); Dependabot (docker ecosystem) bumps tag+digest.
-# rust:1.94-slim-trixie — the same builder image docker/Dockerfile.{hort-server,worker} pin.
-FROM rust:1.94-slim-trixie@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a AS builder
+# rust:1.97-slim-trixie — the same builder image docker/Dockerfile.{hort-server,worker} pin.
+FROM rust:1.97-slim-trixie@sha256:8e8cf8f7fd54a2d23d5a743b3a03f56e26b6c774276c33fa0595111704ebb15c AS builder
 
 WORKDIR /src
 

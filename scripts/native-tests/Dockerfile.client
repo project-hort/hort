@@ -9,11 +9,11 @@
 # The quarantine + scanning scenarios drive `hort-cli admin ...`. It is a
 # pure-HTTP client crate (no DSN / hort-app / sqlx deps — see crates/hort-cli),
 # so this compiles only its own subgraph, not the whole workspace. Built on
-# rust:1.94-slim-trixie (workspace MSRV) so the binary's glibc matches the trixie
+# rust:1.97-slim-trixie (workspace MSRV) so the binary's glibc matches the trixie
 # final stage — the same builder image the server/worker images pin. cargo needs
 # every member's Cargo.toml for workspace resolution, hence `COPY crates`, but
 # only hort-cli's subgraph is compiled.
-FROM rust:1.94-slim-trixie AS cli-builder
+FROM rust:1.97-slim-trixie AS cli-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 # `.cargo/config.toml` declares the `hort-crates` registry that every
