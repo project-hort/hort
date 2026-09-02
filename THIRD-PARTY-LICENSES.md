@@ -106,8 +106,8 @@ the result instead.
 | itertools | 0.10.5 | MIT | https://github.com/rust-itertools/itertools |
 | itertools | 0.14.0 | MIT | https://github.com/rust-itertools/itertools |
 | itertools | 0.15.0 | MIT | https://github.com/rust-itertools/itertools |
-| serde_with | 3.20.0 | MIT | https://github.com/jonasbb/serde_with/ |
-| serde_with_macros | 3.20.0 | MIT | https://github.com/jonasbb/serde_with/ |
+| serde_with | 3.22.0 | MIT | https://github.com/jonasbb/serde_with/ |
+| serde_with_macros | 3.22.0 | MIT | https://github.com/jonasbb/serde_with/ |
 | ordered-float | 2.10.1 | MIT | https://github.com/reem/rust-ordered-float |
 | ordered-float | 5.3.0 | MIT | https://github.com/reem/rust-ordered-float |
 | tempfile | 3.27.0 | MIT | https://github.com/Stebalien/tempfile |
@@ -6006,7 +6006,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_with 3.20.0 — MIT
+### serde_with 3.22.0 — MIT
 
 Repository: https://github.com/jonasbb/serde_with/
 
@@ -6039,7 +6039,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_with_macros 3.20.0 — MIT
+### serde_with_macros 3.22.0 — MIT
 
 Repository: https://github.com/jonasbb/serde_with/
 
