@@ -306,7 +306,7 @@ the result instead.
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
 | serde_spanned | 1.1.1 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.1.4+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.1.5+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_parser | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_writer | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
@@ -336,7 +336,7 @@ the result instead.
 | crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.18.3 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.18.4 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -12425,7 +12425,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.1.4+spec-1.1.0 — MIT
+### toml 1.1.5+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -13254,7 +13254,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.18.3 — MIT
+### lru 0.18.4 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
