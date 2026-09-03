@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **OCI blobs are no longer terminally rejected as `Unsigned` under
+  `provenance_mode: required`** (#230). cosign signs only a manifest or index
+  digest, so an image's config and layer blobs never carry an attestation of
+  their own — their clearance arrives from their subject. When the quarantine
+  observation window was shorter than the client's push took, a blob's first
+  provenance verify ran with the window already closed *and* with no inbound
+  reference edge yet (clients push blobs before the manifest that names them),
+  and the verdict resolved to a terminal `Rejected{Unsigned}`. That state is
+  unreachable by re-evaluation, waiver, admin override and the clearance
+  cascade alike, so a correctly signed image became permanently unservable as
+  a function of the client's push order.
+
+  Classification is now made from the artifact's own identity — a new
+  `FormatHandler::is_provenance_constituent` (default `false`; the OCI handler
+  answers `true` for blob rows and `false` for manifests and indexes) — rather
+  than from `content_references` edges, which record what has been ingested so
+  far and are therefore absent in exactly the window that mattered. An unsigned
+  constituent is **held** and cleared only by its subject (the existing
+  verify-time cascade, or the ingest-time late-joiner self-clear); no new
+  release authority is introduced, and a constituent whose subject never
+  arrives stays held and ages out through retention. Subject semantics are
+  unchanged: a manifest or index with a closed window and no signature is still
+  terminally `Unsigned`, and a forged signature on any row is still rejected
+  immediately.
+
+### Added
+
+- **`hort_provenance_verify_total{result="held_pending_subject"}`** (#230) — a
+  new `result` label value, also surfaced as the `provenance-verify` job's
+  `result_summary`, counting constituents held pending their subject's
+  clearance. Distinct from `held_pending_signature`, which means an artifact
+  that may still be signed; this population previously resolved to a silent
+  terminal rejection. See `docs/metrics-catalog.md`.
+
 ### Changed
 
 - **Credential-hashing and digest dependency stack moved to the RustCrypto

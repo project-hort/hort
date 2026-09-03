@@ -3,8 +3,9 @@ pub mod projection;
 
 use std::io::Read;
 
+use hort_domain::entities::artifact::Artifact;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::oci::ManifestBlobRef;
+use hort_domain::oci::{ManifestBlobRef, OCI_BLOB_PATH_PREFIX};
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership};
 use hort_domain::types::ArtifactCoords;
 
@@ -84,6 +85,28 @@ impl FormatHandler for OciFormatHandler {
     /// which stays at its default `None` (see ADR 0006 §9).
     fn protocol_native_integrity(&self) -> bool {
         true
+    }
+
+    /// Blob rows (an image's config + layers) are constituents; manifests
+    /// and indexes are subjects.
+    ///
+    /// cosign signs a manifest or index digest, and those signed bytes
+    /// transitively bind every blob digest they name — so a blob has no
+    /// attestation of its own and never will. Its clearance arrives from
+    /// its subject, via the verify-time cascade or the ingest-time
+    /// late-joiner self-clear.
+    ///
+    /// The discriminator is the row's own `path`: the OCI adapter projects
+    /// blobs at [`OCI_BLOB_PATH_PREFIX`]`<hex>` and manifests/indexes at
+    /// `manifests/sha256:<hex>`, and the two prefixes are disjoint by
+    /// construction (they are what keeps a manifest and a blob sharing
+    /// bytes from colliding on `(repository_id, path)`). Media type is
+    /// deliberately NOT consulted: every blob is stored as
+    /// `application/octet-stream` regardless of whether the manifest that
+    /// names it calls it a config or a layer, so the path is both the
+    /// narrower and the more stable signal.
+    fn is_provenance_constituent(&self, artifact: &Artifact) -> bool {
+        artifact.path.starts_with(OCI_BLOB_PATH_PREFIX)
     }
 
     /// Reads `content` under [`MANIFEST_BLOB_REFS_MAX_BYTES`] and delegates
@@ -276,5 +299,76 @@ mod tests {
             .extract_oci_manifest_blob_refs(&manifest_coords(), &mut reader)
             .expect("empty object is a valid (empty) manifest");
         assert!(refs.is_empty());
+    }
+
+    // -- is_provenance_constituent ------------------------------------------
+
+    /// An OCI artifact row at `path`, otherwise irrelevant to the
+    /// classification (which reads nothing else).
+    fn artifact_at(path: &str) -> Artifact {
+        Artifact {
+            // `Default::default()` rather than a named `Uuid` — the
+            // classification reads only `path`, and hort-formats has no
+            // direct `uuid` dependency to name the type with.
+            id: Default::default(),
+            repository_id: Default::default(),
+            name: "library/nginx".into(),
+            name_as_published: "library/nginx".into(),
+            version: None,
+            path: path.into(),
+            size_bytes: 42,
+            sha256_checksum: "a".repeat(64).parse().unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: hort_domain::entities::artifact::QuarantineStatus::Quarantined,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deleted_at: None,
+        }
+    }
+
+    /// Config and layer blobs are constituents: cosign signs the
+    /// manifest/index digest, so a blob has no attestation of its own and
+    /// is cleared by its subject.
+    #[test]
+    fn blob_rows_are_provenance_constituents() {
+        let hex = "b".repeat(64);
+        assert!(handler()
+            .is_provenance_constituent(&artifact_at(&format!("{OCI_BLOB_PATH_PREFIX}{hex}"))));
+    }
+
+    /// Manifests and indexes are SUBJECTS — they are the digests cosign
+    /// signs. Classifying one as a constituent would suppress the
+    /// unsigned-at-expiry rejection that `provenance_mode: required`
+    /// exists to enforce.
+    #[test]
+    fn manifest_and_index_rows_are_not_provenance_constituents() {
+        let hex = "b".repeat(64);
+        assert!(
+            !handler().is_provenance_constituent(&artifact_at(&format!("manifests/sha256:{hex}")))
+        );
+        // The OCI group root, whose path is the empty string by contract.
+        assert!(!handler().is_provenance_constituent(&artifact_at("")));
+    }
+
+    /// The discriminator is anchored at the START of the path. A row whose
+    /// path merely CONTAINS the blob prefix later on is not a blob row —
+    /// accepting it would let a crafted path suppress a subject's
+    /// rejection.
+    #[test]
+    fn constituent_classification_is_prefix_anchored() {
+        let hex = "b".repeat(64);
+        assert!(!handler().is_provenance_constituent(&artifact_at(&format!(
+            "manifests/{OCI_BLOB_PATH_PREFIX}{hex}"
+        ))));
+        // A different digest algorithm is not the CAS keyspace OCI blobs
+        // are projected into, so it is not a blob row either.
+        assert!(!handler().is_provenance_constituent(&artifact_at(&format!("blobs/sha512:{hex}"))));
     }
 }

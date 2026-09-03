@@ -876,27 +876,31 @@ impl Artifact {
     ///     provides rather than being collapsed into a terminal rejection at
     ///     the first verify:
     ///     - `window_open == true` **OR** `is_referenced_descendant == true`
+    ///       **OR** `is_constituent == true`
     ///       → `Ok(None)` (no event, status stays `Quarantined` → the
     ///       release gate reads it as [`ProvenanceClearance::Pending`],
     ///       fail-closed / held);
-    ///     - both `false` → emit [`ProvenanceRejected`] with reason
+    ///     - all three `false` → emit [`ProvenanceRejected`] with reason
     ///       [`ProvenanceRejectReason::Unsigned`]; status → `Rejected`
-    ///       (unsigned-at-expiry IS a terminal rejection there).
+    ///       (unsigned-at-expiry IS a terminal rejection there). Only a
+    ///       **subject** can reach this arm.
     ///   - under [`ProvenanceMode::Off`] → `Ok(None)` (provenance is
     ///     inert; the orchestrator does not run a verifier in `Off`, but
     ///     the method is total over the mode for safety).
     ///
-    /// `window_open` and `is_referenced_descendant` gate **only** the
-    /// `NoAttestation × Required` arm. A *bad* signature is
+    /// `window_open`, `is_referenced_descendant` and `is_constituent` gate
+    /// **only** the `NoAttestation × Required` arm. A *bad* signature is
     /// *time-independent* (already wrong) and equally
     /// *position-independent* (a forged signature on a layer blob is still
     /// forged), so the [`ProvenanceOutcome::Verified`] and
-    /// [`ProvenanceOutcome::Rejected`] arms never consult either flag — a
+    /// [`ProvenanceOutcome::Rejected`] arms never consult any of them — a
     /// valid or a forged/untrusted/digest-mismatch signature is decided
-    /// immediately, even mid-window and even on a descendant. The domain
+    /// immediately, even mid-window and even on a constituent. The domain
     /// stays I/O-free: the application layer computes `window_open`
-    /// (`effective_quarantine_deadline(window_start, duration) > now`) and
-    /// resolves `is_referenced_descendant`, then threads both in.
+    /// (`effective_quarantine_deadline(window_start, duration) > now`),
+    /// resolves `is_referenced_descendant` against the reference index and
+    /// asks the format handler for `is_constituent`, then threads all three
+    /// in.
     ///
     /// # `is_referenced_descendant` — why a descendant NEVER
     /// terminally-rejects as `Unsigned` (issue #115 defect (b))
@@ -928,6 +932,36 @@ impl Artifact {
     /// rejection it replaces. See ADR 0007 (zero-window section) and
     /// ADR 0039 (cascade section).
     ///
+    /// # `is_constituent` — the same hold, without needing an edge
+    ///
+    /// `is_referenced_descendant` answers "does an inbound
+    /// `content_references` edge already exist?", which is a fact about
+    /// *what has been ingested so far*, not about *what this artifact is*.
+    /// A config/layer blob pushed before its manifest has no inbound edge
+    /// yet — and an OCI client pushes blobs first — so under `Required`
+    /// with a quarantine window shorter than the push takes, both
+    /// `window_open` and `is_referenced_descendant` are `false` and the
+    /// blob terminally rejected itself as `Unsigned` before its manifest
+    /// (let alone its signature) could arrive. Servability of a correctly
+    /// signed image then depended on client push order.
+    ///
+    /// `is_constituent` closes that by classifying from the artifact's own
+    /// identity instead: the format handler
+    /// ([`crate::ports::format_handler::FormatHandler::is_provenance_constituent`])
+    /// answers whether this row is a kind that can never carry its own
+    /// attestation (an OCI blob), independent of which edges exist yet.
+    /// The three disjuncts are deliberately kept separate rather than
+    /// collapsed — a constituent is held on `is_constituent` from its first
+    /// verify, and continues to be held on the same disjunct when the
+    /// window-expiry backstop re-runs the verify later.
+    ///
+    /// Holding a constituent adds **no release authority**: clearance is
+    /// still subject-driven only (the verify-time cascade, or the
+    /// ingest-time late-joiner self-clear). A constituent whose subject
+    /// never arrives stays held forever and ages out through retention —
+    /// deliberately, since any orphan timer would just be a second window
+    /// with the same race.
+    ///
     /// `backend` is the id of the verifier that produced the verdict
     /// (`port.name()`, e.g. `"cosign"`) — recorded on the event for audit
     /// attribution and kept consistent with the `hort_provenance_*{backend}`
@@ -944,6 +978,7 @@ impl Artifact {
         backend: &str,
         window_open: bool,
         is_referenced_descendant: bool,
+        is_constituent: bool,
     ) -> DomainResult<Option<DomainEvent>> {
         match verdict.outcome {
             ProvenanceOutcome::Verified {
@@ -994,11 +1029,25 @@ impl Artifact {
                 // arriving later via `cascade_provenance_clearance`.
                 // Terminally rejecting it here would race ahead of that
                 // cascade and permanently brick a correctly-signed image.
+                //
+                // A CONSTITUENT is held on the same grounds without needing
+                // an edge to exist yet: an inbound `content_references` row
+                // records what has been ingested so far, whereas
+                // `is_constituent` classifies what the artifact IS. An OCI
+                // client pushes blobs before the manifest that references
+                // them, so a blob's edge does not exist during exactly the
+                // window in which the terminal rejection used to fire.
                 // See the method doc for the full rationale.
-                ProvenanceMode::Required if window_open || is_referenced_descendant => Ok(None),
+                ProvenanceMode::Required
+                    if window_open || is_referenced_descendant || is_constituent =>
+                {
+                    Ok(None)
+                }
                 ProvenanceMode::Required => {
-                    // Window closed on a non-descendant → unsigned-at-expiry
-                    // IS a terminal rejection under Required (ADR 0027).
+                    // Window closed on a SUBJECT → unsigned-at-expiry IS a
+                    // terminal rejection under Required (ADR 0027). Only a
+                    // subject can reach here: a constituent holds above, on
+                    // every verify including the window-expiry backstop's.
                     self.quarantine_status = QuarantineStatus::Rejected;
                     // Not scan-clearable — see the `Rejected` arm above.
                     self.rejection_reason = None;
@@ -2466,11 +2515,14 @@ mod tests {
         // ScanCompleted(clean)) — status stays Quarantined and a
         // ProvenanceVerified event is emitted for the audit trail / the
         // release-sweep `Cleared` computation.
-        for (mode, is_descendant) in [
-            (ProvenanceMode::VerifyIfPresent, false),
-            (ProvenanceMode::VerifyIfPresent, true),
-            (ProvenanceMode::Required, false),
-            (ProvenanceMode::Required, true),
+        for (mode, is_descendant, is_constituent) in [
+            (ProvenanceMode::VerifyIfPresent, false, false),
+            (ProvenanceMode::VerifyIfPresent, true, false),
+            (ProvenanceMode::VerifyIfPresent, false, true),
+            (ProvenanceMode::Required, false, false),
+            (ProvenanceMode::Required, true, false),
+            (ProvenanceMode::Required, false, true),
+            (ProvenanceMode::Required, true, true),
         ] {
             let mut a = quarantined_artifact();
             let signer = SignerIdentity {
@@ -2489,8 +2541,11 @@ mod tests {
                 // verdict is decided immediately even mid-window (it never
                 // consults the window flag); `is_referenced_descendant`
                 // varies across the loop below for the same reason (#115 —
-                // the flag is inert on this arm).
-                .complete_provenance(verdict, mode, "pgp", true, is_descendant)
+                // the flag is inert on this arm), and `is_constituent`
+                // varies with it: a signed constituent is still verified
+                // immediately, the flag only ever suppresses a terminal
+                // unsigned rejection.
+                .complete_provenance(verdict, mode, "pgp", true, is_descendant, is_constituent)
                 .expect("Ok")
                 .expect("Verified emits an event");
             assert_eq!(
@@ -2524,7 +2579,10 @@ mod tests {
         // `window_open = true` proves a bad signature is time-independent:
         // the Rejected arm decides terminally IMMEDIATELY, even mid-window
         // (it never consults `window_open`, unlike the NoAttestation×Required
-        // hold).
+        // hold). `is_constituent = true` in the loop proves the same
+        // position-independence: the constituent hold covers a MISSING
+        // attestation, never a bad one — a forged signature on a layer blob
+        // is still forged and still terminal.
         let reasons = [
             ProvenanceRejectReason::Unsigned,
             ProvenanceRejectReason::UntrustedIdentity,
@@ -2533,11 +2591,14 @@ mod tests {
             ProvenanceRejectReason::BundleMalformed,
         ];
         for reason in reasons {
-            for (mode, is_descendant) in [
-                (ProvenanceMode::VerifyIfPresent, false),
-                (ProvenanceMode::VerifyIfPresent, true),
-                (ProvenanceMode::Required, false),
-                (ProvenanceMode::Required, true),
+            for (mode, is_descendant, is_constituent) in [
+                (ProvenanceMode::VerifyIfPresent, false, false),
+                (ProvenanceMode::VerifyIfPresent, true, false),
+                (ProvenanceMode::VerifyIfPresent, false, true),
+                (ProvenanceMode::Required, false, false),
+                (ProvenanceMode::Required, true, false),
+                (ProvenanceMode::Required, false, true),
+                (ProvenanceMode::Required, true, true),
             ] {
                 let mut a = quarantined_artifact();
                 let ev = a
@@ -2547,6 +2608,7 @@ mod tests {
                         "cosign",
                         true,
                         is_descendant,
+                        is_constituent,
                     )
                     .expect("Ok")
                     .expect("Rejected emits an event");
@@ -2575,9 +2637,10 @@ mod tests {
                 ProvenanceVerdict::no_attestation(),
                 ProvenanceMode::VerifyIfPresent,
                 "cosign",
-                // Neither flag is relevant to VerifyIfPresent (both gate only
-                // NoAttestation×Required); pass false for both to prove they
-                // never leak into this arm.
+                // None of the three hold flags is relevant to VerifyIfPresent
+                // (they gate only NoAttestation×Required); pass false for all
+                // to prove they never leak into this arm.
+                false,
                 false,
                 false,
             )
@@ -2600,8 +2663,10 @@ mod tests {
                 ProvenanceVerdict::no_attestation(),
                 ProvenanceMode::Off,
                 "cosign",
-                // Neither flag is relevant to Off (inert mode); pass false for
-                // both to prove they never leak into this arm.
+                // None of the three hold flags is relevant to Off (inert
+                // mode); pass false for all to prove they never leak into
+                // this arm.
+                false,
                 false,
                 false,
             )
@@ -2624,6 +2689,7 @@ mod tests {
                 "cosign",
                 true,  // window still open → hold
                 false, // not a descendant — the window alone holds it
+                false, // and not a constituent, for the same reason
             )
             .expect("Ok");
         assert!(
@@ -2645,6 +2711,11 @@ mod tests {
         // rejection under Required — emit ProvenanceRejected{Unsigned},
         // status -> Rejected. Byte-for-byte the pre-#13 mapping, incl. the
         // "(policy)" synthetic backend.
+        //
+        // This is SUBJECT semantics and they are unchanged by the
+        // constituent hold: a subject is a row that COULD have carried a
+        // signature, so an expired window with none is a real, terminal
+        // verdict about it.
         let mut a = quarantined_artifact();
         let ev = a
             .complete_provenance(
@@ -2654,7 +2725,8 @@ mod tests {
                 // unsigned arm — the event records the "(policy)" sentinel.
                 "cosign",
                 false, // window closed
-                false, // and NOT a descendant → terminal rejection
+                false, // and NOT a descendant …
+                false, // … and NOT a constituent → terminal rejection
             )
             .expect("Ok")
             .expect("Required NoAttestation at expiry emits a rejection");
@@ -2698,6 +2770,7 @@ mod tests {
                 "cosign",
                 false, // window CLOSED (zero-window descendant, by construction)
                 true,  // …but it IS a referenced-tree descendant → HOLD
+                false, // (on the edge alone — no constituent classification)
             )
             .expect("Ok");
         assert!(
@@ -2715,42 +2788,162 @@ mod tests {
         assert_eq!(a.rejection_reason, None);
     }
 
-    /// Truth table for the two hold flags on the `NoAttestation × Required`
-    /// arm: it holds iff `window_open || is_referenced_descendant`. Pins
-    /// the OR explicitly so a future refactor cannot silently narrow it to
-    /// an AND (which would re-open the defect) or widen it to
-    /// unconditional (which would remove the unsigned-at-expiry rejection).
+    /// Exhaustive truth table for the three hold flags on the
+    /// `NoAttestation × Required` arm: it holds iff
+    /// `window_open || is_referenced_descendant || is_constituent`, and
+    /// terminally rejects on exactly one of the eight rows — the
+    /// all-`false` one, which is a subject with a closed window and no
+    /// signature. Pins the OR explicitly so a future refactor cannot
+    /// silently narrow it to an AND (which would re-open the defect) or
+    /// widen it to unconditional (which would remove the
+    /// unsigned-at-expiry rejection that is the whole point of `Required`).
     #[test]
-    fn complete_provenance_required_no_attestation_holds_iff_window_open_or_descendant() {
-        for (window_open, is_descendant) in
-            [(true, true), (true, false), (false, true), (false, false)]
-        {
-            let mut a = quarantined_artifact();
+    fn complete_provenance_required_no_attestation_holds_iff_any_hold_flag_set() {
+        let mut terminal_rows = 0;
+        for window_open in [true, false] {
+            for is_descendant in [true, false] {
+                for is_constituent in [true, false] {
+                    let mut a = quarantined_artifact();
+                    let out = a
+                        .complete_provenance(
+                            ProvenanceVerdict::no_attestation(),
+                            ProvenanceMode::Required,
+                            "cosign",
+                            window_open,
+                            is_descendant,
+                            is_constituent,
+                        )
+                        .expect("Ok");
+                    let should_hold = window_open || is_descendant || is_constituent;
+                    if !should_hold {
+                        terminal_rows += 1;
+                    }
+                    assert_eq!(
+                        out.is_none(),
+                        should_hold,
+                        "window_open={window_open}, is_descendant={is_descendant}, \
+                         is_constituent={is_constituent}: expected hold={should_hold}"
+                    );
+                    assert_eq!(
+                        a.quarantine_status,
+                        if should_hold {
+                            QuarantineStatus::Quarantined
+                        } else {
+                            QuarantineStatus::Rejected
+                        },
+                        "window_open={window_open}, is_descendant={is_descendant}, \
+                         is_constituent={is_constituent}",
+                    );
+                    // A hold is never a rejection — it must leave the
+                    // scan-clearability field alone.
+                    if should_hold {
+                        assert_eq!(a.rejection_reason, None);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            terminal_rows, 1,
+            "exactly one of the eight rows may terminalize — the subject with \
+             a closed window and no signature"
+        );
+    }
+
+    /// The constituent hold in isolation: window CLOSED, NO inbound
+    /// reference edge, and the artifact is unsigned under `Required`. This
+    /// is the shape an OCI config/layer blob has between its own push and
+    /// its manifest's, and it is exactly the shape that used to resolve to
+    /// a terminal `Rejected{Unsigned}` — unreachable by `reevaluate`
+    /// (scan-clearable only), by `waive` (Quarantined only), by the admin
+    /// override (`ReleaseGeneral` forbids `Rejected`) and by the cascade
+    /// (which forbids `Rejected` too), so a correctly-signed image became
+    /// permanently unservable as a function of the client's push order.
+    #[test]
+    fn complete_provenance_constituent_no_attestation_required_window_closed_holds() {
+        let mut a = quarantined_artifact();
+        let out = a
+            .complete_provenance(
+                ProvenanceVerdict::no_attestation(),
+                ProvenanceMode::Required,
+                "cosign",
+                false, // window CLOSED
+                false, // NO inbound edge yet — the manifest has not been pushed
+                true,  // …but the row can never carry its own attestation
+            )
+            .expect("Ok");
+        assert!(
+            out.is_none(),
+            "an unsigned constituent must HOLD — no ProvenanceRejected event"
+        );
+        assert_eq!(
+            a.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "held constituent stays Quarantined (Pending) so its subject's \
+             cascade can still clear it"
+        );
+        assert_eq!(a.rejection_reason, None);
+    }
+
+    /// The window-expiry backstop re-runs the verify after the deadline. For
+    /// a still-unclaimed constituent that re-enters the SAME arm with
+    /// `window_open = false`, so the hold must be idempotent: repeated
+    /// verifies leave it held rather than eventually terminalizing it.
+    /// Without this the backstop would simply move the defect one sweep
+    /// tick later.
+    #[test]
+    fn complete_provenance_constituent_stays_held_across_repeated_expired_verifies() {
+        let mut a = quarantined_artifact();
+        for attempt in 1..=3 {
             let out = a
                 .complete_provenance(
                     ProvenanceVerdict::no_attestation(),
                     ProvenanceMode::Required,
                     "cosign",
-                    window_open,
-                    is_descendant,
+                    false,
+                    false,
+                    true,
                 )
                 .expect("Ok");
-            let should_hold = window_open || is_descendant;
-            assert_eq!(
+            assert!(
                 out.is_none(),
-                should_hold,
-                "window_open={window_open}, is_descendant={is_descendant}: \
-                 expected hold={should_hold}"
+                "attempt {attempt}: the expiry backstop must not terminalize a constituent"
             );
-            assert_eq!(
-                a.quarantine_status,
-                if should_hold {
-                    QuarantineStatus::Quarantined
-                } else {
-                    QuarantineStatus::Rejected
-                },
-                "window_open={window_open}, is_descendant={is_descendant}",
-            );
+            assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+            assert_eq!(a.rejection_reason, None);
+        }
+    }
+
+    /// `is_constituent` suppresses a terminal UNSIGNED rejection and
+    /// nothing else. A forged / untrusted / digest-mismatch signature on a
+    /// constituent is already wrong — position-independently so — and must
+    /// still reject terminally. Without this the hold would degenerate into
+    /// "blobs are never rejected", which would let a tampered layer
+    /// through.
+    #[test]
+    fn complete_provenance_constituent_still_rejects_a_bad_signature() {
+        for reason in [
+            ProvenanceRejectReason::UntrustedIdentity,
+            ProvenanceRejectReason::CertChainInvalid,
+            ProvenanceRejectReason::BundleMalformed,
+            ProvenanceRejectReason::RekorNotFound,
+        ] {
+            let mut a = quarantined_artifact();
+            let ev = a
+                .complete_provenance(
+                    ProvenanceVerdict::rejected(reason),
+                    ProvenanceMode::Required,
+                    "cosign",
+                    false,
+                    false,
+                    true, // a constituent …
+                )
+                .expect("Ok")
+                .expect("a bad signature on a constituent still emits a rejection");
+            assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+            match ev {
+                DomainEvent::ProvenanceRejected(e) => assert_eq!(e.reason, reason),
+                other => panic!("expected ProvenanceRejected, got {other:?}"),
+            }
         }
     }
 
@@ -2777,6 +2970,7 @@ mod tests {
                     "cosign",
                     false, // window closed
                     true,  // descendant — must NOT rescue a bad signature
+                    false,
                 )
                 .expect("Ok")
                 .expect("a Rejected verdict always emits, descendant or not");
@@ -2792,28 +2986,33 @@ mod tests {
         }
     }
 
-    /// The flag is inert outside `Required`: `VerifyIfPresent` / `Off`
-    /// treat `NoAttestation` as an allowed no-op whether or not the
-    /// artifact is a descendant (they have no hold semantics to gate).
+    /// The hold flags are inert outside `Required`: `VerifyIfPresent` /
+    /// `Off` treat `NoAttestation` as an allowed no-op whether or not the
+    /// artifact is a descendant or a constituent (they have no hold
+    /// semantics to gate).
     #[test]
-    fn complete_provenance_descendant_flag_is_inert_outside_required() {
+    fn complete_provenance_hold_flags_are_inert_outside_required() {
         for mode in [ProvenanceMode::VerifyIfPresent, ProvenanceMode::Off] {
             for is_descendant in [true, false] {
-                let mut a = quarantined_artifact();
-                let out = a
-                    .complete_provenance(
-                        ProvenanceVerdict::no_attestation(),
-                        mode,
-                        "cosign",
-                        false,
-                        is_descendant,
-                    )
-                    .expect("Ok");
-                assert!(
-                    out.is_none(),
-                    "{mode:?} / descendant={is_descendant} must stay an allowed no-op"
-                );
-                assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+                for is_constituent in [true, false] {
+                    let mut a = quarantined_artifact();
+                    let out = a
+                        .complete_provenance(
+                            ProvenanceVerdict::no_attestation(),
+                            mode,
+                            "cosign",
+                            false,
+                            is_descendant,
+                            is_constituent,
+                        )
+                        .expect("Ok");
+                    assert!(
+                        out.is_none(),
+                        "{mode:?} / descendant={is_descendant} / \
+                         constituent={is_constituent} must stay an allowed no-op"
+                    );
+                    assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+                }
             }
         }
     }
@@ -2915,8 +3114,9 @@ mod tests {
                 ProvenanceVerdict::verified(signer, None),
                 ProvenanceMode::Required,
                 "cosign",
-                // Verified never consults either flag; false for both proves
-                // the arm decides regardless.
+                // Verified never consults any hold flag; false for all three
+                // proves the arm decides regardless.
+                false,
                 false,
                 false,
             )

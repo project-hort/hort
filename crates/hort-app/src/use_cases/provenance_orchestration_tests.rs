@@ -168,6 +168,19 @@ fn build(
     build_with_payload(format, mode, identities, ports, ARTIFACT_PAYLOAD)
 }
 
+/// [`build`] with the repo's registered `FormatHandler` classifying the
+/// subject artifact as a **provenance constituent** — the OCI blob-row
+/// shape, which can never carry an attestation of its own. Every other
+/// fixture registers a handler that answers `false` (the trait default),
+/// so the constituent hold engages only where a test asks for it.
+fn build_constituent(
+    format: RepositoryFormat,
+    mode: Option<ProvenanceMode>,
+    ports: Vec<Arc<dyn ProvenancePort>>,
+) -> Fixture {
+    build_inner(format, mode, Vec::new(), ports, ARTIFACT_PAYLOAD, true)
+}
+
 /// [`build`] with the subject artifact's CAS bytes parameterized. The
 /// subject's `content_hash` is pinned to `sha256(payload)` and the
 /// `oci_subject` referrer written by [`seed_manifest_and_bundle`] targets
@@ -184,6 +197,17 @@ fn build_with_payload(
     ports: Vec<Arc<dyn ProvenancePort>>,
     payload: &[u8],
 ) -> Fixture {
+    build_inner(format, mode, identities, ports, payload, false)
+}
+
+fn build_inner(
+    format: RepositoryFormat,
+    mode: Option<ProvenanceMode>,
+    identities: Vec<SignerIdentityPattern>,
+    ports: Vec<Arc<dyn ProvenancePort>>,
+    payload: &[u8],
+    is_constituent: bool,
+) -> Fixture {
     let artifacts = Arc::new(MockArtifactRepository::new());
     let repositories = Arc::new(MockRepositoryRepository::new());
     let projections = Arc::new(MockPolicyProjectionRepository::new());
@@ -194,6 +218,7 @@ fn build_with_payload(
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
     let upstream_resolver = Arc::new(MockUpstreamResolver::new());
 
+    let format_key = format.to_string();
     let mut repo: Repository = sample_repository();
     repo.format = format;
     let repository_id = repo.id;
@@ -227,6 +252,20 @@ fn build_with_payload(
         ports,
         upstream_proxy.clone(),
         upstream_resolver.clone(),
+        // One handler, registered under the repo's own format key so the
+        // orchestrator's lookup resolves. `is_provenance_constituent` is
+        // the only method it is asked for.
+        {
+            let stub = StubFormatHandler::new("stub");
+            let stub = if is_constituent {
+                stub.as_provenance_constituent()
+            } else {
+                stub
+            };
+            let mut m: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+            m.insert(format_key, Arc::new(stub));
+            m
+        },
     );
 
     Fixture {
@@ -987,6 +1026,359 @@ async fn verdict_time_descendant_lookup_failure_propagates_and_applies_no_verdic
     );
 }
 
+// ===========================================================================
+// Constituents HOLD on NoAttestation × Required — with the window closed AND
+// with no inbound edge at all.
+//
+// The gap the descendant hold above leaves open: an inbound
+// `content_references` edge records what has been ingested SO FAR, not what
+// the artifact IS. An OCI client pushes an image's blobs BEFORE the manifest
+// that references them, so on a push (not pull-through) the blob has no
+// inbound edge during exactly the interval where a `Required` scope with a
+// window shorter than the push resolves `window_open == false`. Both
+// disjuncts were then false and the blob terminally rejected itself as
+// `Unsigned` — unreachable by `reevaluate` (scan-clearable only), by `waive`
+// (Quarantined only), by the admin override (`ReleaseGeneral` forbids
+// `Rejected`) and by the cascade (which forbids `Rejected` too). Servability
+// of a correctly signed image then depended on client push order.
+// ===========================================================================
+
+/// The core regression: window CLOSED, NO edges, unsigned, `Required`, and
+/// the repo's format handler classifies the artifact as a constituent. It
+/// must HOLD as `HeldPendingSubject` — a label distinct from the
+/// window-open `HeldPendingSignature`, because nothing is waiting for THIS
+/// row to be signed.
+#[tokio::test]
+async fn required_unsigned_window_closed_constituent_holds_instead_of_rejecting() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build_constituent(
+        RepositoryFormat::Oci,
+        None,
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 0); // window CLOSED
+                                               // …and deliberately NO descendant edge: this is the push-order case.
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSubject,
+        },
+        "an unsigned constituent with a closed window and no edges must HOLD, \
+         reported as HeldPendingSubject",
+    );
+    let saved = f.artifacts.get(f.artifact_id).unwrap();
+    assert_eq!(
+        saved.quarantine_status,
+        QuarantineStatus::Quarantined,
+        "the held constituent stays Quarantined so its subject can clear it",
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "no ProvenanceRejected may be emitted for a constituent",
+    );
+}
+
+/// The same scope with the format handler answering `false` — the
+/// unchanged subject semantics. Pins that the hold is driven by the
+/// classification and not by some incidental widening of the arm: a
+/// non-constituent in the identical shape still terminally rejects.
+#[tokio::test]
+async fn required_unsigned_window_closed_non_constituent_still_rejects() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 0);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::Unsigned),
+        },
+        "subject semantics are unchanged: a subject with a closed window and no \
+         signature is still terminally Unsigned",
+    );
+    assert_eq!(
+        f.artifacts.get(f.artifact_id).unwrap().quarantine_status,
+        QuarantineStatus::Rejected,
+    );
+}
+
+/// A format whose handler is registered but answers `false`
+/// (`is_provenance_constituent`'s trait default — every format except OCI)
+/// is unaffected: no new hold, no behaviour change. Uses a non-OCI repo
+/// format with a verifier that nonetheless applies, so the only variable is
+/// the classification.
+#[tokio::test]
+async fn required_unsigned_window_closed_non_oci_format_is_unaffected() {
+    struct AnyFormatPort;
+    impl ProvenancePort for AnyFormatPort {
+        fn name(&self) -> &str {
+            "cosign"
+        }
+        fn applies_to(&self, _format: &str) -> bool {
+            true
+        }
+        fn verify<'a>(
+            &'a self,
+            _artifact: &'a ProvenanceSubject<'a>,
+            _bundles: &'a [AttestationBundle],
+            _policy: &'a ProvenanceRequirements<'a>,
+        ) -> BoxFuture<'a, DomainResult<ProvenanceVerdict>> {
+            Box::pin(async { Ok(ProvenanceVerdict::no_attestation()) })
+        }
+        fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let f = build(
+        RepositoryFormat::Npm,
+        None,
+        vec![],
+        vec![Arc::new(AnyFormatPort) as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 0);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::Unsigned),
+        },
+        "a non-OCI format's handler answers `false`, so nothing about its \
+         Required semantics changes",
+    );
+}
+
+/// The constituent hold is scoped to a MISSING attestation. A forged /
+/// untrusted signature on a constituent is already wrong and still rejects
+/// terminally — otherwise the hold would degenerate into "blobs are never
+/// rejected" and let a tampered layer through.
+#[tokio::test]
+async fn required_constituent_with_bad_signature_still_rejects() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::rejected(ProvenanceRejectReason::UntrustedIdentity),
+    ));
+    let f = build_constituent(
+        RepositoryFormat::Oci,
+        None,
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 0);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::UntrustedIdentity),
+        },
+        "a BAD signature on a constituent is position-independent and still terminal",
+    );
+    assert_eq!(
+        f.artifacts.get(f.artifact_id).unwrap().quarantine_status,
+        QuarantineStatus::Rejected,
+    );
+}
+
+/// A fetch failure on a constituent stays fail-closed
+/// `Rejected{RekorNotFound}`. "Attestation material could not be fetched"
+/// is a different failure from "provably has none", and only the latter is
+/// the missing-subject case the hold exists for. Pins that threading
+/// `is_constituent` through `apply_fetch_failure` did not weaken the
+/// `Required` fail-closed guarantee.
+#[tokio::test]
+async fn required_constituent_fetch_failure_stays_fail_closed() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build_constituent(
+        RepositoryFormat::Oci,
+        None,
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 0);
+    // Force the bundle fetch to exhaust: a content-reference to a
+    // nonexistent source artifact → find_by_id NotFound on every retry.
+    futures::executor::block_on(async {
+        f.content_references
+            .insert(ContentReference {
+                source_artifact_id: Uuid::new_v4(),
+                target_content_hash: f.content_hash.clone(),
+                kind: "oci_subject".to_string(),
+                metadata: serde_json::Value::Null,
+                repository_id: f.repository_id,
+                recorded_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("seed dangling oci_subject referrer");
+    });
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: true,
+            verdict: ProvenanceVerdictSummary::Rejected(ProvenanceRejectReason::RekorNotFound),
+        },
+        "a fetch exhaustion under Required stays fail-closed even for a constituent",
+    );
+}
+
+/// **The S4 window-expiry backstop must not terminalize a held
+/// constituent.** The backstop re-enqueues a `provenance-verify` for a
+/// still-`Pending` artifact once its deadline passes; that re-run re-enters
+/// the same arm with `window_open == false`. Driving the verify three times
+/// proves the hold is idempotent rather than a one-shot reprieve that a
+/// later sweep converts into the terminal rejection.
+#[tokio::test]
+async fn constituent_stays_held_across_repeated_expired_verifies() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build_constituent(
+        RepositoryFormat::Oci,
+        None,
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 0);
+
+    for attempt in 1..=3 {
+        let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+        assert_eq!(
+            outcome,
+            ProvenanceRunOutcome::Applied {
+                event_appended: false,
+                verdict: ProvenanceVerdictSummary::HeldPendingSubject,
+            },
+            "attempt {attempt}: the expiry backstop must re-hold, never terminalize",
+        );
+        assert_eq!(
+            f.artifacts.get(f.artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Quarantined,
+        );
+        assert!(f.lifecycle.committed_transitions().is_empty());
+    }
+}
+
+/// **The acceptance scenario, at unit level.** A `Required` scope whose
+/// observation window (1 s) is shorter than the client's push takes:
+///
+/// 1. The image's config blob is pushed first and verified — no manifest
+///    exists yet, so it has no inbound edge, its window has already closed,
+///    and it carries no attestation of its own. It HOLDS.
+/// 2. The manifest is pushed and signed, and its verify succeeds. The
+///    verify-time cascade clears the blob that has been sitting held.
+///
+/// The blob ends up cleared, so the image is servable — and the outcome does
+/// not depend on which of the two was pushed first. Before the constituent
+/// hold, step 1 terminalized the blob and step 2's cascade refused it
+/// ("terminal is terminal"), permanently bricking the image.
+#[tokio::test]
+async fn constituent_held_under_short_window_is_cleared_by_its_subject_cascade() {
+    /// Verified when the orchestrator found an attestation bundle,
+    /// unsigned when it did not — the shape a real verifier has, and the
+    /// only way one port can serve both legs of this scenario.
+    struct BundleAwarePort;
+    impl ProvenancePort for BundleAwarePort {
+        fn name(&self) -> &str {
+            "cosign"
+        }
+        fn applies_to(&self, format: &str) -> bool {
+            format == "oci"
+        }
+        fn verify<'a>(
+            &'a self,
+            _artifact: &'a ProvenanceSubject<'a>,
+            bundles: &'a [AttestationBundle],
+            _policy: &'a ProvenanceRequirements<'a>,
+        ) -> BoxFuture<'a, DomainResult<ProvenanceVerdict>> {
+            let verdict = if bundles.is_empty() {
+                ProvenanceVerdict::no_attestation()
+            } else {
+                ProvenanceVerdict::verified(sample_identity(), None)
+            };
+            Box::pin(async move { Ok(verdict) })
+        }
+        fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let config = hexhash('a');
+    let payload = image_manifest_body(&config, &[]);
+    // The subject is the signed manifest; the stub handler answers
+    // "constituent" for every row, which is inert on the manifest's own
+    // Verified verdict and load-bearing on the blob's unsigned one.
+    let f = build_inner(
+        RepositoryFormat::Oci,
+        None,
+        vec![sample_pattern()],
+        vec![Arc::new(BundleAwarePort) as Arc<dyn ProvenancePort>],
+        &payload,
+        true,
+    );
+    // A one-second window — shorter than a real multi-second push.
+    seed_required_policy_with_duration(&f, 1);
+    seed_bundle(&f, b"valid-manifest-signature-bundle");
+
+    // Leg 1: the config blob is pushed first. Its own quarantine anchor is
+    // already outside the 1 s window and no manifest references it yet.
+    let blob_id = seed_held_artifact(&f, f.repository_id, &config);
+    let mut blob = f.artifacts.get(blob_id).unwrap();
+    blob.quarantine_window_start = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+    f.artifacts.insert(blob);
+    f.storage.insert_content(config.clone(), b"config".to_vec());
+
+    let blob_outcome = f.uc.verify_artifact(blob_id).await.expect("Ok");
+    assert_eq!(
+        blob_outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSubject,
+        },
+        "the blob's window has closed and its manifest does not exist yet — it must HOLD",
+    );
+    assert_eq!(
+        f.artifacts.get(blob_id).unwrap().quarantine_status,
+        QuarantineStatus::Quarantined,
+    );
+
+    // Leg 2: the manifest lands, is signed, and verifies. Its cascade
+    // clears the blob its signed bytes bind.
+    let subject_outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert!(matches!(
+        subject_outcome,
+        ProvenanceRunOutcome::Applied {
+            verdict: ProvenanceVerdictSummary::Verified,
+            ..
+        }
+    ));
+
+    let cascaded = cascaded_events(&f);
+    assert!(
+        cascaded.iter().any(|(id, e)| *id == blob_id
+            && e.content_hash == config
+            && e.cascaded_from.as_ref() == Some(&f.content_hash)),
+        "the previously-HELD constituent must be cleared by the subject's cascade, \
+         carrying the root-digest attribution; got {cascaded:?}",
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Required + unsigned + MISSING quarantine_window_start on an ALREADY
 // `Quarantined` artifact → window_open = false (defensive-only branch,
@@ -1547,6 +1939,10 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
         vec![interleaving_port],
         upstream_proxy,
         upstream_resolver,
+        // The subject under test is a signed manifest, not a constituent —
+        // an empty registry resolves the same `false` the trait default
+        // would.
+        HashMap::new(),
     );
 
     let outcome = uc
@@ -2235,6 +2631,60 @@ fn metric_held_pending_signature_fires_on_required_window_open_hold() {
         ),
         None,
         "a held artifact is not rejected — no rejected tick",
+    );
+}
+
+/// The constituent hold ticks its OWN `held_pending_subject` result value.
+/// This population previously resolved to a silent terminal `rejected`, so
+/// folding it into `held_pending_signature` would hide exactly the change
+/// the label exists to make measurable — and `held_pending_signature`
+/// would also be a lie: nothing is waiting for this row to be signed.
+#[test]
+fn metric_held_pending_subject_fires_on_constituent_hold() {
+    let snap = capture_provenance_metrics(|| {
+        Box::pin(async {
+            let port = Arc::new(MockProvenancePort::cosign_returning(
+                ProvenanceVerdict::no_attestation(),
+            ));
+            let f = build_constituent(
+                RepositoryFormat::Oci,
+                None,
+                vec![port as Arc<dyn ProvenancePort>],
+            );
+            // Window CLOSED and no inbound edge — the shape that used to
+            // terminally reject.
+            seed_required_policy_with_duration(&f, 0);
+            f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+        })
+    });
+    assert_eq!(
+        counter_with_labels(
+            &snap,
+            "hort_provenance_verify_total",
+            &[("backend", "cosign"), ("mode", "required"), ("result", "held_pending_subject")],
+        ),
+        Some(1),
+        "a held constituent must tick hort_provenance_verify_total{{...,result=held_pending_subject}}",
+    );
+    for other in ["held_pending_signature", "no_attestation", "rejected"] {
+        assert_eq!(
+            counter_with_labels(
+                &snap,
+                "hort_provenance_verify_total",
+                &[
+                    ("backend", "cosign"),
+                    ("mode", "required"),
+                    ("result", other)
+                ],
+            ),
+            None,
+            "a constituent hold must not tick result={other}",
+        );
+    }
+    assert!(
+        snap.iter()
+            .all(|(k, _)| k.key().name() != "hort_provenance_reject_total"),
+        "a held (no-verdict) constituent must not emit hort_provenance_reject_total",
     );
 }
 
