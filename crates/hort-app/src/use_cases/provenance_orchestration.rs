@@ -34,6 +34,7 @@
 //! catalog-same-PR rule (binds metric emission to its `docs/metrics-catalog.md`
 //! entry + a `with_local_recorder` test).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -46,6 +47,7 @@ use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
+use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::provenance::{
     AttestationBundle, ProvenancePort, ProvenanceRejectReason, ProvenanceRequirements,
@@ -126,6 +128,17 @@ pub enum ProvenanceVerdictSummary {
     /// from `NoAttestation` so the task handler's `result_summary`
     /// separates "waiting to be signed" from "allowed unsigned".
     HeldPendingSignature,
+    /// A `Required`-mode **constituent** (an OCI config/layer blob) was
+    /// found unsigned with its observation window already closed and no
+    /// inbound reference edge yet: no event, status stays `Quarantined`
+    /// (HELD). Distinct from [`Self::HeldPendingSignature`] because
+    /// nothing is waiting for *this* row to be signed — it can never
+    /// carry its own attestation. It is waiting for its **subject** to
+    /// arrive and clear it via the cascade or the late-joiner self-clear.
+    /// This is exactly the population that used to resolve to a silent
+    /// terminal `Rejected{Unsigned}`, so it gets its own label rather
+    /// than folding into the window-open hold.
+    HeldPendingSubject,
 }
 
 /// Result of a single `verify` invocation, before the job row is closed.
@@ -166,6 +179,56 @@ pub enum ProvenanceRunOutcome {
     RequeuedNoAnchor,
 }
 
+/// Why a `NoAttestation × Required` verdict resolved to a HOLD rather
+/// than to the terminal `Rejected{Unsigned}` arm.
+///
+/// The two arms differ in *what the operator is waiting for*, which is the
+/// only thing the hold's observability needs to say: `PendingSignature`
+/// means "this artifact may still be signed"; `PendingSubject` means "this
+/// artifact will never be signed on its own — its subject must arrive and
+/// clear it". Keeping the mapping to the log line, the metric label and
+/// the job's `result_summary` on one type is what stops the three from
+/// drifting apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldReason {
+    /// The observation window is still open, or an inbound reference edge
+    /// already nominates this artifact as a tree descendant.
+    PendingSignature,
+    /// A constituent that can never carry its own attestation, with its
+    /// window already closed and no inbound edge yet.
+    PendingSubject,
+}
+
+impl HoldReason {
+    fn metric_result(self) -> crate::metrics::ProvenanceVerifyResult {
+        match self {
+            Self::PendingSignature => crate::metrics::ProvenanceVerifyResult::HeldPendingSignature,
+            Self::PendingSubject => crate::metrics::ProvenanceVerifyResult::HeldPendingSubject,
+        }
+    }
+
+    fn verdict_summary(self) -> ProvenanceVerdictSummary {
+        match self {
+            Self::PendingSignature => ProvenanceVerdictSummary::HeldPendingSignature,
+            Self::PendingSubject => ProvenanceVerdictSummary::HeldPendingSubject,
+        }
+    }
+
+    fn log_message(self) -> &'static str {
+        match self {
+            Self::PendingSignature => {
+                "provenance held pending signature (Required; observation window open \
+                 or referenced-tree descendant awaiting its parent's cascade)"
+            }
+            Self::PendingSubject => {
+                "provenance held pending subject (Required; a constituent carries no \
+                 attestation of its own and is cleared by its subject's cascade or the \
+                 late-joiner self-clear)"
+            }
+        }
+    }
+}
+
 /// Provenance-orchestration use case (mirror of `ScanOrchestrationUseCase`).
 pub struct ProvenanceOrchestrationUseCase {
     artifacts: Arc<dyn ArtifactRepository>,
@@ -195,6 +258,14 @@ pub struct ProvenanceOrchestrationUseCase {
     /// late-joiner self-clear is the other. One implementation so the
     /// two ends can never drift on what a signature covers.
     cascade: ProvenanceCascade,
+    /// Compiled-in format handlers, keyed by format string — the same
+    /// `HashMap<String, Arc<dyn FormatHandler>>` shape the scan
+    /// orchestrator and `PrefetchTickHandler` take from composition.
+    /// Consulted for exactly one question:
+    /// [`FormatHandler::is_provenance_constituent`], the pure
+    /// classification of "can this row ever carry an attestation of its
+    /// own?".
+    format_handlers: HashMap<String, Arc<dyn FormatHandler>>,
 }
 
 impl ProvenanceOrchestrationUseCase {
@@ -210,6 +281,7 @@ impl ProvenanceOrchestrationUseCase {
         provenance_ports: Vec<Arc<dyn ProvenancePort>>,
         upstream_proxy: Arc<dyn UpstreamProxy>,
         upstream_resolver: Arc<dyn UpstreamResolver>,
+        format_handlers: HashMap<String, Arc<dyn FormatHandler>>,
     ) -> Self {
         let cascade = ProvenanceCascade::new(
             Arc::clone(&artifacts),
@@ -230,6 +302,7 @@ impl ProvenanceOrchestrationUseCase {
             upstream_proxy,
             upstream_resolver,
             cascade,
+            format_handlers,
         }
     }
 
@@ -362,6 +435,43 @@ impl ProvenanceOrchestrationUseCase {
                 .await?,
         );
 
+        // Constituent hold. `is_referenced_descendant` above answers "does
+        // an inbound edge exist YET?" — a fact about ingest order, not
+        // about what this artifact is. An OCI client pushes an image's
+        // blobs BEFORE the manifest that references them, so a blob has no
+        // inbound edge during exactly the interval in which a `Required`
+        // scope with a window shorter than the push (`quarantine_duration_secs:
+        // 1` vs. a multi-second push) resolved `NoAttestation × !window_open
+        // × !descendant` to a TERMINAL `Rejected{Unsigned}` — unreachable by
+        // every release path, so a correctly-signed image became unservable
+        // as a function of client push order.
+        //
+        // The format handler answers the durable question instead:
+        // can this row ever carry an attestation of its own? For OCI, blob
+        // rows cannot (cosign signs the manifest/index digest); manifests
+        // and indexes are subjects and are unaffected. The classification is
+        // pure and derived from the artifact's own identity, so unlike the
+        // descendant lookup above there is no I/O here and no error
+        // direction to get wrong.
+        //
+        // An unregistered format resolves `false` — the pre-existing
+        // subject semantics. That is a composition-root mis-registration,
+        // not a transient failure: nothing would be gained by failing the
+        // job, since a retry re-reads the same empty map. `warn!` so the
+        // mis-wiring is visible rather than silent.
+        let is_constituent = match self.format_handlers.get(&format) {
+            Some(handler) => handler.is_provenance_constituent(&artifact),
+            None => {
+                tracing::warn!(
+                    artifact_id = %artifact.id,
+                    format = %format,
+                    "provenance verify: no FormatHandler registered for the repo's format — \
+                     treating the artifact as a provenance subject",
+                );
+                false
+            }
+        };
+
         // Off — provenance is inert for this scope. The ingest gate should
         // never enqueue here; the orchestrator no-ops defensively.
         if mode == ProvenanceMode::Off {
@@ -465,6 +575,7 @@ impl ProvenanceOrchestrationUseCase {
                         mode,
                         window_open,
                         is_referenced_descendant,
+                        is_constituent,
                         "bundle fetch",
                         e,
                         expected_version,
@@ -509,6 +620,7 @@ impl ProvenanceOrchestrationUseCase {
                                         mode,
                                         window_open,
                                         is_referenced_descendant,
+                                        is_constituent,
                                         "post-proxy bundle re-read",
                                         e,
                                         expected_version,
@@ -525,6 +637,7 @@ impl ProvenanceOrchestrationUseCase {
                                 mode,
                                 window_open,
                                 is_referenced_descendant,
+                                is_constituent,
                                 "upstream referrer fetch",
                                 e,
                                 expected_version,
@@ -548,6 +661,7 @@ impl ProvenanceOrchestrationUseCase {
                         mode,
                         window_open,
                         is_referenced_descendant,
+                        is_constituent,
                         "CAS preimage read",
                         e,
                         expected_version,
@@ -616,6 +730,7 @@ impl ProvenanceOrchestrationUseCase {
                 mode,
                 window_open,
                 is_referenced_descendant,
+                is_constituent,
                 expected_version,
             )
             .await?;
@@ -1101,10 +1216,11 @@ impl ProvenanceOrchestrationUseCase {
     /// persist the returned event (if any). Mirrors how scan orchestration
     /// persists `ScanCompleted` through the lifecycle port.
     ///
-    /// `too_many_arguments`: 8 with `&self` — #115 Item 3's
-    /// `is_referenced_descendant` plus #108's `expected_version`, both
-    /// resolved in `verify_artifact` and threaded here. A struct wrapper
-    /// would churn both call paths for no behavioural gain.
+    /// `too_many_arguments`: 9 with `&self` — the three hold predicates
+    /// (`window_open`, `is_referenced_descendant`, `is_constituent`) plus
+    /// `expected_version`, all resolved in `verify_artifact` and threaded
+    /// here. A struct wrapper would churn both call paths for no
+    /// behavioural gain.
     #[allow(clippy::too_many_arguments)]
     async fn apply_verdict(
         &self,
@@ -1114,6 +1230,7 @@ impl ProvenanceOrchestrationUseCase {
         mode: ProvenanceMode,
         window_open: bool,
         is_referenced_descendant: bool,
+        is_constituent: bool,
         expected_version: ExpectedVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
         // Defense-in-depth bounded requeue (issue #90). A `NoAttestation`
@@ -1176,12 +1293,31 @@ impl ProvenanceOrchestrationUseCase {
         // Held descendants reuse the EXISTING `HeldPendingSignature`
         // summary + `result` value — no new metric name or label value
         // (catalog untouched).
-        let held_pending_signature = mode == ProvenanceMode::Required
-            && (window_open || is_referenced_descendant)
+        //
+        // A CONSTITUENT held with its window already closed and no inbound
+        // edge yet is the population that used to reach the terminal
+        // `Rejected{Unsigned}` arm. It reports the distinct
+        // `held_pending_subject` label: nothing is waiting for THIS row to
+        // be signed (it can never carry its own attestation), it is waiting
+        // for its subject to arrive. Reporting it as `held_pending_signature`
+        // would hide the change this label exists to make measurable — a
+        // previously-silent terminal becoming a hold. The window-open and
+        // descendant holds keep their existing label unchanged.
+        let hold_reason = if mode == ProvenanceMode::Required
             && matches!(
                 verdict.outcome,
                 hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
-            );
+            ) {
+            if window_open || is_referenced_descendant {
+                Some(HoldReason::PendingSignature)
+            } else if is_constituent {
+                Some(HoldReason::PendingSubject)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // The status as LOADED, captured before `complete_provenance`
         // mutates it — the guard the conditional projection write keys on
         // (issue #108 H2b; see `ArtifactLifecyclePort`'s doc). A
@@ -1194,32 +1330,30 @@ impl ProvenanceOrchestrationUseCase {
             backend,
             window_open,
             is_referenced_descendant,
+            is_constituent,
         )?;
 
         let Some(event) = event else {
-            if held_pending_signature {
-                // Hold-pending-signature: no event, status stays Quarantined.
-                // `info!` (no `err`) — the operator audit signal that an image
-                // is waiting to be signed. Ticks the distinct
-                // `held_pending_signature` result value (NOT `no_attestation`),
-                // so a `Required` hold is separable from the allowed-unsigned
-                // no-op. Single emission layer — the orchestration use case.
+            if let Some(reason) = hold_reason {
+                // Held: no event, status stays Quarantined. `info!` (no
+                // `err`) — the operator audit signal that an image is not
+                // yet clearable. Ticks a distinct result value (NOT
+                // `no_attestation`), so a `Required` hold is separable from
+                // the allowed-unsigned no-op. Single emission layer — the
+                // orchestration use case.
                 tracing::info!(
                     artifact_id = %artifact.id,
                     backend = %backend,
                     window_open,
                     is_referenced_descendant,
-                    "provenance held pending signature (Required; observation window open \
-                     or referenced-tree descendant awaiting its parent's cascade)",
+                    is_constituent,
+                    "{}",
+                    reason.log_message(),
                 );
-                crate::metrics::emit_provenance_verify(
-                    backend,
-                    mode,
-                    crate::metrics::ProvenanceVerifyResult::HeldPendingSignature,
-                );
+                crate::metrics::emit_provenance_verify(backend, mode, reason.metric_result());
                 return Ok(ProvenanceRunOutcome::Applied {
                     event_appended: false,
-                    verdict: ProvenanceVerdictSummary::HeldPendingSignature,
+                    verdict: reason.verdict_summary(),
                 });
             }
             // NoAttestation under VerifyIfPresent / Off — no event, status
@@ -1325,19 +1459,20 @@ impl ProvenanceOrchestrationUseCase {
     /// - `VerifyIfPresent` / `Off` → degrade to `NoAttestation` (allow —
     ///   never fail-closed on infra flakiness).
     ///
-    /// `window_open` / `is_referenced_descendant` are threaded to
-    /// `apply_verdict` for signature parity with the verdict path, but are
-    /// **inert on the `Required` arm**: a fetch failure produces a
-    /// `Rejected{RekorNotFound}` verdict, and `complete_provenance`'s
-    /// `Rejected` arm never consults either flag — a fetch failure is NOT an
-    /// unsigned-hold, so it stays fail-closed even mid-window and even on a
-    /// descendant (issue #13, design §2 S1; issue #115 keeps this arm
-    /// deliberately untouched — a descendant whose attestation material
-    /// could not be FETCHED is a different failure from one that provably
-    /// has none). Threading the values through does not weaken this.
+    /// `window_open` / `is_referenced_descendant` / `is_constituent` are
+    /// threaded to `apply_verdict` for signature parity with the verdict
+    /// path, but are **inert on the `Required` arm**: a fetch failure
+    /// produces a `Rejected{RekorNotFound}` verdict, and
+    /// `complete_provenance`'s `Rejected` arm never consults any of them —
+    /// a fetch failure is NOT an unsigned-hold, so it stays fail-closed
+    /// even mid-window, even on a descendant, and even on a constituent.
+    /// The distinction is deliberate: an artifact whose attestation
+    /// material could not be FETCHED is a different failure from one that
+    /// provably has none, and only the latter is the missing-subject case
+    /// the constituent hold exists for. Threading the values through does
+    /// not weaken this.
     ///
-    /// `too_many_arguments`: 9 with `&self` (#115's descendant flag was the
-    /// 8th; #108's `expected_version` is the 9th). Every parameter is a
+    /// `too_many_arguments`: 10 with `&self`. Every parameter is a
     /// distinct, unrelated input this private helper forwards verbatim to
     /// `apply_verdict`; bundling them into a struct would only move the
     /// same values behind a name. Matches the crate's established use of
@@ -1350,6 +1485,7 @@ impl ProvenanceOrchestrationUseCase {
         mode: ProvenanceMode,
         window_open: bool,
         is_referenced_descendant: bool,
+        is_constituent: bool,
         stage: &str,
         err: crate::error::AppError,
         expected_version: ExpectedVersion,
@@ -1375,6 +1511,7 @@ impl ProvenanceOrchestrationUseCase {
                     mode,
                     window_open,
                     is_referenced_descendant,
+                    is_constituent,
                     expected_version,
                 )
                 .await
@@ -1395,6 +1532,7 @@ impl ProvenanceOrchestrationUseCase {
                     mode,
                     window_open,
                     is_referenced_descendant,
+                    is_constituent,
                     expected_version,
                 )
                 .await

@@ -234,7 +234,12 @@ any new release authority.
    value of `hort_provenance_verify_total{result}` (via
    `ProvenanceVerifyResult::HeldPendingSignature`), separable from the
    allowed-unsigned `no_attestation` no-op, plus an `info!` audit line — so an
-   operator can see images *waiting to be signed*.
+   operator can see images *waiting to be signed*. A **constituent** held
+   because it can never carry its own attestation (an OCI config/layer blob)
+   ticks the separate `held_pending_subject` value instead: it is waiting for
+   its subject's clearance, not for a signer, and reporting it as
+   `held_pending_signature` would misdirect the operator. See ADR 0016's
+   `provenance_mode: required` × short-`quarantine_duration_secs` row.
 
 The fail-closed release predicate (ADR 0007), the digest binding, the
 pure-bundle quarantine exemption, and the apply-time linter are all unchanged;

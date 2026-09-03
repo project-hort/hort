@@ -3692,6 +3692,13 @@ pub struct StubFormatHandler {
     /// gate engages; when `false` (default) it inherits the trait default
     /// (`None`) and the gate is skipped (npm/pypi behaviour).
     pub collision_fold: bool,
+    /// Canned answer for `is_provenance_constituent`, returned for every
+    /// artifact. `false` (default) mirrors the trait default — "every row
+    /// is its own provenance subject", the behaviour of every format
+    /// except OCI. Provenance-orchestration tests flip it to `true` to
+    /// stand in for an OCI blob row without pulling `hort-formats` into
+    /// `hort-app` (the dependency direction forbids it).
+    pub provenance_constituent: bool,
 }
 
 /// Canned response shapes for the
@@ -3752,7 +3759,16 @@ impl StubFormatHandler {
             wheel_metadata: None,
             oci_membership_edges: None,
             collision_fold: false,
+            provenance_constituent: false,
         }
+    }
+
+    /// Make this stub classify every artifact as a provenance
+    /// constituent — the OCI blob-row shape, which can never carry an
+    /// attestation of its own.
+    pub fn as_provenance_constituent(mut self) -> Self {
+        self.provenance_constituent = true;
+        self
     }
 
     /// Spec 075 — make this stub behave like cargo for the
@@ -3873,6 +3889,9 @@ impl FormatHandler for StubFormatHandler {
                 Err(DomainError::Validation((*reason).to_string()))
             }
         }
+    }
+    fn is_provenance_constituent(&self, _artifact: &Artifact) -> bool {
+        self.provenance_constituent
     }
     fn extract_oci_manifest_blob_refs(
         &self,

@@ -188,6 +188,7 @@ struct Aux {
     provenance_mode: ProvenanceMode,
     window_open: bool,
     is_referenced_descendant: bool,
+    is_constituent: bool,
     curation_blocked: bool,
     provenance_verified: bool,
 }
@@ -198,6 +199,7 @@ impl Aux {
             provenance_mode: ProvenanceMode::Off,
             window_open: false,
             is_referenced_descendant: false,
+            is_constituent: false,
             curation_blocked: false,
             provenance_verified: false,
         }
@@ -247,6 +249,7 @@ enum Action {
     CascadeClearance,
     ElapseWindow,
     SetDescendant(bool),
+    SetConstituent(bool),
     SetCurationBlocked(bool),
     SetProvenanceMode(ProvenanceMode),
     ReleaseAdmin,
@@ -280,6 +283,7 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         Just(Action::CascadeClearance),
         Just(Action::ElapseWindow),
         any::<bool>().prop_map(Action::SetDescendant),
+        any::<bool>().prop_map(Action::SetConstituent),
         any::<bool>().prop_map(Action::SetCurationBlocked),
         provenance_mode_strategy().prop_map(Action::SetProvenanceMode),
         Just(Action::ReleaseAdmin),
@@ -296,7 +300,7 @@ fn actions_strategy() -> impl Strategy<Value = Vec<Action>> {
 
 /// The [`QuarantineEvent`] a domain-call action represents, for the
 /// declared-table cross-check — `None` for the pure environment-toggle
-/// actions (`ElapseWindow`, `SetDescendant`, `SetCurationBlocked`,
+/// actions (`ElapseWindow`, `SetDescendant`, `SetConstituent`, `SetCurationBlocked`,
 /// `SetProvenanceMode`), which are not domain calls at all.
 fn event_for(action: Action) -> Option<QuarantineEvent> {
     match action {
@@ -319,6 +323,7 @@ fn event_for(action: Action) -> Option<QuarantineEvent> {
         Action::ReEvaluate => Some(QuarantineEvent::ReEvaluate),
         Action::ElapseWindow
         | Action::SetDescendant(_)
+        | Action::SetConstituent(_)
         | Action::SetCurationBlocked(_)
         | Action::SetProvenanceMode(_) => None,
     }
@@ -363,6 +368,7 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
                 "cosign",
                 aux.window_open,
                 aux.is_referenced_descendant,
+                aux.is_constituent,
             )
             .is_ok(),
         Action::ProvenanceReject => artifact
@@ -372,6 +378,7 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
                 "cosign",
                 aux.window_open,
                 aux.is_referenced_descendant,
+                aux.is_constituent,
             )
             .is_ok(),
         Action::ProvenanceNoAttestation => artifact
@@ -381,6 +388,7 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
                 "cosign",
                 aux.window_open,
                 aux.is_referenced_descendant,
+                aux.is_constituent,
             )
             .is_ok(),
         Action::CascadeClearance => artifact
@@ -426,6 +434,7 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
             .is_ok(),
         Action::ElapseWindow
         | Action::SetDescendant(_)
+        | Action::SetConstituent(_)
         | Action::SetCurationBlocked(_)
         | Action::SetProvenanceMode(_) => unreachable!("pure aux actions never call perform"),
     }
@@ -448,6 +457,7 @@ fn run_walk(actions: &[Action]) {
             action,
             Action::ElapseWindow
                 | Action::SetDescendant(_)
+                | Action::SetConstituent(_)
                 | Action::SetCurationBlocked(_)
                 | Action::SetProvenanceMode(_)
         ) {
@@ -459,6 +469,7 @@ fn run_walk(actions: &[Action]) {
                     }
                 }
                 Action::SetDescendant(b) => aux.is_referenced_descendant = b,
+                Action::SetConstituent(b) => aux.is_constituent = b,
                 Action::SetCurationBlocked(b) => aux.curation_blocked = b,
                 Action::SetProvenanceMode(m) => aux.provenance_mode = m,
                 _ => unreachable!(),
@@ -583,6 +594,7 @@ fn run_walk(actions: &[Action]) {
                         "cosign",
                         aux.window_open,
                         aux.is_referenced_descendant,
+                        aux.is_constituent,
                     )
                     .is_ok();
                 assert!(ok, "a pending provenance verify must always be acceptable");
@@ -628,6 +640,7 @@ fn run_walk(actions: &[Action]) {
                             "cosign",
                             aux.window_open,
                             aux.is_referenced_descendant,
+                            aux.is_constituent,
                         )
                         .is_ok();
                     assert!(ok);

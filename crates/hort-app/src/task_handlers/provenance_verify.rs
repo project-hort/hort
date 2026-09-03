@@ -131,7 +131,8 @@ impl TaskHandler for ProvenanceVerifyHandler {
 /// Map a [`ProvenanceRunOutcome`] to the compact `result_summary` label
 /// written on the job row. The closed
 /// taxonomy is `verified` / `rejected:<reason>` / `no_attestation` /
-/// `held_pending_signature` / `skipped:<why>` / `requeued:<why>`;
+/// `held_pending_signature` / `held_pending_subject` / `skipped:<why>` /
+/// `requeued:<why>`;
 /// `<reason>` reuses the metrics-catalog wire string so the
 /// `result_summary` trail and the `hort_provenance_reject_total{reason}`
 /// series agree. Pure — testable without the use case.
@@ -157,6 +158,7 @@ fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
             }
             ProvenanceVerdictSummary::NoAttestation => "no_attestation".to_string(),
             ProvenanceVerdictSummary::HeldPendingSignature => "held_pending_signature".to_string(),
+            ProvenanceVerdictSummary::HeldPendingSubject => "held_pending_subject".to_string(),
         },
     }
 }
@@ -333,6 +335,10 @@ mod tests {
             vec![Arc::new(StubPort(verdict)) as Arc<dyn ProvenancePort>],
             upstream_proxy,
             upstream_resolver,
+            // No handler registered: the orchestrator falls back to the
+            // subject classification, which is what every one of these
+            // fixtures already assumed.
+            std::collections::HashMap::new(),
         ));
         (ProvenanceVerifyHandler::new(uc), artifact_id)
     }
@@ -469,6 +475,10 @@ mod tests {
             vec![Arc::new(StubPort(ProvenanceVerdict::no_attestation())) as Arc<dyn ProvenancePort>],
             upstream_proxy,
             upstream_resolver,
+            // No handler registered: the orchestrator falls back to the
+            // subject classification, which is what every one of these
+            // fixtures already assumed.
+            std::collections::HashMap::new(),
         ));
         let handler = ProvenanceVerifyHandler::new(uc);
 

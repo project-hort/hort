@@ -3208,7 +3208,7 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `requeued_no_anchor` |
+| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `held_pending_subject`, `requeued_no_anchor` |
 | `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
 | `hort_provenance_late_joiner_cleared_total` | counter | `backend` | — | one increment per constituent that self-cleared against an already-verified subject at its own quarantine commit |
 
@@ -3247,8 +3247,8 @@ NetworkPolicy (see the how-to
 `docs/architecture/how-to/enable-provenance-verification.md` → *Worker
 metrics*). The companion per-job `result_summary`
 (`verified` / `rejected:<reason>` / `no_attestation` /
-`held_pending_signature` / `skipped:<why>` / `requeued:<why>`) is
-the per-artifact trail and is **not** a metric.
+`held_pending_signature` / `held_pending_subject` / `skipped:<why>` /
+`requeued:<why>`) is the per-artifact trail and is **not** a metric.
 
 **`requeued_no_anchor`** (issue #90 defense-in-depth): a `NoAttestation`
 verdict under `Required` on a `None`-status, anchor-less, recently-ingested
@@ -3314,12 +3314,25 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   case: an unsigned artifact under `Required` within its window ticks
   `held_pending_signature`, and past its window ticks `rejected`.
 - `held_pending_signature` — Required-mode unsigned artifact held pending
-  signature within its quarantine window (issue #13). No event;
+  signature within its quarantine window (issue #13), or a referenced-tree
+  descendant held on its inbound edge. No event;
   `complete_provenance` returns `Ok(None)` and the artifact stays
   `Quarantined` (read as `Pending`/fail-closed by the release gate) so it
   can still be signed. Separates images *waiting to be signed* from the
   allowed-unsigned `no_attestation` no-op; at window expiry the terminal
   decision ticks `verified` (a signature landed) or `rejected` (`Unsigned`).
+- `held_pending_subject` — a Required-mode **constituent** (a row that can
+  never carry an attestation of its own — an OCI config/layer blob, since
+  cosign signs the manifest/index digest) found unsigned with its
+  observation window already closed and no inbound reference edge yet.
+  Held `Quarantined`, cleared only by its subject: the verify-time cascade
+  or the ingest-time late-joiner self-clear. Distinct from
+  `held_pending_signature` because nothing is waiting for *this* row to be
+  signed — reporting it as such would misdirect an operator into checking
+  their signer. A sustained non-zero rate with no `verified` follow-through
+  means blobs are arriving whose manifests never do. This population
+  previously resolved to a silent terminal `rejected`, which is why it
+  carries its own label rather than folding into the window-open hold.
 
 **`reason` semantics** (`hort_provenance_reject_total`) — one per
 `ProvenanceRejectReason` variant:
