@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-04
+
 ### Fixed
 
 - **OCI blobs are no longer terminally rejected as `Unsigned` under
@@ -45,6 +47,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Rust toolchain 1.94.1 → 1.97.1** (#227): MSRV 1.97 (`.clippy.toml`, `Cargo.toml`,
+  `rust-toolchain.toml`), builder and E2E client images on `rust:1.97.1-slim`
+  (digest-pinned). Runtime-baseline move only; no behaviour change.
 - **Credential-hashing and digest dependency stack moved to the RustCrypto
   new generation** (argon2 0.6, password-hash 0.6, sha2/sha1/md-5 0.11,
   hmac 0.13, p256 0.14; #199). Observable behaviour is unchanged: Argon2id
