@@ -319,7 +319,7 @@ the result instead.
 | tar | 0.4.46 | MIT | https://github.com/composefs/tar-rs |
 | arrayvec | 0.7.6 | MIT | https://github.com/bluss/arrayvec |
 | synstructure | 0.13.2 | MIT | https://github.com/mystor/synstructure |
-| ipnet | 2.12.1 | MIT | https://github.com/krisprice/ipnet |
+| ipnet | 2.12.2 | MIT | https://github.com/krisprice/ipnet |
 | rand | 0.10.2 | MIT | https://github.com/rust-random/rand |
 | rand | 0.8.6 | MIT | https://github.com/rust-random/rand |
 | rand | 0.9.4 | MIT | https://github.com/rust-random/rand |
@@ -12788,7 +12788,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
-### ipnet 2.12.1 — MIT
+### ipnet 2.12.2 — MIT
 
 Repository: https://github.com/krisprice/ipnet
 
