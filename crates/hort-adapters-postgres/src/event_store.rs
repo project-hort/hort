@@ -1625,7 +1625,7 @@ mod tests {
              chain-column read (both ORDER BY stream_position ASC)"
         );
         let mut out = Vec::with_capacity(event_rows.len());
-        for (r, (pos, prev, hash)) in event_rows.into_iter().zip(chain_cols.into_iter()) {
+        for (r, (pos, prev, hash)) in event_rows.into_iter().zip(chain_cols) {
             assert_eq!(
                 r.stream_position, pos,
                 "EventRow / chain-column zip must align by stream_position"

@@ -69,6 +69,9 @@ metrics-util                = { workspace = true, features = ["debugging"] }
 tempfile                    = "3"
 regex                       = "1"
 sha2                        = { workspace = true }
+# Tests assert on lowercase-hex digests; the `digest` crate's `Output` is a
+# plain byte array with no hex formatting of its own.
+hex                         = { workspace = true }
 tower                       = { workspace = true }
 arc-swap                    = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

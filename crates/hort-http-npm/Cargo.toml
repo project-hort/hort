@@ -40,6 +40,9 @@ base64       = "0.23"
 # sha1 is required to compute the `dist.shasum` field of a tarball
 # entry at packument-render time.
 sha1         = { workspace = true }
+# `dist.shasum` is wire-specified as lowercase hex; the `digest` crate's
+# `Output` is a plain byte array with no hex formatting of its own.
+hex          = { workspace = true }
 # Streaming `_attachments[*].data` base64 decode spools into a
 # `NamedTempFile` so peak heap stays O(constant) regardless of tarball
 # size. The previous `body: Bytes` + `Vec<u8>` decode held ~525 MiB

@@ -609,6 +609,49 @@ pub trait FormatHandler: Send + Sync {
         false
     }
 
+    /// Whether `artifact` is a **provenance constituent** — a row that can
+    /// never carry an attestation of its own, because the format's signing
+    /// tooling signs only a top-level *subject* digest whose signed bytes
+    /// transitively bind this row's digest.
+    ///
+    /// OCI is the only v1 format that has such rows: cosign signs the
+    /// manifest / index digest, so an image's config and layer **blobs**
+    /// are constituents while manifests and indexes are subjects. Every
+    /// other format signs the artifact the client downloads, so the
+    /// default is `false` — "every row is its own subject".
+    ///
+    /// # Why the classification comes from the artifact's own identity
+    ///
+    /// The answer MUST be derivable from `artifact` alone — its path /
+    /// media type — and never from `content_references` edges. Edges are
+    /// *nominations* recording that some other artifact points at this
+    /// one; they are not clearance authority (ADR 0039 §11), and they are
+    /// racy: a blob pushed before its manifest has no inbound edge yet, so
+    /// an edge-derived classification would answer `false` exactly in the
+    /// window where the answer matters most.
+    ///
+    /// # What the caller does with it
+    ///
+    /// Under [`crate::entities::scan_policy::ProvenanceMode::Required`] an
+    /// unsigned constituent is **held** (`Quarantined`), never terminally
+    /// rejected as unsigned: its provenance authority is its subject's
+    /// signature, delivered later by
+    /// [`crate::entities::artifact::Artifact::cascade_provenance_clearance`]
+    /// (or by the ingest-time late-joiner self-clear when the constituent
+    /// arrives after the subject was verified). Terminally rejecting it
+    /// would race ahead of that clearance and permanently brick a
+    /// correctly-signed image, because a rejected constituent is terminal
+    /// and the cascade refuses it. Holding is the fail-closed direction:
+    /// held bytes never leave quarantine, and a constituent whose subject
+    /// never arrives simply stays held.
+    ///
+    /// A `true` answer grants **no release authority whatsoever** — it
+    /// only suppresses a terminal self-rejection.
+    fn is_provenance_constituent(&self, artifact: &crate::entities::artifact::Artifact) -> bool {
+        let _ = artifact;
+        false
+    }
+
     /// Format-specific path for fetching the upstream-published
     /// checksum metadata body. The upstream-proxy adapter composes this
     /// onto the mapping's `upstream_url` base (or treats it as an
@@ -1000,6 +1043,40 @@ mod tests {
         // Every format except OCI inherits the false default; OCI alone
         // overrides to `true`. Regression guard.
         assert!(!DefaultsOnlyHandler.protocol_native_integrity());
+    }
+
+    /// Every format except OCI inherits `false` — "every row is its own
+    /// provenance subject". A defaulted `true` would silently suppress the
+    /// unsigned-at-expiry rejection `provenance_mode: required` exists to
+    /// enforce, for every format at once.
+    #[test]
+    fn default_is_provenance_constituent_is_false() {
+        let artifact = crate::entities::artifact::Artifact {
+            id: uuid::Uuid::nil(),
+            repository_id: uuid::Uuid::nil(),
+            name: "pkg".into(),
+            name_as_published: "pkg".into(),
+            version: Some("1.0".into()),
+            path: "blobs/sha256:deadbeef".into(),
+            size_bytes: 1,
+            sha256_checksum: "a".repeat(64).parse().unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: crate::entities::artifact::QuarantineStatus::Quarantined,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            deleted_at: None,
+        };
+        // Even a path that an OCI handler WOULD classify as a blob row is
+        // `false` here: the classification is the format's to make, not
+        // the path string's.
+        assert!(!DefaultsOnlyHandler.is_provenance_constituent(&artifact));
     }
 
     #[test]

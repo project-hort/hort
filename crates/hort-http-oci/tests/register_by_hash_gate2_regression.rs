@@ -156,7 +156,7 @@ fn mount_of_clean_source_quarantines_target_and_holds_blob_read() {
     let content = b"clean mount content for item3 regression".to_vec();
     let hex = {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(&content))
+        hex::encode(sha2::Sha256::digest(&content))
     };
 
     let (mount_status, get_status, retry_after) = run(async {
@@ -242,7 +242,7 @@ fn mount_of_scan_indeterminate_source_returns_404_blob_unknown_no_row_minted() {
     let content = b"indeterminate mount content for item3 regression".to_vec();
     let hex = {
         use sha2::Digest;
-        format!("{:x}", sha2::Sha256::digest(&content))
+        hex::encode(sha2::Sha256::digest(&content))
     };
 
     let (status, body, artifact_count_after) = run(async {

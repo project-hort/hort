@@ -131,7 +131,8 @@ impl TaskHandler for ProvenanceVerifyHandler {
 /// Map a [`ProvenanceRunOutcome`] to the compact `result_summary` label
 /// written on the job row. The closed
 /// taxonomy is `verified` / `rejected:<reason>` / `no_attestation` /
-/// `held_pending_signature` / `skipped:<why>` / `requeued:<why>`;
+/// `held_pending_signature` / `held_pending_subject` / `skipped:<why>` /
+/// `requeued:<why>`;
 /// `<reason>` reuses the metrics-catalog wire string so the
 /// `result_summary` trail and the `hort_provenance_reject_total{reason}`
 /// series agree. Pure — testable without the use case.
@@ -157,6 +158,7 @@ fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
             }
             ProvenanceVerdictSummary::NoAttestation => "no_attestation".to_string(),
             ProvenanceVerdictSummary::HeldPendingSignature => "held_pending_signature".to_string(),
+            ProvenanceVerdictSummary::HeldPendingSubject => "held_pending_subject".to_string(),
         },
     }
 }
@@ -259,7 +261,7 @@ mod tests {
 
         let mut artifact: Artifact = sample_artifact(QuarantineStatus::Quarantined);
         artifact.repository_id = repository_id;
-        let content_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(PAYLOAD))
+        let content_hash: ContentHash = hex::encode(sha2::Sha256::digest(PAYLOAD))
             .parse()
             .expect("valid sha256");
         artifact.sha256_checksum = content_hash.clone();
@@ -293,12 +295,12 @@ mod tests {
 
         if seed_signature {
             let bundle_bytes = b"bundle-bytes".to_vec();
-            let blob_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(&bundle_bytes))
+            let blob_hash: ContentHash = hex::encode(sha2::Sha256::digest(&bundle_bytes))
                 .parse()
                 .expect("valid sha256");
             storage.insert_content(blob_hash.clone(), bundle_bytes);
             let manifest_bytes = referrer_manifest_for(&blob_hash);
-            let manifest_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(&manifest_bytes))
+            let manifest_hash: ContentHash = hex::encode(sha2::Sha256::digest(&manifest_bytes))
                 .parse()
                 .expect("valid sha256");
             let mut sig_artifact: Artifact = sample_artifact(QuarantineStatus::Released);
@@ -333,6 +335,10 @@ mod tests {
             vec![Arc::new(StubPort(verdict)) as Arc<dyn ProvenancePort>],
             upstream_proxy,
             upstream_resolver,
+            // No handler registered: the orchestrator falls back to the
+            // subject classification, which is what every one of these
+            // fixtures already assumed.
+            std::collections::HashMap::new(),
         ));
         (ProvenanceVerifyHandler::new(uc), artifact_id)
     }
@@ -422,7 +428,7 @@ mod tests {
         // shape a racing worker would have observed pre-fix.
         let mut artifact: Artifact = sample_artifact(QuarantineStatus::None);
         artifact.repository_id = repository_id;
-        let content_hash: ContentHash = format!("{:x}", sha2::Sha256::digest(PAYLOAD))
+        let content_hash: ContentHash = hex::encode(sha2::Sha256::digest(PAYLOAD))
             .parse()
             .expect("valid sha256");
         artifact.sha256_checksum = content_hash.clone();
@@ -469,6 +475,10 @@ mod tests {
             vec![Arc::new(StubPort(ProvenanceVerdict::no_attestation())) as Arc<dyn ProvenancePort>],
             upstream_proxy,
             upstream_resolver,
+            // No handler registered: the orchestrator falls back to the
+            // subject classification, which is what every one of these
+            // fixtures already assumed.
+            std::collections::HashMap::new(),
         ));
         let handler = ProvenanceVerifyHandler::new(uc);
 

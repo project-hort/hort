@@ -2073,7 +2073,7 @@ pub fn emit_policy_violations(
 // ---------------------------------------------------------------------------
 
 /// `result` label value for `hort_provenance_verify_total`. Closed
-/// taxonomy of 5. String values are normative — they appear
+/// taxonomy of 6. String values are normative — they appear
 /// verbatim in `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProvenanceVerifyResult {
@@ -2094,6 +2094,17 @@ pub enum ProvenanceVerifyResult {
     /// signed. Separable from `no_attestation` so operators can see images
     /// *waiting to be signed* distinctly from *allowed unsigned*.
     HeldPendingSignature,
+    /// A `Required`-mode **constituent** — a row that can never carry an
+    /// attestation of its own (an OCI config/layer blob; cosign signs the
+    /// manifest/index digest) — was found unsigned with its observation
+    /// window already closed and no inbound reference edge yet. Held
+    /// `Quarantined` pending its subject's cascade or the late-joiner
+    /// self-clear, never terminally rejected as `unsigned`. Distinct from
+    /// `held_pending_signature`: nothing is waiting for THIS row to be
+    /// signed. This population previously resolved to a silent terminal
+    /// `rejected`, which is why it carries its own label rather than
+    /// folding into the window-open hold.
+    HeldPendingSubject,
     /// `NoAttestation`×`Required` with a `None` `quarantine_window_start`
     /// on a `None`-status, recently-ingested artifact (issue #90
     /// defense-in-depth): no terminal verdict is applied — the task
@@ -2113,6 +2124,7 @@ impl ProvenanceVerifyResult {
             Self::Rejected => "rejected",
             Self::NoAttestation => "no_attestation",
             Self::HeldPendingSignature => "held_pending_signature",
+            Self::HeldPendingSubject => "held_pending_subject",
             Self::RequeuedNoAnchor => "requeued_no_anchor",
         }
     }

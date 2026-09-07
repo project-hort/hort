@@ -1100,7 +1100,7 @@ mod tests {
     /// and the upload's verification passes.
     fn content_sha256_hex(content: &[u8]) -> String {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(content))
+        hex::encode(Sha256::digest(content))
     }
 
     fn insert_repo(h: &TestHarness, key: &str) -> Repository {
@@ -1629,7 +1629,7 @@ mod tests {
             seed_mapping(&mocks, repo.id);
 
             let body_bytes = b"the actual sdist body".to_vec();
-            let sha = format!("{:x}", Sha256::digest(&body_bytes));
+            let sha = hex::encode(Sha256::digest(&body_bytes));
             let sdist_url = "https://files.pythonhosted.org/packages/abc/requests-2.31.0.tar.gz";
             let json = pypi_json("requests-2.31.0.tar.gz", &sha, sdist_url);
             mocks
@@ -1666,7 +1666,7 @@ mod tests {
             seed_mapping(&mocks, repo.id);
 
             let actual = b"actual-bytes".to_vec();
-            let lying_sha = format!("{:x}", Sha256::digest(b"different-bytes"));
+            let lying_sha = hex::encode(Sha256::digest(b"different-bytes"));
             let sdist_url = "https://files.pythonhosted.org/packages/abc/requests-2.31.0.tar.gz";
             let json = pypi_json("requests-2.31.0.tar.gz", &lying_sha, sdist_url);
             mocks
@@ -1945,7 +1945,7 @@ mod tests {
             seed_mapping(&mocks, repo.id);
 
             let body_bytes = b"the actual sdist body".to_vec();
-            let sha = format!("{:x}", Sha256::digest(&body_bytes));
+            let sha = hex::encode(Sha256::digest(&body_bytes));
             let sdist_url = "https://files.pythonhosted.org/packages/abc/requests-2.31.0.tar.gz";
             let json = pypi_json("requests-2.31.0.tar.gz", &sha, sdist_url);
             mocks
@@ -2038,7 +2038,7 @@ mod tests {
             seed_mapping(&mocks, repo.id);
 
             let actual = b"actual-bytes".to_vec();
-            let lying_sha = format!("{:x}", Sha256::digest(b"different-bytes"));
+            let lying_sha = hex::encode(Sha256::digest(b"different-bytes"));
             let sdist_url = "https://files.pythonhosted.org/packages/abc/requests-2.31.0.tar.gz";
             let json = pypi_json("requests-2.31.0.tar.gz", &lying_sha, sdist_url);
             mocks
@@ -2315,7 +2315,7 @@ mod tests {
             repo.repo_type = RepositoryType::Hosted;
             mocks.repositories.insert(repo.clone());
 
-            let sha256 = format!("{:x}", Sha256::digest(bytes)).parse().unwrap();
+            let sha256 = hex::encode(Sha256::digest(bytes)).parse().unwrap();
             let mut artifact = sample_artifact(status);
             artifact.repository_id = repo.id;
             artifact.name = project.into();
@@ -2376,7 +2376,7 @@ mod tests {
             bytes: &[u8],
         ) {
             let url = format!("https://files.pythonhosted.org/packages/x/{filename}");
-            let sha = format!("{:x}", Sha256::digest(bytes));
+            let sha = hex::encode(Sha256::digest(bytes));
             let json = pypi_json(filename, &sha, &url);
             mocks.upstream_proxy.insert_metadata(
                 "",
@@ -2670,7 +2670,7 @@ mod tests {
                 mocks.artifacts.insert(artifact.clone());
                 let mut hasher = Sha256::new();
                 hasher.update(metadata);
-                let hex = format!("{:x}", hasher.finalize());
+                let hex = hex::encode(hasher.finalize());
                 let hash: hort_domain::types::ContentHash = hex.parse().unwrap();
                 mocks
                     .storage
@@ -2724,7 +2724,7 @@ mod tests {
                 let metadata_bytes =
                     b"Metadata-Version: 2.1\nName: example\nVersion: 1.0.0\nRequires-Python: >=3.8\n";
                 let wheel_bytes = build_wheel_with_metadata("example", "1.0.0", metadata_bytes);
-                let wheel_sha = format!("{:x}", Sha256::digest(&wheel_bytes));
+                let wheel_sha = hex::encode(Sha256::digest(&wheel_bytes));
                 let wheel_url =
                     "https://files.pythonhosted.org/packages/abc/example-1.0.0-py3-none-any.whl";
                 let json = pypi_wheel_json("example-1.0.0-py3-none-any.whl", &wheel_sha, wheel_url);
@@ -2761,7 +2761,7 @@ mod tests {
                 // the load-bearing PEP 658 + RFC 9530 client-verification
                 // invariant the simple-index advertisement will also
                 // publish.
-                let expected_metadata_hex = format!("{:x}", Sha256::digest(metadata_bytes));
+                let expected_metadata_hex = hex::encode(Sha256::digest(metadata_bytes));
                 let inner = cd
                     .strip_prefix("sha256=:")
                     .and_then(|s| s.strip_suffix(':'))
@@ -2795,7 +2795,7 @@ mod tests {
                     "https://files.pythonhosted.org/packages/abc/example-1.0.0-py3-none-any.whl";
                 let json = pypi_wheel_json(
                     "example-1.0.0-py3-none-any.whl",
-                    &format!("{:x}", Sha256::digest(b"unused")),
+                    &hex::encode(Sha256::digest(b"unused")),
                     wheel_url,
                 );
                 mocks
@@ -2977,7 +2977,7 @@ mod tests {
                                 b"Metadata-Version: 2.1\nName: example\nVersion: 1.0.0\n";
                             let wheel_bytes =
                                 build_wheel_with_metadata("example", "1.0.0", metadata_bytes);
-                            let wheel_sha = format!("{:x}", Sha256::digest(&wheel_bytes));
+                            let wheel_sha = hex::encode(Sha256::digest(&wheel_bytes));
                             let wheel_url = "https://files.pythonhosted.org/packages/abc/\
                                              example-1.0.0-py3-none-any.whl";
                             let json = pypi_wheel_json(
@@ -3142,7 +3142,7 @@ mod tests {
                 mocks.artifacts.insert(artifact.clone());
                 let mut hasher = Sha256::new();
                 hasher.update(metadata);
-                let hex = format!("{:x}", hasher.finalize());
+                let hex = hex::encode(hasher.finalize());
                 let hash: hort_domain::types::ContentHash = hex.parse().unwrap();
                 mocks
                     .storage
@@ -3645,7 +3645,7 @@ mod tests {
         insert_repo(&h, "pypi-test");
 
         let content = b"verified-direct-upload-body".to_vec();
-        let sha = format!("{:x}", Sha256::digest(&content));
+        let sha = hex::encode(Sha256::digest(&content));
 
         let boundary = "----hortinit54-match";
         let body = build_multipart_with_digest(boundary, &content, Some(&sha));
@@ -3698,7 +3698,7 @@ mod tests {
 
         let content = b"actual-upload-bytes".to_vec();
         // Well-formed sha256 hex that does NOT match `content`.
-        let lying_sha = format!("{:x}", Sha256::digest(b"different-bytes"));
+        let lying_sha = hex::encode(Sha256::digest(b"different-bytes"));
 
         let boundary = "----hortinit54-mismatch";
         let body = build_multipart_with_digest(boundary, &content, Some(&lying_sha));
@@ -5138,7 +5138,7 @@ mod tests {
         h.artifacts.insert(artifact.clone());
         let mut hasher = Sha256::new();
         hasher.update(metadata_bytes);
-        let hex = format!("{:x}", hasher.finalize());
+        let hex = hex::encode(hasher.finalize());
         let hash: hort_domain::types::ContentHash = hex.parse().unwrap();
         h.storage
             .insert_content(hash.clone(), metadata_bytes.to_vec());
@@ -5594,7 +5594,7 @@ mod tests {
         let body = to_bytes(res.into_body(), 8192).await.unwrap();
         let mut hasher = Sha256::new();
         hasher.update(&body);
-        let body_hash_hex = format!("{:x}", hasher.finalize());
+        let body_hash_hex = hex::encode(hasher.finalize());
         // Extract base64 from `sha256=:<base64>:` and decode.
         let inner = cd
             .strip_prefix("sha256=:")
@@ -5975,7 +5975,7 @@ mod tests {
             use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(&served_bytes);
-            format!("{:x}", hasher.finalize())
+            hex::encode(hasher.finalize())
         };
 
         // (3) The end-to-end invariant: the advertised hash equals

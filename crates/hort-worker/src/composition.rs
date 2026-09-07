@@ -1037,7 +1037,7 @@ pub async fn build_app_context(
         policy_projections.clone(),
         repositories.clone(),
         artifacts.clone(),
-        handlers,
+        handlers.clone(),
     ));
     dispatcher.register(
         Arc::new(SeedImportHandler::new(seed_import_use_case)),
@@ -1491,6 +1491,11 @@ pub async fn build_app_context(
         event_publisher.clone(),
         upstream_proxy_for_provenance,
         upstream_resolver_for_provenance,
+        // The provenance orchestrator asks the repo's handler one
+        // question: is this artifact a provenance constituent (a row that
+        // can never carry its own attestation)? Last consumer of the map,
+        // so it takes ownership.
+        handlers,
     )
     .await?;
 
@@ -1622,6 +1627,8 @@ async fn register_provenance_verify(
     // decides whether a repo is a proxy scope.
     upstream_proxy: Arc<dyn UpstreamProxy>,
     upstream_resolver: Arc<dyn UpstreamResolver>,
+    // Format dispatch, for `FormatHandler::is_provenance_constituent`.
+    format_handlers: HashMap<String, Arc<dyn FormatHandler>>,
 ) -> anyhow::Result<()> {
     let keyed_keys_file = cfg.provenance_cosign_public_keys_file.clone();
     if !cfg.provenance_cosign_enabled && keyed_keys_file.is_none() {
@@ -1763,6 +1770,7 @@ async fn register_provenance_verify(
         provenance_ports,
         upstream_proxy,
         upstream_resolver,
+        format_handlers,
     ));
     dispatcher.register(
         Arc::new(ProvenanceVerifyHandler::new(orchestration)),

@@ -532,10 +532,8 @@ fn extract_first_arg(source: &str, paren_idx: usize) -> Option<String> {
             b']' => depth_brack -= 1,
             b'{' => depth_brace += 1,
             b'}' => depth_brace -= 1,
-            b',' => {
-                if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 {
-                    return Some(source[start..i].trim().to_string());
-                }
+            b',' if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 => {
+                return Some(source[start..i].trim().to_string());
             }
             _ => {}
         }
@@ -1037,10 +1035,8 @@ fn extract_until_stmt_end(source: &str, start: usize) -> String {
             }
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
-            b';' => {
-                if depth == 0 {
-                    return source[start..i].to_string();
-                }
+            b';' if depth == 0 => {
+                return source[start..i].to_string();
             }
             _ => {}
         }

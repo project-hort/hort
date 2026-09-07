@@ -584,17 +584,17 @@ mod tests {
 
     fn sha1_hex(content: &[u8]) -> String {
         use sha1::{Digest, Sha1};
-        format!("{:x}", Sha1::digest(content))
+        hex::encode(Sha1::digest(content))
     }
 
     fn sha256_hex(content: &[u8]) -> String {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(content))
+        hex::encode(Sha256::digest(content))
     }
 
     fn sha512_hex(content: &[u8]) -> String {
         use sha2::{Digest, Sha512};
-        format!("{:x}", Sha512::digest(content))
+        hex::encode(Sha512::digest(content))
     }
 
     fn proxy_maven_repo(key: &str) -> Repository {

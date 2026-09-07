@@ -949,7 +949,7 @@ mod tests {
         status: QuarantineStatus,
     ) -> Artifact {
         use sha2::{Digest, Sha256};
-        let hash_hex = format!("{:x}", Sha256::digest(content));
+        let hash_hex = hex::encode(Sha256::digest(content));
         let sha256 = hash_hex.parse().unwrap();
 
         let mut artifact = sample_artifact(status);
@@ -1260,7 +1260,7 @@ mod tests {
         {
             use sha2::{Digest, Sha256};
             let content = b"crate contents here";
-            let sha256 = format!("{:x}", Sha256::digest(content)).parse().unwrap();
+            let sha256 = hex::encode(Sha256::digest(content)).parse().unwrap();
             let mut a = sample_artifact(QuarantineStatus::None);
             a.repository_id = repo2_id;
             a.name = "serde".into();
@@ -1576,7 +1576,7 @@ mod tests {
             seed_mapping(&mocks, repo.id);
 
             let body = b"the actual crate body".to_vec();
-            let cksum = format!("{:x}", Sha256::digest(&body));
+            let cksum = hex::encode(Sha256::digest(&body));
             mocks
                 .upstream_proxy
                 .insert_metadata("", "/config.json", CRATES_IO_CONFIG.to_vec());
@@ -1618,7 +1618,7 @@ mod tests {
             seed_mapping(&mocks, repo.id);
 
             let actual = b"actual-bytes".to_vec();
-            let lying_cksum = format!("{:x}", Sha256::digest(b"different-bytes"));
+            let lying_cksum = hex::encode(Sha256::digest(b"different-bytes"));
             mocks
                 .upstream_proxy
                 .insert_metadata("", "/config.json", CRATES_IO_CONFIG.to_vec());
@@ -1814,7 +1814,7 @@ mod tests {
             seed_mapping(&mocks, repo.id);
 
             let body = b"the actual crate body".to_vec();
-            let cksum = format!("{:x}", Sha256::digest(&body));
+            let cksum = hex::encode(Sha256::digest(&body));
             mocks
                 .upstream_proxy
                 .insert_metadata("", "/config.json", CRATES_IO_CONFIG.to_vec());
@@ -1908,7 +1908,7 @@ mod tests {
             seed_mapping(&mocks, repo.id);
 
             let actual = b"actual-bytes".to_vec();
-            let lying_cksum = format!("{:x}", Sha256::digest(b"different-bytes"));
+            let lying_cksum = hex::encode(Sha256::digest(b"different-bytes"));
             mocks
                 .upstream_proxy
                 .insert_metadata("", "/config.json", CRATES_IO_CONFIG.to_vec());
@@ -2111,7 +2111,7 @@ mod tests {
             repo.repo_type = RepositoryType::Hosted;
             mocks.repositories.insert(repo.clone());
 
-            let sha256 = format!("{:x}", Sha256::digest(bytes)).parse().unwrap();
+            let sha256 = hex::encode(Sha256::digest(bytes)).parse().unwrap();
             let mut artifact = sample_artifact(status);
             artifact.repository_id = repo.id;
             artifact.name = name.into();
@@ -2165,7 +2165,7 @@ mod tests {
         /// Seed the upstream config.json + NDJSON index + crate file for a
         /// proxy member so a virtual pull through it succeeds (verified).
         fn seed_upstream_crate(mocks: &MockPorts, name: &str, version: &str, bytes: &[u8]) {
-            let cksum = format!("{:x}", Sha256::digest(bytes));
+            let cksum = hex::encode(Sha256::digest(bytes));
             mocks
                 .upstream_proxy
                 .insert_metadata("", "/config.json", CRATES_IO_CONFIG.to_vec());
@@ -2840,7 +2840,7 @@ mod tests {
         let h = harness();
         let repo = insert_repo(&h, "cargo-test");
         let content: &[u8] = b"serde-1.0.0 bytes";
-        let expected_cksum = format!("{:x}", Sha256::digest(content));
+        let expected_cksum = hex::encode(Sha256::digest(content));
         insert_crate_artifact(
             &h,
             repo.id,
@@ -2899,7 +2899,7 @@ mod tests {
         let repo = insert_repo(&h, "cargo-test");
 
         let content: &[u8] = b"drift crate bytes";
-        let sha256 = format!("{:x}", Sha256::digest(content)).parse().unwrap();
+        let sha256 = hex::encode(Sha256::digest(content)).parse().unwrap();
         let mut artifact = sample_artifact(QuarantineStatus::None);
         artifact.repository_id = repo.id;
         // The NDJSON `name` field echoes the stored mixed-case name (the
@@ -3063,7 +3063,7 @@ mod tests {
         let h = harness();
         let repo = insert_repo(&h, "cargo-test"); // sample_repository → Hosted
         let content: &[u8] = b"local-bytes";
-        let expected_cksum = format!("{:x}", Sha256::digest(content));
+        let expected_cksum = hex::encode(Sha256::digest(content));
         insert_crate_artifact(
             &h,
             repo.id,

@@ -47,7 +47,6 @@
 use std::sync::OnceLock;
 
 use argon2::{Algorithm, Argon2, Params, PasswordHash, PasswordHasher, PasswordVerifier, Version};
-use password_hash::{rand_core::OsRng, SaltString};
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -136,9 +135,8 @@ pub fn sentinel_hash() -> &'static str {
         // fixed string so the sentinel is deterministic; any value
         // works. The salt is freshly generated to keep the encoded
         // PHC well-formed.
-        let salt = SaltString::generate(&mut OsRng);
         argon2_context()
-            .hash_password(b"argon2-hash-helper-sentinel", &salt)
+            .hash_password(b"argon2-hash-helper-sentinel")
             .expect("Argon2id hash of sentinel input cannot fail with valid params")
             .to_string()
     })
@@ -202,9 +200,11 @@ pub enum TokenHashError {
 /// Used by:
 /// - PAT issuance — full token plaintext as input.
 pub fn hash_token(plaintext: &str) -> Result<String, TokenHashError> {
-    let salt = SaltString::generate(&mut OsRng);
+    // `hash_password` draws a fresh 16-byte salt (the PHC-recommended
+    // length) from the system RNG on every call — the per-call salt
+    // uniqueness the stored-credential format depends on.
     argon2_context()
-        .hash_password(plaintext.as_bytes(), &salt)
+        .hash_password(plaintext.as_bytes())
         .map(|ph| ph.to_string())
         .map_err(|e| TokenHashError::HashFailed(e.to_string()))
 }
@@ -260,6 +260,7 @@ const ARGON2ID_PHC_PREFIX: &str = "$argon2id$v=19$";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use password_hash::phc::Salt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Counter-spy verifier. Wraps the real verifier and counts how
@@ -492,9 +493,11 @@ mod tests {
         // result must be byte-identical to the committed string. This is
         // the strictest form of the contract — it pins the KDF output,
         // the parameter encoding, and the PHC serialization together.
-        let salt = SaltString::from_b64(STORED_FORMAT_FIXTURE_SALT_B64).expect("fixture salt");
+        // `hash_password_with_salt` takes the *decoded* salt bytes; the PHC
+        // string re-encodes them, so the committed B64 form round-trips.
+        let salt = Salt::from_b64(STORED_FORMAT_FIXTURE_SALT_B64).expect("fixture salt");
         let produced = argon2_context()
-            .hash_password(STORED_FORMAT_FIXTURE_PLAINTEXT.as_bytes(), &salt)
+            .hash_password_with_salt(STORED_FORMAT_FIXTURE_PLAINTEXT.as_bytes(), &salt)
             .expect("fixture hash succeeds")
             .to_string();
         assert_eq!(

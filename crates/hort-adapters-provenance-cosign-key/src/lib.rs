@@ -285,8 +285,8 @@ mod tests {
     use hort_domain::types::ContentHash;
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::SigningKey;
+    use p256::elliptic_curve::Generate;
     use p256::pkcs8::{EncodePublicKey, LineEnding};
-    use rand_core::OsRng;
 
     const HASH_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const HASH_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn valid_keyed_signature_with_matching_digest_verifies() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let payload = payload_for(HASH_A);
         let sig = der_sign(&key, &payload);
         let v = CosignKeyVerifier::from_pem_keys(&[pub_pem(&key)]).unwrap();
@@ -367,8 +367,8 @@ mod tests {
 
     #[test]
     fn wrong_key_rejects_untrusted_identity() {
-        let signer = SigningKey::random(&mut OsRng);
-        let other = SigningKey::random(&mut OsRng);
+        let signer = SigningKey::generate();
+        let other = SigningKey::generate();
         let payload = payload_for(HASH_A);
         let sig = der_sign(&signer, &payload);
         // Pin a DIFFERENT key than the one that signed.
@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn digest_mismatch_rejects_bundle_malformed_retag_attack() {
         // The payload is validly signed for image A, but presented for image B.
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let payload = payload_for(HASH_A);
         let sig = der_sign(&key, &payload);
         let v = CosignKeyVerifier::from_pem_keys(&[pub_pem(&key)]).unwrap();
@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn malformed_payload_rejects_bundle_malformed() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let payload = b"not a simplesigning json".to_vec();
         let sig = der_sign(&key, &payload);
         let v = CosignKeyVerifier::from_pem_keys(&[pub_pem(&key)]).unwrap();
@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn malformed_signature_rejects() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let payload = payload_for(HASH_A);
         let v = CosignKeyVerifier::from_pem_keys(&[pub_pem(&key)]).unwrap();
         let h = hash(HASH_A);
@@ -431,7 +431,7 @@ mod tests {
 
     #[test]
     fn keyless_bundle_yields_no_attestation() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let v = CosignKeyVerifier::from_pem_keys(&[pub_pem(&key)]).unwrap();
         let h = hash(HASH_A);
         // A keyless v0.3 bundle (signature None) is not ours.
@@ -442,7 +442,7 @@ mod tests {
 
     #[test]
     fn no_bundles_yields_no_attestation() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let v = CosignKeyVerifier::from_pem_keys(&[pub_pem(&key)]).unwrap();
         let h = hash(HASH_A);
         let verdict = run(v.verify(&subject(&h), &[], &empty_reqs())).unwrap();
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn first_valid_keyed_bundle_wins_over_a_bad_one() {
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let good = payload_for(HASH_A);
         let good_sig = der_sign(&key, &good);
         let v = CosignKeyVerifier::from_pem_keys(&[pub_pem(&key)]).unwrap();
@@ -477,7 +477,7 @@ mod tests {
         let empty = CosignKeyVerifier::from_pem_keys(&[]).unwrap();
         assert!(run(empty.health_check()).is_err());
 
-        let key = SigningKey::random(&mut OsRng);
+        let key = SigningKey::generate();
         let v = CosignKeyVerifier::from_pem_keys(&[pub_pem(&key)]).unwrap();
         assert!(run(v.health_check()).is_ok());
     }

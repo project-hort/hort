@@ -873,7 +873,7 @@ mod tests {
 
     fn sha256_hex(content: &[u8]) -> String {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(content))
+        hex::encode(Sha256::digest(content))
     }
 
     fn pypi_repo(key: &str) -> Repository {

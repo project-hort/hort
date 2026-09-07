@@ -377,6 +377,30 @@ A **bad** signature is not held — a forged, wrong-key, or
 digest-mismatched signature is rejected **immediately**, even mid-window (a
 missing signature is time-dependent; a wrong one is already wrong).
 
+> **Only *subjects* are ever terminally unsigned.** cosign signs the
+> manifest or index digest, so a manifest and an index are **subjects** —
+> rows that could have carried a signature, and for which "still unsigned
+> at window expiry" is a real, terminal verdict. An image's **config and
+> layer blobs** are **constituents**: their content is already covered by
+> the signature over the manifest that names them, and they carry no
+> attestation of their own — ever. A constituent is therefore **never**
+> rejected `Unsigned` on its own. It is **held** (observable as
+> `hort_provenance_verify_total{result="held_pending_subject"}`) until its
+> subject clears it: automatically, when the subject's signature is
+> verified, or when a constituent that arrives *after* its subject was
+> verified self-clears at its own ingest. This is why a
+> **`quarantineDuration` shorter than your push takes** is safe:
+> it shortens only the *subject's* observation window — your signing
+> budget — and never turns a correctly signed image's layers into
+> unrecoverable rejections, whatever order your client pushed them in.
+>
+> A constituent whose subject never arrives (a blob pushed without its
+> manifest) stays held indefinitely and ages out through retention. That
+> is deliberate: held bytes serve nothing, and any "orphan timer" would
+> just be a second observation window with the same race. If you need such
+> a row gone sooner, delete it — do not shorten the window expecting a
+> rejection.
+
 > **The "images waiting to be signed" signal.** The
 > `hort_provenance_verify_total{result="held_pending_signature"}` counter
 > increments each time an unsigned `required` image is held mid-window.

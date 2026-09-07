@@ -48,6 +48,9 @@ metrics-util                = { workspace = true, features = ["debugging"] }
 tempfile                    = "3"
 regex                       = "1"
 sha2                        = { workspace = true }
+# Tests assert on lowercase-hex digests; the `digest` crate's `Output` is a
+# plain byte array with no hex formatting of its own.
+hex                         = { workspace = true }
 # Inline test module drives routers through tower's ServiceExt::oneshot.
 tower                       = { workspace = true }
 # `AuthContext::Enabled` fixtures in the test harness wrap the RBAC

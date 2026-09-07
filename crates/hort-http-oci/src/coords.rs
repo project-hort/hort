@@ -41,6 +41,7 @@
 //!   `IngestRequest::payload_metadata` at ingest time, not on coords.
 
 use hort_domain::entities::repository::RepositoryFormat;
+use hort_domain::oci::OCI_BLOB_PATH_PREFIX;
 use hort_domain::types::{ArtifactCoords, ContentHash};
 
 /// Build `ArtifactCoords` for an OCI blob addressed by `(name, digest)`.
@@ -48,12 +49,17 @@ use hort_domain::types::{ArtifactCoords, ContentHash};
 /// The `path` field lays out as `blobs/sha256:<hex>`, so the coords
 /// can feed `ArtifactRepository::find_by_path(repo_id, &coords.path)`
 /// directly in the pull handler.
+///
+/// The prefix comes from [`OCI_BLOB_PATH_PREFIX`] because it is also the
+/// discriminator `OciFormatHandler::is_provenance_constituent` reads to
+/// decide that a row can never carry its own attestation — the two must
+/// not be able to drift.
 pub fn oci_blob_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
     ArtifactCoords {
         name: name.to_string(),
         name_as_published: name.to_string(),
         version: None,
-        path: format!("blobs/sha256:{}", digest.as_ref()),
+        path: format!("{OCI_BLOB_PATH_PREFIX}{}", digest.as_ref()),
         format: RepositoryFormat::Oci,
         metadata: serde_json::Value::Null,
     }

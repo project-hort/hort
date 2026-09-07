@@ -1,2 +1,2 @@
 # Clippy configuration
-msrv = "1.94.0"
+msrv = "1.97.0"

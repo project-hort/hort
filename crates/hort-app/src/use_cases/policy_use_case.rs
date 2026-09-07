@@ -5684,7 +5684,7 @@ mod tests {
             (0u32, None)
         } else {
             let bytes = serde_json::to_vec(findings).unwrap();
-            let hash_hex = format!("{:x}", Sha256::digest(&bytes));
+            let hash_hex = hex::encode(Sha256::digest(&bytes));
             let blob_hash: ContentHash = hash_hex.parse().unwrap();
             storage.insert_content(blob_hash.clone(), bytes);
             (findings.len() as u32, Some(blob_hash))
@@ -6027,7 +6027,7 @@ mod tests {
         // artifact — every artifact stores a ScanCompleted pointing at it.
         let findings = vec![sample_finding("CVE-2024-9999", SeverityThreshold::Critical)];
         let bytes = serde_json::to_vec(&findings).unwrap();
-        let hash_hex = format!("{:x}", Sha256::digest(&bytes));
+        let hash_hex = hex::encode(Sha256::digest(&bytes));
         let blob_hash: ContentHash = hash_hex.parse().unwrap();
         storage.insert_content(blob_hash.clone(), bytes);
 
@@ -6102,13 +6102,11 @@ mod tests {
         // Critical blob (now-failing) + a low-only blob (stays clean).
         let crit = vec![sample_finding("CVE-FAIL", SeverityThreshold::Critical)];
         let crit_bytes = serde_json::to_vec(&crit).unwrap();
-        let crit_hash: ContentHash = format!("{:x}", Sha256::digest(&crit_bytes))
-            .parse()
-            .unwrap();
+        let crit_hash: ContentHash = hex::encode(Sha256::digest(&crit_bytes)).parse().unwrap();
         storage.insert_content(crit_hash.clone(), crit_bytes);
         let low = vec![sample_finding("CVE-OK", SeverityThreshold::Low)];
         let low_bytes = serde_json::to_vec(&low).unwrap();
-        let low_hash: ContentHash = format!("{:x}", Sha256::digest(&low_bytes)).parse().unwrap();
+        let low_hash: ContentHash = hex::encode(Sha256::digest(&low_bytes)).parse().unwrap();
         storage.insert_content(low_hash.clone(), low_bytes);
 
         // 1 500 artifacts (> one 1 000-item page); even idx fail, odd clean.

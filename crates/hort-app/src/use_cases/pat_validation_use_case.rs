@@ -1625,7 +1625,7 @@ mod tests {
             }
             assert_eq!(spy.calls(), 35, "no lockout when client_ip=None");
             // No flag, no counter — the keyspaces are simply unused.
-            for (k, _) in store.entries.lock().unwrap().iter() {
+            for k in store.entries.lock().unwrap().keys() {
                 assert!(
                     !k.starts_with(PAT_LOCKOUT_BY_IP_FLAG_PREFIX)
                         && !k.starts_with(PAT_LOCKOUT_BY_IP_COUNTER_PREFIX),

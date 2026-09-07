@@ -58,7 +58,7 @@ fn insert_file(
     status: QuarantineStatus,
 ) -> Artifact {
     use sha2::{Digest, Sha256};
-    let sha256 = format!("{:x}", Sha256::digest(content)).parse().unwrap();
+    let sha256 = hex::encode(Sha256::digest(content)).parse().unwrap();
     let mut artifact = sample_artifact(status);
     artifact.repository_id = repo_id;
     artifact.name = name.to_string();
@@ -1740,7 +1740,7 @@ mod proxy_pull_through {
 
     fn sha256_hex(content: &[u8]) -> String {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(content))
+        hex::encode(Sha256::digest(content))
     }
 
     const REL: &str = "com/example/foo/1.0/foo-1.0.jar";

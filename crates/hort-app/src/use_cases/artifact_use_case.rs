@@ -2381,9 +2381,7 @@ mod tests {
         let bytes = serde_json::to_vec(&full).unwrap();
         let hash: ContentHash = {
             use sha2::Digest;
-            format!("{:x}", sha2::Sha256::digest(&bytes))
-                .parse()
-                .unwrap()
+            hex::encode(sha2::Sha256::digest(&bytes)).parse().unwrap()
         };
         storage.insert_content(hash.clone(), bytes);
 

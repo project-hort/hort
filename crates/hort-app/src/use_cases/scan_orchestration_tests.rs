@@ -1469,9 +1469,7 @@ async fn record_outcome_completed_with_prior_partial_overlap_emits_only_new_find
     let prior_json = serde_json::to_vec(&prior_findings).unwrap();
     let prior_hash: ContentHash = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(&prior_json))
-            .parse()
-            .unwrap()
+        hex::encode(Sha256::digest(&prior_json)).parse().unwrap()
     };
     storage.insert_content(prior_hash.clone(), prior_json);
 
@@ -1538,9 +1536,7 @@ async fn record_outcome_completed_identical_findings_emits_no_artifact_became_vu
     let prior_json = serde_json::to_vec(&prior_findings).unwrap();
     let prior_hash: ContentHash = {
         use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(&prior_json))
-            .parse()
-            .unwrap()
+        hex::encode(Sha256::digest(&prior_json)).parse().unwrap()
     };
     storage.insert_content(prior_hash.clone(), prior_json);
     let stream_id = StreamId::artifact(artifact_id);

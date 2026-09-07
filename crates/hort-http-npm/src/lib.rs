@@ -1371,7 +1371,7 @@ mod tests {
         status: QuarantineStatus,
     ) -> Artifact {
         use sha2::{Digest, Sha256};
-        let sha256 = format!("{:x}", Sha256::digest(content)).parse().unwrap();
+        let sha256 = hex::encode(Sha256::digest(content)).parse().unwrap();
 
         let mut artifact = sample_artifact(status);
         artifact.repository_id = repo_id;
@@ -2090,7 +2090,7 @@ mod tests {
         let router = router(h.ctx.clone());
 
         let tarball = b"compute-sha1-on-me";
-        let expected_sha1 = format!("{:x}", Sha1::digest(tarball));
+        let expected_sha1 = hex::encode(Sha1::digest(tarball));
         let body = build_publish_body("express", "1.0.0", tarball);
 
         let res = router
@@ -2151,10 +2151,10 @@ mod tests {
         // the prior in-memory `Vec<u8>` and (c) keep the test under
         // the default `cargo test` time budget.
         let tarball: Vec<u8> = (0..50 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
-        let expected_sha1 = format!("{:x}", Sha1::digest(&tarball));
+        let expected_sha1 = hex::encode(Sha1::digest(&tarball));
         let expected_sha256 = {
             use sha2::Digest as _;
-            format!("{:x}", Sha2Sha256::digest(&tarball))
+            hex::encode(Sha2Sha256::digest(&tarball))
         };
         let body = build_publish_body("bigpkg", "9.9.9", &tarball);
         // Total envelope ≈ 50 MiB * 4/3 + small overhead.
@@ -3136,7 +3136,7 @@ mod tests {
         let repo = insert_repo(&h, "npm-test");
 
         let content: &[u8] = b"drift tarball bytes";
-        let sha256 = format!("{:x}", Sha256::digest(content)).parse().unwrap();
+        let sha256 = hex::encode(Sha256::digest(content)).parse().unwrap();
         let filename = "legacy-name-1.0.0.tgz";
         let mut artifact = sample_artifact(QuarantineStatus::None);
         artifact.repository_id = repo.id;
@@ -4779,7 +4779,7 @@ mod tests {
                 1,
                 "exactly one storage.put on the happy path (the pull-through fetch)"
             );
-            let cas_sha256 = format!("{:x}", Sha256::digest(&body_bytes));
+            let cas_sha256 = hex::encode(Sha256::digest(&body_bytes));
             let expected_hash: ContentHash = cas_sha256
                 .parse()
                 .expect("computed sha256 must parse as a ContentHash");
@@ -5119,7 +5119,7 @@ mod tests {
             repo.repo_type = RepositoryType::Hosted;
             mocks.repositories.insert(repo.clone());
 
-            let sha256 = format!("{:x}", Sha256::digest(bytes)).parse().unwrap();
+            let sha256 = hex::encode(Sha256::digest(bytes)).parse().unwrap();
             let mut artifact = sample_artifact(status);
             artifact.repository_id = repo.id;
             artifact.name = pkg.into();

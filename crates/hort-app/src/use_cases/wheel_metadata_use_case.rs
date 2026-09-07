@@ -322,7 +322,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(METADATA_BYTES);
-        let hex = format!("{:x}", h.finalize());
+        let hex = hex::encode(h.finalize());
         hex.parse().unwrap()
     }
 

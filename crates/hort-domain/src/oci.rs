@@ -32,6 +32,20 @@ pub const COSIGN_SIMPLESIGNING_MEDIA_TYPE: &str =
 /// over a [`COSIGN_SIMPLESIGNING_MEDIA_TYPE`] payload layer.
 pub const COSIGN_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
 
+/// The `Artifact.path` prefix every OCI **blob** row carries —
+/// `blobs/sha256:<hex>`, the OCI Distribution URL minus its
+/// `/v2/<name>/` head. Manifests and indexes use a `manifests/` prefix
+/// instead, so the two never collide on the `(repository_id, path)`
+/// uniqueness constraint.
+///
+/// Shared rather than spelled out at each site because the prefix is
+/// load-bearing in two directions: the OCI HTTP adapter *writes* it when
+/// it builds blob coords, and `OciFormatHandler::is_provenance_constituent`
+/// *reads* it to decide that a row can never carry its own attestation.
+/// A silent divergence between the two would re-open a terminal
+/// self-rejection on a correctly-signed image's layers.
+pub const OCI_BLOB_PATH_PREFIX: &str = "blobs/sha256:";
+
 /// The `mediaType` of an OCI image index (multi-arch "manifest of manifests"):
 /// `application/vnd.oci.image.index.v1+json`. An index carries a `manifests[]`
 /// array of child descriptors (one per platform) instead of `config`/`layers`.

@@ -218,8 +218,8 @@ fn malformed_keyed_bundle_is_rejected_bundle_malformed() {
 /// negative). Uses the same `p256` the adapter verifies with.
 fn generate_other_p256_pub_pem() -> String {
     use p256::ecdsa::SigningKey;
+    use p256::elliptic_curve::Generate;
     use p256::pkcs8::{EncodePublicKey, LineEnding};
-    use rand_core::OsRng;
-    let k = SigningKey::random(&mut OsRng);
+    let k = SigningKey::generate();
     k.verifying_key().to_public_key_pem(LineEnding::LF).unwrap()
 }
