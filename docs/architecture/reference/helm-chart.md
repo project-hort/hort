@@ -119,7 +119,8 @@ flipped on).
 | CronJob — noop (`cronjob-noop.yaml`) | `scheduledTasks.adminTasksEnabled` **and** `scheduledTasks.noop.enabled` | `hort-cli admin task invoke noop` heartbeat. |
 | CronJob — quarantine-release-sweep (`cronjob-quarantine-release-sweep.yaml`) | `scheduledTasks.quarantineReleaseSweep.enabled` (default **true**) | `executionPath: dsn-direct` — `hort-server enqueue-quarantine-release-sweep`; not gated by `adminTasksEnabled`. |
 | CronJob — scan-row-retention-sweep (`cronjob-scan-row-retention-sweep.yaml`) | `scheduledTasks.scanRowRetentionSweep.enabled` (default **true**) | `executionPath: dsn-direct` — `hort-server enqueue-scan-row-retention-sweep`; not gated by `adminTasksEnabled`. |
-| CronJobs — prefetch-tick / prefetch-row-retention-sweep / wheel-metadata-backfill | each task's own `scheduledTasks.<task>.enabled` (all default **false**) | `executionPath: dsn-direct` — `hort-server enqueue-<task>`; not gated by `adminTasksEnabled`. |
+| CronJob — prefetch-row-retention-sweep (`cronjob-prefetch-row-retention-sweep.yaml`) | `scheduledTasks.prefetchRowRetentionSweep.enabled` (default **true** — terminal `oci-index-child-ingest` rows accrue on any OCI proxy repository with no per-repo opt-in) | `executionPath: dsn-direct` — `hort-server enqueue-prefetch-row-retention-sweep`; not gated by `adminTasksEnabled`. |
+| CronJobs — prefetch-tick / wheel-metadata-backfill | each task's own `scheduledTasks.<task>.enabled` (both default **false**) | `executionPath: dsn-direct` — `hort-server enqueue-<task>`; not gated by `adminTasksEnabled`. |
 | CronJobs — retention-evaluate / retention-purge / eventstore-archive / eventstore-checkpoint / replay-seen-prune (default **true**) / scanner-registry-prune (default **true**) / verify-event-chain | `scheduledTasks.adminTasksEnabled` **and** the task's own `scheduledTasks.<task>.enabled` | `executionPath: admin-task` (`verify-event-chain` runs `hort-server verify-event-chain` directly but shares the `adminTasksEnabled` gate). |
 | Job — helm test (`tests/test-connection.yaml`) | only under `helm test` (test hook) | busybox `wget` poll of `/healthz`. |
 
@@ -327,7 +328,8 @@ of this umbrella).
   `prefetchTick`, `prefetchRowRetentionSweep`, `wheelMetadataBackfill`) run
   a `hort-server` subcommand with the runtime DSN only — no svc-token, no
   bootstrap Job — and are gated **solely by their own `enabled`**, never by
-  `adminTasksEnabled`. `scrub` + `quarantineReleaseSweep` default **on**.
+  `adminTasksEnabled`. `scrub`, `quarantineReleaseSweep` and
+  `prefetchRowRetentionSweep` default **on**.
 - **`executionPath: admin-task` tasks** (everything else) invoke `hort-cli
   admin task invoke <kind>` with the `<release>-svc-token` PAT and are gated
   by **both** `scheduledTasks.adminTasksEnabled` (the master toggle, which

@@ -203,7 +203,12 @@ impl LeafSummary {
 /// error `Display` chains preserve that text — mirrors the substring
 /// classification `pull_dedup::classify_app_error` uses for the
 /// negative-cache TTL lookup.
-fn is_upstream_not_found(message: &str) -> bool {
+///
+/// `pub(crate)` so sibling task handlers that make their own verified
+/// upstream fetches classify identically — one definition of "the upstream
+/// simply does not publish this" rather than a second, silently divergent
+/// copy per handler.
+pub(crate) fn is_upstream_not_found(message: &str) -> bool {
     let s = message.to_ascii_lowercase();
     s.contains("not_found") || s.contains("not found") || s.contains("404")
 }

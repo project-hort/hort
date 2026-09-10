@@ -235,7 +235,11 @@ failed driver leaves a terminal row; the dedup index (below) excludes
 terminal states, so the next pull of any dependent re-derives the
 missing subtree from the artifacts projection. Terminal `prefetch%`
 rows are garbage-collected by the `prefetch-row-retention-sweep` task
-(`crates/hort-app/src/task_handlers/prefetch_row_retention_sweep.rs`).
+(`crates/hort-app/src/task_handlers/prefetch_row_retention_sweep.rs`),
+which also covers terminal `oci-index-child-ingest` rows — the OCI
+eager index-child ingest is the same class of high-churn, best-effort
+pull-through work, and its jobs row is likewise not the layer that makes
+the work idempotent.
 
 ## Archive-aware dependency extraction
 

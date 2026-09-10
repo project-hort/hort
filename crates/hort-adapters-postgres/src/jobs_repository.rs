@@ -1291,6 +1291,73 @@ impl JobsRepository for PgJobsRepository {
         })
     }
 
+    fn enqueue_idempotent_batch<'a>(
+        &'a self,
+        rows: &'a [hort_domain::ports::jobs_repository::IdempotentEnqueueRow],
+    ) -> BoxFuture<'a, DomainResult<Vec<Uuid>>> {
+        // Same owning rationale as `enqueue_prefetch_batch`: `sqlx::query`
+        // binds borrow the bound values, so the owned `Vec` must outlive
+        // the await.
+        let owned: Vec<hort_domain::ports::jobs_repository::IdempotentEnqueueRow> = rows.to_vec();
+        Box::pin(async move {
+            if owned.is_empty() {
+                return Ok(Vec::new());
+            }
+            // One statement for the whole cohort, regardless of kind:
+            // unlike the `prefetch%`-scoped `target_key` indexes,
+            // `jobs_idempotency_key_uq` is a single index over every
+            // non-NULL key, so there is no per-kind partitioning to do
+            // and the ON CONFLICT predicate is the index's own WHERE.
+            //
+            // Each row contributes 5 binds (kind, params, priority,
+            // trigger_source, idempotency_key); `status` is the literal
+            // 'pending' and `actor_id` is left to its NULL default (see
+            // the port doc for why these rows carry no actor).
+            let mut placeholders: Vec<String> = Vec::with_capacity(owned.len());
+            for i in 0..owned.len() {
+                let base = i * 5;
+                placeholders.push(format!(
+                    "(${},${},${},${},${},'pending')",
+                    base + 1,
+                    base + 2,
+                    base + 3,
+                    base + 4,
+                    base + 5,
+                ));
+            }
+            let sql = format!(
+                "INSERT INTO public.jobs \
+                   (kind, params, priority, trigger_source, idempotency_key, status) \
+                 VALUES {placeholders} \
+                 ON CONFLICT (idempotency_key) \
+                   WHERE idempotency_key IS NOT NULL \
+                 DO NOTHING \
+                 RETURNING id",
+                placeholders = placeholders.join(", "),
+            );
+            let mut q = sqlx::query_scalar::<_, Uuid>(sqlx::AssertSqlSafe(sql));
+            for r in &owned {
+                q = q
+                    .bind(&r.kind)
+                    .bind(sqlx::types::Json(r.params.clone()))
+                    .bind(r.priority)
+                    .bind(&r.trigger_source)
+                    .bind(r.idempotency_key.as_str());
+            }
+            let inserted: Vec<Uuid> = q
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Job", "enqueue_idempotent_batch"))?;
+            tracing::info!(
+                attempted = owned.len(),
+                inserted = inserted.len(),
+                deduped = owned.len() - inserted.len(),
+                "enqueue_idempotent_batch",
+            );
+            Ok(inserted)
+        })
+    }
+
     fn delete_terminal_prefetch_rows_older_than<'a>(
         &'a self,
         horizon: Duration,
@@ -1298,9 +1365,14 @@ impl JobsRepository for PgJobsRepository {
         let interval = duration_to_pg_interval(horizon);
         Box::pin(async move {
             tracing::debug!(?horizon, "delete_terminal_prefetch_rows_older_than");
+            // `oci-index-child-ingest` rides this sweep rather than getting
+            // its own: it is the same class of work as the cascade — a
+            // high-churn, best-effort, per-content unit of pull-through
+            // ingest whose terminal row holds no durable state. See the port
+            // doc for why deleting one is safe.
             let res = sqlx::query(
                 "DELETE FROM public.jobs \
-                  WHERE kind LIKE 'prefetch%' \
+                  WHERE (kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest') \
                     AND status IN ('completed', 'failed') \
                     AND updated_at < now() - $1::interval",
             )
@@ -1890,6 +1962,7 @@ mod tests {
     // per ADR 0019.
     // -----------------------------------------------------------------
 
+    use hort_domain::ports::jobs_repository::IdempotentEnqueueRow as IER;
     use hort_domain::ports::jobs_repository::PrefetchEnqueueRow as PER;
     use serial_test::serial;
 
@@ -1983,9 +2056,131 @@ mod tests {
         );
     }
 
-    /// Retention sweep deletes `completed` + `failed` prefetch%
-    /// rows older than the horizon, leaves `pending`/`running`
-    /// rows alone.
+    fn idempotent_row(kind: &str, idempotency_key: &str) -> IER {
+        IER {
+            kind: kind.to_string(),
+            params: serde_json::json!({"child_digest": "sha256:…"}),
+            priority: 0,
+            trigger_source: "ingest".to_string(),
+            idempotency_key: IdempotencyKey::try_from(idempotency_key.to_string())
+                .expect("valid idempotency key"),
+        }
+    }
+
+    /// One statement inserts the whole cohort when no key collides, and
+    /// returns one id per inserted row.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn enqueue_idempotent_batch_inserts_every_row_when_no_conflict() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        let run = Uuid::new_v4();
+        let rows = vec![
+            idempotent_row("oci-index-child-ingest", &format!("oci-child:{run}:a")),
+            idempotent_row("oci-index-child-ingest", &format!("oci-child:{run}:b")),
+        ];
+        let ids = repo
+            .enqueue_idempotent_batch(&rows)
+            .await
+            .expect("enqueue_idempotent_batch");
+        assert_eq!(ids.len(), 2);
+    }
+
+    /// `jobs_idempotency_key_uq` absorbs a repeat cohort: the second
+    /// call inserts nothing and errors on nothing. This is the batched
+    /// counterpart to the single-row `enqueue_task` `Duplicate` proof —
+    /// there the conflict is REPORTED per row, here it is absorbed by
+    /// the index, and the caller reads the dedup count as
+    /// `rows.len() - ids.len()`.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn enqueue_idempotent_batch_dedup_absorbs_repeat_cohort() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        let run = Uuid::new_v4();
+        let rows = vec![
+            idempotent_row("oci-index-child-ingest", &format!("oci-child:{run}:a")),
+            idempotent_row("oci-index-child-ingest", &format!("oci-child:{run}:b")),
+        ];
+
+        let first = repo
+            .enqueue_idempotent_batch(&rows)
+            .await
+            .expect("first cohort");
+        assert_eq!(first.len(), 2);
+
+        // A partly-overlapping second cohort: one already-seen key, one
+        // fresh. Exactly the shape a re-pull of an index that gained a
+        // platform produces.
+        let second_rows = vec![
+            idempotent_row("oci-index-child-ingest", &format!("oci-child:{run}:b")),
+            idempotent_row("oci-index-child-ingest", &format!("oci-child:{run}:c")),
+        ];
+        let second = repo
+            .enqueue_idempotent_batch(&second_rows)
+            .await
+            .expect("second cohort");
+        assert_eq!(
+            second.len(),
+            1,
+            "the unique index absorbs the repeated key and the statement still inserts the \
+             fresh one — a conflict is not an error for this entry point",
+        );
+    }
+
+    /// Two rows carrying the SAME key inside ONE call collapse to one
+    /// insert rather than failing the statement. An index may legally
+    /// declare the same child digest under two platform descriptors, so
+    /// the cohort builder does not have to pre-deduplicate.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn enqueue_idempotent_batch_collapses_duplicate_keys_within_one_call() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        let key = format!("oci-child:{}:dup", Uuid::new_v4());
+        let rows = vec![
+            idempotent_row("oci-index-child-ingest", &key),
+            idempotent_row("oci-index-child-ingest", &key),
+        ];
+        let ids = repo
+            .enqueue_idempotent_batch(&rows)
+            .await
+            .expect("enqueue_idempotent_batch");
+        assert_eq!(
+            ids.len(),
+            1,
+            "ON CONFLICT DO NOTHING resolves an intra-statement conflict the same way it \
+             resolves one against a committed row",
+        );
+    }
+
+    /// An empty cohort is a no-op that never reaches the database — the
+    /// facade's "index declared no children" path must not synthesise a
+    /// `VALUES` list with no rows (a syntax error).
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn enqueue_idempotent_batch_with_no_rows_is_a_no_op() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+        let ids = repo
+            .enqueue_idempotent_batch(&[])
+            .await
+            .expect("empty batch is Ok");
+        assert!(ids.is_empty());
+    }
+
+    /// Retention sweep deletes `completed` + `failed` rows of the
+    /// pull-through ingest cascade (`prefetch%` plus
+    /// `oci-index-child-ingest`) older than the horizon, leaves
+    /// `pending`/`running` rows and foreign kinds alone.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn retention_sweep_deletes_only_terminal_prefetch_rows_older_than_horizon() {
@@ -2007,6 +2202,14 @@ mod tests {
             mk("completed", "prefetch", 1_000_000),
             mk("failed", "prefetch-dependencies", 1_000_000),
             mk("completed", "prefetch", 0),
+            // The eager index-child ingest rides this sweep too.
+            mk("completed", "oci-index-child-ingest", 1_000_000),
+            mk("failed", "oci-index-child-ingest", 1_000_000),
+            mk("completed", "oci-index-child-ingest", 0),
+            mk("running", "oci-index-child-ingest", 1_000_000),
+            // A foreign kind whose newest terminal row IS durable state —
+            // widening the predicate must never reach it.
+            mk("completed", "verify-event-chain", 1_000_000),
         ];
         for (status, kind, key, age_secs) in &fixtures {
             sqlx::query(
@@ -2026,16 +2229,17 @@ mod tests {
             .expect("seed row");
         }
 
-        // Sweep: horizon = 1 day. The two old-and-terminal rows
-        // qualify; the pending + running + fresh-completed rows do
-        // not.
+        // Sweep: horizon = 1 day. The four old-and-terminal in-scope rows
+        // qualify; the pending + running + fresh-completed rows and the
+        // foreign kind do not.
         let deleted = repo
             .delete_terminal_prefetch_rows_older_than(Duration::from_secs(86_400))
             .await
             .expect("retention sweep");
         assert_eq!(
-            deleted, 2,
-            "exactly the two old-terminal rows are deleted (not pending/running, not fresh)",
+            deleted, 4,
+            "exactly the four old-terminal in-scope rows are deleted (not pending/running, \
+             not fresh, not a foreign kind's durable state)",
         );
 
         // Cleanup: drop the remaining seeded rows for isolation.

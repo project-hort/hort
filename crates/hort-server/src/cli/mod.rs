@@ -227,7 +227,8 @@ pub enum Command {
     /// dependency). The always-on worker picks the row up and
     /// dispatches to `PrefetchRowRetentionSweepHandler`, which
     /// deletes terminal (`status IN ('completed', 'failed')`)
-    /// `kind LIKE 'prefetch%'` rows older than a configurable horizon
+    /// `kind LIKE 'prefetch%'` and `kind = 'oci-index-child-ingest'`
+    /// rows older than a configurable horizon
     /// (default 7 days). Pairs with the per-table
     /// autovacuum tuning on `public.jobs` (migration 009) so the
     /// transitive-cascade churn does not grow the table unbounded.

@@ -180,6 +180,32 @@ Observability — the prefetch metrics fire with `format="oci"` /
 - `hort_prefetch_skipped_total{reason,repository}` — bumps on each
   early-exit reason (`disabled`, `trigger_not_enabled`).
 
+### Multi-arch children start their window with the index
+
+Separately from prefetch, and with **no opt-in**: the first pull-through
+of a multi-arch image (an image index / manifest list) eagerly ingests
+every child manifest the index declares, so all of them start their
+quarantine windows at that moment rather than at the first client GET
+for each one. Previously the index ran its window and the platform
+children ran theirs afterwards — a fresh base image cost two windows
+back to back.
+
+This shortens no window: an eagerly ingested child gets exactly the
+anchor a later lazy pull would have given it (see
+[ADR 0054](../../adr/0054-content-level-age-evidence-anchors-quarantine.md)),
+and it still releases only on its own elapsed window plus its own scan
+verdict. It just starts sooner.
+
+Operationally: **manually warming a multi-arch image's platform children
+in parallel at merge time is no longer necessary** — the first pull
+already does it. Note that only a fresh pull-through mints these jobs;
+an index already in the repository before this behaviour shipped keeps
+resolving its children lazily.
+
+Unlike the blob warm above, the child ingest fetches manifests only —
+the children's layer blobs still arrive on demand (or via
+`prefetchPolicy`, if enabled).
+
 ---
 
 ## 5. What does NOT apply to OCI

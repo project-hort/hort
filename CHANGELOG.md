@@ -7,6 +7,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A proxied multi-arch image index now starts its children's quarantine
+  windows at index ingest, not at first client access** (#229). Pulling a
+  multi-arch image through a proxy repository ingests the image index and
+  records the child manifests it declares — but until now those children were
+  fetched only when a client later asked for one, so the index's observation
+  window and each child's ran back to back. A base-image bump therefore cost
+  two full windows before the image was pullable. Every pull-through leg that
+  mints an index artifact — a pull by digest, a pull by tag, and a
+  request coalesced behind another repository's pull — now queues one
+  background ingest per declared child, so the windows run concurrently and the
+  image becomes pullable roughly a window sooner.
+
+  **No window is shortened.** Each child is held on ingest exactly as it would
+  have been on a later client pull, and its window is anchored the same way it
+  would have been then; a window that would have started tomorrow simply starts
+  today. Every child still needs its own window *and* its own scan verdict to
+  release, and releasing an index still does not release a held child. The
+  children are fetched by the worker, off the request path: an index pull's
+  own response is unchanged, and if the queue is unavailable the child simply
+  falls back to being fetched on first access as before. Eager child ingest is
+  unconditional — an index's children are the declared contents of the artifact
+  a client just asked for, not speculation — and adds no configuration.
+
+  **The fan-out is bounded.** A child that is itself an index queues its own
+  children, so a nested chain could otherwise grow without limit from a single
+  client pull of a pathological upstream. Alongside the existing per-index
+  child cap, the recursion now stops after four levels — real image trees nest
+  one — and says so in the log; children below the cap are not lost, they are
+  simply fetched on first access as before. Both bounds are fixed internal
+  limits, not settings: there is nothing here for an operator to tune.
+
+### Changed
+
+- **The prefetch-row retention sweep now also collects the background
+  index-child ingest's finished rows** (#229). `prefetch-row-retention-sweep`
+  previously covered only the transitive prefetch cascade, so the new
+  per-child ingest rows would have been kept forever. They are the same kind
+  of work — high-churn, best-effort, holding nothing durable — and re-running
+  a collected one is a no-op rather than a re-fetch, so they ride the same
+  sweep rather than getting one of their own.
+
+- **The prefetch-row retention sweep now ships enabled** (#229).
+  `scheduledTasks.prefetchRowRetentionSweep.enabled` defaulted to `false` on
+  the reasoning that the transitive prefetch cascade is opt-in per repository,
+  so a deployment that never opted in accumulated nothing for the sweep to
+  collect. That stopped being true once the background index-child ingest's
+  rows joined it: those accrue on any OCI proxy repository with no opt-in at
+  all, one per declared child manifest per image-index pull. A retention fix
+  that only reaches operators who had already enabled a sweep for an unrelated
+  feature is not a fix, so the default flips — the same day-one-rows reasoning
+  that has the scan-row sweep shipping enabled. **Both deployment flavours
+  move**: the Helm chart's `scheduledTasks.prefetchRowRetentionSweep.enabled`
+  and the Ansible role's `prefetch-row-retention-sweep` timer, which was
+  disabled for the same reason and additionally filed under "needs extra
+  infrastructure" although it needs none. An operator using neither feature
+  gains one idle scheduled task whose delete matches nothing. Operators who had
+  explicitly set the value keep whatever they set.
+
+### Fixed
+
+- **A proxied image index served under a single-image `Content-Type` now gets
+  its membership rows written** (#229). The pull-through path decided whether a
+  manifest was an index from the upstream's declared media type, while the rest
+  of the OCI ingest path decides from the manifest body. Where an upstream
+  mislabels an index — the bytes are an index, the header says single image —
+  the two disagreed, and the index's child-membership rows were silently never
+  recorded, which is the same incomplete-membership state the membership-edge
+  backfill exists to repair. Digest verification cannot catch this: the bytes
+  match their digest, only the header is wrong. The body now decides
+  everywhere; the declared type is still checked against it and a disagreement
+  is logged, but it no longer determines what is recorded.
+
 ## [0.13.0] - 2026-09-04
 
 ### Fixed

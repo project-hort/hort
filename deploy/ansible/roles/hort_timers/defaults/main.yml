@@ -38,6 +38,12 @@ hort_timers_tasks:
     on_calendar: "*-*-* 03:00:00"    # daily 03:00 (Helm: 0 3 * * *)
     enabled: true
     description: "Scrub the gitops config snapshot / CAS integrity."
+  - kind: prefetch-row-retention-sweep
+    path: dsn-direct
+    exec_subcommand: enqueue-prefetch-row-retention-sweep
+    on_calendar: "*-*-* 02:00:00"    # daily 02:00 (Helm: 0 2 * * *)
+    enabled: true
+    description: "Delete terminal prefetch job rows older than the retention horizon; also covers the eager OCI index-child ingest rows, which accrue on any OCI proxy repository with no opt-in at all."
   # ── enabled — admin-task (hort-cli; needs the cronjob-tasks token) ───────────
   - kind: scanner-registry-prune
     path: admin-task
@@ -88,12 +94,6 @@ hort_timers_tasks:
     on_calendar: "*:0/15"            # every 15 min (Helm: */15 * * * *)
     enabled: false
     description: "Walk prefetch-eligible repos + tracked packages and enqueue upstream-divergence prefetch jobs."
-  - kind: prefetch-row-retention-sweep
-    path: dsn-direct
-    exec_subcommand: enqueue-prefetch-row-retention-sweep
-    on_calendar: "*-*-* 02:00:00"    # daily 02:00 (Helm: 0 2 * * *)
-    enabled: false
-    description: "Delete terminal prefetch job rows older than the retention horizon."
   - kind: wheel-metadata-backfill
     path: dsn-direct
     exec_subcommand: enqueue-wheel-metadata-backfill

@@ -1056,7 +1056,7 @@ as of HEAD:
 | `scrub` | dsn-direct | `true` | `0 3 * * *` | `samplingRate`, `concurrency`, `actionOnMismatch` |
 | `quarantineReleaseSweep` | dsn-direct | `true` | `*/5 * * * *` | — |
 | `prefetchTick` | dsn-direct | `false` | `*/15 * * * *` | — |
-| `prefetchRowRetentionSweep` | dsn-direct | `false` | `0 2 * * *` | — |
+| `prefetchRowRetentionSweep` | dsn-direct | `true` | `0 2 * * *` | — |
 | `wheelMetadataBackfill` | dsn-direct | `false` | `0 4 * * 0` | `batchSize` |
 | `noop` | admin-task | `false` | `0 0 * * *` | — |
 | `stagingSweep` | admin-task | `false` | `*/15 * * * *` | — |

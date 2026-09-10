@@ -971,7 +971,7 @@
           }
         },
         "prefetchRowRetentionSweep": {
-          "description": "executionPath: dsn-direct. Periodic prefetch-row retention-sweep CronJob. Inserts a `kind='prefetch-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `PrefetchRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` rows older than a configurable horizon (default 7 days). Default-disabled (the cascade is opt-in per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`; if no repo opts in the table accumulates nothing). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "description": "executionPath: dsn-direct. Periodic prefetch-row retention-sweep CronJob. Inserts a `kind='prefetch-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `PrefetchRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` and `kind = 'oci-index-child-ingest'` rows older than a configurable horizon (default 7 days). Default-enabled, because `oci-index-child-ingest` rows accrue on any OCI proxy repository with no opt-in at all — one terminal row per declared child manifest per image-index pull-through — and are retained permanently without the sweep (the cascade's own `prefetch%` rows are opt-in per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`, so a deployment using neither feature just runs an idle CronJob). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
           "type": "object",
           "additionalProperties": false,
           "properties": {

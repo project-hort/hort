@@ -81,12 +81,13 @@ use hort_app::task_dispatcher::TaskDispatcher;
 use hort_app::task_handlers::eventstore_checkpoint::BackfillBaselineConfig;
 use hort_app::task_handlers::{
     AdvisoryWatchTickHandler, CronRescanTickHandler, EventStoreArchiveHandler,
-    EventstoreCheckpointHandler, NoopTaskHandler, OciMembershipEdgeBackfillHandler,
-    PrefetchDependenciesHandler, PrefetchIngestHandler, PrefetchRowRetentionSweepHandler,
-    PrefetchTickHandler, ProvenanceVerifyHandler, QuarantineReleaseSweepHandler,
-    ReplaySeenPruneHandler, RetentionEvaluateHandler, RetentionPurgeHandler,
-    ScanRowRetentionSweepHandler, ScanTaskHandler, ScannerRegistryPruneHandler, SeedImportHandler,
-    ServiceAccountRotationHandler, StagingSweepHandler, WheelMetadataBackfillHandler,
+    EventstoreCheckpointHandler, NoopTaskHandler, OciIndexChildIngestHandler,
+    OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler, PrefetchIngestHandler,
+    PrefetchRowRetentionSweepHandler, PrefetchTickHandler, ProvenanceVerifyHandler,
+    QuarantineReleaseSweepHandler, ReplaySeenPruneHandler, RetentionEvaluateHandler,
+    RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
+    ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
+    StagingSweepHandler, WheelMetadataBackfillHandler,
 };
 use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
 // IngestUseCase + ArtifactGroupUseCase are the dep subtree the worker
@@ -771,7 +772,8 @@ pub async fn build_app_context(
     //          single-flights the prefetch-vs-client-pull race.
     //
     //          `PrefetchRowRetentionSweepHandler` — periodically
-    //          deletes terminal `prefetch%` rows older than a
+    //          deletes terminal `prefetch%` and
+    //          `oci-index-child-ingest` rows older than a
     //          configurable horizon (default 7d). Enqueued by the
     //          `enqueue-prefetch-row-retention-sweep` hort-server
     //          subcommand.
@@ -1031,6 +1033,13 @@ pub async fn build_app_context(
         )),
         1,
     );
+
+    // The eager index-child ingest handler is registered further down, at
+    // the point where the live `UpstreamResolver` exists — it resolves each
+    // child through the same resolver the rest of the worker uses. Its
+    // dependency on `ingest_use_case` is carried there by this clone, taken
+    // before `SeedImportUseCase` below consumes the original.
+    let ingest_use_case_for_index_child = ingest_use_case.clone();
 
     let seed_import_use_case = Arc::new(SeedImportUseCase::new(
         ingest_use_case,
@@ -1418,6 +1427,12 @@ pub async fn build_app_context(
     // `HORT_UPSTREAM_RESOLVER_REFRESH_SECS` (default 60s, floor 5s) →
     // `reload`. With a primed resolver the proxy referrer-fetch arm fires
     // for proxy-scoped repos; hosted-repo provenance is unaffected.
+    //
+    // This ONE instance serves every worker consumer that needs it — the
+    // provenance orchestrator below and the eager index-child ingest handler
+    // registered just after it. A second instance would carry a second
+    // refresh clock, so the two could disagree about which upstream serves a
+    // name for up to a refresh interval.
     let caching_resolver = Arc::new(hort_adapters_upstream_http::CachingResolver::new());
     // Boot-prime from the same mapping repo the prefetch path uses. A
     // prime failure is logged but does NOT abort boot — an operator with
@@ -1478,6 +1493,75 @@ pub async fn build_app_context(
             }
         });
     }
+    // -----------------------------------------------------------------
+    // Register the OciIndexChildIngestHandler (kind
+    // `oci-index-child-ingest`). Registered HERE, after the boot-primed +
+    // background-refreshed `CachingResolver` above, so the handler resolves a
+    // child through the SAME resolver instance the rest of the worker uses
+    // rather than a second one with its own refresh clock. Its other
+    // dependency — `ingest_use_case`, for `ingest_verified` — is carried down
+    // from the leaf-prefetch block as `ingest_use_case_for_index_child`.
+    //
+    // Resolution is by the row's CLIENT-FACING requested name, which is what
+    // makes an eager child ingest fetch through exactly the mapping a lazy
+    // client pull of that child would use: the longest matching prefix, on a
+    // multi-upstream proxy whose mappings may all be prefix-scoped.
+    //
+    // One claimed row = one child manifest an OCI image index declared.
+    // The handler performs, up front, the verified upstream pull a later
+    // lazy client GET would have performed, so a multi-arch image's index
+    // quarantine window and its children's windows run concurrently
+    // instead of back to back. It shortens no window — the anchor still
+    // comes from `first_seen_for_checksum` (ADR 0054).
+    //
+    // Its own `HttpUpstreamProxy`, NOT a clone of the prefetch or
+    // provenance instance: `format_label` is the metric label fired on
+    // every outbound fetch, and cloning one subsystem's proxy into another
+    // mis-attributes its `hort_upstream_fetch_*` series (see
+    // docs/metrics-catalog.md — the worker's subsystem-labelled instances).
+    //
+    // Concurrency = 1 — single-active per worker replica, matching every
+    // other handler in this file. The per-row dedupe key already
+    // single-flights a given (repository, child digest), so raising
+    // concurrency buys parallelism only across distinct children, at the
+    // cost of N concurrent upstream fetches from one replica.
+    // -----------------------------------------------------------------
+    let upstream_proxy_for_index_child: Arc<dyn UpstreamProxy> = {
+        let cfg = hort_adapters_upstream_http::HttpUpstreamProxyConfig {
+            extra_trust_anchors: extra_ca.cloned(),
+            // Same upstream User-Agent as hort-server and the worker's other
+            // outbound legs (HORT_UPSTREAM_USER_AGENT or the built-in
+            // default), so a custom value applies uniformly.
+            user_agent: hort_adapters_upstream_http::user_agent_from_env(),
+            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("oci_index_child_ingest")
+        };
+        Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
+            cfg,
+            secret_port.clone(),
+        )?)
+    };
+    let oci_handler_for_index_child: Arc<dyn FormatHandler> = handlers
+        .get("oci")
+        .expect(
+            "hort-worker composition: `oci` FormatHandler must be registered for \
+             OciIndexChildIngestHandler (it re-derives the ingested child's OCI \
+             membership edges)",
+        )
+        .clone();
+    dispatcher.register(
+        Arc::new(OciIndexChildIngestHandler::new(
+            repositories.clone(),
+            artifacts.clone(),
+            upstream_proxy_for_index_child,
+            caching_resolver.clone(),
+            content_references.clone(),
+            jobs.clone(),
+            oci_handler_for_index_child,
+            ingest_use_case_for_index_child,
+        )),
+        1, // single-active — see rationale above
+    );
+
     let upstream_resolver_for_provenance: Arc<dyn UpstreamResolver> = caching_resolver;
     register_provenance_verify(
         &mut dispatcher,

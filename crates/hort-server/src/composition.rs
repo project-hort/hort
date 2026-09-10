@@ -46,6 +46,7 @@ use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUse
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
+use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
 use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
 use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
@@ -2592,6 +2593,13 @@ pub async fn build_app_context(
         content_references.clone(),
         repository_access_use_case.clone(),
     ));
+    // The OCI pull-through legs' door to the `jobs` table: one eager
+    // `oci-index-child-ingest` row per child an ingested image index
+    // declares, so the index's quarantine window and its children's run
+    // concurrently instead of back to back. Enqueue-only — the worker owns
+    // the consuming handler.
+    let oci_index_child_enqueue_use_case =
+        Arc::new(OciIndexChildEnqueueUseCase::new(jobs_repo.clone()));
     // `SecurityScoreUseCase`. Composed over the
     // `repo_security_scores` adapter + the repository_access use case
     // (for Read-side anti-enumeration on `find_for_repo` and visibility
@@ -3022,6 +3030,7 @@ pub async fn build_app_context(
         repository_access_use_case,
         virtual_resolution_use_case,
         content_reference_use_case,
+        oci_index_child_enqueue_use_case,
         ingest_use_case,
         user_use_case,
         api_token_use_case,

@@ -66,6 +66,10 @@ pub mod ingest_use_case;
 // extracts the principal + path and maps `AppError` → `ApiError`.
 pub mod manual_rescan_use_case;
 pub mod multi_hash;
+// The facade the OCI inbound-HTTP crate calls to queue eager ingest of
+// an image index's declared children. `AppContext::jobs` is `pub(crate)`
+// (ADR 0008), so a format crate reaches the queue through here.
+pub mod oci_index_child_enqueue;
 // OCI Distribution-Spec `/v2/auth` token exchange. See module-level
 // doc.
 pub mod oci_token_exchange_use_case;

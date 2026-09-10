@@ -767,9 +767,70 @@ pub trait JobsRepository: Send + Sync {
         })
     }
 
-    /// Retention sweep for the prefetch cascade — delete
-    /// terminal `kind LIKE 'prefetch%'` rows whose `updated_at <
-    /// now() - $horizon`. Returns the number of rows deleted.
+    /// Batch-insert jobs deduped by `idempotency_key`, absorbing
+    /// collisions in the index rather than surfacing them per row.
+    ///
+    /// The sibling of [`Self::enqueue_prefetch_batch`] for every cohort
+    /// whose dedup key is the **unscoped** `jobs_idempotency_key_uq`
+    /// index (`WHERE idempotency_key IS NOT NULL`, migration 009) rather
+    /// than the `prefetch%`-scoped `target_key` one. The two are not
+    /// interchangeable: `enqueue_prefetch_batch`'s `ON CONFLICT` names an
+    /// index that does not cover a non-`prefetch%` kind at all, so a
+    /// caller outside the cascade needs this entry point.
+    ///
+    /// The Postgres adapter runs a single multi-row
+    ///
+    /// ```sql
+    /// INSERT INTO public.jobs
+    ///     (kind, params, priority, trigger_source, idempotency_key, status)
+    ///     VALUES ($1,$2,…), ($n+1,$n+2,…), …
+    ///     ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL
+    ///     DO NOTHING
+    /// RETURNING id
+    /// ```
+    ///
+    /// The returned `Vec<Uuid>` holds one id per row that actually
+    /// inserted; rows the unique index absorbed do NOT appear, so a
+    /// caller counts dedup hits as `rows.len() - returned.len()`. Unlike
+    /// [`Self::enqueue_task`] there is no per-row
+    /// [`EnqueueOutcome::Duplicate`] and no existing-row id — a cohort
+    /// caller wants the counts, and recovering N existing ids would cost
+    /// the round-trip this entry point exists to remove. Two rows in the
+    /// same call carrying the same key collapse to one insert as well:
+    /// `DO NOTHING` resolves intra-statement conflicts the same way it
+    /// resolves conflicts with already-committed rows.
+    ///
+    /// **Why a separate entry point from [`Self::enqueue_task`]** — the
+    /// same argument [`Self::enqueue_prefetch_batch`] records, applied to
+    /// this index. `enqueue_task` is a single-row statement, so a cohort
+    /// of N means either N round-trips of latency and lock churn, or N
+    /// conflicts surfaced and swallowed one at a time. The
+    /// batch+ON-CONFLICT contract bundles both wins into one statement,
+    /// which matters most on the request path: the OCI eager index-child
+    /// enqueue runs inside a live pull-through's coalescing window, where
+    /// every extra round-trip is latency other clients pulling the same
+    /// index also wait behind.
+    ///
+    /// **Default implementation:** returns
+    /// `Err(DomainError::Invariant("enqueue_idempotent_batch not implemented"))`
+    /// so existing test fixtures that pre-date this method continue to
+    /// compile without modification.
+    fn enqueue_idempotent_batch<'a>(
+        &'a self,
+        rows: &'a [IdempotentEnqueueRow],
+    ) -> BoxFuture<'a, DomainResult<Vec<Uuid>>> {
+        let _ = rows;
+        Box::pin(async {
+            Err(DomainError::Invariant(
+                "enqueue_idempotent_batch not implemented".into(),
+            ))
+        })
+    }
+
+    /// Retention sweep for the pull-through ingest cascade — delete
+    /// terminal `kind LIKE 'prefetch%'` and `kind =
+    /// 'oci-index-child-ingest'` rows whose `updated_at < now() -
+    /// $horizon`. Returns the number of rows deleted.
     ///
     /// The cascade is high-churn (a closure-warm enqueues thousands
     /// of rows); without periodic GC the `jobs` table grows
@@ -777,10 +838,25 @@ pub trait JobsRepository: Send + Sync {
     ///
     /// ```sql
     /// DELETE FROM public.jobs
-    ///  WHERE kind LIKE 'prefetch%'
+    ///  WHERE (kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest')
     ///    AND status IN ('completed', 'failed')
     ///    AND updated_at < now() - $1::interval
     /// ```
+    ///
+    /// **Why `oci-index-child-ingest` rides this sweep and not its own.**
+    /// It is the same class of work as the cascade: high-churn (one row
+    /// per declared child manifest per repository, and an index declares
+    /// many), best-effort, and holding nothing durable in its terminal
+    /// row. Deleting one is safe because **the jobs row is the second
+    /// dedupe layer, not the only one**: `jobs.idempotency_key` suppresses
+    /// a re-enqueue only while the row exists, but the handler's
+    /// target-repository presence check suppresses the *work*
+    /// permanently. A swept row that is later re-enqueued short-circuits
+    /// on that check before it touches the network — a cheap no-op, never
+    /// a re-fetch and never a re-anchor. Every other `jobs.kind` outside
+    /// these two keeps its newest terminal row as durable state (e.g.
+    /// `verify-event-chain`'s liveness breadcrumb), which is why widening
+    /// the predicate further is not a free change.
     ///
     /// `pending`/`running` rows are deliberately excluded — they are
     /// either claim-pending (the worker has not picked them up yet)
@@ -878,9 +954,123 @@ pub struct PrefetchEnqueueRow {
     pub target_key: String,
 }
 
+/// One row to insert via [`JobsRepository::enqueue_idempotent_batch`].
+///
+/// The `idempotency_key` sibling of [`PrefetchEnqueueRow`]: same
+/// bundling rationale (the trait signature stays stable as columns are
+/// added), different dedup index.
+///
+/// There is deliberately no `actor_id`. Every cohort reaching this entry
+/// point is system-minted — a fan-out derived from content the server
+/// just ingested, not an operator action — so the column would be `NULL`
+/// on every row. A kind that needs operator attribution enqueues one row
+/// at a time through [`JobsRepository::enqueue_task`], which carries it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IdempotentEnqueueRow {
+    /// A `jobs.kind` CHECK literal (migration 009 and its successors).
+    pub kind: String,
+    /// JSONB row params — the per-kind handler shape.
+    pub params: serde_json::Value,
+    /// Priority ranking (see [`TriggerSource`]).
+    pub priority: i16,
+    /// One of the `trigger_source` CHECK literals (migration 009).
+    pub trigger_source: String,
+    /// Dedup key on the unscoped `jobs_idempotency_key_uq` partial
+    /// unique index. Non-optional: a row with no key has nothing to
+    /// dedup against and belongs on [`JobsRepository::enqueue_task`].
+    pub idempotency_key: IdempotencyKey,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `JobsRepository` implementing **only** the trait's required
+    /// methods, so every provided method it answers with is the trait's
+    /// own default.
+    ///
+    /// This is the fixture behind every `*_default_impl_*` test below:
+    /// each one pins what a mock that pre-dates a provided method does
+    /// when that method is called, which is only meaningful against an
+    /// impl that overrides nothing. Adding an override here would make
+    /// all of those tests assert the override instead of the default —
+    /// so a new provided method gets a new test, never a method on
+    /// `Bare`.
+    struct Bare;
+
+    impl JobsRepository for Bare {
+        fn claim_scan_jobs<'a>(
+            &'a self,
+            _worker_id: &'a str,
+            _batch_size: u32,
+            _lock_duration: Duration,
+        ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn mark_completed<'a>(
+            &'a self,
+            _job_id: Uuid,
+            _result_summary: serde_json::Value,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn reschedule<'a>(
+            &'a self,
+            _job_id: Uuid,
+            _backoff: Duration,
+            _last_error: &'a str,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn mark_failed<'a>(
+            &'a self,
+            _job_id: Uuid,
+            _last_error: &'a str,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn enqueue_scan<'a>(
+            &'a self,
+            _artifact_id: Uuid,
+            _repository_id: Uuid,
+            _content_hash: &'a ContentHash,
+            _format: &'a str,
+            _priority: i16,
+            _trigger_source: &'a str,
+        ) -> BoxFuture<'a, DomainResult<Uuid>> {
+            Box::pin(async { Ok(Uuid::nil()) })
+        }
+    }
+
+    /// The shared fixture answers every REQUIRED method inertly. The
+    /// `*_default_impl_*` tests below read a provided method's answer as
+    /// the trait's default; that reading only holds if nothing the
+    /// fixture does can influence it, which is what "inert" means here.
+    #[tokio::test]
+    async fn the_bare_fixture_answers_every_required_method_inertly() {
+        let repo: Box<dyn JobsRepository> = Box::new(Bare);
+        assert!(repo
+            .claim_scan_jobs("w", 1, Duration::from_secs(1))
+            .await
+            .expect("claim_scan_jobs")
+            .is_empty());
+        repo.mark_completed(Uuid::nil(), serde_json::json!({}))
+            .await
+            .expect("mark_completed");
+        repo.reschedule(Uuid::nil(), Duration::from_secs(1), "e")
+            .await
+            .expect("reschedule");
+        repo.mark_failed(Uuid::nil(), "e")
+            .await
+            .expect("mark_failed");
+        let hash: ContentHash = format!("{:064x}", 1).parse().expect("64-hex sha");
+        assert_eq!(
+            repo.enqueue_scan(Uuid::nil(), Uuid::nil(), &hash, "oci", 0, "manual")
+                .await
+                .expect("enqueue_scan"),
+            Uuid::nil(),
+        );
+    }
 
     /// Compile-time assertion that `JobsRepository` is dyn-compatible.
     #[test]
@@ -916,53 +1106,6 @@ mod tests {
     /// test pins the default-impl contract against accidental drift.
     #[tokio::test]
     async fn pending_scan_count_default_impl_returns_zero() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _worker_id: &'a str,
-                _batch_size: u32,
-                _lock_duration: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _backoff: Duration,
-                _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _artifact_id: Uuid,
-                _repository_id: Uuid,
-                _content_hash: &'a ContentHash,
-                _format: &'a str,
-                _priority: i16,
-                _trigger_source: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-            // Intentionally does NOT override `pending_scan_count` —
-            // the default is what we are pinning here.
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let depth = repo
             .pending_scan_count()
@@ -1040,53 +1183,6 @@ mod tests {
     /// returning wrong data.
     #[tokio::test]
     async fn enqueue_task_default_impl_returns_invariant_error() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _worker_id: &'a str,
-                _batch_size: u32,
-                _lock_duration: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _backoff: Duration,
-                _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _artifact_id: Uuid,
-                _repository_id: Uuid,
-                _content_hash: &'a ContentHash,
-                _format: &'a str,
-                _priority: i16,
-                _trigger_source: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-            // Intentionally does NOT override `enqueue_task` or `delete_job`
-            // — the defaults are what we are pinning here.
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let params = serde_json::json!({});
         let err = repo
@@ -1106,51 +1202,6 @@ mod tests {
     /// `None` or `Some` — the default ignores the new arg.
     #[tokio::test]
     async fn enqueue_task_default_impl_returns_invariant_error_with_idempotency_key() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _worker_id: &'a str,
-                _batch_size: u32,
-                _lock_duration: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _backoff: Duration,
-                _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _artifact_id: Uuid,
-                _repository_id: Uuid,
-                _content_hash: &'a ContentHash,
-                _format: &'a str,
-                _priority: i16,
-                _trigger_source: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let params = serde_json::json!({});
         let key = IdempotencyKey::try_from("cron:retention-purge:2026-06-03").expect("valid key");
@@ -1181,51 +1232,6 @@ mod tests {
     /// `JobsRepository::delete_job` default impl returns `Err(Invariant)`.
     #[tokio::test]
     async fn delete_job_default_impl_returns_invariant_error() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _worker_id: &'a str,
-                _batch_size: u32,
-                _lock_duration: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _backoff: Duration,
-                _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _job_id: Uuid,
-                _last_error: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _artifact_id: Uuid,
-                _repository_id: Uuid,
-                _content_hash: &'a ContentHash,
-                _format: &'a str,
-                _priority: i16,
-                _trigger_source: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let err = repo.delete_job(Uuid::nil()).await.unwrap_err();
         assert!(
@@ -1415,51 +1421,6 @@ mod tests {
     /// override it.
     #[tokio::test]
     async fn list_jobs_default_impl_returns_invariant_error() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _w: &'a str,
-                _b: u32,
-                _l: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _id: Uuid,
-                _b: Duration,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _id: Uuid,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _aid: Uuid,
-                _rid: Uuid,
-                _ch: &'a ContentHash,
-                _f: &'a str,
-                _p: i16,
-                _ts: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let err = repo
             .list_jobs(ListJobsFilter::default(), 10, None)
@@ -1474,51 +1435,6 @@ mod tests {
     /// `JobsRepository::get_job` default impl returns `Err(Invariant)`.
     #[tokio::test]
     async fn get_job_default_impl_returns_invariant_error() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _w: &'a str,
-                _b: u32,
-                _l: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _id: Uuid,
-                _b: Duration,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _id: Uuid,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _aid: Uuid,
-                _rid: Uuid,
-                _ch: &'a ContentHash,
-                _f: &'a str,
-                _p: i16,
-                _ts: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let err = repo.get_job(Uuid::nil()).await.unwrap_err();
         assert!(
@@ -1560,53 +1476,6 @@ mod tests {
     /// fail-safe (signals overdue), never fail-silent.
     #[tokio::test]
     async fn last_completed_at_by_kind_default_impl_returns_none() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _w: &'a str,
-                _b: u32,
-                _l: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _id: Uuid,
-                _b: Duration,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _id: Uuid,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _aid: Uuid,
-                _rid: Uuid,
-                _ch: &'a ContentHash,
-                _f: &'a str,
-                _p: i16,
-                _ts: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-            // Intentionally does NOT override
-            // `last_completed_at_by_kind` — the default is pinned here.
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let out = repo
             .last_completed_at_by_kind("staging-sweep")
@@ -1622,53 +1491,6 @@ mod tests {
     /// silently no-ops (observability-only, never fail-closed).
     #[tokio::test]
     async fn record_run_completion_default_impl_returns_ok() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _w: &'a str,
-                _b: u32,
-                _l: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _id: Uuid,
-                _b: Duration,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _id: Uuid,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _aid: Uuid,
-                _rid: Uuid,
-                _ch: &'a ContentHash,
-                _f: &'a str,
-                _p: i16,
-                _ts: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-            // Intentionally does NOT override `record_run_completion` —
-            // the default is pinned here.
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         repo.record_run_completion("verify-event-chain", Utc::now())
             .await
@@ -1680,51 +1502,6 @@ mod tests {
     /// Tests and adapters that exercise the dispatcher override this method.
     #[tokio::test]
     async fn claim_pending_by_kinds_default_impl_returns_invariant_error() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _w: &'a str,
-                _b: u32,
-                _l: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _id: Uuid,
-                _b: Duration,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _id: Uuid,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _aid: Uuid,
-                _rid: Uuid,
-                _ch: &'a ContentHash,
-                _f: &'a str,
-                _p: i16,
-                _ts: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let err = repo
             .claim_pending_by_kinds(&["noop"], 10, "worker-test", Duration::from_secs(60))
@@ -1743,51 +1520,6 @@ mod tests {
     /// reporting "no rows inserted".
     #[tokio::test]
     async fn enqueue_prefetch_batch_default_impl_returns_invariant_error() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _w: &'a str,
-                _b: u32,
-                _l: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _id: Uuid,
-                _b: Duration,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _id: Uuid,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _aid: Uuid,
-                _rid: Uuid,
-                _ch: &'a ContentHash,
-                _f: &'a str,
-                _p: i16,
-                _ts: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let rows = vec![PrefetchEnqueueRow {
             kind: "prefetch".to_string(),
@@ -1803,57 +1535,35 @@ mod tests {
         );
     }
 
+    /// `enqueue_idempotent_batch` default impl surfaces `Invariant` for
+    /// the same reason its `target_key` sibling does: a mock that
+    /// pre-dates the method must fail loudly rather than silently
+    /// reporting "no rows inserted", which a caller counting
+    /// `rows.len() - returned.len()` would read as "all deduped".
+    #[tokio::test]
+    async fn enqueue_idempotent_batch_default_impl_returns_invariant_error() {
+        let repo: Box<dyn JobsRepository> = Box::new(Bare);
+        let rows = vec![IdempotentEnqueueRow {
+            kind: "oci-index-child-ingest".to_string(),
+            params: serde_json::json!({"x": 1}),
+            priority: 0,
+            trigger_source: "ingest".to_string(),
+            idempotency_key: IdempotencyKey::try_from("some-key".to_string())
+                .expect("valid idempotency key"),
+        }];
+        let err = repo.enqueue_idempotent_batch(&rows).await.unwrap_err();
+        assert!(
+            matches!(err, DomainError::Invariant(_)),
+            "expected Invariant for enqueue_idempotent_batch default impl, got {err:?}"
+        );
+    }
+
     /// `delete_terminal_prefetch_rows_older_than` default impl surfaces
     /// `Invariant` for the same reason as `enqueue_prefetch_batch` —
     /// a mock that returns `Ok(0)` would silently pass the retention
     /// sweep tests.
     #[tokio::test]
     async fn delete_terminal_prefetch_rows_older_than_default_impl_returns_invariant_error() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _w: &'a str,
-                _b: u32,
-                _l: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _id: Uuid,
-                _b: Duration,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _id: Uuid,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _aid: Uuid,
-                _rid: Uuid,
-                _ch: &'a ContentHash,
-                _f: &'a str,
-                _p: i16,
-                _ts: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let err = repo
             .delete_terminal_prefetch_rows_older_than(Duration::from_secs(86_400 * 7))
@@ -1871,51 +1581,6 @@ mod tests {
     /// `Ok(0)` would silently pass the retention sweep tests.
     #[tokio::test]
     async fn delete_terminal_scan_rows_older_than_default_impl_returns_invariant_error() {
-        struct Bare;
-        impl JobsRepository for Bare {
-            fn claim_scan_jobs<'a>(
-                &'a self,
-                _w: &'a str,
-                _b: u32,
-                _l: Duration,
-            ) -> BoxFuture<'a, DomainResult<Vec<ScanJob>>> {
-                Box::pin(async { Ok(Vec::new()) })
-            }
-            fn mark_completed<'a>(
-                &'a self,
-                _id: Uuid,
-                _result_summary: serde_json::Value,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn reschedule<'a>(
-                &'a self,
-                _id: Uuid,
-                _b: Duration,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn mark_failed<'a>(
-                &'a self,
-                _id: Uuid,
-                _e: &'a str,
-            ) -> BoxFuture<'a, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
-            fn enqueue_scan<'a>(
-                &'a self,
-                _aid: Uuid,
-                _rid: Uuid,
-                _ch: &'a ContentHash,
-                _f: &'a str,
-                _p: i16,
-                _ts: &'a str,
-            ) -> BoxFuture<'a, DomainResult<Uuid>> {
-                Box::pin(async { Ok(Uuid::nil()) })
-            }
-        }
-
         let repo: Box<dyn JobsRepository> = Box::new(Bare);
         let err = repo
             .delete_terminal_scan_rows_older_than(Duration::from_secs(86_400 * 7))
@@ -1941,5 +1606,33 @@ mod tests {
         };
         let r2 = r1.clone();
         assert_eq!(r1, r2);
+    }
+
+    /// `IdempotentEnqueueRow` round-trips by clone + equality, and two
+    /// rows differing only in the dedup key are NOT equal — the field
+    /// that decides which rows the unique index collapses must
+    /// participate in equality, or a test asserting "the cohort carried
+    /// these keys" could pass on the wrong keys.
+    #[test]
+    fn idempotent_enqueue_row_clone_and_eq() {
+        let r1 = IdempotentEnqueueRow {
+            kind: "oci-index-child-ingest".to_string(),
+            params: serde_json::json!({"repository_id": "0000-…", "depth": 0}),
+            priority: 0,
+            trigger_source: "ingest".to_string(),
+            idempotency_key: IdempotencyKey::try_from(
+                "oci-index-child-ingest:00000000-0000-0000-0000-000000000000:abc".to_string(),
+            )
+            .expect("valid idempotency key"),
+        };
+        let r2 = r1.clone();
+        assert_eq!(r1, r2);
+
+        let mut r3 = r1.clone();
+        r3.idempotency_key = IdempotencyKey::try_from(
+            "oci-index-child-ingest:00000000-0000-0000-0000-000000000000:def".to_string(),
+        )
+        .expect("valid idempotency key");
+        assert_ne!(r1, r3);
     }
 }

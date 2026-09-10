@@ -48,6 +48,7 @@ use hort_app::use_cases::promotion_use_case::PromotionUseCase;
 // Repo-keyed self-service prefetch endpoint use
 // case (`POST /api/v1/repositories/{repo_key}/prefetch`). Consumed by
 // the `hort-http-discovery` inbound adapter.
+use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
 use hort_app::use_cases::ref_use_case::RefUseCase;
@@ -259,6 +260,12 @@ pub struct AppContext {
     /// path and the no-authz write methods carry an explicit trust
     /// contract (ADR 0008).
     pub content_reference_use_case: Arc<ContentReferenceUseCase>,
+    /// Queues eager ingest of an OCI image index's declared children from
+    /// the pull-through legs. Format crates enqueue through here because
+    /// the `jobs` port is `pub(crate)` (ADR 0008), and because keeping the
+    /// producer beside its consumer task handler gives the row's params and
+    /// dedupe key one compiler-checked definition.
+    pub oci_index_child_enqueue_use_case: Arc<OciIndexChildEnqueueUseCase>,
     pub ingest_use_case: Arc<IngestUseCase>,
     pub user_use_case: Arc<UserUseCase>,
     /// Native API token issuance / revocation
@@ -881,6 +888,8 @@ pub struct AppContextParts {
     /// See [`AppContext::virtual_resolution_use_case`].
     pub virtual_resolution_use_case: Arc<VirtualResolutionUseCase>,
     pub content_reference_use_case: Arc<ContentReferenceUseCase>,
+    /// See [`AppContext::oci_index_child_enqueue_use_case`].
+    pub oci_index_child_enqueue_use_case: Arc<OciIndexChildEnqueueUseCase>,
     pub ingest_use_case: Arc<IngestUseCase>,
     pub user_use_case: Arc<UserUseCase>,
     /// See [`AppContext::api_token_use_case`].
@@ -1018,6 +1027,7 @@ impl AppContext {
             repository_access_use_case: parts.repository_access_use_case,
             virtual_resolution_use_case: parts.virtual_resolution_use_case,
             content_reference_use_case: parts.content_reference_use_case,
+            oci_index_child_enqueue_use_case: parts.oci_index_child_enqueue_use_case,
             ingest_use_case: parts.ingest_use_case,
             user_use_case: parts.user_use_case,
             api_token_use_case: parts.api_token_use_case,
