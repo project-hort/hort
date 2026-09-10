@@ -87,6 +87,14 @@ pub mod staging_sweep;
 // and re-derives + writes the missing membership edges. No CronJob —
 // see the module doc for why. Manual admin-tasks invocation only.
 pub mod oci_membership_edge_backfill;
+// Eager ingest of one child manifest declared by an OCI image index (kind
+// `oci-index-child-ingest`). Performs, up front, the verified upstream
+// pull a later lazy client GET would have performed, so a multi-arch
+// image's index window and its children's windows run concurrently
+// instead of back to back. Recursion into a nested index falls out of the
+// handler enqueueing its own kind. Shortens no quarantine window — the
+// anchor still comes from `first_seen_for_checksum` (ADR 0054).
+pub mod oci_index_child_ingest;
 // PEP 658 wheel-metadata backfill (kind
 // `wheel-metadata-backfill`). Operator-opt-in retrofit: walks PyPI
 // wheels without a `wheel_metadata` ContentReference and runs the
@@ -102,6 +110,7 @@ pub use eventstore_checkpoint::{
     CheckpointEmissionHook, CheckpointEmitterHookAdapter, EventstoreCheckpointHandler,
 };
 pub use noop::NoopTaskHandler;
+pub use oci_index_child_ingest::{OciIndexChildIngestHandler, OCI_INDEX_CHILD_INGEST_KIND};
 pub use oci_membership_edge_backfill::OciMembershipEdgeBackfillHandler;
 pub use policy_reevaluation::PolicyReEvaluationHandler;
 pub use prefetch_dependencies::{target_key as prefetch_target_key, PrefetchDependenciesHandler};

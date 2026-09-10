@@ -2256,16 +2256,25 @@ that every `READ_PATH_PROXY_FORMATS` entry is wired, so an
 incomplete composition fails at boot. A silent fallback instance is
 the defect, not the remedy.
 
-The worker builds two **subsystem-labelled** instances that fetch
+The worker builds three **subsystem-labelled** instances that fetch
 through the same adapter but are not a single artifact format:
 `prefetch_tick` (the scheduled prefetch tick / leaf-pull, which
-walks npm/cargo/pypi) and `provenance` (the upstream
-Sigstore-referrer fetch in the `provenance-verify` job). These are
+walks npm/cargo/pypi), `provenance` (the upstream
+Sigstore-referrer fetch in the `provenance-verify` job), and
+`oci_index_child_ingest` (the eager per-child manifest fetch in the
+`oci-index-child-ingest` job — one outbound fetch per child an OCI
+image index declares). These are
 intentional non-format `format` values so dashboards separate
 background traffic from the server hot path, and they are **not**
 converted to per-artifact-format labels: the prefetch tick walks
 npm/cargo/pypi within one job, so a per-format split there would
-name the artifact rather than the subsystem doing the work. Cloning
+name the artifact rather than the subsystem doing the work.
+`oci_index_child_ingest` is OCI-only but is still labelled by
+subsystem rather than folded into `format="oci"`: an operator
+triaging an upstream-fetch spike needs to tell "clients are pulling
+images" from "a base-image bump just fanned out one fetch per
+declared child", and the two are different capacity questions.
+Cloning
 one subsystem's proxy for another would mis-attribute its
 `hort_upstream_fetch_*` series (provenance traffic once emitted
 `format="prefetch_tick"` exactly this way).

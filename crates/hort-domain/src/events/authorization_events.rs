@@ -586,7 +586,7 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
 /// admin-invoke set, so validating against the wider SQL-CHECK set would
 /// be validation widening with no producing emitter).
 ///
-/// This set is exactly [`ADMIN_INVOKABLE_TASK_KINDS`] plus the two
+/// This set is exactly [`ADMIN_INVOKABLE_TASK_KINDS`] plus the three
 /// DB-CHECK-only kinds that are valid `jobs.kind` values but never
 /// admin-invokable:
 /// - `"scan"` — only `JobsRepository::enqueue_scan` writes this kind,
@@ -595,6 +595,36 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
 /// - `"verify-event-chain"` — a liveness breadcrumb written directly by
 ///   the `hort-server verify-event-chain` CLI subcommand, not by a
 ///   worker-dispatched `TaskHandler`.
+/// - `"oci-index-child-ingest"` — eager ingest of ONE child manifest an OCI
+///   image index declares, consumed by `OciIndexChildIngestHandler` in the
+///   worker. One row per `manifests[].digest`: resolve the repository + its
+///   catch-all upstream mapping, short-circuit when the target repository
+///   already holds the content hash, fetch the child by digest, verify the
+///   upstream-declared digest against the requested one, ingest through
+///   `IngestUseCase::ingest_verified`, re-derive the child's own
+///   `oci_config`/`oci_layer` membership edges, and — when the child is itself
+///   an index — register its `oci_index_member` rows and enqueue one row of
+///   this same kind per grandchild (recursion falls out of the handler
+///   enqueueing its own kind; no depth knob, and the domain's per-index child
+///   cap bounds each level). Handler-enqueued only — the index ingest path
+///   mints the first generation and the handler mints each nested one, so
+///   there is no operator-invoke surface to gate. Dedup is the
+///   `jobs_idempotency_key_uq` partial unique index over the composed
+///   `oci-index-child-ingest:{repository_id}:{child_digest}` key. **Shortens
+///   no quarantine window** — ADR 0054 derives the anchor from
+///   `ArtifactRepository::first_seen_for_checksum`, so an eagerly-ingested
+///   child receives exactly the anchor a later lazy pull would have given it;
+///   ADR 0043 D4 and the ADR 0007 release predicate are untouched (every child
+///   still needs its own window AND its own scan verdict). Non-destructive: it
+///   only mints artifacts the lazy pull path would have minted anyway. Params:
+///   `{"repository_id": <uuid>, "upstream_name": <string>, "child_digest":
+///   "sha256:…"}` — the child's media type is deliberately NOT a param, so a
+///   stale row cannot disagree with what upstream serves. Run summary:
+///   `{ repository_id, upstream_name, child_digest, outcome, is_index,
+///   membership_edges_written, grandchildren_enqueued, grandchildren_deduped,
+///   grandchildren_failed }`, `outcome` ∈ `ingested` / `already_present` /
+///   `repository_missing` / `upstream_mapping_missing` / `upstream_not_found`
+///   / `hard_failure`.
 pub const EVENT_TASK_KINDS: &[&str] = &[
     "scan",
     "cron-rescan-tick",
@@ -620,6 +650,7 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
     "verify-event-chain",
     "policy-reevaluation",
     "oci-membership-edge-backfill",
+    "oci-index-child-ingest",
 ];
 
 // ---------------------------------------------------------------------------

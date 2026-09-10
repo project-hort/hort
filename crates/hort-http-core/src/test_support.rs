@@ -63,6 +63,7 @@ use hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase;
 // Wired into the mock `AppContext` so the `hort-http-discovery` handler
 // tests can drive `POST /api/v1/repositories/:repo_key/prefetch` through
 // the shared harness.
+use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
 use hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase;
 use hort_app::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
 use hort_app::use_cases::task_use_case::TaskUseCase;
@@ -1334,6 +1335,7 @@ pub fn build_mock_ctx_with_label_flag(
         repository_access_use_case,
         virtual_resolution_use_case,
         content_reference_use_case,
+        oci_index_child_enqueue_use_case: Arc::new(OciIndexChildEnqueueUseCase::new(jobs.clone())),
         ingest_use_case,
         user_use_case,
         api_token_use_case,
@@ -1574,6 +1576,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         repository_access_use_case: base.repository_access_use_case.clone(),
         virtual_resolution_use_case: base.virtual_resolution_use_case.clone(),
         content_reference_use_case: base.content_reference_use_case.clone(),
+        oci_index_child_enqueue_use_case: base.oci_index_child_enqueue_use_case.clone(),
         ingest_use_case: base.ingest_use_case.clone(),
         user_use_case: base.user_use_case.clone(),
         api_token_use_case: base.api_token_use_case.clone(),

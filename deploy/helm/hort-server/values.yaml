@@ -1603,8 +1603,10 @@ scheduledTasks:
   # ONE `kind='prefetch-row-retention-sweep'` row into `public.jobs`
   # every tick using the RUNTIME DSN; the worker picks it up and runs
   # `PrefetchRowRetentionSweepHandler`, which deletes terminal
-  # (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'`
-  # rows older than a configurable horizon (default 7 days).
+  # (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` and
+  # `kind = 'oci-index-child-ingest'` rows older than a configurable
+  # horizon (default 7 days) — the pull-through ingest cascade's rows,
+  # none of which hold durable state.
   #
   # Pairs with the per-table autovacuum tuning on `public.jobs`
   # (migration 009: `autovacuum_vacuum_scale_factor = 0.02`). The
@@ -1617,12 +1619,18 @@ scheduledTasks:
   # `hort-http-admin-tasks` HTTP route.
   prefetchRowRetentionSweep:
     executionPath: dsn-direct
-    # Render the CronJob. **Default false.** The cascade is opt-in
-    # per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`;
-    # if no repo opts in the `jobs` table accumulates nothing and the
-    # sweep has nothing to delete. An operator enabling the cascade
-    # should also enable this sweep so `jobs` does not grow unbounded.
-    enabled: false
+    # Render the CronJob. **Default true**, because this sweep's rows
+    # accrue unconditionally: an OCI proxy repository mints one terminal
+    # `oci-index-child-ingest` row per declared child manifest on every
+    # pull-through of an image index, from day one and with no per-repo
+    # opt-in. Without the sweep those rows are retained permanently.
+    #
+    # The transitive prefetch cascade's own `prefetch%` rows ARE opt-in
+    # per-repo (`prefetch_policy.triggers.contains(TransitiveDeps)`), so
+    # a deployment that opts into neither feature simply runs an idle
+    # CronJob whose DELETE matches nothing — a far smaller cost than the
+    # unbounded table growth the default-off setting left in place.
+    enabled: true
     # Cron schedule. Default: daily at 02:00 UTC. The 7-day retention
     # 7-day retention horizon gives 6 days of headroom even after a
     # missed run; daily cadence + autovacuum tuning is sufficient for

@@ -8,8 +8,10 @@
 //! then claims the row and dispatches to
 //! [`PrefetchRowRetentionSweepHandler`](
 //!     hort_app::task_handlers::PrefetchRowRetentionSweepHandler),
-//! which deletes terminal `kind LIKE 'prefetch%'` rows older than a
-//! configurable horizon (default 7 days).
+//! which deletes terminal `kind LIKE 'prefetch%'` and
+//! `kind = 'oci-index-child-ingest'` rows older than a configurable
+//! horizon (default 7 days) — the pull-through ingest cascade's rows,
+//! none of which hold durable state.
 //!
 //! ## Why a DB-only subcommand instead of `hort-cli admin task invoke`
 //!

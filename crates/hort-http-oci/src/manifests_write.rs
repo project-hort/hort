@@ -1715,6 +1715,18 @@ async fn resolve_referenced_blobs(
 /// never wrote them, so every proxy descendant's target-check always
 /// missed and got the full quarantine window (the bug this closes).
 ///
+/// **The body decides whether this is an index, never the declared media
+/// type.** `media_type` is the upstream's `Content-Type`, which an upstream
+/// can get wrong; the body is the bytes that were hashed, verified against
+/// the digest and stored, and it is what every other consumer of a pulled
+/// manifest dispatches on. Deciding here on the header instead would mean a
+/// structurally-index body served under an image-manifest `Content-Type`
+/// gets its children ingested while its `oci_index_member` rows are never
+/// written — the incomplete-membership defect the membership-edge backfill
+/// exists to repair, and one digest verification cannot catch because the
+/// bytes match their digest and only the header lies. A disagreement is
+/// still worth knowing about, so it is logged; it just does not decide.
+///
 /// **Non-fatal by design.** The manifest is already committed
 /// (`ArtifactIngested` has landed) by the time this runs — a parse or
 /// insert failure here must not fail the pull-through response or undo
@@ -1732,7 +1744,18 @@ pub(crate) async fn register_membership_edges_from_pull(
     media_type: &str,
     body: &[u8],
 ) {
-    let referenced = if is_index_media_type(media_type) {
+    let body_is_index = hort_domain::oci::is_image_index(body);
+    if is_index_media_type(media_type) != body_is_index {
+        tracing::warn!(
+            manifest_artifact_id = %manifest_artifact_id,
+            %repo_id,
+            media_type,
+            body_is_index,
+            "OCI pull-through: upstream media type disagrees with the manifest body's \
+             shape; membership edges follow the body"
+        );
+    }
+    let referenced = if body_is_index {
         match parse_index_children(body) {
             Ok(r) => r,
             Err(detail) => {
@@ -4128,13 +4151,12 @@ mod tests {
         );
     }
 
-    /// A body that fails to parse (malformed JSON, or a well-formed
-    /// index whose declared media type is single-image so the wrong
-    /// parser runs — either way `parse_manifest_blobs`/
-    /// `parse_index_children` returns `Err`) is a non-fatal, silent skip:
-    /// no `content_references` rows are written, and the function
-    /// returns normally (no panic). Register-only is best-effort by
-    /// design — the manifest is already committed by the time this runs.
+    /// A body that fails to parse — malformed JSON, or a body neither
+    /// `parse_manifest_blobs` nor `parse_index_children` can enumerate — is
+    /// a non-fatal, silent skip: no `content_references` rows are written,
+    /// and the function returns normally (no panic). Register-only is
+    /// best-effort by design — the manifest is already committed by the
+    /// time this runs.
     #[test]
     fn register_membership_edges_from_pull_malformed_body_is_skipped_non_fatal() {
         let entry_count = run(async {
@@ -4159,6 +4181,100 @@ mod tests {
             entry_count, 0,
             "a malformed body must write zero edges, not panic or partially write"
         );
+    }
+
+    /// An upstream serving a structurally-index body under a SINGLE-IMAGE
+    /// `Content-Type` still gets `oci_index_member` edges: the pull-through
+    /// edge write, the eager child-ingest enqueue and the child-ingest
+    /// handler all decide on the body, so the feature has exactly one answer
+    /// to index-versus-image. Deciding on the header here would ingest the
+    /// children while never writing the index's membership rows, and digest
+    /// verification cannot catch that — the bytes match, the header lies.
+    #[test]
+    fn register_membership_edges_from_pull_index_body_under_image_media_type_writes_member_edges() {
+        let (member_rows, config_rows) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child: ContentHash = hex::encode(Sha256::digest(b"pull-child")).parse().unwrap();
+            let body = build_index_json(
+                std::slice::from_ref(&child),
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let manifest_artifact_id = Uuid::new_v4();
+
+            register_membership_edges_from_pull(
+                &h.ctx,
+                repo_id,
+                manifest_artifact_id,
+                // The lie: an index body announced as a single-image manifest.
+                "application/vnd.oci.image.manifest.v1+json",
+                &body,
+            )
+            .await;
+
+            let member_rows = h
+                .content_references
+                .find_by_target(repo_id, &child, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            (member_rows, h.content_references.entry_count())
+        });
+        assert_eq!(
+            member_rows, 1,
+            "the body's shape decides: an index body gets oci_index_member edges whatever \
+             Content-Type the upstream declared"
+        );
+        assert_eq!(
+            config_rows, 1,
+            "and nothing else — the single-image parse must not have run"
+        );
+    }
+
+    /// The mirror case: a single-image body announced as an index writes the
+    /// `oci_config`/`oci_layer` edges the bytes actually call for, not the
+    /// zero child edges the declared type would have produced.
+    #[test]
+    fn register_membership_edges_from_pull_image_body_under_index_media_type_writes_blob_edges() {
+        let (config_rows, layer_rows) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash: ContentHash =
+                hex::encode(Sha256::digest(b"pull-config")).parse().unwrap();
+            let layer_hash: ContentHash =
+                hex::encode(Sha256::digest(b"pull-layer")).parse().unwrap();
+            let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
+            let manifest_artifact_id = Uuid::new_v4();
+
+            register_membership_edges_from_pull(
+                &h.ctx,
+                repo_id,
+                manifest_artifact_id,
+                "application/vnd.oci.image.index.v1+json",
+                &body,
+            )
+            .await;
+
+            let config_rows = h
+                .content_references
+                .find_by_target(repo_id, &config_hash, Some("oci_config"))
+                .await
+                .unwrap()
+                .len();
+            let layer_rows = h
+                .content_references
+                .find_by_target(repo_id, &layer_hash, Some("oci_layer"))
+                .await
+                .unwrap()
+                .len();
+            (config_rows, layer_rows)
+        });
+        assert_eq!(config_rows, 1);
+        assert_eq!(layer_rows, 1);
     }
 
     /// A Docker manifest-list media type routes down the same index path.

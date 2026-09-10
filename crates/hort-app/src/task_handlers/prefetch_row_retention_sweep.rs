@@ -10,10 +10,20 @@
 //!
 //! ```sql
 //! DELETE FROM public.jobs
-//!  WHERE kind LIKE 'prefetch%'
+//!  WHERE (kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest')
 //!    AND status IN ('completed', 'failed')
 //!    AND updated_at < now() - $horizon
 //! ```
+//!
+//! `oci-index-child-ingest` rides this sweep because it is the same
+//! class of work: high-churn (one row per declared child manifest per
+//! repository), best-effort, and holding nothing durable in its
+//! terminal row. The jobs row is that kind's **second** dedupe layer,
+//! not its only one — its handler's target-repository presence check
+//! suppresses the work permanently — so a swept row that is later
+//! re-enqueued is a cheap no-op rather than a re-fetch. See
+//! [`JobsRepository::delete_terminal_prefetch_rows_older_than`] for the
+//! full statement of that invariant.
 //!
 //! Pairs with the per-table autovacuum tuning on `public.jobs`
 //! (migration 009): the sweep deletes the rows, autovacuum reclaims

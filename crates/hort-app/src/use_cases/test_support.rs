@@ -130,6 +130,13 @@ pub struct MockArtifactRepository {
     /// age-evidence read must fall back on the mint instant (a full
     /// window), never on an invented earlier instant.
     first_seen_errors: Mutex<std::collections::VecDeque<DomainError>>,
+    /// FIFO of injected errors for
+    /// [`find_by_repo_and_checksum`](ArtifactRepository::find_by_repo_and_checksum).
+    /// Each call pops the front and returns it verbatim. Used to pin the
+    /// posture of callers whose repo-scoped presence check gates an upstream
+    /// fetch: a failed lookup must not be read as "not present" and quietly
+    /// re-fetch (or re-mint) content the repository may already hold.
+    find_by_repo_and_checksum_errors: Mutex<std::collections::VecDeque<DomainError>>,
     /// Every accepted [`ArtifactRepository::delete`] call, in order, with
     /// the actor it was attributed to. Lets a test assert that the
     /// caller's identity actually reaches the port instead of being
@@ -166,6 +173,7 @@ impl MockArtifactRepository {
             pypi_wheels_without_kind_filter: Mutex::new(None),
             oci_image_manifests_without_kind_filter: Mutex::new(None),
             first_seen_errors: Mutex::new(std::collections::VecDeque::new()),
+            find_by_repo_and_checksum_errors: Mutex::new(std::collections::VecDeque::new()),
             deletions: Mutex::new(Vec::new()),
             pypi_calls: Mutex::new(Vec::new()),
             oci_calls: Mutex::new(Vec::new()),
@@ -183,6 +191,17 @@ impl MockArtifactRepository {
     /// consecutive failures.
     pub fn fail_next_first_seen(&self, err: DomainError) {
         self.first_seen_errors.lock().unwrap().push_back(err);
+    }
+
+    /// Arm the next
+    /// [`find_by_repo_and_checksum`](ArtifactRepository::find_by_repo_and_checksum)
+    /// call to fail with `err`. Queued, so a test can arm several consecutive
+    /// failures.
+    pub fn fail_next_find_by_repo_and_checksum(&self, err: DomainError) {
+        self.find_by_repo_and_checksum_errors
+            .lock()
+            .unwrap()
+            .push_back(err);
     }
 
     /// Pin the allowlist that
@@ -376,6 +395,14 @@ impl ArtifactRepository for MockArtifactRepository {
         repository_id: Uuid,
         sha256: &ContentHash,
     ) -> BoxFut<'_, DomainResult<Option<Artifact>>> {
+        if let Some(err) = self
+            .find_by_repo_and_checksum_errors
+            .lock()
+            .unwrap()
+            .pop_front()
+        {
+            return Box::pin(async move { Err(err) });
+        }
         let sha = sha256.as_ref().to_string();
         let result = self
             .artifacts
@@ -5258,6 +5285,14 @@ pub struct MockUpstreamProxy {
     /// the seeded fixture. Drives the `land_one_referrer` skip arm that
     /// fires when the upstream manifest fetch yields no cached body.
     next_manifest_no_cache_handle: Mutex<bool>,
+    /// One-shot flag: when set, the next `fetch_manifest` call returns a
+    /// `ManifestFetchOutcome` whose `cache_handle` points at a path that does
+    /// **not** exist, instead of writing the seeded fixture to a tempfile.
+    /// Drives the "the cached body could not be read" arm in consumers that
+    /// open `cache_handle.path` themselves — distinct from
+    /// [`Self::next_manifest_yields_no_cache_handle`], which drives the
+    /// "there is no handle at all" arm.
+    next_manifest_unreadable_cache_handle: Mutex<bool>,
 }
 
 impl MockUpstreamProxy {
@@ -5274,6 +5309,7 @@ impl MockUpstreamProxy {
             referrers: Mutex::new(HashMap::new()),
             next_referrers_error: Mutex::new(None),
             next_manifest_no_cache_handle: Mutex::new(false),
+            next_manifest_unreadable_cache_handle: Mutex::new(false),
         }
     }
 
@@ -5447,6 +5483,17 @@ impl MockUpstreamProxy {
     pub fn next_manifest_yields_no_cache_handle(&self) {
         *self.next_manifest_no_cache_handle.lock().unwrap() = true;
     }
+
+    /// Arm the next `fetch_manifest` call to return a `ManifestFetchOutcome`
+    /// carrying a `cache_handle` whose `path` does not exist, so a consumer
+    /// that opens the path itself hits its own "cached body unreadable" arm.
+    /// One-shot, cleared on consumption. The response-header surface
+    /// (`media_type` / `declared_digest` / `last_modified`) still comes from
+    /// the seeded fixture, so a test can drive the read failure without also
+    /// losing the headers it verified against.
+    pub fn next_manifest_yields_unreadable_cache_handle(&self) {
+        *self.next_manifest_unreadable_cache_handle.lock().unwrap() = true;
+    }
 }
 
 impl Default for MockUpstreamProxy {
@@ -5514,6 +5561,11 @@ impl UpstreamProxy for MockUpstreamProxy {
             let mut guard = self.next_manifest_no_cache_handle.lock().unwrap();
             std::mem::replace(&mut *guard, false)
         };
+        // One-shot "the handle points at a path that is not there" outcome.
+        let unreadable_cache_handle = {
+            let mut guard = self.next_manifest_unreadable_cache_handle.lock().unwrap();
+            std::mem::replace(&mut *guard, false)
+        };
         let key = (mapping.path_prefix, upstream_name, reference);
         let entry = self.manifests.lock().unwrap().get(&key).cloned();
         Box::pin(async move {
@@ -5533,10 +5585,21 @@ impl UpstreamProxy for MockUpstreamProxy {
                 DomainError::Invariant(format!("upstream:not_found:mock manifest {key:?}"))
             })?;
             let bytes_read = fixture.bytes.len() as u64;
-            let cache_handle = crate::project::cache_handle_from_bytes(
-                &fixture.bytes,
-                format!("mock-manifest:{key:?}"),
-            )?;
+            let cache_handle = if unreadable_cache_handle {
+                // Write the tempfile the normal way, then delete it: the
+                // handle keeps a real, well-formed path that nothing is at.
+                let handle = crate::project::cache_handle_from_bytes(
+                    &fixture.bytes,
+                    format!("mock-manifest-unreadable:{key:?}"),
+                )?;
+                crate::project::remove_cached_body(&handle).await;
+                handle
+            } else {
+                crate::project::cache_handle_from_bytes(
+                    &fixture.bytes,
+                    format!("mock-manifest:{key:?}"),
+                )?
+            };
             Ok(ManifestFetchOutcome {
                 cache_handle: Some(cache_handle),
                 bytes_read,
@@ -6061,6 +6124,21 @@ pub struct MockJobsRepository {
     /// When `Some`, `enqueue_prefetch_batch`
     /// returns this error on the next call (one-shot).
     prefetch_batch_error: Mutex<Option<DomainError>>,
+    /// Recorded rows passed to `enqueue_idempotent_batch`. Each call
+    /// appends the whole batch, so `len()` is the number of statements
+    /// the caller issued — which is what pins "one statement per cohort,
+    /// not one per row".
+    idempotent_batch_calls:
+        Mutex<Vec<Vec<hort_domain::ports::jobs_repository::IdempotentEnqueueRow>>>,
+    /// Keys already inserted, simulating `jobs_idempotency_key_uq`. A row
+    /// whose key is already here is dropped from the returned id vector
+    /// (mirrors `ON CONFLICT DO NOTHING`). Unlike the `target_key`
+    /// simulation this set is NOT namespaced by kind: the production
+    /// index is unscoped over every non-NULL key.
+    idempotent_seen_keys: Mutex<std::collections::HashSet<String>>,
+    /// When `Some`, `enqueue_idempotent_batch` returns this error on the
+    /// next call (one-shot).
+    idempotent_batch_error: Mutex<Option<DomainError>>,
     /// Recorded calls to
     /// `delete_terminal_prefetch_rows_older_than`. Each call appends
     /// the `Duration` argument.
@@ -6119,6 +6197,9 @@ impl Default for MockJobsRepository {
             prefetch_batch_calls: Mutex::new(Vec::new()),
             prefetch_seen_keys: Mutex::new(std::collections::HashSet::new()),
             prefetch_batch_error: Mutex::new(None),
+            idempotent_batch_calls: Mutex::new(Vec::new()),
+            idempotent_seen_keys: Mutex::new(std::collections::HashSet::new()),
+            idempotent_batch_error: Mutex::new(None),
             prefetch_retention_calls: Mutex::new(Vec::new()),
             prefetch_retention_deleted_count: Mutex::new(None),
             scan_retention_calls: Mutex::new(Vec::new()),
@@ -6270,6 +6351,29 @@ impl MockJobsRepository {
     /// an error on the next call (one-shot).
     pub fn fail_next_prefetch_batch(&self, err: DomainError) {
         *self.prefetch_batch_error.lock().unwrap() = Some(err);
+    }
+
+    /// Recorded `enqueue_idempotent_batch` calls. Each entry is one whole
+    /// cohort, so `len()` is the statement count: a test asserting
+    /// `len() == 1` for an N-child index pins the batching against a
+    /// later refactor back to a per-row loop.
+    pub fn idempotent_batch_calls(
+        &self,
+    ) -> Vec<Vec<hort_domain::ports::jobs_repository::IdempotentEnqueueRow>> {
+        self.idempotent_batch_calls.lock().unwrap().clone()
+    }
+
+    /// Seed an already-inserted `idempotency_key` so the unique-index
+    /// simulator drops it from the returned id vector (mirrors
+    /// `ON CONFLICT DO NOTHING`).
+    pub fn seed_idempotent_key_present(&self, key: impl Into<String>) {
+        self.idempotent_seen_keys.lock().unwrap().insert(key.into());
+    }
+
+    /// Configure `enqueue_idempotent_batch` to return an error on the
+    /// next call (one-shot).
+    pub fn fail_next_idempotent_batch(&self, err: DomainError) {
+        *self.idempotent_batch_error.lock().unwrap() = Some(err);
     }
 
     /// Recorded calls to
@@ -6564,6 +6668,36 @@ impl JobsRepository for MockJobsRepository {
             for r in rows {
                 let key = format!("{}::{}", r.kind, r.target_key);
                 if seen.insert(key) {
+                    ids.push(Uuid::new_v4());
+                }
+            }
+        }
+        Box::pin(async move { Ok(ids) })
+    }
+
+    fn enqueue_idempotent_batch<'a>(
+        &'a self,
+        rows: &'a [hort_domain::ports::jobs_repository::IdempotentEnqueueRow],
+    ) -> BoxFuture<'a, DomainResult<Vec<Uuid>>> {
+        // Record the cohort verbatim, before any error injection: a test
+        // asserting "the failing call still issued ONE statement" needs
+        // the record either way.
+        self.idempotent_batch_calls
+            .lock()
+            .unwrap()
+            .push(rows.to_vec());
+        let maybe_err = self.idempotent_batch_error.lock().unwrap().take();
+        if let Some(err) = maybe_err {
+            return Box::pin(async move { Err(err) });
+        }
+        // `jobs_idempotency_key_uq` simulation: one unscoped set over
+        // every key, so a repeat within the cohort and a repeat across
+        // calls are both absorbed and neither yields an id.
+        let mut ids: Vec<Uuid> = Vec::with_capacity(rows.len());
+        {
+            let mut seen = self.idempotent_seen_keys.lock().unwrap();
+            for r in rows {
+                if seen.insert(r.idempotency_key.as_str().to_string()) {
                     ids.push(Uuid::new_v4());
                 }
             }
