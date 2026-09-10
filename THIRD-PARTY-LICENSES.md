@@ -53,7 +53,7 @@ the result instead.
 | untrusted | 0.9.0 | ISC | https://github.com/briansmith/untrusted |
 | simple_asn1 | 0.6.4 | ISC | https://github.com/acw/simple_asn1 |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
-| rustls-webpki | 0.103.13 | ISC | https://github.com/rustls/webpki |
+| rustls-webpki | 0.103.15 | ISC | https://github.com/rustls/webpki |
 | aws-lc-rs | 1.18.1 | ISC | https://github.com/aws/aws-lc-rs |
 | aws-lc-sys | 0.45.0 | ISC | https://github.com/aws/aws-lc-rs |
 | serde_yaml_ng | 0.10.0 | MIT | https://github.com/acatton/serde-yaml-ng |
@@ -95,7 +95,7 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.26.0 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.26.1 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -142,7 +142,7 @@ the result instead.
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
 | rustls-native-certs | 0.8.4 | MIT | https://github.com/rustls/rustls-native-certs |
-| rustls | 0.23.43 | MIT | https://github.com/rustls/rustls |
+| rustls | 0.23.44 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
@@ -4351,7 +4351,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ```
 
-### rustls-webpki 0.103.13 — ISC
+### rustls-webpki 0.103.15 — ISC
 
 Repository: https://github.com/rustls/webpki
 
@@ -5675,7 +5675,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.26.0 — MIT
+### uuid 1.26.1 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -7182,7 +7182,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls 0.23.43 — MIT
+### rustls 0.23.44 — MIT
 
 Repository: https://github.com/rustls/rustls
 
