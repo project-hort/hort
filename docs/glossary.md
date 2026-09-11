@@ -57,16 +57,19 @@ it. See [declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
 ### In-UAT
 
 A resting state for an issue whose fix is in User Acceptance Testing on
-staging, decoupled from a `main` release cut. See [UAT](#uat) and
-[ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
+staging, decoupled from a `main` release cut. Entered only once an alpha tag
+has been cut whose commit is confirmed (`git merge-base --is-ancestor`) to
+contain the issue's merge — not merely once some alpha exists. See
+[UAT](#uat) and [ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
 
 ### Ready-for-staging
 
 A resting state for an issue whose fix has merged to `develop` and is
-live on staging, awaiting UAT or a release. Not blocked merely because
-`main` hasn't moved — `develop`, `test/*` alpha branches, and `main` are
-all deployable to staging independently of release cadence. See
-[ADR 0048](adr/0048-release-branch-staging-strategy.md) D3, D5.
+eligible for the next alpha cut — explicitly **not yet reachable on
+staging**, since `develop` merges alone publish nothing for staging to
+deploy. Not blocked merely because `main` hasn't moved: alpha cadence is
+on demand, and `test/*` alpha tags and `main` are what actually deploy to
+staging. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D3, D5.
 
 ### Release (`main`)
 
@@ -89,10 +92,10 @@ and [ADR 0013](adr/0013-idp-authoritative-cli-sessions.md).
 
 ### Staging
 
-hort's continuous, multi-source test environment. It deploys from
-`develop`, from `test/*` alpha pre-release branches, and from `main` — so
-there is always a current deployable artifact, independent of whether a
-release has been cut. See
+hort's test environment. It deploys from published artifacts only:
+`test/*` alpha pre-release tags and `main` — never from bare `develop`
+merges, since `develop` publishes no image or chart. It is not gated on a
+`main` cut, but it is gated on the next (on-demand) alpha. See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D3.
 
 ### UAT
