@@ -898,14 +898,19 @@
                 "minLength": 1
               },
               "permissions": {
-                "description": "Permissions minted via repeated `--permission` flags. Each must be backed by a live PermissionGrant for this identity AT THIS ENTRY'S SCOPE (global grant when `repository` is unset, matching-repository or global grant when it is set) or the mint fails loud (`--require-authority`).",
+                "description": "Permissions minted via repeated `--permission` flags. Each must be backed by a live PermissionGrant for this identity AT THE SCOPE `authorityRepository` declares (global grant when unset, matching-repository or global grant when it is set) or the mint fails loud — the always-on `--require-authority` preflight.",
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
                 "minItems": 1,
                 "default": ["admin_task_invoke"]
               },
               "repository": {
-                "description": "Optional: scope the minted token to a single repository by its `key`. The cap carries `repository_ids: [<repo_id>]` instead of the default global `null`, and `--require-authority` (if set) checks the declared permissions at this repository (a global grant also satisfies it). Omit for a global-scope identity — unchanged, byte-compatible default.",
+                "description": "Optional: scope the minted token's CAP ONLY to a single repository by its `key`. The cap carries `repository_ids: [<repo_id>]` instead of the default global `null`. Does not affect the `--require-authority` preflight's scope — see `authorityRepository`. Omit for a global-cap identity — unchanged, byte-compatible default.",
+                "type": "string",
+                "minLength": 1
+              },
+              "authorityRepository": {
+                "description": "Optional: aim the always-on `--require-authority` preflight at this repository's scope, independent of `repository` above — an identity can carry a global cap while its authority is still checked at a specific repository. Omit for the byte-compatible default: the preflight checks global scope unless `repository` is set, in which case it follows `repository`'s scope. `minLength: 1` rejects an empty string at schema validation — there is no value here that disables the preflight, only ones that aim it.",
                 "type": "string",
                 "minLength": 1
               },

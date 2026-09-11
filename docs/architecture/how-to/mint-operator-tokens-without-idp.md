@@ -128,32 +128,52 @@ hort-server admin issue-svc-token --name=maintainer-dev \
 ```
 
 Each declared `--permission` must be backed by a live `PermissionGrant`
-on the SA **at the checked scope**: global by default, or the scope
-named by `--repository <name>` — and a global grant satisfies a
+on the SA **at the checked scope** — and a global grant satisfies a
 repo-scoped check too (the same global-⊇-repo evaluator semantics
 runtime RBAC uses; see `check_require_authority` in
 `crates/hort-server/src/cli/admin.rs`). An unbacked permission fails
 the mint with a message naming every unbacked permission and a
 copy-paste `PermissionGrant` YAML block per permission.
 
-`--repository` also scopes the **minted token's own capability**, not
-just the preflight: with the flag, the token's cap carries
-`repository_ids = [<resolved id>]` instead of the default global
-`None`. Both mint shapes are legitimate — pick the one matching the
+`--require-authority` takes an optional value naming that scope:
+
+- bare `--require-authority`: checks global scope, unless `--repository`
+  is also given, in which case it follows `--repository`'s scope — this
+  is the byte-compatible form, unchanged from before the flag could
+  carry a value.
+- `--require-authority=<repo-key>`: checks `<repo-key>`'s scope,
+  **independent of `--repository`**. There is no value that disables the
+  check — an empty `--require-authority=` is treated the same as the
+  bare form, never as "skip it".
+
+`--repository` separately scopes the **minted token's own capability**:
+with the flag, the token's cap carries `repository_ids = [<resolved
+id>]` instead of the default global `None`. The two flags are
+independent knobs — an identity can carry a global cap while its
+authority is checked at a specific repository, which is exactly the
+shape a repo-scoped-only SA needs. Pick the combination matching the
 job:
 
 ```sh
 # Global identity: usable against any repository the underlying
-# grants cover.
+# grants cover, checked against a global grant.
 hort-server admin issue-svc-token --name=maintainer-dev \
   --permission=read --permission=prefetch \
   --require-authority --output=file:"$TF"
 
 # Repository-scoped identity: the token itself cannot be used outside
-# npm-proxy, even if the SA holds broader grants elsewhere.
+# npm-proxy, even if the SA holds broader grants elsewhere. The bare
+# flag's preflight follows --repository here too.
 hort-server admin issue-svc-token --name=maintainer-dev \
   --permission=read --permission=prefetch --repository=npm-proxy \
   --require-authority --output=file:"$TF"
+
+# Global-cap identity whose grants are only repo-scoped: the cap stays
+# global (no --repository), but the preflight checks npm-proxy's scope
+# explicitly via --require-authority's own value.
+hort-server admin issue-svc-token --name=maintainer-dev \
+  --permission=read --permission=prefetch \
+  --require-authority=npm-proxy --output=file:"$TF"
 ```
 
 `issue-svc-token` is strictly non-admin end to end: it rejects
