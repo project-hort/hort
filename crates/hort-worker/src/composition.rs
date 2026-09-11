@@ -20,7 +20,7 @@
 //!   `upsert_self` happens on the heartbeat loop's first tick, NOT here,
 //!   so the row's existence and the loop's liveness are inseparable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -90,6 +90,9 @@ use hort_app::task_handlers::{
     StagingSweepHandler, WheelMetadataBackfillHandler,
 };
 use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
+use hort_config::schema_compat::{
+    register_from_rows, schema_rollback_floor, SchemaCompatRegister, SchemaCompatibility,
+};
 // IngestUseCase + ArtifactGroupUseCase are the dep subtree the worker
 // side needs to construct the SeedImportUseCase the handler wraps.
 // Mirrors the shape and ordering of
@@ -2279,18 +2282,31 @@ fn read_backfill_baseline() -> Option<BackfillBaselineConfig> {
 
 /// Schema-version assertion. Mirrors `hort-server::migrate::assert_current`
 /// shape exactly (does NOT create the bookkeeping table — the runtime
-/// `hort_app_role` does not have `CREATE TABLE` privilege). Copied rather
-/// than depended-on so the worker does not pull in `hort-server`.
-async fn assert_schema_current(pool: &PgPool) -> anyhow::Result<()> {
+/// `hort_app_role` does not have `CREATE TABLE` privilege). The migration
+/// set is embedded here rather than depended on so the worker does not
+/// pull in `hort-server`; the *rule* about which (binary, schema) pairs
+/// may boot is not duplicated — both binaries ask
+/// [`hort_config::schema_compat::SchemaCompatibility`], so a rolled-back
+/// worker and a rolled-back server accept exactly the same schemas.
+///
+/// The schema compatibility register is read here for the same reason:
+/// the *rule* the register feeds lives in `hort_config::schema_compat`,
+/// so a rolled-back worker refuses exactly the schemas a rolled-back
+/// server refuses. Only the `SELECT` is mirrored, and it stays a
+/// `SELECT` — the worker holds the runtime DSN and issues no DDL, so it
+/// never writes a register row (ADR 0009).
+///
+/// Public so the boot gate can be driven directly from an integration
+/// test against a throwaway database, the way the server's counterpart
+/// is; `build_app_context` needs far more of the environment than the
+/// gate itself does.
+pub async fn assert_schema_current(pool: &PgPool) -> anyhow::Result<()> {
     static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
-    let expected: i64 = MIGRATOR
-        .iter()
-        .map(|m| m.version)
-        .max()
-        .expect("migration set is non-empty at compile time");
+    let embedded: BTreeSet<i64> = MIGRATOR.iter().map(|m| m.version).collect();
 
-    let row: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-        .fetch_one(pool)
+    // SELECT only — the runtime DSN is least-privilege (ADR 0009).
+    let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
+        .fetch_all(pool)
         .await
         .map_err(|e| match e {
             sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01") => {
@@ -2305,21 +2321,81 @@ async fn assert_schema_current(pool: &PgPool) -> anyhow::Result<()> {
             ),
             other => other.into(),
         })?;
-    let applied = row.unwrap_or(0);
+    let applied: BTreeSet<i64> = versions.into_iter().collect();
+    let register = read_schema_compat_register(pool).await?;
 
-    if applied != expected {
-        anyhow::bail!(
-            "schema version mismatch: applied={applied}, binary expects={expected}. \
-             Run `hort-server migrate` to advance, or roll the binary back to match the schema."
-        );
+    let compatibility = SchemaCompatibility::evaluate(
+        &applied,
+        &embedded,
+        &register,
+        // Same workspace-inherited version the `pg_stat_activity`
+        // identity stamps, and the same one `hort-server` compares.
+        env!("CARGO_PKG_VERSION"),
+    );
+    // `boot_refusal` is `None` for exactly one verdict — the bootable one.
+    if let Some(refusal) = compatibility.boot_refusal() {
+        anyhow::bail!("{refusal}");
     }
 
-    tracing::info!(
-        applied_version = applied,
-        expected_version = expected,
-        "schema version OK"
-    );
+    let applied_version = applied.iter().next_back().copied().unwrap_or(0);
+    let expected_version = embedded.iter().next_back().copied().unwrap_or(0);
+    // "How far back does this schema tolerate a binary" — reported on the
+    // surface that already carries the applied and expected versions.
+    let tolerates_binaries_from = schema_rollback_floor(&applied, &register);
+    match compatibility {
+        SchemaCompatibility::Supported { newer_applied } if !newer_applied.is_empty() => {
+            // Warn, not info: an operator running a rolled-back binary
+            // against a migrated schema needs to see that state without
+            // going looking for it.
+            tracing::warn!(
+                applied_version,
+                expected_version,
+                newer_applied = ?newer_applied,
+                tolerates_binaries_from = %tolerates_binaries_from,
+                "serving against a schema newer than this binary's embedded migration set; \
+                 supported by the expand/contract discipline (ADR 0030), but the fleet is not \
+                 on the schema's own release"
+            );
+        }
+        _ => {
+            tracing::info!(
+                applied_version,
+                expected_version,
+                tolerates_binaries_from = %tolerates_binaries_from,
+                "schema version OK"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Read the schema compatibility register — the oldest binary version
+/// each applied migration tolerates.
+///
+/// `SELECT` only (ADR 0009). A missing table means this database was last
+/// migrated by a binary from before the register shipped: that yields an
+/// empty register, on which every applied migration the worker does not
+/// embed is unregistered and `SchemaCompatibility`'s fail-closed rule
+/// refuses. Treating the missing table as a hard error instead would
+/// refuse boots the structural gate already handles correctly.
+async fn read_schema_compat_register(pool: &PgPool) -> anyhow::Result<SchemaCompatRegister> {
+    match sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT version, min_binary_version FROM schema_compat_register",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => Ok(register_from_rows(rows)),
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => {
+            Ok(SchemaCompatRegister::new())
+        }
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42501") => Err(anyhow!(
+            "permission denied reading schema_compat_register — grant SELECT on \
+             schema_compat_register to the runtime role (see \
+             docs/architecture/how-to/deploy/postgres-roles.md)"
+        )),
+        Err(other) => Err(other.into()),
+    }
 }
 
 #[cfg(test)]

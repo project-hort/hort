@@ -7,8 +7,8 @@ This is the operator-facing half of [ADR
 0030](../../../adr/0030-sensitive-surface-structural-guards.md)'s
 expand/contract policy. The build-side half — a guard test that refuses to let
 a destructive migration be authored too early — is what makes the routine path
-below boring; this document exists for the two cases where boring is not
-enough: a flagged release, and a deployment that mirrors its own images.
+below boring; this document exists for the cases where boring is not enough: a
+flagged release, a deployment that mirrors its own images, and a rollback.
 
 ## 1. The routine upgrade
 
@@ -122,7 +122,139 @@ images somewhere that does not depend on the instance being upgraded (a second
 registry, or `crictl pull` / a node-level preload on each node before the
 upgrade) so the new pods can start even while the old ones are erroring.
 
-## 4. Flux and automated remediation
+## 4. Rolling a release back
+
+Rolling the **binary** back and rolling the **schema** back are different
+questions, and only the first one has an answer. Migrations are forward-only:
+nothing here undoes an applied migration. What expand/contract buys is that an
+older binary can serve a newer schema — for an additive release, which is most
+of them, that makes a binary rollback a supported serving state rather than a
+last resort.
+
+### 4.1 Ask the schema how far back it goes, before rolling back
+
+Every start of `hort-server` and `hort-worker` reports the answer as
+`tolerates_binaries_from`, alongside the schema versions it already logs:
+
+```bash
+kubectl logs deploy/<release>-hort-server | grep tolerates_binaries_from
+# schema version OK applied_version=25 expected_version=25 tolerates_binaries_from=0.12.0
+```
+
+The migration Job from the last upgrade carries the same field:
+
+```bash
+kubectl logs job/<release>-hort-server-migrate | grep tolerates_binaries_from
+```
+
+A recorded version means: **this schema tolerates any binary of that version
+or newer.** A rollback to a release at or above it starts — with the one
+exception §4.2 ends on, which is a property of the target binary rather than
+of the schema. Below it, the binary refuses and names why (§4.3).
+
+Two other outcomes are possible, and they give opposite advice:
+
+- `tolerates_binaries_from=unconstrained` — every applied migration is
+  registered, and every one of them is an expansion. Nothing constrains the
+  rollback; any binary carrying the boot gates will serve this schema. This is
+  the common case, since contractions are rare and batched.
+- `tolerates_binaries_from=indeterminate` — at least one applied migration has
+  no register row at all, so the register cannot answer. A binary missing that
+  migration is refused fail-closed (§4.4), regardless of what the rest of the
+  applied set records. This is the state of a database that has never been
+  migrated by a release carrying the register; migrate once with the current
+  release to resolve it.
+
+### 4.2 Across additive migrations: rolling the binary back is supported
+
+An additive release adds identifiers and removes none, so the previous
+release's binary never names the new ones and everything it does name is still
+there. It serves the newer schema correctly — this is precisely the case the
+expand/contract discipline exists to protect. The rollback is a redeploy of the
+older version and nothing else:
+
+```bash
+helm upgrade <release> hort/hort-server -f values.yaml --version <older-chart-version>
+kubectl rollout status deploy/<release>-hort-server
+```
+
+Both checks that could block it now ask the same question. The chart re-runs
+`migrate` in its pre-upgrade hook and the systemd units order `hort-server` /
+`hort-worker` after `hort-migrate`, so every start re-runs the migration step
+with the installed binary; the serve path separately re-checks the schema at
+boot. A rollback therefore clears both gates or is refused by both with the
+same reason. The serve path logs the state at **warn** while it lasts — the
+fleet is running behind its schema, which is supported but is not the steady
+state.
+
+**How far back is not a fixed number of releases.** Applying a migration
+records, per migration, the oldest binary version that tolerates it: nothing
+for an expansion, and the `reference_removed_in` of its
+`migrations/CONTRACTIONS.toml` entry for a contraction. Both gates read those
+rows back for exactly the migrations the binary does not embed. So a rollback
+across nothing but expansions is accepted **however far back it goes** — five
+expansion-only releases are as safe as one — and a rollback across a
+contraction is refused, naming the migration that blocks it and the version it
+would take to clear it.
+
+One bound is a property of the binary you roll back *to*, not of the schema:
+a release from before the register existed (migration
+`025_schema_compat_register`) answers the question its own, older way — it
+compares the newest applied version against the newest it embeds and refuses
+any difference. Such a binary will not start against a newer schema whatever
+the register says, and nothing done to the current database changes that.
+
+### 4.3 Across a contraction: refused, and the refusal says what to do
+
+A binary older than a contraction's minimum tolerating version still names
+identifiers that migration removed, so every query touching one fails — the
+failure §2 describes. The gates refuse that combination up front instead of
+letting it half-work:
+
+```text
+refusing to migrate: schema is newer than this binary (0.11.4) tolerates:
+migration 21 requires a binary of version 0.12.0 or newer. Run a binary of
+version 0.12.0 or newer against this database, or restore a backup taken
+before those migrations were applied — migrations are forward-only, so the
+schema itself cannot be rolled back.
+```
+
+The message also points at the migration's `migrations/CONTRACTIONS.toml`
+entry, which is where the version it names comes from. The two remedies it
+gives are the only two: go **forward** to a binary at or above the named
+version, or restore a backup taken before those migrations were applied. There
+is no third option in which the schema goes backwards.
+
+### 4.4 What both gates refuse outright
+
+These are not version skew, and no rollback resolves them:
+
+- **A gap below the waterline** — the database records a migration the binary
+  does not embed that sits *below* the newest one it does, or the binary
+  embeds one the database never applied below the newest one it did. The
+  shared prefix of the two sets is immutable ([ADR
+  0022](../../../adr/0022-pre-1.0-edit-existing-migrations.md)), so this is a
+  broken migration history rather than a skew. The refusal names the offending
+  versions.
+- **A checksum divergence on a shared-prefix migration** — a migration file
+  whose contents changed after it was applied. `sqlx` aborts on it, and
+  accepting a newer schema does not relax that check.
+- **An applied migration absent from the register**, among the ones the binary
+  does not embed — silence is not evidence that nothing was removed, so it
+  counts as a contraction whose minimum this binary cannot meet. A release
+  carrying the register writes a row for every migration it embeds on every
+  `migrate` run, which backfills the whole history of a database upgraded from
+  before the register existed; what remains unregistered is what a
+  downgrade-then-migrate applies, and that fails closed.
+
+**Never hand-edit `_sqlx_migrations`.** Deleting rows to make a gate pass
+changes nothing about the schema — the objects a contraction removed are still
+gone — and leaves the database misreporting its own history, so the next
+`migrate` re-applies migrations over existing objects and the divergence
+refusal above becomes permanent. If a binary genuinely cannot serve the
+applied schema, the answer is a newer binary or a restore.
+
+### 4.5 Flux and automated remediation
 
 If a `HelmRelease` manages the install, check its remediation settings before
 a flagged release:
