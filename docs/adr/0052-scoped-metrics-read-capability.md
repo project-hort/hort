@@ -228,11 +228,18 @@ right fix; `METRICS_INCLUDE_REPOSITORY_LABEL=false` remains available as a
   carry the same repository names, protected only by the NetworkPolicy the
   metrics catalog instructs operators to apply. That is the control this ADR
   rejects as a *sole* gate for the server surface, so the two surfaces are
-  currently asymmetric. The gap is **pre-existing, consciously documented, and
-  out of #113's scope** — closing it is not a doc change: `hort-worker` has no
-  inbound-auth stack, no `AppContext`, and no `RbacEvaluator` wired for HTTP, so
-  extending `ReadMetrics` to it is an initiative, not a patch. Recorded here so
-  the asymmetry is visible rather than implied away by this ADR's framing.
+  asymmetric. The gap is **pre-existing and consciously documented**:
+  `hort-worker` has no inbound-auth stack, no `AppContext`, and no
+  `RbacEvaluator` wired for HTTP, so extending `ReadMetrics` to it would be an
+  initiative, not a patch — and that initiative was evaluated and **rejected,
+  not deferred**. The full argument (why more auth code is not automatically
+  more security here, why this ADR's own network-position rejection was
+  cost-scoped to a surface that already had an auth edge, and the four
+  controls that protect the worker listener without one) lives in the
+  open-items register's ACCEPTED-postures table
+  (`docs/adr/0000-historical-decisions-index.md`), so the asymmetry is
+  discoverable from either document rather than only from whichever one the
+  reader happens to open.
 - **No architectural surface was added.** No new port, no `AppContext` field, no
   adapter import in a format crate, no new metric name, no
   [ADR 0016](0016-cross-opt-in-interaction-matrix.md) cross-opt-in row —

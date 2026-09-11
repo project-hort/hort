@@ -1,0 +1,48 @@
+# Regression fixture: `worker.enabled: false` with `worker.metrics.enabled:
+# true` and `networkPolicy.enabled: false` left set MUST still render
+# cleanly — this is the exact combination directive 118 rev2 fixed.
+#
+# Before rev2 the worker-metrics guard
+# (`templates/worker-networkpolicy.yaml`) fired on `worker.metrics.enabled`
+# + `networkPolicy.enabled` alone, ignoring `worker.enabled`. With no
+# worker pod (`worker-deployment.yaml` is itself gated on `worker.enabled`),
+# there is no `/metrics` listener and nothing for a NetworkPolicy to
+# protect — so leaving `worker.metrics.enabled: true` set on a disabled
+# worker is inert, not dangerous, and the render must succeed.
+#
+# Paired rejected fixture: test-values-worker-metrics-no-networkpolicy.yaml
+# (identical except `worker.enabled` stays at its chart default of `true`
+# → a worker pod exists, so the same metrics/networkPolicy pairing IS
+# dangerous and the render must fail).
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+networkPolicy:
+  enabled: false
+
+worker:
+  enabled: false
+  metrics:
+    enabled: true
+    port: 9090
+    scrapeFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus
