@@ -471,6 +471,28 @@ impl FromStr for PrefetchTrigger {
     }
 }
 
+impl PrefetchTrigger {
+    /// Whether firing this trigger requires the repository's format
+    /// handler to declare the [`VersionDiscovery`](crate::ports::format_handler::VersionDiscovery)
+    /// capability group (ADR 0005).
+    ///
+    /// `TransitiveDeps` needs `extract_dependency_specs` to walk the
+    /// ingested artifact's declared runtime manifest — without it
+    /// `prefetch_dependencies` completes as a structural no-op.
+    /// `Scheduled` needs `extract_upstream_versions` — the newest-N walk
+    /// `prefetch_tick` performs has no upstream version listing to walk
+    /// without it, and the handler skips with a log line.
+    /// `OnDistTagMove` needs neither: OCI fires it today from
+    /// `hort-http-oci::prefetch` with no `VersionDiscovery` implementation
+    /// at all.
+    pub fn requires_version_discovery(self) -> bool {
+        match self {
+            Self::TransitiveDeps | Self::Scheduled => true,
+            Self::OnDistTagMove => false,
+        }
+    }
+}
+
 /// Per-repository prefetch policy (see
 /// `docs/architecture/explanation/prefetch-pipeline.md`).
 ///
@@ -1349,6 +1371,19 @@ mod tests {
             let decoded: PrefetchTrigger = serde_json::from_str(literal).unwrap();
             assert_eq!(decoded, *variant);
         }
+    }
+
+    /// Exactly `TransitiveDeps` and `Scheduled` require `VersionDiscovery`
+    /// (ADR 0005); `OnDistTagMove` fires today for OCI, which has no
+    /// `VersionDiscovery` implementation. Regression guard: a future
+    /// variant added to `PrefetchTrigger` without a matching arm here is
+    /// a compile error (exhaustive match), so this pins the table against
+    /// silent drift.
+    #[test]
+    fn requires_version_discovery_matches_the_capability_table() {
+        assert!(PrefetchTrigger::TransitiveDeps.requires_version_discovery());
+        assert!(PrefetchTrigger::Scheduled.requires_version_discovery());
+        assert!(!PrefetchTrigger::OnDistTagMove.requires_version_discovery());
     }
 
     /// `PrefetchPolicy` round-trips through serde unchanged with a

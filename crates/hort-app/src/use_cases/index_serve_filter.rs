@@ -58,7 +58,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 
 use hort_domain::entities::artifact::QuarantineStatus;
-use hort_domain::entities::repository::IndexMode;
+use hort_domain::entities::repository::{IndexMode, RepositoryFormat};
 
 /// Per-format version ordering primitive.
 ///
@@ -951,10 +951,11 @@ fn pep440_postpredev_key(v: &ParsedPep440Version) -> (u8, u8, u64, u8, u64, u8, 
 /// strictly more digits, so length-compare orders the tiers; equal length
 /// compares lexically == numerically).
 ///
-/// **Wiring:** consumed by the Maven serve/builder path only (constructed
-/// directly into the index builder's `ordering`). It is deliberately
-/// **not** registered in either `ordering_for_format` selector — Maven
-/// scheduled/self-service prefetch is deferred (design §4(d), §15).
+/// **Wiring:** the Maven serve/builder path constructs it directly into
+/// the index builder's `ordering`; every prefetch consumer resolves the
+/// same singleton through [`ordering_for_format`], which is what makes a
+/// Maven `triggers: [scheduled]` policy plan versions in Maven order
+/// rather than silently doing nothing.
 ///
 /// [cv]: https://maven.apache.org/pom.html#version-order-specification
 #[derive(Debug, Default, Clone, Copy)]
@@ -1364,6 +1365,67 @@ fn maven_normalize(items: &mut Vec<MavenItem>) {
             break;
         }
         // A non-null list: keep it, but continue scanning earlier items.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Canonical format → ordering mapping
+// ---------------------------------------------------------------------------
+
+/// The one canonical [`RepositoryFormat`] → [`VersionOrdering`] mapping.
+///
+/// Every consumer that needs "the comparator this format sorts versions
+/// with" resolves it here — the scheduled prefetch tick
+/// (`task_handlers::prefetch_tick`), the self-service prefetch endpoint
+/// (`use_cases::self_service_prefetch_use_case`), and any future
+/// consumer. There is deliberately **exactly one** such mapping in the
+/// workspace: the fact "which formats have a version ordering" written
+/// down twice has to be kept in agreement by hand, and a copy that fell
+/// behind is what let a format declare the `VersionDiscovery` capability
+/// group (opening the apply-time gate for `triggers: [scheduled]`) while
+/// the runtime consumer silently skipped it.
+///
+/// **Paired with `FormatHandler::version_discovery`.** A format that
+/// participates in the `VersionDiscovery` capability group MUST resolve
+/// an ordering here, and vice versa: discovering an upstream version set
+/// you cannot order is a policy accepted at apply and inert at runtime.
+/// The pairing is enforced structurally by the DB-free participation
+/// guard in `hort-formats/tests/version_discovery_participation.rs`,
+/// which asserts the iff across every `RepositoryFormat` variant — so
+/// adding a format to one side alone fails a sub-second test rather than
+/// silently dropping an operator's policy in production.
+///
+/// **Not exhaustive on purpose.** `RepositoryFormat` has 50+ variants,
+/// nearly all of which genuinely have no ordering; spelling them out
+/// would buy a wall of `=> None` arms and a second edit per future
+/// format. Exhaustiveness lives in the guard test, where a new variant
+/// fails to compile until it is consciously classified.
+///
+/// The returned trait object is `&'static` and `Send + Sync` — every
+/// ordering is a zero-sized unit struct, so the bounds cost nothing and
+/// callers may hold the reference across an `.await` without tainting
+/// the enclosing `Send` future.
+pub fn ordering_for_format(
+    format: &RepositoryFormat,
+) -> Option<&'static (dyn VersionOrdering + Send + Sync)> {
+    // Pinned singletons so the returned reference is `'static` without
+    // dragging any caller's lifetime along.
+    static NPM: NpmSemverOrdering = NpmSemverOrdering;
+    // `CargoSemverOrdering` is a `pub type` alias for `NpmSemverOrdering`
+    // (see the alias doc above); the same singleton serves both arms.
+    static CARGO: CargoSemverOrdering = NpmSemverOrdering;
+    static PEP440: Pep440Ordering = Pep440Ordering;
+    static MAVEN: MavenVersionOrdering = MavenVersionOrdering;
+    match format {
+        RepositoryFormat::Npm => Some(&NPM),
+        RepositoryFormat::Cargo => Some(&CARGO),
+        RepositoryFormat::Pypi => Some(&PEP440),
+        RepositoryFormat::Maven => Some(&MAVEN),
+        // Every other format — OCI and its aliases, helm, rpm, debian,
+        // generic, the WASM-plugin escape hatch — has no version-ordering
+        // primitive, and correspondingly does not implement
+        // `VersionDiscovery`.
+        _ => None,
     }
 }
 
@@ -2143,5 +2205,64 @@ mod tests {
         // 2.0a1 stays (never ingested → not known non-servable). PEP 440
         // max over {1.0, 1.0.dev1, 2.0a1} is 2.0a1.
         assert_eq!(out.latest, Some("2.0a1".to_string()));
+    }
+
+    // ---------- ordering_for_format ----------
+
+    #[test]
+    fn ordering_for_format_resolves_every_version_discovery_participant() {
+        assert!(ordering_for_format(&RepositoryFormat::Npm).is_some());
+        assert!(ordering_for_format(&RepositoryFormat::Cargo).is_some());
+        assert!(ordering_for_format(&RepositoryFormat::Pypi).is_some());
+        assert!(ordering_for_format(&RepositoryFormat::Maven).is_some());
+    }
+
+    #[test]
+    fn ordering_for_format_is_none_for_non_participating_formats() {
+        assert!(ordering_for_format(&RepositoryFormat::Oci).is_none());
+        assert!(ordering_for_format(&RepositoryFormat::Helm).is_none());
+        assert!(ordering_for_format(&RepositoryFormat::Generic).is_none());
+        assert!(ordering_for_format(&RepositoryFormat::Gradle).is_none());
+        assert!(ordering_for_format(&RepositoryFormat::Other("wasm-plugin".into())).is_none());
+    }
+
+    #[test]
+    fn ordering_for_format_returns_each_formats_own_comparator() {
+        // The arms are not interchangeable: each must hand back the
+        // comparator its format actually sorts with. Each assertion
+        // below is a probe only ONE of the four impls answers this way,
+        // so a copy-paste that wires the wrong singleton fails here
+        // rather than mis-ordering an operator's prefetch plan.
+        //
+        // Common to all: `1.10` above `1.9` — the numeric-vs-lexical
+        // discriminator that rules out a byte comparator.
+        let npm = ordering_for_format(&RepositoryFormat::Npm).expect("npm arm");
+        let cargo = ordering_for_format(&RepositoryFormat::Cargo).expect("cargo arm");
+        let pypi = ordering_for_format(&RepositoryFormat::Pypi).expect("pypi arm");
+        let maven = ordering_for_format(&RepositoryFormat::Maven).expect("maven arm");
+        for o in [npm, cargo, pypi, maven] {
+            assert_eq!(o.compare("1.10.0", "1.9.0"), Ordering::Greater);
+        }
+
+        // npm / cargo: the only impl that overrides `is_prerelease`.
+        // Cargo's ordering is a type alias for npm's, so both answer.
+        assert!(npm.is_prerelease("1.0.0-rc.1"));
+        assert!(cargo.is_prerelease("1.0.0-rc.1"));
+
+        // PEP 440: `.postN` sorts ABOVE the release it post-dates, and
+        // a `v` prefix is insignificant. npm reads `1.0.post1` as a
+        // pre-release (Less) and Maven sorts `v1.0` below `1.0` (an
+        // unknown qualifier below a numeric), so the pair is unique to
+        // the PEP 440 impl.
+        assert!(!pypi.is_prerelease("1.0.0-rc.1"));
+        assert_eq!(pypi.compare("1.0.post1", "1.0"), Ordering::Greater);
+        assert_eq!(pypi.compare("v1.0", "1.0"), Ordering::Equal);
+
+        // Maven's qualifier table is the only one that ranks `sp`
+        // (service pack) ABOVE the bare GA release; both semver and
+        // PEP 440 read the `-sp` suffix as something below it.
+        assert_eq!(maven.compare("1.0-sp", "1.0"), Ordering::Greater);
+        assert_eq!(npm.compare("1.0-sp", "1.0"), Ordering::Less);
+        assert_eq!(pypi.compare("1.0-sp", "1.0"), Ordering::Less);
     }
 }

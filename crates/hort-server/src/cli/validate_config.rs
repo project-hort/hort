@@ -4,7 +4,7 @@
 //! Runs the pure
 //! [`StaticConfigValidator`](hort_app::lint::StaticConfigValidator) — the
 //! snapshot-free subset of the apply-time validation/lint pass (rows
-//! 2,3,5,6,7,7b,8) — over a gitops config tree, **DSN-free** and
+//! 2,3,5,6,6b,7,7b,8) — over a gitops config tree, **DSN-free** and
 //! **synchronous** (no Tokio runtime; the whole flow is file reads +
 //! parse + validate, none of which is async). It is the offline operator
 //! surface for a CI pre-merge gate: it reproduces the server's *static*
@@ -280,13 +280,16 @@ fn validate_tree(
         }
     };
 
-    // ---- 4. run the snapshot-free validator (rows 2,3,5,6,7,7b,8) ----
+    // ---- 4. run the snapshot-free validator (rows 2,3,5,6,6b,7,7b,8) ----
     //
     // Version-static facts baked into the binary: the
     // provenance-capable format set is THE shared
     // `hort_app::provenance::TIER1_PROVENANCE_CAPABLE_FORMATS` const the server
     // composition (`gitops_boot.rs` / `composition.rs`) also derives from — so
     // the offline gate's row-7 verdict cannot drift from the live server's.
+    // The row-6b VersionDiscovery-capable format set is derived from the
+    // same compiled-in handler registry `gitops_boot.rs` uses (see
+    // `crate::format_capabilities`), so row 6b cannot drift either.
     // The grant-lint base is the secure
     // `LintConfig::default()` (the offline CLI has no composition-level
     // operator override; the desired-side `PermissionGrantLintConfig` override
@@ -299,6 +302,7 @@ fn validate_tree(
                 .map(String::from)
                 .collect(),
         ),
+        Arc::new(crate::format_capabilities::version_discovery_capable_formats()),
         Some(backend),
     )
     .with_grant_lint_base(LintConfig::default());

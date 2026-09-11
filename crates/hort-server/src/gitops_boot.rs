@@ -355,6 +355,19 @@ async fn apply_inner(
         oidc_issuers,
         service_accounts,
         users,
+        // The apply-time fail-closed `PrefetchPolicy.triggers` linter
+        // (row 6b, ADR 0015): a repository declaring `transitive_deps` or
+        // `scheduled` on a format whose handler does not declare
+        // `VersionDiscovery` (ADR 0005) is apply-rejected — the trigger
+        // would otherwise be accepted and never fire. A required
+        // constructor argument, not an opt-in builder, so a future
+        // composition point cannot inherit its way past the rejection by
+        // omission. The set is derived from the actual compiled-in
+        // `FormatHandler` registry (`crate::format_capabilities`), never
+        // a maintained format list, so the rejection lifts itself for
+        // any format the moment its handler starts declaring the
+        // capability.
+        Arc::new(crate::format_capabilities::version_discovery_capable_formats()),
     );
     let apply_uc = match federated_jwt_validator {
         Some(v) => apply_uc.with_federated_jwt_validator(v),
@@ -385,7 +398,6 @@ async fn apply_inner(
             .copied()
             .map(String::from),
     );
-
     // ---- 4. apply ----
     let env_snapshot = EnvSnapshot {
         auth_provider: match auth {

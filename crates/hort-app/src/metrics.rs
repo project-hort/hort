@@ -1178,6 +1178,34 @@ pub fn emit_discovery_list_versions(format: &str, repository: &str, result: Disc
     .increment(1);
 }
 
+/// Emit `hort_prefetch_ordering_missing_total{repository, format}`.
+///
+/// Fires exactly once per (repository, package) the scheduled prefetch
+/// tick had to abandon because the repository's format declares the
+/// `VersionDiscovery` capability group — which is what opens the
+/// apply-time gate for `prefetchPolicy.triggers: [scheduled]` — but
+/// resolves no comparator through
+/// [`ordering_for_format`](crate::use_cases::index_serve_filter::ordering_for_format).
+///
+/// **This counter should never move.** The pairing is enforced by a
+/// DB-free structural guard test, so a non-zero value means the two
+/// halves have been changed apart and every scheduled prefetch on that
+/// repository is silently doing nothing — an operator's policy accepted
+/// at apply and inert at runtime. Alert on any increase; the fix is to
+/// add the format's arm to the canonical mapping, not to the operator's
+/// config.
+///
+/// `format` is the low-cardinality format key (`"maven"`, `"npm"`, …),
+/// not a per-package value.
+pub fn emit_prefetch_ordering_missing(repository: &str, format: &str) {
+    metrics::counter!(
+        "hort_prefetch_ordering_missing_total",
+        labels::REPOSITORY => repository.to_owned(),
+        labels::FORMAT => format.to_owned(),
+    )
+    .increment(1);
+}
+
 // ---------------------------------------------------------------------------
 // Self-service prefetch — `hort_prefetch_self_service_total{format, repository, result}`
 // ---------------------------------------------------------------------------

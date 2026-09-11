@@ -20,17 +20,25 @@
 //!   files (pom/jar/sources/javadoc/module), `None` for sidecars + metadata.
 //! - [`FormatHandler::resolve_mutable_version`] → SNAPSHOT timestamped-build
 //!   resolution (see [`snapshot`]).
+//! - [`FormatHandler::version_discovery`] → `Some(self)`: Maven declares the
+//!   `VersionDiscovery` capability group (ADR 0005). The upstream version
+//!   set comes from the A-level `maven-metadata.xml` ([`metadata`]) and the
+//!   declared compile- and runtime-scope dependencies from the POM's own
+//!   `<dependencies>` ([`pom`]).
 //!
-//! Everything else (upstream-pull metadata, dependency extraction, prefetch
-//! URL composition, SBOM) is inherited at the trait default and wired by
-//! later/deferred items.
+//! Everything else (prefetch download-URL composition, SBOM) is inherited at
+//! the trait default and wired by later/deferred items.
 
 pub mod coords;
 pub mod metadata;
+pub mod pom;
 pub mod snapshot;
+pub(crate) mod xml;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::format_handler::{FormatHandler, GroupMembership};
+use hort_domain::ports::format_handler::{
+    DependencySpec, FormatHandler, GroupMembership, VersionDiscovery,
+};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::ArtifactCoords;
 
@@ -264,6 +272,182 @@ impl FormatHandler for MavenFormatHandler {
         })?;
         let hex = parse_sidecar_hex(&buf)?;
         UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, hex)
+    }
+
+    /// Maven declares the `VersionDiscovery` capability group (ADR 0005).
+    ///
+    /// The two members that carry the group for Maven are
+    /// [`VersionDiscovery::extract_upstream_versions`] (the A-level
+    /// `maven-metadata.xml` version list) and
+    /// [`VersionDiscovery::extract_dependency_specs`] (the POM's own
+    /// compile- and runtime-scope `<dependencies>`). Together they are what gives a
+    /// Maven proxy a warm-up path: unlike npm, PyPI and cargo, nothing
+    /// else in the Maven protocol makes a proxy self-warm, so without them
+    /// a non-zero quarantine window on a Maven proxy surfaces to a build
+    /// as a resolver failure.
+    fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+        Some(self)
+    }
+}
+
+impl VersionDiscovery for MavenFormatHandler {
+    /// Extract the upstream-published version set from an A-level
+    /// `maven-metadata.xml` body.
+    ///
+    /// Delegates to [`metadata::parse_upstream_versions`], which reads
+    /// `<versioning><versions><version>` and preserves document order (the
+    /// planner owns ordering and de-duplication). Degrades open on a
+    /// malformed body — `Ok` with whatever was read — matching the npm and
+    /// cargo readers: on the discovery tier a mis-served body is a
+    /// transient condition the next tick re-evaluates, not a reason to
+    /// surface an error.
+    ///
+    /// Bounded by [`metadata::UPSTREAM_METADATA_MAX_BYTES`]; a body over
+    /// the cap is `Validation`.
+    fn extract_upstream_versions(&self, body: &mut dyn std::io::Read) -> DomainResult<Vec<String>> {
+        let bytes = crate::stream_helpers::read_to_capped_vec(
+            body,
+            metadata::UPSTREAM_METADATA_MAX_BYTES,
+            |len, max| {
+                format!("maven upstream metadata body is {len} bytes; per-format max is {max}")
+            },
+        )?;
+        Ok(metadata::parse_upstream_versions(&bytes))
+    }
+
+    /// The A-level `maven-metadata.xml` path for a `groupId:artifactId`.
+    ///
+    /// **Differs** from
+    /// [`FormatHandler::upstream_checksum_metadata_path`], which is the
+    /// per-FILE `.sha1` floor. Maven is, with PyPI, one of the formats
+    /// where the version-set document and the checksum document are
+    /// structurally distinct: the version set lives at the artifact level
+    /// (`g/a/maven-metadata.xml`) and each checksum lives beside its own
+    /// file. Reading the checksum path here would fetch a sidecar and find
+    /// no versions in it.
+    ///
+    /// `None` when `package` is not the colon-joined GA form or fails the
+    /// coordinate guard — a caller that cannot name an artifact has no
+    /// version list to fetch.
+    fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+        let (group_id, artifact_id) = coords::split_ga(package).ok()?;
+        validate_maven_coordinate(group_id, artifact_id, None).ok()?;
+        let group_path = group_id.replace('.', "/");
+        Some(format!(
+            "/{group_path}/{artifact_id}/{}",
+            coords::MAVEN_METADATA_FILENAME
+        ))
+    }
+
+    /// Maven has no content negotiation — `maven-metadata.xml` is the
+    /// upstream's only representation. Same inert value npm and cargo
+    /// supply.
+    fn upstream_metadata_accept(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Extract the declared compile- and runtime-scope dependencies from a
+    /// stored POM.
+    ///
+    /// **Input is the POM's own bytes** — unlike npm/cargo/pypi, Maven's
+    /// declared dependencies are not inside an archive: the `.pom` IS the
+    /// manifest, stored as its own group member, so there is no container
+    /// to open and no `archive_bounds` guard in the path.
+    ///
+    /// Resolution and its ceiling are [`pom::parse_pom_dependencies`]'s;
+    /// see that module for what a pure function over one POM can and
+    /// cannot see. Everything it could not resolve is counted per
+    /// [`pom::PomSkipReason`] and emitted here as one structured `debug!`
+    /// per reason that occurred, so an operator can tell a tree the
+    /// cascade genuinely warmed from one whose versions all live in a
+    /// parent.
+    ///
+    /// **`Err` versus `Ok(vec![])`.** `Err` means the bytes are not a POM
+    /// (not XML, wrong root element, over the size cap). A well-formed POM
+    /// always yields `Ok`, however little of it resolved — a POM whose
+    /// every version is inherited returns `Ok(vec![])` with the skips
+    /// counted. Inverting that would abort the cascade for every
+    /// parent-managed POM instead of partially warming it, which is worse
+    /// than the no-op this method replaces.
+    fn extract_dependency_specs(
+        &self,
+        content: &mut dyn std::io::Read,
+    ) -> DomainResult<Vec<DependencySpec>> {
+        let extraction = pom::parse_pom_dependencies(content)?;
+        for (reason, count) in extraction.skip_counts() {
+            if count > 0 {
+                tracing::debug!(
+                    reason = reason.as_str(),
+                    count,
+                    resolved = extraction.specs.len(),
+                    "maven.pom: declared dependencies skipped — this reader sees only the \
+                     POM's own bytes, so a version held by a parent POM or an imported BOM \
+                     is out of reach",
+                );
+            }
+        }
+        Ok(extraction.specs)
+    }
+
+    /// Resolve a declared Maven dependency version against an `available`
+    /// set.
+    ///
+    /// Maven's bare `<version>` is a **soft requirement** — "use exactly
+    /// this unless something else in the resolve wins" — so the only
+    /// version that satisfies it is itself. This resolver is therefore an
+    /// exact match against `available`, which is precisely the grammar
+    /// [`extract_dependency_specs`](Self::extract_dependency_specs)
+    /// produces: a hard range never reaches here, because a range is a
+    /// counted [`pom::PomSkipReason::UnsupportedRange`] skip rather than a
+    /// spec (ADR 0053 D2 — a range upstream cannot satisfy is skipped and
+    /// logged, never guessed at).
+    ///
+    /// `None` when the declared version is not published upstream, which
+    /// the cascade reads as "skip this dep".
+    fn resolve_range_max(&self, range: &str, available: &[&str]) -> DomainResult<Option<String>> {
+        let wanted = range.trim();
+        Ok(available
+            .iter()
+            .find(|candidate| candidate.trim() == wanted)
+            .map(|candidate| (*candidate).to_string()))
+    }
+
+    /// Maven has no separate download-config document — a Maven download
+    /// URL is the mapping base plus the layout path. Same inert value npm
+    /// and pypi supply; a format returning `None` here must never reach
+    /// [`compose_download_url_from_config`](Self::compose_download_url_from_config).
+    fn download_config_path(&self) -> Option<String> {
+        None
+    }
+
+    /// Unreachable for Maven — see
+    /// [`download_config_path`](Self::download_config_path).
+    fn compose_download_url_from_config(
+        &self,
+        body: &mut dyn std::io::Read,
+        package: &str,
+        version: &str,
+        cksum_hex: Option<&str>,
+    ) -> DomainResult<String> {
+        let _ = (body, package, version, cksum_hex);
+        Err(DomainError::Validation(
+            "compose_download_url_from_config not supported for maven".into(),
+        ))
+    }
+
+    /// Unreachable for Maven. A Maven artifact's download URL is composed
+    /// from the layout path (`build_artifact_logical_path`), not resolved
+    /// out of a metadata body: `maven-metadata.xml` carries the version
+    /// list, never per-version download URLs.
+    fn resolve_download_url_from_metadata(
+        &self,
+        body: &mut dyn std::io::Read,
+        coords: &ArtifactCoords,
+    ) -> DomainResult<String> {
+        let _ = (body, coords);
+        Err(DomainError::Validation(
+            "resolve_download_url_from_metadata not supported for maven".into(),
+        ))
     }
 }
 
@@ -969,5 +1153,205 @@ mod tests {
             parse_sidecar_hex("   \n\t"),
             Err(DomainError::Validation(_))
         ));
+    }
+
+    // -- VersionDiscovery ----------------------------------------------------
+
+    /// The capability group, via the accessor the consumers actually call.
+    fn discovery() -> &'static dyn VersionDiscovery {
+        static HANDLER: MavenFormatHandler = MavenFormatHandler;
+        HANDLER
+            .version_discovery()
+            .expect("maven declares VersionDiscovery")
+    }
+
+    #[test]
+    fn maven_declares_version_discovery() {
+        assert!(handler().version_discovery().is_some());
+    }
+
+    #[test]
+    fn upstream_metadata_path_is_the_a_level_document() {
+        assert_eq!(
+            discovery().upstream_metadata_path("com.google.guava:guava"),
+            Some("/com/google/guava/guava/maven-metadata.xml".to_string()),
+        );
+    }
+
+    #[test]
+    fn upstream_metadata_path_differs_from_the_per_file_checksum_floor() {
+        // The two are structurally distinct for Maven: the version set is
+        // artifact-level, each checksum sits beside its own file.
+        let coords = sample_file_coords();
+        assert_ne!(
+            discovery().upstream_metadata_path(&coords.name),
+            handler().upstream_checksum_metadata_path(&coords),
+        );
+    }
+
+    #[test]
+    fn upstream_metadata_path_rejects_a_non_ga_or_unsafe_package() {
+        for package in [
+            "no-colon-here",
+            ":empty-group",
+            "group:",
+            "com.example:..",
+            "com..example:foo",
+            "com/example:foo",
+            "com.example:fo\no",
+        ] {
+            assert_eq!(
+                discovery().upstream_metadata_path(package),
+                None,
+                "{package} must not compose an upstream path"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_metadata_accept_is_empty() {
+        assert!(discovery().upstream_metadata_accept().is_empty());
+    }
+
+    #[test]
+    fn extract_upstream_versions_reads_the_a_level_list() {
+        let body = br#"<metadata><versioning><versions>
+            <version>31.1-jre</version><version>32.1.3-jre</version>
+        </versions></versioning></metadata>"#;
+        let got = discovery()
+            .extract_upstream_versions(&mut std::io::Cursor::new(&body[..]))
+            .unwrap();
+        assert_eq!(got, ["31.1-jre", "32.1.3-jre"]);
+    }
+
+    #[test]
+    fn extract_upstream_versions_degrades_open_on_a_malformed_body() {
+        let got = discovery()
+            .extract_upstream_versions(&mut std::io::Cursor::new(b"not xml".as_slice()))
+            .expect("a malformed body is no signal, not an error");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn extract_upstream_versions_rejects_an_over_cap_body() {
+        let oversized = vec![b'x'; metadata::UPSTREAM_METADATA_MAX_BYTES + 1];
+        let err = discovery()
+            .extract_upstream_versions(&mut std::io::Cursor::new(oversized.as_slice()))
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn extract_dependency_specs_reads_the_poms_own_dependencies() {
+        let body = br#"<project>
+            <groupId>com.example</groupId><artifactId>app</artifactId><version>1.0</version>
+            <dependencies>
+              <dependency><groupId>com.google.guava</groupId><artifactId>guava</artifactId>
+                <version>31.1-jre</version></dependency>
+              <dependency><groupId>org.junit</groupId><artifactId>junit</artifactId>
+                <version>5.10.0</version><scope>test</scope></dependency>
+            </dependencies>
+        </project>"#;
+        let specs = discovery()
+            .extract_dependency_specs(&mut std::io::Cursor::new(&body[..]))
+            .unwrap();
+        assert_eq!(
+            specs,
+            [DependencySpec {
+                name: "com.google.guava:guava".to_string(),
+                range: "31.1-jre".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_dependency_specs_is_ok_empty_when_every_version_is_inherited() {
+        // The distinction the cascade depends on: a POM this reader cannot
+        // fully resolve partially warms the tree, it does not abort it.
+        let body = br#"<project>
+            <parent><groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-starter-parent</artifactId>
+              <version>3.2.0</version></parent>
+            <artifactId>demo</artifactId>
+            <dependencies><dependency><groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-starter-web</artifactId></dependency></dependencies>
+        </project>"#;
+        let specs = discovery()
+            .extract_dependency_specs(&mut std::io::Cursor::new(&body[..]))
+            .expect("a parent-managed POM is valid input");
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn extract_dependency_specs_errs_on_non_pom_bytes() {
+        let err = discovery()
+            .extract_dependency_specs(&mut std::io::Cursor::new(b"PK\x03\x04".as_slice()))
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    #[test]
+    fn resolve_range_max_pins_the_soft_requirement_exactly() {
+        let available = ["31.0-jre", "31.1-jre", "32.1.3-jre"];
+        assert_eq!(
+            discovery()
+                .resolve_range_max("31.1-jre", &available)
+                .unwrap()
+                .as_deref(),
+            Some("31.1-jre"),
+            "a bare Maven version is a soft requirement — only itself satisfies it",
+        );
+    }
+
+    #[test]
+    fn resolve_range_max_is_none_when_upstream_lacks_the_version() {
+        assert_eq!(
+            discovery()
+                .resolve_range_max("9.9.9", &["1.0", "2.0"])
+                .unwrap(),
+            None
+        );
+        assert_eq!(discovery().resolve_range_max("1.0", &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_range_max_ignores_surrounding_whitespace() {
+        assert_eq!(
+            discovery()
+                .resolve_range_max("  1.0  ", &["1.0"])
+                .unwrap()
+                .as_deref(),
+            Some("1.0")
+        );
+    }
+
+    #[test]
+    fn resolve_range_max_returns_the_upstream_spelling_verbatim() {
+        // The returned string feeds a pull-through path, so it must be the
+        // upstream entry, not a re-serialisation of the declared version.
+        let out = discovery()
+            .resolve_range_max("1.0", &[" 1.0 "])
+            .unwrap()
+            .expect("matched");
+        assert_eq!(out, " 1.0 ");
+    }
+
+    #[test]
+    fn download_config_members_are_inert_for_maven() {
+        assert_eq!(discovery().download_config_path(), None);
+        assert!(discovery()
+            .compose_download_url_from_config(
+                &mut std::io::Cursor::new(b"{}".as_slice()),
+                "com.example:foo",
+                "1.0",
+                None,
+            )
+            .is_err());
+        assert!(discovery()
+            .resolve_download_url_from_metadata(
+                &mut std::io::Cursor::new(b"<metadata/>".as_slice()),
+                &sample_file_coords(),
+            )
+            .is_err());
     }
 }

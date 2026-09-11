@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Prefetch now works on Maven repositories** (#233). A Maven proxy could
+  already be configured with `prefetchPolicy.triggers: [scheduled]` and the
+  configuration was accepted, but nothing happened at run time: the scheduled
+  tick had no way to compare two Maven versions, so it skipped the repository
+  without a word. It now reads the upstream's `maven-metadata.xml`, compares
+  versions with Maven's own version-ordering rules (so `1.10.0` is newer than
+  `1.9.0`, which a naive text comparison gets backwards), and warms the newest
+  releases like any other format. `hort-cli prefetch` against a Maven
+  repository works the same way, including resolving "the latest version" when
+  none is given — previously it was refused as an unsupported format.
+
+  Which formats can be prefetched is now decided in exactly one place instead
+  of three, and a test enforces that a format able to discover upstream
+  versions can always order them. That pairing is what a repository's accepted
+  prefetch policy rests on, so it can no longer be half-configured: a policy
+  Hort accepts is a policy Hort acts on. In the impossible case that the two
+  halves are ever changed apart, the tick now says so loudly and increments
+  `hort_prefetch_ordering_missing_total` rather than skipping in silence.
+
 - **A proxied multi-arch image index now starts its children's quarantine
   windows at index ingest, not at first client access** (#229). Pulling a
   multi-arch image through a proxy repository ingests the image index and

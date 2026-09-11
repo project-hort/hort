@@ -2154,6 +2154,34 @@ mod tests {
     }
 
     #[test]
+    fn upstream_metadata_path_coincides_with_upstream_checksum_metadata_path() {
+        // cargo is one of the formats where `VersionDiscovery::upstream_metadata_path`
+        // and `FormatHandler::upstream_checksum_metadata_path` happen to
+        // answer the identical string — a documented coincidence (the
+        // sparse-index NDJSON entry carries both the version set and
+        // per-version `cksum`), not a rule the trait enforces. Pinned
+        // directly so a change to either method's URL convention that
+        // silently breaks the coincidence is caught here, not by a
+        // consumer (the prefetch-dependencies cascade) that assumes it.
+        let handler = handler();
+        for name in ["encoding_rs", "a"] {
+            let coords = ArtifactCoords {
+                name: name.to_string(),
+                name_as_published: name.to_string(),
+                version: None,
+                path: String::new(),
+                format: RepositoryFormat::Cargo,
+                metadata: serde_json::Value::Null,
+            };
+            assert_eq!(
+                handler.upstream_metadata_path(name),
+                handler.upstream_checksum_metadata_path(&coords),
+                "upstream_metadata_path and upstream_checksum_metadata_path diverged for {name}",
+            );
+        }
+    }
+
+    #[test]
     fn upstream_metadata_accept_cargo_inherits_trait_default_empty() {
         // Cargo sparse-index serves NDJSON only — no content
         // negotiation. Inherits the trait default `Vec::new()`. Same
