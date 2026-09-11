@@ -42,6 +42,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Rolling a release back no longer requires rolling the schema back with
+  it** (#226). Every start of `hort-server` and `hort-worker` re-runs the
+  migration step with the installed binary, and the serving binary
+  separately re-checked the schema version at boot. Both refused any schema
+  newer than the binary, so a deployment that had applied even a purely
+  additive migration could not be rolled back to the previous release: the
+  older binary would not start, although the expand/contract discipline
+  guarantees it serves that schema correctly. Both checks now ask the same
+  question — is this schema one this binary supports? — and a schema that is
+  merely newer is accepted, logged as a warning so an operator can see the
+  fleet is not on the schema's own release.
+
+  **The strictness that mattered is kept.** A schema *older* than the binary
+  is still the normal upgrade path (the migrations get applied), and a
+  genuinely broken history — a recorded migration the binary does not know
+  sitting below ones it does, or a migration missing from the middle of the
+  applied sequence — is still refused by both checks, now naming the
+  offending versions in the refusal. Checksum verification of the migrations
+  the two sides share is unchanged and still aborts a mismatch.
+
+  **How far back a rollback may go is now answered from the schema itself,
+  not assumed** (#226). An older binary fails against a newer schema for
+  exactly one reason: one of the migrations it does not carry removed
+  something it still references. Migrations that only add are harmless
+  however many of them there are, so five releases without a removal are as
+  safe as one, and a fixed "one release back" bound would refuse rollbacks
+  that are provably fine. Applying a migration now records, in the database,
+  the oldest release that migration tolerates — taken from the destructive-DDL
+  manifest the applying release ships — and both boot checks read those
+  records back for exactly the migrations they do not carry. A binary old
+  enough to be affected is refused, and the refusal names the migration that
+  blocks it and the version it would work from; anything else starts,
+  whatever the distance. A migration with no record at all is treated as one
+  that removed something: silence is not evidence. Every start also reports
+  how far back the current schema tolerates a binary, alongside the schema
+  versions it already logged — the question a rollback decision turns on and
+  that nothing could answer before.
+
 - **The prefetch-row retention sweep now also collects the background
   index-child ingest's finished rows** (#229). `prefetch-row-retention-sweep`
   previously covered only the transitive prefetch cascade, so the new

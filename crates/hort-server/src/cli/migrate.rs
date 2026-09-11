@@ -34,13 +34,6 @@ use tracing::{info, warn};
 use crate::config::MinimalConfig;
 use crate::{migrate, pg_identity, telemetry};
 
-/// This binary's own version — the fence's "current" side of the
-/// older/newer comparison. Identical to [`hort_config::pg_identity`]'s
-/// stamped `application_name` version segment: both read
-/// `CARGO_PKG_VERSION` from the same workspace-inherited `version.workspace
-/// = true`.
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
 /// Arguments to `hort-server migrate`.
 #[derive(Debug, Args)]
 pub struct MigrateArgs {
@@ -82,7 +75,7 @@ async fn run_async(args: MigrateArgs) -> anyhow::Result<()> {
         .await
         .context("connecting to postgres")?;
 
-    let fence = migrate::evaluate_fleet_fence(&pool, CURRENT_VERSION)
+    let fence = migrate::evaluate_fleet_fence(&pool, migrate::BINARY_VERSION)
         .await
         .context("evaluating the runtime fleet fence")?;
     if fence.blocked && args.allow_running_fleet {

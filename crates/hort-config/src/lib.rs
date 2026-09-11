@@ -36,6 +36,7 @@ pub mod pg_identity;
 pub mod repository;
 pub mod retention_policy;
 pub mod scan_policy;
+pub mod schema_compat;
 pub mod scope;
 pub mod service_account;
 pub mod upstream_mapping;

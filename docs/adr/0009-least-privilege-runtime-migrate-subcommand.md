@@ -24,7 +24,7 @@ DB-only subcommands (`migrate`, `reconcile-groups`) parse a `MinimalConfig`, not
 ## Alternatives considered
 
 - **Runtime auto-migrates on boot (prototype behaviour).** Rejected: gives the serving role DDL, which is the privilege the whole ADR removes.
-- **No boot-time schema check.** Rejected: a stale binary against a newer schema (or vice versa) would run silently; `assert_current` makes it fail fast without granting DDL.
+- **No boot-time schema check.** Rejected: a binary would run silently against a schema it does not match; `assert_current` makes that fail fast without granting DDL. A binary *ahead* of its schema still refuses to boot. A binary running against a **newer** schema is no longer a refusal but an accepted state: the expand/contract discipline (ADR 0030) makes it a correct one, so it is admitted and logged at warn when the schema records that it tolerates a binary that old, and refused with the blocking migration named when it does not. Either way it is not silent, which is the point this alternative was rejected for.
 
 ## References
 
