@@ -1966,6 +1966,34 @@ spawned task fetches the per-version JSON manifest and drives a
 `hort_prefetch_enqueued_total` and `hort_prefetch_skipped_total` carry
 PyPI-keyed `repository` labels alongside npm and cargo.
 
+### Prefetch tick — missing version ordering
+
+| Metric | Type | Labels | Unit | Label values |
+|--------|------|--------|------|--------------|
+| `hort_prefetch_ordering_missing_total` | counter | `repository`, `format` | — | `format` is the format key (`maven`, `npm`, …) |
+
+Emitted by
+`hort_app::task_handlers::prefetch_tick::PrefetchTickHandler::run`, once
+per `(repository, package)` the scheduled tick had to abandon because
+the repository's format declares the `VersionDiscovery` capability group
+but resolves no comparator through
+`hort_app::use_cases::index_serve_filter::ordering_for_format`.
+
+**This counter should never move.** The two halves are paired by a
+DB-free structural guard
+(`crates/hort-formats/tests/version_discovery_participation.rs`), so a
+non-zero value means they were changed apart in a release. Because
+declaring the capability group is exactly what makes gitops apply
+*accept* `prefetchPolicy.triggers: [scheduled]` on that format, the
+observable consequence is an operator policy that Hort accepted and then
+silently ignores — the ADR 0015 hard block. **Alert on any increase.**
+The accompanying `tracing::error!` names the repository, format and
+package; the fix is the missing arm in the canonical format-to-ordering
+mapping, never a change to the operator's config.
+
+`format` is the low-cardinality format key, not a per-package value; the
+package appears in the log event only.
+
 ### Prefetch amplification
 
 | Metric | Type | Labels | Unit | Label values |
@@ -2039,6 +2067,75 @@ counters) emitted immediately before the metric increment.
 **Cardinality envelope.** `format` (≤ ~10) × `repository`
 (prefetch-transitive-opt-in repos, typically < 50) × 3 `result`
 values. Well under any per-metric ceiling.
+
+**"Could not ask" vs "asked and got nothing" — two `WalkSummary`
+fields, not one.** Two `result_summary` counters (same status as
+`no_upstream_mapping` above — internal to `WalkSummary`, not their own
+Prometheus series) account for why a cold dependency never became a
+`prefetch` row:
+
+- `deps_upstream_unsatisfiable` — the cascade **asked upstream and got
+  nothing that satisfied the spec**: either the metadata fetch/parse
+  itself failed, or the fetch succeeded and `resolve_range_max`
+  returned `None` against upstream's available set. A fact about
+  upstream (or the network path to it).
+- `deps_routing_dead_end` — the cascade **could not even ask**:
+  `VersionDiscovery::upstream_metadata_path` returned `None` for the
+  package's normalised name (e.g. a name that does not parse as a
+  valid coordinate under the format's convention), so no metadata
+  fetch was attempted at all. A local capability/config gap, not an
+  upstream fact.
+
+Before this split, a routing dead-end silently folded into
+`deps_upstream_unsatisfiable`, which would send an operator looking
+upstream for a cause that was actually local. Both fields ride the
+existing `tracing::info!` "prefetch-dependencies walk complete" event
+alongside the rest of `WalkSummary`; neither currently feeds the
+`result` enum above (`resolver_failed` stays keyed on
+`no_upstream_mapping`, the repo-level "no mapping configured at all"
+case) — a per-package routing dead-end can occur on a walk the
+amplification metric otherwise reports `normal`, so a zero
+`deps_routing_dead_end` count in the job's `result_summary` is part of
+reading that walk as fully healthy.
+
+### Maven POM dependency-extraction skip accounting
+
+Not a Prometheus series — this documents a structured `tracing::debug!`
+event, one per `PomSkipReason` that occurred, emitted by
+`MavenFormatHandler::extract_dependency_specs`
+(`crates/hort-formats/src/maven/mod.rs`) once per stored POM it reads.
+Each event carries `reason` (the label below), `count` (how many
+declared dependencies fell to that reason on this POM), and `resolved`
+(how many dependencies this POM yielded). It is documented here per the
+catalog's convention for labelling skip/failure reasons even though
+Maven's dependency-extraction ceiling (below) is architectural, not a
+gap this catalog entry can close by itself — see
+[the prefetch pipeline explanation](architecture/explanation/prefetch-pipeline.md#maven-the-poms-own-bytes-and-where-that-stops)
+for the full mechanism and why the ceiling exists.
+
+`PomSkipReason::ALL` (`crates/hort-formats/src/maven/pom.rs`) is a
+closed taxonomy of five, split into **two classes an operator must
+read differently**:
+
+| Reason | Class | Meaning |
+|---|---|---|
+| `scope_excluded` | deliberate class boundary | Effective scope is `provided` / `test` / `system` / `import`; declined on purpose (ADR 0053 D4/D5). Normal, and expected to be the largest count on a well-formed POM. |
+| `version_from_parent_or_bom` | reader limit | No `<version>` in this POM or its own `<dependencyManagement>` — the version lives in a parent POM or an imported BOM, neither reachable from here. Dominant reason on a managed tree (Spring Boot, Quarkus); the one that most understates real coverage. |
+| `unresolved_property` | reader limit | A `${...}` placeholder did not resolve from this POM's own `<properties>` or the model built-ins. |
+| `unsupported_range` | reader limit | The version is a Maven range; per ADR 0053 D2 a range upstream cannot satisfy is skipped, never guessed at. |
+| `incomplete_coordinate` | reader limit | The `<dependency>` declares no `<groupId>` or `<artifactId>` — no identity to enqueue even in principle. |
+
+**Operator reading.** A `scope_excluded`-dominated skip set is a
+healthy cascade — it explains why the warmed set is smaller than the
+POM's full dependency list, nothing more. A skip set dominated by the
+other four means the tree really was only partly reached; on a
+POM-managed or BOM-managed project, expect this to be the common case,
+and treat a non-trivial warmed set on such a project as the real
+signal, not the skip count's absolute size. Collapsing the five into
+one number would make a healthy cascade look broken and a half-blind
+one look fine — which is exactly why they stay distinguishable
+per-reason rather than folded into a single `deps_extracted` /
+`deps_skipped` pair.
 
 ### Discovery + self-service prefetch endpoints
 

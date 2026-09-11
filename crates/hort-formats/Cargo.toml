@@ -63,6 +63,18 @@ toml          = { workspace = true }
 # in `index_serve_filter.rs` at the `NpmSemverOrdering` docstring.
 semver        = "1"
 pep440_rs     = "0.7"
+# Pull-parser for the two Maven XML documents this crate reads: the POM's
+# own `<dependencies>` block (`maven::pom`) and the upstream
+# `maven-metadata.xml` version list (`maven::metadata`). A hand-rolled
+# scanner would have to re-derive comment, CDATA, entity-reference and
+# namespace handling to stay correct on real Central POMs, and getting any
+# of that wrong turns a valid POM into a cascade-aborting parse error.
+# Default features only (`default = []`) — no `encoding`, no `serialize`,
+# no async: the reader stays a byte-level pull parser, so a POM in a
+# non-UTF-8 charset still parses and only fails if a decoded *value*
+# happens to be the invalid one. Already in the active build graph via
+# `object_store`, so this edge adds no crate to the dependency set.
+quick-xml     = "0.41"
 
 [features]
 # Exposes cross-crate test fixtures: `archive_bounds::build_zip_bytes`

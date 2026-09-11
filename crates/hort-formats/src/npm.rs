@@ -3230,6 +3230,26 @@ mod tests {
     }
 
     #[test]
+    fn upstream_metadata_path_coincides_with_upstream_checksum_metadata_path() {
+        // npm is one of the formats where `VersionDiscovery::upstream_metadata_path`
+        // and `FormatHandler::upstream_checksum_metadata_path` happen to
+        // answer the identical string — a documented coincidence (the
+        // packument carries both the version set and dist.integrity),
+        // not a rule the trait enforces. Pinned directly so a change to
+        // either method's URL convention that silently breaks the
+        // coincidence is caught here, not by a consumer (the
+        // prefetch-dependencies cascade) that assumes it.
+        for name in ["express", "@scope/pkg"] {
+            let coords = coords_for(name, None, "irrelevant");
+            assert_eq!(
+                handler().upstream_metadata_path(name),
+                handler().upstream_checksum_metadata_path(&coords),
+                "upstream_metadata_path and upstream_checksum_metadata_path diverged for {name}",
+            );
+        }
+    }
+
+    #[test]
     fn upstream_metadata_accept_npm_inherits_trait_default_empty() {
         // npm needs no content negotiation — the upstream's default
         // packument representation (JSON) is the only one. Inherits

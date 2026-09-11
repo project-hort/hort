@@ -86,6 +86,19 @@ pub(crate) const RULE_TRUST_UPSTREAM_PUBLISH_TIME_REQUIRES_SCAN_BACKENDS: &str =
 pub(crate) const RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED: &str =
     "prefetch_max_age_days_not_implemented";
 
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `PrefetchPolicy`
+/// envelope declares `transitive_deps` or `scheduled` on a format whose
+/// handler does not declare the `VersionDiscovery` capability group
+/// (ADR 0005) — the same accepted-but-inert anti-pattern
+/// [`RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED`] closes for
+/// `maxAgeDays`. One increment per offending trigger.
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_PREFETCH_TRIGGER_REQUIRES_VERSION_DISCOVERY: &str =
+    "prefetch_trigger_requires_version_discovery";
+
 /// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
@@ -106,6 +119,13 @@ pub enum LinterRule {
     /// Row 6 — accepted-but-inert `PrefetchPolicy.max_age_days`.
     /// Reject + metric.
     PrefetchMaxAgeDaysNotImplemented,
+    /// Row 6b — a `PrefetchPolicy.triggers` entry (`transitive_deps` /
+    /// `scheduled`) that requires the `VersionDiscovery` capability group
+    /// on a format whose handler does not declare it. Reject + metric.
+    /// The capability set is a required [`StaticConfigValidator::new`]
+    /// parameter (see [`StaticConfigValidator::version_discovery_capable_formats`]),
+    /// so this row always runs.
+    PrefetchTriggerRequiresVersionDiscovery,
     /// Row 7 — provenance-config linter: backend/identity
     /// domain rules + the apply-only no-verifier-format rule (reject) and
     /// the `verify_if_present`-without-identities advisory (warn). No
@@ -144,6 +164,9 @@ impl LinterRule {
             }
             Self::PrefetchMaxAgeDaysNotImplemented => {
                 Some(RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED)
+            }
+            Self::PrefetchTriggerRequiresVersionDiscovery => {
+                Some(RULE_PREFETCH_TRIGGER_REQUIRES_VERSION_DISCOVERY)
             }
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
@@ -246,6 +269,18 @@ pub struct StaticConfigValidator {
     /// hard reject (no verifier ⇒ the artifact would stay `Pending`
     /// forever).
     provenance_capable_formats: Arc<HashSet<String>>,
+    /// Row 6b — the set of repository-format strings whose compiled-in
+    /// `FormatHandler` declares the `VersionDiscovery` capability group
+    /// (ADR 0005). A **required** [`Self::new`] parameter: there is no
+    /// runtime default that answers row 6b's rejection question
+    /// correctly in either direction, so a caller that forgets to supply
+    /// the real set fails to build instead of silently skipping the row.
+    /// Production (`gitops_boot` / the offline `validate-config` CLI)
+    /// passes the set derived from the real handler registry's own
+    /// declarations — never a maintained format list, so a format that
+    /// gains (or loses) the capability changes row 6b's verdict with no
+    /// edit here.
+    version_discovery_capable_formats: Arc<HashSet<String>>,
     /// Row 7b — the deployment's effective global storage backend kind.
     /// `None` ⇒ row 7b is skipped (the apply harness / a composition that
     /// did not opt in); the CLI always supplies `Some`.
@@ -277,10 +312,12 @@ impl StaticConfigValidator {
     /// opts in via [`Self::with_grant_lint_base`].
     pub fn new(
         provenance_capable_formats: Arc<HashSet<String>>,
+        version_discovery_capable_formats: Arc<HashSet<String>>,
         effective_storage_backend: Option<EffectiveStorageBackend>,
     ) -> Self {
         Self {
             provenance_capable_formats,
+            version_discovery_capable_formats,
             effective_storage_backend,
             grant_lint_base: None,
         }
@@ -354,6 +391,19 @@ impl StaticConfigValidator {
         for err in hort_config::desired::validate_prefetch_max_age_days_not_implemented(desired) {
             report.errors.push(LintFinding::error(
                 LinterRule::PrefetchMaxAgeDaysNotImplemented,
+                err.to_string(),
+            ));
+        }
+
+        // Row 6b — PrefetchPolicy.triggers entries that require the
+        // VersionDiscovery capability group on a format whose handler
+        // does not declare it.
+        for err in hort_config::desired::validate_prefetch_triggers_require_version_discovery(
+            desired,
+            self.version_discovery_capable_formats.as_ref(),
+        ) {
+            report.errors.push(LintFinding::error(
+                LinterRule::PrefetchTriggerRequiresVersionDiscovery,
                 err.to_string(),
             ));
         }
@@ -849,7 +899,8 @@ mod tests {
     }
 
     fn oci_validator() -> StaticConfigValidator {
-        StaticConfigValidator::new(formats(&["oci"]), None)
+        // No test in this module exercises row 6b.
+        StaticConfigValidator::new(formats(&["oci"]), formats(&[]), None)
     }
 
     // ---- envelope builders (mirror the apply test-module shapes) ------
@@ -1421,6 +1472,7 @@ mod tests {
         };
         let v = StaticConfigValidator::new(
             formats(&["oci"]),
+            formats(&[]),
             Some(EffectiveStorageBackend::Filesystem),
         );
         let report = v.validate(&desired);
@@ -1443,6 +1495,7 @@ mod tests {
         };
         let v = StaticConfigValidator::new(
             formats(&["oci"]),
+            formats(&[]),
             Some(EffectiveStorageBackend::Filesystem),
         );
         let report = v.validate(&desired);
@@ -1482,7 +1535,11 @@ mod tests {
             repositories: vec![repo],
             ..Default::default()
         };
-        let v = StaticConfigValidator::new(formats(&["oci"]), Some(EffectiveStorageBackend::S3));
+        let v = StaticConfigValidator::new(
+            formats(&["oci"]),
+            formats(&[]),
+            Some(EffectiveStorageBackend::S3),
+        );
         let report = v.validate(&desired);
         assert!(
             report.errors.is_empty(),
@@ -1525,6 +1582,7 @@ mod tests {
         };
         let v = StaticConfigValidator::new(
             formats(&["oci"]),
+            formats(&[]),
             Some(EffectiveStorageBackend::Filesystem),
         );
         let report = v.validate(&desired);
@@ -1579,7 +1637,7 @@ mod tests {
 
     /// A validator with row 8 ENABLED at the secure-default base config.
     fn grant_lint_validator() -> StaticConfigValidator {
-        StaticConfigValidator::new(formats(&["oci"]), None)
+        StaticConfigValidator::new(formats(&["oci"]), formats(&[]), None)
             .with_grant_lint_base(LintConfig::default())
     }
 

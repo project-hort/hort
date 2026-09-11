@@ -2830,6 +2830,7 @@ dependencies = [
  "hort-app",
  "hort-domain",
  "pep440_rs",
+ "quick-xml",
  "semver",
  "serde",
  "serde_json",

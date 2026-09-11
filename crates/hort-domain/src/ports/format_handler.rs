@@ -75,9 +75,11 @@ pub trait VersionDiscovery: Send + Sync {
     ///
     /// **Phase-1 scope cap.** Reference implementations exist for
     /// `npm` (packument `versions{}` keys), `cargo` (sparse-index
-    /// NDJSON `vers` field per line), and `pypi` (PEP 503 HTML anchor
-    /// list parsed via the filename → version extractor). A format that
-    /// does not implement `VersionDiscovery` at all (maven, oci, helm,
+    /// NDJSON `vers` field per line), `pypi` (PEP 503 HTML anchor
+    /// list parsed via the filename → version extractor), and `maven`
+    /// (A-level `maven-metadata.xml` `<versioning><versions>` list).
+    /// A format that
+    /// does not implement `VersionDiscovery` at all (oci, helm,
     /// rpm, debian, generic, …) never reaches this method — the
     /// scheduled tick reads `version_discovery() == None` as "format has
     /// no Phase-1 upstream-version discovery" and silently skips it.
@@ -142,8 +144,12 @@ pub trait VersionDiscovery: Send + Sync {
     ///   top-level `<dir>/Cargo.toml` inside it.
     /// - **pypi** — the wheel (zip) / sdist (gzip-tar); `Requires-Dist` lives
     ///   in `*.dist-info/METADATA` inside the wheel.
+    /// - **maven** — the `.pom` itself. The one participating format whose
+    ///   declared manifest is NOT inside a container: the POM is stored as
+    ///   its own group member, so there is no archive to open.
     ///
-    /// Each implementing handler is **archive-aware**: it locates its declared
+    /// Each implementing handler whose artifact IS a container is
+    /// **archive-aware**: it locates its declared
     /// runtime manifest inside the artifact (via the audited
     /// `hort-formats::archive_bounds` extractor) and parses it. (An earlier
     /// contract — "a just-ingested artifact's pre-selected manifest body" —
@@ -164,7 +170,8 @@ pub trait VersionDiscovery: Send + Sync {
     ///
     /// The `range` field stays opaque (a [`String`] in the format's
     /// native range syntax — `"^1.2"` for npm, `">=2,<3"` for PyPI,
-    /// `"2.x"` for cargo, `"[1.0,2.0)"` for Maven). Parsing the range
+    /// `"2.x"` for cargo, `"31.1-jre"` for Maven, whose bare version is a
+    /// soft requirement satisfied only by itself). Parsing the range
     /// is the per-format
     /// [`resolve_range_max`](Self::resolve_range_max) implementation's
     /// concern, not the caller's; different formats have different
@@ -176,7 +183,7 @@ pub trait VersionDiscovery: Send + Sync {
     /// stored artifact via the per-format `hort-formats` archive helpers.
     ///
     /// A format without a machine-readable runtime-dep concept
-    /// (oci, generic, raw uploads, helm, Maven) simply does not implement
+    /// (oci, generic, raw uploads, helm) simply does not implement
     /// `VersionDiscovery`; a participating format with nothing to declare
     /// returns `Ok(Vec::new())`, which the cascade reads as "no
     /// transitive deps to enqueue". Returning
@@ -185,6 +192,14 @@ pub trait VersionDiscovery: Send + Sync {
     /// a missing declared manifest entry, an unparseable manifest, or an
     /// `archive_bounds` guard trip; a well-formed artifact whose manifest
     /// declares zero runtime deps must return `Ok(vec![])`, not `Err`.
+    ///
+    /// **"Well-formed but unresolvable" is `Ok`, not `Err`.** A manifest a
+    /// handler parses successfully but cannot fully interpret — a Maven POM
+    /// whose versions are all held by its parent, an sdist whose PKG-INFO
+    /// carries no `Requires-Dist` — is valid input, and returning `Err`
+    /// there aborts the cascade for the whole artifact instead of partially
+    /// warming it. Handlers count what they could not resolve (see
+    /// `hort-formats::maven::pom::PomSkipReason`) rather than failing.
     fn extract_dependency_specs(
         &self,
         content: &mut dyn std::io::Read,
@@ -726,14 +741,17 @@ pub trait FormatHandler: Send + Sync {
     /// realisation note (issue #58).
     ///
     /// **Why the default is `None` and not a required method:** every
-    /// non-participating format (OCI, Maven, Helm, and any future Tier-C)
+    /// non-participating format (OCI, Helm, and any future Tier-C)
     /// would otherwise need a boilerplate `None` override. The default is
     /// safe here precisely because it is *one* method whose meaning is "I
     /// do not participate" — unlike the eight per-method defaults this
     /// accessor replaced, each of which used to silently fake a behaviour.
     ///
-    /// npm, cargo, and pypi implement [`VersionDiscovery`] and return
-    /// `Some(self)`. Every other format inherits this default.
+    /// npm, cargo, pypi, and maven implement [`VersionDiscovery`] and
+    /// return `Some(self)`. Every other format inherits this default.
+    /// `hort-formats/tests/version_discovery_participation.rs` pins the
+    /// participating set against an exhaustive `RepositoryFormat` match,
+    /// so a change here cannot drift from the declared classification.
     fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
         None
     }

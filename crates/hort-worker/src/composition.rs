@@ -464,17 +464,17 @@ pub async fn build_app_context(
     //    the orchestration call site preserves single-instance semantics
     //    for the scan path while handing a second handle to seed-import.
     //
-    //    `maven` participates here too: it has no `VersionDiscovery`
-    //    (no ordering, no upstream-metadata fan-out), so the auto-trigger
-    //    tick and the transitive-dependency cascade both fall through
-    //    their `handler.version_discovery()` guard and no-op for Maven
-    //    repos exactly as they already do for a registered handler with
-    //    no `VersionDiscovery` impl — a case both handlers have dedicated
-    //    coverage for. The leaf-ingest `PrefetchIngestHandler` below is
-    //    the consumer that actually needs the registration: without it,
-    //    the self-service prefetch endpoint's `prefetch` leaf-ingest rows
-    //    for a Maven repo short-circuit as "no FormatHandler registered"
-    //    before ever reaching the Maven pull-through arm.
+    //    `maven` declares `VersionDiscovery`, so the transitive-dependency
+    //    cascade reads a stored POM's own compile- and runtime-scope
+    //    `<dependencies>` and warms them, and the scheduled
+    //    `prefetch-tick` walks a Maven repo like any other participant —
+    //    it resolves `MavenVersionOrdering` through the canonical
+    //    `index_serve_filter::ordering_for_format` mapping.
+    //    The leaf-ingest `PrefetchIngestHandler` below is
+    //    the consumer that needs the registration unconditionally: without
+    //    it, the self-service prefetch endpoint's `prefetch` leaf-ingest
+    //    rows for a Maven repo short-circuit as "no FormatHandler
+    //    registered" before ever reaching the Maven pull-through arm.
     // -----------------------------------------------------------------
     let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
     handlers.insert("pypi".into(), Arc::new(PyPiFormatHandler));

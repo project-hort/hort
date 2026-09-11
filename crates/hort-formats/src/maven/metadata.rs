@@ -402,8 +402,130 @@ fn xml_escape_text(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Reading an UPSTREAM maven-metadata.xml
+// ---------------------------------------------------------------------------
+
+/// Ceiling on an upstream `maven-metadata.xml` body. The A-level document
+/// is one `<version>` element per published release; even an artifact with
+/// tens of thousands of releases stays under a megabyte, so 16 MiB is a
+/// plausibility bound rather than a working limit.
+pub const UPSTREAM_METADATA_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// The A-level version list of an upstream `maven-metadata.xml`, in
+/// document order.
+///
+/// Reads `<metadata><versioning><versions><version>` — the artifact-level
+/// version list, NOT `<versioning><latest>`/`<release>` (single pointers)
+/// and NOT the V-level `<snapshotVersions>` document, whose entries are
+/// timestamped builds of one snapshot rather than published versions.
+///
+/// **Degrade-open.** A malformed or truncated body yields whatever was
+/// read before the failure — for the discovery tier "no upstream signal
+/// this tick" is the right failure mode, and the next tick re-evaluates.
+/// Empty `<version/>` entries are dropped: they name no version.
+///
+/// Order is preserved and duplicates are not removed; ordering and
+/// de-duplication are the prefetch planner's policy.
+pub fn parse_upstream_versions(bytes: &[u8]) -> Vec<String> {
+    crate::maven::xml::collect_text_at_path(
+        bytes,
+        &["metadata", "versioning", "versions", "version"],
+    )
+    .into_iter()
+    .filter(|version| !version.is_empty())
+    .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod upstream_versions_tests {
+    use super::*;
+
+    const A_LEVEL: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.google.guava</groupId>
+  <artifactId>guava</artifactId>
+  <versioning>
+    <latest>32.1.3-jre</latest>
+    <release>32.1.3-jre</release>
+    <versions>
+      <version>31.1-jre</version>
+      <version>32.0.0-jre</version>
+      <version>32.1.3-jre</version>
+    </versions>
+    <lastUpdated>20231020120000</lastUpdated>
+  </versioning>
+</metadata>"#;
+
+    #[test]
+    fn reads_the_a_level_version_list_in_document_order() {
+        assert_eq!(
+            parse_upstream_versions(A_LEVEL),
+            ["31.1-jre", "32.0.0-jre", "32.1.3-jre"]
+        );
+    }
+
+    #[test]
+    fn ignores_latest_and_release_pointers() {
+        // `<latest>`/`<release>` sit beside `<versions>`, not inside it —
+        // a reader that matched on element NAME rather than path would
+        // duplicate the newest version twice.
+        let versions = parse_upstream_versions(A_LEVEL);
+        assert_eq!(versions.iter().filter(|v| *v == "32.1.3-jre").count(), 1);
+    }
+
+    #[test]
+    fn ignores_the_v_level_snapshot_document() {
+        let v_level = br#"<metadata>
+  <versioning>
+    <snapshot><timestamp>20231201.120000</timestamp><buildNumber>3</buildNumber></snapshot>
+    <snapshotVersions>
+      <snapshotVersion><extension>jar</extension>
+        <value>1.0-20231201.120000-3</value></snapshotVersion>
+    </snapshotVersions>
+  </versioning>
+</metadata>"#;
+        assert!(parse_upstream_versions(v_level).is_empty());
+    }
+
+    #[test]
+    fn empty_version_entries_are_dropped() {
+        let xml = br#"<metadata><versioning><versions>
+            <version/><version>  </version><version>1.0</version>
+        </versions></versioning></metadata>"#;
+        assert_eq!(parse_upstream_versions(xml), ["1.0"]);
+    }
+
+    #[test]
+    fn a_document_with_no_versions_yields_an_empty_list() {
+        let xml = br#"<metadata><versioning><versions/></versioning></metadata>"#;
+        assert!(parse_upstream_versions(xml).is_empty());
+    }
+
+    #[test]
+    fn non_xml_bytes_degrade_to_an_empty_list() {
+        assert!(parse_upstream_versions(b"not xml at all").is_empty());
+        assert!(parse_upstream_versions(&[0x1F, 0x8B, 0x08]).is_empty());
+    }
+
+    #[test]
+    fn a_truncated_document_keeps_what_it_read() {
+        let xml = br#"<metadata><versioning><versions>
+            <version>1.0</version><version>2.0<"#;
+        assert_eq!(parse_upstream_versions(xml), ["1.0"]);
+    }
+
+    #[test]
+    fn duplicates_are_preserved_for_the_planner_to_handle() {
+        let xml = br#"<metadata><versioning><versions>
+            <version>1.0</version><version>1.0</version>
+        </versions></versioning></metadata>"#;
+        assert_eq!(parse_upstream_versions(xml), ["1.0", "1.0"]);
+    }
+}
 
 #[cfg(test)]
 mod tests {

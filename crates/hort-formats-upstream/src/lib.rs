@@ -2,18 +2,18 @@
 //!
 //! This is the ONLY production crate other than `hort-server` that imports
 //! multiple `hort-http-<format>` inbound crates as a normal dep. The
-//! dispatch table on `format` ("npm" / "pypi" / "cargo") is the
-//! composition seam — each format branch calls the per-format
-//! `fetch_raw_with_cache` helper (in `hort-http-<format>`), which owns the
-//! cache + dedup + upstream proxy fetch + URL composition for that
-//! format's wire shape AND returns a typed per-format projection each
-//! dispatcher reads its version list off directly. This crate does not
-//! call into `hort-formats`'s `VersionDiscovery` capability group
-//! (issue #58's split of `extract_upstream_versions` and its seven
-//! siblings off `FormatHandler`) — see the note on `map_parse_result`'s
-//! retirement below for why the two-step "helper, then re-parse via
-//! FormatHandler" composition this crate-doc historically described no
-//! longer exists.
+//! dispatch table on `format` ("npm" / "pypi" / "cargo" / "maven") is
+//! the composition seam — the npm / pypi / cargo branches each call the
+//! per-format `fetch_raw_with_cache` helper (in `hort-http-<format>`),
+//! which owns the cache + dedup + upstream proxy fetch + URL composition
+//! for that format's wire shape AND returns a typed per-format
+//! projection each dispatcher reads its version list off directly. Those
+//! three branches do not call into `hort-formats`'s `VersionDiscovery`
+//! capability group — see the note on `map_parse_result`'s retirement
+//! below for why the two-step "helper, then re-parse via
+//! `FormatHandler`" composition this crate-doc historically described no
+//! longer exists. The Maven branch is the deliberate exception, for the
+//! reason given under the dispatch table.
 //!
 //! See `docs/architecture/explanation/format-handlers.md` and
 //! `docs/architecture/explanation/prefetch-pipeline.md` for the design
@@ -36,8 +36,20 @@
 //! | `"npm"`  | [`hort_http_npm::packument::fetch_raw_with_cache`]                                       |
 //! | `"pypi"` | [`hort_http_pypi::simple_index::fetch_raw_with_cache`]                                   |
 //! | `"cargo"`| [`hort_http_cargo::index_cache::fetch_raw_with_cache`]                                   |
+//! | `"maven"`| the `VersionDiscovery` capability group over the A-level `maven-metadata.xml` (see below)|
 //! | `"oci"`  | rejected → [`UpstreamFetchError::UnsupportedFormat`]                                     |
 //! | other    | rejected → [`UpstreamFetchError::UnsupportedFormat`]                                     |
+//!
+//! Maven is the one branch that does NOT go through a per-format
+//! `fetch_raw_with_cache` helper: its version list lives in the A-level
+//! `maven-metadata.xml`, which no inbound serve path caches, so there is
+//! no typed projection to read versions off. That branch drives the
+//! `VersionDiscovery` capability group directly — the same three calls
+//! (`upstream_metadata_path` → `UpstreamProxy::fetch_metadata` →
+//! `extract_upstream_versions`) the scheduled `prefetch-tick` handler
+//! makes — so both prefetch surfaces resolve a Maven repository's
+//! version set from the same document under the same policy gate. See
+//! [`UpstreamMetadataAdapter::dispatch_maven`].
 //!
 //! # Error mapping
 //!
@@ -77,12 +89,12 @@
 //! `mapping.upstream_name_prefix` is OCI-effective-only per the
 //! `RepositoryUpstreamMapping` doc (see
 //! `docs/architecture/how-to/declare-gitops-config.md`). The npm /
-//! pypi / cargo branches MUST NOT consume the field. The OCI branch
-//! never reaches URL composition — the dispatch table rejects OCI
+//! pypi / cargo / maven branches MUST NOT consume the field. The OCI
+//! branch never reaches URL composition — the dispatch table rejects OCI
 //! upstream of any composer. A unit test
-//! (`upstream_name_prefix_is_inert_*`) asserts that for each of the
-//! three non-OCI branches, `mapping.upstream_name_prefix = Some("foo")`
-//! produces byte-identical version output as `None`.
+//! (`upstream_name_prefix_is_inert_*`) asserts that for each non-OCI
+//! branch, `mapping.upstream_name_prefix = Some("foo")` produces
+//! byte-identical version output as `None`.
 //!
 //! [`UpstreamErrorKind`]: hort_app::metrics::UpstreamErrorKind
 
@@ -95,17 +107,19 @@ use hort_domain::entities::repository::Repository;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::entities::repository::RepositoryType;
 use hort_domain::ports::ephemeral_store::EphemeralStore;
+use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMapping;
 use hort_domain::ports::upstream_proxy::UpstreamProxyByFormat;
 use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::BoxFuture;
-// No dispatcher calls `FormatHandler::extract_upstream_versions` any more:
-// every per-format helper returns the typed projection and each `dispatch_*`
-// reads the version list off it directly (npm/cargo via the typed `version`
-// field, pypi via `pypi_extract_version_from_filename` over the projection's
-// `files[]`). The `FormatHandler` trait + `PyPiFormatHandler` are now only
-// referenced from the test module (`normalize_name` /
-// `metadata_expected_max_bytes`), so their imports moved there.
+// The npm / pypi / cargo dispatchers read their version list straight off
+// the typed projection their per-format helper returns (npm/cargo via the
+// typed `version` field, pypi via `pypi_extract_version_from_filename`
+// over the projection's `files[]`) — none of them re-parses through a
+// capability-group method. `FormatHandler` is in scope for the Maven
+// dispatcher, which has no such helper and reaches the `VersionDiscovery`
+// group through this accessor; `PyPiFormatHandler` is referenced only
+// from the test module, so its import lives there.
 use hort_http_cargo::index_cache as cargo_helpers;
 use hort_http_npm::packument as npm_helpers;
 use hort_http_pypi::simple_index as pypi_helpers;
@@ -116,6 +130,8 @@ const FORMAT_NPM: &str = "npm";
 const FORMAT_PYPI: &str = "pypi";
 /// Wire format key for Cargo.
 const FORMAT_CARGO: &str = "cargo";
+/// Wire format key for Maven.
+const FORMAT_MAVEN: &str = "maven";
 /// Wire format key for OCI (upstream metadata not supported).
 const FORMAT_OCI: &str = "oci";
 
@@ -220,6 +236,7 @@ impl UpstreamMetadataAdapter {
             FORMAT_NPM => self.dispatch_npm(mapping, package).await,
             FORMAT_PYPI => self.dispatch_pypi(mapping, package).await,
             FORMAT_CARGO => self.dispatch_cargo(mapping, package).await,
+            FORMAT_MAVEN => self.dispatch_maven(mapping, package).await,
             FORMAT_OCI => {
                 // Discovery + prefetch are not supported for OCI.
                 tracing::debug!(
@@ -369,6 +386,97 @@ impl UpstreamMetadataAdapter {
             }
             Err(e) => Err(map_cargo_helper_error(&e)),
         }
+    }
+
+    /// Maven has no `fetch_raw_with_cache` helper to dispatch to: its
+    /// upstream version list lives in the A-level `maven-metadata.xml`,
+    /// which is not a serve-path document the inbound crate caches, so
+    /// there is no per-format projection to read a version list off.
+    ///
+    /// Instead this branch walks the `VersionDiscovery` capability group
+    /// directly — `upstream_metadata_path` for the URL convention,
+    /// `fetch_metadata` for the body, `extract_upstream_versions` for
+    /// the projection — which is exactly the sequence the scheduled
+    /// `prefetch-tick` handler runs. Same document, same upstream
+    /// mapping, same policy gate; the two prefetch surfaces therefore
+    /// resolve the same version set for a Maven repository.
+    ///
+    /// The body is streamed off the cache tempfile on a blocking thread
+    /// and never buffered whole in this crate (ADR 0026); the tempfile
+    /// is removed once the version list is projected, since this seam
+    /// does not serve and holds no mirror.
+    async fn dispatch_maven(
+        &self,
+        mapping: &RepositoryUpstreamMapping,
+        package: &str,
+    ) -> Result<Vec<String>, UpstreamFetchError> {
+        let vd = hort_formats::maven::MavenFormatHandler
+            .version_discovery()
+            .ok_or(UpstreamFetchError::UnsupportedFormat)?;
+        // `None` here means the package is not a well-formed
+        // `groupId:artifactId` coordinate — a validation-class failure,
+        // sanitised to a constant (no coordinate fragments). Mirrors the
+        // `InvalidName` arms of the npm / pypi helper error maps.
+        let Some(path) = vd.upstream_metadata_path(package) else {
+            return Err(UpstreamFetchError::ParseError(
+                "maven package coordinate invalid".into(),
+            ));
+        };
+        let accept = vd.upstream_metadata_accept();
+        let outcome = self
+            .upstream_proxy
+            .for_format(&RepositoryFormat::Maven)
+            .fetch_metadata(mapping.clone(), path, accept)
+            .await
+            .map_err(|e| map_maven_proxy_error(&e))?;
+        let Some(handle) = outcome.cache_handle else {
+            return Err(UpstreamFetchError::ParseError(
+                "maven upstream metadata produced no cached body".into(),
+            ));
+        };
+        let versions = hort_app::project::run_handler_body(&handle, move |reader| {
+            // The closure must be `'static`, so it re-derives the
+            // capability group off a fresh unit-struct handler rather
+            // than capturing the borrowed `vd`. `version_discovery()` is
+            // a pure dispatch on the concrete type — same handler, same
+            // answer as the check above.
+            hort_formats::maven::MavenFormatHandler
+                .version_discovery()
+                .ok_or_else(|| {
+                    hort_domain::error::DomainError::Invariant(
+                        "maven handler participates in VersionDiscovery".into(),
+                    )
+                })?
+                .extract_upstream_versions(reader)
+        })
+        .await;
+        hort_app::project::remove_cached_body(&handle).await;
+        // A malformed / oversized `maven-metadata.xml` is a parse-class
+        // failure; sanitised constant, no body or URL fragments.
+        versions
+            .map_err(|_| UpstreamFetchError::ParseError("maven upstream metadata malformed".into()))
+    }
+}
+
+/// Map an upstream-proxy [`DomainError`] to the typed
+/// [`UpstreamFetchError`] taxonomy.
+///
+/// The proxy port is format-agnostic and returns `DomainError`, not the
+/// coarse per-format helper enums the other three branches map — so this
+/// branch classifies the one distinction the consuming use case acts on:
+/// "the upstream does not publish this artifact" (a real 404, which the
+/// upstream adapter encodes as an `upstream:not_found:…` sentinel and
+/// error `Display` chains preserve) versus everything else. Everything
+/// else collapses to a sanitised `NetworkError` constant, matching the
+/// `UpstreamUnavailable` arm the npm / pypi / cargo maps already fold
+/// their upstream-side failures into.
+fn map_maven_proxy_error(e: &hort_domain::error::DomainError) -> UpstreamFetchError {
+    let rendered = e.to_string().to_ascii_lowercase();
+    if rendered.contains("not_found") || rendered.contains("not found") || rendered.contains("404")
+    {
+        UpstreamFetchError::NotFound
+    } else {
+        UpstreamFetchError::NetworkError("upstream fetch failed".into())
     }
 }
 
@@ -553,6 +661,7 @@ mod tests {
     // crate-level production `use`s were removed to avoid unused imports.
     use hort_domain::ports::format_handler::FormatHandler;
     use hort_domain::ports::repository_upstream_mapping_repository::UpstreamAuth;
+    use hort_formats::maven::MavenFormatHandler;
     use hort_formats::npm::NpmFormatHandler;
     use hort_formats::pypi::PyPiFormatHandler;
     use uuid::Uuid;
@@ -729,6 +838,111 @@ mod tests {
             .expect("cargo happy path must return Ok");
         got.sort();
         assert_eq!(got, vec!["0.1.0".to_string(), "0.2.0".to_string()]);
+    }
+
+    /// Seed `upstream_proxy` so the Maven branch's `fetch_metadata`
+    /// resolves for `groupId:artifactId` with the given
+    /// `maven-metadata.xml` body. No resolver seeding — the Maven branch
+    /// goes straight to the upstream proxy with the caller's mapping,
+    /// exactly as the scheduled prefetch tick does.
+    fn seed_maven(proxy: &MockUpstreamProxy, package: &str, body: Vec<u8>) {
+        let path = MavenFormatHandler
+            .version_discovery()
+            .expect("maven participates in VersionDiscovery")
+            .upstream_metadata_path(package)
+            .expect("well-formed groupId:artifactId");
+        proxy.insert_metadata("", &path, body);
+    }
+
+    fn maven_metadata_xml(versions: &[&str]) -> Vec<u8> {
+        let entries: String = versions
+            .iter()
+            .map(|v| format!("<version>{v}</version>"))
+            .collect();
+        format!(
+            "<metadata><groupId>com.example</groupId><artifactId>lib</artifactId>\
+             <versioning><versions>{entries}</versions></versioning></metadata>"
+        )
+        .into_bytes()
+    }
+
+    /// The fourth site of the prefetch coupling: a Maven repository
+    /// resolves its upstream version set here instead of being turned
+    /// away with `UnsupportedFormat`, so the self-service prefetch
+    /// endpoint can pick a latest for `version: None`.
+    #[tokio::test]
+    async fn dispatch_maven_returns_parsed_version_set() {
+        let (adapter, _, proxy) = build_adapter();
+        let mapping = make_mapping(Uuid::new_v4(), None);
+        seed_maven(
+            &proxy,
+            "com.example:lib",
+            maven_metadata_xml(&["1.9.0", "1.10.0"]),
+        );
+
+        let got = adapter
+            .list_versions("maven", &mapping, "com.example:lib")
+            .await
+            .expect("maven happy path must return Ok");
+        // Document order preserved — ordering is the planner's job, via
+        // the canonical `MavenVersionOrdering`.
+        assert_eq!(got, vec!["1.9.0".to_string(), "1.10.0".to_string()]);
+    }
+
+    /// A package that is not the colon-joined `groupId:artifactId` form
+    /// has no `maven-metadata.xml` path to compose. Sanitised
+    /// `ParseError`, not a panic and not a misleading `NotFound`.
+    #[tokio::test]
+    async fn dispatch_maven_rejects_a_malformed_coordinate_as_parse_error() {
+        let (adapter, _, _) = build_adapter();
+        let mapping = make_mapping(Uuid::new_v4(), None);
+
+        let got = adapter.list_versions("maven", &mapping, "not-a-gav").await;
+        assert_eq!(
+            got,
+            Err(UpstreamFetchError::ParseError(
+                "maven package coordinate invalid".into()
+            ))
+        );
+    }
+
+    /// An unseeded coordinate makes the mock proxy return the
+    /// `upstream:not_found:…` sentinel the real adapter encodes a 404
+    /// as; the branch must classify it as `NotFound` rather than folding
+    /// every upstream failure into a network error.
+    #[tokio::test]
+    async fn dispatch_maven_maps_an_upstream_404_to_not_found() {
+        let (adapter, _, _) = build_adapter();
+        let mapping = make_mapping(Uuid::new_v4(), None);
+
+        let got = adapter
+            .list_versions("maven", &mapping, "com.example:absent")
+            .await;
+        assert_eq!(got, Err(UpstreamFetchError::NotFound));
+    }
+
+    #[test]
+    fn map_maven_proxy_error_classifies_not_found_and_folds_the_rest() {
+        use hort_domain::error::DomainError;
+        // The sentinel the upstream adapter encodes a real 404 as; the
+        // `Display` chain preserves the substring.
+        assert_eq!(
+            map_maven_proxy_error(&DomainError::Invariant(
+                "upstream:not_found:maven-metadata.xml".into()
+            )),
+            UpstreamFetchError::NotFound
+        );
+        assert_eq!(
+            map_maven_proxy_error(&DomainError::NotFound {
+                entity: "artifact",
+                id: "com.example:lib".into(),
+            }),
+            UpstreamFetchError::NotFound
+        );
+        assert_eq!(
+            map_maven_proxy_error(&DomainError::Invariant("connection refused".into())),
+            UpstreamFetchError::NetworkError("upstream fetch failed".into())
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1071,6 +1285,31 @@ mod tests {
         assert_eq!(
             got_none, got_some,
             "upstream_name_prefix is OCI-effective-only: cargo versions must be identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_name_prefix_is_inert_maven() {
+        let (adapter, _, proxy) = build_adapter();
+        let mapping_none = make_mapping(Uuid::new_v4(), None);
+        seed_maven(&proxy, "com.example:lib", maven_metadata_xml(&["1.0.0"]));
+
+        let got_none = adapter
+            .list_versions("maven", &mapping_none, "com.example:lib")
+            .await
+            .expect("maven with prefix=None must succeed");
+
+        let mut mapping_some = mapping_none.clone();
+        mapping_some.upstream_name_prefix = Some("foo".into());
+
+        let got_some = adapter
+            .list_versions("maven", &mapping_some, "com.example:lib")
+            .await
+            .expect("maven with prefix=Some(\"foo\") must produce IDENTICAL output");
+
+        assert_eq!(
+            got_none, got_some,
+            "upstream_name_prefix is OCI-effective-only: maven versions must be identical"
         );
     }
 

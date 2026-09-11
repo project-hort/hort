@@ -404,12 +404,26 @@ struct WalkSummary {
     deps_extracted: u64,
     deps_already_held: u64,
     deps_resolve_failed: u64,
-    /// Cold deps the cascade tried to resolve
-    /// against upstream but could not find a satisfying version for
-    /// (upstream's available set returned `None` from
-    /// `resolve_range_max`). Logged as `warn` and skipped (the
-    /// cascade can't fabricate a version upstream doesn't have).
+    /// Cold deps the cascade **asked upstream about and got nothing
+    /// back that satisfied them** — either `resolve_range_max`
+    /// returned `None` against upstream's available set, or the
+    /// metadata fetch/parse itself failed after a request went out.
+    /// Logged as `warn` and skipped (the cascade can't fabricate a
+    /// version upstream doesn't have). Distinct from
+    /// `deps_routing_dead_end`, which never reaches upstream at all —
+    /// collapsing the two would send an operator investigating
+    /// upstream for a cause that is local.
     deps_upstream_unsatisfiable: u64,
+    /// Cold deps the cascade **could not even ask about** — the
+    /// `VersionDiscovery::upstream_metadata_path` call for this
+    /// package's normalised name returned `None`, so no metadata
+    /// fetch was attempted (e.g. a package name that does not parse
+    /// as a valid coordinate under the format's convention). This is
+    /// a local capability/config gap, not a fact about upstream: the
+    /// question was never asked, as opposed to
+    /// `deps_upstream_unsatisfiable`, where it was asked and answered
+    /// "no". Logged as `debug` and skipped.
+    deps_routing_dead_end: u64,
     /// Distinct upstream `fetch_metadata` calls
     /// the walk performed (one per cold `(repo, package)` cohort).
     /// Coalesced so two specs referencing the same package make ONE
@@ -448,6 +462,7 @@ impl WalkSummary {
             "deps_already_held":               self.deps_already_held,
             "deps_resolve_failed":             self.deps_resolve_failed,
             "deps_upstream_unsatisfiable":     self.deps_upstream_unsatisfiable,
+            "deps_routing_dead_end":           self.deps_routing_dead_end,
             "upstream_metadata_fetches":       self.upstream_metadata_fetches,
             "upstream_metadata_fetch_errors":  self.upstream_metadata_fetch_errors,
             "no_upstream_mapping":             self.no_upstream_mapping,
@@ -841,12 +856,31 @@ impl PrefetchDependenciesHandler {
 
         if let Some(mapping) = upstream_mapping {
             for (normalised, cold_specs) in cold_by_package {
+                // Per-format URL conventions live on the
+                // VersionDiscovery trait — exactly the values
+                // `prefetch_tick` uses, not a locally-composed guess.
+                // `None` here means this package's name does not name
+                // a fetchable metadata-index document under the
+                // format's convention (e.g. an invalid Maven GA
+                // coordinate); a format that reaches the cascade
+                // without the capability at all is already filtered
+                // out above the cohort loop.
+                let Some(upstream_path) = vd.upstream_metadata_path(&normalised) else {
+                    tracing::debug!(
+                        repository = %repo.key,
+                        package = %normalised,
+                        format = ?repo.format,
+                        "prefetch-dependencies: handler has no upstream_metadata_path for this \
+                         package; skipping its cold specs — never reached upstream, so this is \
+                         not an upstream-unsatisfiable outcome",
+                    );
+                    summary.deps_routing_dead_end += cold_specs.len() as u64;
+                    continue;
+                };
                 // ONE upstream metadata fetch per package, regardless
                 // of how many specs refer to it.
                 summary.upstream_metadata_fetches += 1;
-                let upstream_path =
-                    upstream_metadata_path_for(handler.as_ref(), &repo.format, &normalised);
-                let accept = upstream_accept_for(&repo.format);
+                let accept = vd.upstream_metadata_accept();
                 let outcome = match self
                     .upstream_proxy
                     .fetch_metadata(mapping.clone(), upstream_path.clone(), accept)
@@ -1068,65 +1102,6 @@ impl PrefetchDependenciesHandler {
 }
 
 // ---------------------------------------------------------------------------
-// Per-format upstream-metadata path / accept helpers
-// ---------------------------------------------------------------------------
-//
-// Mirrors `prefetch_tick.rs`'s helpers verbatim — same per-format
-// hot-path equivalence (npm packument, cargo NDJSON, pypi
-// PEP 503/691). Lifted into module-scope so the cascade and the
-// scheduled tick stay in lock-step; a future refactor could lift
-// these into a shared `task_handlers::prefetch_shared` module.
-
-/// Compose the format-native upstream-metadata path for a tracked
-/// package. Mirrors `prefetch_tick::upstream_metadata_path_for`.
-fn upstream_metadata_path_for(
-    handler: &dyn FormatHandler,
-    format: &hort_domain::entities::repository::RepositoryFormat,
-    package: &str,
-) -> String {
-    use hort_domain::entities::repository::RepositoryFormat;
-    use hort_domain::types::ArtifactCoords;
-    match format {
-        RepositoryFormat::Pypi => {
-            // The simple-index path enumerates ALL versions of the
-            // package; the per-version JSON manifest is per-VERSION
-            // and not the right read here. Mirrors
-            // `prefetch_tick::upstream_metadata_path_for`'s Pypi arm.
-            let normalized = handler.normalize_name(package);
-            format!("/simple/{normalized}/")
-        }
-        _ => {
-            let coords = ArtifactCoords {
-                name: package.to_string(),
-                name_as_published: package.to_string(),
-                version: None,
-                path: String::new(),
-                format: format.clone(),
-                metadata: serde_json::Value::Null,
-            };
-            handler
-                .upstream_checksum_metadata_path(&coords)
-                .unwrap_or_else(|| format!("/{package}"))
-        }
-    }
-}
-
-/// The `Accept` header set the upstream-metadata fetch should send.
-/// Mirrors `prefetch_tick::upstream_accept_for`.
-fn upstream_accept_for(
-    format: &hort_domain::entities::repository::RepositoryFormat,
-) -> Vec<String> {
-    use hort_domain::entities::repository::RepositoryFormat;
-    match format {
-        RepositoryFormat::Pypi => vec![
-            "application/vnd.pypi.simple.v1+json".to_string(),
-            "text/html;q=0.5".to_string(),
-        ],
-        _ => Vec::new(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1273,6 +1248,73 @@ mod tests {
         .into_bytes()
     }
 
+    // Shared JSON-fixture parsing for the per-format `VersionDiscovery`
+    // test doubles below. These stand-ins deliberately diverge from the
+    // real per-format parsers (archive-aware, format-native range syntax
+    // — see `hort-formats`): the cascade tests here exercise WALK/ENQUEUE
+    // logic (depth, fan-out caps, cohort planning, upstream-path
+    // routing), not per-format parsing, so every fixture shares one
+    // trivial JSON shape.
+
+    /// Parse the test packument shape
+    /// `{"versions":{"1.0.0":{},"2.5.0":{}}}` into the version-string set.
+    fn test_extract_versions_from_json(body: &mut dyn std::io::Read) -> DomainResult<Vec<String>> {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(body, &mut buf)
+            .map_err(|e| DomainError::Validation(e.to_string()))?;
+        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&buf) else {
+            return Ok(Vec::new());
+        };
+        let Some(versions) = doc.get("versions").and_then(|v| v.as_object()) else {
+            return Ok(Vec::new());
+        };
+        Ok(versions.keys().cloned().collect())
+    }
+
+    /// Parse the test manifest shape `{"dependencies":{"name":"range"}}`
+    /// into `DependencySpec`s.
+    fn test_extract_deps_from_json(
+        content: &mut dyn std::io::Read,
+    ) -> DomainResult<Vec<DependencySpec>> {
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(content, &mut buf)
+            .map_err(|e| DomainError::Validation(e.to_string()))?;
+        let v: serde_json::Value = serde_json::from_slice(&buf)
+            .map_err(|e| DomainError::Validation(format!("test manifest parse: {e}")))?;
+        let deps = v.get("dependencies").and_then(|d| d.as_object());
+        let mut out = Vec::new();
+        if let Some(map) = deps {
+            for (k, val) in map {
+                if let Some(s) = val.as_str() {
+                    out.push(DependencySpec {
+                        name: k.clone(),
+                        range: s.to_string(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// "Any range matches any version containing its (un-caret-prefixed)
+    /// text; pick the lexicographically-max match" — sufficient for
+    /// cascade WALK/ENQUEUE-logic tests. Real per-format range semantics
+    /// live in `hort-formats`.
+    fn test_resolve_range_max(range: &str, available: &[&str]) -> DomainResult<Option<String>> {
+        if available.is_empty() {
+            return Ok(None);
+        }
+        let any = range == "*" || range == "x" || range == "latest";
+        if !any
+            && !available
+                .iter()
+                .any(|v| v.contains(range.trim_start_matches('^')))
+        {
+            return Ok(None);
+        }
+        Ok(available.iter().max().copied().map(str::to_string))
+    }
+
     /// Tiny in-test [`FormatHandler`] for npm. Implements only the
     /// methods the cascade touches:
     /// `format_key`, `normalize_name`, `extract_dependency_specs`,
@@ -1309,27 +1351,20 @@ mod tests {
             &self,
             body: &mut dyn std::io::Read,
         ) -> DomainResult<Vec<String>> {
-            // Test packument: `{"versions":{"1.0.0":{},"2.5.0":{}}}`.
-            // Cold-cohort tests seed this shape.
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(body, &mut buf)
-                .map_err(|e| DomainError::Validation(e.to_string()))?;
-            let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&buf) else {
-                return Ok(Vec::new());
-            };
-            let Some(versions) = doc.get("versions").and_then(|v| v.as_object()) else {
-                return Ok(Vec::new());
-            };
-            Ok(versions.keys().cloned().collect())
+            test_extract_versions_from_json(body)
         }
-        fn upstream_metadata_path(&self, _package: &str) -> Option<String> {
-            None
+        fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+            // Coincides with `upstream_checksum_metadata_path` below —
+            // real npm's packument document carries both the version
+            // set and the per-version checksum, so both methods answer
+            // `/{package}`. The cascade now reads this one.
+            Some(format!("/{package}"))
         }
         fn upstream_metadata_accept(&self) -> Vec<String> {
             Vec::new()
         }
-        // NOTE: this stand-in JSON-parses `content` DIRECTLY,
-        // which deliberately diverges from the production npm handler's
+        // NOTE: `content` here is the raw test-manifest JSON, which
+        // deliberately diverges from the production npm handler's
         // archive-aware contract (the real handler is fed the stored `.tgz`
         // and reads `package/package.json` out of it via `archive_bounds`).
         // That is intentional, not a contract contradiction: these cascade
@@ -1341,48 +1376,268 @@ mod tests {
             &self,
             content: &mut dyn std::io::Read,
         ) -> DomainResult<Vec<DependencySpec>> {
-            let mut buf = Vec::new();
-            std::io::Read::read_to_end(content, &mut buf)
-                .map_err(|e| DomainError::Validation(e.to_string()))?;
-            let v: serde_json::Value = serde_json::from_slice(&buf)
-                .map_err(|e| DomainError::Validation(format!("npm in-test parse: {e}")))?;
-            let deps = v.get("dependencies").and_then(|d| d.as_object());
-            let mut out = Vec::new();
-            if let Some(map) = deps {
-                for (k, val) in map {
-                    if let Some(s) = val.as_str() {
-                        out.push(DependencySpec {
-                            name: k.clone(),
-                            range: s.to_string(),
-                        });
-                    }
-                }
-            }
-            Ok(out)
+            test_extract_deps_from_json(content)
         }
         fn resolve_range_max(
             &self,
             range: &str,
             available: &[&str],
         ) -> DomainResult<Option<String>> {
-            // For testing: "any range" matches any non-empty version
-            // in the available set; the highest version is the
-            // lexicographically-max string. Real npm semver lives in
-            // hort-formats; this is sufficient for cascade-logic tests.
-            if available.is_empty() {
-                return Ok(None);
+            test_resolve_range_max(range, available)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+    }
+
+    /// `FormatHandler`+`VersionDiscovery` test double for cargo.
+    ///
+    /// `upstream_checksum_metadata_path` deliberately answers a
+    /// DIFFERENT path than `VersionDiscovery::upstream_metadata_path` —
+    /// unlike npm above, where the two coincide. This is the regression
+    /// shape: if the cascade ever again composed its cold-cohort fetch
+    /// path from `upstream_checksum_metadata_path` instead of routing
+    /// through `VersionDiscovery`, the seeded metadata (at the
+    /// `upstream_metadata_path` path) would not be found and the cold
+    /// cohort would report `deps_upstream_unsatisfiable` instead of
+    /// enqueuing — exactly the bug this item fixes.
+    struct CargoInTest;
+    impl FormatHandler for CargoInTest {
+        fn format_key(&self) -> &str {
+            "cargo"
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> DomainResult<hort_domain::types::ArtifactCoords> {
+            unimplemented!("not called in cascade tests")
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn upstream_checksum_metadata_path(
+            &self,
+            coords: &hort_domain::types::ArtifactCoords,
+        ) -> Option<String> {
+            Some(format!("/checksum-floor/{}", coords.name))
+        }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for CargoInTest {
+        fn extract_upstream_versions(
+            &self,
+            body: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<String>> {
+            test_extract_versions_from_json(body)
+        }
+        fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+            Some(format!("/index/{package}"))
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn extract_dependency_specs(
+            &self,
+            content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            test_extract_deps_from_json(content)
+        }
+        fn resolve_range_max(
+            &self,
+            range: &str,
+            available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            test_resolve_range_max(range, available)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+    }
+
+    /// `FormatHandler`+`VersionDiscovery` test double for PyPI.
+    ///
+    /// Mirrors the real `PyPiFormatHandler`: `upstream_metadata_path`
+    /// answers the PEP 503 simple-index path
+    /// (`/simple/{normalized}/`), and `upstream_checksum_metadata_path`
+    /// is left at the trait default (`None`) — PyPI's per-version
+    /// checksum document requires a version, which a catalog-level
+    /// cold-cohort request does not have. The old cascade special-cased
+    /// PyPI to reach this same string directly; this fixture pins that
+    /// the now-deleted special case was redundant, not load-bearing.
+    struct PypiInTest;
+    impl FormatHandler for PypiInTest {
+        fn format_key(&self) -> &str {
+            "pypi"
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> DomainResult<hort_domain::types::ArtifactCoords> {
+            unimplemented!("not called in cascade tests")
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_lowercase().replace(['.', '_'], "-")
+        }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for PypiInTest {
+        fn extract_upstream_versions(
+            &self,
+            body: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<String>> {
+            test_extract_versions_from_json(body)
+        }
+        fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+            let normalized = self.normalize_name(package);
+            Some(format!("/simple/{normalized}/"))
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            vec![
+                "application/vnd.pypi.simple.v1+json".to_string(),
+                "text/html;q=0.5".to_string(),
+            ]
+        }
+        fn extract_dependency_specs(
+            &self,
+            content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            test_extract_deps_from_json(content)
+        }
+        fn resolve_range_max(
+            &self,
+            range: &str,
+            available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            test_resolve_range_max(range, available)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+    }
+
+    /// `FormatHandler`+`VersionDiscovery` test double for Maven.
+    ///
+    /// Mirrors the real `MavenFormatHandler`: `upstream_metadata_path`
+    /// answers the A-level `maven-metadata.xml` path
+    /// (`/{group-as-path}/{artifact}/maven-metadata.xml`), and
+    /// `upstream_checksum_metadata_path` is left at the trait default
+    /// (`None`) — Maven has no per-artifact checksum document at the
+    /// catalog level (each FILE's checksum lives beside that file).
+    /// This is the coordinate the pre-fix cascade could not compose:
+    /// `upstream_checksum_metadata_path` being `None` was exactly what
+    /// made the old helper fall through to the naive `/{package}` guess.
+    struct MavenInTest;
+    impl FormatHandler for MavenInTest {
+        fn format_key(&self) -> &str {
+            "maven"
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> DomainResult<hort_domain::types::ArtifactCoords> {
+            unimplemented!("not called in cascade tests")
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for MavenInTest {
+        fn extract_upstream_versions(
+            &self,
+            body: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<String>> {
+            test_extract_versions_from_json(body)
+        }
+        fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+            let (group_id, artifact_id) = package.split_once(':')?;
+            if group_id.is_empty() || artifact_id.is_empty() {
+                return None;
             }
-            // Treat "x.x.x" as "match any version".
-            let any = range == "*" || range == "x" || range == "latest";
-            if !any
-                && !available
-                    .iter()
-                    .any(|v| v.contains(range.trim_start_matches('^')))
-            {
-                return Ok(None);
-            }
-            let max = available.iter().max().copied().map(str::to_string);
-            Ok(max)
+            let group_path = group_id.replace('.', "/");
+            Some(format!("/{group_path}/{artifact_id}/maven-metadata.xml"))
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn extract_dependency_specs(
+            &self,
+            content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            test_extract_deps_from_json(content)
+        }
+        fn resolve_range_max(
+            &self,
+            range: &str,
+            available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            test_resolve_range_max(range, available)
         }
         fn download_config_path(&self) -> Option<String> {
             None
@@ -1411,14 +1666,23 @@ mod tests {
 
     // Seed an npm packument body the cold-cohort
     // `fetch_metadata` path returns. Path matches
-    // `upstream_metadata_path_for` for npm (`/{package}`) and the
-    // packument shape `NpmInTest::extract_upstream_versions` parses.
+    // `VersionDiscovery::upstream_metadata_path` for npm (`/{package}`)
+    // and the packument shape `NpmInTest::extract_upstream_versions`
+    // parses.
     fn seed_npm_packument(proxy: &MockUpstreamProxy, package: &str, versions: &[&str]) {
+        seed_packument_at(proxy, &format!("/{package}"), versions);
+    }
+
+    /// Seed a test packument/version-list body at an arbitrary path —
+    /// the generalisation `seed_npm_packument` delegates to, used by the
+    /// cargo/pypi/maven cold-cohort tests where the path shape differs
+    /// per format.
+    fn seed_packument_at(proxy: &MockUpstreamProxy, path: &str, versions: &[&str]) {
         let mut s = String::from(r#"{"versions":{"#);
         let pieces: Vec<String> = versions.iter().map(|v| format!(r#""{v}":{{}}"#)).collect();
         s.push_str(&pieces.join(","));
         s.push_str("}}");
-        proxy.insert_metadata("", &format!("/{package}"), s.into_bytes());
+        proxy.insert_metadata("", path, s.into_bytes());
     }
 
     // Build + upsert the catch-all upstream
@@ -1529,6 +1793,24 @@ mod tests {
     fn handlers_npm() -> HashMap<String, Arc<dyn FormatHandler>> {
         let mut m: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
         m.insert("npm".to_string(), Arc::new(NpmInTest));
+        m
+    }
+
+    fn handlers_cargo() -> HashMap<String, Arc<dyn FormatHandler>> {
+        let mut m: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        m.insert("cargo".to_string(), Arc::new(CargoInTest));
+        m
+    }
+
+    fn handlers_pypi() -> HashMap<String, Arc<dyn FormatHandler>> {
+        let mut m: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        m.insert("pypi".to_string(), Arc::new(PypiInTest));
+        m
+    }
+
+    fn handlers_maven() -> HashMap<String, Arc<dyn FormatHandler>> {
+        let mut m: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        m.insert("maven".to_string(), Arc::new(MavenInTest));
         m
     }
 
@@ -2737,6 +3019,221 @@ mod tests {
         // Two specs, ONE upstream fetch (coalesced by normalised name).
         assert_eq!(result_summary["deps_extracted"], 2);
         assert_eq!(result_summary["upstream_metadata_fetches"], 1);
+    }
+
+    // =====================================================================
+    // Cold-cohort upstream-metadata path routes through
+    // `VersionDiscovery`, not a locally-composed guess (backlog 179 /
+    // issue #233). The cascade's cold pass used to compose
+    // `/{package}` (or, worse for Maven, `/com.example:foo`) instead of
+    // reading `vd.upstream_metadata_path`/`vd.upstream_metadata_accept`
+    // the way `prefetch_tick` does.
+    // =====================================================================
+
+    /// The load-bearing acceptance case: a Maven repository's cold
+    /// cohort fetches the A-level `maven-metadata.xml` path the handler
+    /// returns — not `/{package}` (the pre-fix guess: neither
+    /// `com.example:foo` nor `/com.example:foo` is a valid Maven
+    /// upstream path) and not a checksum path (Maven's
+    /// `upstream_checksum_metadata_path` is `None` by design, which is
+    /// exactly what made the old helper fall through to the guess).
+    #[tokio::test]
+    async fn maven_cold_cohort_fetches_the_a_level_metadata_path() {
+        let repo = make_repo(RepositoryFormat::Maven, 5);
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(repo.clone());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let jobs = Arc::new(MockJobsRepository::new());
+        let manifest = br#"{"name":"r","version":"1.0.0",
+            "dependencies":{"com.example:foo":"1.0.0"},"devDependencies":{}}"#;
+        let art = seed_artifact_with_bytes(&artifacts, &storage, repo.id, manifest.to_vec()).await;
+
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        // Seeded ONLY at the A-level path. If the cascade instead
+        // composed `/com.example:foo` (the pre-fix bug) or any
+        // checksum-floor path, this fetch would miss and every dep
+        // would land in `deps_upstream_unsatisfiable` rather than
+        // `prefetch_rows_enqueued`.
+        seed_packument_at(
+            &proxy,
+            "/com/example/foo/maven-metadata.xml",
+            &["1.0.0", "1.1.0"],
+        );
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        seed_catchall_mapping(&mappings, repo.id).await;
+
+        let handler = make_handler(
+            repos,
+            artifacts,
+            storage,
+            jobs.clone(),
+            proxy,
+            mappings,
+            handlers_maven(),
+        );
+
+        let outcome = handler
+            .run(&json!({"artifact_id": art.id}), make_context())
+            .await
+            .expect("Ok");
+        let TaskOutcome::Completed { result_summary } = outcome else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["upstream_metadata_fetch_errors"], 0);
+        assert_eq!(result_summary["deps_upstream_unsatisfiable"], 0);
+        assert_eq!(result_summary["prefetch_rows_enqueued"], 1);
+
+        let batches = jobs.prefetch_batch_calls();
+        let prefetch_batch = batches
+            .iter()
+            .find(|b| b.iter().all(|r| r.kind == "prefetch"))
+            .expect("prefetch batch present");
+        assert_eq!(prefetch_batch[0].params["package"], "com.example:foo");
+        assert_eq!(prefetch_batch[0].params["version"], "1.1.0");
+    }
+
+    /// cargo's cold cohort routes through
+    /// `VersionDiscovery::upstream_metadata_path`, not
+    /// `upstream_checksum_metadata_path` (the two are made to differ in
+    /// `CargoInTest` specifically to catch a regression back to the
+    /// deleted local helper).
+    #[tokio::test]
+    async fn cargo_cold_cohort_fetches_the_version_discovery_path_not_the_checksum_path() {
+        let repo = make_repo(RepositoryFormat::Cargo, 5);
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(repo.clone());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let jobs = Arc::new(MockJobsRepository::new());
+        let manifest =
+            br#"{"name":"r","version":"1.0.0","dependencies":{"serde":"1.0"},"devDependencies":{}}"#;
+        let art = seed_artifact_with_bytes(&artifacts, &storage, repo.id, manifest.to_vec()).await;
+
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        // Seeded at `CargoInTest::upstream_metadata_path`'s path
+        // (`/index/{package}`), NOT at its
+        // `upstream_checksum_metadata_path` (`/checksum-floor/{package}`).
+        seed_packument_at(&proxy, "/index/serde", &["1.0.0", "1.0.5"]);
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        seed_catchall_mapping(&mappings, repo.id).await;
+
+        let handler = make_handler(
+            repos,
+            artifacts,
+            storage,
+            jobs.clone(),
+            proxy,
+            mappings,
+            handlers_cargo(),
+        );
+
+        let outcome = handler
+            .run(&json!({"artifact_id": art.id}), make_context())
+            .await
+            .expect("Ok");
+        let TaskOutcome::Completed { result_summary } = outcome else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["upstream_metadata_fetch_errors"], 0);
+        assert_eq!(result_summary["prefetch_rows_enqueued"], 1);
+    }
+
+    /// PyPI's cold cohort still fetches the PEP 503 simple-index path —
+    /// the deleted `RepositoryFormat::Pypi` special case in the local
+    /// helper is redundant with `PyPiFormatHandler::upstream_metadata_path`,
+    /// not load-bearing.
+    #[tokio::test]
+    async fn pypi_cold_cohort_still_fetches_the_simple_index_path() {
+        let repo = make_repo(RepositoryFormat::Pypi, 5);
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(repo.clone());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let jobs = Arc::new(MockJobsRepository::new());
+        let manifest = br#"{"name":"r","version":"1.0.0","dependencies":{"Requests":"2.0"},"devDependencies":{}}"#;
+        let art = seed_artifact_with_bytes(&artifacts, &storage, repo.id, manifest.to_vec()).await;
+
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        // PEP 503 normalises `Requests` -> `requests`.
+        seed_packument_at(&proxy, "/simple/requests/", &["2.0.0", "2.1.0"]);
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        seed_catchall_mapping(&mappings, repo.id).await;
+
+        let handler = make_handler(
+            repos,
+            artifacts,
+            storage,
+            jobs.clone(),
+            proxy,
+            mappings,
+            handlers_pypi(),
+        );
+
+        let outcome = handler
+            .run(&json!({"artifact_id": art.id}), make_context())
+            .await
+            .expect("Ok");
+        let TaskOutcome::Completed { result_summary } = outcome else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["upstream_metadata_fetch_errors"], 0);
+        assert_eq!(result_summary["prefetch_rows_enqueued"], 1);
+    }
+
+    /// A package name `VersionDiscovery::upstream_metadata_path` cannot
+    /// compose a path for (e.g. an invalid Maven GA coordinate with no
+    /// colon) is skipped — counted `deps_routing_dead_end`, never
+    /// falling back to a guessed URL, and never landing in
+    /// `deps_upstream_unsatisfiable` (no fetch was ever attempted, so
+    /// there is nothing upstream to blame). Exercises the `None` arm
+    /// added at the cold-cohort call site, distinct from the
+    /// handler-level `version_discovery() == None` no-op path already
+    /// covered by `registered_handler_without_version_discovery_completes_as_noop`.
+    #[tokio::test]
+    async fn per_package_no_metadata_path_is_skipped_not_guessed() {
+        let repo = make_repo(RepositoryFormat::Maven, 5);
+        let repos = Arc::new(MockRepositoryRepository::new());
+        repos.insert(repo.clone());
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let jobs = Arc::new(MockJobsRepository::new());
+        // `not-a-ga-coordinate` has no `:` — `MavenInTest::upstream_metadata_path`
+        // returns `None` for it, mirroring the real handler's coordinate guard.
+        let manifest = br#"{"name":"r","version":"1.0.0",
+            "dependencies":{"not-a-ga-coordinate":"1.0.0"},"devDependencies":{}}"#;
+        let art = seed_artifact_with_bytes(&artifacts, &storage, repo.id, manifest.to_vec()).await;
+
+        // No metadata seeded anywhere — a guessed-URL fetch attempt
+        // would also fail, so absence of a fetch-error count
+        // distinguishes "skipped before fetching" from "fetched a
+        // guessed URL and got a 404".
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        seed_catchall_mapping(&mappings, repo.id).await;
+
+        let handler = make_handler(
+            repos,
+            artifacts,
+            storage,
+            jobs.clone(),
+            proxy,
+            mappings,
+            handlers_maven(),
+        );
+
+        let outcome = handler
+            .run(&json!({"artifact_id": art.id}), make_context())
+            .await
+            .expect("Ok");
+        let TaskOutcome::Completed { result_summary } = outcome else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["deps_routing_dead_end"], 1);
+        assert_eq!(result_summary["deps_upstream_unsatisfiable"], 0);
+        assert_eq!(result_summary["upstream_metadata_fetches"], 0);
+        assert_eq!(result_summary["upstream_metadata_fetch_errors"], 0);
+        assert_eq!(result_summary["prefetch_rows_enqueued"], 0);
     }
 
     // =====================================================================

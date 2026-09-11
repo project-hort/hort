@@ -156,7 +156,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
-use hort_domain::entities::repository::{PrefetchTrigger, Repository, RepositoryFormat};
+use hort_domain::entities::repository::{PrefetchTrigger, Repository};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::format_handler::FormatHandler;
@@ -167,9 +167,7 @@ use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
 use hort_domain::ports::BoxFuture;
 
-use crate::use_cases::index_serve_filter::{
-    CargoSemverOrdering, NpmSemverOrdering, Pep440Ordering, VersionOrdering,
-};
+use crate::use_cases::index_serve_filter::{ordering_for_format, VersionOrdering};
 use crate::use_cases::prefetch_use_case::PrefetchUseCase;
 
 // ---------------------------------------------------------------------------
@@ -537,14 +535,16 @@ impl TaskHandler for PrefetchTickHandler {
                     continue;
                 };
                 // Pre-flight: the format must participate in the
-                // VersionDiscovery capability group (issue #58) — the
-                // structural replacement for the old
-                // `ordering_for_format(&repo.format).is_none()` boolean
-                // pre-check. `vd` (`&dyn VersionDiscovery`) is `Send +
-                // Sync` (a supertrait bound on the trait itself), so —
-                // unlike `&dyn VersionOrdering` below — holding it across
-                // this iteration's `.await` points does not taint the
-                // enclosing `Pin<Box<dyn Future + Send>>`.
+                // VersionDiscovery capability group. This is also the
+                // gate gitops apply keys on when it accepts
+                // `prefetchPolicy.triggers: [scheduled]`, so a format
+                // that passes here and then fails to resolve a
+                // comparator below is a broken promise to the operator,
+                // not a routine skip. `vd` (`&dyn VersionDiscovery`) is
+                // `Send + Sync` (a supertrait bound on the trait
+                // itself), so holding it across this iteration's
+                // `.await` points does not taint the enclosing
+                // `Pin<Box<dyn Future + Send>>`.
                 let Some(vd) = handler.version_discovery() else {
                     tracing::debug!(
                         repository = %repo.key,
@@ -736,29 +736,43 @@ impl TaskHandler for PrefetchTickHandler {
                         }
                     };
 
-                    // Resolve the ordering + run the pure planner inside a
-                    // block — strictly after every `.await` in this
-                    // iteration AND before the `enqueue_prefetch_batch` await
-                    // below — so the `!Send` trait object never crosses an
-                    // await boundary. Today npm/cargo/pypi are exactly both
-                    // the VersionDiscovery participants (the pre-flight
-                    // `vd` check above) and the only Phase-1-ordering
-                    // formats, so that check already guarantees this
-                    // resolves; we still pattern-match for defence-in-depth
-                    // against the two capabilities ever diverging.
-                    let planned: Vec<String> = {
-                        let Some(ordering) = ordering_for_format(&repo.format) else {
-                            continue;
-                        };
-                        run_planner_sync(
-                            self.prefetch.as_ref(),
-                            repo,
-                            package,
-                            &upstream_versions,
-                            &held_status,
-                            ordering,
-                        )
+                    // Resolve the canonical per-format comparator. The
+                    // pre-flight above already established that this
+                    // format participates in the VersionDiscovery
+                    // capability group, and participation-implies-ordering
+                    // is a structural invariant a DB-free guard test
+                    // enforces across every `RepositoryFormat` variant —
+                    // so `None` here is a programming error (the two
+                    // halves were changed apart), not a routine skip.
+                    // Every scheduled prefetch on this repository is
+                    // silently doing nothing when that happens, which is
+                    // exactly the "policy accepted at apply, inert at
+                    // runtime" failure the pairing exists to prevent: say
+                    // so at ERROR and tick a counter an operator can
+                    // alert on.
+                    let Some(ordering) = ordering_for_format(&repo.format) else {
+                        tracing::error!(
+                            repository = %repo.key,
+                            format = ?repo.format,
+                            package = %package,
+                            "prefetch-tick: format declares VersionDiscovery but resolves no \
+                             VersionOrdering — scheduled prefetch is inert for this repository; \
+                             the canonical format-to-ordering mapping is missing this format",
+                        );
+                        crate::metrics::emit_prefetch_ordering_missing(
+                            &repo.key,
+                            &repo.format.to_string(),
+                        );
+                        continue;
                     };
+                    let planned: Vec<String> = run_planner_sync(
+                        self.prefetch.as_ref(),
+                        repo,
+                        package,
+                        &upstream_versions,
+                        &held_status,
+                        ordering,
+                    );
                     summary.packages_walked += 1;
                     summary.prefetches_planned += planned.len() as u64;
                     if planned.is_empty() {
@@ -881,17 +895,21 @@ impl TaskHandler for PrefetchTickHandler {
     }
 }
 
-/// Synchronous planner invocation. Called inside the `for package`
-/// loop after the held-status `await` has completed, so the `&dyn
-/// VersionOrdering` it instantiates here never crosses an `await`
-/// boundary and the enclosing async block stays `Send`.
+/// Synchronous planner invocation, extracted from the `for package`
+/// loop so the pure planning step reads as one call.
+///
+/// `ordering` is `Send + Sync` (every ordering is a zero-sized unit
+/// struct), so the caller may hold it across the `.await` points that
+/// follow without tainting the enclosing `Pin<Box<dyn Future + Send>>` —
+/// the scoped-block dance an earlier `&dyn VersionOrdering` signature
+/// forced is no longer needed.
 fn run_planner_sync(
     prefetch: &PrefetchUseCase,
     repo: &Repository,
     package: &str,
     upstream_versions: &[String],
     held_status: &[(String, QuarantineStatus)],
-    ordering: &'static dyn VersionOrdering,
+    ordering: &'static (dyn VersionOrdering + Send + Sync),
 ) -> Vec<String> {
     let upstream_refs: Vec<&str> = upstream_versions.iter().map(String::as_str).collect();
     let plan = prefetch.plan(
@@ -903,24 +921,6 @@ fn run_planner_sync(
         ordering,
     );
     plan.versions
-}
-
-/// Map a [`RepositoryFormat`] reference to a Phase-1 [`VersionOrdering`]
-/// reference. Returns `None` for formats without a Phase-1 reference
-/// ordering (Maven, OCI, generic, etc.). Mirrors the per-format pick at
-/// the format-crate serve sites.
-fn ordering_for_format(format: &RepositoryFormat) -> Option<&'static dyn VersionOrdering> {
-    static NPM: NpmSemverOrdering = NpmSemverOrdering;
-    static CARGO: CargoSemverOrdering = NpmSemverOrdering;
-    static PEP440: Pep440Ordering = Pep440Ordering;
-    match format {
-        RepositoryFormat::Npm => Some(&NPM as &dyn VersionOrdering),
-        RepositoryFormat::Cargo => Some(&CARGO as &dyn VersionOrdering),
-        RepositoryFormat::Pypi => Some(&PEP440 as &dyn VersionOrdering),
-        // Maven, OCI, Helm, RPM, Debian, … — Phase-1 has no reference
-        // ordering. Phase-2 extends this match.
-        _ => None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -942,7 +942,7 @@ mod tests {
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::repository::{
-        IndexMode, PrefetchPolicy, ReplicationPriority, RepositoryType,
+        IndexMode, PrefetchPolicy, ReplicationPriority, RepositoryFormat, RepositoryType,
     };
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
@@ -1067,6 +1067,30 @@ mod tests {
         m.insert(
             "npm".to_string(),
             Arc::new(NpmHandlerForTests) as Arc<dyn FormatHandler>,
+        );
+        m
+    }
+
+    /// A-level `maven-metadata.xml` carrying `versions` in document
+    /// order. Deliberately unsorted at the source: the planner, not the
+    /// upstream document, is what must impose Maven ordering.
+    fn maven_metadata_with_versions(versions: &[&str]) -> Vec<u8> {
+        let entries: String = versions
+            .iter()
+            .map(|v| format!("<version>{v}</version>"))
+            .collect();
+        format!(
+            "<metadata><groupId>com.example</groupId><artifactId>lib</artifactId>\
+             <versioning><versions>{entries}</versions></versioning></metadata>"
+        )
+        .into_bytes()
+    }
+
+    fn handlers_for_maven() -> HashMap<String, Arc<dyn FormatHandler>> {
+        let mut m: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        m.insert(
+            "maven".to_string(),
+            Arc::new(MavenHandlerForTests) as Arc<dyn FormatHandler>,
         );
         m
     }
@@ -1205,6 +1229,169 @@ mod tests {
                 .iter()
                 .filter_map(|e| e.as_str().map(str::to_string))
                 .collect())
+        }
+        fn extract_dependency_specs(
+            &self,
+            _content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            Ok(Vec::new())
+        }
+        fn resolve_range_max(
+            &self,
+            _range: &str,
+            _available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            Ok(None)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+    }
+
+    /// Minimal Maven double. `hort-app` must not depend on
+    /// `hort-formats` (it would close a dependency cycle), so this
+    /// mirrors just enough of `MavenFormatHandler`'s `VersionDiscovery`
+    /// shape for the tick to walk a Maven repository: the A-level
+    /// `maven-metadata.xml` path convention and a `<version>` scrape
+    /// that preserves document order. The real XML parse (entity-safe,
+    /// size-capped) has its own tests in `hort-formats`.
+    struct MavenHandlerForTests;
+    impl FormatHandler for MavenHandlerForTests {
+        fn format_key(&self) -> &str {
+            "maven"
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> DomainResult<hort_domain::types::ArtifactCoords> {
+            unimplemented!()
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for MavenHandlerForTests {
+        fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+            let (group_id, artifact_id) = package.split_once(':')?;
+            Some(format!(
+                "/{}/{artifact_id}/maven-metadata.xml",
+                group_id.replace('.', "/")
+            ))
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn extract_upstream_versions(
+            &self,
+            body: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<String>> {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(body, &mut buf)
+                .map_err(|e| DomainError::Validation(e.to_string()))?;
+            Ok(buf
+                .split("<version>")
+                .skip(1)
+                .filter_map(|rest| rest.split_once("</version>"))
+                .map(|(v, _)| v.to_string())
+                .collect())
+        }
+        fn extract_dependency_specs(
+            &self,
+            _content: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<DependencySpec>> {
+            Ok(Vec::new())
+        }
+        fn resolve_range_max(
+            &self,
+            _range: &str,
+            _available: &[&str],
+        ) -> DomainResult<Option<String>> {
+            Ok(None)
+        }
+        fn download_config_path(&self) -> Option<String> {
+            None
+        }
+        fn compose_download_url_from_config(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _package: &str,
+            _version: &str,
+            _cksum_hex: Option<&str>,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+        fn resolve_download_url_from_metadata(
+            &self,
+            _body: &mut dyn std::io::Read,
+            _coords: &hort_domain::types::ArtifactCoords,
+        ) -> DomainResult<String> {
+            Err(DomainError::Validation(
+                "not supported by test double".into(),
+            ))
+        }
+    }
+
+    /// A `FormatHandler` registered under a format that participates in
+    /// `VersionDiscovery` here but resolves NO canonical
+    /// `VersionOrdering` — the pairing the `hort-formats` participation
+    /// guard forbids. Only a test can construct that state; it exists to
+    /// prove the runtime branch is loud rather than silent when it does
+    /// occur. Registered under `"helm"`, a format with no ordering.
+    struct OrderinglessParticipantHandler;
+    impl FormatHandler for OrderinglessParticipantHandler {
+        fn format_key(&self) -> &str {
+            "helm"
+        }
+        fn parse_download_path(
+            &self,
+            _path: &str,
+        ) -> DomainResult<hort_domain::types::ArtifactCoords> {
+            unimplemented!()
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
+            Some(self)
+        }
+    }
+    impl VersionDiscovery for OrderinglessParticipantHandler {
+        fn upstream_metadata_path(&self, package: &str) -> Option<String> {
+            Some(format!("/{package}"))
+        }
+        fn upstream_metadata_accept(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn extract_upstream_versions(
+            &self,
+            _body: &mut dyn std::io::Read,
+        ) -> DomainResult<Vec<String>> {
+            Ok(vec!["1.0.0".to_string()])
         }
         fn extract_dependency_specs(
             &self,
@@ -2077,6 +2264,182 @@ mod tests {
     }
 
     // =====================================================================
+    // Maven: `triggers: [scheduled]` plans versions at run time, in
+    // MavenVersionOrdering order.
+    //
+    // The commit that made `MavenFormatHandler` declare VersionDiscovery
+    // is the commit that made gitops apply ACCEPT `[scheduled]` on a
+    // Maven proxy; these tests are what make that acceptance honest.
+    // =====================================================================
+
+    #[tokio::test]
+    async fn scheduled_tick_plans_maven_versions_in_maven_ordering_not_lexicographic() {
+        let r = repo_with(
+            "maven-mirror",
+            RepositoryFormat::Maven,
+            enabled_scheduled_policy(),
+        );
+        let repo_id = r.id;
+        let repos = Arc::new(MockRepoRepo::returning(vec![r]));
+        // Held: 1.2.0 only. Upstream also publishes 1.9.0 and 1.10.0.
+        //
+        // Under a byte-lexical comparator "1.10.0" < "1.2.0", so BOTH
+        // new versions would be filtered out as `not_newer` and nothing
+        // would be planned. Maven ordering compares the numeric tokens,
+        // so both clear the held-newest floor and 1.10.0 sorts above
+        // 1.9.0.
+        let arts = Arc::new(
+            MockArtRepo::new()
+                .with_names(repo_id, vec!["com.example:lib"])
+                .with_held(
+                    repo_id,
+                    "com.example:lib",
+                    vec![("1.2.0", QuarantineStatus::Released)],
+                ),
+        );
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        proxy.insert_metadata(
+            "",
+            "/com/example/lib/maven-metadata.xml",
+            maven_metadata_with_versions(&["1.2.0", "1.10.0", "1.9.0"]),
+        );
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        mappings
+            .upsert(catchall_mapping(repo_id))
+            .await
+            .expect("upsert");
+        let jobs = Arc::new(MockJobsRepository::default());
+        let handler = make_handler_with_jobs(
+            repos,
+            arts,
+            proxy,
+            mappings,
+            handlers_for_maven(),
+            jobs.clone(),
+        );
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        let batches = jobs.prefetch_batch_calls();
+        assert_eq!(batches.len(), 1, "one cohort batch for the single package");
+        let versions: Vec<&str> = batches[0]
+            .iter()
+            .map(|r| r.params["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["1.10.0", "1.9.0"],
+            "planner must sort descending by MavenVersionOrdering — 1.10.0 above 1.9.0; a \
+             lexicographic comparator would have planned nothing at all (both sorting below \
+             the held 1.2.0)",
+        );
+        for row in &batches[0] {
+            assert_eq!(row.params["package"], "com.example:lib");
+            assert_eq!(row.trigger_source, "scheduled");
+        }
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["repos_walked"], 1);
+                assert_eq!(result_summary["packages_walked"], 1);
+                assert_eq!(result_summary["prefetches_planned"], 2);
+                assert_eq!(result_summary["prefetches_enqueued"], 2);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The residual `ordering_for_format` → `None` branch, reachable
+    /// only when a format declares `VersionDiscovery` without a
+    /// canonical ordering — a pairing the `hort-formats` participation
+    /// guard rejects, so this state cannot exist in production and is
+    /// constructed here with a purpose-built handler double.
+    ///
+    /// The point of the test is that the branch is OBSERVED, not merely
+    /// annotated: silence is what let a Maven `[scheduled]` policy be
+    /// accepted at apply and do nothing at run time for a whole
+    /// development cycle, so the counter is the operator's signal.
+    #[test]
+    fn participant_without_an_ordering_ticks_the_ordering_missing_counter() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let r = repo_with(
+            "helm-mirror",
+            RepositoryFormat::Helm,
+            enabled_scheduled_policy(),
+        );
+        let repo_id = r.id;
+        let repos = Arc::new(MockRepoRepo::returning(vec![r]));
+        let arts = Arc::new(MockArtRepo::new().with_names(repo_id, vec!["nginx"]));
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        proxy.insert_metadata("", "/nginx", b"ignored by the double".to_vec());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(mappings.upsert(catchall_mapping(repo_id)))
+            .expect("upsert");
+        let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+        handlers.insert(
+            "helm".to_string(),
+            Arc::new(OrderinglessParticipantHandler) as Arc<dyn FormatHandler>,
+        );
+        let jobs = Arc::new(MockJobsRepository::default());
+        let handler = make_handler_with_jobs(repos, arts, proxy, mappings, handlers, jobs.clone());
+
+        let outcome = metrics::with_local_recorder(&recorder, || {
+            rt.block_on(handler.run(&serde_json::Value::Null, make_context()))
+        })
+        .expect("Ok");
+
+        assert!(
+            jobs.prefetch_batch_calls().is_empty(),
+            "no ordering means no plan, so nothing may be enqueued",
+        );
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["prefetches_planned"], 0);
+                assert_eq!(result_summary["prefetches_enqueued"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        let snapshot = snapshotter.snapshot().into_vec();
+        let missing = snapshot
+            .iter()
+            .find(|(ck, _, _, _)| {
+                ck.kind() == MetricKind::Counter
+                    && ck.key().name() == "hort_prefetch_ordering_missing_total"
+            })
+            .expect(
+                "hort_prefetch_ordering_missing_total must fire — this branch used to be a \
+                 bare `continue` with no log line and no metric",
+            );
+        assert!(
+            missing
+                .0
+                .key()
+                .labels()
+                .any(|l| l.key() == "repository" && l.value() == "helm-mirror"),
+            "the counter must carry the repository whose policy is inert",
+        );
+        assert!(
+            missing
+                .0
+                .key()
+                .labels()
+                .any(|l| l.key() == "format" && l.value() == "helm"),
+            "the counter must carry the format whose ordering arm is missing",
+        );
+        match &missing.3 {
+            DebugValue::Counter(c) => assert_eq!(*c, 1),
+            other => panic!("expected counter, got {other:?}"),
+        }
+    }
+
+    // =====================================================================
     // The scheduled tick ENQUEUES `prefetch` leaf rows
     // (`enqueue_prefetch_batch`), it does not merely plan + count.
     // =====================================================================
@@ -2591,23 +2954,10 @@ mod tests {
         }
     }
 
-    // =====================================================================
-    // ordering_for_format pin: npm/cargo/pypi resolve, Maven/OCI don't.
-    // =====================================================================
-
-    #[test]
-    fn ordering_for_format_supports_npm_cargo_pypi() {
-        assert!(ordering_for_format(&RepositoryFormat::Npm).is_some());
-        assert!(ordering_for_format(&RepositoryFormat::Cargo).is_some());
-        assert!(ordering_for_format(&RepositoryFormat::Pypi).is_some());
-    }
-
-    #[test]
-    fn ordering_for_format_does_not_support_maven_oci_helm() {
-        assert!(ordering_for_format(&RepositoryFormat::Maven).is_none());
-        assert!(ordering_for_format(&RepositoryFormat::Oci).is_none());
-        assert!(ordering_for_format(&RepositoryFormat::Helm).is_none());
-    }
+    // The format-to-ordering mapping itself is pinned where it lives
+    // (`index_serve_filter`), and the participation-implies-ordering
+    // parity is pinned by the `hort-formats` guard test. A third copy
+    // here is the duplication this handler stopped carrying.
 
     // =====================================================================
     // FormatHandler::upstream_metadata_path — per-format hot-path

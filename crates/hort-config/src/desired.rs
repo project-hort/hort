@@ -984,6 +984,71 @@ pub fn validate_prefetch_max_age_days_not_implemented(
     errors
 }
 
+/// Apply-time linter rejecting a `PrefetchPolicy.triggers` entry a
+/// repository's format cannot honour.
+///
+/// `transitive_deps` and `scheduled` both require the format's handler to
+/// declare the `VersionDiscovery` capability group (ADR 0005); a
+/// repository declaring either on a format whose handler does not is
+/// accepted at apply today and silently never fires (see
+/// [`hort_domain::entities::repository::PrefetchTrigger::requires_version_discovery`]).
+/// `on_dist_tag_move` needs no such declaration — OCI fires it today with
+/// no `VersionDiscovery` implementation — so it is never rejected here.
+///
+/// This is the same accepted-but-inert anti-pattern
+/// [`validate_prefetch_max_age_days_not_implemented`] closes for
+/// `maxAgeDays`; ADR 0015 makes it a hard block.
+///
+/// `version_discovery_capable_formats` is the set of `format_key()`
+/// strings some compiled-in `FormatHandler` declares the group for. The
+/// caller derives it from the handler registry's own
+/// `FormatHandler::version_discovery()` declaration — this function reads
+/// only that set, never a maintained format list, so a format that gains
+/// (or loses) `VersionDiscovery` changes this rejection with no edit
+/// here.
+///
+/// **Fail-closed.** No escape hatch. The operator-actionable error names
+/// the repository, its format, and the offending trigger, and tells the
+/// operator to either remove the trigger or fall back to warming the
+/// repository from outside Hort (a scheduled pull against the proxy)
+/// until the format implements `VersionDiscovery`.
+///
+/// Pure function of `DesiredState` plus the capability set; runs
+/// alongside [`validate_prefetch_max_age_days_not_implemented`] after the
+/// snapshot-validation stage. One error per offending trigger.
+pub fn validate_prefetch_triggers_require_version_discovery(
+    state: &DesiredState,
+    version_discovery_capable_formats: &std::collections::HashSet<String>,
+) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for env in &state.repositories {
+        if version_discovery_capable_formats.contains(&env.spec.format) {
+            continue;
+        }
+        for trigger in &env.spec.prefetch_policy.triggers {
+            if !trigger.requires_version_discovery() {
+                continue;
+            }
+            errors.push(ValidationError::Invalid {
+                kind: Kind::ArtifactRepository,
+                name: env.metadata.name.clone(),
+                detail: format!(
+                    "`prefetchPolicy.triggers` includes `{trigger}`, which requires the \
+                     VersionDiscovery capability; the `{format}` format handler does not \
+                     declare it, so the trigger is accepted but never fires. Remove \
+                     `{trigger}` from `triggers`, or warm this repository from outside Hort \
+                     (a scheduled pull against the proxy) until `{format}` implements \
+                     VersionDiscovery. (repository: `{repo_key}`, format: `{format}`)",
+                    trigger = trigger,
+                    format = env.spec.format,
+                    repo_key = env.metadata.name,
+                ),
+            });
+        }
+    }
+    errors
+}
+
 /// Every `UpstreamMapping.spec.repository` must resolve to a declared
 /// `ArtifactRepository.metadata.name`. The apply pipeline needs the
 /// repository_id for the row insert; a dangling reference at
@@ -2760,5 +2825,121 @@ spec: {}
             }
             other => panic!("expected UnknownKind, got {other:?}"),
         }
+    }
+
+    // ===================================================================
+    // validate_prefetch_triggers_require_version_discovery
+    // ===================================================================
+
+    fn repo_yaml_with_prefetch(name: &str, format: &str, triggers: &[&str]) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: {name}
+spec:
+  name: {name}
+  format: {format}
+  type: hosted
+  storage: {{ backend: filesystem, path: /data/{name} }}
+  isPublic: true
+  replicationPriority: immediate
+  prefetchPolicy:
+    enabled: true
+    triggers: [{triggers}]
+",
+            triggers = triggers.join(", "),
+        )
+        .into_bytes()
+    }
+
+    fn capable(formats: &[&str]) -> std::collections::HashSet<String> {
+        formats.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn prefetch_trigger_transitive_deps_rejected_on_non_capable_format() {
+        let files = vec![(
+            p("maven-proxy.yaml"),
+            repo_yaml_with_prefetch("maven-proxy", "maven", &["transitive_deps"]),
+        )];
+        let state = DesiredState::parse_files(files).unwrap();
+        let errors = validate_prefetch_triggers_require_version_discovery(&state, &capable(&[]));
+        assert_eq!(errors.len(), 1);
+        let ValidationError::Invalid { name, detail, .. } = &errors[0] else {
+            panic!("expected Invalid, got {:?}", errors[0]);
+        };
+        assert_eq!(name, "maven-proxy");
+        assert!(detail.contains("transitive_deps"), "{detail}");
+        assert!(detail.contains("maven"), "{detail}");
+        assert!(detail.contains("maven-proxy"), "{detail}");
+    }
+
+    #[test]
+    fn prefetch_trigger_scheduled_rejected_on_non_capable_format() {
+        let files = vec![(
+            p("helm-proxy.yaml"),
+            repo_yaml_with_prefetch("helm-proxy", "helm", &["scheduled"]),
+        )];
+        let state = DesiredState::parse_files(files).unwrap();
+        let errors = validate_prefetch_triggers_require_version_discovery(&state, &capable(&[]));
+        assert_eq!(errors.len(), 1);
+        let ValidationError::Invalid { detail, .. } = &errors[0] else {
+            panic!("expected Invalid, got {:?}", errors[0]);
+        };
+        assert!(detail.contains("scheduled"), "{detail}");
+        assert!(detail.contains("helm"), "{detail}");
+    }
+
+    #[test]
+    fn prefetch_trigger_on_dist_tag_move_accepted_on_non_capable_format() {
+        let files = vec![(
+            p("oci-proxy.yaml"),
+            repo_yaml_with_prefetch("oci-proxy", "oci", &["on_dist_tag_move"]),
+        )];
+        let state = DesiredState::parse_files(files).unwrap();
+        let errors = validate_prefetch_triggers_require_version_discovery(&state, &capable(&[]));
+        assert!(
+            errors.is_empty(),
+            "on_dist_tag_move must never be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn prefetch_trigger_every_trigger_accepted_on_capable_format() {
+        let files = vec![(
+            p("npm-proxy.yaml"),
+            repo_yaml_with_prefetch(
+                "npm-proxy",
+                "npm",
+                &["transitive_deps", "scheduled", "on_dist_tag_move"],
+            ),
+        )];
+        let state = DesiredState::parse_files(files).unwrap();
+        let errors =
+            validate_prefetch_triggers_require_version_discovery(&state, &capable(&["npm"]));
+        assert!(
+            errors.is_empty(),
+            "a VersionDiscovery-capable format must accept every trigger: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn prefetch_trigger_reports_one_error_per_offending_trigger() {
+        let files = vec![(
+            p("maven-proxy.yaml"),
+            repo_yaml_with_prefetch(
+                "maven-proxy",
+                "maven",
+                &["transitive_deps", "scheduled", "on_dist_tag_move"],
+            ),
+        )];
+        let state = DesiredState::parse_files(files).unwrap();
+        let errors = validate_prefetch_triggers_require_version_discovery(&state, &capable(&[]));
+        assert_eq!(
+            errors.len(),
+            2,
+            "on_dist_tag_move must not add a third error: {errors:?}"
+        );
     }
 }
