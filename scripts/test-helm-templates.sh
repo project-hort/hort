@@ -142,6 +142,9 @@ test-values-svc-tokens-rotate-entry.yaml|^            - --rotate$|1|per-entry ro
 test-values-svc-tokens-rotate-global.yaml|^            - --rotate$|2|blanket scheduledTasks.rotateSvcToken=true reaches EVERY entry's init container as --rotate, even with no per-entry rotate set
 test-values-svc-tokens-repository.yaml|^            - --repository=maven-proxy$|1|per-entry repository:maven-proxy on only the second entry reaches ONLY that entry's init container as --repository
 test-values-svc-tokens-repository.yaml|repository=maven-proxy|1|exactly one entry declares repository — the first (unscoped) entry renders NO --repository flag at all
+test-values-svc-tokens-authority-repository.yaml|^            - --require-authority=maven-proxy$|1|per-entry authorityRepository:maven-proxy on only the second entry reaches ONLY that entry's init container as --require-authority=<scope>
+test-values-svc-tokens-authority-repository.yaml|^            - --require-authority$|1|the first entry (neither field set) still renders the bare --require-authority — the byte-compatible default is unaffected
+test-values-svc-tokens-authority-repository.yaml|^            - --repository=|0|the second entry's cap stays global (no --repository flag at all) even though its preflight is scoped — proving cap width and preflight scope are independent knobs
 test-values.yaml|helm.sh/hook-weight: "-10"|2|both pre-pull DaemonSets (server + worker) render at weight -10, strictly before the migrate hook's -5 (prePull.enabled + worker.enabled default true)
 test-values.yaml|helm.sh/hook-weight: "-9"|1|the pre-pull wait/cleanup Job renders at weight -9 — between the DaemonSets (-10) and the migrate hook (-5)
 test-values.yaml|^kind: DaemonSet$|2|both prepull DaemonSets (server + worker) render by default

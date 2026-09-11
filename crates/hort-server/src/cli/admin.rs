@@ -170,15 +170,31 @@ pub struct IssueSvcTokenArgs {
 
     /// Verify each `--permission` is backed by a live `PermissionGrant` on
     /// the service account before minting; fail with actionable guidance
-    /// if not.
+    /// if not. There is no value that disables the check once the flag is
+    /// present — only the scope it runs at changes.
     ///
-    /// Default `false`: unchanged behaviour — no grant read, matching
-    /// every prior release (other callers may legitimately mint a cap
-    /// before applying the grant). The Helm bootstrap Job sets this so a
-    /// missing grant fails the install loudly instead of 403-ing silently
-    /// at every CronJob tick (issue #21).
-    #[arg(long, default_value_t = false)]
-    pub require_authority: bool,
+    /// - absent (default): no preflight — unchanged behaviour, no grant
+    ///   read, matching every prior release (other callers may
+    ///   legitimately mint a cap before applying the grant).
+    /// - bare `--require-authority`: the preflight scope follows
+    ///   `--repository` — global unless `--repository` is also set, in
+    ///   which case that repository's scope. This is the byte-compatible
+    ///   form: it reproduces exactly what the bare flag did before it
+    ///   could carry its own value.
+    /// - `--require-authority=<repo-key>`: the preflight scope is
+    ///   `<repo-key>`, resolved to a repository id before any DB write —
+    ///   an unknown key fails loudly, the same shape as an unknown
+    ///   `--repository`. This is independent of `--repository`, so an
+    ///   identity can carry a global (unscoped) cap while its authority
+    ///   is still checked at a specific repository. An explicit empty
+    ///   value (`--require-authority=`) is treated the same as the bare
+    ///   form, never as "skip the check".
+    ///
+    /// The Helm bootstrap Job always sets this (bare, or with a scope) so
+    /// a missing grant fails the install loudly instead of 403-ing
+    /// silently at every CronJob tick (issue #21).
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub require_authority: Option<String>,
 
     /// Scope the minted token to a single repository by its `key`.
     ///
@@ -186,10 +202,16 @@ pub struct IssueSvcTokenArgs {
     /// the cap carries `repository_ids = None`). With this flag, the name
     /// is resolved to a repository id before any DB write — an unknown
     /// name fails loudly — and the minted cap carries
-    /// `repository_ids = [<repo_id>]`. With `--require-authority`, the
-    /// preflight also checks each declared permission AT this scope
-    /// (a global grant still satisfies it, since global authority
-    /// encompasses every repository scope).
+    /// `repository_ids = [<repo_id>]`.
+    ///
+    /// Governs cap width ONLY — it no longer also drives the
+    /// `--require-authority` preflight's scope. A bare `--require-authority`
+    /// still follows this flag for byte-compatibility, but
+    /// `--require-authority=<repo-key>` names its own scope independently,
+    /// so an identity can carry a global cap while its authority is
+    /// checked at a specific repository (a global grant still satisfies a
+    /// repo-scoped check either way, since global authority encompasses
+    /// every repository scope).
     #[arg(long)]
     pub repository: Option<String>,
 }
@@ -481,10 +503,10 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
     let event_publisher = Arc::new(EventStorePublisher::without_broadcast(event_store));
 
     // Resolve `--repository` to a repository id before any DB write —
-    // an unknown name fails loudly here, not after minting. Scopes both
-    // the `--require-authority` preflight below and the minted token's
-    // capability. Without the flag: `None`, byte-compatible
-    // with today (global cap, global-only preflight).
+    // an unknown name fails loudly here, not after minting. Governs the
+    // minted token's capability ONLY (see `authority_scope` below for the
+    // preflight). Without the flag: `None`, byte-compatible with today
+    // (global cap).
     let repository_scope: Option<(Uuid, String)> = match &args.repository {
         Some(name) => {
             let repository_repo: Arc<dyn RepositoryRepository> =
@@ -496,6 +518,34 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
             Some((repo.id, name.clone()))
         }
         None => None,
+    };
+
+    // Resolve the `--require-authority` preflight scope, independently of
+    // `--repository`'s cap-width resolution above.
+    //
+    // - `None`: the flag was not given at all — no preflight, byte-
+    //   compatible with today's `false` default.
+    // - `Some(repository_scope.clone())`: the bare flag (or an explicit
+    //   empty value) — reproduces exactly what the bare flag did before
+    //   it could carry its own value: global unless `--repository` is
+    //   ALSO set, in which case that repository's scope. This is the
+    //   byte-compatibility case every existing invocation relies on.
+    // - `Some(Some((id, name)))`: an explicit `--require-authority=<repo-
+    //   key>` names its own scope, resolved to a repository id before any
+    //   DB write — an unknown key fails loudly, the same shape as an
+    //   unknown `--repository` above. Independent of `--repository`, so
+    //   cap width and preflight scope are no longer welded together.
+    let authority_scope: Option<Option<(Uuid, String)>> = match args.require_authority.as_deref() {
+        None => None,
+        Some("") => Some(repository_scope.clone()),
+        Some(name) => {
+            let repository_repo: Arc<dyn RepositoryRepository> =
+                Arc::new(PgRepositoryRepository::new(pool.clone()));
+            let repo = repository_repo.find_by_key(name).await.with_context(|| {
+                format!("resolving --require-authority scope {name:?}: unknown repository")
+            })?;
+            Some(Some((repo.id, name.to_string())))
+        }
     };
 
     // Require a PRE-EXISTING gitops ServiceAccount. The command no
@@ -514,7 +564,7 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
     // would 403 at run time with no install-time signal. Runs BEFORE the
     // idempotent early-exit below so a grant an operator later revoked
     // still surfaces on the next routine upgrade, not just on `--rotate`.
-    if args.require_authority {
+    if let Some(scope) = authority_scope.as_ref() {
         let permission_grant_repo: Arc<dyn PermissionGrantRepository> =
             Arc::new(PgPermissionGrantRepository::new(pool.clone()));
         let grants = permission_grant_repo
@@ -530,9 +580,7 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
             &args.name,
             svc_user.id,
             &permissions,
-            repository_scope
-                .as_ref()
-                .map(|(id, name)| (*id, name.as_str())),
+            scope.as_ref().map(|(id, name)| (*id, name.as_str())),
         )?;
     }
 
@@ -991,11 +1039,15 @@ mod tests {
         assert_eq!(args.expires_in_days, DEFAULT_SVC_EXPIRY_DAYS);
         // Default: the preflight is opt-in — unset ⇒ byte-for-byte
         // unchanged behaviour, no grant read.
-        assert!(!args.require_authority);
+        assert_eq!(args.require_authority, None);
     }
 
     #[test]
-    fn issue_svc_token_accepts_require_authority_flag() {
+    fn issue_svc_token_accepts_require_authority_bare_flag() {
+        // The bare form must stay byte-compatible: `Some("")`, not a
+        // named scope — the async body treats an empty value the same as
+        // the pre-238 boolean `true` (preflight scope follows
+        // `--repository`, or global if that is also absent).
         let cli = TestCli::try_parse_from([
             "hort-server",
             "admin",
@@ -1011,7 +1063,31 @@ mod tests {
         let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
             panic!("expected IssueSvcToken");
         };
-        assert!(args.require_authority);
+        assert_eq!(args.require_authority.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn issue_svc_token_accepts_require_authority_with_explicit_scope() {
+        // `--require-authority=<repo-key>` aims the preflight at that
+        // scope, independent of `--repository` (which is absent here).
+        let cli = TestCli::try_parse_from([
+            "hort-server",
+            "admin",
+            "issue-svc-token",
+            "--name",
+            "uat-smoke",
+            "--require-authority=maven-proxy",
+        ])
+        .unwrap();
+        let super::super::Command::Admin(admin_cmd) = cli.command else {
+            panic!("expected Admin");
+        };
+        let AdminSubcommand::IssueSvcToken(args) = admin_cmd.command else {
+            panic!("expected IssueSvcToken");
+        };
+        assert_eq!(args.require_authority.as_deref(), Some("maven-proxy"));
+        // `--repository` (cap width) is untouched by this flag.
+        assert_eq!(args.repository, None);
     }
 
     #[test]
@@ -1176,7 +1252,7 @@ mod tests {
             output: "kube-secret".into(),
             rotate: false,
             expires_in_days: DEFAULT_SVC_EXPIRY_DAYS,
-            require_authority: false,
+            require_authority: None,
             repository: None,
         };
         // We can't call issue_svc_token_async without a live DB, but we can
