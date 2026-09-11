@@ -465,9 +465,10 @@ step-by-step. In short:
   and [ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) D4;
   `beta`/`rc` naming stays reserved for a possible future *public*
   pre-release track (not in use today).
-- **Staging is continuous and multi-source**: it deploys from `develop`, from
-  `test/*` alpha branches, and from `main` — there's always a deployable
-  artifact, independent of release cadence
+- **Staging deploys from published artifacts only**: `test/*` alpha tags and
+  `main` — never from bare `develop` merges, since `develop` publishes no
+  image or chart. It is not gated on a `main` cut, but it is gated on the
+  next (on-demand) alpha
   ([ADR 0048](docs/adr/0048-release-branch-staging-strategy.md) D3).
 - A **final** release (`vX.Y.Z`, no suffix) is the **`develop → main`
   promotion**. That single promotion MR is where the changelog is stamped, the
