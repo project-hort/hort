@@ -256,6 +256,54 @@ decisions:
     posture (a hardened parser with entity expansion disabled), tracked as an
     open item in the decision index.
 
+## Amendment (2026-09-11) — Phase-2 prefetch discharged, hard-block preserved
+
+The *Design integrity* evidence above (the "review gate, satisfied" bullet
+under Consequences) recorded a **hard-block** — no new Maven-shaped
+abstraction and no `match format { Maven => … }` arm in shared dispatch —
+and offered three facts as evidence that the block held. Two of those facts
+have since been superseded by the shipped Maven Phase-2 prefetch work
+(scheduled, transitive and self-service prefetch all now cover Maven; the
+decision index's *Maven Phase-2 prefetch* row records the closure).
+
+**Superseded.** "No Maven arm in `prefetch_tick` /
+`self_service_prefetch_use_case` `ordering_for_format`" and "no Maven branch
+in `hort-formats-upstream` dispatch" no longer describe the tree. The two
+duplicated `ordering_for_format` matches the first fact depended on were
+collapsed into the single canonical mapping,
+`hort_app::use_cases::index_serve_filter::ordering_for_format`, where Maven
+resolves `MavenVersionOrdering` exactly as npm resolves `NpmSemverOrdering`
+and cargo resolves `CargoSemverOrdering` — one more instance of an axis the
+other three formats already established, not a Maven-specific case. A
+format's participation is enforced structurally rather than left to the
+absence the old text relied on: the DB-free guard
+`hort-formats/tests/version_discovery_participation.rs` asserts that
+declaring the `VersionDiscovery` capability group and resolving an ordering
+here can never diverge. `hort-formats-upstream`'s dispatch table now
+routes `"maven"` to that same capability group instead of rejecting with
+`UnsupportedFormat`.
+
+**Not superseded.** The shared ingest core still carries no Maven branch —
+that fact stands unchanged. And the hard-block itself **stands**: nothing
+above licenses a new Maven-shaped abstraction or a fresh `match format {
+Maven => … }` arm anywhere in shared dispatch. What changed is that Maven
+now participates *through the format-parametric abstractions the block
+always allowed* — the same canonical mapping, the same capability group,
+the same guard — on equal footing with npm, cargo and pypi. That is the
+hard-block working as designed, not the hard-block relaxing.
+
+**Open integrity item.** One branch strains the block today rather than
+satisfying it cleanly. `hort-formats-upstream`'s npm, pypi and cargo
+dispatch arms each route through a per-format `fetch_raw_with_cache`
+helper that owns ephemeral caching and pull-dedup and hands back a typed
+per-format projection to read a version list from. The Maven arm does not:
+it calls `UpstreamProxy::fetch_metadata` directly, because nothing caches
+`maven-metadata.xml` and there is no typed projection over it to read
+versions off. That asymmetry — one format's dispatch arm shaped
+differently from its three siblings — is exactly what the hard-block
+exists to prevent, and it is live in the tree today. It is tracked as an
+open item, not smoothed over: issue #235.
+
 ## Alternatives considered
 
 - **`artifact_files` / `primary_file` pull model (the ADR 0005 sketch).**
