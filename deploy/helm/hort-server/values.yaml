@@ -1083,7 +1083,11 @@ worker:
     # container port, and (when networkPolicy.enabled) co-renders a worker NetworkPolicy adding a
     # Prometheus-scoped Ingress allowance on <port>. The listener has NO per-request auth — the
     # NetworkPolicy is the control. The default-on server NetworkPolicy already DENIES this port;
-    # this knob adds the scrape allowance.
+    # this knob adds the scrape allowance. worker.enabled:true with enabled:true and
+    # networkPolicy.enabled:false is REJECTED at helm template — that combination would turn the
+    # listener on with no NetworkPolicy protecting it at all (see
+    # templates/worker-networkpolicy.yaml). worker.enabled:false makes this flag inert (no worker
+    # pod, no listener), so that case renders fine regardless of networkPolicy.enabled.
     enabled: false
     port: 9090
     # scrapeFrom: a list of k8s NetworkPolicyPeer objects (from[]) allowed to scrape — e.g. your
