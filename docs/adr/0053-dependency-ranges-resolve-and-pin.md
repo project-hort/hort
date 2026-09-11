@@ -71,9 +71,9 @@ needs `[build-dependencies]`, which the cascade excludes by design. Tool
 bootstrapping belongs in a prebuilt image, not in the cascade.
 
 **D5 — The stance is cross-format.** cargo `[dependencies]`, npm
-`dependencies`, PyPI `requires-dist`, Maven compile scope: runtime declaration
-classes only, resolved the same way. This is the same boundary the cascade
-already enforces to keep dev/test closures out of the fan-out.
+`dependencies`, PyPI `requires-dist`, Maven compile and runtime scopes: runtime
+declaration classes only, resolved the same way. This is the same boundary the
+cascade already enforces to keep dev/test closures out of the fan-out.
 
 ### Rejected alternatives that specifically must stay rejected
 
