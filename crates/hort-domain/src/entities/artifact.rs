@@ -411,31 +411,44 @@ pub enum CurationClearance {
 pub enum TerminalRejectionRecord {
     /// An `ArtifactRejected` is on the stream — the rejection is a real,
     /// recorded verdict. Every legitimate rejection on the scan, curation,
-    /// curator, admin and provenance-disproof axes is `Present`.
+    /// curator, admin, provenance-disproof and CAS-corruption axes is
+    /// `Present`.
     Present,
-    /// No `ArtifactRejected`, **but** an `ArtifactCorrupted` — the CAS
-    /// integrity tombstone.
+    /// No `ArtifactRejected`, **but** an `ArtifactCorrupted` — a CAS
+    /// integrity tombstone written **before** the corruption axis appended
+    /// its terminal companion.
     ///
-    /// [`Artifact::tombstone_from_corruption`] drives an artifact to
-    /// `Rejected` while appending only `ArtifactCorrupted`, never the
-    /// `ArtifactRejected` companion D6 requires. That gap is real, known,
-    /// and tracked separately (it needs a `RejectionReason` variant and
-    /// therefore touches event serialisation); it is pinned as a named
-    /// `KnownGap` by
-    /// `crates/hort-domain/tests/rejected_requires_terminal_event.rs`.
+    /// A corruption tombstone is a *genuine* terminal condemnation — the
+    /// stored bytes do not match their content hash — and on the
+    /// `ArtifactRejected` test alone it is indistinguishable from the
+    /// repairable state. A verified-then-corrupted artifact would
+    /// otherwise satisfy all three repair conjuncts and be handed back to
+    /// the release sweep, which is how corrupt bytes would become servable
+    /// again. This variant exists to make that shape nameable, and
+    /// [`Artifact::repair_provenance_misrejection`] refuses it.
     ///
-    /// **This variant exists so that gap cannot leak into the repair.**
-    /// A corruption tombstone is a *genuine* terminal condemnation —
-    /// the stored bytes do not match their content hash — and it is
-    /// indistinguishable from the repairable state on the
-    /// `ArtifactRejected` test alone. A verified-then-corrupted artifact
-    /// would otherwise satisfy all three repair conjuncts and be handed
-    /// back to the release sweep, which is how corrupt bytes would become
-    /// servable again. Classified separately rather than folded into
-    /// `Present` so the refusal message can name the corruption axis, and
-    /// so widening [`has_terminal_rejection_event`] — which would silently
-    /// convert the D6 guard's `KnownGap` into a false "compliant" — is not
-    /// needed.
+    /// # Why it survives the fix that looks like it made it redundant
+    ///
+    /// [`Artifact::tombstone_from_corruption`] now appends an
+    /// `ArtifactRejected{Corruption}` next to its `ArtifactCorrupted` (ADR
+    /// 0039's 2026-09-12 amendment, D6), so a **new** tombstone classifies
+    /// [`Present`](Self::Present) and never reaches this arm.
+    ///
+    /// **The event store is append-only.** That change cannot retroactively
+    /// add a companion to streams written before it. Every **historical**
+    /// tombstone still carries `ArtifactCorrupted` alone, and without this
+    /// variant it would classify [`Absent`](Self::Absent) and become
+    /// repairable — re-opening precisely the hole the variant was added to
+    /// close, for the data most likely to be affected by it. It can be
+    /// removed only once those streams are backfilled with the companion or
+    /// have aged out of the system.
+    ///
+    /// Kept as its own classification rather than folded into `Present` for
+    /// two reasons that also survive: the refusal message names the
+    /// corruption axis, and [`has_terminal_rejection_event`] — the shared
+    /// D6 predicate the structural guard also asks — stays exactly "is
+    /// there an `ArtifactRejected`", with no corruption special case that
+    /// could make a non-compliant transition read as compliant.
     CorruptionTombstone,
     /// Nothing terminal on the stream at all. Paired with
     /// `status = Rejected` this is the illegal state D6 names.
@@ -448,6 +461,12 @@ impl TerminalRejectionRecord {
     /// the corruption tombstone — see
     /// [`CorruptionTombstone`](Self::CorruptionTombstone) for why the
     /// second test is not folded into the first.
+    ///
+    /// The order matters for a **current** corruption tombstone, whose
+    /// stream carries both events: it classifies `Present`, which is the
+    /// truthful answer (a real recorded verdict) and refuses the repair
+    /// just as the second arm would. The second arm is what catches the
+    /// **historical** tombstones that carry `ArtifactCorrupted` alone.
     pub fn from_events<'a>(events: impl IntoIterator<Item = &'a DomainEvent>) -> Self {
         // Borrowed once so the shared D6 predicate can be CALLED rather
         // than re-implemented here; a per-artifact stream is capped at
@@ -813,11 +832,29 @@ impl Artifact {
     /// mismatch — flows through to `ArtifactCorrupted.detected_at` so
     /// the event carries a server-time fact independent of when the
     /// event store appended.
+    ///
+    /// # Why this returns two events
+    ///
+    /// `quarantine_status = Rejected` with no `ArtifactRejected` on the
+    /// stream is an illegal state: the status is a projection, the stream
+    /// is the record (ADR 0002), and a status with no event behind it
+    /// cannot be audited or re-derived (ADR 0039's 2026-09-12 amendment,
+    /// D6). The corruption axis was the last one still doing that — the
+    /// scan, curation, curator, retroactive-policy and provenance-disproof
+    /// axes all append the companion, and this method now mirrors
+    /// [`Self::complete_provenance`]'s `Rejected` arm by returning both.
+    ///
+    /// The consequence was not theoretical: the curation-queue projection
+    /// resolves a row's rejection reason from the latest `ArtifactRejected`
+    /// on the stream, so a curator looking at a corruption-tombstoned
+    /// artifact saw no rejection reason at all. The companion carries
+    /// [`RejectionReason::Corruption`], which the queue renders as
+    /// `corruption` and its `?reason=` filter now accepts.
     pub fn tombstone_from_corruption(
         &mut self,
         computed_hash: ContentHash,
         now: DateTime<Utc>,
-    ) -> DomainResult<ArtifactCorrupted> {
+    ) -> DomainResult<Vec<DomainEvent>> {
         if quarantine_transitions::allowed_targets(
             QuarantineEvent::TombstoneFromCorruption,
             self.quarantine_status,
@@ -831,18 +868,42 @@ impl Artifact {
         }
         let expected_hash = self.sha256_checksum.clone();
         self.quarantine_status = QuarantineStatus::Rejected;
-        // Corruption is not scan-clearable: there is no `RejectionReason`
-        // variant for it (it emits `ArtifactCorrupted`, not
-        // `ArtifactRejected`). Leaving the reason `None` keeps a
-        // corruption-tombstoned artifact ineligible for a scan
-        // re-judgement (ADR 0041 invariant #6 — `None` is not `Scanner`).
-        self.rejection_reason = None;
-        Ok(ArtifactCorrupted {
-            artifact_id: self.id,
-            computed_hash,
-            expected_hash,
-            detected_at: now,
-        })
+        // Corruption is a terminal condemnation on its own axis and is
+        // **not** scan-clearable — `is_scan_clearable` refuses
+        // `Corruption`, so a corruption-tombstoned artifact stays
+        // ineligible for a scan re-judgement exactly as it was when this
+        // column was left `None` for want of a variant to put in it (ADR
+        // 0041 invariant #6).
+        //
+        // The column is not persisted (`mappers.rs` hydrates it `None`;
+        // callers re-derive it from the stream via
+        // `scan_history::read_last_rejection_reason`), so what this
+        // assignment buys is agreement between the just-transitioned
+        // entity and the value a later stream re-derivation reconstructs —
+        // which, now that the companion event exists, is exactly
+        // `Some(Corruption)`.
+        self.rejection_reason = Some(RejectionReason::Corruption);
+        // Rendered before either hash moves onto the axis event. The free
+        // text repeats both because an operator reading the curation queue
+        // sees this event's reason, not the axis event's fields.
+        let reason = format!(
+            "CAS integrity mismatch: stored bytes hash to {computed_hash}, \
+             expected {expected_hash}"
+        );
+        Ok(vec![
+            DomainEvent::ArtifactCorrupted(ArtifactCorrupted {
+                artifact_id: self.id,
+                computed_hash,
+                expected_hash,
+                detected_at: now,
+            }),
+            // The terminal-status companion (D6).
+            DomainEvent::ArtifactRejected(ArtifactRejected {
+                artifact_id: self.id,
+                rejected_by: RejectionReason::Corruption,
+                reason,
+            }),
+        ])
     }
 
     /// Release after quarantine period expires or by admin override.
@@ -1232,7 +1293,8 @@ impl Artifact {
     ///   rejection (`rejection_reason == Some(RejectionReason::Scanner)`)
     ///   is a candidate for a scan re-judgement. A provenance- /
     ///   curation- / admin- / corruption-rejected artifact (any other
-    ///   reason, including `None`) is **ineligible** and returns
+    ///   reason — see [`is_scan_clearable`] — including `None`) is
+    ///   **ineligible** and returns
     ///   `Err(Invariant)` without mutating, so the application pass skips
     ///   it (the artifact stays `Rejected`). The caller has already
     ///   re-hydrated `rejection_reason` from the stored `ArtifactRejected`
@@ -1376,12 +1438,12 @@ impl Artifact {
     /// 2. `terminal_record == `[`TerminalRejectionRecord::Absent`] — the
     ///    stream records no terminal condemnation at all. **Without this a
     ///    genuine terminal rejection would be in range**: every real
-    ///    rejection (scan, curation, curator, admin, and — since the
-    ///    amendment — a provenance *disproof*) writes an
-    ///    `ArtifactRejected`, and the CAS integrity tombstone writes an
-    ///    `ArtifactCorrupted` (see
+    ///    rejection (scan, curation, curator, admin, a provenance
+    ///    *disproof*, and a CAS-corruption tombstone) writes an
+    ///    `ArtifactRejected`, and a corruption tombstone written before
+    ///    that companion existed carries an `ArtifactCorrupted` alone (see
     ///    [`TerminalRejectionRecord::CorruptionTombstone`] for why that
-    ///    second shape needs naming rather than being assumed away).
+    ///    second shape still needs naming rather than being assumed away).
     /// 3. `provenance == `[`ProvenanceClearance::Cleared`] — a
     ///    `ProvenanceVerified` IS on the stream. **Without this an
     ///    artifact that really was never signed would be released.**
@@ -1445,11 +1507,11 @@ impl Artifact {
             }
             TerminalRejectionRecord::CorruptionTombstone => {
                 return Err(DomainError::Invariant(format!(
-                    "refusing to repair artifact {}: its stream carries an ArtifactCorrupted, \
-                     so it was tombstoned because its stored bytes do not match their content \
-                     hash. That is a genuine terminal condemnation even though the corruption \
-                     path does not write the ArtifactRejected companion D6 requires — repairing \
-                     it would hand corrupt bytes back to the release sweep",
+                    "refusing to repair artifact {}: its stream carries an ArtifactCorrupted \
+                     with no ArtifactRejected companion, so it was tombstoned because its \
+                     stored bytes do not match their content hash, by a corruption path that \
+                     predates the D6 companion. That is a genuine terminal condemnation — \
+                     repairing it would hand corrupt bytes back to the release sweep",
                     self.id
                 )));
             }
@@ -1563,11 +1625,22 @@ impl Artifact {
 /// Every other reason is **not** scan-clearable and stays held:
 /// `Admin`, `Curator` (manual decisions), `CurationRetroactive` (curation
 /// axis), `Provenance` (a forged signature does not become acceptable
-/// because a scan later passed), and an unknown `None` (a legacy /
-/// reason-less rejection, or a corruption rejection that deliberately
-/// leaves the reason `None`). Exhaustive `match` (no wildcard) so a future
-/// `RejectionReason` variant forces a deliberate scan-clearable / not
-/// decision here rather than silently defaulting to eligible.
+/// because a scan later passed), `Corruption` (below), and an unknown
+/// `None` (a legacy / reason-less rejection). Exhaustive `match` (no
+/// wildcard) so a future `RejectionReason` variant forces a deliberate
+/// scan-clearable / not decision here rather than silently defaulting to
+/// eligible.
+///
+/// **`Corruption` is refused deliberately.** A byte mismatch does not
+/// become curable because a scan passes: the scanner reads the bytes the
+/// storage backend returns and reports what it finds *in* them, which says
+/// nothing about whether they are the bytes this artifact's content hash
+/// names. A clean verdict over corrupt bytes is a clean verdict over
+/// somebody else's content. The escape hatch for a false positive is the
+/// admin release (e.g. the operator restored the blob from a known-good
+/// backup), not a re-scan. Before the corruption axis had a variant this
+/// refusal happened by accident — the column was left `None`, and `None`
+/// already fails here; it is now stated rather than inherited.
 pub fn is_scan_clearable(reason: Option<&RejectionReason>) -> bool {
     match reason {
         Some(RejectionReason::Scanner) | Some(RejectionReason::ScanPolicyRetroactive) => true,
@@ -1575,6 +1648,7 @@ pub fn is_scan_clearable(reason: Option<&RejectionReason>) -> bool {
         | Some(RejectionReason::Curator { .. })
         | Some(RejectionReason::CurationRetroactive { .. })
         | Some(RejectionReason::Provenance)
+        | Some(RejectionReason::Corruption)
         | None => false,
     }
 }
@@ -2086,32 +2160,97 @@ mod tests {
         "aa".repeat(32).parse().unwrap()
     }
 
+    /// Unwrap the `ArtifactCorrupted` the tombstone emits first (the axis
+    /// event), asserting the shape rather than indexing blindly.
+    fn corrupted_of(events: &[DomainEvent]) -> &ArtifactCorrupted {
+        match &events[0] {
+            DomainEvent::ArtifactCorrupted(e) => e,
+            other => panic!("expected ArtifactCorrupted first, got {other:?}"),
+        }
+    }
+
+    /// Unwrap the `ArtifactRejected` companion (the terminal-status event).
+    fn rejected_of(events: &[DomainEvent]) -> &ArtifactRejected {
+        match &events[1] {
+            DomainEvent::ArtifactRejected(e) => e,
+            other => panic!("expected ArtifactRejected second, got {other:?}"),
+        }
+    }
+
     #[test]
     fn tombstone_from_corruption_from_none_succeeds() {
         let mut a = sample_artifact();
         assert_eq!(a.quarantine_status, QuarantineStatus::None);
         let now = Utc::now();
-        let event = a
+        let events = a
             .tombstone_from_corruption(computed_hash(), now)
             .expect("tombstone from None must succeed");
         assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        let event = corrupted_of(&events);
         assert_eq!(event.artifact_id, a.id);
         assert_eq!(event.computed_hash, computed_hash());
         assert_eq!(event.expected_hash, a.sha256_checksum);
         assert_eq!(event.detected_at, now);
-        // ADR 0041: corruption is not scan-clearable — reason stays None
-        // (ineligible for `re_evaluate`'s scan re-judgement).
-        assert_eq!(a.rejection_reason, None);
+        // ADR 0041: corruption is not scan-clearable — the typed reason is
+        // refused by `is_scan_clearable`, so the artifact stays ineligible
+        // for `re_evaluate`'s scan re-judgement.
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Corruption));
+        assert!(!is_scan_clearable(a.rejection_reason.as_ref()));
+    }
+
+    /// **D6: the tombstone appends its own terminal event.** A `Rejected`
+    /// projection with no `ArtifactRejected` behind it cannot be audited or
+    /// re-derived, and the curation queue — which resolves a row's
+    /// rejection reason from that event alone — showed a
+    /// corruption-tombstoned artifact with no reason at all.
+    #[test]
+    fn tombstone_from_corruption_appends_both_events_with_the_corruption_reason() {
+        let mut a = quarantined_artifact();
+        let now = Utc::now();
+        let events = a
+            .tombstone_from_corruption(computed_hash(), now)
+            .expect("tombstone from Quarantined must succeed");
+        assert_eq!(
+            events.len(),
+            2,
+            "a terminal status needs a terminal event beside its axis event"
+        );
+        assert!(
+            has_terminal_rejection_event(&events),
+            "the emitted set must satisfy D6's own predicate"
+        );
+
+        let corrupted = corrupted_of(&events);
+        assert_eq!(corrupted.computed_hash, computed_hash());
+        assert_eq!(corrupted.expected_hash, a.sha256_checksum);
+        assert_eq!(corrupted.detected_at, now);
+
+        let rejected = rejected_of(&events);
+        assert_eq!(rejected.artifact_id, a.id);
+        assert_eq!(
+            rejected.rejected_by,
+            RejectionReason::Corruption,
+            "corruption is its own axis — never `Scanner`, which \
+             `is_scan_clearable` would admit for a scan re-judgement"
+        );
+        assert!(!is_scan_clearable(Some(&rejected.rejected_by)));
+        assert!(
+            rejected.reason.contains(computed_hash().as_ref())
+                && rejected.reason.contains(a.sha256_checksum.as_ref()),
+            "the free-text reason must name both hashes, got {:?}",
+            rejected.reason
+        );
+        rejected.validate().expect("the companion event is valid");
     }
 
     #[test]
     fn tombstone_from_corruption_from_quarantined_succeeds() {
         let mut a = quarantined_artifact();
-        let event = a
+        let events = a
             .tombstone_from_corruption(computed_hash(), Utc::now())
             .expect("tombstone from Quarantined must succeed");
         assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
-        assert_eq!(event.expected_hash, a.sha256_checksum);
+        assert_eq!(corrupted_of(&events).expected_hash, a.sha256_checksum);
     }
 
     #[test]
@@ -2120,11 +2259,32 @@ mod tests {
         // window expired, downloads have been served, scrubber catches
         // a later at-rest corruption.
         let mut a = released_artifact();
-        let event = a
+        let events = a
             .tombstone_from_corruption(computed_hash(), Utc::now())
             .expect("tombstone from Released must succeed");
         assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
-        assert_eq!(event.expected_hash, a.sha256_checksum);
+        assert_eq!(corrupted_of(&events).expected_hash, a.sha256_checksum);
+    }
+
+    /// A corruption-rejected artifact is refused by `re_evaluate` — the
+    /// scan re-judgement path — for the same reason a provenance-rejected
+    /// one is: the verdict is not on the scan axis. Without mutating, so
+    /// the application pass leaves it `Rejected`.
+    #[test]
+    fn re_evaluate_refuses_a_corruption_rejected_artifact() {
+        let mut a = rejected_artifact();
+        a.rejection_reason = Some(RejectionReason::Corruption);
+        // Window long past, and both cross-axis conjuncts clear — so the
+        // ONLY thing that can refuse the release is the reason guard (a).
+        a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+        let result = a.re_evaluate(
+            Utc::now(),
+            ProvenanceClearance::NotRequired,
+            CurationClearance::Cleared,
+        );
+        assert!(matches!(result, Err(DomainError::Invariant(_))));
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Corruption));
     }
 
     #[test]
@@ -3824,6 +3984,26 @@ mod tests {
                 rule_id: Uuid::new_v4(),
             }
         )));
+        assert!(!is_scan_clearable(Some(&RejectionReason::Provenance)));
+        // A byte mismatch does not become curable because a scan passes:
+        // the scanner reports on whatever bytes storage returned, which
+        // says nothing about whether they are the bytes the content hash
+        // names.
+        assert!(!is_scan_clearable(Some(&RejectionReason::Corruption)));
+    }
+
+    /// The scan-clearable set is exactly two members, asserted over the
+    /// domain's own variant list rather than a copy — so a future
+    /// `RejectionReason` that is wrongly admitted here fails a test as
+    /// well as forcing the wildcard-free `match` to be edited.
+    #[test]
+    fn is_scan_clearable_admits_only_the_two_scan_axis_reasons() {
+        let clearable: Vec<&'static str> = RejectionReason::ALL_KIND_SAMPLES
+            .iter()
+            .filter(|r| is_scan_clearable(Some(r)))
+            .map(RejectionReason::wire_kind)
+            .collect();
+        assert_eq!(clearable, vec!["scanner", "scan_policy_retroactive"]);
     }
 
     // -- State machine: reject_from_scan_policy_retroactive (ADR 0041) ------
@@ -4232,30 +4412,58 @@ mod tests {
         );
     }
 
-    /// A corruption tombstone reaches `Rejected` while appending only
-    /// `ArtifactCorrupted` — so D6's own predicate (correctly) reads
-    /// `false`, and the record classifies it as its own thing rather than
-    /// as the repairable `Absent`.
+    /// **A HISTORICAL corruption tombstone** — `ArtifactCorrupted` alone,
+    /// the shape every stream written before the D6 companion carries, and
+    /// the shape the event store's append-only nature makes permanent. D6's
+    /// own predicate (correctly) reads `false` on it, and the record
+    /// classifies it as its own thing rather than as the repairable
+    /// `Absent`.
+    ///
+    /// This is what the [`TerminalRejectionRecord::CorruptionTombstone`]
+    /// variant survives the fix *for*: without it this population becomes
+    /// repairable and corrupt bytes go back to the release sweep.
     #[test]
-    fn a_corruption_tombstone_is_classified_separately_not_as_absent() {
-        let mut a = sample_artifact();
-        a.quarantine_status = QuarantineStatus::Quarantined;
-        a.quarantine_window_start = Some(Utc::now());
-        let corrupted = a
-            .tombstone_from_corruption(a.sha256_checksum.clone(), Utc::now())
-            .expect("Quarantined -> TombstoneFromCorruption is allowed");
+    fn a_historical_corruption_tombstone_is_classified_separately_not_as_absent() {
         let events = vec![
             provenance_verified_event(),
-            DomainEvent::ArtifactCorrupted(corrupted),
+            DomainEvent::ArtifactCorrupted(ArtifactCorrupted {
+                artifact_id: Uuid::nil(),
+                computed_hash: VALID_SHA256.parse().unwrap(),
+                expected_hash: VALID_SHA256.parse().unwrap(),
+                detected_at: Utc::now(),
+            }),
         ];
 
-        // D6's predicate stays exactly what it was — widening it here
-        // would silently turn the structural guard's KnownGap into a
-        // false "compliant".
+        // D6's predicate stays exactly what it was — widening it to treat
+        // `ArtifactCorrupted` as terminal would make a non-compliant
+        // transition read as compliant to the structural guard.
         assert!(!has_terminal_rejection_event(&events));
         assert_eq!(
             TerminalRejectionRecord::from_events(&events),
             TerminalRejectionRecord::CorruptionTombstone
+        );
+    }
+
+    /// **A CURRENT corruption tombstone** — both events, straight from the
+    /// entity — classifies `Present`, because it now is what `Present`
+    /// means: a real, recorded terminal verdict. The repair refuses it on
+    /// that arm instead, so the outcome is unchanged; only the reason the
+    /// refusal gives differs.
+    #[test]
+    fn a_current_corruption_tombstone_classifies_as_present() {
+        let mut a = sample_artifact();
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(Utc::now());
+        let mut events = vec![provenance_verified_event()];
+        events.extend(
+            a.tombstone_from_corruption(a.sha256_checksum.clone(), Utc::now())
+                .expect("Quarantined -> TombstoneFromCorruption is allowed"),
+        );
+
+        assert!(has_terminal_rejection_event(&events));
+        assert_eq!(
+            TerminalRejectionRecord::from_events(&events),
+            TerminalRejectionRecord::Present
         );
     }
 
@@ -4359,10 +4567,9 @@ mod tests {
         assert_eq!(a, before, "a refused repair must not mutate the artifact");
     }
 
-    /// **A CAS-corruption tombstone is refused**, even though it reaches
-    /// `Rejected` with no `ArtifactRejected` behind it (the D6 gap the
-    /// structural guard pins as a `KnownGap`) and even with a
-    /// `ProvenanceVerified` on its stream. Its bytes do not match their
+    /// **A CAS-corruption tombstone is refused**, even in the historical
+    /// shape that reaches `Rejected` with no `ArtifactRejected` behind it,
+    /// and even with a `ProvenanceVerified` on its stream. Its bytes do not match their
     /// content hash; repairing it would hand corrupt content back to the
     /// release sweep. This is the one shape that satisfies every
     /// `ArtifactRejected`-shaped test and must still never be touched.

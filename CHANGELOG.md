@@ -139,6 +139,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A curator looking at an artifact the integrity scrubber condemned now sees
+  why** (#245). When the CAS scrubber re-reads a stored blob and the bytes do
+  not hash to their content hash, it tombstones the artifact — marks it
+  `rejected` so nothing can download it again. It recorded the corruption
+  itself, but not the rejection, and the curation queue reads a row's reason
+  from the rejection record: the artifact showed up condemned with no
+  explanation next to it, and no way to list exactly those artifacts. The
+  tombstone now records the rejection alongside the corruption, in one write,
+  so the queue shows the reason `corruption` and `?reason=corruption` (or
+  `hort-cli curation queue --reason corruption`) lists them.
+
+  Corruption is deliberately **not** clearable by a scan: a clean scan of
+  corrupt bytes is a clean scan of somebody else's content. Recovering from a
+  false positive — an operator restoring the blob from a known-good backup —
+  is the admin release, as before. Artifacts tombstoned by an earlier version
+  keep their old record, so they still show an empty reason and will not match
+  the new filter; they remain condemned either way.
+
+  `hort-cli curation queue --reason` no longer keeps its own list of accepted
+  values. It had gone stale — the CLI refused `provenance`, `admin` and
+  `scan_policy_retroactive` client-side while the server was serving rows
+  carrying exactly those — so the value is now passed through and the server,
+  which derives the list from the rejection reasons it can actually record,
+  answers.
+
 - **An image whose signature arrives a moment after it is pushed is no longer
   rejected for being unsigned** (#243). Under `provenanceMode: required`, hort
   verified provenance as soon as the manifest landed — but with cosign the

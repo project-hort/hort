@@ -8,7 +8,8 @@
 //! between flag-only [`ActionOnMismatch::Alert`] (the default; the
 //! "operator decides the response" posture) and
 //! [`ActionOnMismatch::Tombstone`] which additionally emits an
-//! [`ArtifactCorrupted`] event and transitions the artifact to
+//! [`ArtifactCorrupted`] event plus its `ArtifactRejected{Corruption}`
+//! companion, and transitions the artifact to
 //! `quarantine_status = 'rejected'` via the existing quarantine state
 //! machine. Tombstone reuses the existing `Rejected` vocabulary rather
 //! than introducing a new state.
@@ -72,8 +73,10 @@ const CHUNK_SIZE: usize = 64 * 1024;
 /// existing quarantine state machine to
 /// [`QuarantineStatus::Rejected`](hort_domain::entities::artifact::QuarantineStatus::Rejected)
 /// via [`Artifact::tombstone_from_corruption`](hort_domain::entities::artifact::Artifact::tombstone_from_corruption),
-/// and emits an [`ArtifactCorrupted`] event on the artifact stream
-/// alongside the persisted state change via
+/// and emits an [`ArtifactCorrupted`] event on the artifact stream — plus
+/// the `ArtifactRejected{Corruption}` companion a terminal status must
+/// have behind it (ADR 0039's 2026-09-12 amendment, D6) — alongside the
+/// persisted state change via
 /// [`ArtifactLifecyclePort::commit_transition`]. Subsequent reads via
 /// `ArtifactUseCase::download` see the rejected status and return the
 /// existing quarantine error — no new admin surface, no new error path.
@@ -91,9 +94,9 @@ pub enum ActionOnMismatch {
     #[default]
     Alert,
     /// Tombstone: emit `CasIntegrityMismatch` AND
-    /// [`ArtifactCorrupted`], and transition the artifact to
-    /// `quarantine_status = 'rejected'` so subsequent download
-    /// attempts are blocked at the application layer.
+    /// [`ArtifactCorrupted`] + `ArtifactRejected{Corruption}`, and
+    /// transition the artifact to `quarantine_status = 'rejected'` so
+    /// subsequent download attempts are blocked at the application layer.
     Tombstone,
 }
 
@@ -587,14 +590,16 @@ async fn emit_mismatch_event(
 /// Locates the artifact row by content
 /// hash, transitions it through
 /// [`Artifact::tombstone_from_corruption`](hort_domain::entities::artifact::Artifact::tombstone_from_corruption),
-/// and persists the state change + the [`ArtifactCorrupted`] event in
-/// one transaction via [`ArtifactLifecyclePort::commit_transition`].
+/// and persists the state change + BOTH events the transition emits (the
+/// [`ArtifactCorrupted`] axis record and its `ArtifactRejected{Corruption}`
+/// terminal companion) in one transaction via
+/// [`ArtifactLifecyclePort::commit_transition`].
 ///
 /// Returns `Ok(())` on:
 /// - successful tombstone,
 /// - "artifact not found" (orphan blob with no matching row — the
 ///   `CasIntegrityMismatch` event is the only audit trail in that case),
-/// - "artifact already rejected" (idempotent skip — duplicate event
+/// - "artifact already rejected" (idempotent skip — duplicate events
 ///   would only confuse audit consumers).
 ///
 /// Returns `Err(_)` on:
@@ -636,7 +641,7 @@ async fn try_tombstone_artifact(
         return Ok(());
     };
 
-    let event = match artifact.tombstone_from_corruption(computed_hash.clone(), Utc::now()) {
+    let events = match artifact.tombstone_from_corruption(computed_hash.clone(), Utc::now()) {
         Ok(e) => e,
         Err(err) => {
             // Already-rejected (or some future state-machine
@@ -662,7 +667,13 @@ async fn try_tombstone_artifact(
             AppendEvents {
                 stream_id,
                 expected_version: ExpectedVersion::Any,
-                events: vec![EventToAppend::new(DomainEvent::ArtifactCorrupted(event))],
+                // Both events in ONE append: the `ArtifactCorrupted` axis
+                // record and the `ArtifactRejected` companion the terminal
+                // status must have behind it (ADR 0039's 2026-09-12
+                // amendment, D6). Splitting them across two appends would
+                // leave a window in which the projection is `Rejected` and
+                // the stream cannot explain why.
+                events: events.into_iter().map(EventToAppend::new).collect(),
                 correlation_id: Uuid::new_v4(),
                 causation_id: None,
                 actor: system_actor(),
@@ -720,6 +731,7 @@ mod tests {
         MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
+    use hort_domain::events::RejectionReason;
 
     const HELLO_WORLD_SHA256: &str =
         "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -953,7 +965,12 @@ mod tests {
             QuarantineStatus::Rejected,
             "tombstone must transition the artifact to Rejected"
         );
-        assert_eq!(append.events.len(), 1);
+        // BOTH events, in the one append: the axis record and the
+        // terminal-status companion a `Rejected` projection must have
+        // behind it (ADR 0039's 2026-09-12 amendment, D6). One append, so
+        // there is no window in which the status is `Rejected` and the
+        // stream cannot explain why.
+        assert_eq!(append.events.len(), 2);
         match &append.events[0].event {
             DomainEvent::ArtifactCorrupted(e) => {
                 assert_eq!(e.artifact_id, artifact_id);
@@ -961,6 +978,13 @@ mod tests {
                 assert_eq!(e.expected_hash, tampered_hash);
             }
             other => panic!("expected ArtifactCorrupted, got {other:?}"),
+        }
+        match &append.events[1].event {
+            DomainEvent::ArtifactRejected(e) => {
+                assert_eq!(e.artifact_id, artifact_id);
+                assert_eq!(e.rejected_by, RejectionReason::Corruption);
+            }
+            other => panic!("expected ArtifactRejected, got {other:?}"),
         }
 
         // The state-machine transition is what blocks subsequent

@@ -187,8 +187,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 A row with a non-null `rejection_reason_kind` is a **real** rejection and
 is not part of this population. A null one is *probably* in it but not
-necessarily — a CAS-corruption tombstone also shows null, and the repair
-refuses those; the dry run below is what tells you which is which. `?reason=provenance` lists the opposite
+necessarily — a CAS-corruption tombstone written by an older Hort also
+shows null (a current one shows `corruption`, since the tombstone now
+records its own rejection event), and the repair refuses those; the dry
+run below is what tells you which is which. `?reason=provenance` lists the opposite
 group — artifacts a *positive disproof* rejected (signature present and
 invalid), which are terminal by design and stay that way.
 

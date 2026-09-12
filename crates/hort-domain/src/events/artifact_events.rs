@@ -955,6 +955,25 @@ pub enum RejectionReason {
     /// refuses it — as it already refused the reason-less rejection this
     /// event replaces.
     Provenance,
+    /// The CAS integrity scrub re-streamed the stored bytes and they did
+    /// not hash to the artifact's content hash. Set by
+    /// [`Artifact::tombstone_from_corruption`](crate::entities::artifact::Artifact::tombstone_from_corruption),
+    /// which appends this `ArtifactRejected` alongside the axis-specific
+    /// `ArtifactCorrupted` so the terminal `quarantine_status` has a
+    /// terminal event behind it (ADR 0039's 2026-09-12 amendment, D6).
+    ///
+    /// A **unit** variant, like [`Provenance`](Self::Provenance): the
+    /// mismatching hashes are on the companion
+    /// [`ArtifactCorrupted`] event, so a payload here would only duplicate
+    /// them.
+    ///
+    /// **Not scan-clearable (ADR 0041 invariant #6(a)).** Bytes that do
+    /// not match their content hash do not become servable because a scan
+    /// later passed — there is nothing a scanner can observe that bears on
+    /// a hash mismatch at all. The admin-release override remains the
+    /// human-review escape hatch for a false positive (e.g. the operator
+    /// restored the blob from a known-good backup).
+    Corruption,
 }
 
 impl RejectionReason {
@@ -983,6 +1002,7 @@ impl RejectionReason {
             curator_id: Uuid::nil(),
         },
         RejectionReason::Provenance,
+        RejectionReason::Corruption,
     ];
 
     /// The **serialised** discriminator: the JSON key serde writes for
@@ -1001,6 +1021,7 @@ impl RejectionReason {
             Self::ScanPolicyRetroactive => "ScanPolicyRetroactive",
             Self::Curator { .. } => "Curator",
             Self::Provenance => "Provenance",
+            Self::Corruption => "Corruption",
         }
     }
 
@@ -1015,6 +1036,7 @@ impl RejectionReason {
             Self::ScanPolicyRetroactive => "scan_policy_retroactive",
             Self::Curator { .. } => "curator",
             Self::Provenance => "provenance",
+            Self::Corruption => "corruption",
         }
     }
 
@@ -1964,5 +1986,49 @@ mod re_evaluated_event_tests {
         let back: ArtifactRejected = serde_json::from_value(json).unwrap();
         assert_eq!(ev, back);
         assert_eq!(back.rejected_by, RejectionReason::Provenance);
+    }
+
+    /// The CAS-corruption companion's wire form — the sibling of
+    /// `provenance_rejection_reason_round_trips_inside_artifact_rejected`
+    /// and pinned for the same reason. A **unit** variant, so it
+    /// serialises as the bare string discriminator, which is the shape the
+    /// curation-queue projection's JSONB `CASE` keys on
+    /// (`jsonb_typeof(... ->'rejected_by') = 'string'`); a tuple variant
+    /// would land in the object branch instead, and the difference is one
+    /// the adapter cannot tell you about until a row exists.
+    #[test]
+    fn corruption_rejection_reason_round_trips_inside_artifact_rejected() {
+        let reason = RejectionReason::Corruption;
+        assert_eq!(
+            serde_json::to_value(&reason).unwrap(),
+            serde_json::json!("Corruption")
+        );
+
+        let ev = ArtifactRejected {
+            artifact_id: Uuid::from_u128(3),
+            rejected_by: reason,
+            reason: "CAS integrity mismatch".into(),
+        };
+        ev.validate().expect("valid");
+        let json = serde_json::to_value(&ev).unwrap();
+        let back: ArtifactRejected = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+        assert_eq!(back.rejected_by, RejectionReason::Corruption);
+    }
+
+    /// Both halves of the discriminator vocabulary agree for the new
+    /// variant: the serialised form is its `variant_name()`, and the
+    /// operator-facing form is its `wire_kind()`. The adapter's SQL `CASE`
+    /// maps the first to the second, so a disagreement here is what makes
+    /// `?reason=corruption` match nothing.
+    #[test]
+    fn corruption_discriminators_match_its_serialised_form() {
+        let reason = RejectionReason::Corruption;
+        assert_eq!(
+            serde_json::to_value(&reason).unwrap(),
+            serde_json::json!(reason.variant_name())
+        );
+        assert_eq!(reason.wire_kind(), "corruption");
+        assert!(RejectionReason::all_wire_kinds().contains(&"corruption"));
     }
 }

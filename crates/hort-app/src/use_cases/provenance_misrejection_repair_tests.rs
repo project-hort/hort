@@ -425,14 +425,24 @@ async fn leaves_a_disproof_rejected_artifact_untouched_even_with_a_verified_even
     );
 }
 
-/// **A CAS-corruption tombstone.** The one shape that passes every
-/// `ArtifactRejected`-shaped test *and* carries a `ProvenanceVerified`:
-/// `tombstone_from_corruption` drives `Rejected` while appending only
-/// `ArtifactCorrupted`, so an `ArtifactRejected`-only conjunct 2 would
-/// hand bytes that do not match their content hash back to the release
-/// sweep. Refused.
+/// **A HISTORICAL CAS-corruption tombstone — the important one.**
+///
+/// `tombstone_from_corruption` now appends an `ArtifactRejected{Corruption}`
+/// beside its `ArtifactCorrupted` (ADR 0039's 2026-09-12 amendment, D6),
+/// which makes a *new* tombstone classify `Present` and look as though
+/// `TerminalRejectionRecord::CorruptionTombstone` had become redundant.
+///
+/// It has not. The event store is append-only: no change can add a
+/// companion to a stream written before it, so every tombstone predating
+/// that fix still carries `ArtifactCorrupted` **alone** — the shape seeded
+/// here. Without the separate classification it would read as `Absent`,
+/// satisfy all three repair conjuncts (it carries a `ProvenanceVerified`
+/// from before the corruption was found) and hand bytes that do not match
+/// their content hash back to the release sweep. That is the exact hole the
+/// variant was added to close, and this test is what proves the fix did not
+/// re-open it for the data most likely to be in it. Refused.
 #[tokio::test]
-async fn leaves_a_corruption_tombstoned_artifact_untouched() {
+async fn leaves_a_historical_corruption_tombstoned_artifact_untouched() {
     let f = build();
     let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
         vec![
@@ -449,6 +459,47 @@ async fn leaves_a_corruption_tombstoned_artifact_untouched() {
                     detected_at: Utc::now(),
                 }),
             ),
+        ]
+    });
+    f.queue.set_entries(vec![entry]);
+
+    let report = f.uc.run(repair_request(false), api_actor()).await.unwrap();
+    assert!(
+        report.affected.is_empty(),
+        "corrupt bytes must never be handed back to the release sweep"
+    );
+    assert!(report.failed.is_empty());
+    assert!(f.lifecycle.committed_transitions().is_empty());
+    assert_eq!(
+        f.artifacts.get(artifact.id).unwrap().quarantine_status,
+        QuarantineStatus::Rejected
+    );
+}
+
+/// **A CURRENT CAS-corruption tombstone** — both events, the shape the
+/// entity emits today. Refused too, on conjunct 2's `Present` arm rather
+/// than its `CorruptionTombstone` one: the companion makes the rejection a
+/// real recorded verdict, which is exactly what `Present` means. The
+/// outcome is what matters and it is identical — corrupt bytes stay
+/// condemned however the stream spells it.
+#[tokio::test]
+async fn leaves_a_current_corruption_tombstoned_artifact_untouched() {
+    let f = build();
+    let (artifact, entry) = seed(&f, QuarantineStatus::Rejected, |id, anchor| {
+        vec![
+            quarantined(id, 0, anchor),
+            verified(id, 1),
+            persisted(
+                id,
+                2,
+                DomainEvent::ArtifactCorrupted(hort_domain::events::ArtifactCorrupted {
+                    artifact_id: id,
+                    computed_hash: VALID_SHA256.parse::<ContentHash>().unwrap(),
+                    expected_hash: VALID_SHA256.parse::<ContentHash>().unwrap(),
+                    detected_at: Utc::now(),
+                }),
+            ),
+            persisted_artifact_rejected(id, RejectionReason::Corruption, 3),
         ]
     });
     f.queue.set_entries(vec![entry]);

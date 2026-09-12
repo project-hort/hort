@@ -2102,6 +2102,7 @@ fn rejection_reason_kind_samples_cover_every_variant_and_match_serde() {
         sorted,
         vec![
             "admin",
+            "corruption",
             "curation_retroactive",
             "curator",
             "provenance",

@@ -809,9 +809,11 @@ concern). Do not expect a released artifact to flip back to `Rejected`.
 
 ### §11.5.5 — Read-surface validation
 
-`--reason corruption` on the queue → `400`; `--type unknown_decision` on
-decisions → client-side `valid:` hint; `--since 2026-05-32T00:00:00Z` →
-client-side date rejection.
+`--reason corruption` on the queue → `200` (it is a real rejection reason
+since the CAS tombstone started recording one); `--reason bogus` → server
+`400` listing the accepted set, with no client-side refusal; `--type
+unknown_decision` on decisions → client-side `valid:` hint; `--since
+2026-05-32T00:00:00Z` → client-side date rejection.
 
 ---
 
