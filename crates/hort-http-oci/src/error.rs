@@ -107,13 +107,24 @@ pub enum OciError {
     /// back off on 406. `detail.media_type` echoes the server's stored
     /// type so the client can retry with a compatible `Accept`.
     ManifestNotAcceptable { media_type: String },
-    /// 503 — the artifact or manifest is in a time-bounded quarantine
-    /// hold. Emits HTTP 503 + a `Retry-After` header whose value is
-    /// `retry_after_seconds`. Code is `UNAVAILABLE` — a spec-extension
-    /// with the closest upstream-compatible semantics; chosen over
-    /// `TOOMANYREQUESTS` (HTTP 429) to avoid overloading rate-limit-
-    /// adaptive retry heuristics in strict clients like Artifactory.
-    Quarantined { retry_after_seconds: i64 },
+    /// 503 — the artifact or manifest is in a quarantine hold. Code is
+    /// `UNAVAILABLE` — a spec-extension with the closest
+    /// upstream-compatible semantics; chosen over `TOOMANYREQUESTS`
+    /// (HTTP 429) to avoid overloading rate-limit-adaptive retry
+    /// heuristics in strict clients like Artifactory.
+    ///
+    /// `retry_after_seconds` is `Some` for a **time-bounded** hold: the
+    /// response then carries a `Retry-After` header with that value and
+    /// echoes it under `detail`. It is `None` when the hold has no
+    /// self-resolving deadline — an unsigned artifact past its
+    /// observation window is waiting on a signature reaching Hort, not
+    /// on the clock, and a `Retry-After` there tells a well-behaved
+    /// client to come back forever (ADR 0039's 2026-09-12 amendment,
+    /// D5). `None` emits no header and a `null` detail, exactly like
+    /// [`Self::ScanIndeterminate`]; the code, status and message are
+    /// unchanged either way, so which hold an artifact is in stays
+    /// opaque to the client.
+    Quarantined { retry_after_seconds: Option<i64> },
     /// 503 — the artifact's scan result is indeterminate (the scanner
     /// exhausted its retries without a decision; ADR 0007's fail-closed
     /// terminal state — issue #6). Unlike [`Self::Quarantined`], this
@@ -355,11 +366,17 @@ impl OciError {
                 "actions": actions,
             })),
             Self::Unsupported { .. } => None,
+            // `None` ⇒ `null` detail: a hold with no self-resolving
+            // deadline has no retry schedule to echo (see the variant
+            // doc), and inventing one would contradict the omitted
+            // `Retry-After` header.
             Self::Quarantined {
                 retry_after_seconds,
-            } => Some(serde_json::json!({
-                "retry_after_seconds": retry_after_seconds,
-            })),
+            } => retry_after_seconds.map(|secs| {
+                serde_json::json!({
+                    "retry_after_seconds": secs,
+                })
+            }),
             // No `retry_after_seconds` — this hold has no self-resolving
             // deadline (see the variant doc). `null` on the wire, same
             // shape as `Unsupported` / `Internal`.
@@ -427,14 +444,16 @@ struct WireEnvelope<'a> {
 impl IntoResponse for OciError {
     fn into_response(self) -> Response {
         let status = self.status();
-        // `Retry-After` is variant-specific — only `Quarantined` carries
-        // it. Computing it before `code()`/`message()`/`detail()`
-        // because those move/borrow parts of `self`; the header is a
-        // plain i64 clone so the borrow is cheap.
+        // `Retry-After` is variant-specific. Computing it before
+        // `code()`/`message()`/`detail()` because those move/borrow
+        // parts of `self`; the header is a plain i64 clone so the borrow
+        // is cheap.
         let retry_after: Option<i64> = match &self {
+            // A `Quarantined` hold carries the header only when it has a
+            // self-resolving deadline — see the variant doc.
             Self::Quarantined {
                 retry_after_seconds,
-            } => Some(*retry_after_seconds),
+            } => *retry_after_seconds,
             // Transient 503 contention hold — same `Retry-After`
             // contract as `Quarantined`: come back shortly.
             Self::Unavailable {
@@ -672,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn quarantined_is_503_with_unavailable_code_and_retry_after_header() {
         let err = OciError::Quarantined {
-            retry_after_seconds: 42,
+            retry_after_seconds: Some(42),
         };
         let response = err.into_response();
         let status = response.status();
@@ -690,6 +709,30 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
         assert_eq!(parsed["errors"][0]["detail"]["retry_after_seconds"], 42);
+    }
+
+    #[tokio::test]
+    async fn quarantined_without_retry_after_is_503_with_no_header_and_null_detail() {
+        // ADR 0039 D5: a hold with no self-resolving deadline keeps the
+        // 503 and the `UNAVAILABLE` code but advertises no retry
+        // schedule — same wire shape as `ScanIndeterminate`, and the
+        // message is unchanged so the two holds stay indistinguishable
+        // to the client.
+        let response = OciError::Quarantined {
+            retry_after_seconds: None,
+        }
+        .into_response();
+        let status = response.status();
+        assert!(
+            response.headers().get("Retry-After").is_none(),
+            "a deadline-less quarantine hold must never carry Retry-After"
+        );
+        let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(parsed["errors"][0]["message"], "artifact is quarantined");
+        assert!(parsed["errors"][0]["detail"].is_null());
     }
 
     #[tokio::test]

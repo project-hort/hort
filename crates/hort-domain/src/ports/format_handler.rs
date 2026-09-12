@@ -1085,6 +1085,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: chrono::Utc::now(),

@@ -33,16 +33,21 @@
 #                               is Cleared, the image RELEASES and PULLS.
 #   [4] NEGATIVE (never-sign) — a second image (a DISTINCT digest — same bytes
 #                               would CAS-dedup to the signed artifact) is
-#                               pushed and never signed; at `quarantineDuration`
-#                               expiry the backstop (S4) makes the TERMINAL
-#                               decision -> `ProvenanceRejected{Unsigned}`.
-#                               On a PRIVATE repo an anonymous manifest GET is
-#                               401 throughout (visibility, not the hold), so
-#                               held and terminal are indistinguishable
-#                               anonymously; the terminal decision is observed
-#                               via the emitted `ProvenanceRejected` domain
-#                               event, exactly as [4/6] observes
-#                               `ProvenanceVerified`.
+#                               pushed and never signed. Past `quarantineDuration`
+#                               it stays HELD, indefinitely: absence of a
+#                               signature is a statement about a point in time,
+#                               never about the artifact, so it can produce no
+#                               terminal state (ADR 0039's 2026-09-12 amendment,
+#                               D1/D4). Asserted as: the expiry sweep has
+#                               considered the row (`release_attempt_at`
+#                               stamped), `quarantine_status` is STILL
+#                               `quarantined`, the stream carries NEITHER a
+#                               `ProvenanceVerified` NOR a `ProvenanceRejected`,
+#                               and a real pull still fails. On a PRIVATE repo an
+#                               anonymous manifest GET is 401 throughout
+#                               (visibility, not the hold), which is why the hold
+#                               is observed through the projection + the stream
+#                               rather than through a status-code transition.
 #
 # -----------------------------------------------------------------------------
 # COSIGN RESOLVES THE SUBJECT BY GET (ADR 0039 §10).
@@ -124,11 +129,11 @@ UNSIGNED_SOURCE_IMAGE="${UNSIGNED_SOURCE_IMAGE:-ghcr.io/stefanprodan/podinfo:6.5
 # priority-10 release-sweep then releases on its next tick. This window is
 # just margin, not the fix.
 WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-300}"
-# [6/6]'s negative leg observes a terminal decision that only fires on the
-# expiry backstop (the release sweep's window_open=false pass), so its bound
-# must clear one full sweep-ticker interval (compose ticker: 5min) plus job
-# latency — anything tighter can time out on phase offset alone against a
-# healthy stack, not a real regression.
+# [6/6]'s negative leg waits for the release sweep to have CONSIDERED the
+# never-signed row (it stamps `release_attempt_at` on every candidate in its
+# batch), so its bound must clear one full sweep-ticker interval (compose
+# ticker: 5min) plus job latency — anything tighter can time out on phase
+# offset alone against a healthy stack, not a real regression.
 NEGATIVE_WINDOW_WAIT_SECS="${PROVENANCE_NEGATIVE_WINDOW_WAIT_SECS:-450}"
 
 # Strip scheme so skopeo/cosign's docker:// transport gets host:port only.
@@ -140,6 +145,7 @@ UNSIGNED_NAME="${UNSIGNED_NAME:-provunsigned}"
 DEST_SIGNED="${REGISTRY_HOST}/${REPO_KEY}/${SIGNED_NAME}:v1"
 DEST_UNSIGNED="${REGISTRY_HOST}/${REPO_KEY}/${UNSIGNED_NAME}:v1"
 PULLED_ARCHIVE="/tmp/prov-pulled-${SIGNED_NAME}.tar"
+UNSIGNED_ARCHIVE="/tmp/prov-pulled-${UNSIGNED_NAME}.tar"
 
 log "==> Provenance hold-until-signed round-trip (push-then-sign, keyed)"
 log "Registry : ${HORT_URL}"
@@ -155,7 +161,7 @@ command -v cosign >/dev/null 2>&1 || \
 [ -f "$COSIGN_KEY" ] || \
     skip "keyed cosign private key '$COSIGN_KEY' not found (expected the committed fixture at \$FIXTURES/cosign/cosign.key, or a CI-provided COSIGN_KEY)"
 
-trap 'rm -f "$PULLED_ARCHIVE"' EXIT
+trap 'rm -f "$PULLED_ARCHIVE" "$UNSIGNED_ARCHIVE"' EXIT
 
 # -----------------------------------------------------------------------------
 # Credential mode: legacy (Basic / IdP-JWT) vs native tokens.
@@ -496,9 +502,9 @@ else
 fi
 
 # =============================================================================
-# [6/6] NEGATIVE — never-signed image -> terminal Rejected{Unsigned} at expiry
+# [6/6] NEGATIVE — never-signed image stays HELD past expiry (never terminal)
 # =============================================================================
-log "==> [6/6] NEGATIVE: push an image INDEX (distinct digest), never sign it -> terminal Rejected{Unsigned} at window expiry"
+log "==> [6/6] NEGATIVE: push an image INDEX (distinct digest), never sign it -> still HELD past window expiry, no terminal verdict"
 # Distinct-digest source (UNSIGNED_SOURCE_IMAGE) — same-bytes would CAS-dedup
 # to the signed leg's already-released artifact (see the env-contract comment).
 if push_source_index "$DEST_UNSIGNED" "$UNSIGNED_SOURCE_IMAGE"; then
@@ -536,21 +542,65 @@ else
          "got HTTP ${ANON_UNSIGNED_CODE} (a private repo must 401 an anonymous read before the hold/terminal check, ADR 0045; 200 would mean an unsigned image is being served)"
 fi
 
-# …and observe the TERMINAL Rejected{Unsigned} decision via the emitted domain
-# event, exactly as [4/6] observes ProvenanceVerified. At window expiry the
-# release sweep enqueues a final provenance-verify with window_open=false and
-# complete_provenance emits ProvenanceRejected{Unsigned}. The event is the
-# authoritative, mode-independent signal (no token-expiry window, and no
-# anonymous 503->404 transition to watch on a private repo).
+# Wait for POSITIVE proof the expiry sweep has actually CONSIDERED this
+# artifact, rather than sleeping and hoping. The sweep stamps
+# `release_attempt_at` on every candidate in the batch it hands to
+# `release_expired`, and candidacy is exactly "computed window deadline
+# elapsed" — so a non-NULL stamp proves both that the window passed and that
+# the sweep looked at this row. Without that anchor, every assertion below
+# ("still quarantined", "no verdict event") would be trivially true before the
+# window even elapsed and would prove nothing.
 if bounded_poll \
-        "never-signed manifest -> terminal ProvenanceRejected{Unsigned}" \
+        "never-signed manifest considered by the expiry sweep" \
         "$NEGATIVE_WINDOW_WAIT_SECS" \
-        "[ -n \"\$(psql_one \"SELECT 1 FROM events e JOIN artifacts a ON e.stream_id = 'artifact-' || a.id::text WHERE a.checksum_sha256 = '${UNSIGNED_DIGEST_HEX}' AND e.event_type = 'ProvenanceRejected' LIMIT 1;\")\" ]" \
+        "[ -n \"\$(psql_one \"SELECT 1 FROM artifacts WHERE checksum_sha256 = '${UNSIGNED_DIGEST_HEX}' AND release_attempt_at IS NOT NULL LIMIT 1;\")\" ]" \
         5; then
-    pass "never-signed image is terminally Rejected{Unsigned} at window expiry (ProvenanceRejected event emitted, not released)"
+    pass "expiry sweep considered the never-signed image (release_attempt_at stamped — window elapsed and the sweep reached this row)"
 else
-    fail "never-signed image -> terminal Rejected{Unsigned}" \
-         "no ProvenanceRejected event for checksum ${UNSIGNED_DIGEST_HEX} within ${NEGATIVE_WINDOW_WAIT_SECS}s (the expiry backstop should have made the terminal Unsigned decision)"
+    fail "expiry sweep considers the never-signed image" \
+         "release_attempt_at still NULL for checksum ${UNSIGNED_DIGEST_HEX} after ${NEGATIVE_WINDOW_WAIT_SECS}s (the sweep never reached it, so the hold assertions below would be vacuous)"
+    summary
 fi
+
+# The hold survives expiry. `quarantine_status` is still `quarantined` — NOT
+# `rejected`: absence of a signature is a statement about a point in time, so
+# it can never produce a terminal state (ADR 0039's 2026-09-12 amendment, D1).
+UNSIGNED_STATUS="$(psql_one "SELECT quarantine_status FROM artifacts WHERE checksum_sha256 = '${UNSIGNED_DIGEST_HEX}' LIMIT 1;")"
+if [ "$UNSIGNED_STATUS" = "quarantined" ]; then
+    pass "never-signed image is still HELD past window expiry (quarantine_status = quarantined)"
+else
+    fail "never-signed image stays quarantined past expiry" \
+         "quarantine_status = '${UNSIGNED_STATUS:-<none>}' for checksum ${UNSIGNED_DIGEST_HEX}, expected 'quarantined' (a missing signature must never terminalise)"
+fi
+
+# Nothing cleared it — the hold is real, not a released artifact we failed to
+# notice. And nothing REJECTED it either: a `ProvenanceRejected` on this stream
+# is the exact regression the amendment removed, so its absence is the
+# load-bearing assertion of this leg.
+UNSIGNED_VERDICT_EVENTS="$(psql_one "SELECT string_agg(DISTINCT e.event_type, ',') FROM events e JOIN artifacts a ON e.stream_id = 'artifact-' || a.id::text WHERE a.checksum_sha256 = '${UNSIGNED_DIGEST_HEX}' AND e.event_type IN ('ProvenanceVerified', 'ProvenanceRejected');")"
+if [ -z "$UNSIGNED_VERDICT_EVENTS" ]; then
+    pass "never-signed image carries no provenance verdict event (no ProvenanceVerified, and no terminal ProvenanceRejected — the hold is indefinite, D1/D4)"
+else
+    fail "never-signed image carries no provenance verdict event" \
+         "found ${UNSIGNED_VERDICT_EVENTS} on the stream for checksum ${UNSIGNED_DIGEST_HEX}; a never-signed artifact must hold with NO verdict event (a ProvenanceRejected here means the terminal Unsigned arm is back)"
+fi
+
+# The operational half: held means unrunnable. The layer blobs keep their
+# HEAD-only probe even for a write-granted caller, so a real pull fails — the
+# exact mirror of [5/6], which asserts the SIGNED image does pull. (A manifest
+# GET is served here rather than 503'd: the only credential this scenario holds
+# is the write-granted signer identity, which is precisely who the ADR 0039 §10
+# hold-read exemption serves. The blob refusal is the property that keeps the
+# image unpullable, and it is observable from the same credential.)
+rm -f "$UNSIGNED_ARCHIVE"
+if skopeo copy --all --insecure-policy --src-tls-verify=false \
+        --src-creds "${DEST_CREDS}" \
+        "docker://${DEST_UNSIGNED}" "oci-archive:${UNSIGNED_ARCHIVE}" >/dev/null 2>&1; then
+    fail "never-signed image is NOT pullable" \
+         "skopeo copy of ${DEST_UNSIGNED} SUCCEEDED past window expiry — an unsigned image under provenanceMode=required must never become pullable"
+else
+    pass "never-signed image is still not pullable past window expiry (layer blobs withheld — held is exactly as unrunnable as rejected)"
+fi
+rm -f "$UNSIGNED_ARCHIVE"
 
 summary

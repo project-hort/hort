@@ -42,6 +42,9 @@ use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueu
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
+use hort_domain::ports::curation_queue_repository::{
+    CurationQueueEntry, CurationQueueFilter, CurationQueueRepository,
+};
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{
     AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
@@ -315,6 +318,7 @@ impl MockArtifactRepository {
                 rejection_reason: None,
                 quarantine_window_start: None,
                 quarantine_deadline: None,
+                provenance_hold_indefinite: false,
                 deleted_at: None,
                 upstream_published_at: None,
                 uploaded_by: None,
@@ -1205,6 +1209,91 @@ impl PolicyProjectionRepository for MockPolicyProjectionRepository {
         }
         self.exclusion_deletes.lock().unwrap().push(exclusion_id);
         Box::pin(async move { Ok(()) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MockCurationQueueRepository
+// ---------------------------------------------------------------------------
+
+/// Recording [`CurationQueueRepository`] for application-layer tests.
+///
+/// Returns whatever [`Self::set_entries`] seeded (empty by default) and
+/// records every [`CurationQueueFilter`] it was asked for, so a test can
+/// assert the caller narrowed the listing the way it claims to. The
+/// hort-http-core harness has its own mock of the same port; the two
+/// serve different layers and are deliberately not shared.
+pub struct MockCurationQueueRepository {
+    entries: Mutex<Vec<CurationQueueEntry>>,
+    recorded: Mutex<Vec<CurationQueueFilter>>,
+    next_error: Mutex<Option<DomainError>>,
+}
+
+impl MockCurationQueueRepository {
+    pub fn new() -> Self {
+        Self {
+            entries: Mutex::new(Vec::new()),
+            recorded: Mutex::new(Vec::new()),
+            next_error: Mutex::new(None),
+        }
+    }
+
+    /// Replace what `list_queue` returns. The mock applies **no**
+    /// filtering — the seeded rows are returned verbatim so a test can
+    /// feed the caller rows its own filter would never have produced and
+    /// prove the decision is not leaning on the listing.
+    pub fn set_entries(&self, entries: Vec<CurationQueueEntry>) {
+        *self.entries.lock().unwrap() = entries;
+    }
+
+    /// One-shot failure injection on `list_queue`. Consumed on fire.
+    pub fn fail_next_list(&self, e: DomainError) {
+        *self.next_error.lock().unwrap() = Some(e);
+    }
+
+    pub fn recorded_filters(&self) -> Vec<CurationQueueFilter> {
+        self.recorded.lock().unwrap().clone()
+    }
+}
+
+impl Default for MockCurationQueueRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CurationQueueRepository for MockCurationQueueRepository {
+    fn list_queue<'a>(
+        &'a self,
+        filter: CurationQueueFilter,
+    ) -> BoxFuture<'a, DomainResult<Vec<CurationQueueEntry>>> {
+        self.recorded.lock().unwrap().push(filter);
+        if let Some(e) = self.next_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(e) });
+        }
+        let entries = self.entries.lock().unwrap().clone();
+        Box::pin(async move { Ok(entries) })
+    }
+}
+
+/// Build a [`CurationQueueEntry`] for `artifact` — only the fields the
+/// repair surface reads (identity + the operator-recognisable name) are
+/// meaningful; the scan-findings and deadline columns are the listing's
+/// concern, not this caller's.
+pub fn queue_entry_for(artifact: &Artifact, repository_key: &str) -> CurationQueueEntry {
+    CurationQueueEntry {
+        artifact_id: artifact.id,
+        repository_id: artifact.repository_id,
+        repository_key: repository_key.to_string(),
+        format: RepositoryFormat::Oci,
+        package_name: artifact.name.clone(),
+        version: artifact.version.clone(),
+        quarantine_status: artifact.quarantine_status,
+        quarantine_window_start: artifact.quarantine_window_start,
+        quarantine_deadline: None,
+        finding_count: 0,
+        max_severity: None,
+        rejection_reason_kind: None,
     }
 }
 
@@ -2128,6 +2217,10 @@ pub struct MockEventStore {
     /// retry loop absorbs; a `read_stream` failure is a real infra
     /// error that must propagate immediately.
     fail_next_read_stream: Mutex<Option<DomainError>>,
+    /// Call-indexed one-shot `read_stream` failure — see
+    /// [`MockEventStore::fail_read_stream_at`]. Armed as
+    /// `(0-based call index, error)`; consumed when that call fires.
+    fail_read_stream_at: Mutex<Option<(usize, DomainError)>>,
     /// Total `read_stream` invocations, including failed ones. Lets
     /// tests pin a "no read round-trip on this path anymore" claim
     /// (issue #87: `ExpectedVersion::Any` appends need no
@@ -2146,6 +2239,7 @@ impl MockEventStore {
             fail_all_appends: Mutex::new(None),
             stream_after_next_read: Mutex::new(HashMap::new()),
             fail_next_read_stream: Mutex::new(None),
+            fail_read_stream_at: Mutex::new(None),
             read_stream_calls: AtomicUsize::new(0),
         }
     }
@@ -2172,6 +2266,20 @@ impl MockEventStore {
     /// fire.
     pub fn fail_next_read_stream(&self, err: DomainError) {
         *self.fail_next_read_stream.lock().unwrap() = Some(err);
+    }
+
+    /// Arm the `read_stream` call at 0-based index `n` — the same counter
+    /// [`Self::read_stream_call_count`] reports — to fail once with
+    /// `err`. Consumed when it fires.
+    ///
+    /// [`Self::fail_next_read_stream`] can only ever reach the FIRST
+    /// read. A caller that reads one stream twice for two different
+    /// decisions needs the LATER read to fail, in order to pin that an
+    /// infrastructure failure there is surfaced rather than silently read
+    /// as "the evidence is not there" — a fail-open shape that would drop
+    /// a candidate from a report without saying so.
+    pub fn fail_read_stream_at(&self, n: usize, err: DomainError) {
+        *self.fail_read_stream_at.lock().unwrap() = Some((n, err));
     }
 
     pub fn appended_batches(&self) -> Vec<AppendEvents> {
@@ -2249,9 +2357,16 @@ impl EventStore for MockEventStore {
         _from: ReadFrom,
         max_count: u64,
     ) -> BoxFut<'_, DomainResult<Vec<PersistedEvent>>> {
-        self.read_stream_calls.fetch_add(1, Ordering::SeqCst);
+        let call_index = self.read_stream_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(err) = self.fail_next_read_stream.lock().unwrap().take() {
             return Box::pin(async move { Err(err) });
+        }
+        {
+            let mut armed = self.fail_read_stream_at.lock().unwrap();
+            if armed.as_ref().is_some_and(|(n, _)| *n == call_index) {
+                let (_, err) = armed.take().expect("just checked it is armed");
+                return Box::pin(async move { Err(err) });
+            }
         }
         let key = stream_id.to_string();
         let events = self
@@ -3500,6 +3615,7 @@ pub fn sample_artifact(status: QuarantineStatus) -> Artifact {
         // on read paths; fixtures that exercise `Retry-After` set it
         // explicitly.
         quarantine_deadline: None,
+        provenance_hold_indefinite: false,
         deleted_at: None,
         upstream_published_at: None,
         uploaded_by: None,

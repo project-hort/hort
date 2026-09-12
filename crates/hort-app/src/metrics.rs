@@ -39,6 +39,11 @@ pub mod labels {
     pub const REASON: &str = "reason";
     /// Storage backend identifier (`"filesystem"`, `"s3"`, etc.).
     pub const BACKEND: &str = "backend";
+    /// Which provenance hold a quarantined artifact is in, on
+    /// `hort_provenance_held_artifacts` /
+    /// `hort_provenance_hold_oldest_age_seconds`. Values live in
+    /// [`super::ProvenanceHold`].
+    pub const HOLD: &str = "hold";
     /// Low-level operation identifier (`"put"`, `"get"`, `"append"`, etc.).
     pub const OPERATION: &str = "operation";
     /// Metadata-persistence strategy picked per ingest. Values live in
@@ -2228,6 +2233,71 @@ pub fn emit_provenance_late_joiner_cleared(backend: &str) {
         labels::BACKEND => backend.to_string(),
     )
     .increment(1);
+}
+
+/// `hold` label value on the two provenance-hold population gauges.
+/// String values are normative — they appear verbatim in
+/// `docs/metrics-catalog.md`. Deliberately mirrors the two
+/// `ReleaseExpiredSummary` hold buckets one-for-one; the sweep's third
+/// skip cause (`skipped_no_scan_authority`) is a scan-axis backlog, not
+/// a provenance hold, and does not belong on these series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProvenanceHold {
+    /// Waiting for its own signature to reach Hort. Resolves the moment
+    /// one arrives — or never, which is exactly what the age tells you.
+    PendingSignature,
+    /// A parent-gated blob constituent: it can never carry an
+    /// attestation of its own, so only its parent manifest's cascade can
+    /// lift it. A growing age here means an unsigned **root**.
+    ParentGated,
+}
+
+impl ProvenanceHold {
+    /// Wire string. Catalog rule: must match `docs/metrics-catalog.md`
+    /// exactly.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PendingSignature => "pending_signature",
+            Self::ParentGated => "parent_gated",
+        }
+    }
+}
+
+/// Set `hort_provenance_held_artifacts{hold}` and
+/// `hort_provenance_hold_oldest_age_seconds{hold}` for one hold bucket.
+/// Single emission site: `QuarantineReleaseSweepHandler::run`, once per
+/// tick per bucket, **including the tick that finds nothing** — a gauge
+/// that is only written when the population is non-empty keeps reporting
+/// a drained backlog forever.
+///
+/// ADR 0039's 2026-09-12 amendment (D4) rejects a signing deadline and
+/// rests that choice on the operator being able to *see* the held set
+/// instead: *"a metric keeps the age, a status column discards it."*
+/// These two gauges are that surface. The count answers "what is
+/// waiting"; `oldest_age_secs` answers "for how long", which a count
+/// cannot — it collapses a 20-second hold and a 20-day one into the
+/// same number.
+///
+/// Both are scoped to the sweep's per-tick candidate batch, which is
+/// capped (`QuarantineReleaseSweepHandler::BATCH_SIZE`). Below the cap
+/// that batch is the whole expired population, so the gauges are exact;
+/// at the cap they are a lower bound, the same reading
+/// `hort_cron_rescan_eligible_artifacts` carries. **No `repository`
+/// label**: the sweep is deployment-wide and this is a
+/// population-health signal, so a per-repo breakdown would multiply the
+/// series by the repository count for no operator decision the aggregate
+/// does not already drive.
+pub fn set_provenance_hold_population(hold: ProvenanceHold, count: u32, oldest_age_secs: i64) {
+    metrics::gauge!(
+        "hort_provenance_held_artifacts",
+        labels::HOLD => hold.as_str(),
+    )
+    .set(f64::from(count));
+    metrics::gauge!(
+        "hort_provenance_hold_oldest_age_seconds",
+        labels::HOLD => hold.as_str(),
+    )
+    .set(oldest_age_secs as f64);
 }
 
 // ---------------------------------------------------------------------------

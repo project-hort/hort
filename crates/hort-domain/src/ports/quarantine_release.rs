@@ -73,6 +73,23 @@ pub struct ReleaseExpiredSummary {
     /// carry an attestation of its own, so its only clearance path is
     /// the parent manifest's cascade. A structural hold, not a backlog.
     pub held_parent_gated: u32,
+    /// Age in seconds of the **oldest** candidate counted in
+    /// `skipped_provenance_pending` this batch, measured from its ingest
+    /// (`Artifact::created_at`). `None` when the batch held none.
+    ///
+    /// A count alone cannot answer "will this ever release?" — it
+    /// collapses "held for 20 seconds" and "held for 20 days" into the
+    /// same number, and under ADR 0039's 2026-09-12 amendment (D4) the
+    /// hold is indefinite, so the age *is* the signal. It is carried here
+    /// rather than emitted from the loop so the whole per-tick
+    /// observation — counts and ages together — has one emission site in
+    /// the sweep handler, including the tick that finds nothing.
+    pub oldest_provenance_pending_hold_secs: Option<i64>,
+    /// The same measure for the `held_parent_gated` bucket. Split for
+    /// the same reason the two counts are split: a long-lived
+    /// parent-gated blob means an unsigned *root*, which is a different
+    /// operator response from an artifact awaiting its own signature.
+    pub oldest_parent_gated_hold_secs: Option<i64>,
 }
 
 /// Outbound port: release a batch of artifact ids whose quarantine
@@ -124,9 +141,7 @@ mod tests {
                 Box::pin(async move {
                     Ok(ReleaseExpiredSummary {
                         released: ids,
-                        skipped_no_scan_authority: 0,
-                        skipped_provenance_pending: 0,
-                        held_parent_gated: 0,
+                        ..Default::default()
                     })
                 })
             }
@@ -146,6 +161,12 @@ mod tests {
         assert_eq!(s.skipped_no_scan_authority, 0);
         assert_eq!(s.skipped_provenance_pending, 0);
         assert_eq!(s.held_parent_gated, 0);
+        // A bucket that held nothing reports NO age, not an age of zero:
+        // the sweep handler turns `None` into the gauge's 0, and
+        // conflating the two here would make "nothing held" and "held
+        // for 0 s" indistinguishable in the port contract.
+        assert_eq!(s.oldest_provenance_pending_hold_secs, None);
+        assert_eq!(s.oldest_parent_gated_hold_secs, None);
     }
 
     /// The three hold counters are distinct fields, not aliases: a
@@ -156,26 +177,29 @@ mod tests {
     #[test]
     fn release_expired_summary_counters_are_independent() {
         let provenance_only = ReleaseExpiredSummary {
-            released: Vec::new(),
-            skipped_no_scan_authority: 0,
             skipped_provenance_pending: 7,
-            held_parent_gated: 0,
+            oldest_provenance_pending_hold_secs: Some(90),
+            ..Default::default()
         };
         let authority_only = ReleaseExpiredSummary {
-            released: Vec::new(),
             skipped_no_scan_authority: 7,
-            skipped_provenance_pending: 0,
-            held_parent_gated: 0,
+            ..Default::default()
         };
         let parent_gated_only = ReleaseExpiredSummary {
-            released: Vec::new(),
-            skipped_no_scan_authority: 0,
-            skipped_provenance_pending: 0,
             held_parent_gated: 7,
+            oldest_parent_gated_hold_secs: Some(90),
+            ..Default::default()
         };
         assert_ne!(provenance_only, authority_only);
         assert_ne!(provenance_only, parent_gated_only);
         assert_ne!(authority_only, parent_gated_only);
         assert_eq!(provenance_only.clone(), provenance_only);
+        // The two ages are distinct fields too: the same number under a
+        // different bucket is a different operator response (an unsigned
+        // artifact vs an unsigned root).
+        assert_ne!(
+            provenance_only.oldest_provenance_pending_hold_secs,
+            provenance_only.oldest_parent_gated_hold_secs
+        );
     }
 }

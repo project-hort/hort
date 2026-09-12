@@ -139,6 +139,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An image whose signature arrives a moment after it is pushed is no longer
+  rejected for being unsigned** (#243). Under `provenanceMode: required`, hort
+  verified provenance as soon as the manifest landed — but with cosign the
+  signer must resolve the manifest before it can attach a signature to it, so
+  the verify routinely ran first and found nothing. That was treated as a
+  terminal verdict: the image went `rejected`, and the signature that arrived a
+  second later changed nothing. A missing signature is a statement about a
+  point in time, so it can never be terminal; it is now an indefinite **hold**
+  instead, and the image clears and releases the moment the signature is seen,
+  whether that is a second or a day later. Only a *positive disproof* — a
+  signature that is present and invalid — still rejects, and it now writes the
+  terminal event that every other rejection axis already wrote, so a rejected
+  image can be audited from its own stream instead of from a status with
+  nothing behind it.
+
+  Two operator-facing consequences. A held image's `503` no longer carries
+  `Retry-After`: the hold waits on an external event rather than on the clock,
+  and advertising a retry schedule it does not have put well-behaved clients in
+  an unbounded retry loop. And the standing held population is now visible —
+  `hort_provenance_held_artifacts` and `hort_provenance_hold_oldest_age_seconds`
+  report how many artifacts are waiting and how long the oldest has waited,
+  split by whether they are waiting for their own signature or their parent's.
+
+  For the images already stranded by the old behaviour there is a one-shot,
+  admin-only repair — `POST /api/v1/admin/quarantine/provenance-misrejections/repair`,
+  **dry-run by default** — that returns them to the hold so the ordinary
+  release sweep can release them. It touches only artifacts whose own event
+  stream contradicts their rejection, and leaves every genuine rejection alone;
+  see *Recovering stranded artifacts* §5 in the docs. Relatedly, the curation
+  queue's `?reason=` filter no longer answers `400` for discriminators the
+  queue itself emits (`provenance`, `admin`, `scan_policy_retroactive`).
+
 - **A proxied image index served under a single-image `Content-Type` now gets
   its membership rows written** (#229). The pull-through path decided whether a
   manifest was an index from the upstream's declared media type, while the rest

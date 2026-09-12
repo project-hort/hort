@@ -1540,6 +1540,7 @@ impl IngestUseCase {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: actor_to_uploaded_by(&actor),
@@ -3568,6 +3569,7 @@ impl IngestUseCase {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             // Record the upstream-asserted publish
             // hint unconditionally (audit only). Anchor resolution is
@@ -4415,6 +4417,7 @@ impl IngestUseCase {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: actor_to_uploaded_by(&actor),
@@ -4575,16 +4578,14 @@ impl IngestUseCase {
         // unchanged. This path stamps the *time* anchor AND requests the
         // scan/provenance verdicts that authority depends on.
         //
-        // Consequence (issue #115 design doc §2 D1, intentional and
-        // policy-consistent, not a bug — now applies to every caller, not
-        // just seed-import): registering unsigned content into a repo
-        // with `provenance_mode: Required` and a provenance-capable
-        // format resolves to an IMMEDIATE terminal `Rejected{Unsigned}`
-        // once the window closes, UNLESS this artifact is itself a
-        // referenced-tree descendant of some other already-ingested
-        // artifact (the `content_references` carve-out, #46 Item 2 / #115
-        // Item 3 — orthogonal to this fn, evaluated by the provenance
-        // orchestrator at verdict time, not here).
+        // Consequence (intentional and policy-consistent, not a bug):
+        // registering unsigned content into a repo with
+        // `provenance_mode: Required` and a provenance-capable format
+        // leaves the artifact HELD (`Quarantined`, 503, `Pending` at the
+        // release gate) until a signature arrives — indefinitely if none
+        // ever does. The observation window is not a signing deadline
+        // (ADR 0039's 2026-09-12 amendment, D1/D4), so the anchor this fn
+        // stamps does not bound the provenance axis.
         let trigger_source = if quarantine_anchor_override.is_some() {
             "seed-import"
         } else {

@@ -240,17 +240,26 @@ any new release authority.
    write-authorized manifest HEAD — no anonymous manifest-metadata disclosure,
    and the proxy/Artifactory retry semantics are untouched.
 
-4. **Observability.** The held-pending-signature case (the `Ok(None)` under
-   `Required` with the window open) ticks a distinct `held_pending_signature`
-   value of `hort_provenance_verify_total{result}` (via
-   `ProvenanceVerifyResult::HeldPendingSignature`), separable from the
+4. **Observability.** The held-pending-signature case (the empty-event
+   `NoAttestation` arm under `Required`) ticks a distinct
+   `held_pending_signature` value of `hort_provenance_verify_total{result}`
+   (via `ProvenanceVerifyResult::HeldPendingSignature`), separable from the
    allowed-unsigned `no_attestation` no-op, plus an `info!` audit line — so an
    operator can see images *waiting to be signed*. A **constituent** held
    because it can never carry its own attestation (an OCI config/layer blob)
    ticks the separate `held_pending_subject` value instead: it is waiting for
    its subject's clearance, not for a signer, and reporting it as
-   `held_pending_signature` would misdirect the operator. See ADR 0016's
-   `provenance_mode: required` × short-`quarantine_duration_secs` row.
+   `held_pending_signature` would misdirect the operator. The split is the
+   constituent classification alone — neither the observation window nor an
+   inbound reference edge is consulted, both having been removed as hold
+   predicates by ADR 0039's 2026-09-12 amendment (D3). Because that
+   amendment also makes the hold indefinite (D4), the counter — which
+   counts verify *events* — is paired with the standing-population
+   gauges `hort_provenance_held_artifacts{hold}` and
+   `hort_provenance_hold_oldest_age_seconds{hold}` emitted by the release
+   sweep; the age is the half a status column could never have kept. See
+   ADR 0016's `provenance_mode: required` ×
+   short-`quarantine_duration_secs` row.
 
 The fail-closed release predicate (ADR 0007), the digest binding, the
 pure-bundle quarantine exemption, and the apply-time linter are all unchanged;

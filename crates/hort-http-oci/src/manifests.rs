@@ -2496,6 +2496,158 @@ mod tests {
         );
     }
 
+    // -- ADR 0039 D5: no `Retry-After` on a hold with no deadline ------
+    //
+    // A `Required`-mode artifact that is still unsigned once its
+    // observation window has elapsed is waiting on a signature reaching
+    // Hort, not on the clock. The clamp in `check_quarantine` would
+    // otherwise answer `Retry-After: 1` on every pull, forever. These
+    // two tests drive the whole read path — policy resolution, the
+    // clearance stream read, the hydrated flag, the response — through
+    // the live handler for both verbs, because the plumbing between the
+    // use case and the header is exactly what the unit tests in
+    // `quarantine.rs` cannot see.
+
+    /// Seed a repo-scoped `provenance_mode: Required` policy. Repo-scoped
+    /// shadows the harness's permissive global seed
+    /// (`resolve_active_policy_for_repo` precedence), so the global stays
+    /// in place for every other test in this file.
+    fn seed_required_policy(
+        projections: &hort_app::use_cases::test_support::MockPolicyProjectionRepository,
+        repo_id: Uuid,
+        quarantine_duration_secs: i64,
+    ) {
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
+        };
+        use hort_domain::events::PolicyScope;
+        let now = Utc::now();
+        projections.insert(ScanPolicyProjection {
+            policy_id: Uuid::new_v4(),
+            name: "required-provenance".to_string(),
+            scope: PolicyScope::Repository(repo_id),
+            severity_threshold: SeverityThreshold::Critical,
+            quarantine_duration_secs,
+            require_approval: false,
+            provenance_mode: ProvenanceMode::Required,
+            provenance_backends: vec!["cosign".to_string()],
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: None,
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
+            stream_version: 0,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    /// Drive an anonymous read of an unsigned `Required` manifest whose
+    /// anchor is `anchor_age_secs` old under a `window_secs` window, and
+    /// return `(status, Retry-After)` for the requested verb.
+    fn unsigned_required_hold_read(
+        window_secs: i64,
+        anchor_age_secs: i64,
+        head: bool,
+    ) -> (StatusCode, Option<String>) {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            seed_required_policy(&mocks.policy_projections, repo_id, window_secs);
+            seed_manifest(
+                &mocks.artifacts,
+                &mocks.storage,
+                &mocks.artifact_metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Quarantined,
+            );
+            // Age the anchor. `seed_manifest` stamps `Utc::now()`; the
+            // hold only has no deadline once the window has elapsed.
+            let hash: ContentHash = hex.parse().unwrap();
+            let mut artifact = mocks
+                .artifacts
+                .find_by_repo_and_checksum(repo_id, &hash)
+                .await
+                .unwrap()
+                .expect("seeded manifest");
+            artifact.quarantine_window_start =
+                Some(Utc::now() - chrono::Duration::seconds(anchor_age_secs));
+            mocks.artifacts.insert(artifact);
+            // No `ProvenanceVerified` is ever seeded, so the clearance
+            // resolves `Pending` — the never-signed population.
+            //
+            // RBAC-enabled so the anonymous caller genuinely lacks
+            // Write (otherwise the ADR 0039 §10 hold-read exemption
+            // would serve the manifest instead of the 503), then the
+            // hydration wiring on top so the rebuilt use case keeps it.
+            let ctx = write_grant_ctx(&ctx, mocks.repositories.clone(), "ci-pusher");
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&ctx);
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                /* anonymous */ None,
+            )
+            .await;
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_string());
+            (status, retry_after)
+        })
+    }
+
+    #[test]
+    fn unsigned_required_manifest_past_window_is_503_without_retry_after() {
+        for head in [false, true] {
+            let (status, retry_after) = unsigned_required_hold_read(1, 60, head);
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the hold still withholds the manifest (head={head})"
+            );
+            assert_eq!(
+                retry_after, None,
+                "an unsigned hold past its window must advertise no retry schedule (head={head})"
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_required_manifest_inside_window_keeps_its_retry_after() {
+        for head in [false, true] {
+            let (status, retry_after) = unsigned_required_hold_read(3600, 0, head);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            let secs: i64 = retry_after
+                .unwrap_or_else(|| panic!("in-window hold must keep Retry-After (head={head})"))
+                .parse()
+                .unwrap();
+            assert!(
+                (1..=3600).contains(&secs),
+                "Retry-After out of range: {secs} (head={head})"
+            );
+        }
+    }
+
     // -- Write-authorized manifest hold-read exemption (ADR 0039) --
     //
     // Under `provenance_mode: Required` the subject image is held

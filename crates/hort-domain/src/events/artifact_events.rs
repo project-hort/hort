@@ -518,6 +518,19 @@ pub enum ReEvaluationTrigger {
     /// "an operator asked for this," which the loosen-direction
     /// population pass can never say about itself.
     CuratorRequested,
+    /// An operator invoked the corrective path out of the illegal state
+    /// ADR 0039's 2026-09-12 amendment (D6) names —
+    /// [`Artifact::repair_provenance_misrejection`](crate::entities::artifact::Artifact::repair_provenance_misrejection).
+    /// Like [`Self::CuratorRequested`] there is no policy-side change to
+    /// name: nothing about the policy or its exclusions moved, and no
+    /// scan evidence was re-judged. What happened is that a `Rejected`
+    /// status with no `ArtifactRejected` behind it — contradicted by a
+    /// `ProvenanceVerified` on the same stream — was returned to the
+    /// hold. Distinct from `CuratorRequested` so an audit query can tell
+    /// "a curator asked for a re-judgement" apart from "an operator
+    /// repaired a structurally invalid rejection"; the operator's
+    /// identity rides the append envelope's `actor`.
+    ProvenanceMisrejectionRepair,
 }
 
 /// Audit record for a re-evaluation pass decision (ADR 0041).
@@ -532,11 +545,20 @@ pub enum ReEvaluationTrigger {
 /// [`ArtifactQuarantined`] / [`ArtifactReleased`] / [`ArtifactRejected`]
 /// events on the same stream.
 ///
-/// `trigger` is the [`ReEvaluationTrigger`] discriminator naming which
-/// policy-change event drove the pass (invariant #3) — answers "what
-/// loosened/tightened this artifact?" without re-running the evaluator.
+/// Also emitted for the two **operator-invoked** transitions that have no
+/// policy-side change to name — the curator's single-artifact
+/// re-evaluation ([`ReEvaluationTrigger::CuratorRequested`]) and the
+/// corrective path out of D6's illegal state
+/// ([`ReEvaluationTrigger::ProvenanceMisrejectionRepair`]) — so the
+/// "every transition that happened" audit projection stays complete
+/// whatever drove the transition.
+///
+/// `trigger` is the [`ReEvaluationTrigger`] discriminator naming what
+/// drove the pass (invariant #3) — answers "what loosened/tightened this
+/// artifact?" without re-running the evaluator.
 /// `policy_id` is the policy the pass evaluated against, for symmetry
-/// with [`PolicyEvaluated`].
+/// with [`PolicyEvaluated`]; the operator-invoked triggers carry
+/// [`NO_POLICY`] since no policy was consulted.
 ///
 /// # Schema evolution (ADR 0002, append-only)
 ///
@@ -912,6 +934,100 @@ pub enum RejectionReason {
     Curator {
         curator_id: Uuid,
     },
+    /// A **positive disproof** on the provenance axis: a signature that is
+    /// present and invalid — signed by an untrusted key, bound to a
+    /// different digest, a broken certificate chain, a malformed bundle.
+    /// Set by
+    /// [`Artifact::complete_provenance`](crate::entities::artifact::Artifact::complete_provenance)'s
+    /// `Rejected` arm, which appends this `ArtifactRejected` alongside the
+    /// axis-specific `ProvenanceRejected` so the terminal
+    /// `quarantine_status` has a terminal event behind it (ADR 0039's
+    /// 2026-09-12 amendment, D6 — a status is a projection, the stream is
+    /// the record).
+    ///
+    /// A **missing** signature never produces this: absence of evidence is
+    /// a statement about a point in time, so it holds (`Quarantined`)
+    /// rather than rejecting (same amendment, D1).
+    ///
+    /// **Not scan-clearable (ADR 0041 invariant #6(a)).** A forged
+    /// signature does not become acceptable because a scan later passed, so
+    /// [`is_scan_clearable`](crate::entities::artifact::is_scan_clearable)
+    /// refuses it — as it already refused the reason-less rejection this
+    /// event replaces.
+    Provenance,
+}
+
+impl RejectionReason {
+    /// One sample of **every** variant, in declaration order — the single
+    /// source the rejection-reason discriminator vocabulary is derived
+    /// from.
+    ///
+    /// The curation-queue projection reads `ArtifactRejected.rejected_by`
+    /// off the stream and renders a discriminator
+    /// ([`Self::wire_kind`]); the admin queue's `?reason=` filter must
+    /// accept exactly that vocabulary, or an operator gets a `400` for
+    /// rows that demonstrably exist. Deriving both ends from this list
+    /// removes the hand-copied second list that produced exactly that
+    /// trap for `provenance`, `admin` and `scan_policy_retroactive`.
+    ///
+    /// Payload-carrying variants use nil ids: only the discriminator is
+    /// read from a sample, never the payload.
+    pub const ALL_KIND_SAMPLES: &'static [RejectionReason] = &[
+        RejectionReason::Scanner,
+        RejectionReason::Admin,
+        RejectionReason::CurationRetroactive {
+            rule_id: Uuid::nil(),
+        },
+        RejectionReason::ScanPolicyRetroactive,
+        RejectionReason::Curator {
+            curator_id: Uuid::nil(),
+        },
+        RejectionReason::Provenance,
+    ];
+
+    /// The **serialised** discriminator: the JSON key serde writes for
+    /// this variant (a bare string for a unit variant, the single object
+    /// key for a payload-carrying one). This is what the curation-queue
+    /// projection reads out of the event JSONB.
+    ///
+    /// Exhaustive `match`, **no wildcard arm** — a new variant fails this
+    /// to compile until its discriminator and its wire form are both
+    /// decided here.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Scanner => "Scanner",
+            Self::Admin => "Admin",
+            Self::CurationRetroactive { .. } => "CurationRetroactive",
+            Self::ScanPolicyRetroactive => "ScanPolicyRetroactive",
+            Self::Curator { .. } => "Curator",
+            Self::Provenance => "Provenance",
+        }
+    }
+
+    /// The **operator-facing** discriminator: the lowercase / snake_case
+    /// form the curation-queue row renders and the `?reason=` filter
+    /// accepts. Exhaustive `match`, no wildcard arm.
+    pub fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::Scanner => "scanner",
+            Self::Admin => "admin",
+            Self::CurationRetroactive { .. } => "curation_retroactive",
+            Self::ScanPolicyRetroactive => "scan_policy_retroactive",
+            Self::Curator { .. } => "curator",
+            Self::Provenance => "provenance",
+        }
+    }
+
+    /// Every wire discriminator the projection can emit, derived from
+    /// [`Self::ALL_KIND_SAMPLES`]. Callers that need a closed accepted
+    /// set (the admin queue filter) build it from here rather than
+    /// restating one.
+    pub fn all_wire_kinds() -> Vec<&'static str> {
+        Self::ALL_KIND_SAMPLES
+            .iter()
+            .map(RejectionReason::wire_kind)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,5 +1939,30 @@ mod re_evaluated_event_tests {
         let back: ArtifactRejected = serde_json::from_value(json).unwrap();
         assert_eq!(ev, back);
         assert_eq!(back.rejected_by, RejectionReason::ScanPolicyRetroactive);
+    }
+
+    /// The provenance-disproof companion's wire form. A **unit** variant,
+    /// so it serialises as the bare string discriminator — which is the
+    /// shape the curation-queue projection's JSONB `CASE` keys on
+    /// (`jsonb_typeof(... ->'rejected_by') = 'string'`); a tuple variant
+    /// would land in the object branch instead.
+    #[test]
+    fn provenance_rejection_reason_round_trips_inside_artifact_rejected() {
+        let reason = RejectionReason::Provenance;
+        assert_eq!(
+            serde_json::to_value(&reason).unwrap(),
+            serde_json::json!("Provenance")
+        );
+
+        let ev = ArtifactRejected {
+            artifact_id: Uuid::from_u128(2),
+            rejected_by: reason,
+            reason: "provenance verification failed (UntrustedIdentity) — backend cosign".into(),
+        };
+        ev.validate().expect("valid");
+        let json = serde_json::to_value(&ev).unwrap();
+        let back: ArtifactRejected = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+        assert_eq!(back.rejected_by, RejectionReason::Provenance);
     }
 }

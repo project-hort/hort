@@ -185,9 +185,10 @@ pub struct QuarantineUseCase {
     /// expiry, a `provenance_mode: Required` + `ProvenanceClearance::
     /// Pending` candidate can neither release (fail-closed — `Pending`
     /// denies the timer arm) nor stay held forever; the sweep enqueues a
-    /// **final** `provenance-verify` for it (which runs `window_open =
-    /// false` via Item 2 and either clears a just-in-time signature or
-    /// emits terminal `ProvenanceRejected{Unsigned}`). The enqueue is
+    /// **final** `provenance-verify` for it, which either clears a
+    /// just-in-time signature or re-holds the candidate (an unsigned
+    /// artifact is held indefinitely — ADR 0039's 2026-09-12 amendment,
+    /// D1/D4 — never terminally rejected). The enqueue is
     /// best-effort, non-gating (warn-and-continue) and idempotent per
     /// tick via [`JobsRepository::find_active_provenance_for_artifact`] —
     /// it never blocks the sweep and never releases a `Pending`
@@ -1674,10 +1675,10 @@ impl QuarantineUseCase {
             // `Required` + `Pending` candidate can neither release
             // (fail-closed — `Pending` denies the timer arm below) nor
             // stay held forever. Enqueue a FINAL `provenance-verify` for
-            // it: it runs with `window_open = false` (Item 2), so
-            // `complete_provenance` either CLEARS a signature that landed
-            // just before expiry or emits terminal
-            // `ProvenanceRejected{Unsigned}`. This is also the backstop if
+            // it: `complete_provenance` either CLEARS a signature that
+            // landed just before expiry or re-holds the candidate (an
+            // unsigned artifact is held indefinitely — ADR 0039's
+            // 2026-09-12 amendment, D1/D4). This is also the backstop if
             // the S3 signature-arrival enqueue was lost.
             //
             // The enqueue does NOT change the release decision — the
@@ -1693,9 +1694,9 @@ impl QuarantineUseCase {
             // attestation of its own (the OCI referrers `subject` is a
             // manifest descriptor; cosign signs manifest digests), so the
             // verify this would enqueue has exactly two reachable
-            // outcomes: the referenced-tree-descendant HOLD — which
-            // changes no state at all, and which every subsequent tick
-            // would re-enqueue forever — or, on a proxy scope whose
+            // outcomes: the unsigned HOLD — which changes no state at
+            // all, and which every subsequent tick would re-enqueue
+            // forever — or, on a proxy scope whose
             // upstream referrer fetch errors, the fail-closed
             // `Rejected{RekorNotFound}` that `apply_fetch_failure`
             // produces regardless of the descendant flag. The first is
@@ -1745,8 +1746,23 @@ impl QuarantineUseCase {
                 // reason: a parent-gated blob is a STRUCTURAL hold
                 // (only the parent's cascade can lift it), everything
                 // else is an actionable pending one.
+                // Age of the hold, measured from ingest. The hold is
+                // indefinite (ADR 0039 D4), so the count alone cannot say
+                // whether the population is churning or stuck — only the
+                // age can. Measured from `created_at` rather than the
+                // window anchor because the anchor is a proxy for
+                // *ecosystem exposure* (ADR 0054) and can legitimately
+                // predate ingest, which would overstate how long Hort has
+                // actually been holding the artifact.
+                let hold_secs = (Utc::now() - artifact.created_at).num_seconds().max(0);
                 if is_parent_gated_blob_constituent(&refs) {
                     summary.held_parent_gated = summary.held_parent_gated.saturating_add(1);
+                    summary.oldest_parent_gated_hold_secs = Some(
+                        summary
+                            .oldest_parent_gated_hold_secs
+                            .unwrap_or(0)
+                            .max(hold_secs),
+                    );
                     tracing::debug!(
                         artifact_id = %artifact_id,
                         "expiry backstop: parent-gated blob constituent; no verify enqueued \
@@ -1755,6 +1771,12 @@ impl QuarantineUseCase {
                 } else {
                     summary.skipped_provenance_pending =
                         summary.skipped_provenance_pending.saturating_add(1);
+                    summary.oldest_provenance_pending_hold_secs = Some(
+                        summary
+                            .oldest_provenance_pending_hold_secs
+                            .unwrap_or(0)
+                            .max(hold_secs),
+                    );
                     self.enqueue_final_provenance_verify(artifact_id).await;
                 }
             }
@@ -5147,6 +5169,103 @@ mod tests {
         );
     }
 
+    /// **An indefinitely-held artifact must never stop being a
+    /// candidate.** Under ADR 0039's 2026-09-12 amendment (D4) an
+    /// unsigned `Required` artifact holds forever rather than
+    /// terminalising, so the sweep re-examines it on every rotation. The
+    /// candidacy query selects on `quarantine_status = 'quarantined' AND
+    /// quarantine_window_start <= now - duration AND deleted_at IS NULL`
+    /// — and a held tick writes **none** of those three, which is what
+    /// makes the hold self-healing: the moment a `ProvenanceVerified`
+    /// lands, the very next tick releases the same row.
+    ///
+    /// This is the property any candidate-query skip for the held
+    /// population has to preserve, and the reason the sweep's per-tick
+    /// re-examination is load-bearing rather than waste (the final
+    /// `provenance-verify` it enqueues is the only backstop for a lost
+    /// signature-arrival enqueue — ADR 0027's "doubles as the backstop"
+    /// clause).
+    #[tokio::test]
+    async fn a_held_candidate_stays_selectable_and_releases_once_verified() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+        let before = artifacts.get(artifact_id).unwrap();
+
+        // Tick 1 — the signature has not arrived; the artifact holds.
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+        assert!(summary.released.is_empty());
+        assert_eq!(summary.skipped_provenance_pending, 1);
+        assert!(lifecycle.committed_transitions().is_empty());
+
+        // Every input the candidacy predicate reads is untouched, so the
+        // same row is served again on the next rotation.
+        let after = artifacts.get(artifact_id).unwrap();
+        assert_eq!(after.quarantine_status, QuarantineStatus::Quarantined);
+        assert_eq!(
+            after.quarantine_window_start, before.quarantine_window_start,
+            "a held tick must not move the anchor — the candidacy range scan keys on it"
+        );
+        assert!(after.deleted_at.is_none());
+
+        // The signature lands.
+        seed_stream_scanned_and_provenance_verified(&events, artifact_id);
+
+        // Tick 2 — the same candidate releases.
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+        assert_eq!(
+            summary.released,
+            vec![artifact_id],
+            "an artifact that was held indefinitely must still release the tick after \
+             its signature arrives"
+        );
+    }
+
+    /// The hold's **age** rides the summary alongside its count, and the
+    /// reported value is the oldest in the batch. Under ADR 0039 D4 the
+    /// hold never ends on its own, so a count that cannot distinguish a
+    /// 20-second wait from a 20-day one is not an answer to "will this
+    /// ever release?".
+    #[tokio::test]
+    async fn release_expired_reports_the_oldest_provenance_hold_age() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let young =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(young).unwrap().repository_id;
+        seed_required_provenance_policy(&projections, repo_id);
+        seed_stream_with_scan_completed(&events, young);
+
+        // A second held artifact in the same repo, ingested ten days ago.
+        let old = {
+            let mut a = sample_artifact(QuarantineStatus::Quarantined);
+            a.repository_id = repo_id;
+            a.created_at = Utc::now() - chrono::Duration::days(10);
+            let id = a.id;
+            artifacts.insert(a);
+            seed_stream_with_scan_completed(&events, id);
+            id
+        };
+
+        let summary = uc.release_expired(vec![young, old]).await.unwrap();
+
+        assert_eq!(summary.skipped_provenance_pending, 2);
+        let oldest = summary
+            .oldest_provenance_pending_hold_secs
+            .expect("a held batch must carry an age");
+        assert!(
+            oldest >= chrono::Duration::days(10).num_seconds(),
+            "the reported age must be the OLDEST hold in the batch, not the last one seen: \
+             {oldest}"
+        );
+        assert_eq!(
+            summary.oldest_parent_gated_hold_secs, None,
+            "a bucket that held nothing reports no age"
+        );
+    }
+
     // -- release_expired per-cause skip attribution ---------------------------
     //
     // The counts are what an operator reads off a non-draining backlog,
@@ -5237,6 +5356,12 @@ mod tests {
             "the actionable-pending bucket must not also claim this candidate",
         );
         assert_eq!(summary.skipped_no_scan_authority, 0);
+        // The age rides the same bucket split: a long-lived parent-gated
+        // hold means an unsigned ROOT, a different operator response from
+        // an artifact awaiting its own signature, so the two ages must
+        // never be reported on one series.
+        assert!(summary.oldest_parent_gated_hold_secs.is_some());
+        assert_eq!(summary.oldest_provenance_pending_hold_secs, None);
     }
 
     /// A candidate the domain source-state guard refuses counts towards
@@ -5454,12 +5579,11 @@ mod tests {
     }
 
     // =====================================================================
-    // S4 — terminal decision at window expiry (design §2 S4). A Required +
+    // S4 — the final verify at window expiry (design §2 S4). A Required +
     // Pending + past-deadline candidate enqueues a FINAL provenance-verify
-    // (running window_open=false via Item 2) that either clears a
-    // just-in-time signature or emits terminal Rejected{Unsigned}. The
-    // sweep STILL never releases a Pending candidate; the enqueue is
-    // idempotent per tick.
+    // that either clears a just-in-time signature or re-holds the
+    // candidate. The sweep STILL never releases a Pending candidate; the
+    // enqueue is idempotent per tick.
     // =====================================================================
 
     /// S4: a `Required` + `Pending` (scan gate passing, NO

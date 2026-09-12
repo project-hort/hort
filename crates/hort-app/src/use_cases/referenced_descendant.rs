@@ -1,23 +1,18 @@
-//! Shared referenced-tree-descendant predicate (issue #115 item 3).
+//! Shared referenced-tree-descendant predicate.
 //!
 //! Extracted from the inline `.any(..)` in
-//! `IngestUseCase::ingest_inner`'s zero-window carve-out (#46 Item 2) so
-//! the provenance orchestrator can apply the SAME definition when
-//! deciding whether a `NoAttestation × Required` verdict HOLDS instead
-//! of terminally rejecting (issue #115 defect (b)). Two call sites, one
-//! definition — a drift between them would mean an artifact treated as a
-//! descendant for its quarantine anchor but not for its provenance hold
-//! (or vice versa), which is exactly the class of bug that produced #115.
+//! `IngestUseCase::ingest_inner`'s zero-window carve-out so every caller
+//! applies the SAME definition of "this content is already some other
+//! artifact's `content_references` target".
 //!
-//! Mirrors the `policy_resolution` module's shape (issue #76): a small
-//! `pub(crate)` home for a predicate shared across use cases, rather
-//! than a method on either use case.
+//! Mirrors the `policy_resolution` module's shape: a small `pub(crate)`
+//! home for a predicate shared across use cases, rather than a method on
+//! either use case.
 //!
-//! # Ingest vs. verdict: the error-direction asymmetry
+//! # Error direction per caller
 //!
 //! The predicate itself is pure. What differs between the callers is
-//! how a FAILED `content_references` lookup is handled, and the
-//! difference is load-bearing — see each call site's comment:
+//! how a FAILED `content_references` lookup is handled:
 //!
 //! - **Quarantine-anchor resolution** — `ingest_inner` and
 //!   `register_by_hash_inner`, both through
@@ -25,18 +20,17 @@
 //!   `false` on a lookup error. `false` there means "not a descendant"
 //!   ⇒ the artifact keeps its normal FULL observation window — the more
 //!   conservative outcome.
-//! - **Verdict** (`ProvenanceOrchestrationUseCase::verify_artifact`)
-//!   PROPAGATES the error. `false` there means "no descendant hold" ⇒
-//!   under `Required` with a closed window the artifact is TERMINALLY
-//!   REJECTED — the unsafe direction. A failed lookup must fail the job
-//!   (dispatcher retries), never silently reject.
+//! - The release sweep's expiry backstop reads the same reference set
+//!   through the narrower [`is_parent_gated_blob_constituent`], which
+//!   decides whether the final `provenance-verify` enqueue can be SKIPPED
+//!   as provably state-neutral. It PROPAGATES a lookup failure: `false`
+//!   there re-creates the churn the skip exists to remove, `true` would
+//!   strand the candidate.
 //!
-//! A third caller — the release sweep's expiry backstop — reads the same
-//! reference set through the narrower
-//! [`is_parent_gated_blob_constituent`], which decides whether the final
-//! `provenance-verify` enqueue can be SKIPPED as provably state-neutral.
-//! It also propagates a lookup failure: `false` there re-creates the
-//! churn the skip exists to remove, `true` would strand the candidate.
+//! The provenance orchestrator no longer consults either: under ADR
+//! 0039's 2026-09-12 amendment (D1/D3) a `NoAttestation × Required`
+//! verdict holds regardless of the artifact's position in the tree, so
+//! there is nothing for the predicate to gate there.
 
 use uuid::Uuid;
 
@@ -88,10 +82,7 @@ pub(crate) fn is_referenced_tree_descendant(refs: &[ContentReference]) -> bool {
 ///
 /// The `false`-on-error degradation is FAIL-SAFE, not fail-open: `false`
 /// means "not a descendant", which yields the artifact's normal FULL
-/// observation window. It is never the zero-window direction. The
-/// provenance orchestrator deliberately does NOT use this helper — there
-/// `false` falls toward terminal rejection, so it must propagate the
-/// error instead (see the module doc).
+/// observation window. It is never the zero-window direction.
 pub(crate) async fn resolve_referenced_tree_descendant_fail_safe(
     content_references: &dyn ContentReferenceIndex,
     repository_id: Uuid,

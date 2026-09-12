@@ -3317,6 +3317,8 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 | `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `held_pending_subject`, `requeued_no_anchor` |
 | `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
 | `hort_provenance_late_joiner_cleared_total` | counter | `backend` | — | one increment per constituent that self-cleared against an already-verified subject at its own quarantine commit |
+| `hort_provenance_held_artifacts` | gauge | `hold` | artifacts | `hold` ∈ `pending_signature`, `parent_gated`; set once per `quarantine-release-sweep` tick to the number of held candidates in that tick's batch |
+| `hort_provenance_hold_oldest_age_seconds` | gauge | `hold` | seconds | same `hold` values; set once per tick to the age (since ingest) of the **oldest** held candidate in that tick's batch, `0` when the bucket held none |
 
 The first two counters are emitted at exactly **one layer** — the
 orchestration use case
@@ -3342,8 +3344,60 @@ subject's clearance — same bounded value space as everywhere else. No
 per-artifact labels (same forbidden-label rule below); `artifact_id`,
 `subject`, and `constituent` ride the accompanying `info!` line.
 
+**`hort_provenance_held_artifacts` / `hort_provenance_hold_oldest_age_seconds`**
+(ADR 0039's 2026-09-12 amendment, D4). Emitted at exactly one layer —
+[`QuarantineReleaseSweepHandler::run`](../crates/hort-app/src/task_handlers/quarantine_release_sweep.rs)
+— both gauges, both `hold` values, **once per sweep tick, including the
+tick that finds no candidates at all**. A gauge written only when the
+population is non-empty keeps reporting a backlog that has since drained
+(or whose last member was deleted out from under the sweep) for the life
+of the process, so the empty tick writes explicit zeros.
+
+These exist because under D4 an unsigned `Required` artifact holds
+**indefinitely** rather than terminalising at window expiry. The
+amendment rejects a signing deadline and rests that choice on the
+operator being able to see the held set instead: *"a metric keeps the
+age, a status column discards it"* — a status transition collapses "held
+for 20 seconds" and "held for 20 days" into the same value, which is
+precisely the information an operator needs. So the count answers *what
+is waiting* and the age gauge answers *for how long*; neither is
+sufficient alone.
+
+- `hold = pending_signature` — artifacts waiting for their own signature
+  to reach Hort (the sweep's `skipped_provenance_pending` bucket). A
+  rising *age* with a stable count means a specific artifact will never
+  be signed and needs an operator exit (admin release, curator waiver,
+  deletion); a rising *count* with a low age means a signing pipeline
+  that is lagging, not one that is broken.
+- `hold = parent_gated` — config/layer blob constituents whose only
+  clearance path is the parent manifest's cascade (the sweep's
+  `held_parent_gated` bucket). A growing age here means an unsigned
+  **root**: the remediation is on the parent image, never on the blob.
+
+**Age origin.** Seconds since the artifact's ingest
+(`Artifact.created_at`), not since its quarantine window anchor. The
+anchor is a proxy for elapsed *ecosystem exposure* (ADR 0054) and can
+legitimately predate ingest — a trusted upstream publish time, or the
+referenced-tree-descendant carve-out — which would overstate how long
+Hort has actually been holding the artifact.
+
+**Batch scope.** Both gauges are computed over the sweep tick's
+candidate batch, which is capped at `BATCH_SIZE` (1000). Below the cap
+that batch is the entire expired population and the gauges are exact; at
+the cap they are a **lower bound** — the same reading
+`hort_cron_rescan_eligible_artifacts` carries, and a gauge sitting at the
+cap is itself the signal that the pool exceeds what one tick can reach.
+
+**No `repository` label.** The sweep is deployment-wide and this is a
+population-health signal; a per-repo breakdown would multiply the series
+by the repository count without changing the operator response the
+aggregate already drives. Same forbidden-label rule as the counters
+below — per-artifact context rides the sweep's per-candidate `debug!`
+line, never a label.
+
 **Scrape target — the worker `/metrics` listener.** The two verdict
-counters run in **`hort-worker`** (the `provenance-verify` job), which
+counters run in **`hort-worker`** (the `provenance-verify` job), as do
+the two hold gauges (the `quarantine-release-sweep` job). The worker
 serves an opt-in `GET /metrics` listener — bound via `HORT_WORKER_METRICS_BIND`
 (disabled by default; set a pod-reachable address to enable) — making
 these series (and every other worker metric: scan counters, queue depth, …)
@@ -3411,40 +3465,57 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   emitted). Under every mode this is a success record; it does NOT
   release the artifact early (mirrors `ScanCompleted(clean)`).
 - `rejected` — a typed rejection (`ProvenanceRejected` emitted) — the
-  per-reason breakdown is on `hort_provenance_reject_total`. Covers a
-  forged/untrusted signature under any mode, a `Required`-mode unsigned
-  artifact (mapped to `Rejected{Unsigned}` upstream), and a
-  `Required`-mode fetch-exhaustion fail-closed (`Rejected{RekorNotFound}`).
+  per-reason breakdown is on `hort_provenance_reject_total`. A rejection
+  is only ever a **positive disproof**: a signature that is present and
+  wrong (forged, untrusted identity, digest-mismatched, malformed) under
+  any mode, or a `Required`-mode fetch-exhaustion fail-closed
+  (`Rejected{RekorNotFound}` — "could not be fetched", not "proven
+  absent"). A *missing* signature never ticks this value: ADR 0039's
+  2026-09-12 amendment (D1) makes absence of evidence non-terminal, and
+  the `Rejected{Unsigned}` arm that produced it is gone.
 - `no_attestation` — no bundle was found/passed and the mode allowed it
-  (`VerifyIfPresent` no-op, no event). Strictly the allowed-unsigned
-  case: an unsigned artifact under `Required` within its window ticks
-  `held_pending_signature`, and past its window ticks `rejected`.
-- `held_pending_signature` — Required-mode unsigned artifact held pending
-  signature within its quarantine window (issue #13), or a referenced-tree
-  descendant held on its inbound edge. No event;
-  `complete_provenance` returns `Ok(None)` and the artifact stays
+  (`VerifyIfPresent` / `Off` no-op, no event). Strictly the
+  allowed-unsigned case: an unsigned artifact under `Required` ticks
+  `held_pending_signature` (or `held_pending_subject` for a constituent)
+  whether or not its window has elapsed.
+- `held_pending_signature` — a `Required`-mode artifact found unsigned
+  where a signature of its own is the thing it is waiting for. No event;
+  `complete_provenance` appends nothing and the artifact stays
   `Quarantined` (read as `Pending`/fail-closed by the release gate) so it
   can still be signed. Separates images *waiting to be signed* from the
-  allowed-unsigned `no_attestation` no-op; at window expiry the terminal
-  decision ticks `verified` (a signature landed) or `rejected` (`Unsigned`).
-- `held_pending_subject` — a Required-mode **constituent** (a row that can
-  never carry an attestation of its own — an OCI config/layer blob, since
-  cosign signs the manifest/index digest) found unsigned with its
-  observation window already closed and no inbound reference edge yet.
-  Held `Quarantined`, cleared only by its subject: the verify-time cascade
-  or the ingest-time late-joiner self-clear. Distinct from
-  `held_pending_signature` because nothing is waiting for *this* row to be
-  signed — reporting it as such would misdirect an operator into checking
-  their signer. A sustained non-zero rate with no `verified` follow-through
-  means blobs are arriving whose manifests never do. This population
-  previously resolved to a silent terminal `rejected`, which is why it
-  carries its own label rather than folding into the window-open hold.
+  allowed-unsigned `no_attestation` no-op. The hold is **indefinite**
+  (ADR 0039 D4): the window is not a signing deadline, and the only exits
+  are a signature (directly or via the §11 cascade) or an operator
+  authority — admin release, curator waiver, deletion. Watch the
+  population on `hort_provenance_held_artifacts{hold="pending_signature"}`
+  and its age on `hort_provenance_hold_oldest_age_seconds`; this counter
+  counts verify *events*, not the standing population.
+- `held_pending_subject` — the same hold for a `Required`-mode
+  **constituent**: a row that can never carry an attestation of its own
+  (an OCI config/layer blob, since cosign signs the manifest/index
+  digest). Held `Quarantined`, cleared only by its subject — the
+  verify-time cascade or the ingest-time late-joiner self-clear. The
+  split is driven by the format handler's constituent classification
+  alone; neither the observation window nor an inbound reference edge is
+  consulted. Distinct from `held_pending_signature` because nothing is
+  waiting for *this* row to be signed — reporting it as such would
+  misdirect an operator into checking their signer. A sustained non-zero
+  rate with no `verified` follow-through means blobs are arriving whose
+  manifests never do.
 
 **`reason` semantics** (`hort_provenance_reject_total`) — one per
 `ProvenanceRejectReason` variant:
 
-- `unsigned` — `Required` mode, no attestation present (the orchestrator
-  maps `NoAttestation` → `Rejected{Unsigned}`).
+- `unsigned` — **historical events only; nothing produces this value.**
+  It recorded the pre-amendment `Required` + no-attestation mapping
+  (`NoAttestation` → `Rejected{Unsigned}`), which ADR 0039's 2026-09-12
+  amendment (D1) removed: a missing signature is a statement about a
+  point in time, never about the artifact, so it holds instead. The
+  `ProvenanceRejectReason::Unsigned` variant is retained so
+  `ProvenanceRejected` events already on production streams still
+  deserialise, and the label value is retained here so a dashboard
+  querying historical data keeps resolving. A non-zero *rate* on a
+  current build means the code has regressed to the terminal arm.
 - `untrusted_identity` — a cryptographically valid signature whose
   `{issuer, san}` matched no allowed `provenance_identities` pattern.
 - `rekor_not_found` — the bundle's Rekor inclusion proof / SET could not
@@ -3465,9 +3536,10 @@ accompanying `info!` audit line on the `ProvenanceVerified` /
 not `err`).
 
 Cardinality: `hort_provenance_verify_total` ≤ `backend` (~few) × `mode`
-(3) × `result` (5); `hort_provenance_reject_total` ≤ `backend` × `reason`
+(3) × `result` (6); `hort_provenance_reject_total` ≤ `backend` × `reason`
 (5); `hort_provenance_late_joiner_cleared_total` ≤ `backend`. All three
-are tiny in Tier 1 (one backend).
+are tiny in Tier 1 (one backend). The two hold gauges are 2 series each
+(`hold`, unlabelled otherwise) regardless of deployment size.
 
 ### Admin task dispatcher
 

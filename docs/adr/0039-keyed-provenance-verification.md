@@ -13,13 +13,18 @@
   (`crates/hort-adapters-provenance-cosign-key`), the apply-time linter, and the
   worker wiring are on `develop` behind the same `ProvenancePort`. Code anchors
   below cite symbols, not line numbers.
-- **The 2026-09-12 amendment is a decision, not yet enforcement.** Its D1–D7
-  supersede the "unsigned at window expiry ⇒ terminal `Rejected{Unsigned}`"
-  outcome throughout this ADR (the body is written to the amended decision);
-  the code still produces that rejection until the implementing change lands.
-  As-built references that describe the current behaviour — `docs/metrics-catalog.md`,
-  the E2E scenario inventory — are correct as they stand and move with that
-  change, not with this one.
+- **The 2026-09-12 amendment is enforced**, as of the implementing change
+  that landed with it. D1–D5 and D7 are in the code: `NoAttestation` under
+  every mode holds, the three shape predicates are gone, a positive disproof
+  appends an `ArtifactRejected` companion, a hold past its window drops its
+  `Retry-After`, and `RepairProvenanceMisrejection` gives the previously
+  exit-less state an exit. **D6 has one known exception**, on an axis this
+  amendment did not create: `Artifact::tombstone_from_corruption` drives
+  `Rejected` while appending only `ArtifactCorrupted`. It is pinned — not
+  papered over — as a named `KnownGap` in
+  `crates/hort-domain/tests/rejected_requires_terminal_event.rs`, and closing
+  it needs a `RejectionReason` variant, which touches event serialisation and
+  is therefore its own change.
 
 ## Context
 
@@ -745,10 +750,28 @@ Each argument for one dissolves on inspection:
   buys no bytes back. Note the direction this existing decision actually
   points: if both states are retained as evidence anyway, then **"waiting" is
   the truthful label** for an artifact that is waiting.
-- **Sweep load is a query concern, not a status concern.** A `Required`
-  artifact whose clearance resolves `Pending` can be skipped by the candidate
-  query without any status change — the sweep already resolves that clearance
-  through `release_clearance::resolve_provenance_clearance`.
+- **Sweep load is real, bounded, and load-bearing — it is not to be
+  optimised away.** *(Corrected 2026-09-12 during implementation; as first
+  written this bullet claimed a `Pending` artifact "can be skipped by the
+  candidate query without any status change". It cannot, and the reason
+  strengthens D4 rather than weakening it.)* A `provenance-verify` job is
+  enqueued from exactly two places — the ingest/seed path, and the release
+  sweep's `enqueue_final_provenance_verify` at window expiry. **There is no
+  cron re-verify.** Before this amendment the sweep's enqueue was what
+  *ended* the wait, by making the terminal `Unsigned` decision; with
+  terminality gone its remaining function is the one ADR 0027 named for it,
+  the backstop when the ingest enqueue was lost (job insert failed, worker
+  died mid-run, retries exhausted). Skip it and an artifact whose signature
+  exists but whose verify was never driven is stranded permanently, with
+  nothing left to notice the signature — the very failure this amendment
+  exists to end, arriving through another door. **So the repeated verify is
+  what makes an indefinite hold recoverable at all**, which is an argument
+  for having no deadline, not a cost of it. The load is bounded: the
+  `release_attempt_at` fairness cursor puts never-attempted rows first, so a
+  growing held population costs re-attempt ticks rather than starving fresh
+  artifacts. A candidate-query skip would additionally have to re-implement
+  the release gate's provenance conjunct in SQL — the second computation
+  `release_clearance.rs` exists to prevent.
 - **"Will this ever release?" is an observability question.** A metric
   answers it strictly better than a status column, because it **keeps the
   age** instead of discarding it: a status transition collapses "held for 20
@@ -964,8 +987,8 @@ documented meaning is the one that survives.
 - `crates/hort-app/src/use_cases/release_clearance.rs` —
   `resolve_provenance_clearance`, the single-source `Cleared`/`Pending`
   resolution the release sweep and the ADR 0041 re-evaluation callers share;
-  the reason a `Pending` artifact can be skipped by a query rather than by a
-  status change (D4).
+  and the reason a `Pending` artifact must keep being re-driven rather than
+  skipped (D4).
 - `crates/hort-http-oci/src/quarantine.rs` — `check_quarantine` (computed
   `Retry-After`, clamped to 1 on a past deadline) and
   `check_scan_indeterminate` (`503`, no `Retry-After`, *"no self-resolving
