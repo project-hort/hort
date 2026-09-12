@@ -38,21 +38,31 @@
 //! (see `mappers::serialize_event_data`). `rejected_by` is serialized by
 //! serde's default externally-tagged convention:
 //!
-//! | Variant                                       | JSON shape                                 |
-//! |-----------------------------------------------|--------------------------------------------|
-//! | `RejectionReason::Scanner`                    | `"Scanner"` (string)                       |
-//! | `RejectionReason::Admin`                      | `"Admin"` (string)                         |
-//! | `RejectionReason::CurationRetroactive { .. }` | `{"CurationRetroactive": {"rule_id": ".."}}` |
-//! | `RejectionReason::Curator { .. }`             | `{"Curator": {"curator_id": ".."}}`        |
+//! | Variant                                        | JSON shape                                   | Wire kind                 |
+//! |------------------------------------------------|----------------------------------------------|---------------------------|
+//! | `RejectionReason::Scanner`                     | `"Scanner"` (string)                         | `scanner`                 |
+//! | `RejectionReason::Admin`                       | `"Admin"` (string)                           | `admin`                   |
+//! | `RejectionReason::CurationRetroactive { .. }`  | `{"CurationRetroactive": {"rule_id": ".."}}` | `curation_retroactive`    |
+//! | `RejectionReason::ScanPolicyRetroactive`       | `"ScanPolicyRetroactive"` (string)           | `scan_policy_retroactive` |
+//! | `RejectionReason::Curator { .. }`              | `{"Curator": {"curator_id": ".."}}`          | `curator`                 |
+//! | `RejectionReason::Provenance`                  | `"Provenance"` (string)                      | `provenance`              |
 //!
-//! Adapter normalises both forms to lowercase string discriminators
-//! (`scanner`, `admin`, `curation_retroactive`, `curator`, plus
-//! `corruption` for `ArtifactCorrupted` — though
-//! the variant tag is `ArtifactCorrupted` not `ArtifactRejected`; we
-//! include only the `RejectionReason` discriminators here and design's
-//! `corruption` is sourced separately if a future schema change adds
-//! it). The CASE expression handles BOTH the bare-string form (unit
-//! variants) and the single-key object form (tuple variants).
+//! **The wire column is not a mechanical lowering** —
+//! `ScanPolicyRetroactive` must become `scan_policy_retroactive`, not
+//! `scanpolicyretroactive` — so every variant needs its own `CASE` arm;
+//! the `ELSE lower(...)` fallthrough is a defensive backstop, not a
+//! substitute. `RejectionReason::wire_kind()` is the single source, the
+//! Rust-side `normalise_rejection_reason_kind` derives from it, and the
+//! DB-free guard `sql_case_covers_every_rejection_reason_variant` pins
+//! the SQL `CASE` to the same set.
+//!
+//! The CASE expression handles BOTH the bare-string form (unit variants)
+//! and the single-key object form (tuple variants).
+//!
+//! `corruption` is deliberately absent: it rides the separate
+//! `ArtifactCorrupted` event, whose tag is not `ArtifactRejected`, so the
+//! LATERAL never sees it. Only `RejectionReason` discriminators appear
+//! here; a corruption discriminator would need a separate source.
 //!
 //! The lowercasing of the PascalCase JSONB key happens **inside SQL**
 //! (case-symmetry fix on commit ce043c05): both the output column and
@@ -78,6 +88,7 @@ use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::events::RejectionReason;
 use hort_domain::ports::curation_queue_repository::{
     CurationQueueEntry, CurationQueueFilter, CurationQueueRepository,
 };
@@ -101,44 +112,32 @@ impl PgCurationQueueRepository {
     }
 }
 
-impl CurationQueueRepository for PgCurationQueueRepository {
-    fn list_queue<'a>(
-        &'a self,
-        filter: CurationQueueFilter,
-    ) -> BoxFuture<'a, DomainResult<Vec<CurationQueueEntry>>> {
-        Box::pin(async move {
-            // Clamp limit to MAX_LIMIT defensively (use case should
-            // already validate; the adapter still enforces).
-            let limit = filter.limit.min(MAX_LIMIT);
-
-            // Status filter as Option<&str> — bound to a NULL when the
-            // caller did not supply one. The outer set is
-            // `IN ('quarantined','rejected','scan_indeterminate')`.
-            let status_text: Option<String> = filter.status.map(|s| s.to_string());
-
-            // The queue listing query.
-            //
-            // - The `effective_policy_duration` CTE resolves
-            //   `quarantine_duration_secs` per repo using the same
-            //   precedence `quarantine_release_candidates` uses
-            //   (repo-scoped > global; no policy ⇒ NULL ⇒ no deadline).
-            // - The LATERAL `events` lookup pulls the latest
-            //   `ArtifactRejected` event for the artifact's stream and
-            //   extracts the `rejected_by` discriminator via a `CASE`
-            //   expression that handles BOTH the bare-string form
-            //   (unit variants) and the single-key object form (tuple
-            //   variants).
-            // - `f.finding_count` and `f.max_severity_rank` are the
-            //   same scan_findings projection as
-            //   `patch_candidate_repo` — values 0–4 inline mapping.
-            // - `LEFT JOIN` for findings + LATERAL so a row with no
-            //   findings and no rejection event still surfaces (e.g.,
-            //   `scan_indeterminate` rows).
-            // - `$1` = optional repository_id, `$2` = optional status
-            //   text, `$3` = optional rejection_reason_kind, `$4` =
-            //   limit i64.
-            let rows = sqlx::query_as::<_, CurationQueueRow>(
-                r#"
+/// The queue listing query.
+///
+/// Hoisted to a `const` (rather than inlined at the call site) so the
+/// DB-free guard `sql_case_covers_every_rejection_reason_variant` can
+/// read it: the PascalCase -> wire-format `CASE` below is the one place
+/// the discriminator mapping is expressed in SQL, and nothing else in
+/// the build can see whether it still covers every `RejectionReason`
+/// variant.
+///
+/// - The `effective_policy_duration` CTE resolves
+///   `quarantine_duration_secs` per repo using the same precedence
+///   `quarantine_release_candidates` uses (repo-scoped > global; no
+///   policy => NULL => no deadline).
+/// - The LATERAL `events` lookup pulls the latest `ArtifactRejected`
+///   event for the artifact's stream and extracts the `rejected_by`
+///   discriminator via a `CASE` expression that handles BOTH the
+///   bare-string form (unit variants) and the single-key object form
+///   (tuple variants).
+/// - `f.finding_count` and `f.max_severity_rank` are the same
+///   scan_findings projection as `patch_candidate_repo` — values 0–4
+///   inline mapping.
+/// - `LEFT JOIN` for findings + LATERAL so a row with no findings and no
+///   rejection event still surfaces (e.g. `scan_indeterminate` rows).
+/// - `$1` = optional repository_id, `$2` = optional status text,
+///   `$3` = optional rejection_reason_kind, `$4` = limit i64.
+const QUEUE_SQL: &str = r#"
                 WITH effective_policy_duration AS (
                     -- Per-repo effective quarantine duration. Repo-scoped
                     -- non-archived policy beats global non-archived; an
@@ -212,26 +211,35 @@ impl CurationQueueRepository for PgCurationQueueRepository {
                     -- single-key object for tuple variants) to the
                     -- wire format (lowercase / snake_case) via an
                     -- enumerated CASE that mirrors
-                    -- `normalise_rejection_reason_kind` below.
+                    -- `RejectionReason::wire_kind()`. One arm per
+                    -- variant; `sql_case_covers_every_rejection_reason_variant`
+                    -- is the DB-free guard that keeps the two in step.
                     -- Unknown variants lowercase through (defensive —
                     -- a future RejectionReason arm must still surface,
-                    -- not vanish).
+                    -- not vanish — but the lowering is NOT the wire
+                    -- format for a multi-word variant, which is why
+                    -- every variant needs its own arm rather than
+                    -- relying on the ELSE).
                     SELECT
                         CASE
                             WHEN jsonb_typeof(ev.event_data->'data'->'rejected_by') = 'string'
                                 THEN CASE ev.event_data->'data'->>'rejected_by'
-                                    WHEN 'Scanner'             THEN 'scanner'
-                                    WHEN 'Admin'               THEN 'admin'
-                                    WHEN 'Curator'             THEN 'curator'
-                                    WHEN 'CurationRetroactive' THEN 'curation_retroactive'
+                                    WHEN 'Scanner'              THEN 'scanner'
+                                    WHEN 'Admin'                THEN 'admin'
+                                    WHEN 'Curator'              THEN 'curator'
+                                    WHEN 'CurationRetroactive'  THEN 'curation_retroactive'
+                                    WHEN 'ScanPolicyRetroactive' THEN 'scan_policy_retroactive'
+                                    WHEN 'Provenance'           THEN 'provenance'
                                     ELSE lower(ev.event_data->'data'->>'rejected_by')
                                 END
                             WHEN jsonb_typeof(ev.event_data->'data'->'rejected_by') = 'object'
                                 THEN CASE (SELECT k FROM jsonb_object_keys(ev.event_data->'data'->'rejected_by') k LIMIT 1)
-                                    WHEN 'Scanner'             THEN 'scanner'
-                                    WHEN 'Admin'               THEN 'admin'
-                                    WHEN 'Curator'             THEN 'curator'
-                                    WHEN 'CurationRetroactive' THEN 'curation_retroactive'
+                                    WHEN 'Scanner'              THEN 'scanner'
+                                    WHEN 'Admin'                THEN 'admin'
+                                    WHEN 'Curator'              THEN 'curator'
+                                    WHEN 'CurationRetroactive'  THEN 'curation_retroactive'
+                                    WHEN 'ScanPolicyRetroactive' THEN 'scan_policy_retroactive'
+                                    WHEN 'Provenance'           THEN 'provenance'
                                     ELSE lower((SELECT k FROM jsonb_object_keys(ev.event_data->'data'->'rejected_by') k LIMIT 1))
                                 END
                             ELSE NULL
@@ -248,15 +256,32 @@ impl CurationQueueRepository for PgCurationQueueRepository {
                   AND ($3::text IS NULL OR e.rejection_reason_kind = $3)
                 ORDER BY a.created_at DESC
                 LIMIT $4
-                "#,
-            )
-            .bind(filter.repository_id)
-            .bind(status_text.as_deref())
-            .bind(filter.rejection_reason_kind.as_deref())
-            .bind(i64::from(limit))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| DomainError::Invariant(format!("curation_queue_repo list: {e}")))?;
+"#;
+
+impl CurationQueueRepository for PgCurationQueueRepository {
+    fn list_queue<'a>(
+        &'a self,
+        filter: CurationQueueFilter,
+    ) -> BoxFuture<'a, DomainResult<Vec<CurationQueueEntry>>> {
+        Box::pin(async move {
+            // Clamp limit to MAX_LIMIT defensively (use case should
+            // already validate; the adapter still enforces).
+            let limit = filter.limit.min(MAX_LIMIT);
+
+            // Status filter as Option<&str> — bound to a NULL when the
+            // caller did not supply one. The outer set is
+            // `IN ('quarantined','rejected','scan_indeterminate')`.
+            let status_text: Option<String> = filter.status.map(|s| s.to_string());
+
+            // See [`QUEUE_SQL`] for the query and its parameter map.
+            let rows = sqlx::query_as::<_, CurationQueueRow>(QUEUE_SQL)
+                .bind(filter.repository_id)
+                .bind(status_text.as_deref())
+                .bind(filter.rejection_reason_kind.as_deref())
+                .bind(i64::from(limit))
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| DomainError::Invariant(format!("curation_queue_repo list: {e}")))?;
 
             rows.into_iter()
                 .map(CurationQueueRow::into_domain)
@@ -364,19 +389,22 @@ fn i64_finding_count_to_u32(v: i64) -> u32 {
     }
 }
 
-/// Normalise the raw `rejected_by` discriminator to the
-/// wire-format enum (`"scanner"`, `"admin"`, `"curator"`,
-/// `"curation_retroactive"`).
+/// Normalise the raw `rejected_by` discriminator to its wire format.
+///
+/// **Derived from the domain, not restated.** The mapping is
+/// `RejectionReason::variant_name() → RejectionReason::wire_kind()` over
+/// [`RejectionReason::ALL_KIND_SAMPLES`], the same single source the
+/// admin queue's `?reason=` accepted set is built from — so a new variant
+/// cannot appear in one place and be missing from the other.
 ///
 /// **Note (case-symmetry fix on ce043c05):** the SQL LATERAL subquery
-/// now lowercases the discriminator before binding it to the output
+/// lowercases the discriminator before binding it to the output
 /// column AND before comparing it against the `$3` filter parameter.
 /// In the steady state this function therefore receives values that
 /// are already lowercase and round-trips them unchanged. It is kept
 /// as defence-in-depth: a future `RejectionReason` variant landing in
 /// the domain ahead of the SQL CASE update would otherwise leak
-/// PascalCase to HTTP callers. The inline unit tests double as the
-/// canonical variant→wire-format mapping documentation.
+/// PascalCase to HTTP callers.
 ///
 /// Adapter-private — the wire format the HTTP DTO renders is the
 /// normalised form. Pinning the case-conversion here makes the
@@ -386,14 +414,10 @@ fn i64_finding_count_to_u32(v: i64) -> u32 {
 /// Unknown discriminators round-trip lowercased (defensive: a future
 /// `RejectionReason` variant should still surface, not vanish).
 fn normalise_rejection_reason_kind(raw: &str) -> String {
-    match raw {
-        "Scanner" => "scanner".to_string(),
-        "Admin" => "admin".to_string(),
-        "Curator" => "curator".to_string(),
-        "CurationRetroactive" => "curation_retroactive".to_string(),
-        "ScanPolicyRetroactive" => "scan_policy_retroactive".to_string(),
-        other => other.to_lowercase(),
-    }
+    RejectionReason::ALL_KIND_SAMPLES
+        .iter()
+        .find(|r| r.variant_name() == raw)
+        .map_or_else(|| raw.to_lowercase(), |r| r.wire_kind().to_string())
 }
 
 #[cfg(test)]
@@ -443,6 +467,71 @@ mod tests {
             normalise_rejection_reason_kind("ScanPolicyRetroactive"),
             "scan_policy_retroactive"
         );
+    }
+
+    /// The Rust-side normaliser is derived from the domain, so it covers
+    /// **every** variant by construction — asserted here over the same
+    /// single source rather than by re-listing the variants.
+    #[test]
+    fn normalise_covers_every_rejection_reason_variant() {
+        for sample in RejectionReason::ALL_KIND_SAMPLES {
+            assert_eq!(
+                normalise_rejection_reason_kind(sample.variant_name()),
+                sample.wire_kind(),
+                "normaliser must map {} to its wire kind",
+                sample.variant_name()
+            );
+        }
+    }
+
+    /// **DB-free drift guard for the SQL half of the mapping.**
+    ///
+    /// The PascalCase→wire `CASE` inside [`QUEUE_SQL`] is the one place
+    /// the discriminator mapping is written in SQL, and the compiler
+    /// cannot see it. Its `ELSE lower(...)` fallthrough makes an omission
+    /// silent *and wrong* for any multi-word variant —
+    /// `ScanPolicyRetroactive` lowers to `scanpolicyretroactive`, which
+    /// matches neither the documented wire format nor the `$3` filter
+    /// value an operator would send. That is exactly how
+    /// `?reason=scan_policy_retroactive` came to match nothing.
+    ///
+    /// This is a source scan, unlike the sibling structural guards that
+    /// deliberately avoid one — but here the SQL string *is* the artifact
+    /// being checked, not a proxy for it.
+    #[test]
+    fn sql_case_covers_every_rejection_reason_variant() {
+        for sample in RejectionReason::ALL_KIND_SAMPLES {
+            let arm = format!("WHEN '{}'", sample.variant_name());
+            assert!(
+                QUEUE_SQL.contains(&arm),
+                "QUEUE_SQL has no `{arm}` arm — a {} rejection would fall through the \
+                 ELSE lower(...) branch and surface as `{}` instead of `{}`, which the \
+                 ?reason= filter will never match",
+                sample.variant_name(),
+                sample.variant_name().to_lowercase(),
+                sample.wire_kind()
+            );
+            let target = format!("THEN '{}'", sample.wire_kind());
+            assert!(
+                QUEUE_SQL.contains(&target),
+                "QUEUE_SQL never produces `{}` — the {} arm maps to something else",
+                sample.wire_kind(),
+                sample.variant_name()
+            );
+        }
+        // Both shapes of the discriminator need the arms: unit variants
+        // serialise as a bare string, payload-carrying ones as a
+        // single-key object, and the query branches on `jsonb_typeof`.
+        for sample in RejectionReason::ALL_KIND_SAMPLES {
+            let arm = format!("WHEN '{}'", sample.variant_name());
+            assert_eq!(
+                QUEUE_SQL.matches(&arm).count(),
+                2,
+                "`{arm}` must appear in BOTH the string-form and object-form CASE \
+                 branches — a variant covered in only one is a latent gap the day its \
+                 payload shape changes"
+            );
+        }
     }
 
     /// An unknown variant tag (introduced by a future

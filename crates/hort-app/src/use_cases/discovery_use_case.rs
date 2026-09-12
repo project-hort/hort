@@ -872,6 +872,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: Some(anchor),
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,

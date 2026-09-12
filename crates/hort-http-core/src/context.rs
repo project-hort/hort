@@ -45,6 +45,7 @@ use hort_app::use_cases::policy_use_case::PolicyUseCase;
 // use-case surface, NOT because it has constructor dependencies.
 use hort_app::use_cases::prefetch_use_case::PrefetchUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
+use hort_app::use_cases::provenance_misrejection_repair::ProvenanceMisrejectionRepairUseCase;
 // Repo-keyed self-service prefetch endpoint use
 // case (`POST /api/v1/repositories/{repo_key}/prefetch`). Consumed by
 // the `hort-http-discovery` inbound adapter.
@@ -402,6 +403,16 @@ pub struct AppContext {
     /// `list_*` methods on the same use case back the
     /// queue / decisions / exclusions read surfaces.
     pub curation_use_case: Arc<CurationUseCase>,
+    /// One-shot corrective path for the artifacts stranded `Rejected`
+    /// with no `ArtifactRejected` behind them by the defect ADR 0039's
+    /// 2026-09-12 amendment removed. Driven by
+    /// `POST /api/v1/admin/quarantine/provenance-misrejections/repair`,
+    /// which sits behind the [`crate::authz::AdminPrincipal`] gate — not
+    /// the curator gate that protects `/api/v1/admin/curation/*`: this is
+    /// not a curation decision about an artifact, it withdraws a
+    /// structurally invalid one, and ADR 0038's "service accounts are
+    /// strictly non-admin" is what keeps it out of pipelines.
+    pub provenance_misrejection_repair_use_case: Arc<ProvenanceMisrejectionRepairUseCase>,
     /// Finding-exclusion HTTP write surface.
     /// The inbound adapter (`handlers/admin/policies/exclusions.rs`)
     /// calls `PolicyUseCase::{add_exclusion, remove_exclusion}` from
@@ -922,6 +933,8 @@ pub struct AppContextParts {
 
     /// See [`AppContext::curation_use_case`].
     pub curation_use_case: Arc<CurationUseCase>,
+    /// See [`AppContext::provenance_misrejection_repair_use_case`].
+    pub provenance_misrejection_repair_use_case: Arc<ProvenanceMisrejectionRepairUseCase>,
     /// See [`AppContext::policy_use_case`].
     pub policy_use_case: Arc<PolicyUseCase>,
     /// See [`AppContext::wheel_metadata_use_case`].
@@ -1046,6 +1059,7 @@ impl AppContext {
             rbac_resolve_use_case: parts.rbac_resolve_use_case,
             subscription_use_case: parts.subscription_use_case,
             curation_use_case: parts.curation_use_case,
+            provenance_misrejection_repair_use_case: parts.provenance_misrejection_repair_use_case,
             policy_use_case: parts.policy_use_case,
             wheel_metadata_use_case: parts.wheel_metadata_use_case,
             // Wired after `new` via `with_discovery_use_cases`: the use

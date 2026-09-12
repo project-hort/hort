@@ -65,6 +65,16 @@ pub enum QuarantineEvent {
     FailScanIndeterminate,
     /// `Artifact::re_evaluate`.
     ReEvaluate,
+    /// `Artifact::repair_provenance_misrejection` — the operator-invoked
+    /// corrective exit from the illegal state ADR 0039's 2026-09-12
+    /// amendment (D6) names: `Rejected` with no `ArtifactRejected` on the
+    /// stream. Narrower than [`Self::ReEvaluate`] in both directions: it
+    /// admits only the rejections `ReEvaluate` structurally cannot reach
+    /// (a scan re-judgement must never clear a provenance rejection —
+    /// ADR 0041 invariant #6(a)), and it targets `Quarantined` only,
+    /// handing the release decision back to the ordinary sweep rather
+    /// than making it here.
+    RepairProvenanceMisrejection,
     /// `Artifact::complete_provenance`. **Not source-state-gated** — the
     /// method carries no `match self.quarantine_status` guard at all (its
     /// caller, the provenance orchestrator, only ever invokes it against a
@@ -94,6 +104,7 @@ impl QuarantineEvent {
         QuarantineEvent::FailScanIndeterminate,
         QuarantineEvent::ReEvaluate,
         QuarantineEvent::CompleteProvenance,
+        QuarantineEvent::RepairProvenanceMisrejection,
     ];
 
     /// Stable, human-readable label — the DOT edge label and the name used
@@ -113,6 +124,7 @@ impl QuarantineEvent {
             Self::FailScanIndeterminate => "fail_scan_indeterminate",
             Self::ReEvaluate => "re_evaluate",
             Self::CompleteProvenance => "complete_provenance",
+            Self::RepairProvenanceMisrejection => "repair_provenance_misrejection",
         }
     }
 }
@@ -220,6 +232,16 @@ pub fn classify(event: QuarantineEvent, state: QuarantineStatus) -> Cell {
             Released => Allowed(&[Released, Rejected]),
             Rejected => Allowed(&[Rejected]),
             ScanIndeterminate => Allowed(&[ScanIndeterminate, Rejected]),
+        },
+        // Source-state guard only; the two stream-derived conjuncts
+        // (no `ArtifactRejected`, a `ProvenanceVerified`) are the
+        // method's `required_triggers`, enforced in its body. Targets
+        // `Quarantined` alone — never `Released`: the repair returns the
+        // artifact to the hold and lets the ordinary release sweep make
+        // the release decision under the live gate.
+        QuarantineEvent::RepairProvenanceMisrejection => match state {
+            Rejected => Allowed(&[Quarantined]),
+            NoneSt | Quarantined | Released | ScanIndeterminate => Forbidden,
         },
     }
 }
@@ -444,14 +466,25 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         ],
         required_triggers: COMPLETE_PROVENANCE_TRIGGERS,
     },
+    QuarantineTransitionRow {
+        event: QuarantineEvent::RepairProvenanceMisrejection,
+        from: QuarantineStatus::Rejected,
+        to: &[QuarantineStatus::Quarantined],
+        required_triggers: &[
+            "TerminalRejectionRecord::Absent — no ArtifactRejected anywhere on the \
+             stream (ADR 0039's 2026-09-12 amendment, D6's illegal state); a Present \
+             record is a genuine terminal rejection and is refused",
+            "ProvenanceClearance::Cleared — a ProvenanceVerified IS on the stream, so \
+             the stream contradicts the rejection the status records; Pending / \
+             NotRequired are refused",
+        ],
+    },
 ];
 
 const COMPLETE_PROVENANCE_TRIGGERS: &[&str] = &[
     "ProvenanceOutcome::Verified -> no-op (status unchanged, success record only)",
-    "ProvenanceOutcome::Rejected -> Rejected",
-    "ProvenanceOutcome::NoAttestation, mode=Required, window_open||is_referenced_descendant -> no-op (held)",
-    "ProvenanceOutcome::NoAttestation, mode=Required, !window_open && !is_referenced_descendant -> Rejected (Unsigned)",
-    "ProvenanceOutcome::NoAttestation, mode=VerifyIfPresent|Off -> no-op",
+    "ProvenanceOutcome::Rejected (positive disproof) -> Rejected, ProvenanceRejected + ArtifactRejected",
+    "ProvenanceOutcome::NoAttestation -> no-op in every mode (Required: held Quarantined/Pending)",
 ];
 
 // ---------------------------------------------------------------------------

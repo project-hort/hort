@@ -318,6 +318,10 @@ impl TryFrom<ArtifactRow> for Artifact {
             // store; it is hydrated by the use-case layer on the read
             // path. A fresh row always carries `None`.
             quarantine_deadline: None,
+            // Same transient contract: whether this hold waits on a
+            // signature rather than on the clock is resolved on the read
+            // path (it needs the artifact's event stream), never stored.
+            provenance_hold_indefinite: false,
             deleted_at: row.deleted_at,
             upstream_published_at: row.upstream_published_at,
             uploaded_by: row.uploaded_by,

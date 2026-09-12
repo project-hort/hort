@@ -157,8 +157,14 @@ pub struct ProvenanceRequirements<'a> {
 /// `ProvenanceRejected` event payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProvenanceRejectReason {
-    /// No attestation was present and policy required one (`Required`
-    /// mode maps the orchestrator's `NoAttestation` to this).
+    /// No attestation was present and policy required one.
+    ///
+    /// **No producer remains.** The `Required`-mode policy mapping that
+    /// emitted it was removed by ADR 0039's 2026-09-12 amendment (D1 —
+    /// an unsigned artifact holds), and no verifier produces it. The
+    /// variant stays because persisted `ProvenanceRejected` events on
+    /// existing streams carry it and must keep deserialising; the
+    /// merge-ranking below keeps ordering it last for the same reason.
     Unsigned,
     /// A valid signature whose `{issuer, san}` is not in the allowed set.
     UntrustedIdentity,
@@ -201,7 +207,11 @@ pub enum ProvenanceOutcome {
     Rejected(ProvenanceRejectReason),
     /// No bundle was found / passed — the unsigned case. Under
     /// `VerifyIfPresent` this is allowed (no event); under `Required` the
-    /// orchestrator maps it to `Rejected(Unsigned)`.
+    /// artifact is HELD (`Quarantined`, `Pending` at the release gate,
+    /// 503 to a pull) until a signature arrives. It is never terminal:
+    /// "no signature has reached Hort yet" is a statement about a point
+    /// in time, not about the artifact (ADR 0039's 2026-09-12 amendment,
+    /// D1).
     NoAttestation,
 }
 

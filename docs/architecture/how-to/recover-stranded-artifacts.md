@@ -138,3 +138,123 @@ a last resort if the HTTP surface itself is unreachable.
 - **Waiting past `quarantine_until` does nothing on its own.** The
   release predicate has no timer-only authority (ADR 0007); a stranded
   artifact only releases once a scan actually succeeds.
+
+---
+
+## 5. A different strand: artifacts wrongly `rejected` on the provenance axis
+
+Everything above is about the **scan** axis. There is one historical
+population stranded on the **provenance** axis, and it needs a different
+tool.
+
+### What happened
+
+Before [ADR 0039](../../adr/0039-keyed-provenance-verification.md)'s
+2026-09-12 amendment, an artifact under `provenanceMode: required` whose
+signature had not yet reached hort when the verify ran was driven
+**terminal**: `quarantine_status = 'rejected'`, `rejection_reason` left
+NULL, and — because the provenance axis did not write one — **no
+`ArtifactRejected` event on its stream**. With cosign the signer must
+resolve the subject manifest before it can attach a signature to it, so
+the verdict running first is the *normal* ordering: the signature landed
+a moment later and a `ProvenanceVerified` was appended to the very same
+stream.
+
+The artifact is therefore condemned by a verdict its own stream
+contradicts. The amendment stopped this happening (a missing signature
+now **holds** indefinitely instead of rejecting), but it did not move the
+artifacts already in that state — and **none of the ordinary exits
+reaches them**:
+
+- `POST /api/v1/admin/curation/quarantine/:id/reevaluate` answers
+  `{"outcome":"still_rejected"}` and writes nothing. Its eligibility
+  guard admits only a *scan-clearable* rejection, and that refusal is
+  correct: a scan re-judgement must never clear a provenance rejection.
+- `release` / `waive` do not apply — their source-state guard admits only
+  `quarantined` / `scan_indeterminate`.
+- Re-pushing produces no ingest: the content is already present, so the
+  push is a no-op.
+
+### Confirming whether you have any
+
+```bash
+# Rejected rows whose rejection reason is null — no ArtifactRejected
+# behind the status. Requires Permission::Curate or Permission::Admin.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "$HORT_URL/api/v1/admin/curation/queue?status=rejected" \
+  | jq '.entries[] | select(.rejection_reason_kind == null)'
+```
+
+A row with a non-null `rejection_reason_kind` is a **real** rejection and
+is not part of this population. A null one is *probably* in it but not
+necessarily — a CAS-corruption tombstone also shows null, and the repair
+refuses those; the dry run below is what tells you which is which. `?reason=provenance` lists the opposite
+group — artifacts a *positive disproof* rejected (signature present and
+invalid), which are terminal by design and stay that way.
+
+### The repair — dry run first
+
+```bash
+# 1. DRY RUN (the default: an absent body, or a body without `dry_run`,
+#    never mutates). Reports exactly what a real run would touch.
+curl -s -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "$HORT_URL/api/v1/admin/quarantine/provenance-misrejections/repair" | jq
+
+# 2. Read the `affected` list. When you are satisfied it is the set you
+#    expect, run it for real.
+curl -s -XPOST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"dry_run": false}' \
+  "$HORT_URL/api/v1/admin/quarantine/provenance-misrejections/repair" | jq
+```
+
+Optional body fields: `repository_id` (narrow the scan to one
+repository) and `limit` (how many `rejected` rows to examine; clamped to
+500). If the response has `"scan_cap_hit": true`, there may be more rows
+beyond the bound — re-run, optionally per repository, until it is
+`false`.
+
+**Requires `Permission::Admin`, not `Permission::Curate`.** This is not a
+curation decision — it withdraws a structurally invalid rejection — and
+per [ADR 0038](../../adr/0038-admin-identity-model.md) service accounts
+are strictly non-admin, so it cannot be driven from a pipeline. A human
+operator with an IdP-assumed admin session runs it.
+
+### What it will and will not touch
+
+It repairs an artifact only when **all three** hold:
+
+1. `quarantine_status = 'rejected'`;
+2. its stream records **no terminal condemnation** — no
+   `ArtifactRejected` (every real rejection writes one) and no
+   `ArtifactCorrupted` (the CAS integrity tombstone reaches `rejected`
+   without writing an `ArtifactRejected`, so it needs naming separately);
+   and
+3. a `ProvenanceVerified` **is** on its stream — without this, an
+   artifact that really was never signed would be released.
+
+So it leaves alone: an artifact rejected by a *positive disproof*
+(present-but-invalid signature — it carries both `ProvenanceRejected` and
+`ArtifactRejected`), a scan-rejected artifact, a curator- or
+admin-blocked one, an artifact tombstoned because its stored bytes do not
+match their content hash, a never-signed artifact still held
+`quarantined`, and anything already released.
+
+### What happens after
+
+A repaired artifact goes back to `quarantined` with its **original**
+observation-window anchor — restored, not restarted — and an
+`ArtifactReEvaluated` + `ArtifactQuarantined` pair is appended to its
+stream (the repair is recorded as events; the status is only the
+projection). The ordinary release sweep picks it up on its next tick and
+applies the live scan, curation and provenance gates. Because the
+`ProvenanceVerified` that made it repairable is the same event the
+release gate reads, the provenance conjunct clears and the artifact
+releases normally.
+
+OCI tags pointing at a repaired manifest need no separate action: a tag
+resolves through the manifest, so it becomes servable when the manifest
+does.
+
+The repair is idempotent — a second run finds nothing, because the first
+one moved the artifact out of `rejected`.

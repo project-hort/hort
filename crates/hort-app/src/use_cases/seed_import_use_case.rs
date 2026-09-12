@@ -31,19 +31,16 @@
 //! before this fix — issue #115 Item 2, a separate change.)
 //!
 //! **Consequence: seeding into a `provenance_mode: Required` repo.**
-//! Seed-import's anchor is backdated, so `window_open` is already
-//! `false` by the time the enqueued `provenance-verify` job runs, and a
-//! freshly seed-imported artifact is never a referenced-tree descendant
-//! (no other already-ingested artifact's `content_references` targets
-//! it) — so neither the zero-window nor the descendant hold carve-out
-//! applies. Seeding **unsigned** content into a repository with
+//! Seeding **unsigned** content into a repository with
 //! `provenance_mode: Required` and a provenance-capable format
-//! (`IngestUseCase::provenance_capable_formats`) therefore resolves to
-//! an **immediate terminal `Rejected{Unsigned}`** the moment the
-//! enqueued job runs — not a stranded hold, not a delayed release. This
-//! is the policy-consistent fail-closed outcome, not a defect:
-//! `Required` means unsigned content never releases, whether it arrived
-//! via seed-import or a live push. Operators seed unsigned content into
+//! (`IngestUseCase::provenance_capable_formats`) leaves the artifact
+//! **held** (`Quarantined`, 503, `Pending` at the release gate) until a
+//! signature for it arrives — indefinitely, if none ever does (ADR 0039's
+//! 2026-09-12 amendment, D1/D4). Seed-import's backdated anchor does not
+//! change that: the observation window is not a signing deadline. This is
+//! the policy-consistent fail-closed outcome, not a defect: `Required`
+//! means unsigned content never releases, whether it arrived via
+//! seed-import or a live push. Operators seed unsigned content into
 //! repositories that are not `provenance_mode: Required`.
 //!
 //! **Critical invariant — the scan still gates.** Seed-import stamps

@@ -11,12 +11,14 @@
 //!   missing key → 404.
 //! - `status` — one of `quarantined | rejected | scan_indeterminate`.
 //!   Invalid value → 400.
-//! - `reason` — rejection-reason discriminator, one of
-//!   `scanner | curator | curation_retroactive` (closed set —
-//!   `corruption` is NOT a curation-queue
-//!   reason; corrupted artifacts surface via the separate
-//!   `ArtifactCorrupted` stream, so `?reason=corruption` is rejected
-//!   at the boundary). Invalid value → 400.
+//! - `reason` — rejection-reason discriminator. The accepted set is
+//!   **derived** from `RejectionReason`'s own vocabulary (`scanner |
+//!   admin | curation_retroactive | scan_policy_retroactive | curator |
+//!   provenance`), so it can never be narrower than the data the
+//!   projection emits. `corruption` is NOT a curation-queue reason —
+//!   corrupted artifacts surface via the separate `ArtifactCorrupted`
+//!   stream, so `?reason=corruption` is rejected at the boundary.
+//!   Invalid value → 400.
 //! - `limit` — 1..=500. Default 100 when absent. Invalid range → 400.
 //!
 //! Status-code map:
@@ -58,16 +60,33 @@ use crate::error::ApiError;
 
 use super::MAX_LIST_LIMIT;
 
-/// Closed set of accepted `?reason=` values for `GET /queue`.
+/// Accepted `?reason=` values for `GET /queue`, **derived from the
+/// projection's own vocabulary** rather than restated here.
 ///
-/// `corruption` is deliberately not a queue discriminator: corruption
-/// rides on the separate
-/// `ArtifactCorrupted` event, and the queue's LATERAL JOIN
-/// only reads `ArtifactRejected`, so a `?reason=corruption` filter
-/// would always return empty. The handler rejects it with 400 so
-/// operators
-/// get a clear signal rather than a silent empty list.
-const ACCEPTED_REASONS: &[&str] = &["scanner", "curator", "curation_retroactive"];
+/// The queue's LATERAL JOIN projects the `rejected_by` discriminator off
+/// the latest `ArtifactRejected` on the artifact's stream, so the set of
+/// values a row can carry is exactly the set of
+/// [`RejectionReason`](hort_domain::events::RejectionReason) variants.
+/// This function asks the domain for it
+/// ([`RejectionReason::all_wire_kinds`](hort_domain::events::RejectionReason::all_wire_kinds)),
+/// so a new variant widens the filter automatically.
+///
+/// A hand-copied second list is how this surface came to answer **400**
+/// for `?reason=provenance`, `?reason=admin` and
+/// `?reason=scan_policy_retroactive` while rows carrying those
+/// discriminators existed — a filter narrower than the data is a trap for
+/// the operator who is trying to find exactly those rows.
+///
+/// `corruption` is deliberately still NOT accepted, and that falls out of
+/// the derivation rather than being special-cased: corruption rides on
+/// the separate `ArtifactCorrupted` event, `RejectionReason` has no
+/// corruption variant, and the LATERAL JOIN only reads
+/// `ArtifactRejected` — so `?reason=corruption` would always return
+/// empty. The 400 gives operators a clear signal instead of a silent
+/// empty list.
+fn accepted_reasons() -> Vec<&'static str> {
+    hort_domain::events::RejectionReason::all_wire_kinds()
+}
 
 /// Query parameters for `GET /api/v1/admin/curation/queue`.
 ///
@@ -178,20 +197,20 @@ pub async fn get_queue(
         Some(s) => Some(s.parse::<QuarantineStatus>().map_err(ApiError::from)?),
     };
 
-    // Validate `?reason=` against the closed set the adapter
-    // actually emits (`scanner | curator | curation_retroactive`).
-    // `corruption` is NOT a curation-queue reason (corrupted
-    // artifacts surface via the separate
-    // `ArtifactCorrupted` stream); reject with 400 rather than return
-    // a silent empty list.
+    // Validate `?reason=` against the discriminators the projection can
+    // actually emit — derived from `RejectionReason`, not restated (see
+    // `accepted_reasons`). `corruption` is not among them (corrupted
+    // artifacts surface via the separate `ArtifactCorrupted` stream);
+    // reject with 400 rather than return a silent empty list.
     let rejection_reason_kind = match query.reason {
         None => None,
         Some(r) => {
-            if !ACCEPTED_REASONS.contains(&r.as_str()) {
+            let accepted = accepted_reasons();
+            if !accepted.contains(&r.as_str()) {
                 return Err(ApiError(AppError::Domain(DomainError::Validation(
                     format!(
                         "invalid reason {r:?} (expected one of {})",
-                        ACCEPTED_REASONS.join(" | "),
+                        accepted.join(" | "),
                     ),
                 ))));
             }
@@ -480,6 +499,47 @@ mod tests {
             mocks.curation_queue.recorded_filters().is_empty(),
             "invalid reason must not reach the port"
         );
+    }
+
+    /// **The filter must accept every discriminator the projection can
+    /// emit.** Asserted against the projection's own vocabulary
+    /// (`RejectionReason`), not a list copied into the test — a
+    /// hand-copied list in the test would drift in lockstep with a
+    /// hand-copied list in the handler and prove nothing.
+    ///
+    /// This is the regression guard for the trap the closed set created:
+    /// `?reason=provenance` answered 400 for rows that demonstrably
+    /// existed (a provenance disproof writes
+    /// `ArtifactRejected{Provenance}`), and `admin` /
+    /// `scan_policy_retroactive` were missing for the same reason.
+    #[tokio::test]
+    async fn queue_accepts_every_discriminator_the_projection_can_emit() {
+        let kinds = hort_domain::events::RejectionReason::all_wire_kinds();
+        assert!(
+            kinds.contains(&"provenance"),
+            "the projection emits `provenance` since the ADR 0039 amendment's D6 companion"
+        );
+        for kind in kinds {
+            let (router, mocks) = harness();
+            let resp = router
+                .oneshot(queue_get(
+                    &format!("reason={kind}&status=rejected"),
+                    Some(principal_with_claims(&["curate"])),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "?reason={kind} must be accepted — the projection can emit it"
+            );
+            let recorded = mocks.curation_queue.recorded_filters();
+            assert_eq!(
+                recorded[0].rejection_reason_kind.as_deref(),
+                Some(kind),
+                "?reason={kind} must reach the port verbatim"
+            );
+        }
     }
 
     /// `?reason=bogus` (arbitrary string outside the closed set) → 400.

@@ -5,8 +5,17 @@
 //! (OCI: the Referrers / content-reference surface — possibly empty),
 //! stream the artifact preimage from CAS, dispatch each applicable
 //! [`ProvenancePort`], fold the per-verifier verdicts to one, and apply
-//! [`Artifact::complete_provenance`] — persisting the returned event (if
+//! [`Artifact::complete_provenance`] — persisting the returned events (if
 //! any) via the artifact lifecycle port.
+//!
+//! # An unsigned artifact is held, never rejected
+//!
+//! A `NoAttestation` verdict under [`ProvenanceMode::Required`] HOLDS the
+//! artifact (`Quarantined`, `Pending` at the release gate, 503 to a pull)
+//! indefinitely — it is a statement about a point in time, not about the
+//! artifact, and with cosign the signature necessarily follows the subject
+//! it signs. Only a positive disproof (a signature that is present and
+//! invalid) is terminal. See ADR 0039's 2026-09-12 amendment, D1–D4.
 //!
 //! Mirrors [`ScanOrchestrationUseCase`](super::scan_orchestration::ScanOrchestrationUseCase):
 //! port-only `Arc<dyn _Port>` dependencies, no concrete use-case handles.
@@ -42,7 +51,6 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::scan_policy::ProvenanceMode;
 use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource};
-use hort_domain::policy::{effective_quarantine_deadline, DefaultPolicy};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
@@ -67,7 +75,6 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
 use crate::use_cases::read_expected_version;
-use crate::use_cases::referenced_descendant::is_referenced_tree_descendant;
 
 /// The `kind` filter used to read cosign attestation bundles off the
 /// content-reference / OCI Referrers surface. A cosign signature manifest
@@ -113,31 +120,27 @@ const PROVENANCE_ANCHOR_GRACE_SECS: i64 = 300;
 pub enum ProvenanceVerdictSummary {
     /// A trusted signature was verified (`ProvenanceVerified` emitted).
     Verified,
-    /// A typed rejection (`ProvenanceRejected` emitted), carrying the typed
-    /// reason. Covers both the `Required` unsigned mapping
-    /// (`Rejected{Unsigned}`) and the fail-closed `Rejected{RekorNotFound}`
-    /// path.
+    /// A typed rejection (`ProvenanceRejected` + its `ArtifactRejected`
+    /// companion emitted), carrying the typed reason. Covers a verifier's
+    /// positive disproof and the fail-closed `Rejected{RekorNotFound}`
+    /// fetch-exhaustion path.
     Rejected(ProvenanceRejectReason),
     /// No bundle was found / passed and the mode allowed it
     /// (`VerifyIfPresent`/`Off` no-op, no event) — a previously-silent
     /// case, made observable here.
     NoAttestation,
-    /// A `Required`-mode artifact was found unsigned while its quarantine
-    /// observation window is still open (issue #13): no event, status stays
-    /// `Quarantined` (HELD, read as `Pending` by the release gate). Distinct
-    /// from `NoAttestation` so the task handler's `result_summary`
+    /// A `Required`-mode **subject** was found unsigned: no event, status
+    /// stays `Quarantined` (HELD, read as `Pending` by the release gate).
+    /// Distinct from `NoAttestation` so the task handler's `result_summary`
     /// separates "waiting to be signed" from "allowed unsigned".
     HeldPendingSignature,
     /// A `Required`-mode **constituent** (an OCI config/layer blob) was
-    /// found unsigned with its observation window already closed and no
-    /// inbound reference edge yet: no event, status stays `Quarantined`
-    /// (HELD). Distinct from [`Self::HeldPendingSignature`] because
-    /// nothing is waiting for *this* row to be signed — it can never
-    /// carry its own attestation. It is waiting for its **subject** to
-    /// arrive and clear it via the cascade or the late-joiner self-clear.
-    /// This is exactly the population that used to resolve to a silent
-    /// terminal `Rejected{Unsigned}`, so it gets its own label rather
-    /// than folding into the window-open hold.
+    /// found unsigned: no event, status stays `Quarantined` (HELD).
+    /// Distinct from [`Self::HeldPendingSignature`] because nothing is
+    /// waiting for *this* row to be signed — it can never carry its own
+    /// attestation. It is waiting for its **subject** to arrive and clear
+    /// it via the cascade or the late-joiner self-clear, which is a
+    /// different operator action (push/sign the parent, not this row).
     HeldPendingSubject,
 }
 
@@ -154,15 +157,15 @@ pub enum ProvenanceRunOutcome {
     /// The artifact's stream already carries a `ProvenanceVerified` — its
     /// own earlier verification or a cascaded clearance from a verified
     /// subject (ADR 0039 cascade) — so the verify is a no-op. Re-judging a
-    /// cleared artifact could only harm it: a cascade-cleared constituent
-    /// has no referrer surface of its own (cosign signs only the top-level
-    /// digest), so re-running the pipeline with the window closed (the S4
-    /// expiry backstop racing the cascade) would terminally reject a
-    /// cleared artifact as `Unsigned`. `Required` mode only.
+    /// cleared artifact is wasted work at best: a cascade-cleared
+    /// constituent has no referrer surface of its own (cosign signs only
+    /// the top-level digest), so re-running the pipeline would resolve
+    /// `NoAttestation` and re-hold an already-cleared artifact's job for
+    /// no outcome. `Required` mode only.
     SkippedAlreadyCleared,
     /// A verdict was produced and applied. `event_appended` is `true` when
-    /// `complete_provenance` emitted an event (Verified / Rejected) and
-    /// `false` for the `NoAttestation`-under-`VerifyIfPresent` no-op.
+    /// `complete_provenance` emitted events (Verified / Rejected) and
+    /// `false` for the `NoAttestation` hold / allowed-unsigned no-op.
     /// `verdict` carries the coarse outcome bucket the task handler maps to
     /// `result_summary`.
     Applied {
@@ -179,23 +182,23 @@ pub enum ProvenanceRunOutcome {
     RequeuedNoAnchor,
 }
 
-/// Why a `NoAttestation × Required` verdict resolved to a HOLD rather
-/// than to the terminal `Rejected{Unsigned}` arm.
+/// What a `NoAttestation × Required` HOLD is waiting for.
 ///
-/// The two arms differ in *what the operator is waiting for*, which is the
-/// only thing the hold's observability needs to say: `PendingSignature`
-/// means "this artifact may still be signed"; `PendingSubject` means "this
-/// artifact will never be signed on its own — its subject must arrive and
-/// clear it". Keeping the mapping to the log line, the metric label and
-/// the job's `result_summary` on one type is what stops the three from
-/// drifting apart.
+/// **Reporting only — never a gate.** A `NoAttestation` verdict holds
+/// unconditionally (ADR 0039's 2026-09-12 amendment, D1/D3); this type
+/// decides nothing about the outcome, it only says *what the operator is
+/// waiting for*, which under D4's indefinite hold is the one thing the
+/// observability has to answer: `PendingSignature` means "this artifact
+/// may still be signed" (sign it); `PendingSubject` means "this artifact
+/// will never be signed on its own — its subject must arrive and clear
+/// it" (push/sign the parent). Keeping the mapping to the log line, the
+/// metric label and the job's `result_summary` on one type is what stops
+/// the three from drifting apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HoldReason {
-    /// The observation window is still open, or an inbound reference edge
-    /// already nominates this artifact as a tree descendant.
+    /// A subject — a row that could carry an attestation of its own.
     PendingSignature,
-    /// A constituent that can never carry its own attestation, with its
-    /// window already closed and no inbound edge yet.
+    /// A constituent that can never carry its own attestation.
     PendingSubject,
 }
 
@@ -217,8 +220,8 @@ impl HoldReason {
     fn log_message(self) -> &'static str {
         match self {
             Self::PendingSignature => {
-                "provenance held pending signature (Required; observation window open \
-                 or referenced-tree descendant awaiting its parent's cascade)"
+                "provenance held pending signature (Required; no attestation has reached \
+                 Hort yet — the hold is indefinite and lifts when one does)"
             }
             Self::PendingSubject => {
                 "provenance held pending subject (Required; a constituent carries no \
@@ -363,102 +366,24 @@ impl ProvenanceOrchestrationUseCase {
             .map(|p| p.provenance_mode)
             .unwrap_or_default();
 
-        // Compute the observation-window state (issue #13, design §2 S1/S4).
-        // A missing signature under `Required` is time-dependent — the
-        // artifact may yet be signed — so it is HELD while this window is
-        // open (mirroring an incomplete scan) rather than terminally rejected
-        // at the first verify. The deadline is derived (never persisted) from
-        // the artifact's immutable quarantine anchor + the resolved
-        // `ScanPolicy.quarantineDuration` (or the default), through the SAME
-        // `effective_quarantine_deadline` helper the release sweep uses.
-        //
-        // A missing `quarantine_window_start` resolves `window_open = false`.
-        // `IngestUseCase::ingest_inner` commits `ArtifactIngested` +
-        // `ArtifactQuarantined` (+ this job's own enqueue) atomically in
-        // ONE transition (issue #90) whenever the resolved policy actually
-        // quarantines, so a job it enqueues can never observe a `None`
-        // anchor mid-transition — a `None` anchor here means either (a)
-        // this artifact's policy is PERMISSIVE (`quarantine_duration_secs
-        // == 0`, ingest never quarantines it — a legitimate, permanent
-        // `None`-status steady state, not a race) or (b) a residual race
-        // in some other/future dual-commit path. `apply_verdict`'s bounded
-        // requeue (`PROVENANCE_ANCHOR_GRACE_SECS`) is the defense-in-depth
-        // backstop for (b); a defensive run past that grace window must
-        // not HOLD indefinitely (no anchor ⇒ no window ⇒ terminal).
-        // `window_open` gates only the `NoAttestation × Required` arm in
-        // `complete_provenance`; the expiry backstop (`release_expired`)
-        // re-runs the verify after the deadline, where this resolves to
-        // `false` by construction.
-        let effective_duration_secs: i64 = policy
-            .as_ref()
-            .map(|p| p.quarantine_duration_secs)
-            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
-        let now = chrono::Utc::now();
-        let window_open = artifact
-            .quarantine_window_start
-            .map(|anchor| {
-                effective_quarantine_deadline(
-                    anchor,
-                    chrono::Duration::seconds(effective_duration_secs),
-                ) > now
-            })
-            .unwrap_or(false);
-
-        // Referenced-tree-descendant hold (issue #115 defect (b)). A
-        // descendant — an index's child manifest, a manifest's config/layer
-        // blob, a referrer's subject — has a zero-length window by
-        // construction (#46), so `window_open` above is ALWAYS false for it.
-        // Under `Required` that used to resolve `NoAttestation` straight to
-        // terminal `Rejected{Unsigned}` before the subject's cascade could
-        // clear the constituent, permanently bricking a correctly-signed
-        // image. `complete_provenance` now holds on
-        // `window_open || is_referenced_descendant`; this resolves the flag.
-        //
-        // **ERROR DIRECTION IS LOAD-BEARING — the asymmetry with ingest is
-        // deliberate, not an oversight.** `IngestUseCase::ingest_inner`
-        // resolves this SAME predicate and degrades a lookup failure to
-        // `false`; that is correct THERE because `false` at ingest means
-        // "not a descendant" ⇒ the artifact keeps its normal FULL
-        // observation window — the conservative direction. HERE `false`
-        // means "no descendant hold" ⇒ under `Required` with a closed
-        // window the very next step is a TERMINAL rejection. Degrading to
-        // `false` at verdict time would turn a transient
-        // `content_references` read failure into an unrecoverable
-        // `Rejected{Unsigned}` on a legitimately-signed image's layer. So
-        // this PROPAGATES: the job fails, the dispatcher retries, and the
-        // artifact stays `Quarantined` (held, 503) in the meantime —
-        // fail-closed and recoverable.
-        let is_referenced_descendant = is_referenced_tree_descendant(
-            &self
-                .content_references
-                .find_by_target(artifact.repository_id, &artifact.sha256_checksum, None)
-                .await?,
-        );
-
-        // Constituent hold. `is_referenced_descendant` above answers "does
-        // an inbound edge exist YET?" — a fact about ingest order, not
-        // about what this artifact is. An OCI client pushes an image's
-        // blobs BEFORE the manifest that references them, so a blob has no
-        // inbound edge during exactly the interval in which a `Required`
-        // scope with a window shorter than the push (`quarantine_duration_secs:
-        // 1` vs. a multi-second push) resolved `NoAttestation × !window_open
-        // × !descendant` to a TERMINAL `Rejected{Unsigned}` — unreachable by
-        // every release path, so a correctly-signed image became unservable
-        // as a function of client push order.
-        //
-        // The format handler answers the durable question instead:
-        // can this row ever carry an attestation of its own? For OCI, blob
-        // rows cannot (cosign signs the manifest/index digest); manifests
-        // and indexes are subjects and are unaffected. The classification is
-        // pure and derived from the artifact's own identity, so unlike the
-        // descendant lookup above there is no I/O here and no error
+        // Constituent classification — REPORTING ONLY, never a gate. A
+        // `NoAttestation` verdict under `Required` holds unconditionally
+        // (ADR 0039's 2026-09-12 amendment, D1/D3), so nothing here decides
+        // whether the artifact is held; it decides what the hold is waiting
+        // FOR, which is what an indefinite hold's observability has to
+        // answer. The format handler is asked the durable question — can
+        // this row ever carry an attestation of its own? For OCI, blob rows
+        // cannot (cosign signs the manifest/index digest); manifests and
+        // indexes are subjects. The classification is pure and derived from
+        // the artifact's own identity, so there is no I/O here and no error
         // direction to get wrong.
         //
-        // An unregistered format resolves `false` — the pre-existing
-        // subject semantics. That is a composition-root mis-registration,
-        // not a transient failure: nothing would be gained by failing the
-        // job, since a retry re-reads the same empty map. `warn!` so the
-        // mis-wiring is visible rather than silent.
+        // An unregistered format resolves `false` — subject semantics, the
+        // conservative label ("waiting for its own signature"). That is a
+        // composition-root mis-registration, not a transient failure:
+        // nothing would be gained by failing the job, since a retry re-reads
+        // the same empty map. `warn!` so the mis-wiring is visible rather
+        // than silent.
         let is_constituent = match self.format_handlers.get(&format) {
             Some(handler) => handler.is_provenance_constituent(&artifact),
             None => {
@@ -499,8 +424,8 @@ impl ProvenanceOrchestrationUseCase {
         // (cosign signs only the top-level digest), so a verify that lands
         // after the cascade (the S4 expiry backstop enqueued while the
         // artifact was still `Pending`, a duplicate S3 enqueue) would re-run
-        // the pipeline to `NoAttestation` and — window closed — terminally
-        // reject a cleared artifact as `Unsigned`. Skip instead.
+        // the whole pipeline only to resolve `NoAttestation` and report a
+        // hold for an artifact that is already cleared. Skip instead.
         // `VerifyIfPresent`/`Off` never consult the clearance, so their
         // re-verify behaviour is unchanged.
         if mode == ProvenanceMode::Required {
@@ -573,9 +498,6 @@ impl ProvenanceOrchestrationUseCase {
                         artifact,
                         &backend,
                         mode,
-                        window_open,
-                        is_referenced_descendant,
-                        is_constituent,
                         "bundle fetch",
                         e,
                         expected_version,
@@ -618,9 +540,6 @@ impl ProvenanceOrchestrationUseCase {
                                         artifact,
                                         &backend,
                                         mode,
-                                        window_open,
-                                        is_referenced_descendant,
-                                        is_constituent,
                                         "post-proxy bundle re-read",
                                         e,
                                         expected_version,
@@ -635,9 +554,6 @@ impl ProvenanceOrchestrationUseCase {
                                 artifact,
                                 &backend,
                                 mode,
-                                window_open,
-                                is_referenced_descendant,
-                                is_constituent,
                                 "upstream referrer fetch",
                                 e,
                                 expected_version,
@@ -659,9 +575,6 @@ impl ProvenanceOrchestrationUseCase {
                         artifact,
                         &backend,
                         mode,
-                        window_open,
-                        is_referenced_descendant,
-                        is_constituent,
                         "CAS preimage read",
                         e,
                         expected_version,
@@ -728,8 +641,6 @@ impl ProvenanceOrchestrationUseCase {
                 &metric_backend,
                 verdict,
                 mode,
-                window_open,
-                is_referenced_descendant,
                 is_constituent,
                 expected_version,
             )
@@ -829,7 +740,8 @@ impl ProvenanceOrchestrationUseCase {
             // `bytes` = the simplesigning payload-layer blob, `signature` = the
             // base64 `dev.cosignproject.cosign/signature` annotation decoded. An
             // undecodable annotation can never be a valid signature → skipped
-            // (under `Required`, no valid bundle folds to `Rejected{Unsigned}`).
+            // (under `Required`, no valid bundle folds to `NoAttestation`, which
+            // holds).
             let sig_layers = hort_domain::oci::simplesigning_signature_layers(&manifest_bytes)?;
             for sig in sig_layers {
                 let payload_bytes = self.cascade.read_bounded(&sig.payload_layer).await?;
@@ -1083,6 +995,7 @@ impl ProvenanceOrchestrationUseCase {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -1213,23 +1126,17 @@ impl ProvenanceOrchestrationUseCase {
     }
 
     /// Apply a folded verdict via [`Artifact::complete_provenance`] and
-    /// persist the returned event (if any). Mirrors how scan orchestration
+    /// persist the returned events (if any). Mirrors how scan orchestration
     /// persists `ScanCompleted` through the lifecycle port.
     ///
-    /// `too_many_arguments`: 9 with `&self` — the three hold predicates
-    /// (`window_open`, `is_referenced_descendant`, `is_constituent`) plus
-    /// `expected_version`, all resolved in `verify_artifact` and threaded
-    /// here. A struct wrapper would churn both call paths for no
-    /// behavioural gain.
-    #[allow(clippy::too_many_arguments)]
+    /// `is_constituent` is threaded for the **hold label only** (see
+    /// [`HoldReason`]); it is not a gate and does not reach the domain.
     async fn apply_verdict(
         &self,
         mut artifact: Artifact,
         backend: &str,
         verdict: ProvenanceVerdict,
         mode: ProvenanceMode,
-        window_open: bool,
-        is_referenced_descendant: bool,
         is_constituent: bool,
         expected_version: ExpectedVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
@@ -1241,16 +1148,15 @@ impl ProvenanceOrchestrationUseCase {
         // landed yet (or a residual race in some other/future dual-commit
         // path — `IngestUseCase::ingest_inner` itself now commits
         // `ArtifactIngested` + `ArtifactQuarantined` atomically, so a job
-        // IT enqueues can no longer observe this shape). Requeue instead
-        // of resolving `window_open = false` → terminal, but ONLY while
-        // the artifact is younger than `PROVENANCE_ANCHOR_GRACE_SECS` — a
+        // IT enqueues can no longer observe this shape). Requeueing runs
+        // the verify again once the (expected, imminent) quarantine commit
+        // has landed, so the verdict is applied against the artifact's real
+        // state rather than a half-committed one — bounded to artifacts
+        // younger than `PROVENANCE_ANCHOR_GRACE_SECS`, because a
         // steady-state PERMISSIVE artifact (`quarantine_duration_secs ==
         // 0`) shows this exact shape too, but FOREVER (it is never
-        // quarantined), so past the grace window this falls through to
-        // the existing terminal resolution below (ADR 0007's "no anchor ⇒
-        // no indefinite hold" rationale stands).
+        // quarantined), and must not requeue indefinitely.
         if mode == ProvenanceMode::Required
-            && !window_open
             && artifact.quarantine_status == QuarantineStatus::None
             && artifact.quarantine_window_start.is_none()
             && matches!(
@@ -1275,46 +1181,34 @@ impl ProvenanceOrchestrationUseCase {
             return Ok(ProvenanceRunOutcome::RequeuedNoAnchor);
         }
 
-        // Under `Required` an unsigned-but-still-in-window artifact is HELD
-        // (issue #13): `complete_provenance` returns `Ok(None)` and leaves
-        // the status `Quarantined` → the release gate reads it as `Pending`
+        // Under `Required` an unsigned artifact is HELD:
+        // `complete_provenance` emits nothing and leaves the status
+        // `Quarantined` → the release gate reads it as `Pending`
         // (fail-closed / held), not an allowed-unsigned no-op. Captured
-        // before the value is moved into `complete_provenance` so the `None`
-        // branch can distinguish the hold from the VerifyIfPresent/Off allow.
+        // before the verdict is moved into `complete_provenance` so the
+        // empty-batch branch can tell the hold from the VerifyIfPresent/Off
+        // allow — the domain produces the same (absent) transition for
+        // both, and only the mode distinguishes them.
         //
-        // A referenced-tree descendant is held on the same arm regardless of
-        // the window (issue #115 defect (b)) — its window is zero-length by
-        // construction and its provenance authority is its parent's
-        // signature. This condition MUST mirror `complete_provenance`'s
-        // `window_open || is_referenced_descendant` exactly: a held
-        // descendant that fell through to the `else` below would be reported
-        // as the allowed-unsigned `NoAttestation` no-op, mislabelling a
+        // A hold that fell through to the `else` below would be reported as
+        // the allowed-unsigned `NoAttestation` no-op, mislabelling a
         // fail-closed hold as a pass in both the summary and the metric.
-        // Held descendants reuse the EXISTING `HeldPendingSignature`
-        // summary + `result` value — no new metric name or label value
-        // (catalog untouched).
         //
-        // A CONSTITUENT held with its window already closed and no inbound
-        // edge yet is the population that used to reach the terminal
-        // `Rejected{Unsigned}` arm. It reports the distinct
-        // `held_pending_subject` label: nothing is waiting for THIS row to
-        // be signed (it can never carry its own attestation), it is waiting
-        // for its subject to arrive. Reporting it as `held_pending_signature`
-        // would hide the change this label exists to make measurable — a
-        // previously-silent terminal becoming a hold. The window-open and
-        // descendant holds keep their existing label unchanged.
+        // Which hold is a LABEL, not a gate (see `HoldReason`): a
+        // constituent can never carry an attestation of its own, so it is
+        // waiting for its subject's cascade, not for its own signature —
+        // a different operator action, and the hold is indefinite, so the
+        // distinction is the useful half of the observability.
         let hold_reason = if mode == ProvenanceMode::Required
             && matches!(
                 verdict.outcome,
                 hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
             ) {
-            if window_open || is_referenced_descendant {
-                Some(HoldReason::PendingSignature)
-            } else if is_constituent {
-                Some(HoldReason::PendingSubject)
+            Some(if is_constituent {
+                HoldReason::PendingSubject
             } else {
-                None
-            }
+                HoldReason::PendingSignature
+            })
         } else {
             None
         };
@@ -1324,16 +1218,9 @@ impl ProvenanceOrchestrationUseCase {
         // `Verified` verdict leaves the artifact `Quarantined`, i.e.
         // EQUAL to this, so the adapter skips the status write entirely.
         let prior_status = artifact.quarantine_status;
-        let event = artifact.complete_provenance(
-            verdict,
-            mode,
-            backend,
-            window_open,
-            is_referenced_descendant,
-            is_constituent,
-        )?;
+        let events = artifact.complete_provenance(verdict, backend)?;
 
-        let Some(event) = event else {
+        if events.is_empty() {
             if let Some(reason) = hold_reason {
                 // Held: no event, status stays Quarantined. `info!` (no
                 // `err`) — the operator audit signal that an image is not
@@ -1344,8 +1231,6 @@ impl ProvenanceOrchestrationUseCase {
                 tracing::info!(
                     artifact_id = %artifact.id,
                     backend = %backend,
-                    window_open,
-                    is_referenced_descendant,
                     is_constituent,
                     "{}",
                     reason.log_message(),
@@ -1369,7 +1254,7 @@ impl ProvenanceOrchestrationUseCase {
                 event_appended: false,
                 verdict: ProvenanceVerdictSummary::NoAttestation,
             });
-        };
+        }
 
         // Tracing: info! on the supply-chain decision — audit signal, not
         // `err`. Domain stays tracing-free. Metrics fire alongside, once
@@ -1377,41 +1262,46 @@ impl ProvenanceOrchestrationUseCase {
         // `hort_provenance_verify_total{backend, mode, result}` always, +
         // `hort_provenance_reject_total{backend, reason}` on a rejection.
         // The coarse verdict bucket surfaced to the task handler's
-        // `result_summary`. Derived from the same event the
-        // metrics below tick — Verified / Rejected(reason); a non-provenance
-        // event here is unreachable (`complete_provenance` only ever emits
-        // these two), so the defensive default keeps the match total.
-        let verdict_summary = match &event {
-            DomainEvent::ProvenanceVerified(e) => {
-                tracing::info!(
-                    artifact_id = %artifact.id,
-                    backend = %e.backend,
-                    "provenance verified",
-                );
-                crate::metrics::emit_provenance_verify(
-                    backend,
-                    mode,
-                    crate::metrics::ProvenanceVerifyResult::Verified,
-                );
-                ProvenanceVerdictSummary::Verified
-            }
-            DomainEvent::ProvenanceRejected(e) => {
-                tracing::info!(
-                    artifact_id = %artifact.id,
-                    backend = %e.backend,
-                    reason = ?e.reason,
-                    "provenance rejected",
-                );
-                crate::metrics::emit_provenance_verify(
-                    backend,
-                    mode,
-                    crate::metrics::ProvenanceVerifyResult::Rejected,
-                );
-                crate::metrics::emit_provenance_reject(backend, e.reason);
-                ProvenanceVerdictSummary::Rejected(e.reason)
-            }
-            _ => ProvenanceVerdictSummary::NoAttestation,
-        };
+        // `result_summary`. Derived from the batch's AXIS event — the
+        // `Verified` / `Rejected` arm; the `ArtifactRejected` companion the
+        // rejection arm appends alongside carries no provenance-specific
+        // information, so it is skipped here rather than matched. A batch
+        // with no axis event is unreachable (a non-empty batch always leads
+        // with one), so the defensive default keeps the fold total.
+        let verdict_summary = events.iter().fold(
+            ProvenanceVerdictSummary::NoAttestation,
+            |acc, event| match event {
+                DomainEvent::ProvenanceVerified(e) => {
+                    tracing::info!(
+                        artifact_id = %artifact.id,
+                        backend = %e.backend,
+                        "provenance verified",
+                    );
+                    crate::metrics::emit_provenance_verify(
+                        backend,
+                        mode,
+                        crate::metrics::ProvenanceVerifyResult::Verified,
+                    );
+                    ProvenanceVerdictSummary::Verified
+                }
+                DomainEvent::ProvenanceRejected(e) => {
+                    tracing::info!(
+                        artifact_id = %artifact.id,
+                        backend = %e.backend,
+                        reason = ?e.reason,
+                        "provenance rejected",
+                    );
+                    crate::metrics::emit_provenance_verify(
+                        backend,
+                        mode,
+                        crate::metrics::ProvenanceVerifyResult::Rejected,
+                    );
+                    crate::metrics::emit_provenance_reject(backend, e.reason);
+                    ProvenanceVerdictSummary::Rejected(e.reason)
+                }
+                _ => acc,
+            },
+        );
 
         let stream_id = hort_domain::events::StreamId::artifact(artifact.id);
         let correlation_id = Uuid::new_v4();
@@ -1437,7 +1327,7 @@ impl ProvenanceOrchestrationUseCase {
                 AppendEvents {
                     stream_id,
                     expected_version,
-                    events: vec![EventToAppend::new(event)],
+                    events: events.into_iter().map(EventToAppend::new).collect(),
                     correlation_id,
                     causation_id: None,
                     actor: system_actor(),
@@ -1459,33 +1349,20 @@ impl ProvenanceOrchestrationUseCase {
     /// - `VerifyIfPresent` / `Off` → degrade to `NoAttestation` (allow —
     ///   never fail-closed on infra flakiness).
     ///
-    /// `window_open` / `is_referenced_descendant` / `is_constituent` are
-    /// threaded to `apply_verdict` for signature parity with the verdict
-    /// path, but are **inert on the `Required` arm**: a fetch failure
-    /// produces a `Rejected{RekorNotFound}` verdict, and
-    /// `complete_provenance`'s `Rejected` arm never consults any of them —
-    /// a fetch failure is NOT an unsigned-hold, so it stays fail-closed
-    /// even mid-window, even on a descendant, and even on a constituent.
-    /// The distinction is deliberate: an artifact whose attestation
-    /// material could not be FETCHED is a different failure from one that
-    /// provably has none, and only the latter is the missing-subject case
-    /// the constituent hold exists for. Threading the values through does
-    /// not weaken this.
-    ///
-    /// `too_many_arguments`: 10 with `&self`. Every parameter is a
-    /// distinct, unrelated input this private helper forwards verbatim to
-    /// `apply_verdict`; bundling them into a struct would only move the
-    /// same values behind a name. Matches the crate's established use of
-    /// this allow.
-    #[allow(clippy::too_many_arguments)]
+    /// The `Required` arm stays fail-closed on every shape — mid-window, on
+    /// a descendant, on a constituent alike — because the verdict it
+    /// produces is `Rejected{RekorNotFound}`, not `NoAttestation`. The
+    /// distinction is deliberate and survives the 2026-09-12 amendment's
+    /// unconditional unsigned hold: an artifact whose attestation material
+    /// could not be FETCHED is a different failure from one that provably
+    /// has none, and only the latter is "the evidence has not arrived yet".
+    /// The hold-label input (`is_constituent`) is therefore not threaded
+    /// here — no hold can result.
     async fn apply_fetch_failure(
         &self,
         artifact: Artifact,
         backend: &str,
         mode: ProvenanceMode,
-        window_open: bool,
-        is_referenced_descendant: bool,
-        is_constituent: bool,
         stage: &str,
         err: crate::error::AppError,
         expected_version: ExpectedVersion,
@@ -1504,17 +1381,8 @@ impl ProvenanceOrchestrationUseCase {
                 // growing the enum — the audit event's `backend` label disambiguates
                 // which backend's fetch failed.
                 let verdict = ProvenanceVerdict::rejected(ProvenanceRejectReason::RekorNotFound);
-                self.apply_verdict(
-                    artifact,
-                    backend,
-                    verdict,
-                    mode,
-                    window_open,
-                    is_referenced_descendant,
-                    is_constituent,
-                    expected_version,
-                )
-                .await
+                self.apply_verdict(artifact, backend, verdict, mode, false, expected_version)
+                    .await
             }
             ProvenanceMode::VerifyIfPresent | ProvenanceMode::Off => {
                 tracing::warn!(
@@ -1525,17 +1393,8 @@ impl ProvenanceOrchestrationUseCase {
                      degrade to NoAttestation (allow)",
                 );
                 let verdict = ProvenanceVerdict::no_attestation();
-                self.apply_verdict(
-                    artifact,
-                    backend,
-                    verdict,
-                    mode,
-                    window_open,
-                    is_referenced_descendant,
-                    is_constituent,
-                    expected_version,
-                )
-                .await
+                self.apply_verdict(artifact, backend, verdict, mode, false, expected_version)
+                    .await
             }
         }
     }
@@ -1555,7 +1414,7 @@ fn parse_sha256_digest(digest: &str) -> Option<ContentHash> {
 /// signature bytes (ADR 0039 §8). cosign emits standard-alphabet base64. A
 /// malformed annotation yields `None` — the carriage skips it; it can never be
 /// a valid signature, and under `Required` the absence of any valid bundle
-/// folds to `Rejected{Unsigned}`.
+/// folds to `NoAttestation`, which holds.
 fn decode_simplesigning_signature(annotation: &str) -> Option<Vec<u8>> {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD

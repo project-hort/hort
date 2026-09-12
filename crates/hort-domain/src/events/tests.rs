@@ -2036,12 +2036,89 @@ fn rejection_reason_clone_eq_serde() {
         RejectionReason::CurationRetroactive { rule_id },
         // Manual-curator variant.
         RejectionReason::Curator { curator_id },
+        // Provenance-axis positive disproof.
+        RejectionReason::Provenance,
     ] {
         let cloned = src.clone();
         assert_eq!(src, cloned);
         let json = serde_json::to_string(&src).unwrap();
         let back: RejectionReason = serde_json::from_str(&json).unwrap();
         assert_eq!(src, back);
+    }
+}
+
+/// [`RejectionReason::ALL_KIND_SAMPLES`] must cover **every** variant —
+/// it is the single source both the curation-queue projection's
+/// PascalCase→wire mapping and the admin queue's `?reason=` accepted set
+/// derive from, so a variant missing here silently narrows an
+/// operator-facing filter below the data (the trap that made
+/// `?reason=provenance` a 400 for rows that existed).
+///
+/// Cross-checked against the serde wire form rather than a second hand-
+/// written list: `variant_name()` must be exactly the discriminator
+/// serde emits, and the set of samples must be distinct and complete.
+#[test]
+fn rejection_reason_kind_samples_cover_every_variant_and_match_serde() {
+    let samples = RejectionReason::ALL_KIND_SAMPLES;
+
+    // Every sample's `variant_name()` is the discriminator serde writes
+    // — a bare string for a unit variant, the single object key for a
+    // payload-carrying one. This is what the projection reads out of the
+    // event JSONB, so a drift here silently breaks the queue filter.
+    for s in samples {
+        let json: serde_json::Value = serde_json::to_value(s).unwrap();
+        let discriminator = match &json {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Object(map) => {
+                assert_eq!(map.len(), 1, "tuple/struct variant must be single-keyed");
+                map.keys().next().unwrap().clone()
+            }
+            other => panic!("unexpected RejectionReason wire shape: {other}"),
+        };
+        assert_eq!(
+            discriminator,
+            s.variant_name(),
+            "variant_name() must match the serde discriminator for {s:?}"
+        );
+    }
+
+    // Distinct — a duplicate would silently drop a kind from the
+    // derived accepted set.
+    let kinds = RejectionReason::all_wire_kinds();
+    assert_eq!(kinds.len(), samples.len());
+    let mut sorted = kinds.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        kinds.len(),
+        "wire kinds must be distinct: {kinds:?}"
+    );
+
+    // Complete — the compile-forced `wire_kind` match cannot see an
+    // omission from the sample list, so pin the full expected set. A new
+    // variant fails here until it is added to `ALL_KIND_SAMPLES`.
+    assert_eq!(
+        sorted,
+        vec![
+            "admin",
+            "curation_retroactive",
+            "curator",
+            "provenance",
+            "scan_policy_retroactive",
+            "scanner",
+        ]
+    );
+
+    // And the wire form is the snake_case lowering of the discriminator
+    // — the shape the projection's SQL CASE has to produce.
+    for s in samples {
+        assert_eq!(
+            s.wire_kind().replace('_', ""),
+            s.variant_name().to_lowercase(),
+            "wire_kind must be the snake_case lowering of {}",
+            s.variant_name()
+        );
     }
 }
 

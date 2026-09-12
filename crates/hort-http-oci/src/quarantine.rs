@@ -33,24 +33,49 @@ use super::error::OciError;
 /// `blobs.rs` / `manifests.rs`.
 const DEFAULT_QUARANTINE_RETRY_AFTER_SECS: i64 = 3600;
 
-/// Build the `Quarantined` 503 + `Retry-After` response and emit the
+/// Build the `Quarantined` 503 response and emit the
 /// `hort_download_total{format="oci", repository=<repo_key>,
 /// result="quarantined"}` counter. Callers invoke this ONLY from a
 /// `QuarantineStatus::Quarantined` match arm — see the module doc.
 ///
+/// The response carries `Retry-After` only for a hold that resolves
+/// itself with the passage of time. An artifact whose observation
+/// window has elapsed and which is still waiting on a provenance
+/// signature has no such deadline — the thing it waits for is an
+/// external event — so it answers `503` with **no** header, mirroring
+/// [`check_scan_indeterminate`] (ADR 0039's 2026-09-12 amendment, D5).
+/// Advertising `Retry-After: 1` there, which is what a past deadline
+/// clamps to, tells a well-behaved client to come back one second
+/// later, forever.
+///
+/// Both inputs are hydrated by the use-case layer
+/// (`ArtifactUseCase::hydrate_quarantine_deadline`); the format crate
+/// computes neither, and cannot — resolving a `ScanPolicy` or reading
+/// the artifact's event stream from here would reach past the use case
+/// (ADR 0008).
+///
 /// `repo_key` goes into the counter's `repository` label. It is NOT
-/// echoed in the response body, so quarantine state stays opaque to
-/// the client — only "try again later" is exposed.
+/// echoed in the response body, and the two holds are indistinguishable
+/// on the wire beyond the presence of the header, so quarantine state
+/// stays opaque to the client — only "try again later", or nothing at
+/// all, is exposed.
 pub(super) fn check_quarantine(artifact: &Artifact, repo_key: &str) -> Response {
     // Retry-After computation: seconds until the computed quarantine
     // deadline (`quarantine_deadline` is hydrated by the use-case layer;
     // the format crate never computes it), clamped to >= 1 so clients
     // don't get `Retry-After: 0` (spec-legal but easy to misparse),
-    // falling back to 1 hour when no deadline is set.
-    let retry_after_seconds = artifact
-        .quarantine_deadline
-        .map(|deadline| (deadline - Utc::now()).num_seconds().max(1))
-        .unwrap_or(DEFAULT_QUARANTINE_RETRY_AFTER_SECS);
+    // falling back to 1 hour when no deadline is set. Suppressed
+    // entirely for a hold with no self-resolving deadline.
+    let retry_after_seconds = if artifact.provenance_hold_indefinite {
+        None
+    } else {
+        Some(
+            artifact
+                .quarantine_deadline
+                .map(|deadline| (deadline - Utc::now()).num_seconds().max(1))
+                .unwrap_or(DEFAULT_QUARANTINE_RETRY_AFTER_SECS),
+        )
+    };
 
     // Emit the download-outcome counter from the short-circuit path.
     // `ArtifactUseCase::download` never runs for quarantined pulls (we
@@ -166,6 +191,51 @@ mod tests {
         // `detail.retry_after_seconds` echoes the computed delta so
         // the client can cross-check against the header.
         assert!(parsed["errors"][0]["detail"]["retry_after_seconds"].is_i64());
+    }
+
+    /// ADR 0039 D5 — the hold whose window has elapsed and which is
+    /// still waiting on a signature keeps the 503 and drops the header.
+    /// Without this the response is `Retry-After: 1` on every pull,
+    /// forever (the past-deadline clamp above).
+    #[tokio::test]
+    async fn provenance_held_past_window_is_503_with_no_retry_after() {
+        let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+        artifact.quarantine_deadline = Some(Utc::now() - Duration::seconds(60));
+        artifact.provenance_hold_indefinite = true;
+        let response = check_quarantine(&artifact, "myrepo");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response.headers().get("Retry-After").is_none(),
+            "an unsigned hold past its window has no self-resolving deadline — no Retry-After"
+        );
+        let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        // Same message as the time-bounded hold: which hold this is
+        // stays opaque to the client.
+        assert_eq!(parsed["errors"][0]["message"], "artifact is quarantined");
+        assert!(parsed["errors"][0]["detail"].is_null());
+    }
+
+    /// The converse: a hold still inside its window has a real deadline,
+    /// so its `Retry-After` is correct and useful and must survive.
+    #[tokio::test]
+    async fn hold_inside_its_window_keeps_its_retry_after() {
+        let mut artifact = sample_artifact(QuarantineStatus::Quarantined);
+        artifact.quarantine_deadline = Some(Utc::now() + Duration::seconds(60));
+        // The hydration never sets this inside the window; pinned here so
+        // the two inputs cannot be conflated into one.
+        artifact.provenance_hold_indefinite = false;
+        let response = check_quarantine(&artifact, "myrepo");
+        let secs: i64 = response
+            .headers()
+            .get("Retry-After")
+            .expect("an in-window hold keeps its computed Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((1..=60).contains(&secs), "retry-after out of range: {secs}");
     }
 
     #[tokio::test]
