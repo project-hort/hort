@@ -166,6 +166,17 @@ verify identically.**
 
 ## Amendment (2026-07-02, issue #13 — hold-until-signed)
 
+> **Superseded in part.** The "window closed ⇒ terminal `Rejected` +
+> `ProvenanceRejected{Unsigned}`" arm of this amendment (point 1 below, and the
+> expiry outcome in point 2) is superseded by
+> [ADR 0039](0039-keyed-provenance-verification.md)'s 2026-09-12 amendment: a
+> missing signature is a statement about a point in time and never produces a
+> terminal state, so the hold has no expiry on the provenance axis. Everything
+> else here stands — the hold itself, its window-awareness, the
+> `Verified`/`Rejected` arms never consulting `window_open`, the
+> re-verification triggers, and the write-authorized hold-read. That ADR owns
+> the argument; it is not restated here.
+
 The original decision applied the `NoAttestation × Required` verdict
 **terminally at ingest**. Because a keyed cosign signature signs the
 *already-pushed* digest, the image must exist before it can be signed, so the
