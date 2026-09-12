@@ -51,14 +51,17 @@
 //!   contain an `ArtifactRejected`.
 //! - `Unreachable` — the event's declared table never targets
 //!   `Rejected` from any source state; nothing to exercise.
-//! - `KnownGap` — the event reaches `Rejected` but its
-//!   emitted event set is asserted NOT to contain an `ArtifactRejected`.
-//!   This is not a legitimate exemption from D6 — see
-//!   [`QuarantineEvent::TombstoneFromCorruption`]'s arm below for the one
-//!   member of this category and why it is pinned rather than silently
-//!   passing: pinning a known-bad behaviour as an explicit, named,
-//!   commented arm is the only way a reader can tell "the guard checked
-//!   this and it currently fails" apart from "the guard never looked."
+//!
+//! There is no third verdict. This file briefly carried a `KnownGap` one,
+//! holding the single transition that reached `Rejected` without a
+//! terminal companion — `TombstoneFromCorruption`, found by this guard on
+//! its first run, on an axis it was not written for. That gap is closed
+//! (the tombstone now appends `ArtifactRejected{Corruption}`), and the
+//! verdict was removed with it rather than kept as a sanctioned shelf: a
+//! category whose only use is to record a live violation of D6 invites the
+//! next violation to be filed there instead of fixed. A future
+//! `Rejected`-reaching transition without a companion now fails this
+//! guard, which is the outcome the guard exists to produce.
 
 use hort_domain::entities::artifact::{has_terminal_rejection_event, Artifact, QuarantineStatus};
 use hort_domain::entities::quarantine_transitions::{self, QuarantineEvent};
@@ -121,10 +124,6 @@ enum RejectedArmVerdict {
     /// Reaches `Rejected`, and the entity method is proven (below) to emit
     /// an `ArtifactRejected` alongside its own axis event — D6-compliant.
     Compliant,
-    /// Reaches `Rejected` WITHOUT an `ArtifactRejected` companion. Not a
-    /// legitimate design exemption — see the arm's own comment for why it
-    /// exists and what closes it.
-    KnownGap,
 }
 
 /// Classify every [`QuarantineEvent`] for the Rejected-terminal-event
@@ -132,7 +131,7 @@ enum RejectedArmVerdict {
 /// what that buys.
 #[allow(clippy::match_same_arms)]
 fn classify(event: QuarantineEvent) -> RejectedArmVerdict {
-    use RejectedArmVerdict::{Compliant, KnownGap, Unreachable};
+    use RejectedArmVerdict::{Compliant, Unreachable};
 
     match event {
         // ── never reach Rejected (see quarantine_transitions::classify) ──
@@ -175,31 +174,16 @@ fn classify(event: QuarantineEvent) -> RejectedArmVerdict {
         // per D1/D4 — so it is not a member of this match's
         // "reaches Rejected" set to begin with).
         QuarantineEvent::CompleteProvenance => Compliant,
-
-        // ── reaches Rejected, but WITHOUT an ArtifactRejected companion ──
-        //
-        // `Artifact::tombstone_from_corruption` transitions
+        // The CAS-integrity axis (`CasScrubUseCase`). This is the arm this
+        // guard caught on its first run: the tombstone transitioned
         // `{None, Quarantined, Released, ScanIndeterminate} -> Rejected`
-        // but appends only `ArtifactCorrupted` — never `ArtifactRejected`.
-        // This is the guard finding a genuine, pre-existing D6 violation,
-        // not a legitimate design choice: `RejectionReason` has no
-        // corruption-shaped variant to carry (the entity method leaves
-        // `rejection_reason = None`), and
-        // `crates/hort-adapters-postgres/src/curation_queue_repository.rs`'s
-        // rejection-reason LATERAL JOIN resolves only `event_type =
-        // 'ArtifactRejected'` rows — its own doc comment already flags
-        // that a corruption-tombstoned artifact's rejection reason is
-        // "sourced separately if a future schema change adds it", i.e.
-        // today it resolves to nothing. A corruption-tombstoned artifact
-        // is therefore exactly the state D6 forbids: `Rejected` with no
-        // `ArtifactRejected` on the stream, unauditable via the query path
-        // every other Rejected axis uses.
-        //
-        // Pinned here as a NAMED arm — not silently passed — so
-        // `every_transition_reaching_rejected_is_checked_for_its_terminal_event`
-        // fails loudly the moment someone closes it, forcing a conscious
-        // promotion to `Compliant` instead of the fix going unnoticed.
-        QuarantineEvent::TombstoneFromCorruption => KnownGap,
+        // while appending only `ArtifactCorrupted`, so a
+        // corruption-tombstoned artifact was `Rejected` with nothing on the
+        // stream to audit it by — and the curation queue, which resolves a
+        // row's rejection reason from the latest `ArtifactRejected` alone,
+        // showed a curator no reason at all. It now appends
+        // `ArtifactRejected{Corruption}` alongside.
+        QuarantineEvent::TombstoneFromCorruption => Compliant,
     }
 }
 
@@ -289,10 +273,8 @@ fn exercise(event: QuarantineEvent) -> Vec<DomainEvent> {
         }
         QuarantineEvent::TombstoneFromCorruption => {
             let mut a = quarantined_artifact();
-            let ev = a
-                .tombstone_from_corruption(fixed_hash(), chrono::Utc::now())
-                .expect("Quarantined -> TombstoneFromCorruption is an allowed transition");
-            vec![DomainEvent::ArtifactCorrupted(ev)]
+            a.tombstone_from_corruption(fixed_hash(), chrono::Utc::now())
+                .expect("Quarantined -> TombstoneFromCorruption is an allowed transition")
         }
         QuarantineEvent::Quarantine
         | QuarantineEvent::RecordCleanScan
@@ -342,18 +324,9 @@ fn every_transition_reaching_rejected_is_checked_for_its_terminal_event() {
                     "{event:?} reaches QuarantineStatus::Rejected but its emitted event set \
                      {events:?} carries no ArtifactRejected. This is the illegal state ADR \
                      0039's 2026-09-12 amendment (D6) forbids — a terminal status the stream \
-                     cannot audit or re-derive. If this regression is intentional, reclassify \
-                     the arm KnownGap with a named, commented reason instead \
-                     of silently letting this assertion fail."
-                );
-            }
-            RejectedArmVerdict::KnownGap => {
-                let events = exercise(event);
-                assert!(
-                    !contains_artifact_rejected(&events),
-                    "{event:?} is classified KnownGap but its emitted event \
-                     set {events:?} now DOES carry an ArtifactRejected — the gap has been \
-                     closed; promote this arm to Compliant."
+                     cannot audit or re-derive. Fix the transition so it appends the \
+                     companion — this file has no verdict for one that does not, \
+                     deliberately."
                 );
             }
         }
@@ -363,9 +336,9 @@ fn every_transition_reaching_rejected_is_checked_for_its_terminal_event() {
 /// Proves the guard's own predicate actually distinguishes compliant from
 /// illegal event sets — a guard nobody has watched fail is a guard nobody
 /// knows works. Constructs the exact illegal shape D6 forbids: a
-/// transition to `Rejected` (stood in for by an `ArtifactCorrupted`
-/// companion, exactly what `TombstoneFromCorruption` above emits for
-/// real) whose event set omits `ArtifactRejected`.
+/// transition to `Rejected` whose event set carries an axis event only
+/// (here an `ArtifactCorrupted`, the shape `TombstoneFromCorruption`
+/// emitted before it appended its companion) and no `ArtifactRejected`.
 #[test]
 fn predicate_rejects_a_fabricated_event_set_with_no_terminal_companion() {
     let illegal_state_events = vec![DomainEvent::ArtifactCorrupted(ArtifactCorrupted {

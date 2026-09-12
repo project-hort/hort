@@ -18,13 +18,20 @@
   every mode holds, the three shape predicates are gone, a positive disproof
   appends an `ArtifactRejected` companion, a hold past its window drops its
   `Retry-After`, and `RepairProvenanceMisrejection` gives the previously
-  exit-less state an exit. **D6 has one known exception**, on an axis this
-  amendment did not create: `Artifact::tombstone_from_corruption` drives
-  `Rejected` while appending only `ArtifactCorrupted`. It is pinned — not
-  papered over — as a named `KnownGap` in
-  `crates/hort-domain/tests/rejected_requires_terminal_event.rs`, and closing
-  it needs a `RejectionReason` variant, which touches event serialisation and
-  is therefore its own change.
+  exit-less state an exit. **D6 now has no known exception.** The one it had
+  — on an axis this amendment did not create —
+  was `Artifact::tombstone_from_corruption` driving `Rejected` while
+  appending only `ArtifactCorrupted`. It was pinned rather than papered over
+  as a named `KnownGap` in
+  `crates/hort-domain/tests/rejected_requires_terminal_event.rs`; closing it
+  needed a `RejectionReason` variant, which touches event serialisation, so
+  it landed as its own change. The tombstone now appends
+  `ArtifactRejected{Corruption}` alongside its axis event, and that guard has
+  no `KnownGap` verdict left — a future `Rejected`-reaching transition
+  without a companion fails it rather than being filed as an exception.
+  `TerminalRejectionRecord::CorruptionTombstone` survives that fix, because
+  the event store is append-only: tombstones written before it still carry
+  `ArtifactCorrupted` alone and must stay unrepairable.
 
 ## Context
 

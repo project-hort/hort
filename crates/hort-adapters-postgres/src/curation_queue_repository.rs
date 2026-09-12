@@ -46,6 +46,7 @@
 //! | `RejectionReason::ScanPolicyRetroactive`       | `"ScanPolicyRetroactive"` (string)           | `scan_policy_retroactive` |
 //! | `RejectionReason::Curator { .. }`              | `{"Curator": {"curator_id": ".."}}`          | `curator`                 |
 //! | `RejectionReason::Provenance`                  | `"Provenance"` (string)                      | `provenance`              |
+//! | `RejectionReason::Corruption`                  | `"Corruption"` (string)                      | `corruption`              |
 //!
 //! **The wire column is not a mechanical lowering** —
 //! `ScanPolicyRetroactive` must become `scan_policy_retroactive`, not
@@ -59,10 +60,14 @@
 //! The CASE expression handles BOTH the bare-string form (unit variants)
 //! and the single-key object form (tuple variants).
 //!
-//! `corruption` is deliberately absent: it rides the separate
-//! `ArtifactCorrupted` event, whose tag is not `ArtifactRejected`, so the
-//! LATERAL never sees it. Only `RejectionReason` discriminators appear
-//! here; a corruption discriminator would need a separate source.
+//! `corruption` is here because the CAS-integrity tombstone now appends an
+//! `ArtifactRejected{Corruption}` alongside its `ArtifactCorrupted` (ADR
+//! 0039's 2026-09-12 amendment, D6) — the LATERAL reads the companion, not
+//! the axis event. Before that companion existed this column resolved to
+//! NULL for a corruption-tombstoned artifact, so a curator saw a `rejected`
+//! row with no reason at all; a **historical** tombstone (a stream written
+//! before the companion) still resolves to NULL, because the event store is
+//! append-only and this change cannot reach backwards.
 //!
 //! The lowercasing of the PascalCase JSONB key happens **inside SQL**
 //! (case-symmetry fix on commit ce043c05): both the output column and
@@ -230,6 +235,7 @@ const QUEUE_SQL: &str = r#"
                                     WHEN 'CurationRetroactive'  THEN 'curation_retroactive'
                                     WHEN 'ScanPolicyRetroactive' THEN 'scan_policy_retroactive'
                                     WHEN 'Provenance'           THEN 'provenance'
+                                    WHEN 'Corruption'           THEN 'corruption'
                                     ELSE lower(ev.event_data->'data'->>'rejected_by')
                                 END
                             WHEN jsonb_typeof(ev.event_data->'data'->'rejected_by') = 'object'
@@ -240,6 +246,7 @@ const QUEUE_SQL: &str = r#"
                                     WHEN 'CurationRetroactive'  THEN 'curation_retroactive'
                                     WHEN 'ScanPolicyRetroactive' THEN 'scan_policy_retroactive'
                                     WHEN 'Provenance'           THEN 'provenance'
+                                    WHEN 'Corruption'           THEN 'corruption'
                                     ELSE lower((SELECT k FROM jsonb_object_keys(ev.event_data->'data'->'rejected_by') k LIMIT 1))
                                 END
                             ELSE NULL

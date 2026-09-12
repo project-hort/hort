@@ -14,11 +14,16 @@
 //! - `--status <quarantined|rejected|scan_indeterminate>` → `?status=`.
 //!   Closed-set validation CLIENT-side (fail-fast with a clear "valid:"
 //!   hint).
-//! - `--reason <scanner|curator|curation_retroactive>` → `?reason=`.
-//!   Closed-set validation CLIENT-side. The server rejects `corruption`
-//!   at the boundary; the CLI mirrors the server's closed set so the
-//!   operator sees a fast client-side hint rather than burning a 400
-//!   round-trip.
+//! - `--reason <kind>` → `?reason=`. **No client-side validation** — the
+//!   CLI passes through and lets the server's 400 surface, exactly as
+//!   `--limit` does. The accepted set is the server's `RejectionReason`
+//!   vocabulary, which grows when the domain gains a rejection axis; this
+//!   crate deliberately carries no `hort-domain` dependency, so any list
+//!   here would be a hand-maintained copy and would go stale the moment
+//!   that vocabulary widened. It did: the copy that stood here still
+//!   refused `admin`, `scan_policy_retroactive` and `provenance` after the
+//!   server had begun serving rows carrying exactly those — a fast hint
+//!   turned into a fast wrong answer.
 //! - `--limit <n>` → `?limit=`. Server caps at 500. No client-side
 //!   validation — the CLI passes through and lets the server's 400
 //!   surface naturally.
@@ -64,12 +69,6 @@ use crate::output::{format_json, format_table_rows};
 /// the server re-validates (defence in depth).
 const ACCEPTED_STATUSES: &[&str] = &["quarantined", "rejected", "scan_indeterminate"];
 
-/// Accepted values for `--reason`. Mirrors the server's closed set
-/// (`scanner | curator | curation_retroactive`) — `corruption` is
-/// deliberately omitted at the server boundary.
-/// If this is widened, the server and CLI lists update together.
-const ACCEPTED_REASONS: &[&str] = &["scanner", "curator", "curation_retroactive"];
-
 fn validate_status(s: &str) -> Result<()> {
     if ACCEPTED_STATUSES.contains(&s) {
         Ok(())
@@ -77,17 +76,6 @@ fn validate_status(s: &str) -> Result<()> {
         Err(anyhow::anyhow!(
             "invalid --status {s:?} (valid: {})",
             ACCEPTED_STATUSES.join(" | "),
-        ))
-    }
-}
-
-fn validate_reason(r: &str) -> Result<()> {
-    if ACCEPTED_REASONS.contains(&r) {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "invalid --reason {r:?} (valid: {})",
-            ACCEPTED_REASONS.join(" | "),
         ))
     }
 }
@@ -149,10 +137,11 @@ pub struct QueueArgs {
     #[arg(long)]
     pub status: Option<String>,
 
-    /// Filter by rejection-reason kind (`rejected` rows only). Valid:
-    /// `scanner`, `curator`, `curation_retroactive`. Validated
-    /// client-side; `corruption` is rejected by the server so the CLI
-    /// matches the closed set.
+    /// Filter by rejection-reason kind (`rejected` rows only), e.g.
+    /// `scanner`, `curator`, `curation_retroactive`,
+    /// `scan_policy_retroactive`, `admin`, `provenance`, `corruption`.
+    /// Validated server-side (400 lists the accepted set) — the server's
+    /// vocabulary is the only authority on it.
     #[arg(long)]
     pub reason: Option<String>,
 
@@ -178,16 +167,34 @@ pub async fn run_with_output(
     out: &mut impl Write,
 ) -> Result<()> {
     // Step 1 — closed-set client-side validation (fail-fast hints).
+    // `--status` only: `QuarantineStatus` is a fixed three-value lifecycle
+    // enum, whereas `--reason` tracks the server's `RejectionReason`
+    // vocabulary and is validated there (see the module doc).
     if let Some(ref s) = args.status {
         validate_status(s)?;
     }
-    if let Some(ref r) = args.reason {
-        validate_reason(r)?;
-    }
 
-    // Step 2 — build query string. Manual assembly keeps the dep set
-    // tight (mirrors `task_list.rs:74-93` and
-    // `list_patch_candidates.rs:113-127`).
+    let resp: CurationQueueResponseDto = client.get(&build_path(&args)).await?;
+
+    match output {
+        OutputFormat::Json => {
+            writeln!(out, "{}", format_json(&resp))?;
+        }
+        OutputFormat::Table => {
+            render_table(&resp.entries, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Build the request path + query string. Manual assembly keeps the dep
+/// set tight (mirrors `task_list.rs:74-93` and
+/// `list_patch_candidates.rs:113-127`).
+///
+/// Factored out of [`run_with_output`] so the pass-through behaviour of
+/// each filter is testable without an HTTP round trip — `--reason` in
+/// particular, which this CLI must forward verbatim rather than judge.
+fn build_path(args: &QueueArgs) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(ref r) = args.repository {
         parts.push(format!("repository={}", urlencoded(r)));
@@ -201,23 +208,11 @@ pub async fn run_with_output(
     if let Some(l) = args.limit {
         parts.push(format!("limit={l}"));
     }
-    let path = if parts.is_empty() {
+    if parts.is_empty() {
         "/api/v1/admin/curation/queue".to_string()
     } else {
         format!("/api/v1/admin/curation/queue?{}", parts.join("&"))
-    };
-
-    let resp: CurationQueueResponseDto = client.get(&path).await?;
-
-    match output {
-        OutputFormat::Json => {
-            writeln!(out, "{}", format_json(&resp))?;
-        }
-        OutputFormat::Table => {
-            render_table(&resp.entries, out)?;
-        }
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -326,25 +321,71 @@ mod tests {
         assert!(err.contains("quarantined"), "lists accepted: {err}");
     }
 
-    #[test]
-    fn validate_reason_accepts_closed_set() {
-        for r in ACCEPTED_REASONS {
-            assert!(validate_reason(r).is_ok(), "{r} should be accepted");
+    fn queue_args(reason: Option<&str>) -> QueueArgs {
+        QueueArgs {
+            repository: None,
+            status: None,
+            reason: reason.map(str::to_string),
+            limit: None,
         }
     }
 
+    /// **Every reason the server's vocabulary can hold reaches it.** The
+    /// CLI once carried its own `["scanner", "curator",
+    /// "curation_retroactive"]` copy and refused the rest client-side, so
+    /// an operator asking for the rows that existed got a confident local
+    /// "invalid" instead. This crate has no `hort-domain` dependency by
+    /// design, so it cannot derive the set — it forwards instead, and the
+    /// server (which does derive it) answers.
     #[test]
-    fn validate_reason_rejects_corruption() {
-        // Server rejects `corruption` at the boundary. CLI mirrors so
-        // operator sees a client-side hint rather than a 400 round-trip.
-        let err = validate_reason("corruption").unwrap_err().to_string();
-        assert!(err.contains("valid:"), "hint present: {err}");
+    fn reason_is_forwarded_verbatim_for_every_server_side_discriminator() {
+        for reason in [
+            "scanner",
+            "admin",
+            "curation_retroactive",
+            "scan_policy_retroactive",
+            "curator",
+            "provenance",
+            "corruption",
+        ] {
+            assert_eq!(
+                build_path(&queue_args(Some(reason))),
+                format!("/api/v1/admin/curation/queue?reason={reason}")
+            );
+        }
+    }
+
+    /// Even an unknown value is forwarded: the server's 400 names the
+    /// accepted set, which is a better answer than a stale local list.
+    #[test]
+    fn reason_unknown_is_forwarded_rather_than_refused_locally() {
+        assert_eq!(
+            build_path(&queue_args(Some("bogus"))),
+            "/api/v1/admin/curation/queue?reason=bogus"
+        );
     }
 
     #[test]
-    fn validate_reason_rejects_unknown() {
-        let err = validate_reason("bogus").unwrap_err().to_string();
-        assert!(err.contains("valid:"));
+    fn build_path_without_filters_has_no_query_string() {
+        assert_eq!(
+            build_path(&queue_args(None)),
+            "/api/v1/admin/curation/queue"
+        );
+    }
+
+    #[test]
+    fn build_path_joins_every_filter() {
+        let args = QueueArgs {
+            repository: Some("npm main".into()),
+            status: Some("rejected".into()),
+            reason: Some("corruption".into()),
+            limit: Some(42),
+        };
+        assert_eq!(
+            build_path(&args),
+            "/api/v1/admin/curation/queue?repository=npm%20main&status=rejected\
+             &reason=corruption&limit=42"
+        );
     }
 
     #[test]

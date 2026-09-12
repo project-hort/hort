@@ -14,11 +14,8 @@
 //! - `reason` — rejection-reason discriminator. The accepted set is
 //!   **derived** from `RejectionReason`'s own vocabulary (`scanner |
 //!   admin | curation_retroactive | scan_policy_retroactive | curator |
-//!   provenance`), so it can never be narrower than the data the
-//!   projection emits. `corruption` is NOT a curation-queue reason —
-//!   corrupted artifacts surface via the separate `ArtifactCorrupted`
-//!   stream, so `?reason=corruption` is rejected at the boundary.
-//!   Invalid value → 400.
+//!   provenance | corruption`), so it can never be narrower than the data
+//!   the projection emits. Invalid value → 400.
 //! - `limit` — 1..=500. Default 100 when absent. Invalid range → 400.
 //!
 //! Status-code map:
@@ -77,13 +74,13 @@ use super::MAX_LIST_LIMIT;
 /// discriminators existed — a filter narrower than the data is a trap for
 /// the operator who is trying to find exactly those rows.
 ///
-/// `corruption` is deliberately still NOT accepted, and that falls out of
-/// the derivation rather than being special-cased: corruption rides on
-/// the separate `ArtifactCorrupted` event, `RejectionReason` has no
-/// corruption variant, and the LATERAL JOIN only reads
-/// `ArtifactRejected` — so `?reason=corruption` would always return
-/// empty. The 400 gives operators a clear signal instead of a silent
-/// empty list.
+/// `corruption` is accepted, and that too falls out of the derivation
+/// rather than being special-cased: the CAS-integrity tombstone appends an
+/// `ArtifactRejected{Corruption}` beside its `ArtifactCorrupted` (ADR
+/// 0039's 2026-09-12 amendment, D6), so the LATERAL JOIN reads it like any
+/// other reason and rows carrying it exist. It was correctly refused
+/// before that companion existed — the derivation flipped the answer on
+/// its own, which is the property this function is for.
 fn accepted_reasons() -> Vec<&'static str> {
     hort_domain::events::RejectionReason::all_wire_kinds()
 }
@@ -199,8 +196,7 @@ pub async fn get_queue(
 
     // Validate `?reason=` against the discriminators the projection can
     // actually emit — derived from `RejectionReason`, not restated (see
-    // `accepted_reasons`). `corruption` is not among them (corrupted
-    // artifacts surface via the separate `ArtifactCorrupted` stream);
+    // `accepted_reasons`). A value outside that set can match no row, so
     // reject with 400 rather than return a silent empty list.
     let rejection_reason_kind = match query.reason {
         None => None,
@@ -483,21 +479,29 @@ mod tests {
         assert_eq!(recorded[0].limit, 500);
     }
 
-    /// `?reason=corruption` → 400 (pinned).
+    /// `?reason=corruption` is **accepted** and threaded into the filter.
+    ///
+    /// It answered 400 while the CAS-integrity tombstone appended no
+    /// `ArtifactRejected` — correctly, since no row could carry the
+    /// discriminator. The tombstone now appends
+    /// `ArtifactRejected{Corruption}` (ADR 0039's 2026-09-12 amendment,
+    /// D6), so those rows exist and the operator triaging exactly them
+    /// must be able to ask for them.
     #[tokio::test]
-    async fn queue_reason_corruption_returns_400() {
+    async fn queue_reason_corruption_is_accepted_and_threaded_into_the_filter() {
         let (router, mocks) = harness();
         let resp = router
             .oneshot(queue_get(
-                "reason=corruption",
+                "reason=corruption&status=rejected",
                 Some(principal_with_claims(&["curate"])),
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(
-            mocks.curation_queue.recorded_filters().is_empty(),
-            "invalid reason must not reach the port"
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recorded = mocks.curation_queue.recorded_filters();
+        assert_eq!(
+            recorded[0].rejection_reason_kind.as_deref(),
+            Some("corruption")
         );
     }
 
@@ -518,6 +522,10 @@ mod tests {
         assert!(
             kinds.contains(&"provenance"),
             "the projection emits `provenance` since the ADR 0039 amendment's D6 companion"
+        );
+        assert!(
+            kinds.contains(&"corruption"),
+            "the projection emits `corruption` since the CAS tombstone gained the same companion"
         );
         for kind in kinds {
             let (router, mocks) = harness();

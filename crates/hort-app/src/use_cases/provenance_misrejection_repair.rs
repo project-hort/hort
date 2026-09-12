@@ -60,10 +60,12 @@
 //!    `has_terminal_rejection_event` predicate the D6 structural guard
 //!    (`hort-domain/tests/rejected_requires_terminal_event.rs`) applies to
 //!    the emitting side. One definition, two consumers. It also
-//!    classifies the **CAS corruption tombstone** separately: that path
-//!    reaches `Rejected` without writing the `ArtifactRejected` D6
-//!    requires, so an `ArtifactRejected`-only test would let a
-//!    verified-then-corrupted artifact through and hand corrupt bytes
+//!    classifies a **historical CAS corruption tombstone** separately:
+//!    that path now writes the `ArtifactRejected` D6 requires, but every
+//!    stream written before it does not, and the event store is
+//!    append-only. Without that second classification an
+//!    `ArtifactRejected`-only test would let one of those
+//!    verified-then-corrupted artifacts through and hand corrupt bytes
 //!    back to the release sweep.
 //! 3. a `ProvenanceVerified` on the stream — resolved via
 //!    [`resolve_provenance_clearance`], the single-source release-gate
@@ -306,7 +308,8 @@ impl ProvenanceMisrejectionRepairUseCase {
         // Conjunct 2 — cheap and highly selective, so it runs first and
         // short-circuits the clearance read for every genuine rejection.
         // Only `Absent` continues: `Present` is a recorded verdict and
-        // `CorruptionTombstone` is a CAS integrity failure, both genuine.
+        // `CorruptionTombstone` is a CAS integrity failure recorded before
+        // that axis wrote its companion — both genuine.
         let terminal_record =
             TerminalRejectionRecord::from_events(persisted.iter().map(|p| &p.event));
         if terminal_record != TerminalRejectionRecord::Absent {
