@@ -48,17 +48,24 @@ A version bump touches exactly these three files:
   sed -i '/^#/!s/<old-version>/<new-version>/g' Cargo.toml
   ```
 
-  The `/^#/!` guard is load-bearing, not defensive. The `[workspace.dependencies]`
-  block's own commentary quotes the current version twice — once as a worked
-  example of pre-release ordering, once as a verbatim `cargo` error message —
-  and a global substitution rewrites both. That turns the ordering example into
-  a different (and pointless) claim and the quoted error into one cargo never
-  emitted, silently, at every cut.
+  Keep the `/^#/!` guard. The `[workspace.dependencies]` block's commentary
+  explains pre-release ordering with a worked example and a verbatim `cargo`
+  error message, both of which quote a version literal; when that literal is
+  the version being cut, a global substitution rewrites them — turning the
+  ordering example into a different (and pointless) claim and the quoted error
+  into one cargo never emitted, silently, at every cut. That commentary
+  currently quotes a **fixed historical** example (`0.11.0-dev` /
+  `0.11.0-beta.4`), so today the guard changes nothing; it is the protection
+  against the next author writing the live version into a comment, which is
+  why it stays.
 
   Verify the count rather than trusting the command: after the substitution
   `grep -c '<old-version>' Cargo.toml` must report exactly the number of
-  comment occurrences (2 today), and `grep -c '<new-version>'` the number of
-  value sites (35 today — one marker plus 34 requirements).
+  **comment lines that quote the version being cut — 0 today**, because of the
+  fixed example above; and `grep -c '<new-version>'` the number of value sites
+  (35 today — one marker plus 34 requirements). If the first count is not zero,
+  check what it found before assuming the `sed` under-applied: a non-zero
+  answer here means a comment has started quoting the live version again.
 
   The published form of a crate has no `path` — `cargo publish` strips it and
   resolves intra-workspace dependencies through the registry — so those
