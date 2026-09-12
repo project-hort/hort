@@ -155,7 +155,7 @@ the result instead.
 | scopeguard | 1.2.0 | MIT | https://github.com/bluss/scopeguard |
 | cipher | 0.4.4 | MIT | https://github.com/RustCrypto/traits |
 | cipher | 0.5.2 | MIT | https://github.com/RustCrypto/traits |
-| reqwest | 0.13.4 | MIT | https://github.com/seanmonstar/reqwest |
+| reqwest | 0.13.5 | MIT | https://github.com/seanmonstar/reqwest |
 | md-5 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
 | sha1 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
 | sha2 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
@@ -7600,7 +7600,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### reqwest 0.13.4 — MIT
+### reqwest 0.13.5 — MIT
 
 Repository: https://github.com/seanmonstar/reqwest
 
