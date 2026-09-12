@@ -61,6 +61,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A signature that arrives late will no longer cost you the artifact**
+  (#242) — recorded as a standing decision; the enforcement change follows. Under
+  `provenanceMode: required`, an artifact whose signature had not reached Hort
+  by the end of its observation window was rejected permanently, and no later
+  successful verification could lift it — while with `cosign` the signature
+  always follows the image it signs, so a short `quarantineDuration` (a
+  sensible *exposure* choice for first-party CI, and nothing in its name says
+  it also bounds how long signing may take) silently doubled as a signing
+  deadline. The decision now says such an artifact is **held** — still
+  unpullable, still fail-closed — for as long as it takes, and that only a
+  signature which is present and invalid is ever terminal. See
+  `docs/adr/0039-keyed-provenance-verification.md`.
+
 - **Rolling a release back no longer requires rolling the schema back with
   it** (#226). Every start of `hort-server` and `hort-worker` re-runs the
   migration step with the installed binary, and the serving binary

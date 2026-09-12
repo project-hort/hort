@@ -132,6 +132,16 @@ Five invariants, each preserving a foundation:
    (mirroring the `ProvenanceClearance` param on `release()`); the domain stays
    pure.
 
+   **Incomplete, not wrong (recorded by [0039](0039-keyed-provenance-verification.md)'s
+   2026-09-12 amendment, D7).** Everything above stands: a *scan* re-judgement
+   must not clear a provenance rejection, and (a)'s reason guard is the right
+   mechanism for that. What this invariant does not do is name the **provenance
+   re-judgement** that should stand beside it — so `Rejected` arising from a
+   provenance rejection has no exit at all (`re_evaluate` is the only named exit
+   from `Rejected`, and (a) excludes exactly this rejection kind, by design).
+   That amendment stops the state from arising and owns the argument; do not
+   restate it here.
+
 ### Triggers and scope
 
 Gate-affecting `ScanPolicy` mutations run a bounded re-evaluation pass over the
