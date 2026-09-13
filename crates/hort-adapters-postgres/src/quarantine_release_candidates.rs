@@ -57,12 +57,27 @@
 //! check in `release_expired`. The cursor reorders which candidates a
 //! bounded batch re-checks first; it can never authorize a release.
 //!
-//! **Permissive opt-in preserved.** An operator policy with
-//! `quarantine_duration_secs = 0` is permissive mode — the policy
-//! *exists* but its window collapses to zero. Such repos contribute no
-//! candidates because the SQL filter drops the duration with `> 0`
-//! (matches `record_scan_result` and the rescan-candidates' `> 0`
-//! treatment).
+//! **Selection is by deadline, never by current policy.** An operator
+//! policy with `quarantine_duration_secs = 0` is permissive mode — the
+//! policy *exists* but its window collapses to zero. That is a window of
+//! zero length, not an absent one: its cutoff is `now`, so every artifact
+//! such a repo still holds is past its deadline and is selected here. In
+//! steady state that set is empty — both minting paths in
+//! `IngestUseCase` (`decide_and_apply_quarantine` and
+//! `register_by_hash_inner`) skip the `Quarantined` transition outright
+//! when the resolved duration is `<= 0` — so admitting these repos costs
+//! nothing. The set is non-empty exactly in the cases that matter: an
+//! artifact held under a longer window that an operator has since
+//! shortened, or one a corrective path
+//! (`ProvenanceMisrejectionRepairUseCase`) put back into the hold. Those
+//! artifacts have no other exit — nothing moves `quarantine_window_start`
+//! once it is stamped — so excluding their repo from candidacy strands
+//! them `quarantined` permanently.
+//!
+//! Whether a selected artifact may actually be released is decided per
+//! artifact in `release_expired`: the scan-axis authority (ADR 0007) and
+//! the provenance clearance (ADR 0027). Nothing in this module authorizes
+//! a release.
 //!
 //! See `crates/hort-app/src/task_handlers/quarantine_release_sweep.rs`
 //! for the handler that consumes this port and feeds the result into
@@ -217,24 +232,37 @@ impl QuarantineReleaseCandidatesRepository for PgQuarantineReleaseCandidatesRepo
             // same three-tier resolution every other consumer of the
             // quarantine window uses (`QuarantineUseCase::record_scan_result`,
             // the scan fast path, `is_window_elapsed`, the read-path
-            // deadline). A resolved duration of `<= 0` (the permissive
-            // opt-in: an explicit policy with `quarantine_duration_secs =
-            // 0`) still contributes no candidates — permissive mode is
-            // exactly "no quarantine hold," so no release-sweep work.
+            // deadline).
+            //
+            // Every resolved duration is grouped, none is discarded: this
+            // step selects by DEADLINE only. A permissive window is a
+            // zero-length window, not an absent one — its cutoff is `now`,
+            // which is the same arithmetic
+            // `effective_quarantine_deadline(anchor, 0)` gives the scan
+            // fast path — so every artifact the repo still holds is past
+            // its deadline and belongs in the candidate set. Deciding here
+            // that a repo's artifacts should not be released would be an
+            // authority decision, and those belong to `release_expired`
+            // (ADR 0007 scan authority, ADR 0027 provenance clearance).
+            //
+            // The `.max(0)` clamp makes zero and negative resolve the same
+            // way — both say the window is behind us — and keeps the
+            // cutoff off the future side of `now`, where a negative
+            // duration would otherwise select rows whose window has NOT
+            // elapsed.
             let mut by_duration: HashMap<i64, Vec<Uuid>> = HashMap::new();
             for repo in quarantined_repos {
-                let effective = repo_scoped
+                let secs = repo_scoped
                     .get(&repo)
                     .copied()
                     .or(global_duration)
-                    .or(Some(DefaultPolicy::quarantine_duration_secs()));
-                if let Some(secs) = effective {
-                    if secs > 0 {
-                        by_duration.entry(secs).or_default().push(repo);
-                    }
-                }
+                    .unwrap_or_else(DefaultPolicy::quarantine_duration_secs)
+                    .max(0);
+                by_duration.entry(secs).or_default().push(repo);
             }
 
+            // Reachable only when no repository holds a quarantined
+            // artifact at all — the honest meaning of "no candidates".
             if by_duration.is_empty() {
                 return Ok(Vec::new());
             }
@@ -441,8 +469,29 @@ mod tests {
     }
 
     /// Seed a non-archived repository-scoped policy with the requested
-    /// `quarantine_duration_secs`.
+    /// `quarantine_duration_secs`, leaving `provenance_mode` at the
+    /// column default (`verify_if_present`).
     async fn seed_repo_scoped_policy(pool: &PgPool, repo_id: Uuid, quarantine_duration_secs: i64) {
+        seed_repo_scoped_policy_with_provenance(
+            pool,
+            repo_id,
+            quarantine_duration_secs,
+            "verify_if_present",
+        )
+        .await;
+    }
+
+    /// Seed a non-archived repository-scoped policy with an explicit
+    /// `provenance_mode`. `provenance_backends` stays at its
+    /// `{cosign}` default so the
+    /// `policy_projections_provenance_backends_nonempty_unless_off`
+    /// constraint holds for every mode.
+    async fn seed_repo_scoped_policy_with_provenance(
+        pool: &PgPool,
+        repo_id: Uuid,
+        quarantine_duration_secs: i64,
+        provenance_mode: &str,
+    ) {
         let policy_id = Uuid::new_v4();
         let name = format!("it-qrc-policy-{}", policy_id.simple());
         let scope = json!({ "Repository": repo_id });
@@ -450,12 +499,12 @@ mod tests {
             r#"INSERT INTO public.policy_projections (
                    policy_id, name, scope, severity_threshold,
                    rescan_interval_hours, quarantine_duration_secs,
-                   require_approval, archived,
+                   require_approval, archived, provenance_mode,
                    stream_version
                ) VALUES (
                    $1, $2, $3, 'high',
                    24, $4,
-                   false, false,
+                   false, false, $5,
                    1
                )"#,
         )
@@ -463,6 +512,7 @@ mod tests {
         .bind(&name)
         .bind(&scope)
         .bind(quarantine_duration_secs)
+        .bind(provenance_mode)
         .execute(pool)
         .await
         .expect("seed repo-scoped policy_projections row");
@@ -558,25 +608,32 @@ mod tests {
         );
     }
 
-    /// Permissive opt-in: an explicit repo-scoped policy with
-    /// `quarantine_duration_secs = 0` must never contribute a candidate,
-    /// no matter how long ago the artifact's window started. The
-    /// default-duration fallback added by this fix must not override an
-    /// operator's explicit zero.
+    /// **Production strand regression.** A repository switched to
+    /// `quarantine_duration_secs = 0` while artifacts sat inside a longer
+    /// window: those artifacts must still be selected. Nothing else moves
+    /// `quarantine_window_start` once it is stamped, so a repo excluded
+    /// from candidacy holds its artifacts `quarantined` forever with
+    /// `release_attempt_at = NULL` — the observed failure (29 artifacts
+    /// held nineteen days, recoverable only by a manual per-artifact
+    /// waive).
+    ///
+    /// A zero window is a window of zero length: its cutoff is `now`, so
+    /// every held artifact is past its deadline.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    async fn select_expired_explicit_zero_duration_never_a_candidate() {
+    async fn select_expired_zero_window_repo_still_selects_artifacts_held_under_a_prior_window() {
         let Some(pool) = maybe_pool().await else {
             eprintln!("skipping: no DATABASE_URL");
             return;
         };
 
         let repo = seed_repo(&pool).await;
+        // The switch already happened: the live policy is permissive...
         seed_repo_scoped_policy(&pool, repo, 0).await;
         let now = Utc::now();
-        // Started far in the past — would be well past the default
-        // window if the zero-duration policy did not exist.
-        let started = now - chrono::Duration::days(365);
+        // ...but the artifact was anchored minutes before it, well inside
+        // the 24h window that was in force at ingest.
+        let started = now - chrono::Duration::minutes(12);
         let artifact = seed_quarantined_artifact(&pool, repo, started).await;
 
         let out = PgQuarantineReleaseCandidatesRepository::new(pool)
@@ -584,9 +641,134 @@ mod tests {
             .await
             .expect("select_expired Ok");
 
+        assert_eq!(
+            out.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+            vec![artifact],
+            "an artifact held under a prior window must stay selectable after the repo \
+             goes permissive — the sweep is its only exit",
+        );
+    }
+
+    /// Selection never consults the provenance gate. A held artifact in a
+    /// permissive repo under `provenance_mode = 'required'` is a
+    /// candidate exactly like any other; whether it may be RELEASED is
+    /// `release_expired`'s decision (ADR 0027), and the app-layer sweep
+    /// test
+    /// `release_expired_zero_window_repo_holds_a_provenance_required_candidate`
+    /// pins that it refuses and enqueues the final `provenance-verify`.
+    ///
+    /// The pair matters: permissive is an opt-in on the quarantine
+    /// window, never an opt-out of provenance, and the two halves of that
+    /// claim live in two layers.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_zero_window_repo_selects_a_provenance_required_candidate() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy_with_provenance(&pool, repo, 0, "required").await;
+        let now = Utc::now();
+        let artifact =
+            seed_quarantined_artifact(&pool, repo, now - chrono::Duration::minutes(12)).await;
+
+        let out = PgQuarantineReleaseCandidatesRepository::new(pool)
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        assert_eq!(
+            out.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+            vec![artifact],
+            "candidacy is deadline-only: a provenance-Required artifact is selected and \
+             then refused by the release gate, not hidden from the sweep",
+        );
+    }
+
+    /// A permissive repository that holds nothing contributes nothing:
+    /// step 1 selects only repositories with a `quarantined` row, so the
+    /// repo never reaches the grouping at all and no per-duration scan
+    /// runs for it. This is what makes admitting zero-duration repos free
+    /// in steady state — under `quarantineDuration: 0` ingest never
+    /// quarantines, so the held set is empty.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_zero_window_repo_with_no_quarantined_artifacts_contributes_nothing() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let empty_repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy(&pool, empty_repo, 0).await;
+        // A second, policy-less repo that DOES hold an expired artifact,
+        // so the query has work to do and the assertion is about the
+        // permissive repo's absence rather than about an empty result.
+        let holding_repo = seed_repo(&pool).await;
+        let now = Utc::now();
+        let held = seed_quarantined_artifact(
+            &pool,
+            holding_repo,
+            now - chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs() + 1),
+        )
+        .await;
+
+        let out = PgQuarantineReleaseCandidatesRepository::new(pool)
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        assert_eq!(
+            out.iter().map(|c| c.artifact_id).collect::<Vec<_>>(),
+            vec![held],
+            "a repo holding no quarantined artifact contributes no candidates",
+        );
+    }
+
+    /// A negative `quarantine_duration_secs` behaves exactly as zero. The
+    /// column is a plain `bigint NOT NULL` with no non-negativity CHECK,
+    /// so the adapter — which reads the projection, not the validated
+    /// YAML — can encounter one.
+    ///
+    /// The clamp is what keeps the cutoff at `now` instead of
+    /// `now + |secs|`: an unclamped negative duration would put the
+    /// cutoff in the FUTURE and select artifacts whose window has not
+    /// elapsed, turning a bad row into an early release.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn select_expired_negative_duration_behaves_as_zero_without_a_future_cutoff() {
+        let Some(pool) = maybe_pool().await else {
+            eprintln!("skipping: no DATABASE_URL");
+            return;
+        };
+
+        let repo = seed_repo(&pool).await;
+        seed_repo_scoped_policy(&pool, repo, -3600).await;
+        let now = Utc::now();
+        // Anchored in the past: past the clamped (zero) window.
+        let elapsed =
+            seed_quarantined_artifact(&pool, repo, now - chrono::Duration::minutes(5)).await;
+        // Anchored in the future: inside any window, and the row an
+        // unclamped `now - (-3600s)` cutoff would wrongly select.
+        let not_yet =
+            seed_quarantined_artifact(&pool, repo, now + chrono::Duration::minutes(30)).await;
+
+        let out = PgQuarantineReleaseCandidatesRepository::new(pool)
+            .select_expired(1000, now)
+            .await
+            .expect("select_expired Ok");
+
+        let ids: Vec<Uuid> = out.iter().map(|c| c.artifact_id).collect();
+        assert_eq!(
+            ids,
+            vec![elapsed],
+            "a negative duration resolves to a cutoff of `now`, exactly as zero does",
+        );
         assert!(
-            !out.iter().any(|c| c.artifact_id == artifact),
-            "quarantine_duration_secs = 0 must permanently exclude the repo from candidacy"
+            !ids.contains(&not_yet),
+            "the cutoff must never land after `now` — that would select an unelapsed window",
         );
     }
 
