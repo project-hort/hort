@@ -126,6 +126,49 @@ index's served set therefore depends on identity, that route emits
 "never ingested" tier — and only that tier (its truth table is in the
 `index_filters` module documentation).
 
+### Dropping a version from resolution is not the same as being silent about it
+
+The filter's property is about **resolution**: a range, a bare install
+or `latest` must not be able to resolve to a version the content route
+would refuse. Being silent about *why* a version is missing is a
+separate thing, and for a long time the two were conflated — with the
+result that the two surfaces of the same registry contradicted each
+other. The content route answers a held version with `503` and a
+`Retry-After`; the catalog dropped it from `versions{}` and from
+`dist-tags`, so a client asking "what versions exist?" was told it did
+not exist. That cost two days of misdiagnosis in production once: a
+pinned `package-lock.json` install failed, and everyone who then checked
+the packument concluded the version was missing upstream.
+
+npm closes it with an additive top-level `hort.held` block naming the
+withheld versions, their reason, and — for a timed hold — when it lifts
+(`crates/hort-formats/src/npm/index.rs`). The block is **outside** the
+resolution surface: `versions{}` and `dist-tags` come out byte-identical
+to the same input's output without it, and the abbreviated
+per-version / tag route resolves through the filtered set alone, so
+nothing there becomes reachable. It is omitted entirely when nothing is
+held. Operator-facing detail:
+[`npm-pull-through.md` §8](../how-to/npm-pull-through.md).
+
+Two rules make the block honest rather than a second lie. `status`
+distinguishes a timed hold (`quarantined`) from a verdict (`rejected`,
+`scan_indeterminate`), because telling a client to wait for a version
+that was rejected is a lie in the opposite direction. And
+`available_after` is computed from the same window anchor and resolved
+policy duration the content route's `Retry-After` counts down to
+(`ArtifactUseCase::package_hold_deadlines` and
+`ArtifactUseCase::hydrate_quarantine_deadline` share one window
+resolver), so the two surfaces cannot name different instants; where it
+cannot be computed the field is absent rather than guessed.
+
+Unlike the hold-read exemption above, this is not identity-dependent:
+npm composes the ordinary reader's pipeline for every caller and derives
+the block from repository state alone, so the response stays as
+cacheable as it was. The information it surfaces is the same information
+the content route already gives any `Read`-authorized caller who asks
+for the tarball — a `503` rather than a `404` — with the guessing
+removed.
+
 The ordering convention is `[universal, mode-specific,
 operator-defined]`, and the universal filter holding the first slot
 is what makes the no-data-leak property independent of everything

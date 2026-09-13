@@ -59,6 +59,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   simply fetched on first access as before. Both bounds are fixed internal
   limits, not settings: there is nothing here for an operator to tune.
 
+- **An npm packument now says which versions Hort is holding, instead of
+  leaving them looking as if they never existed** (#251). Two surfaces of the
+  same registry used to contradict each other. Asking for a held version's
+  tarball returned `503` with a `Retry-After` — the truth. Asking the catalog
+  what versions exist left it out of `versions{}` and out of `dist-tags`, so
+  anyone checking concluded the version was missing upstream. In production
+  that cost two days: a pinned `package-lock.json` install failed, and every
+  human who then read the packument drew the wrong conclusion.
+
+  The packument now carries an additional top-level `hort` block naming each
+  withheld version, why it is withheld, and — for a version inside its
+  observation window — when the hold lifts:
+
+  ```json
+  "hort": { "held": [ { "version": "7.29.7", "status": "quarantined",
+                        "available_after": "2026-08-26T08:18:00Z" } ] }
+  ```
+
+  `status` distinguishes a version that is *waiting* (`quarantined`) from one a
+  scan verdict went against (`rejected`, `scan_indeterminate`) — telling a
+  client to wait for a rejected version would be a lie in the other direction,
+  so those carry no deadline at all. `available_after` is computed from the
+  same window the tarball route's `Retry-After` counts down to, so the two
+  answers cannot drift; where Hort cannot compute it the field is absent rather
+  than guessed. The whole block is omitted when nothing is held, so an ordinary
+  packument does not grow a key.
+
+  **Nothing about resolution changes.** `versions{}` and `dist-tags` come out
+  byte-identical to before, and the per-version route still refuses a held
+  version, so a version range, a bare `npm install` or `latest` still cannot
+  resolve to something that would `503`. That is the reason the versions are
+  withheld in the first place; the block only stops the catalog being silent
+  about it. `npm-pull-through.md` now documents the whole diagnosis path,
+  including how to tell a `503` (Hort has it, briefly) from a `404` (nobody
+  published it).
+
 ### Changed
 
 - **A signature that arrives late will no longer cost you the artifact**
