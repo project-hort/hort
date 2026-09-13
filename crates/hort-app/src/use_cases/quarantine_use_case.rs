@@ -2556,6 +2556,24 @@ mod tests {
         projections.insert(p);
     }
 
+    /// Seed an active repo-scoped policy whose quarantine window is the
+    /// **permissive zero** (`quarantine_duration_secs = 0`). Returned so
+    /// a test can assert the premise it depends on rather than inherit it
+    /// silently from [`projection`]'s defaults: permissive is an opt-in
+    /// on the observation window only, and the tests that use this exist
+    /// to pin that it changes nothing about the release gates.
+    fn seed_permissive_policy(
+        projections: &Arc<MockPolicyProjectionRepository>,
+        repository_id: Uuid,
+    ) -> ScanPolicyProjection {
+        let p = projection(
+            PolicyScope::Repository(repository_id),
+            SeverityThreshold::Critical,
+        );
+        projections.insert(p.clone());
+        p
+    }
+
     /// Seed a repo-scoped policy in `enforcement: record` mode. Scanning
     /// stays ON (`scan_backends: ["trivy"]`) — `record` is orthogonal to
     /// the waiver.
@@ -5043,7 +5061,7 @@ mod tests {
     fn seed_required_provenance_policy(
         projections: &Arc<MockPolicyProjectionRepository>,
         repository_id: Uuid,
-    ) {
+    ) -> ScanPolicyProjection {
         let mut p = projection(
             PolicyScope::Repository(repository_id),
             SeverityThreshold::Critical,
@@ -5057,7 +5075,8 @@ mod tests {
             )
             .expect("valid identity pattern"),
         ];
-        projections.insert(p);
+        projections.insert(p.clone());
+        p
     }
 
     /// Seed an artifact stream carrying
@@ -5222,6 +5241,118 @@ mod tests {
             "an artifact that was held indefinitely must still release the tick after \
              its signature arrives"
         );
+    }
+
+    // =====================================================================
+    // Permissive window (`quarantine_duration_secs = 0`) — what the sweep
+    // does with an artifact stranded by a mid-window switch to permissive.
+    //
+    // Candidacy is the adapter's half and is pinned there
+    // (`hort-adapters-postgres`'s
+    // `select_expired_zero_window_repo_still_selects_artifacts_held_under_a_prior_window`
+    // and `..._selects_a_provenance_required_candidate`): a zero-length
+    // window puts the cutoff at `now`, so every held artifact is past its
+    // deadline. These two pin the other half — that becoming a candidate
+    // buys no authority it did not already have.
+    // =====================================================================
+
+    /// A permissive repository's stranded artifact releases on the
+    /// ORDINARY scan-axis authority once the sweep reaches it: the
+    /// existing `(ReleaseReason::Timer,
+    /// ReleaseAuthorization::ScanSucceeded)` pair, minted from its own
+    /// clean `ScanCompleted`. The permissive window is not the reason it
+    /// releases — it is only the reason it is a candidate.
+    #[tokio::test]
+    async fn release_expired_releases_an_artifact_stranded_by_a_switch_to_a_zero_window() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let policy = seed_permissive_policy(&projections, repo_id);
+        assert_eq!(
+            policy.quarantine_duration_secs, 0,
+            "premise: the repository's live window is the permissive zero"
+        );
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
+
+        assert_eq!(released, vec![artifact_id]);
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        let DomainEvent::ArtifactReleased(ev) = &batch.events[0].event else {
+            panic!("ArtifactReleased expected");
+        };
+        assert_eq!(
+            ev.released_by,
+            ReleaseReason::Timer,
+            "the timer arm, not a new permissive-mode authority"
+        );
+        assert!(ev.released_by_user_id.is_none());
+    }
+
+    /// **Permissive is an opt-in on the quarantine window, never an
+    /// opt-out of ADR 0027.** The same repository under `provenance_mode:
+    /// Required` with no `ProvenanceVerified`: the candidate is refused
+    /// fail-closed and receives its final `provenance-verify` instead.
+    ///
+    /// This is the security property the deadline-only candidacy query
+    /// must not collapse — an implementation that read "the repository is
+    /// permissive" as "release these artifacts" would hand out an
+    /// unverified artifact here.
+    #[tokio::test]
+    async fn release_expired_zero_window_repo_holds_a_provenance_required_candidate() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // The scan gate passes; only provenance is outstanding.
+        seed_stream_with_scan_completed(&events, artifact_id);
+        let policy = seed_required_provenance_policy(&projections, repo_id);
+        assert_eq!(
+            policy.quarantine_duration_secs, 0,
+            "premise: the repository's live window is the permissive zero"
+        );
+        assert_eq!(policy.provenance_mode, ProvenanceMode::Required);
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            summary.released.is_empty(),
+            "a Required + Pending candidate is never released, permissive window or not"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "fail-closed: no release transition committed"
+        );
+        assert_eq!(
+            summary.skipped_provenance_pending, 1,
+            "the hold is attributed to the provenance gate"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Quarantined,
+            "the artifact stays held"
+        );
+
+        // …and the terminal decision is still pursued: one final
+        // provenance-verify for this artifact.
+        let calls = jobs.enqueue_calls();
+        assert_eq!(calls.len(), 1);
+        let (kind, params, actor_id) = &calls[0];
+        assert_eq!(kind, "provenance-verify");
+        assert_eq!(
+            params.get("artifact_id").and_then(|v| v.as_str()),
+            Some(artifact_id.to_string().as_str())
+        );
+        assert!(actor_id.is_none(), "expiry backstop is system-driven");
     }
 
     /// The hold's **age** rides the summary alongside its count, and the
