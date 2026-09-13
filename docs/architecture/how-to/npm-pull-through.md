@@ -3,9 +3,10 @@
 This guide is for operators who want a Remote npm repository in
 `hort` that proxies `registry.npmjs.org` (or a private npm
 mirror) and serves packuments and tarballs to `npm`. It covers the
-YAML to declare, the `.npmrc` shape, and how to read the four `502`
+YAML to declare, the `.npmrc` shape, how to read the four `502`
 responses you may see when verification rejects an upstream tarball
-or its packument.
+or its packument, and how to tell a version hort is *holding* (`503`)
+apart from one that does not exist (`404`).
 
 For the architectural rationale see
 [ADR 0006 — mandatory upstream verification](../../adr/0006-mandatory-upstream-verification.md).
@@ -305,7 +306,122 @@ every cache miss that successfully verifies.
 
 ---
 
-## 8. What is NOT covered
+## 8. Diagnose a `503` — a version hort is holding
+
+A `502` means verification rejected something. A **`503` means the
+opposite**: the bytes verified, hort has them, and it is deliberately
+not serving them yet.
+
+### What you will see
+
+A pinned install — `npm ci` against a `package-lock.json`, or
+`npm install pkg@7.29.7` — fails hard:
+
+```
+npm error 503 Service Unavailable - GET http://hort.example.com/npm/npm-public/pkg/-/pkg-7.29.7.tgz
+```
+
+The response carries a `Retry-After` header in seconds and the body
+`{"error":"artifact is quarantined"}`.
+
+**This is intended.** The version is inside its scan observation window
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)):
+hort ingested and checksum-verified it, has not finished deciding
+whether it is safe, and fails closed rather than serving unvetted bytes.
+A lockfile names an exact version, so there is nothing for the client to
+fall back to — the install fails rather than silently resolving
+something else. A *non-pinned* install of the same package succeeds
+against a different version, because the served index never offers a
+held one (see §8.3).
+
+### 8.1. Tell "held" apart from "does not exist"
+
+Two different problems produce a failed install, and they are
+distinguished by the response code on the **tarball** route:
+
+| You asked for | hort answers | Means |
+|---|---|---|
+| a held version's tarball | `503` + `Retry-After` | hort has it; the observation window has not elapsed |
+| a rejected version's tarball | `403` | hort has it and a scan verdict went against it — permanent |
+| a version nothing published | `404` | hort has never seen it, and neither has the upstream it proxies |
+
+The **packument** answers the same question without guessing a tarball
+URL. `GET /npm/<repo-key>/<pkg>` carries an additional top-level `hort`
+block listing every version the served index is withholding, and why:
+
+```json
+{
+  "name": "pkg",
+  "versions": { "…only the versions hort will serve…" },
+  "dist-tags": { "latest": "7.29.6" },
+  "hort": {
+    "held": [
+      { "version": "7.29.7", "status": "quarantined",
+        "available_after": "2026-08-26T08:18:00Z" }
+    ]
+  }
+}
+```
+
+- `status: quarantined` — a timed hold. It resolves on its own.
+- `status: rejected` — a scan verdict went against the version. It is
+  not waiting for anything and carries no `available_after`; only an
+  operator decision (see
+  [`curator-workflow.md`](curator-workflow.md)) changes it.
+- `status: scan_indeterminate` — the scanner could not decide, and hort
+  fails closed. Also terminal, also no `available_after`.
+- `available_after` is the instant the hold lifts, computed from the
+  same window the tarball route's `Retry-After` counts down to. It is
+  **omitted** when hort cannot compute it (no recorded window anchor, or
+  a `type: virtual` repository, which holds no artifact rows of its own
+  and aggregates its members' — query the member repository directly for
+  the deadline). An absent field means "not known", never "no deadline".
+
+The `hort` key is **absent entirely** when nothing is held, so a
+packument that carries no `hort` block is one where every version hort
+knows about is servable.
+
+A version that appears in **neither** `versions{}` nor `hort.held` is
+one hort holds nothing for: on a Proxy repo under the default
+`indexMode: releasedOnly` that is an upstream version hort has not
+pulled through yet (requesting it pulls it normally), and otherwise it
+is a version that was never published.
+
+### 8.2. Wait, or release it
+
+The condition is temporary. Options, in order of preference:
+
+1. **Wait** until `available_after` and re-run the install. The window
+   is `quarantineDuration` on the active `ScanPolicy`.
+2. **Release it early**, if the scan has completed and you accept the
+   findings — the curator flow in
+   [`curator-workflow.md`](curator-workflow.md).
+3. **Shorten the window** for the repository via its `ScanPolicy`. This
+   weakens the guarantee for every consumer of that repository, not just
+   the blocked one; prefer 1 or 2.
+
+Re-running `npm ci` before the window elapses returns the same `503`.
+
+### 8.3. Why the held version is not in `versions{}`
+
+The served index lists only versions hort holds in a servable status, so
+that a range (`^7.29.0`), a bare `npm install pkg`, or `latest` can
+never resolve to a version that would `503`. That property protects
+every consumer of the repository, and it is why the hold costs only the
+pinned installs rather than all of them.
+
+It says nothing about whether the catalog may *explain* a version's
+absence — which is exactly what the `hort.held` block does. The block
+lives outside the resolution surface: `versions{}` and `dist-tags` are
+byte-identical to what they would be without it, and the
+`GET /npm/<repo>/<pkg>/<version-or-tag>` route resolves through the same
+filtered set, so a held version stays unresolvable there too. Nothing in
+the block makes a held version reachable; it only stops the catalog
+being silent about one.
+
+---
+
+## 9. What is NOT covered
 
 A few related concerns are deliberately out of scope for the npm
 verified-pull-through path. Recorded here so operators do not
@@ -330,7 +446,7 @@ expect them as configuration knobs:
 
 ---
 
-## 9. See also
+## 10. See also
 
 - [ADR 0006 — mandatory upstream verification](../../adr/0006-mandatory-upstream-verification.md)
   — architectural rationale and the type-system invariants for the

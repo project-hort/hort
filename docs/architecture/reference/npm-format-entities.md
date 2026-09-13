@@ -23,6 +23,7 @@ them: for each, its wire shape, whether hort **stores**, **derives**, or
 | Packument | **Derived** (built per request, never stored) | `NpmIndexBuilder::build` |
 | `dist` object | **Derived** from stored fields | builder |
 | `dist-tags` | **Stored and intersected** — full map, ∩ served set | proxy: cached projection · hosted: `mutable_refs` |
+| `hort.held` block | **Derived**, diagnostic — outside the resolution surface; omitted when empty | `NpmIndexBuilder::build` |
 | Scope / name | **Normalised** at the edge | format handler |
 | Publish envelope | **Consumed** (subset; `dist-tags` → refs), not stored | streaming publish parser |
 | Upstream packument | **Cached projection**, not served verbatim | `CachedNpmProjection` |
@@ -82,6 +83,53 @@ entries, then the filter pipeline (`NonServableStatusFilter`,
 packument therefore never advertises a version hort would refuse to serve
 — the load-bearing invariant of the whole serve path. An empty served set
 yields empty `versions{}` and **no** `dist-tags` block.
+
+That invariant is about **resolution**, not silence: the packument also
+carries the `hort.held` block below, which names what was withheld
+without making any of it reachable.
+
+### `hort.held` block — derived, diagnostic, outside the resolution surface
+
+A top-level `hort` key carrying one entry per version the filter pipeline
+withheld:
+
+```json
+"hort": { "held": [ { "version": "7.29.7", "status": "quarantined",
+                      "available_after": "2026-08-26T08:18:00Z" } ] }
+```
+
+It exists because "dropped from the served set" and "does not exist" are
+otherwise the same wire answer, while the tarball route already answers a
+held version `503` rather than `404` — two surfaces of one registry
+contradicting each other.
+
+- **Membership** is exactly what `NonServableStatusFilter` drops: a
+  version hort holds locally in a non-servable status. A version hort has
+  never ingested (`status == None`, withheld by `IndexModeFilter` under
+  `releasedOnly`) is **not** listed — hort has no verdict on it and no
+  hold over it, and on a proxy repo those are most of the upstream
+  catalog.
+- **`status`** is `quarantined` (a timed hold, resolves on its own),
+  `rejected`, or `scan_indeterminate` (both terminal). The distinction is
+  load-bearing: only the first carries `available_after`, because telling
+  a client to wait for a rejected version would be a lie in the opposite
+  direction from the one the block exists to fix.
+- **`available_after`** is `effective_quarantine_deadline(anchor,
+  resolved policy duration)` — the same instant the tarball `503`'s
+  `Retry-After` counts down to (`ArtifactUseCase::package_hold_deadlines`
+  and `::hydrate_quarantine_deadline` share one window resolver).
+  **Omitted, never `null` or zero**, when hort cannot compute it: a held
+  row with no `quarantine_window_start`, or a `type: virtual` repository,
+  which holds no artifact rows of its own (ADR 0031).
+- **Omitted entirely** when nothing is held — an ordinary packument does
+  not grow a key.
+- **Not a resolution surface.** `versions{}` and `dist-tags` are
+  byte-identical to the same input's output without the block, and the
+  abbreviated per-version / tag route resolves through the filtered set
+  alone, so nothing here is reachable. Identity-independent: npm composes
+  the ordinary reader's `HeldVisibility::Hidden` for every caller, so
+  unlike the cargo index (ADR 0055) the response implies no
+  `Vary: Authorization`.
 
 ### `dist` object — derived from stored fields
 
