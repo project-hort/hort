@@ -1569,10 +1569,10 @@ quality:site-build:
   after_script:
     - rm -f /tmp/cosign.key
 
-# Single hort-server image. Tag policy:
-#   - SemVer tag (vX.Y.Z, vX.Y.Z-rc.N, or vX.Y.Z-beta.N): push
-#     :${CI_COMMIT_TAG#v} only; stable releases additionally push :latest,
-#     pre-release (rc / beta) tags do NOT.
+# Single hort-server image. Tag policy (see .gitlab/ci/resolve-version-tag.sh):
+#   - SemVer tag (vX.Y.Z, or vX.Y.Z-<pre-release>): push :${CI_COMMIT_TAG#v}
+#     only; a stable tag (no pre-release suffix) additionally pushes
+#     :latest, any pre-release (alpha / beta / rc / ...) does NOT.
 #   - main branch:                        push :${CI_COMMIT_SHORT_SHA} AND :latest.
 #   - release/* branch:                   push :${CI_COMMIT_SHORT_SHA} only;
 #     no :latest so a maintenance build can't clobber main's :latest.
@@ -1606,22 +1606,9 @@ build-images:hort-server:
       set -euo pipefail
       IMAGE="${REGISTRY}/${IMAGE_PREFIX}/hort-server"
 
-      # Resolve primary version tag and whether to also push :latest.
-      PUSH_LATEST="false"
-      if [ -n "${CI_COMMIT_TAG:-}" ]; then
-        VERSION_TAG="${CI_COMMIT_TAG#v}"
-        case "${VERSION_TAG}" in
-          *-rc.*|*-beta.*) PUSH_LATEST="false" ;;
-          *)      PUSH_LATEST="true"  ;;
-        esac
-      elif [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
-        VERSION_TAG="${CI_COMMIT_SHORT_SHA}"
-        PUSH_LATEST="true"
-      else
-        # release/* branches: SHA tag only.
-        VERSION_TAG="${CI_COMMIT_SHORT_SHA}"
-        PUSH_LATEST="false"
-      fi
+      # Resolve primary version tag and whether to also push :latest --
+      # shared with build-images:hort-worker, see the script for the policy.
+      . ${CI_PROJECT_DIR}/.gitlab/ci/resolve-version-tag.sh
 
       echo "=== build plan ==="
       echo "  IMAGE=${IMAGE}"
@@ -1703,22 +1690,9 @@ build-images:hort-worker:
       set -euo pipefail
       IMAGE="${REGISTRY}/${IMAGE_PREFIX}/hort-worker"
 
-      # Resolve primary version tag and whether to also push :latest.
-      PUSH_LATEST="false"
-      if [ -n "${CI_COMMIT_TAG:-}" ]; then
-        VERSION_TAG="${CI_COMMIT_TAG#v}"
-        case "${VERSION_TAG}" in
-          *-rc.*|*-beta.*) PUSH_LATEST="false" ;;
-          *)      PUSH_LATEST="true"  ;;
-        esac
-      elif [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
-        VERSION_TAG="${CI_COMMIT_SHORT_SHA}"
-        PUSH_LATEST="true"
-      else
-        # release/* branches: SHA tag only.
-        VERSION_TAG="${CI_COMMIT_SHORT_SHA}"
-        PUSH_LATEST="false"
-      fi
+      # Resolve primary version tag and whether to also push :latest --
+      # shared with build-images:hort-server, see the script for the policy.
+      . ${CI_PROJECT_DIR}/.gitlab/ci/resolve-version-tag.sh
 
       echo "=== build plan ==="
       echo "  IMAGE=${IMAGE}"
