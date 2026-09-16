@@ -233,7 +233,7 @@ the result instead.
 | crypto_secretbox | 0.1.1 | MIT | https://github.com/RustCrypto/nacl-compat/tree/master/crypto_secretbox |
 | http-body | 1.0.1 | MIT | https://github.com/hyperium/http-body |
 | http-body-util | 0.1.3 | MIT | https://github.com/hyperium/http-body |
-| chacha20 | 0.10.0 | MIT | https://github.com/RustCrypto/stream-ciphers |
+| chacha20 | 0.10.2 | MIT | https://github.com/RustCrypto/stream-ciphers |
 | zeroize_derive | 1.5.0 | MIT | https://github.com/RustCrypto/utils |
 | salsa20 | 0.11.0 | MIT | https://github.com/RustCrypto/stream-ciphers |
 | iana-time-zone | 0.1.65 | MIT | https://github.com/strawlab/iana-time-zone |
@@ -290,7 +290,7 @@ the result instead.
 | system-configuration | 0.7.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | primefield | 0.14.0 | MIT | https://github.com/RustCrypto/elliptic-curves |
 | ctutils | 0.4.2 | MIT | https://github.com/RustCrypto/utils |
-| wnaf | 0.14.0 | MIT | https://github.com/RustCrypto/elliptic-curves |
+| wnaf | 0.14.1 | MIT | https://github.com/RustCrypto/elliptic-curves |
 | annotate-snippets | 0.12.16 | MIT | https://github.com/rust-lang/annotate-snippets-rs |
 | anstream | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-parse | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -10144,7 +10144,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### chacha20 0.10.0 — MIT
+### chacha20 0.10.2 — MIT
 
 Repository: https://github.com/RustCrypto/stream-ciphers
 
@@ -11986,7 +11986,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### wnaf 0.14.0 — MIT
+### wnaf 0.14.1 — MIT
 
 Repository: https://github.com/RustCrypto/elliptic-curves
 
