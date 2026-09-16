@@ -142,7 +142,7 @@ the result instead.
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
 | rustls-native-certs | 0.8.4 | MIT | https://github.com/rustls/rustls-native-certs |
-| rustls | 0.23.44 | MIT | https://github.com/rustls/rustls |
+| rustls | 0.23.45 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
@@ -299,7 +299,7 @@ the result instead.
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
 | clap | 4.6.6 | MIT | https://github.com/clap-rs/clap |
 | clap_builder | 4.6.6 | MIT | https://github.com/clap-rs/clap |
-| clap_complete | 4.6.9 | MIT | https://github.com/clap-rs/clap |
+| clap_complete | 4.6.11 | MIT | https://github.com/clap-rs/clap |
 | clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -7182,7 +7182,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls 0.23.44 — MIT
+### rustls 0.23.45 — MIT
 
 Repository: https://github.com/rustls/rustls
 
@@ -12236,7 +12236,7 @@ SOFTWARE.
 
 ```
 
-### clap_complete 4.6.9 — MIT
+### clap_complete 4.6.11 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
