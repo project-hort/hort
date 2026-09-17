@@ -243,6 +243,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   match their digest, only the header is wrong. The body now decides
   everywhere; the declared type is still checked against it and a disagreement
   is logged, but it no longer determines what is recorded.
+- **The worker's ingest path now runs the late-joiner provenance clearance**
+  (#263), so eager-ingested children of a signed proxied image index no longer
+  stay held under `provenanceMode: required`.
 
 ### Removed
 
