@@ -1746,23 +1746,8 @@ impl QuarantineUseCase {
                 // reason: a parent-gated blob is a STRUCTURAL hold
                 // (only the parent's cascade can lift it), everything
                 // else is an actionable pending one.
-                // Age of the hold, measured from ingest. The hold is
-                // indefinite (ADR 0039 D4), so the count alone cannot say
-                // whether the population is churning or stuck — only the
-                // age can. Measured from `created_at` rather than the
-                // window anchor because the anchor is a proxy for
-                // *ecosystem exposure* (ADR 0054) and can legitimately
-                // predate ingest, which would overstate how long Hort has
-                // actually been holding the artifact.
-                let hold_secs = (Utc::now() - artifact.created_at).num_seconds().max(0);
                 if is_parent_gated_blob_constituent(&refs) {
                     summary.held_parent_gated = summary.held_parent_gated.saturating_add(1);
-                    summary.oldest_parent_gated_hold_secs = Some(
-                        summary
-                            .oldest_parent_gated_hold_secs
-                            .unwrap_or(0)
-                            .max(hold_secs),
-                    );
                     tracing::debug!(
                         artifact_id = %artifact_id,
                         "expiry backstop: parent-gated blob constituent; no verify enqueued \
@@ -1771,12 +1756,6 @@ impl QuarantineUseCase {
                 } else {
                     summary.skipped_provenance_pending =
                         summary.skipped_provenance_pending.saturating_add(1);
-                    summary.oldest_provenance_pending_hold_secs = Some(
-                        summary
-                            .oldest_provenance_pending_hold_secs
-                            .unwrap_or(0)
-                            .max(hold_secs),
-                    );
                     self.enqueue_final_provenance_verify(artifact_id).await;
                 }
             }
@@ -5355,48 +5334,6 @@ mod tests {
         assert!(actor_id.is_none(), "expiry backstop is system-driven");
     }
 
-    /// The hold's **age** rides the summary alongside its count, and the
-    /// reported value is the oldest in the batch. Under ADR 0039 D4 the
-    /// hold never ends on its own, so a count that cannot distinguish a
-    /// 20-second wait from a 20-day one is not an answer to "will this
-    /// ever release?".
-    #[tokio::test]
-    async fn release_expired_reports_the_oldest_provenance_hold_age() {
-        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
-        let young =
-            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
-        let repo_id = artifacts.get(young).unwrap().repository_id;
-        seed_required_provenance_policy(&projections, repo_id);
-        seed_stream_with_scan_completed(&events, young);
-
-        // A second held artifact in the same repo, ingested ten days ago.
-        let old = {
-            let mut a = sample_artifact(QuarantineStatus::Quarantined);
-            a.repository_id = repo_id;
-            a.created_at = Utc::now() - chrono::Duration::days(10);
-            let id = a.id;
-            artifacts.insert(a);
-            seed_stream_with_scan_completed(&events, id);
-            id
-        };
-
-        let summary = uc.release_expired(vec![young, old]).await.unwrap();
-
-        assert_eq!(summary.skipped_provenance_pending, 2);
-        let oldest = summary
-            .oldest_provenance_pending_hold_secs
-            .expect("a held batch must carry an age");
-        assert!(
-            oldest >= chrono::Duration::days(10).num_seconds(),
-            "the reported age must be the OLDEST hold in the batch, not the last one seen: \
-             {oldest}"
-        );
-        assert_eq!(
-            summary.oldest_parent_gated_hold_secs, None,
-            "a bucket that held nothing reports no age"
-        );
-    }
-
     // -- release_expired per-cause skip attribution ---------------------------
     //
     // The counts are what an operator reads off a non-draining backlog,
@@ -5487,12 +5424,6 @@ mod tests {
             "the actionable-pending bucket must not also claim this candidate",
         );
         assert_eq!(summary.skipped_no_scan_authority, 0);
-        // The age rides the same bucket split: a long-lived parent-gated
-        // hold means an unsigned ROOT, a different operator response from
-        // an artifact awaiting its own signature, so the two ages must
-        // never be reported on one series.
-        assert!(summary.oldest_parent_gated_hold_secs.is_some());
-        assert_eq!(summary.oldest_provenance_pending_hold_secs, None);
     }
 
     /// A candidate the domain source-state guard refuses counts towards

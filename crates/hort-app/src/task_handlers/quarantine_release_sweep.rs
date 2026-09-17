@@ -76,17 +76,14 @@
 //! handler adds none for them, and its `info!` line carries the rest of
 //! the per-tick outcome.
 //!
-//! The **held** population is the exception, and it is deliberate. ADR
-//! 0039's 2026-09-12 amendment (D4) makes an unsigned `Required`
-//! artifact hold *indefinitely* rather than terminalising at expiry, and
-//! rests that choice on the operator being able to see the held set —
-//! *"a metric keeps the age, a status column discards it."* So each tick
-//! sets `hort_provenance_held_artifacts{hold}` and
-//! `hort_provenance_hold_oldest_age_seconds{hold}` for both hold
-//! buckets, including the tick that finds nothing (a gauge written only
-//! when non-empty would report a drained backlog forever). Both are
-//! scoped to the tick's candidate batch and therefore capped at
-//! [`BATCH_SIZE`]; see `docs/metrics-catalog.md` for the reading.
+//! The **held** population carries no per-tick metric. A gauge fed from
+//! one tick's candidate batch — capped at [`BATCH_SIZE`], rotating under
+//! the anti-starvation cursor — cannot describe the population it would
+//! claim to report: it saturates once the population exceeds a batch,
+//! jumps as candidates rotate, and falls without any release. The
+//! authoritative view of the held set is the projection surface instead
+//! — today the admin curation queue, later retention's overview — never
+//! a metric derived from this handler's batch.
 //!
 //! **Authority discipline (ADR 0007).** The candidacy
 //! filter and the release-authority gate live in different layers, by
@@ -110,12 +107,10 @@ use chrono::Utc;
 use serde_json::json;
 
 use hort_domain::error::DomainResult;
-use hort_domain::ports::quarantine_release::{QuarantineReleasePort, ReleaseExpiredSummary};
+use hort_domain::ports::quarantine_release::QuarantineReleasePort;
 use hort_domain::ports::quarantine_release_candidates::QuarantineReleaseCandidatesRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
-
-use crate::metrics::{set_provenance_hold_population, ProvenanceHold};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -130,27 +125,6 @@ use crate::metrics::{set_provenance_hold_population, ProvenanceHold};
 /// env) matches `CronRescanTickHandler` — ENV-tuning is deliberately
 /// not offered.
 const BATCH_SIZE: u32 = 1000;
-
-// ---------------------------------------------------------------------------
-// Metrics
-// ---------------------------------------------------------------------------
-
-/// Set both provenance-hold gauges for both buckets from one tick's
-/// summary. A bucket that held nothing reports `0` for the count **and**
-/// `0` for the age, rather than being left unwritten — see
-/// [`set_provenance_hold_population`].
-fn emit_hold_population(summary: &ReleaseExpiredSummary) {
-    set_provenance_hold_population(
-        ProvenanceHold::PendingSignature,
-        summary.skipped_provenance_pending,
-        summary.oldest_provenance_pending_hold_secs.unwrap_or(0),
-    );
-    set_provenance_hold_population(
-        ProvenanceHold::ParentGated,
-        summary.held_parent_gated,
-        summary.oldest_parent_gated_hold_secs.unwrap_or(0),
-    );
-}
 
 // ---------------------------------------------------------------------------
 // Handler
@@ -206,12 +180,6 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
 
             let candidate_count = candidates.len();
             if candidate_count == 0 {
-                // Nothing expired at all ⇒ nothing held. Write the zero
-                // explicitly: a gauge only written on non-empty ticks
-                // would keep reporting a backlog that has since drained
-                // (or whose last member was deleted out from under the
-                // sweep) for as long as the process lives.
-                emit_hold_population(&ReleaseExpiredSummary::default());
                 // Most ticks under steady-state will be empty — short-
                 // circuit before invoking `release_expired` (which would
                 // otherwise round-trip an empty Vec through the use
@@ -269,11 +237,6 @@ impl TaskHandler for QuarantineReleaseSweepHandler {
                      candidacy cursor not advanced this tick",
                 );
             }
-
-            // The per-tick observation of the held population (ADR 0039
-            // D4's "a metric keeps the age"). Emitted before the log
-            // arms so an early `return` can never skip it.
-            emit_hold_population(&summary);
 
             let released_count = summary.released.len();
             // Per-cause counts come from `release_expired` itself. They
@@ -484,10 +447,6 @@ mod tests {
         /// counts the use case gives it, never re-derive them from
         /// `candidates - released`.
         skips: Mutex<(u32, u32, u32)>,
-        /// Oldest-hold ages the mock reports back:
-        /// `(pending_signature, parent_gated)`, in seconds. Same
-        /// independence rationale as `skips`.
-        hold_ages: Mutex<(Option<i64>, Option<i64>)>,
         err: Mutex<Option<DomainError>>,
         last_input: Mutex<Vec<Uuid>>,
     }
@@ -499,7 +458,6 @@ mod tests {
                 skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(None),
                 last_input: Mutex::new(Vec::new()),
-                hold_ages: Mutex::new((None, None)),
             }
         }
 
@@ -511,7 +469,6 @@ mod tests {
                 skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(None),
                 last_input: Mutex::new(Vec::new()),
-                hold_ages: Mutex::new((None, None)),
             }
         }
 
@@ -521,7 +478,6 @@ mod tests {
                 skips: Mutex::new((0, 0, 0)),
                 err: Mutex::new(Some(err)),
                 last_input: Mutex::new(Vec::new()),
-                hold_ages: Mutex::new((None, None)),
             }
         }
 
@@ -533,13 +489,6 @@ mod tests {
             let held_parent_gated = self.skips.lock().unwrap().2;
             *self.skips.lock().unwrap() =
                 (no_scan_authority, provenance_pending, held_parent_gated);
-            self
-        }
-
-        /// Programme the oldest-hold ages the mock reports:
-        /// `(pending_signature, parent_gated)`, in seconds.
-        fn with_hold_ages(self, pending_signature: Option<i64>, parent_gated: Option<i64>) -> Self {
-            *self.hold_ages.lock().unwrap() = (pending_signature, parent_gated);
             self
         }
 
@@ -580,16 +529,12 @@ mod tests {
                     .filter(|id| subset.contains(id))
                     .collect()
             };
-            let (oldest_provenance_pending_hold_secs, oldest_parent_gated_hold_secs) =
-                *self.hold_ages.lock().unwrap();
             Box::pin(async move {
                 Ok(ReleaseExpiredSummary {
                     released,
                     skipped_no_scan_authority,
                     skipped_provenance_pending,
                     held_parent_gated,
-                    oldest_provenance_pending_hold_secs,
-                    oldest_parent_gated_hold_secs,
                 })
             })
         }
@@ -607,10 +552,10 @@ mod tests {
 
     // ---------- tracing capture ------------------------------------------
     //
-    // The per-tick log line carries the release-side observability
-    // contract (the only per-tick metrics are the two provenance-hold
-    // gauges — see the module docs), so the stall signal and the
-    // per-cause counts are asserted on the emitted records. Mirrors
+    // The per-tick log line carries the sweep's whole observability
+    // contract — the handler emits no metrics of its own — so the stall
+    // signal and the per-cause counts are asserted on the emitted
+    // records. Mirrors
     // the capture block in `use_cases/quarantine_use_case.rs`: a global
     // passthrough subscriber is installed once so callsite interest is
     // not cached as "never", then each test layers a thread-local
@@ -1313,129 +1258,5 @@ mod tests {
             "BATCH_SIZE constant must drive the candidacy LIMIT — handler asks for 1000",
         );
         assert_eq!(BATCH_SIZE, 1000, "design pin: BATCH_SIZE = 1000");
-    }
-
-    // =====================================================================
-    // Provenance-hold population gauges (ADR 0039 D4)
-    // =====================================================================
-
-    /// One row of a [`metrics_util::debugging::Snapshot`].
-    type MetricRow = (
-        metrics_util::CompositeKey,
-        Option<metrics::Unit>,
-        Option<metrics::SharedString>,
-        metrics_util::debugging::DebugValue,
-    );
-
-    /// Drive one handler tick under a local recorder and return its
-    /// metric rows.
-    fn tick_metrics(handler: &QuarantineReleaseSweepHandler) -> Vec<MetricRow> {
-        let recorder = metrics_util::debugging::DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        // `with_local_recorder` is sync-only, so the async run is driven
-        // to completion on this thread inside the closure.
-        metrics::with_local_recorder(&recorder, || {
-            futures::executor::block_on(handler.run(&serde_json::Value::Null, make_context()))
-                .expect("Ok");
-        });
-        snapshotter.snapshot().into_vec()
-    }
-
-    /// Read one gauge's value for a given `hold` label out of a snapshot.
-    fn gauge_value(snapshot: &[MetricRow], name: &str, hold: &str) -> f64 {
-        use metrics_util::debugging::DebugValue;
-        snapshot
-            .iter()
-            .find_map(|(key, _unit, _desc, value)| {
-                let k = key.key();
-                if k.name() != name {
-                    return None;
-                }
-                if !k.labels().any(|l| l.key() == "hold" && l.value() == hold) {
-                    return None;
-                }
-                match value {
-                    DebugValue::Gauge(v) => Some(v.into_inner()),
-                    other => panic!("{name} must be a gauge, got {other:?}"),
-                }
-            })
-            .unwrap_or_else(|| panic!("no {name}{{hold=\"{hold}\"}} in snapshot"))
-    }
-
-    /// A tick that holds artifacts reports both the population and its
-    /// oldest age, per bucket. The age is the half a count cannot carry:
-    /// under D4 the hold is indefinite, so "how long" is the whole
-    /// question.
-    #[tokio::test]
-    async fn run_sets_the_hold_population_and_age_gauges_per_bucket() {
-        let rows: Vec<QuarantineReleaseCandidate> = (0..4)
-            .map(|_| QuarantineReleaseCandidate {
-                artifact_id: Uuid::new_v4(),
-            })
-            .collect();
-        let candidates = Arc::new(MockCandidates::new(rows));
-        let releaser = Arc::new(
-            MockReleaser::releases_none()
-                .with_skips(0, 3)
-                .with_held_parent_gated(1)
-                .with_hold_ages(Some(1_814_400), Some(600)),
-        );
-        let handler = make_handler(candidates, releaser);
-
-        let snapshot = tick_metrics(&handler);
-
-        assert_eq!(
-            gauge_value(
-                &snapshot,
-                "hort_provenance_held_artifacts",
-                "pending_signature"
-            ),
-            3.0
-        );
-        assert_eq!(
-            gauge_value(
-                &snapshot,
-                "hort_provenance_hold_oldest_age_seconds",
-                "pending_signature"
-            ),
-            1_814_400.0,
-            "three weeks of waiting must be visible as three weeks, not as the number 3"
-        );
-        assert_eq!(
-            gauge_value(&snapshot, "hort_provenance_held_artifacts", "parent_gated"),
-            1.0
-        );
-        assert_eq!(
-            gauge_value(
-                &snapshot,
-                "hort_provenance_hold_oldest_age_seconds",
-                "parent_gated"
-            ),
-            600.0
-        );
-    }
-
-    /// The empty tick writes zeros rather than leaving the gauges
-    /// unwritten — otherwise a backlog that has drained (or whose last
-    /// member was deleted) keeps being reported for the life of the
-    /// process.
-    #[tokio::test]
-    async fn run_zeroes_the_hold_gauges_when_there_are_no_candidates() {
-        let candidates = Arc::new(MockCandidates::new(Vec::new()));
-        let releaser = Arc::new(MockReleaser::releases_none());
-        let handler = make_handler(candidates, releaser);
-
-        let snapshot = tick_metrics(&handler);
-
-        for hold in ["pending_signature", "parent_gated"] {
-            assert_eq!(
-                gauge_value(&snapshot, "hort_provenance_held_artifacts", hold),
-                0.0
-            );
-            assert_eq!(
-                gauge_value(&snapshot, "hort_provenance_hold_oldest_age_seconds", hold),
-                0.0
-            );
-        }
     }
 }

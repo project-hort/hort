@@ -438,15 +438,9 @@ on the provenance axis.
 >
 > Because the hold is indefinite, that counter — which counts verify
 > *events* — is not the whole picture: it cannot tell you whether the held
-> set is churning or stuck. The release sweep publishes the standing
-> population beside it:
-> `hort_provenance_held_artifacts{hold="pending_signature"|"parent_gated"}`
-> (how many are waiting) and
-> `hort_provenance_hold_oldest_age_seconds{hold=…}` (how long the oldest
-> has waited). A rising age with a flat count is one specific artifact
-> that will never be signed and needs an operator exit; a rising count
-> with a low age is a signer that is merely lagging. See
-> `docs/metrics-catalog.md`.
+> set is churning or stuck. For the standing population, use the
+> projection surface instead of a metric: today the admin curation queue,
+> and, once it exists, retention's overview. See `docs/metrics-catalog.md`.
 
 For the design rationale — provenance as an AND-precondition on the timer
 release arm, the fail-closed hold, and the granted-write hold-read
@@ -469,12 +463,9 @@ exemption — see
     `result ∈ {verified, rejected, no_attestation}`.
   - `hort_provenance_reject_total{backend="cosign", reason}` — the
     per-reason breakdown of rejections.
-  - `hort_provenance_held_artifacts{hold}` and
-    `hort_provenance_hold_oldest_age_seconds{hold}` — the standing held
-    population and how long its oldest member has waited, set once per
-    release-sweep tick.
   These are emitted by the **worker** and are scrapeable from the worker's
-  `/metrics` listener — see *Worker metrics* below.
+  `/metrics` listener — see *Worker metrics* below. The standing held
+  population itself is not a metric — see the admin curation queue.
 - Per-job verdict: the `provenance-verify` job records a compact
   `result_summary` on its job row, one of
   `{"result": "verified"}`,

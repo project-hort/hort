@@ -779,15 +779,18 @@ Each argument for one dissolves on inspection:
   artifacts. A candidate-query skip would additionally have to re-implement
   the release gate's provenance conjunct in SQL — the second computation
   `release_clearance.rs` exists to prevent.
-- **"Will this ever release?" is an observability question.** A metric
-  answers it strictly better than a status column, because it **keeps the
-  age** instead of discarding it: a status transition collapses "held for 20
-  seconds" and "held for 20 days" into the same value, which is precisely the
-  information an operator needs. The hold itself already ticks the existing
+- **"Will this ever release?" is an observability question.** A status
+  column answers it worse than the alternative, because it discards the
+  **age**: a status transition collapses "held for 20 seconds" and "held for
+  20 days" into the same value, which is precisely the information an
+  operator needs — so writing no terminal status is right. But that
+  operator's view of the held set is **not a metric**: it is the
+  authoritative surface over the projection — today the admin curation
+  queue (reads `events` via `LATERAL`), and, once it exists, retention's
+  overview (#244), where disposal is decided operator-confirmed and never
+  automatically. The hold itself already ticks the existing
   `hort_provenance_verify_total{result="held_pending_signature"}` value — no
-  new label value is required for it; an age-carrying signal for "how long
-  has this been waiting" is the implementing change's to name, and lands in
-  `docs/metrics-catalog.md` with it (ADR 0017).
+  new label value is required for it.
 - **The cost is concrete, and it is the reason this is a hard no.** A
   deadline re-creates the very construct that has now failed three times
   (`window_open` alone, then `|| is_referenced_descendant`, then
