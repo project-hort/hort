@@ -175,6 +175,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A policy created with `enforcement: record` now records from its first
+  apply** (#267). `create_policy` built the rest of the policy projection
+  from the submitted command but hard-coded `enforcement` to `reject`, so a
+  freshly-applied `record` policy enforced `reject` until a later apply
+  diffed and corrected it. The projection now takes `enforcement` from the
+  command like every other field.
+
 - **A curator looking at an artifact the integrity scrubber condemned now sees
   why** (#245). When the CAS scrubber re-reads a stored blob and the bytes do
   not hash to their content hash, it tombstones the artifact — marks it
