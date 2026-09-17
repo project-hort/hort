@@ -2526,7 +2526,7 @@ dependencies = [
  "futures",
  "hort-config",
  "hort-domain",
- "jsonwebtoken 11.0.0",
+ "jsonwebtoken 11.1.0",
  "metrics",
  "metrics-util",
  "rcgen",
@@ -2723,7 +2723,7 @@ dependencies = [
  "hort-config",
  "hort-domain",
  "humantime",
- "jsonwebtoken 11.0.0",
+ "jsonwebtoken 11.1.0",
  "lru",
  "metrics",
  "metrics-util",
@@ -3894,9 +3894,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "11.0.0"
+version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
+checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -4469,7 +4469,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -6058,7 +6058,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser",
