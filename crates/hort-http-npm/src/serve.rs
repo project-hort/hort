@@ -414,9 +414,13 @@ pub(crate) async fn serve_packument_unified(
 ///   docs). No other tag has a fallback: present or absent;
 /// - anything else → `None`, which this function turns into the same
 ///   anti-enumeration `Artifact NotFound` envelope
-///   [`serve_packument_unified`] uses for an unknown package. Unknown
-///   tag, unknown version, held version, unknown package, and invisible
-///   repo are therefore indistinguishable on the wire.
+///   [`serve_packument_unified`] uses for an unknown package. On this
+///   abbreviated route, unknown tag, unknown version, held version,
+///   unknown package, and invisible repo are therefore indistinguishable
+///   on the wire. The full packument is not: its `hort.held[]` block
+///   (see [`HeldVersion`]) names a held version and the reason it is
+///   withheld, so a held version IS distinguishable there from an unknown
+///   one — only this single-version/tag resolution collapses the two.
 ///
 /// On a match, the response body is exactly the per-version object the
 /// packument serves (`{name, version, dist: {tarball, shasum,
