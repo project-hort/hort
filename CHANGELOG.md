@@ -244,6 +244,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   everywhere; the declared type is still checked against it and a disagreement
   is logged, but it no longer determines what is recorded.
 
+### Removed
+
+- **The provenance-hold population gauges**, `hort_provenance_held_artifacts`
+  and `hort_provenance_hold_oldest_age_seconds` (#260). They were set from one
+  release-sweep tick's candidate batch and could not describe the held
+  population — no replacement metric; the operator's view of the held set is
+  the admin curation queue.
+
 ## [0.13.0] - 2026-09-04
 
 ### Fixed

@@ -254,11 +254,10 @@ any new release authority.
    inbound reference edge is consulted, both having been removed as hold
    predicates by ADR 0039's 2026-09-12 amendment (D3). Because that
    amendment also makes the hold indefinite (D4), the counter — which
-   counts verify *events* — is paired with the standing-population
-   gauges `hort_provenance_held_artifacts{hold}` and
-   `hort_provenance_hold_oldest_age_seconds{hold}` emitted by the release
-   sweep; the age is the half a status column could never have kept. See
-   ADR 0016's `provenance_mode: required` ×
+   counts verify *events*, not the standing population — is not the whole
+   picture; the operator's view of the standing held set is the
+   authoritative projection surface instead (ADR 0039 D4), never a metric.
+   See ADR 0016's `provenance_mode: required` ×
    short-`quarantine_duration_secs` row.
 
 The fail-closed release predicate (ADR 0007), the digest binding, the
