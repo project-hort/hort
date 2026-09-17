@@ -2295,53 +2295,30 @@ pub async fn build_app_context(
         artifact_group_lifecycle.clone(),
         include_repository_label,
     ));
-    let ingest_use_case = Arc::new(
-        IngestUseCase::new(
-            storage.clone(),
-            lifecycle.clone(),
-            artifact_repo.clone(),
-            repo_repo.clone(),
-            event_publisher.clone(),
-            curation_rules.clone(),
-            artifact_group_use_case.clone(),
-            include_repository_label,
-            metadata_caps.clone(),
-            metadata_blob_max_bytes,
-            // Refcount projection writes ride on the same
-            // ContentReferenceIndex Arc that ContentReferenceUseCase wraps
-            // below — the use case is constructed AFTER auth/access, but
-            // IngestUseCase needs the raw port handle for unauthorised
-            // post-commit projection writes (the artifact lifecycle has
-            // already authorised the ingest itself).
-            content_references.clone(),
-            // `policy_projections` (already wired
-            // above for `QuarantineUseCase`) drives the ingest-time policy
-            // match; `jobs_repo` performs the actual `kind='scan'` insert.
-            policy_projections.clone(),
-            jobs_repo.clone(),
-        )
-        // Activate the provenance-verify
-        // enqueue gate (ADR 0027). The set is the known Tier-1 cosign coverage
-        // (cosign → OCI), passed as plain data: hort-server enqueues a
-        // `provenance-verify` job iff the resolved policy `provenance_mode
-        // != Off` AND the ingest's format is in this set. The literal
-        // `{"oci"}` mirrors the worker's registered cosign port (Tier-1:
-        // cosign → oci); hort-server derives it from that known coverage
-        // WITHOUT depending on hort-adapters-provenance-sigstore (which
-        // would pull sigstore's transitive reqwest 0.13 into the server
-        // binary). The set is always `{"oci"}` regardless of whether the
-        // worker has cosign enabled — if disabled, the enqueued jobs are
-        // simply never processed (no worker handler claims them) and a
-        // `Required` artifact stays Pending (fail-closed);
-        // gating the enqueue on the worker flag is neither visible to the
-        // server nor necessary for correctness.
-        .with_provenance_capable_formats(
-            hort_app::provenance::TIER1_PROVENANCE_CAPABLE_FORMATS
-                .iter()
-                .copied()
-                .map(String::from),
-        ),
-    );
+    let ingest_use_case = Arc::new(IngestUseCase::new(
+        storage.clone(),
+        lifecycle.clone(),
+        artifact_repo.clone(),
+        repo_repo.clone(),
+        event_publisher.clone(),
+        curation_rules.clone(),
+        artifact_group_use_case.clone(),
+        include_repository_label,
+        metadata_caps.clone(),
+        metadata_blob_max_bytes,
+        // Refcount projection writes ride on the same
+        // ContentReferenceIndex Arc that ContentReferenceUseCase wraps
+        // below — the use case is constructed AFTER auth/access, but
+        // IngestUseCase needs the raw port handle for unauthorised
+        // post-commit projection writes (the artifact lifecycle has
+        // already authorised the ingest itself).
+        content_references.clone(),
+        // `policy_projections` (already wired
+        // above for `QuarantineUseCase`) drives the ingest-time policy
+        // match; `jobs_repo` performs the actual `kind='scan'` insert.
+        policy_projections.clone(),
+        jobs_repo.clone(),
+    ));
     let ref_use_case = Arc::new(RefUseCase::new(
         ref_registry.clone(),
         ref_lifecycle.clone(),

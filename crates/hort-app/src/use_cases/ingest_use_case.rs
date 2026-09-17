@@ -614,9 +614,16 @@ pub struct IngestUseCase {
     /// nothing; the next pull re-triggers), so warn-and-continue is the
     /// correct posture for them.
     jobs: Arc<dyn JobsRepository>,
-    /// The set of repository-format strings
-    /// some registered `ProvenancePort` `applies_to`. Drives the
-    /// ingest-time `provenance-verify` enqueue gate: a job is enqueued
+    /// The Tier-1 provenance capability map
+    /// ([`crate::provenance::TIER1_PROVENANCE_CAPABLE_FORMATS`]): the set of
+    /// repository-format strings some registered `ProvenancePort`
+    /// `applies_to`. [`Self::new`] is the one authority every composition
+    /// (server and worker alike) gets it from — no caller narrows or widens
+    /// it, so the ingest-time `provenance-verify` enqueue gate and the
+    /// late-joiner self-clear (ADR 0039 §11) run identically wherever an
+    /// ingest commits a quarantine.
+    ///
+    /// Drives the `provenance-verify` enqueue gate: a job is enqueued
     /// **only when** the resolved `ScanPolicy.provenance_mode != Off` AND
     /// `provenance_capable_formats.contains(format)`. Gating on
     /// `mode != Off` alone would enqueue a no-op
@@ -625,15 +632,6 @@ pub struct IngestUseCase {
     /// `"oci"`), which the gate avoids: non-applicable ingests are
     /// genuinely zero-overhead (no row), and the set auto-activates when a
     /// Tier-2 verifier later registers (no migration).
-    ///
-    /// **Default empty** (set by [`Self::new`]) so the composition root
-    /// compiles unchanged until the real capability set is wired via
-    /// [`Self::with_provenance_capable_formats`]. An empty set means "no
-    /// verifier applies to anything" → no `provenance-verify` is ever
-    /// enqueued, which is fail-safe: a `Required` policy on a no-verifier
-    /// format is already apply-rejected, and a runtime
-    /// mis-registration leaves the artifact `Pending` → never timer-releases
-    /// (fail-closed at the release gate).
     provenance_capable_formats: Arc<HashSet<String>>,
     /// Shared provenance-clearance cascade machinery (ADR 0039 §11),
     /// built from the port handles above. Drives the **late-joiner**
@@ -695,31 +693,14 @@ impl IngestUseCase {
             content_references,
             policy_projections,
             jobs,
-            // Default empty; the composition root wires the real set via
-            // `with_provenance_capable_formats`. Empty = no
-            // `provenance-verify` ever enqueued (fail-safe).
-            provenance_capable_formats: Arc::new(HashSet::new()),
+            provenance_capable_formats: Arc::new(
+                crate::provenance::TIER1_PROVENANCE_CAPABLE_FORMATS
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
             provenance_cascade,
         }
-    }
-
-    /// Install the set of repository-format
-    /// strings some registered `ProvenancePort` `applies_to` (Tier-1:
-    /// `{"oci"}` for cosign; ADR 0027). Builder-style so the composition
-    /// root wires it without changing the [`Self::new`] arg list — and
-    /// every existing call site keeps compiling with the default empty set.
-    ///
-    /// The ingest path consults this set together with the resolved policy
-    /// `provenance_mode` to decide whether to enqueue a `provenance-verify`
-    /// job: enqueue **iff** `mode != Off` AND the set contains the ingest's
-    /// format.
-    #[must_use]
-    pub fn with_provenance_capable_formats(
-        mut self,
-        formats: impl IntoIterator<Item = String>,
-    ) -> Self {
-        self.provenance_capable_formats = Arc::new(formats.into_iter().collect());
-        self
     }
 
     /// Resolve the `repository` metric label. When the repository-label flag
@@ -13648,13 +13629,11 @@ mod tests {
     // VerifyIfPresent / Required on OCI (cosign applies) → job enqueued.
     // =====================================================================
 
-    /// `make_scan_gated_use_case` variant that wires the provenance-capable
-    /// format set (Tier-1: `{"oci"}`) and hands back `policy_projections` +
-    /// `jobs` for enqueue assertions.
+    /// `make_scan_gated_use_case` variant that hands back `policy_projections`
+    /// and `jobs` for enqueue assertions. `IngestUseCase::new` already
+    /// carries the Tier-1 provenance-capable format set (`{"oci"}`).
     #[allow(clippy::type_complexity)]
-    fn provenance_make_use_case(
-        capable_formats: &[&str],
-    ) -> (
+    fn provenance_make_use_case() -> (
         IngestUseCase,
         Arc<MockRepositoryRepository>,
         Arc<MockPolicyProjectionRepository>,
@@ -13688,8 +13667,7 @@ mod tests {
             content_references,
             policy_projections.clone(),
             jobs.clone(),
-        )
-        .with_provenance_capable_formats(capable_formats.iter().map(ToString::to_string));
+        );
 
         (uc, repos, policy_projections, jobs, lifecycle)
     }
@@ -13700,9 +13678,7 @@ mod tests {
     /// tests that drive `register_by_hash` (rather than `ingest_verified`)
     /// against a provenance-capable format.
     #[allow(clippy::type_complexity)]
-    fn provenance_make_use_case_for_register_by_hash(
-        capable_formats: &[&str],
-    ) -> (
+    fn provenance_make_use_case_for_register_by_hash() -> (
         IngestUseCase,
         Arc<MockRepositoryRepository>,
         Arc<MockPolicyProjectionRepository>,
@@ -13737,8 +13713,7 @@ mod tests {
             content_references,
             policy_projections.clone(),
             jobs.clone(),
-        )
-        .with_provenance_capable_formats(capable_formats.iter().map(ToString::to_string));
+        );
 
         (uc, repos, policy_projections, jobs, lifecycle, storage)
     }
@@ -13905,7 +13880,7 @@ mod tests {
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (uc, repos, projections, _jobs, lifecycle, storage) =
-                provenance_make_use_case_for_register_by_hash(&["oci"]);
+                provenance_make_use_case_for_register_by_hash();
             repos.insert(repo);
             projections.insert(provenance_policy(ProvenanceMode::Required));
             let hash: ContentHash = ZERO_HASH.parse().unwrap();
@@ -14290,7 +14265,7 @@ mod tests {
     fn off_mode_enqueues_no_provenance_verify_job() {
         let content: &[u8] = b"oci manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&["oci"]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -14320,7 +14295,7 @@ mod tests {
         let content: &[u8] = b"pypi sdist bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             // The capable set is {"oci"} — pypi is NOT in it.
-            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&["oci"]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case();
             let repo = pypi_repository();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -14354,7 +14329,7 @@ mod tests {
     fn verify_if_present_oci_enqueues_provenance_verify_job() {
         let content: &[u8] = b"oci manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&["oci"]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -14385,7 +14360,7 @@ mod tests {
     fn required_oci_enqueues_provenance_verify_job() {
         let content: &[u8] = b"oci manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&["oci"]);
+            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -14407,37 +14382,6 @@ mod tests {
         });
     }
 
-    /// Default empty capability set (the un-wired composition default) →
-    /// no `provenance-verify` job even on OCI with a non-Off mode. Proves
-    /// the gate is fail-safe when the real set is not yet configured.
-    #[test]
-    fn empty_capability_set_enqueues_no_provenance_verify_job() {
-        let content: &[u8] = b"oci manifest bytes";
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Capable set is EMPTY (the `new()` default — no
-            // `with_provenance_capable_formats` call).
-            let (uc, repos, projections, _jobs, lifecycle) = provenance_make_use_case(&[]);
-            let repo = oci_repo();
-            let repo_id = repo.id;
-            repos.insert(repo);
-            projections.insert(provenance_policy(ProvenanceMode::Required));
-
-            uc.ingest_verified(
-                oci_verified_req(repo_id, content),
-                content_stream(content),
-                &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
-            )
-            .await
-            .expect("ingest must succeed");
-
-            assert_eq!(
-                provenance_verify_enqueues(&lifecycle),
-                0,
-                "an empty capability set must enqueue NO provenance-verify job (fail-safe default)"
-            );
-        });
-    }
-
     // =====================================================================
     // Late-joiner provenance self-clear (ADR 0039 §11, constituent end).
     //
@@ -14452,9 +14396,7 @@ mod tests {
     /// the event store (to seed its clearance), and the reference index
     /// (to seed the inbound edge that nominates it).
     #[allow(clippy::type_complexity)]
-    fn late_joiner_make_use_case(
-        capable_formats: &[&str],
-    ) -> (
+    fn late_joiner_make_use_case() -> (
         IngestUseCase,
         Arc<MockRepositoryRepository>,
         Arc<MockPolicyProjectionRepository>,
@@ -14491,8 +14433,7 @@ mod tests {
             content_references.clone(),
             policy_projections.clone(),
             jobs,
-        )
-        .with_provenance_capable_formats(capable_formats.iter().map(ToString::to_string));
+        );
 
         (
             uc,
@@ -14620,7 +14561,7 @@ mod tests {
         let snap = capture_metrics(|| {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
-                    late_joiner_make_use_case(&["oci"]);
+                    late_joiner_make_use_case();
                 let repo = oci_repo();
                 let repo_id = repo.id;
                 repos.insert(repo);
@@ -14676,7 +14617,7 @@ mod tests {
         let content: &[u8] = b"foreign-platform child manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
-                late_joiner_make_use_case(&["oci"]);
+                late_joiner_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -14701,27 +14642,36 @@ mod tests {
 
     /// Gate: a format no verifier acts on can never have a signed subject
     /// to clear against, so the hook does not run even under `Required`.
+    /// `pypi` carries no registered `ProvenancePort` verifier, unlike the
+    /// Tier-1 `oci` format the seeded index binding is expressed in — the
+    /// seeded binding is irrelevant here since the format gate short-
+    /// circuits before the cascade is ever consulted.
     #[test]
     fn a_non_capable_format_runs_no_late_joiner_clearance() {
-        let content: &[u8] = b"foreign-platform child manifest bytes";
+        let content: &[u8] = b"pypi sdist bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            // Capable set is EMPTY — the un-wired composition default.
             let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
-                late_joiner_make_use_case(&[]);
-            let repo = oci_repo();
+                late_joiner_make_use_case();
+            let repo = pypi_repository();
             let repo_id = repo.id;
             repos.insert(repo);
             projections.insert(late_joiner_policy(ProvenanceMode::Required));
             seed_verified_index_binding(&artifacts, &storage, &events, &refs, repo_id, content)
                 .await;
 
-            uc.ingest_verified(
-                oci_verified_req(repo_id, content),
-                content_stream(content),
-                &StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024),
-            )
-            .await
-            .expect("ingest must succeed");
+            let req = VerifiedIngestRequest::ProtocolNative {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/gzip".into(),
+                actor: sample_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_digest: sha256_of(content).parse().unwrap(),
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+            uc.ingest_verified(req, content_stream(content), &test_handler())
+                .await
+                .expect("ingest must succeed");
 
             assert!(
                 cascaded_clearances(&lifecycle).is_empty(),
@@ -14737,7 +14687,7 @@ mod tests {
         let content: &[u8] = b"foreign-platform child manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
-                late_joiner_make_use_case(&["oci"]);
+                late_joiner_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -14769,7 +14719,7 @@ mod tests {
         let content: &[u8] = b"foreign-platform child manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
-                late_joiner_make_use_case(&["oci"]);
+                late_joiner_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -14803,7 +14753,7 @@ mod tests {
         let content: &[u8] = b"mounted child manifest bytes";
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (uc, repos, projections, lifecycle, artifacts, storage, events, refs) =
-                late_joiner_make_use_case(&["oci"]);
+                late_joiner_make_use_case();
             let repo = oci_repo();
             let repo_id = repo.id;
             repos.insert(repo);
@@ -15231,8 +15181,7 @@ mod tests {
             content_references,
             policy_projections.clone(),
             jobs.clone(),
-        )
-        .with_provenance_capable_formats(["oci".to_string()]);
+        );
 
         (
             uc,
