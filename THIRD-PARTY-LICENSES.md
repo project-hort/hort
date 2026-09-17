@@ -297,10 +297,10 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.6 | MIT | https://github.com/clap-rs/clap |
-| clap_builder | 4.6.6 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.7 | MIT | https://github.com/clap-rs/clap |
+| clap_builder | 4.6.7 | MIT | https://github.com/clap-rs/clap |
 | clap_complete | 4.6.11 | MIT | https://github.com/clap-rs/clap |
-| clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
+| clap_derive | 4.6.7 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
@@ -366,7 +366,7 @@ the result instead.
 | objc2-encode | 4.1.0 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
-| object_store | 0.14.1 | MIT | https://github.com/apache/arrow-rs-object-store |
+| object_store | 0.14.2 | MIT | https://github.com/apache/arrow-rs-object-store |
 | sqlx-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
 | sqlx-macros-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
 | sqlx-macros | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
@@ -480,7 +480,7 @@ the result instead.
 | security-framework-sys | 2.17.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | security-framework | 3.7.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
-| jsonwebtoken | 11.0.0 | MIT | https://github.com/Keats/jsonwebtoken |
+| jsonwebtoken | 11.1.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.45.0 | MIT | https://github.com/aws/aws-lc-rs |
 | webbrowser | 1.2.4 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
@@ -12182,7 +12182,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.6 — MIT
+### clap 4.6.7 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -12209,7 +12209,7 @@ SOFTWARE.
 
 ```
 
-### clap_builder 4.6.6 — MIT
+### clap_builder 4.6.7 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -12263,7 +12263,7 @@ SOFTWARE.
 
 ```
 
-### clap_derive 4.6.4 — MIT
+### clap_derive 4.6.7 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -14103,7 +14103,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### object_store 0.14.1 — MIT
+### object_store 0.14.2 — MIT
 
 Repository: https://github.com/apache/arrow-rs-object-store
 
@@ -17398,7 +17398,7 @@ SOFTWARE.
 
 ```
 
-### jsonwebtoken 11.0.0 — MIT
+### jsonwebtoken 11.1.0 — MIT
 
 Repository: https://github.com/Keats/jsonwebtoken
 
