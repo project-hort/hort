@@ -35,12 +35,17 @@ pub mod pom;
 pub mod snapshot;
 pub(crate) mod xml;
 
+use std::io::{Cursor, Read};
+
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::format_handler::{
-    DependencySpec, FormatHandler, GroupMembership, VersionDiscovery,
+    DependencySpec, FormatHandler, GroupMembership, PayloadSbom, PayloadSbomExtraction,
+    SbomResolution, VersionDiscovery,
 };
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
-use hort_domain::types::ArtifactCoords;
+use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
+
+use crate::sbom_helpers::build_subject_component;
 
 pub use coords::{
     build_logical_path, parse_download_path, parse_sidecar_hex, validate_maven_coordinate,
@@ -263,11 +268,11 @@ impl FormatHandler for MavenFormatHandler {
     /// intent (no multi-MB buffering — a sidecar is bounded by construction).
     fn parse_upstream_checksum(
         &self,
-        body: &mut dyn std::io::Read,
+        body: &mut dyn Read,
         _coords: &ArtifactCoords,
     ) -> DomainResult<UpstreamPublishedChecksum> {
         let mut buf = String::new();
-        std::io::Read::read_to_string(body, &mut buf).map_err(|e| {
+        Read::read_to_string(body, &mut buf).map_err(|e| {
             DomainError::Validation(format!("maven.sidecar: failed to read checksum body: {e}"))
         })?;
         let hex = parse_sidecar_hex(&buf)?;
@@ -288,6 +293,16 @@ impl FormatHandler for MavenFormatHandler {
     fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
         Some(self)
     }
+
+    /// `Some(self)` — Maven implements [`PayloadSbom`]. Maven's declared
+    /// dependencies live in the `.pom` itself (or, for a `.jar`/`.war`, in
+    /// its embedded `META-INF/maven/{g}/{a}/pom.xml`) — there is no
+    /// separate index/publish-body JSON the way npm and cargo have, so
+    /// `format_metadata` carries nothing `FormatHandler::extract_sbom`
+    /// could read. The payload IS the manifest; see the impl block below.
+    fn payload_sbom(&self) -> Option<&dyn PayloadSbom> {
+        Some(self)
+    }
 }
 
 impl VersionDiscovery for MavenFormatHandler {
@@ -304,7 +319,7 @@ impl VersionDiscovery for MavenFormatHandler {
     ///
     /// Bounded by [`metadata::UPSTREAM_METADATA_MAX_BYTES`]; a body over
     /// the cap is `Validation`.
-    fn extract_upstream_versions(&self, body: &mut dyn std::io::Read) -> DomainResult<Vec<String>> {
+    fn extract_upstream_versions(&self, body: &mut dyn Read) -> DomainResult<Vec<String>> {
         let bytes = crate::stream_helpers::read_to_capped_vec(
             body,
             metadata::UPSTREAM_METADATA_MAX_BYTES,
@@ -371,7 +386,7 @@ impl VersionDiscovery for MavenFormatHandler {
     /// than the no-op this method replaces.
     fn extract_dependency_specs(
         &self,
-        content: &mut dyn std::io::Read,
+        content: &mut dyn Read,
     ) -> DomainResult<Vec<DependencySpec>> {
         let extraction = pom::parse_pom_dependencies(content)?;
         for (reason, count) in extraction.skip_counts() {
@@ -424,7 +439,7 @@ impl VersionDiscovery for MavenFormatHandler {
     /// [`download_config_path`](Self::download_config_path).
     fn compose_download_url_from_config(
         &self,
-        body: &mut dyn std::io::Read,
+        body: &mut dyn Read,
         package: &str,
         version: &str,
         cksum_hex: Option<&str>,
@@ -441,13 +456,279 @@ impl VersionDiscovery for MavenFormatHandler {
     /// list, never per-version download URLs.
     fn resolve_download_url_from_metadata(
         &self,
-        body: &mut dyn std::io::Read,
+        body: &mut dyn Read,
         coords: &ArtifactCoords,
     ) -> DomainResult<String> {
         let _ = (body, coords);
         Err(DomainError::Validation(
             "resolve_download_url_from_metadata not supported for maven".into(),
         ))
+    }
+}
+
+/// Maven's [`PayloadSbom`] participation — the SBOM the **scan** path
+/// uses.
+///
+/// Only the two roles that carry a Maven manifest produce a non-`None`
+/// BOM: a `.pom` payload IS the manifest, and a `.jar`/`.war` payload MAY
+/// embed one at `META-INF/maven/{groupId}/{artifactId}/pom.xml`. Every
+/// other role — checksum sidecars, `maven-metadata.xml`, `-sources.jar`,
+/// `-javadoc.jar`, Gradle `.module` — carries no dependency information
+/// this format can extract, so [`classify_role`] (the same classifier
+/// [`FormatHandler::classify_group_member`] uses) gates which branch runs.
+///
+/// **Three outcomes, three postures**, mirroring cargo's
+/// [`PayloadSbom`] impl:
+///
+/// | Payload | Components | [`SbomResolution`] |
+/// |---|---|---|
+/// | `.pom`/embedded pom.xml parses | resolved, exact versions | `Resolved` |
+/// | `.jar`/`.war` with no embedded pom.xml | none — subject only | `NoLockfile` |
+/// | pom bytes present but not a well-formed POM, or the jar is not a valid zip | none — subject only | `UnusableLockfile` |
+///
+/// **Every failure is soft.** No arm returns `Err` for malformed payload
+/// bytes — SBOM enrichment is not release authority, and a
+/// publisher-controlled byte sequence must not be able to abort a scan.
+/// `Err` only propagates from [`coords::split_ga`] on a stored
+/// coordinate whose `name` is not the colon-joined GA form, which
+/// publish-time validation should never allow through.
+impl PayloadSbom for MavenFormatHandler {
+    fn extract_sbom_from_payload(
+        &self,
+        coords: &ArtifactCoords,
+        _format_metadata: &serde_json::Value,
+        payload: PayloadAccess<'_>,
+    ) -> DomainResult<PayloadSbomExtraction> {
+        let filename = coords
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(coords.path.as_str());
+        match classify_role(filename) {
+            Some("pom") => {
+                let subject = maven_subject_component(coords)?;
+                let mut slice;
+                let mut stream;
+                let content: &mut dyn Read = match payload {
+                    PayloadAccess::Bytes(b) => {
+                        slice = b;
+                        &mut slice
+                    }
+                    PayloadAccess::ReadStream(r) => {
+                        stream = r;
+                        &mut stream
+                    }
+                };
+                match pom::parse_pom_dependencies(content) {
+                    Ok(deps) => Ok(PayloadSbomExtraction {
+                        sbom: Some(Sbom {
+                            subject: Some(subject),
+                            components: maven_sbom_components(&deps.specs),
+                        }),
+                        resolution: SbomResolution::Resolved,
+                        skipped_non_registry: 0,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            artifact = %coords.name,
+                            error = %e,
+                            "maven SBOM: stored .pom did not parse; degrading to subject-only",
+                        );
+                        Ok(subject_only(subject, SbomResolution::UnusableLockfile))
+                    }
+                }
+            }
+            Some("jar") => {
+                let subject = maven_subject_component(coords)?;
+                let (group_id, artifact_id) = coords::split_ga(&coords.name)?;
+                extract_jar_embedded_pom_sbom(coords, group_id, artifact_id, subject, payload)
+            }
+            _ => Ok(PayloadSbomExtraction {
+                sbom: None,
+                resolution: SbomResolution::NoLockfile,
+                skipped_non_registry: 0,
+            }),
+        }
+    }
+}
+
+/// Build the [`Sbom::subject`] component for a Maven coordinate:
+/// `pkg:maven/{groupId}/{artifactId}@{version}`, `Ecosystem::Maven`.
+fn maven_subject_component(coords: &ArtifactCoords) -> DomainResult<SbomComponent> {
+    let (group_id, artifact_id) = coords::split_ga(&coords.name)?;
+    let purl_name = format!("{group_id}/{artifact_id}");
+    Ok(build_subject_component(
+        coords,
+        Ecosystem::Maven,
+        "pkg:maven/",
+        &purl_name,
+        Vec::new(),
+    ))
+}
+
+/// Turn resolved POM dependency specs into [`SbomComponent`]s.
+///
+/// Each [`DependencySpec::name`] is the colon-joined `groupId:artifactId`
+/// the POM reader produces; the PURL form needs them slash-joined instead.
+/// A spec whose name is not colon-joined cannot happen from this crate's
+/// own POM reader, so a malformed one is skipped rather than panicking or
+/// aborting the whole SBOM.
+fn maven_sbom_components(specs: &[DependencySpec]) -> Vec<SbomComponent> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            let (group_id, artifact_id) = coords::split_ga(&spec.name).ok()?;
+            Some(SbomComponent {
+                purl: format!("pkg:maven/{group_id}/{artifact_id}@{}", spec.range),
+                name: spec.name.clone(),
+                version: Some(spec.range.clone()),
+                ecosystem: Ecosystem::Maven,
+                licenses: Vec::new(),
+                direct_dependency: true,
+            })
+        })
+        .collect()
+}
+
+/// A subject-only [`PayloadSbomExtraction`] — no components, just the
+/// artifact's own coordinate. Used for every degrade-soft arm: a
+/// `.jar`/`.war` with no embedded POM still lets OSV query the artifact's
+/// own coordinate, and a POM that failed to parse degrades to the same
+/// shape rather than dropping the SBOM entirely.
+fn subject_only(subject: SbomComponent, resolution: SbomResolution) -> PayloadSbomExtraction {
+    PayloadSbomExtraction {
+        sbom: Some(Sbom {
+            subject: Some(subject),
+            components: Vec::new(),
+        }),
+        resolution,
+        skipped_non_registry: 0,
+    }
+}
+
+/// Whether any `/`-separated segment of a zip entry name is a literal
+/// `..` — a path-traversal-shaped entry. The embedded-POM lookup below
+/// only ever reads the one entry whose name exactly equals the expected
+/// `META-INF/maven/{g}/{a}/pom.xml` path (itself built from validated
+/// coordinates, so it can never contain `..`), which already can't match
+/// a traversal-shaped name — this check is defense-in-depth so a
+/// traversal-named entry is refused explicitly rather than relying
+/// solely on the exact-match property.
+fn has_traversal_segment(name: &str) -> bool {
+    name.split('/').any(|segment| segment == "..")
+}
+
+/// Read `META-INF/maven/{group_id}/{artifact_id}/pom.xml` out of a
+/// `.jar`/`.war` payload and extract its declared dependencies.
+///
+/// Bounded by [`crate::archive_bounds::BoundsConfig::default_for_metadata_extraction`]
+/// (10 MiB decompressed / 10x compression-ratio / 1024 entries — the same
+/// cap the PyPI wheel-METADATA extractor uses). Degrades to
+/// [`subject_only`] rather than erroring on every non-fatal outcome: no
+/// embedded POM (the common case — most Maven jars don't embed one),
+/// a corrupt/non-ZIP jar, or an embedded POM that isn't well-formed XML.
+/// A bounds trip (entry-count or decompression-ratio cap exceeded) is the
+/// one outcome treated as hostile input and also degrades softly, logged
+/// at `warn` — SBOM enrichment must never abort a scan.
+fn extract_jar_embedded_pom_sbom(
+    coords: &ArtifactCoords,
+    group_id: &str,
+    artifact_id: &str,
+    subject: SbomComponent,
+    payload: PayloadAccess<'_>,
+) -> DomainResult<PayloadSbomExtraction> {
+    // ZIP parsing needs `Read + Seek`; materialise into memory the same
+    // way the PyPI wheel-METADATA extractor does — the ingest hook has
+    // already buffered the artifact for the primary-content-hash
+    // computation, so the memory cost is already paid at this point.
+    let buf: Vec<u8> = match payload {
+        PayloadAccess::Bytes(b) => b.to_vec(),
+        PayloadAccess::ReadStream(mut r) => {
+            let mut v = Vec::new();
+            if r.read_to_end(&mut v).is_err() {
+                return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
+            }
+            v
+        }
+    };
+
+    // Unlike the storage/download layout path (where groupId is
+    // slash-expanded), the JAR's own internal `META-INF/maven/` convention
+    // keeps groupId as a single literal dotted path segment — real-world
+    // jars embed e.g. `META-INF/maven/org.springframework.boot/spring-boot/pom.xml`,
+    // not a slash-expanded one.
+    let expected_path = format!("META-INF/maven/{group_id}/{artifact_id}/pom.xml");
+
+    let mut pom_bytes: Option<Vec<u8>> = None;
+    let mut read_err: Option<String> = None;
+    let iter_result = crate::archive_bounds::iter_zip_entries(
+        Cursor::new(&buf),
+        crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
+        |name, reader| {
+            if read_err.is_some() || pom_bytes.is_some() {
+                return;
+            }
+            if has_traversal_segment(name) || name != expected_path {
+                return;
+            }
+            let mut out = Vec::new();
+            match reader.read_to_end(&mut out) {
+                Ok(_) => pom_bytes = Some(out),
+                Err(e) => read_err = Some(format!("maven jar embedded pom read failed: {e}")),
+            }
+        },
+    );
+
+    match iter_result {
+        Ok(()) => {}
+        // Not a valid ZIP — non-fatal: the same leaf outcome as a jar
+        // with no embedded POM. The primary-content-hash check already
+        // verified this artifact at ingest; SBOM extraction just can't
+        // say more about it.
+        Err(crate::archive_bounds::ZipIterError::Open(_)) => {
+            return Ok(subject_only(subject, SbomResolution::NoLockfile));
+        }
+        Err(e) => {
+            tracing::warn!(
+                artifact = %coords.name,
+                error = %e,
+                "maven SBOM: jar zip rejected during embedded-POM extraction; degrading to subject-only",
+            );
+            return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
+        }
+    }
+    if let Some(msg) = read_err {
+        tracing::warn!(
+            artifact = %coords.name,
+            error = %msg,
+            "maven SBOM: embedded pom.xml read failed; degrading to subject-only",
+        );
+        return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
+    }
+
+    let Some(pom_bytes) = pom_bytes else {
+        // No embedded POM — the leaf case. OSV can still query the
+        // artifact's own coordinate via the subject.
+        return Ok(subject_only(subject, SbomResolution::NoLockfile));
+    };
+
+    match pom::parse_pom_dependencies(&mut Cursor::new(pom_bytes)) {
+        Ok(deps) => Ok(PayloadSbomExtraction {
+            sbom: Some(Sbom {
+                subject: Some(subject),
+                components: maven_sbom_components(&deps.specs),
+            }),
+            resolution: SbomResolution::Resolved,
+            skipped_non_registry: 0,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                artifact = %coords.name,
+                error = %e,
+                "maven SBOM: embedded pom.xml did not parse; degrading to subject-only",
+            );
+            Ok(subject_only(subject, SbomResolution::UnusableLockfile))
+        }
     }
 }
 
@@ -1064,7 +1345,7 @@ mod tests {
     fn parse_upstream_checksum_bare_hex_to_sha1() {
         let coords = sample_file_coords();
         let cs = handler()
-            .parse_upstream_checksum(&mut std::io::Cursor::new(SHA1_HEX.as_bytes()), &coords)
+            .parse_upstream_checksum(&mut Cursor::new(SHA1_HEX.as_bytes()), &coords)
             .unwrap();
         assert_eq!(cs.algorithm(), HashAlgorithm::Sha1);
         assert_eq!(cs.hex(), SHA1_HEX);
@@ -1076,7 +1357,7 @@ mod tests {
         let coords = sample_file_coords();
         let body = format!("{SHA1_HEX}  guava-31.1-jre.jar");
         let cs = handler()
-            .parse_upstream_checksum(&mut std::io::Cursor::new(body.as_bytes()), &coords)
+            .parse_upstream_checksum(&mut Cursor::new(body.as_bytes()), &coords)
             .unwrap();
         assert_eq!(cs.algorithm(), HashAlgorithm::Sha1);
         assert_eq!(cs.hex(), SHA1_HEX);
@@ -1087,7 +1368,7 @@ mod tests {
         let coords = sample_file_coords();
         let upper = SHA1_HEX.to_ascii_uppercase();
         let cs = handler()
-            .parse_upstream_checksum(&mut std::io::Cursor::new(upper.as_bytes()), &coords)
+            .parse_upstream_checksum(&mut Cursor::new(upper.as_bytes()), &coords)
             .unwrap();
         assert_eq!(cs.hex(), SHA1_HEX);
     }
@@ -1097,7 +1378,7 @@ mod tests {
         let coords = sample_file_coords();
         for body in ["", "   ", "\n\t "] {
             let err = handler()
-                .parse_upstream_checksum(&mut std::io::Cursor::new(body.as_bytes()), &coords)
+                .parse_upstream_checksum(&mut Cursor::new(body.as_bytes()), &coords)
                 .unwrap_err();
             assert!(
                 matches!(err, DomainError::Validation(_)),
@@ -1113,7 +1394,7 @@ mod tests {
         let coords = sample_file_coords();
         for body in ["not-a-digest", "deadbeef", "z".repeat(40).as_str()] {
             let err = handler()
-                .parse_upstream_checksum(&mut std::io::Cursor::new(body.as_bytes()), &coords)
+                .parse_upstream_checksum(&mut Cursor::new(body.as_bytes()), &coords)
                 .unwrap_err();
             assert!(
                 matches!(err, DomainError::Validation(_)),
@@ -1219,7 +1500,7 @@ mod tests {
             <version>31.1-jre</version><version>32.1.3-jre</version>
         </versions></versioning></metadata>"#;
         let got = discovery()
-            .extract_upstream_versions(&mut std::io::Cursor::new(&body[..]))
+            .extract_upstream_versions(&mut Cursor::new(&body[..]))
             .unwrap();
         assert_eq!(got, ["31.1-jre", "32.1.3-jre"]);
     }
@@ -1227,7 +1508,7 @@ mod tests {
     #[test]
     fn extract_upstream_versions_degrades_open_on_a_malformed_body() {
         let got = discovery()
-            .extract_upstream_versions(&mut std::io::Cursor::new(b"not xml".as_slice()))
+            .extract_upstream_versions(&mut Cursor::new(b"not xml".as_slice()))
             .expect("a malformed body is no signal, not an error");
         assert!(got.is_empty());
     }
@@ -1236,7 +1517,7 @@ mod tests {
     fn extract_upstream_versions_rejects_an_over_cap_body() {
         let oversized = vec![b'x'; metadata::UPSTREAM_METADATA_MAX_BYTES + 1];
         let err = discovery()
-            .extract_upstream_versions(&mut std::io::Cursor::new(oversized.as_slice()))
+            .extract_upstream_versions(&mut Cursor::new(oversized.as_slice()))
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
@@ -1253,7 +1534,7 @@ mod tests {
             </dependencies>
         </project>"#;
         let specs = discovery()
-            .extract_dependency_specs(&mut std::io::Cursor::new(&body[..]))
+            .extract_dependency_specs(&mut Cursor::new(&body[..]))
             .unwrap();
         assert_eq!(
             specs,
@@ -1277,7 +1558,7 @@ mod tests {
               <artifactId>spring-boot-starter-web</artifactId></dependency></dependencies>
         </project>"#;
         let specs = discovery()
-            .extract_dependency_specs(&mut std::io::Cursor::new(&body[..]))
+            .extract_dependency_specs(&mut Cursor::new(&body[..]))
             .expect("a parent-managed POM is valid input");
         assert!(specs.is_empty());
     }
@@ -1285,7 +1566,7 @@ mod tests {
     #[test]
     fn extract_dependency_specs_errs_on_non_pom_bytes() {
         let err = discovery()
-            .extract_dependency_specs(&mut std::io::Cursor::new(b"PK\x03\x04".as_slice()))
+            .extract_dependency_specs(&mut Cursor::new(b"PK\x03\x04".as_slice()))
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
@@ -1341,7 +1622,7 @@ mod tests {
         assert_eq!(discovery().download_config_path(), None);
         assert!(discovery()
             .compose_download_url_from_config(
-                &mut std::io::Cursor::new(b"{}".as_slice()),
+                &mut Cursor::new(b"{}".as_slice()),
                 "com.example:foo",
                 "1.0",
                 None,
@@ -1349,9 +1630,364 @@ mod tests {
             .is_err());
         assert!(discovery()
             .resolve_download_url_from_metadata(
-                &mut std::io::Cursor::new(b"<metadata/>".as_slice()),
+                &mut Cursor::new(b"<metadata/>".as_slice()),
                 &sample_file_coords(),
             )
             .is_err());
+    }
+
+    // -- PayloadSbom / extract_sbom_from_payload ------------------------------
+
+    fn payload_sbom() -> &'static dyn PayloadSbom {
+        static HANDLER: MavenFormatHandler = MavenFormatHandler;
+        HANDLER.payload_sbom().expect("maven declares PayloadSbom")
+    }
+
+    /// Wrap a `<dependencies>`/`<dependencyManagement>` fragment in a
+    /// minimal well-formed POM, mirroring `pom.rs`'s own `pom_with` test
+    /// helper.
+    fn pom_wrapped(body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.example</groupId>
+  <artifactId>app</artifactId>
+  <version>1.2.3</version>
+{body}
+</project>"#
+        )
+    }
+
+    #[test]
+    fn maven_declares_payload_sbom() {
+        assert!(handler().payload_sbom().is_some());
+    }
+
+    #[test]
+    fn extract_sbom_pom_yields_three_components_and_subject() {
+        let xml = pom_wrapped(
+            r#"<dependencyManagement>
+                 <dependencies>
+                   <dependency>
+                     <groupId>com.example</groupId><artifactId>managed-lib</artifactId>
+                     <version>2.0</version>
+                   </dependency>
+                 </dependencies>
+               </dependencyManagement>
+               <dependencies>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>compile-lib</artifactId>
+                   <version>1.1</version>
+                 </dependency>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>runtime-lib</artifactId>
+                   <version>1.2</version><scope>runtime</scope>
+                 </dependency>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>managed-lib</artifactId>
+                 </dependency>
+               </dependencies>"#,
+        );
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.pom",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(xml.as_bytes()),
+            )
+            .expect("well-formed pom parses");
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        assert_eq!(extraction.skipped_non_registry, 0);
+        let sbom = extraction.sbom.expect("sbom present");
+        let subject = sbom.subject.expect("subject present");
+        assert_eq!(subject.purl, "pkg:maven/com.example/app@1.2.3");
+        assert_eq!(subject.ecosystem, Ecosystem::Maven);
+        assert!(subject.direct_dependency);
+        assert_eq!(sbom.components.len(), 3);
+        let purls: Vec<&str> = sbom.components.iter().map(|c| c.purl.as_str()).collect();
+        assert!(purls.contains(&"pkg:maven/com.example/compile-lib@1.1"));
+        assert!(purls.contains(&"pkg:maven/com.example/runtime-lib@1.2"));
+        assert!(
+            purls.contains(&"pkg:maven/com.example/managed-lib@2.0"),
+            "the dependencyManagement-resolved dependency must carry its managed version"
+        );
+        for c in &sbom.components {
+            assert!(c.direct_dependency);
+            assert!(c.licenses.is_empty());
+            assert_eq!(c.ecosystem, Ecosystem::Maven);
+        }
+    }
+
+    #[test]
+    fn extract_sbom_pom_omits_property_and_range_dependencies_but_keeps_the_subject() {
+        let xml = pom_wrapped(
+            r#"<dependencies>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>prop-lib</artifactId>
+                   <version>${undeclared.version}</version>
+                 </dependency>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>range-lib</artifactId>
+                   <version>[1.0,2.0)</version>
+                 </dependency>
+               </dependencies>"#,
+        );
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.pom",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(xml.as_bytes()),
+            )
+            .expect("well-formed pom parses even when every dependency is skipped");
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        let sbom = extraction.sbom.expect("sbom present");
+        assert!(
+            sbom.components.is_empty(),
+            "an unresolved property and an unsupported range must not become components"
+        );
+        assert!(
+            sbom.subject.is_some(),
+            "subject stays present so osv can still query the artifact's own coordinate"
+        );
+    }
+
+    #[test]
+    fn extract_sbom_pom_reads_from_a_streaming_payload() {
+        let xml = pom_wrapped(
+            r#"<dependencies>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>compile-lib</artifactId>
+                   <version>1.1</version>
+                 </dependency>
+               </dependencies>"#,
+        );
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.pom",
+        );
+        let stream: Box<dyn Read + Send> = Box::new(Cursor::new(xml.into_bytes()));
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::ReadStream(stream),
+            )
+            .expect("pom parses from a streaming payload");
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        assert_eq!(extraction.sbom.expect("sbom present").components.len(), 1);
+    }
+
+    #[test]
+    fn extract_sbom_pom_degrades_to_unusable_lockfile_on_malformed_xml() {
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.pom",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(b"not xml"),
+            )
+            .expect("a malformed pom degrades softly rather than erroring");
+        assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
+        let sbom = extraction.sbom.expect("subject-only fallback");
+        assert!(sbom.components.is_empty());
+        assert!(sbom.subject.is_some());
+    }
+
+    #[test]
+    fn extract_sbom_jar_with_embedded_pom_matches_the_pom_case() {
+        let xml = pom_wrapped(
+            r#"<dependencies>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>compile-lib</artifactId>
+                   <version>1.1</version>
+                 </dependency>
+               </dependencies>"#,
+        );
+        let jar_bytes = crate::test_support::build_wheel_zip(&[
+            ("META-INF/maven/com.example/app/pom.xml", xml.as_bytes()),
+            ("com/example/App.class", b"\xCA\xFE\xBA\xBE".as_slice()),
+        ]);
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(&jar_bytes),
+            )
+            .expect("jar zip opens");
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        let sbom = extraction.sbom.expect("sbom present");
+        assert_eq!(sbom.components.len(), 1);
+        assert_eq!(
+            sbom.components[0].purl,
+            "pkg:maven/com.example/compile-lib@1.1"
+        );
+        let subject = sbom.subject.expect("subject present");
+        assert_eq!(subject.purl, "pkg:maven/com.example/app@1.2.3");
+    }
+
+    #[test]
+    fn extract_sbom_jar_without_embedded_pom_is_a_subject_only_leaf() {
+        let jar_bytes = crate::test_support::build_wheel_zip(&[(
+            "com/example/App.class",
+            b"\xCA\xFE\xBA\xBE".as_slice(),
+        )]);
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(&jar_bytes),
+            )
+            .expect("jar zip opens");
+        assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
+        let sbom = extraction
+            .sbom
+            .expect("sbom present — the leaf case still lets osv query the artifact");
+        assert!(sbom.components.is_empty());
+        let subject = sbom.subject.expect("subject present");
+        assert_eq!(subject.purl, "pkg:maven/com.example/app@1.2.3");
+    }
+
+    #[test]
+    fn extract_sbom_jar_ignores_a_traversal_named_entry_without_panicking() {
+        let xml = pom_wrapped(
+            r#"<dependencies>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>compile-lib</artifactId>
+                   <version>1.1</version>
+                 </dependency>
+               </dependencies>"#,
+        );
+        // Not the exact expected embedded-POM path — a traversal-shaped
+        // entry name must never be treated as the artifact's own POM.
+        let jar_bytes = crate::test_support::build_wheel_zip(&[(
+            "META-INF/maven/../../../../etc/passwd",
+            xml.as_bytes(),
+        )]);
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(&jar_bytes),
+            )
+            .expect("jar zip opens without panicking on a traversal-shaped entry name");
+        assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
+        assert!(extraction
+            .sbom
+            .expect("subject-only leaf")
+            .components
+            .is_empty());
+    }
+
+    #[test]
+    fn extract_sbom_jar_degrades_to_subject_only_when_not_a_valid_zip() {
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(b"not a zip"),
+            )
+            .expect("a non-zip jar degrades softly rather than erroring");
+        assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
+        let sbom = extraction.sbom.expect("subject-only fallback");
+        assert!(sbom.components.is_empty());
+        assert!(sbom.subject.is_some());
+    }
+
+    #[test]
+    fn extract_sbom_jar_reads_from_a_streaming_payload() {
+        let jar_bytes = crate::test_support::build_wheel_zip(&[(
+            "com/example/App.class",
+            b"\xCA\xFE\xBA\xBE".as_slice(),
+        )]);
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let stream: Box<dyn Read + Send> = Box::new(Cursor::new(jar_bytes));
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::ReadStream(stream),
+            )
+            .expect("jar zip opens from a streaming payload");
+        assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
+    }
+
+    #[test]
+    fn extract_sbom_returns_none_for_non_manifest_roles() {
+        for path in [
+            "com/example/app/1.2.3/app-1.2.3.jar.sha1",
+            "com/example/app/maven-metadata.xml",
+            "com/example/app/1.2.3/app-1.2.3-sources.jar",
+            "com/example/app/1.2.3/app-1.2.3-javadoc.jar",
+            "com/example/app/1.2.3/app-1.2.3.module",
+        ] {
+            let coords = file_coords("com.example:app", "1.2.3", path);
+            let extraction = payload_sbom()
+                .extract_sbom_from_payload(
+                    &coords,
+                    &serde_json::Value::Null,
+                    PayloadAccess::Bytes(b"<project/>"),
+                )
+                .unwrap_or_else(|e| panic!("non-manifest role {path} must never error: {e}"));
+            assert_eq!(extraction.sbom, None, "role for {path} must yield no SBOM");
+            assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
+            assert_eq!(extraction.skipped_non_registry, 0);
+        }
+    }
+
+    #[test]
+    fn extract_sbom_errs_when_coords_name_is_not_colon_joined() {
+        let mut coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.pom",
+        );
+        coords.name = "not-a-ga-name".to_string();
+        let err = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(b"<project/>"),
+            )
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
     }
 }

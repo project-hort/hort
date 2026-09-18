@@ -1,0 +1,24 @@
+# Mirrors hort-crates-scan.yaml's posture for the same reason: the
+# scenario publishes a `.pom` declaring a known-affected coordinate and
+# needs the resulting finding recorded, not enforced, so the publish
+# itself is never gated by the scan verdict it is trying to observe.
+#
+# `quarantineDuration: 0s` releases the published `.pom` immediately —
+# the scenario polls for the scan outcome, not for a quarantine window —
+# and `enforcement: record` means a `critical` finding on
+# org.apache.logging.log4j:log4j-core:2.14.1 (the scenario's fixture
+# coordinate) is recorded rather than rejecting the artifact.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: maven-osv-e2e-scan
+spec:
+  scope:
+    repository: maven-osv-e2e
+  severityThreshold: critical
+  quarantineDuration: 0s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["osv"]
+  enforcement: record
+  licensePolicy: {}
