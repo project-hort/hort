@@ -181,6 +181,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   freshly-applied `record` policy enforced `reject` until a later apply
   diffed and corrected it. The projection now takes `enforcement` from the
   command like every other field.
+- **OSV scanning now covers Maven artifacts** (#265). `scan_backends:
+  ["osv"]` on a Maven repository was accepted at apply time but scanned
+  nothing at run time — the Maven format handler had every piece the
+  scanner needed (the POM reader, the coordinates, the `Maven` ecosystem,
+  the `maven` purl type) but never wired them into an SBOM, so
+  `OsvScanner::scan` always logged "scan skipped — no SBOM provided" and
+  moved on. A published `.pom` now yields its declared compile- and
+  runtime-scope dependencies as scannable components, and a `.jar`/`.war`
+  yields the same from its embedded `META-INF/maven/{groupId}/{artifactId}/pom.xml`
+  when present; either way the artifact's own coordinate is always in the
+  SBOM as the subject, so osv-scanner can flag the artifact itself even
+  when its dependency versions cannot be resolved from the POM alone (a
+  version inherited from a parent POM or an imported BOM, for instance).
 
 - **A curator looking at an artifact the integrity scrubber condemned now sees
   why** (#245). When the CAS scrubber re-reads a stored blob and the bytes do
