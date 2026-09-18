@@ -2724,7 +2724,7 @@ pub fn emit_sbom_extraction(format: &str, result: SbomExtractionResult) {
     .increment(1);
 }
 
-/// Outcome label of `hort_sbom_resolution_total`. Closed taxonomy of 6 —
+/// Outcome label of `hort_sbom_resolution_total`. Closed taxonomy of 5 —
 /// exactly one per scan-time SBOM extraction attempt.
 ///
 /// Where [`SbomExtractionResult`] says whether an SBOM came out,
@@ -2761,22 +2761,6 @@ pub enum SbomResolutionResult {
     /// opaque format. Not a degradation: there is no resolved-dependency
     /// document to look for.
     NotApplicable,
-    /// The format *does* derive its SBOM from the payload, but the
-    /// artifact's repository is not `Hosted`, so the payload path was
-    /// not taken and the scan used the metadata-only BOM. Deliberate
-    /// policy, not a failure: an embedded lockfile is only the
-    /// authenticated publisher's own build witness on a hosted publish;
-    /// on a proxied third-party library it is the upstream author's
-    /// dev-time resolve, which no consumer ever runs.
-    ///
-    /// Split from [`Self::NotApplicable`] because the two are
-    /// operationally different and would otherwise collide on the same
-    /// `format` label: `not_applicable` says "there is nothing to look
-    /// for", `hosted_only` says "there is, and this repository class
-    /// deliberately does not look". A cargo registry whose scans are all
-    /// `hosted_only` when its operator believes those repositories are
-    /// hosted is a misconfiguration no other series reveals.
-    HostedOnly,
 }
 
 impl SbomResolutionResult {
@@ -2789,14 +2773,13 @@ impl SbomResolutionResult {
             Self::UnusableLockfile => "unusable_lockfile",
             Self::PayloadUnavailable => "payload_unavailable",
             Self::NotApplicable => "not_applicable",
-            Self::HostedOnly => "hosted_only",
         }
     }
 }
 
 /// The handler-side vocabulary (3 arms — what a format handler can
-/// observe) lifted into the emitting layer's vocabulary (6 arms — the
-/// handler's three plus the three only the orchestrator can see). The
+/// observe) lifted into the emitting layer's vocabulary (5 arms — the
+/// handler's three plus the two only the orchestrator can see). The
 /// domain stays free of metric concerns; the mapping lives here, with
 /// the counter.
 impl From<hort_domain::ports::format_handler::SbomResolution> for SbomResolutionResult {

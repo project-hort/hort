@@ -2668,7 +2668,7 @@ intentionally NOT operator-tunable.
 | `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout` |
 | `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
 | `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error, payload_unavailable}` |
-| `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable, hosted_only}` |
+| `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
 | `hort_sbom_components_skipped_total` | counter | `format` | — | — (the skip count rides the counter's value) |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
 | `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
@@ -2686,7 +2686,7 @@ Source of truth for the result enums:
 - `hort_app::metrics::SbomResolutionResult` for
   `hort_sbom_resolution_total.result`. Its three payload-derived arms are
   lifted from `hort_domain::ports::format_handler::SbomResolution` (the
-  handler-side vocabulary) via `From`; the remaining three are outcomes only
+  handler-side vocabulary) via `From`; the remaining two are outcomes only
   the orchestrator can observe.
 
 Adding a variant to any of those enums requires updating this catalog
@@ -2818,7 +2818,7 @@ scan-time SBOM extraction attempt) — *did a BOM come out*:
   content one.
 
 **`hort_sbom_resolution_total.result` semantics** (closed taxonomy of
-6; same emitter, same one-tick-per-attempt cadence) — *what the
+5; same emitter, same one-tick-per-attempt cadence) — *what the
 component versions mean*. The two counters are orthogonal and both fire
 on every attempt: `hort_sbom_extraction_total` says whether a BOM was
 produced, this one says on what basis:
@@ -2842,25 +2842,18 @@ produced, this one says on what basis:
   payload (npm, PyPI, and every opaque format), or no handler is
   registered. Not a degradation: there is no resolved-dependency
   document to look for.
-- `hosted_only` — the format *does* derive its SBOM from the payload,
-  but the artifact's repository is not `Hosted`, so the payload path was
-  declined and the scan used the metadata-only BOM. Deliberate policy,
-  not a failure: an embedded lockfile is the authenticated publisher's
-  own build witness only on a hosted publish; on a proxied third-party
-  library it is the upstream author's dev-time resolve, which consumers
-  re-resolve and never run. `Staging` and `Virtual` land here with
-  `Proxy`. The extraction counter still reports what came out of the
-  metadata path, so `hosted_only` never means "no BOM".
 
 Operator reading: `resolved / (resolved + no_lockfile +
 unusable_lockfile)` per format is the share of scans that examined
 dependencies at all. A registry whose cargo scans are mostly
 `no_lockfile` is not being scanned in the way its operator thinks it is,
 and no finding count would reveal that. `no_lockfile` moving is a
-publisher-population fact; `unusable_lockfile` moving is ours;
-`hosted_only` is a repository-topology fact — it is the expected value
-for a pull-through cache, and a surprise on a repository the operator
-believes is hosted.
+publisher-population fact; `unusable_lockfile` moving is ours. The
+payload path now runs for every repository class, so a proxy's
+`resolved` findings are real evidence about the upstream author's
+dev-time resolve, not the consumer's build — `enforcement: record` is
+the recommended mode on proxied lockfile-resolving formats for exactly
+that reason (see ADR 0056's amendment).
 
 **`hort_sbom_components_skipped_total`** counts dependencies a resolved
 closure walked *through* but could not emit, for having no registry
@@ -2953,7 +2946,7 @@ Cardinality:
 - `hort_advisory_query_total`: 6 result values → 6 series.
 - `hort_advisory_hydration_total`: 3 result values → 3 series.
 - `hort_sbom_extraction_total`: ~15 formats × 4 results → 60 series.
-- `hort_sbom_resolution_total`: ~15 formats × 6 results → 90 series.
+- `hort_sbom_resolution_total`: ~15 formats × 5 results → 75 series.
 - `hort_sbom_components_skipped_total`: ~15 formats → 15 series.
 - `hort_artifact_became_vulnerable_total`: ≤10k repositories × 4
   severities × 2 ingest_source → 80k series ceiling. Honours the

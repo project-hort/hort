@@ -3,13 +3,16 @@
 - **Status:** Accepted
 - **Enforced by:** `FormatHandler::payload_sbom()` — a format that does not
   return a `&dyn PayloadSbom` never sees a payload byte, structurally rather
-  than by convention (ADR 0005 capability groups); the literal
-  `RepositoryType::Hosted` match in `ScanOrchestrationUseCase::try_extract_sbom`
-  (pinned by test against a "simplification" into `RepositoryType::is_hosted`,
-  which would silently widen the class to `Staging`); the
-  `hort_sbom_resolution_total{format, result}` counter, whose `hosted_only`
-  and `no_lockfile` arms make every non-resolved outcome observable rather
-  than silent.
+  than by convention (ADR 0005 capability groups); `ScanOrchestrationUseCase::
+  try_extract_sbom` reads the payload for every `RepositoryType` once that
+  capability answers `Some` (the repository-class gate this ADR originally
+  shipped is removed — see the amendment below; the test
+  `payload_scan_runs_for_every_repository_class` pins the current shape and
+  is the renamed inverse of the retired
+  `payload_scan_is_gated_off_for_every_non_hosted_repository_class`); the
+  `hort_sbom_resolution_total{format, result}` counter, whose `no_lockfile`
+  and `unusable_lockfile` arms make every non-resolved outcome observable
+  rather than silent.
 - **Supersedes:** —
 - **Relates:** [0005](0005-wasm-format-modules-capability-taxonomy.md) (the
   capability-group shape this reuses),
@@ -276,6 +279,66 @@ metric label's name at that moment — it would then be a misnomer.
   cycles.
 - A future format that wants payload-derived components implements
   `PayloadSbom`; nothing else in the pipeline changes for it.
+
+## Amendment (2026-09-17) — payload SBOM extraction runs for every repository class
+
+**Superseded.** The *Decision* above — "for artifacts in a `Hosted`
+repository" — and its dedicated section, *The payload path is
+hosted-only*, no longer describe the code. `ScanOrchestrationUseCase::
+try_extract_sbom` now reads the stored payload for **every**
+`RepositoryType` once the format handler declares `payload_sbom()`; the
+literal `RepositoryType::Hosted` match is gone, along with
+`SbomResolutionResult::HostedOnly` and its `hosted_only` label in
+`docs/metrics-catalog.md`. The two questions the *Explicitly out of
+scope / open* section deferred — the proxy lockfile, and Staging — are
+resolved by this reversal: both now take the payload path with Hosted
+and Virtual, on equal footing.
+
+**Rationale reversal.** The original decision held the payload path back
+by repository class because the evidentiary weight of a lockfile finding
+depends on who wrote it, and a stale upstream resolve carrying gate power
+under `enforcement: reject` is the same false-positive-with-gate-power
+class this ADR exists to remove — just reintroduced on the proxy face
+instead of the declared-range face. That argument correctly identifies a
+risk, but it locates the fix in the wrong layer: it makes the scanner
+withhold information the repository configuration says should exist,
+rather than letting the operator's `enforcement` setting decide what a
+finding does to the artifact. The governing rule for the scan axis is
+now: *a repository configuration that declares no artifact above a
+threat level is delivered obliges the scanner to be able to deliver that
+information — do what is necessary for that, and no more.* A Maven proxy
+has no metadata fallback at all, so gating its payload path did not trade
+a stronger signal for a weaker one — it produced no SBOM, and `osv`
+scanned nothing while the policy claimed a threat level. Per-repository-
+class gate power was considered as a narrower fix and rejected: it adds a
+second mechanism duplicating what `enforcement` already does, for no
+additional safety `enforcement: record` does not already provide.
+
+**What stays.** `enforcement` and its vocabulary (ADR 0007, ADR 0041) are
+untouched — this amendment does not add, remove, or reinterpret an
+enforcement mode, and no new policy field or opt-in is introduced. The
+resolution metrics stay in place: `resolved`, `no_lockfile` and
+`unusable_lockfile` still make every non-resolved outcome observable
+per format, and now do so uniformly across repository classes rather
+than being pre-empted by a `hosted_only` arm on the non-hosted ones. The
+declared-deps branch stays deleted, not demoted — see *The
+declared-deps branch is deleted, not demoted* above — a payload with no
+usable lockfile still yields a subject-only BOM, never a fallback to
+declared ranges. Resolved components still claim no licence, unchanged.
+The binary-vs-library nuance is still open: a **binary** crate installed
+with `cargo install --locked` really does run its embedded resolve, so
+for bins the upstream signal is genuine, and bin/lib still cannot be told
+apart cheaply at scan time.
+
+**Operator note.** On a proxied lockfile-resolving format, a resolved
+component now names the upstream author's dev-time resolve, not the
+consumer's build — the same fact the original decision treated as
+disqualifying. `enforcement: record` is the recommended mode there: the
+finding is kept and observable without becoming release authority.
+`crates-proxy`, which ships `enforcement: reject` today, is exactly the
+configuration this note is for; #259 tracks the apply-time warn-rule
+that flags `reject × proxy × payload-resolve format` so an operator is
+told rather than left to discover it from a rejected release.
 
 ## References
 

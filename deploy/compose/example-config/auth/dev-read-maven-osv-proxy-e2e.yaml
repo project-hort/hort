@@ -1,0 +1,17 @@
+# PermissionGrant: [developer, ci-pusher] -> read maven-osv-proxy-e2e.
+#
+# maven-osv-proxy-e2e is private (isPublic: false): the scenario pulls the
+# fixture .pom through it as dev-user, so without this grant the pull returns
+# 403 before it ever reaches the quarantine/scan gate the scenario asserts
+# on. Two-claim subject per the allowlist linter, mirroring
+# dev-read-crates-proxy.yaml.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-read-maven-osv-proxy-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: read
+  repository: maven-osv-proxy-e2e

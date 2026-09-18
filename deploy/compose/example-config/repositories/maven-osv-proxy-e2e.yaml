@@ -1,0 +1,31 @@
+# Private Maven Central pull-through used by the proxy leg of
+# scripts/native-tests/scenarios/dogfood/maven-osv-scan.sh.
+#
+# Distinct from maven-osv-e2e: that repository is hosted (a direct PUT
+# publishes the fixture .pom); this one is a proxy, so the same
+# extract-SBOM-then-osv-scan chain has to run on an artifact that arrived via
+# an upstream pull-through instead of a client push — the two legs together
+# are the proof that the payload SBOM extractor runs for every repository
+# class, not just hosted.
+#
+# `indexMode: include_pending` is load-bearing (same reason as
+# maven-central-e2e / crates-proxy): the default `released_only` serves an
+# empty index on a cold mirror, so a never-ingested coordinate cannot be
+# resolved and the pull-through never starts.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: maven-osv-proxy-e2e
+spec:
+  name: "Maven Central pull-through (OSV scan e2e)"
+  description: "Private, quarantined+scanned Maven Central proxy; proves the payload SBOM extractor feeds a real osv-scanner run on a proxy pull-through. requires: egress."
+  format: maven
+  type: proxy
+  indexMode: include_pending
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/maven-osv-proxy-e2e
+  proxy:
+    upstreamUrl: "https://repo1.maven.org/maven2"
+  isPublic: false
+  replicationPriority: local_only

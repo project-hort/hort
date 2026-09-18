@@ -1,0 +1,15 @@
+# UpstreamMapping for maven-osv-proxy-e2e — the runtime upstream a Maven
+# pull-through fetch actually reads (the ArtifactRepository's spec.proxy
+# block is validator-only; see maven-central-e2e.yaml's own note on this).
+# Empty pathPrefix → catch-all single-upstream mapping, matching Maven's
+# registry-wide-upstream-per-repo shape (no path-prefix routing).
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: maven-osv-proxy-e2e
+spec:
+  repository: maven-osv-proxy-e2e
+  pathPrefix: ""
+  upstreamUrl: https://repo1.maven.org/maven2
+  auth:
+    type: anonymous

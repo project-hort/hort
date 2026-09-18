@@ -1,0 +1,20 @@
+# ScanPolicy for maven-osv-proxy-e2e — record mode so an osv verdict never
+# blocks the scenario, mirroring maven-osv-e2e-scan.yaml's posture. Unlike
+# that hosted-leg policy's quarantineDuration: 0s, this repo keeps a real —
+# but short — observation window: the point of this fixture is a genuine
+# quarantined pull-through with an osv verdict landing inside it, not an
+# immediately-servable artifact.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: maven-osv-proxy-e2e-scan
+spec:
+  scope:
+    repository: maven-osv-proxy-e2e
+  severityThreshold: critical
+  quarantineDuration: 20s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["osv"]
+  enforcement: record
+  licensePolicy: {}

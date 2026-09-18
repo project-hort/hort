@@ -25,6 +25,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
+use hort_domain::entities::repository::RepositoryType;
 use hort_domain::entities::scan_policy::{
     NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
@@ -2582,8 +2583,9 @@ fn component(purl: &str) -> SbomComponent {
 
 /// Seed a cargo artifact whose stored CAS content is `payload`, with the
 /// artifact row's `sha256_checksum` pointing at it — the only handle the
-/// orchestrator has on the bytes. The repository is `Hosted`, the one
-/// class whose artifacts take the payload path.
+/// orchestrator has on the bytes. The repository is `Hosted`; every
+/// class takes the payload path, so callers that need a different one
+/// use [`seed_cargo_artifact_in_repo_type`] directly.
 ///
 /// `metadata_json` is the stored `ArtifactMetadata.metadata` row (the
 /// registry-index document). Note what is deliberately absent: no
@@ -2611,7 +2613,7 @@ async fn seed_cargo_artifact_with_payload(
 }
 
 /// As [`seed_cargo_artifact_with_payload`], with the repository class
-/// chosen by the caller — the input the payload-path gate reads.
+/// chosen by the caller.
 #[allow(clippy::too_many_arguments)]
 async fn seed_cargo_artifact_in_repo_type(
     repo_type: RepositoryType,
@@ -2854,55 +2856,51 @@ async fn payload_scan_survives_an_unreadable_stored_payload() {
 }
 
 #[tokio::test]
-async fn payload_scan_in_a_proxy_repo_never_pays_for_a_cas_read() {
-    // The gate's cost half. A proxied cargo artifact's embedded lockfile
-    // is the upstream author's dev-time resolve, which no consumer of the
-    // library ever runs — so the registry must not stream the payload out
-    // of CAS to read it. `payload_sbom()` still answers `Some` for cargo;
-    // the repository class is what turns the read away, and it does so
-    // before the storage handle is touched at all.
+async fn payload_scan_in_a_proxy_repo_reads_the_stored_payload() {
+    // ADR 0056's amendment: the repository class no longer decides
+    // whether the payload path runs. `payload_sbom()` answering `Some`
+    // for cargo is now sufficient by itself, so a proxied artifact reads
+    // CAS exactly as a hosted one does.
     let (_queried, handler, storage) =
         run_cargo_scan_in_repo_type(RepositoryType::Proxy, b"RESOLVED:serde@1.0.200").await;
 
     assert_eq!(
         storage.get_call_count(),
-        0,
-        "a proxied cargo artifact must not read CAS for its SBOM"
+        1,
+        "a proxied cargo artifact reads CAS for its SBOM, same as hosted"
     );
     assert!(
-        handler.seen_payload.lock().unwrap().is_none(),
-        "the payload capability is never dispatched for a non-hosted repository"
+        handler.seen_payload.lock().unwrap().is_some(),
+        "the payload capability is dispatched for a proxied repository"
     );
 }
 
 #[tokio::test]
-async fn payload_scan_in_a_proxy_repo_produces_the_pre_payload_metadata_sbom() {
-    // The gate's behaviour half: a proxied cargo scan is byte-identical
-    // to what it produced before the payload path existed — the
-    // handler's metadata-only `extract_sbom`, declared-range components
-    // and all. This arm must not change: findings against an upstream
-    // author's stale resolve would carry gate power (the shipped
-    // `enforcement: reject` default) over a crate every consumer would
-    // resolve safely.
+async fn payload_scan_in_a_proxy_repo_resolves_from_the_payload() {
+    // The behaviour half of the same reversal: a proxied cargo scan now
+    // produces the resolved-lockfile SBOM, not the declared-range one.
+    // The false-positive-with-gate-power risk this used to guard against
+    // is addressed by `enforcement: record` on proxied lockfile formats
+    // (an operator setting, not a scanner-side gate) rather than by
+    // withholding the SBOM.
     let (queried, _handler, _storage) =
         run_cargo_scan_in_repo_type(RepositoryType::Proxy, b"RESOLVED:serde@1.0.200").await;
 
-    assert_eq!(
-        queried.iter().map(|c| c.purl.as_str()).collect::<Vec<_>>(),
-        vec!["pkg:cargo/declared@1"],
-        "the proxy path must be exactly the metadata-only SBOM"
+    assert!(
+        queried.iter().any(|c| c.purl == "pkg:cargo/serde@1.0.200"),
+        "the proxy path must resolve from the payload, not the declared range: {queried:?}"
     );
 }
 
 #[tokio::test]
-async fn payload_scan_is_gated_off_for_every_non_hosted_repository_class() {
-    // `Staging` is gated off with `Proxy` and `Virtual` even though
-    // `RepositoryType::is_hosted()` counts it as upload-accepting — the
-    // gate is a literal `Hosted` match, and this test is what stops a
-    // future edit from "simplifying" it into that predicate. Widening
-    // the gate to staging is a policy decision about which publishes a
-    // lockfile may gate, not a helper rename.
+async fn payload_scan_runs_for_every_repository_class() {
+    // Every `RepositoryType` takes the payload path once the handler
+    // declares `payload_sbom()`. This is what stops a future edit from
+    // reintroducing a per-class gate — the scanner must be able to
+    // deliver the threat level the repository configuration declares,
+    // for every class that configuration allows.
     for repo_type in [
+        RepositoryType::Hosted,
         RepositoryType::Proxy,
         RepositoryType::Virtual,
         RepositoryType::Staging,
@@ -2911,26 +2909,25 @@ async fn payload_scan_is_gated_off_for_every_non_hosted_repository_class() {
             run_cargo_scan_in_repo_type(repo_type, b"RESOLVED:serde@1.0.200").await;
         assert_eq!(
             storage.get_call_count(),
-            0,
-            "{repo_type:?} must not read CAS for its SBOM"
+            1,
+            "{repo_type:?} must read CAS for its SBOM"
         );
         assert!(
-            handler.seen_payload.lock().unwrap().is_none(),
-            "{repo_type:?} must not dispatch the payload capability"
+            handler.seen_payload.lock().unwrap().is_some(),
+            "{repo_type:?} must dispatch the payload capability"
         );
-        assert_eq!(
-            queried.iter().map(|c| c.purl.as_str()).collect::<Vec<_>>(),
-            vec!["pkg:cargo/declared@1"],
-            "{repo_type:?} must take the metadata-only path"
+        assert!(
+            queried.iter().any(|c| c.purl == "pkg:cargo/serde@1.0.200"),
+            "{repo_type:?} must take the payload path: {queried:?}"
         );
     }
 }
 
 #[tokio::test]
 async fn payload_scan_in_a_hosted_repo_still_resolves_from_the_payload() {
-    // The gate's other side, pinned next to the negative cases so a
-    // change that over-tightens it fails here rather than silently
-    // turning every cargo scan into a subject-only one.
+    // Pinned on its own so a future change that narrows the payload
+    // path fails here rather than silently turning a hosted cargo scan
+    // into a subject-only one.
     let (queried, handler, storage) =
         run_cargo_scan_in_repo_type(RepositoryType::Hosted, b"RESOLVED:serde@1.0.200").await;
 
@@ -3925,7 +3922,6 @@ mod metrics_emission_tests {
             "unusable_lockfile",
             "payload_unavailable",
             "not_applicable",
-            "hosted_only",
         ] {
             let hit = find_counter(&snap, "hort_sbom_resolution_total", |labels| {
                 labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&candidate)
@@ -4135,15 +4131,10 @@ mod metrics_emission_tests {
     }
 
     #[test]
-    fn hort_sbom_resolution_total_fires_hosted_only_for_a_non_hosted_repository() {
-        // The gated-off case gets its own label rather than sharing
-        // `not_applicable`. Sharing would collide on the same `format`
-        // label with two facts an operator must be able to separate:
-        // "cargo has no handler registered" and "cargo has one, and this
-        // repository class deliberately does not use its payload path".
-        // A cargo registry whose scans are all `hosted_only` when its
-        // operator believes those repositories are hosted has a
-        // misconfiguration no other series would reveal.
+    fn hort_sbom_resolution_total_fires_resolved_for_a_proxy_repository() {
+        // ADR 0056's amendment: `hosted_only` is retired, and a proxied
+        // cargo scan now ticks `resolved` exactly as a hosted one does —
+        // the repository class no longer changes which label fires.
         let snap = capture_async_metrics(|| {
             Box::pin(async move {
                 let _ =
@@ -4153,8 +4144,7 @@ mod metrics_emission_tests {
         });
         assert_eq!(
             find_counter(&snap, "hort_sbom_resolution_total", |labels| {
-                labels.get("format") == Some(&"cargo")
-                    && labels.get("result") == Some(&"hosted_only")
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"resolved")
             }),
             Some(1),
         );
@@ -4164,16 +4154,36 @@ mod metrics_emission_tests {
                     && labels.get("result") == Some(&"not_applicable")
             }),
             None,
-            "the gated-off case must not also tick not_applicable"
+            "a payload-capable format must not also tick not_applicable"
         );
     }
 
     #[test]
-    fn hort_sbom_extraction_total_still_reports_the_metadata_bom_when_gated_off() {
-        // The two counters stay orthogonal across the gate: resolution
-        // says the payload path was declined, extraction says a BOM
-        // still came out — the metadata one. An operator reading
-        // `hosted_only` must not conclude the scan produced nothing.
+    fn hort_sbom_resolution_total_fires_resolved_for_a_staging_repository() {
+        // `Staging` was excluded on purpose by the retired gate (it
+        // counts as upload-accepting under `RepositoryType::is_hosted`
+        // but the gate was a literal `Hosted` match). The amendment
+        // removes the gate entirely, so `Staging` now resolves too.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ =
+                    run_cargo_scan_in_repo_type(RepositoryType::Staging, b"RESOLVED:serde@1.0.200")
+                        .await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"resolved")
+            }),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn hort_sbom_extraction_total_reports_success_for_a_proxy_repository() {
+        // The two counters stay orthogonal: resolution says the basis
+        // (`resolved`), extraction says a BOM came out (`success`) —
+        // unchanged by which repository class produced it.
         let snap = capture_async_metrics(|| {
             Box::pin(async move {
                 let _ =
