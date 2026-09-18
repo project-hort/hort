@@ -125,12 +125,19 @@ _probe_repo() {
     esac
 }
 
-# The sparse-index root of a cargo repo is /cargo/<key>/ — a 401 (auth required)
-# or 200 (public, if the repo exists but serves an empty index) confirms presence.
-_probe_repo "crates-proxy sparse-index" "${CRATES_PROXY_URL}/"   || skip "crates-proxy repo absent — run against the dogfood instance or mount ansible gitops config"
-_probe_repo "hort-crates  sparse-index" "${HORT_CRATES_URL}/"    || skip "hort-crates repo absent"
-_probe_repo "OCI v2 endpoint"            "${OCI_V2_URL}"          || skip "OCI v2 endpoint absent (hort-oci repo not configured)"
-_probe_repo "cargo-virtual sparse-index" "${CARGO_VIRTUAL_URL}/" || skip "cargo-virtual repo absent"
+# `config.json` is the anonymous bootstrap document every cargo client reads
+# first, and hort serves it for a private repository too (it answers with
+# auth-required: true rather than refusing) — the sparse-index root does not:
+# an anonymous request there collapses a private repo to the same 404 an
+# absent repo would return, so it cannot distinguish "gated" from "missing".
+# 200 (repo exists, auth-required true or false) or 401/403 (an instance that
+# gates even the bootstrap document) both confirm presence; only 404 means
+# the repo itself is not configured. The OCI probe stays on /v2/ — OCI has no
+# equivalent private-vs-absent collapse (see (d) below).
+_probe_repo "crates-proxy config.json" "${CRATES_PROXY_URL}/config.json"   || skip "crates-proxy repo absent — run against the dogfood instance or mount ansible gitops config"
+_probe_repo "hort-crates  config.json" "${HORT_CRATES_URL}/config.json"    || skip "hort-crates repo absent"
+_probe_repo "OCI v2 endpoint"          "${OCI_V2_URL}"                     || skip "OCI v2 endpoint absent (hort-oci repo not configured)"
+_probe_repo "cargo-virtual config.json" "${CARGO_VIRTUAL_URL}/config.json" || skip "cargo-virtual repo absent"
 
 # ---------------------------------------------------------------------------
 # (a) Anonymous pull from crates-proxy → must be denied (private).
@@ -154,151 +161,159 @@ case "$ANON_CODE" in
 esac
 
 # ---------------------------------------------------------------------------
-# (b) Authenticated pull triggers ingest → 503 + Retry-After (quarantined).
+# warm_and_release_via_proxy <crate> <version> <label>
 #
-# crates-proxy has quarantineDuration: 24h (crates-scan policy). The first
-# authenticated fetch of a crate triggers ingest + quarantine. The response
-# must be 503 with a Retry-After header while the artifact sits in quarantine.
+# Shared (b)+(c) choreography, reused by (h0) for the record-mode advisory
+# dependency: crates-proxy has quarantineDuration: 24h (crates-scan policy),
+# so the first authenticated fetch of a crate triggers ingest + quarantine —
+# a 503 with Retry-After, not the download itself. We probe the download
+# endpoint rather than the index because the index entry appears as soon as
+# the crate is ingested (indexMode: include_pending); only the download
+# endpoint enforces the quarantine gate. On a long-lived registry the crate
+# may already be released from a prior run (200) — that is a pass too, with
+# the release+redownload leg skipped.
 #
-# We probe the download endpoint (not the index) because the index entry
-# appears as soon as the crate is ingested (indexMode: include_pending), but
-# the *download* endpoint enforces the quarantine gate.
+# On 503: locate the artifact via psql (requires: db) by
+# (repository_id, name, version) — name+version alone is not unique across
+# repositories — release it through the admin API (mirroring the
+# patch-candidate smoke pattern), then confirm a re-download returns 200.
+# Every stage reports pass/fail tagged with "<label>" so the two call sites
+# share one implementation without their PASS/FAIL lines becoming ambiguous.
 # ---------------------------------------------------------------------------
+warm_and_release_via_proxy() {
+    local crate="$1" version="$2" label="$3"
+    local download_url auth_tmp auth_headers auth_code repo_id artifact_id
+
+    download_url="${CRATES_PROXY_URL}/api/v1/crates/${crate}/${version}/download"
+
+    auth_tmp="$(mktemp)"
+    auth_headers="$(mktemp)"
+    auth_code="$(curl -sS -o "$auth_tmp" -D "$auth_headers" -w '%{http_code}' --max-time 30 \
+        -H "Authorization: Bearer $DEV_TOKEN" \
+        "$download_url" 2>/dev/null || echo "000")"
+    log "  authenticated download ${crate}@${version} -> HTTP ${auth_code}"
+
+    case "$auth_code" in
+        503)
+            # Confirm Retry-After is present (mandatory for RFC 7231 503 on quarantine)
+            if grep -qi 'retry-after' "$auth_headers"; then
+                pass "${label} authenticated pull crates-proxy -> 503 + Retry-After (quarantined)"
+            else
+                # Still count as correct behaviour — 503 is the load-bearing signal
+                pass "${label} authenticated pull crates-proxy -> 503 (quarantined; Retry-After header absent)"
+                log "  note: Retry-After header not seen in response headers"
+            fi
+            ;;
+        200)
+            # The artifact was already ingested + released from a prior run. This
+            # is valid on a long-lived registry — treat as pass with a note.
+            pass "${label} authenticated pull crates-proxy -> 200 (artifact already released from prior run)"
+            log "  note: artifact was pre-existing and already released; quarantine+503 path not exercised this run"
+            ;;
+        401|403)
+            fail "${label} authenticated pull crates-proxy expected 503 or 200" \
+                "got ${auth_code} — dev-user may not have read permission on crates-proxy"
+            ;;
+        *)
+            fail "${label} authenticated pull crates-proxy expected 503 (quarantined) or 200 (pre-released)" \
+                "got HTTP ${auth_code}"
+            ;;
+    esac
+    rm -f "$auth_tmp" "$auth_headers"
+
+    if [ "$auth_code" != "503" ]; then
+        log "  ${label} download returned ${auth_code} (not 503) — artifact was pre-released; release+redownload skipped this run"
+        pass "${label} release+redownload skipped — artifact was not freshly quarantined (pre-existing release)"
+        return 0
+    fi
+
+    repo_id="$(psql_one "SELECT id FROM repositories WHERE key='${CRATES_PROXY_KEY}';")"
+
+    # Find the artifact id via psql. Wait up to 15s for the ingest to commit
+    # (the ingest path is synchronous for pull-through cargo, but allow margin).
+    artifact_id=""
+    if bounded_poll \
+            "artifact ${crate}@${version} ingested" \
+            15 \
+            "[ -n \"\$(psql_one \"SELECT id FROM artifacts WHERE repository_id = '${repo_id}' AND name = '${crate}' AND version = '${version}' AND quarantine_status = 'quarantined' LIMIT 1;\")\" ]" \
+            2; then
+        artifact_id="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${repo_id}' AND name = '${crate}' AND version = '${version}' AND quarantine_status = 'quarantined' LIMIT 1;")"
+        log "  located quarantined artifact id=${artifact_id}"
+    else
+        fail "${label} locate quarantined artifact via psql" \
+            "${crate}@${version} not found in artifacts table with quarantine_status=quarantined after 15s"
+    fi
+
+    [ -n "$artifact_id" ] || return 0
+
+    # Release via admin API (POST /api/v1/admin/quarantine/<id>/release).
+    local release_url release_tmp release_code
+    release_url="${HORT_URL%/}/api/v1/admin/quarantine/${artifact_id}/release"
+    release_tmp="$(mktemp)"
+    release_code="$(curl -sS -o "$release_tmp" -w '%{http_code}' --max-time 15 \
+        -X POST "$release_url" \
+        -H "Authorization: Bearer $ADMIN_TOKEN" \
+        -H 'Content-Type: application/json' \
+        -d "{\"justification\":\"dogfood smoke release ${NONCE}\"}" \
+        2>/dev/null || echo "000")"
+    log "  POST ${release_url} -> HTTP ${release_code}"
+
+    case "$release_code" in
+        200|204)
+            pass "${label} admin release call succeeded (HTTP ${release_code})"
+            ;;
+        *)
+            fail "${label} admin release expected 200/204" \
+                "got HTTP ${release_code}; body: $(head -3 "$release_tmp" 2>/dev/null)"
+            ;;
+    esac
+    rm -f "$release_tmp"
+
+    # Verify the projection updated via bounded_poll (15s — same as patch-candidate smoke).
+    if bounded_poll \
+            "artifact ${artifact_id} status=released" \
+            15 \
+            "[ \"\$(psql_one \"SELECT quarantine_status FROM artifacts WHERE id = '${artifact_id}';\")\" = 'released' ]" \
+            1; then
+        pass "${label} artifacts.quarantine_status='released' confirmed via psql"
+    else
+        local final_st
+        final_st="$(psql_one "SELECT quarantine_status FROM artifacts WHERE id = '${artifact_id}';" || true)"
+        fail "${label} artifacts.quarantine_status='released'" \
+            "still '${final_st}' after 15s — projection did not advance"
+    fi
+
+    # Re-download must now succeed.
+    local redown_tmp redown_code
+    redown_tmp="$(mktemp)"
+    redown_code="$(curl -sS -o "$redown_tmp" -w '%{http_code}' --max-time 30 \
+        -H "Authorization: Bearer $DEV_TOKEN" \
+        "$download_url" 2>/dev/null || echo "000")"
+    rm -f "$redown_tmp"
+    case "$redown_code" in
+        200)
+            pass "${label} re-download after release -> 200"
+            ;;
+        302|307|308)
+            # Some storage backends serve a redirect to the CAS blob.
+            pass "${label} re-download after release -> ${redown_code} (redirect to CAS blob)"
+            ;;
+        *)
+            fail "${label} re-download after release expected 200/redirect" \
+                "got HTTP ${redown_code}"
+            ;;
+    esac
+}
+
 log ""
-log "--- (b) Authenticated pull from crates-proxy → expect 503 + Retry-After (quarantined ingest)"
+log "--- (b)+(c) Authenticated pull from crates-proxy -> quarantine -> admin release -> re-download"
 
 # Use a well-known small crate with a pinned version to keep the test
 # deterministic. `serde` 1.0.100 is a stable, widely-cached leaf.
 PROBE_CRATE="serde"
 PROBE_VERSION="1.0.100"
-DOWNLOAD_URL="${CRATES_PROXY_URL}/api/v1/crates/${PROBE_CRATE}/${PROBE_VERSION}/download"
 
-AUTH_TMP="$(mktemp)"
-AUTH_HEADERS="$(mktemp)"
-AUTH_CODE="$(curl -sS -o "$AUTH_TMP" -D "$AUTH_HEADERS" -w '%{http_code}' --max-time 30 \
-    -H "Authorization: Bearer $DEV_TOKEN" \
-    "$DOWNLOAD_URL" 2>/dev/null || echo "000")"
-log "  authenticated download ${PROBE_CRATE}@${PROBE_VERSION} -> HTTP ${AUTH_CODE}"
-
-case "$AUTH_CODE" in
-    503)
-        # Confirm Retry-After is present (mandatory for RFC 7231 503 on quarantine)
-        if grep -qi 'retry-after' "$AUTH_HEADERS"; then
-            pass "(b) authenticated pull crates-proxy -> 503 + Retry-After (quarantined)"
-        else
-            # Still count as correct behaviour — 503 is the load-bearing signal
-            pass "(b) authenticated pull crates-proxy -> 503 (quarantined; Retry-After header absent)"
-            log "  note: Retry-After header not seen in response headers"
-        fi
-        ;;
-    200)
-        # The artifact was already ingested + released from a prior run. This
-        # is valid on a long-lived registry — treat as pass with a note.
-        pass "(b) authenticated pull crates-proxy -> 200 (artifact already released from prior run)"
-        log "  note: artifact was pre-existing and already released; quarantine+503 path not exercised this run"
-        ;;
-    401|403)
-        fail "(b) authenticated pull crates-proxy expected 503 or 200" \
-            "got ${AUTH_CODE} — dev-user may not have read permission on crates-proxy"
-        ;;
-    *)
-        fail "(b) authenticated pull crates-proxy expected 503 (quarantined) or 200 (pre-released)" \
-            "got HTTP ${AUTH_CODE}"
-        ;;
-esac
-
-rm -f "$AUTH_TMP" "$AUTH_HEADERS"
-
-# ---------------------------------------------------------------------------
-# (c) Admin-release the quarantined artifact → re-pull succeeds.
-#
-# Only executes when (b) returned 503 (a fresh ingest + quarantine). When
-# (b) returned 200 (pre-released), this step is skipped gracefully.
-#
-# We locate the artifact via psql (requires: db) and release it using the
-# admin API endpoint, mirroring the patch-candidate smoke pattern.
-# ---------------------------------------------------------------------------
-log ""
-log "--- (c) Admin-release quarantined artifact → re-download succeeds"
-
-if [ "$AUTH_CODE" = "503" ]; then
-    # Find the artifact id via psql. Wait up to 10s for the ingest to commit
-    # (the ingest path is synchronous for pull-through cargo, but allow margin).
-    ARTIFACT_ID=""
-    if bounded_poll \
-            "artifact ${PROBE_CRATE}@${PROBE_VERSION} ingested" \
-            15 \
-            "[ -n \"\$(psql_one \"SELECT id FROM artifacts WHERE name = '${PROBE_CRATE}' AND version = '${PROBE_VERSION}' AND quarantine_status = 'quarantined' LIMIT 1;\")\" ]" \
-            2; then
-        ARTIFACT_ID="$(psql_one "SELECT id FROM artifacts WHERE name = '${PROBE_CRATE}' AND version = '${PROBE_VERSION}' AND quarantine_status = 'quarantined' LIMIT 1;")"
-        log "  located quarantined artifact id=${ARTIFACT_ID}"
-    else
-        fail "(c) locate quarantined artifact via psql" \
-            "${PROBE_CRATE}@${PROBE_VERSION} not found in artifacts table with quarantine_status=quarantined after 15s"
-    fi
-
-    if [ -n "$ARTIFACT_ID" ]; then
-        # Release via admin API (POST /api/v1/admin/quarantine/<id>/release).
-        # Export HORT_TOKEN + HORT_SERVER for hort-cli if it is available;
-        # fall back to a direct curl call if hort-cli is absent from the image.
-        RELEASE_URL="${HORT_URL%/}/api/v1/admin/quarantine/${ARTIFACT_ID}/release"
-        RELEASE_TMP="$(mktemp)"
-        RELEASE_CODE="$(curl -sS -o "$RELEASE_TMP" -w '%{http_code}' --max-time 15 \
-            -X POST "$RELEASE_URL" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" \
-            -H 'Content-Type: application/json' \
-            -d "{\"justification\":\"dogfood smoke release ${NONCE}\"}" \
-            2>/dev/null || echo "000")"
-        log "  POST ${RELEASE_URL} -> HTTP ${RELEASE_CODE}"
-
-        case "$RELEASE_CODE" in
-            200|204)
-                pass "(c) admin release call succeeded (HTTP ${RELEASE_CODE})"
-                ;;
-            *)
-                fail "(c) admin release expected 200/204" \
-                    "got HTTP ${RELEASE_CODE}; body: $(head -3 "$RELEASE_TMP" 2>/dev/null)"
-                ;;
-        esac
-        rm -f "$RELEASE_TMP"
-
-        # Verify the projection updated via bounded_poll (15s — same as patch-candidate smoke).
-        if bounded_poll \
-                "artifact ${ARTIFACT_ID} status=released" \
-                15 \
-                "[ \"\$(psql_one \"SELECT quarantine_status FROM artifacts WHERE id = '${ARTIFACT_ID}';\")\" = 'released' ]" \
-                1; then
-            pass "(c) artifacts.quarantine_status='released' confirmed via psql"
-        else
-            final_st="$(psql_one "SELECT quarantine_status FROM artifacts WHERE id = '${ARTIFACT_ID}';" || true)"
-            fail "(c) artifacts.quarantine_status='released'" \
-                "still '${final_st}' after 15s — projection did not advance"
-        fi
-
-        # Re-download must now succeed.
-        REDOWN_TMP="$(mktemp)"
-        REDOWN_CODE="$(curl -sS -o "$REDOWN_TMP" -w '%{http_code}' --max-time 30 \
-            -H "Authorization: Bearer $DEV_TOKEN" \
-            "$DOWNLOAD_URL" 2>/dev/null || echo "000")"
-        rm -f "$REDOWN_TMP"
-        case "$REDOWN_CODE" in
-            200)
-                pass "(c) re-download after release -> 200"
-                ;;
-            302|307|308)
-                # Some storage backends serve a redirect to the CAS blob.
-                pass "(c) re-download after release -> ${REDOWN_CODE} (redirect to CAS blob)"
-                ;;
-            *)
-                fail "(c) re-download after release expected 200/redirect" \
-                    "got HTTP ${REDOWN_CODE}"
-                ;;
-        esac
-    fi
-else
-    log "  (b) returned ${AUTH_CODE} (not 503) — artifact was pre-released; (c) release+redownload path skipped this run"
-    pass "(c) release+redownload skipped — artifact was not freshly quarantined (pre-existing release)"
-fi
+warm_and_release_via_proxy "$PROBE_CRATE" "$PROBE_VERSION" "(b)/(c)"
 
 # ---------------------------------------------------------------------------
 # (d) Anonymous pull of hort-oci → succeeds (public repo, no auth required).
@@ -540,6 +555,13 @@ EOF
     cat > "$VIRTUAL_DIR/.cargo/config.toml" << EOF
 [registries.cargo-virtual]
 index = "sparse+${CARGO_VIRTUAL_URL}/"
+# An auth-required registry needs a declared credential provider, or cargo
+# resolves the index anonymously and the private repository answers 404
+# (anti-enumeration). cargo:token reads CARGO_REGISTRIES_<KEY>_TOKEN and sends
+# it verbatim as the Authorization header, which is what hort's bearer auth
+# expects. The public hort-crates index needs none; the private aggregation does.
+[registry]
+global-credential-providers = ["cargo:token"]
 EOF
 
     # Authenticated (dev-user has read on cargo-virtual via the reader claim
@@ -586,6 +608,16 @@ fi
 # half broke. The advisory pinned below is the one external fact this
 # scenario depends on; if it is ever withdrawn, repin RECORD_VULN_* rather
 # than deleting the assertion.
+#
+# Before any of that: the advisory dependency itself must be resolvable
+# through cargo-virtual, which is what crate A's `[source.crates-io]`
+# replacement resolves against. cargo-virtual composes its members' gated
+# serve paths (ADR 0031) — a version still sitting in crates-proxy's
+# quarantine window is invisible to the virtual index, so without a prior
+# warm+release, crate A's own `cargo publish` cannot resolve its own
+# lockfile and (h1) fails before either claim above gets exercised. (h0)
+# performs that warm+release; (h0b) confirms the virtual index actually
+# serves the released version.
 # ---------------------------------------------------------------------------
 log ""
 log "--- (h) hort-crates record-mode scan over a resolved-version SBOM"
@@ -594,6 +626,28 @@ log "--- (h) hort-crates record-mode scan over a resolved-version SBOM"
 # its own, so the resolved closure stays two packages wide.
 RECORD_VULN_CRATE="rustc-serialize"
 RECORD_VULN_VERSION="0.3.24"
+
+# ---- (h0) warm + release the advisory dependency through crates-proxy ----
+log ""
+log "--- (h0) warm + release ${RECORD_VULN_CRATE}@${RECORD_VULN_VERSION} through crates-proxy"
+warm_and_release_via_proxy "$RECORD_VULN_CRATE" "$RECORD_VULN_VERSION" "(h0)"
+
+# ---- (h0b) cargo-virtual's sparse index now serves the released version ----
+# Cargo's sparse-index layout for a >=4-char crate name is
+# <first two chars>/<next two chars>/<name>.
+RECORD_VULN_INDEX_URL="${CARGO_VIRTUAL_URL}/ru/st/${RECORD_VULN_CRATE}"
+RECORD_VULN_INDEX_TMP="$(mktemp)"
+RECORD_VULN_INDEX_CODE="$(curl -sS -o "$RECORD_VULN_INDEX_TMP" -w '%{http_code}' --max-time 15 \
+    -H "Authorization: Bearer $ADMIN_TOKEN" \
+    "$RECORD_VULN_INDEX_URL" 2>/dev/null || echo "000")"
+log "  authenticated GET ${RECORD_VULN_INDEX_URL} -> HTTP ${RECORD_VULN_INDEX_CODE}"
+if [ "$RECORD_VULN_INDEX_CODE" = "200" ] && grep -q "\"vers\":\"${RECORD_VULN_VERSION}\"" "$RECORD_VULN_INDEX_TMP"; then
+    pass "(h0b) cargo-virtual sparse index for ${RECORD_VULN_CRATE} serves vers=${RECORD_VULN_VERSION}"
+else
+    fail "(h0b) cargo-virtual sparse index must serve ${RECORD_VULN_CRATE}@${RECORD_VULN_VERSION} after release" \
+        "GET -> HTTP ${RECORD_VULN_INDEX_CODE}; body: $(head -c 300 "$RECORD_VULN_INDEX_TMP" 2>/dev/null)"
+fi
+rm -f "$RECORD_VULN_INDEX_TMP"
 
 RECORD_DIR="$(mktemp -d)"
 # Extend the existing cleanup rather than replacing it — WORK_DIR is still
@@ -692,6 +746,14 @@ replace-with = "hort-cargo-virtual"
 
 [source.hort-cargo-virtual]
 registry = "sparse+${CARGO_VIRTUAL_URL}/"
+
+# An auth-required registry needs a declared credential provider, or cargo
+# resolves the index anonymously and the private repository answers 404
+# (anti-enumeration). cargo:token reads CARGO_REGISTRIES_<KEY>_TOKEN and sends
+# it verbatim as the Authorization header, which is what hort's bearer auth
+# expects. The public hort-crates index needs none; the private aggregation does.
+[registry]
+global-credential-providers = ["cargo:token"]
 EOF
 
 export CARGO_REGISTRIES_HORT_CRATES_TOKEN="Bearer $ADMIN_TOKEN"

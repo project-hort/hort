@@ -33,8 +33,10 @@ KEYCLOAK_URL=https://idp.example.com/realms/hort \
 ## The client image
 
 `Dockerfile.client` carries every client tool a scenario needs — python +
-`build`/`twine`, node 20 + npm, cargo, skopeo, `psql`, `jq`, `curl` — so scenarios
-never depend on host toolchains. `run.sh` builds it (cached) as
+`build`/`twine`, node 20 + npm, cargo/rustc (copied from the `cli-builder` stage,
+so it matches the workspace's pinned MSRV rather than a separately-pinned
+version), skopeo, `psql`, `jq`, `curl` — so scenarios never depend on host
+toolchains. `run.sh` builds it (cached) as
 `hort-test-client:dev` and runs each scenario as a throwaway container. It is based
 on `python:3.12-slim` specifically so venvs created by scenarios inherit a modern
 pip (Debian's stock pip 23.0.1 crashes on hort's PEP 658/714 simple-index
@@ -163,6 +165,15 @@ why. **Unset or any value other than `external` must behave as `compose`** (fail
 hard): a scenario invoked by hand, without the runner's forward, must not
 silently take the lenient branch and report a green run that asserted nothing.
 `scenarios/proxy/pull-dedup.sh`'s two coldness gates are the canonical example.
+
+### Repository presence probes (dogfood scenarios)
+
+A cargo repository's presence preflight must probe `<repo>/config.json`, not
+the sparse-index root: `config.json` is the anonymous bootstrap document hort
+serves for a private repository too (200, `auth-required: true`), while an
+anonymous request to the index root collapses a private repo to the same 404
+an absent repo returns. `scenarios/dogfood/registry-supply-chain.sh` and
+`scenarios/dogfood/publish-chain.sh` both rely on this.
 
 ### Adding a scenario
 
