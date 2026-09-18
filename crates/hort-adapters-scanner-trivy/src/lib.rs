@@ -35,11 +35,16 @@
 //!
 //! - **A verdict** — Trivy reported at least one analysed target. The
 //!   finding list, empty or not, is the verdict.
-//! - **Nothing to analyse** — no materialisation applies to this kind,
-//!   the payload's container could not be safely opened, or Trivy
-//!   returned a report with no `Results` at all. There is no verdict, and
-//!   the orchestrator holds the artifact fail-closed (ADR 0007) rather
-//!   than recording a clean scan of bytes nothing examined.
+//! - **Nothing to analyse** — no materialisation applies to this kind, the
+//!   payload's container could not be safely opened, or Trivy returned a
+//!   report with no `Results` at all. There is no verdict. An empty
+//!   report from an `fs`-mode invocation is a surface that went
+//!   unassessed, so the orchestrator holds the artifact fail-closed (ADR
+//!   0007) rather than recording a clean scan of bytes nothing examined.
+//!   An empty report from a `rootfs`-mode invocation is different: that
+//!   target runs every analyzer over the whole tree, so an empty result
+//!   means the tree has no package surface at all — a completed "not
+//!   applicable" fact, not a hold.
 //! - **A failure** — the binary is missing, the child timed out, the
 //!   report blew its cap. `Err`, and retryable.
 //!
@@ -544,29 +549,66 @@ impl ScannerPort for TrivyAdapter {
             //    Collapsing the two is the defect this distinction
             //    exists to remove: the first has no verdict to give.
             if report.results.is_empty() {
-                // The two facts that make this warning actionable: what
-                // the scanner said on its way to saying nothing, and what
-                // the tree it was pointed at actually contained. Without
-                // them "no analyzer matched" is indistinguishable from a
-                // materialisation this adapter got wrong.
+                // The two facts that make either branch's log actionable:
+                // what the scanner said on its way to saying nothing, and
+                // what the tree it was pointed at actually contained.
+                // Without them the two outcomes below are indistinguishable
+                // from a materialisation this adapter got wrong.
                 //
-                // Both are computed *before* the macro: a `.await`
-                // inside `warn!` would hold the event's `Arguments`
-                // across it and make the whole future non-`Send`.
+                // Both are computed *before* the macros: a `.await` inside
+                // `warn!`/`info!` would hold the event's `Arguments` across
+                // it and make the whole future non-`Send`.
                 let materialised = ws.listing().await;
-                tracing::warn!(
-                    scanner = "trivy",
-                    kind = target.kind.as_str(),
-                    format = target.format,
-                    subcommand = mode.subcommand(),
-                    stderr_tail = stderr_tail(&stderr),
-                    materialised,
-                    skipped_links = ws.skipped_links(),
-                    "trivy adapter: report carries no analysed target; no verdict"
-                );
-                return Ok(ScanAnalysis::NothingAnalysable(
-                    NotAnalysable::NoAnalyzerMatched,
-                ));
+                match mode {
+                    // `rootfs` runs every OS-package, language and binary
+                    // analyzer over the whole extracted tree. An empty
+                    // report there is not a pairing mismatch — it is the
+                    // analyzers agreeing the tree has no package surface at
+                    // all, which is a completed fact about the artifact,
+                    // not an unassessed one. The listing is still worth
+                    // keeping for an operator who doubts that fact, so it
+                    // moves to `debug!` instead of dropping out of the log
+                    // entirely.
+                    ScanMode::Rootfs => {
+                        tracing::debug!(
+                            scanner = "trivy",
+                            kind = target.kind.as_str(),
+                            materialised,
+                            "trivy adapter: root filesystem listing"
+                        );
+                        tracing::info!(
+                            scanner = "trivy",
+                            kind = target.kind.as_str(),
+                            format = target.format,
+                            subcommand = mode.subcommand(),
+                            stderr_tail = stderr_tail(&stderr),
+                            skipped_links = ws.skipped_links(),
+                            "trivy adapter: root filesystem walked, no package surface — nothing to assess"
+                        );
+                        return Ok(ScanAnalysis::NothingAnalysable(
+                            NotAnalysable::NotApplicable,
+                        ));
+                    }
+                    // `fs` targets one artifact whose analyzer either
+                    // engages or does not; an empty report here means the
+                    // surface this kind was materialised for went
+                    // unassessed, which still fails closed.
+                    ScanMode::Fs => {
+                        tracing::warn!(
+                            scanner = "trivy",
+                            kind = target.kind.as_str(),
+                            format = target.format,
+                            subcommand = mode.subcommand(),
+                            stderr_tail = stderr_tail(&stderr),
+                            materialised,
+                            skipped_links = ws.skipped_links(),
+                            "trivy adapter: report carries no analysed target; no verdict"
+                        );
+                        return Ok(ScanAnalysis::NothingAnalysable(
+                            NotAnalysable::NoAnalyzerMatched,
+                        ));
+                    }
+                }
             }
 
             // 4. Lower into Vec<Finding>. Findings that fail
@@ -690,15 +732,29 @@ mod tests {
         }
     }
 
-    /// A Maven-JAR scan target: the only kind whose materialisation is a
-    /// single file, so the CLI paths below are exercised without also
-    /// exercising archive extraction.
+    /// A Maven-JAR scan target: the only `Rootfs`-mode kind whose
+    /// materialisation is a single file, so the CLI paths below are
+    /// exercised without also exercising archive extraction.
     fn jar_coords() -> hort_domain::types::ArtifactCoords {
         hort_domain::types::ArtifactCoords {
             name: "com.example:app".to_string(),
             name_as_published: "com.example:app".to_string(),
             version: Some("1.0.0".to_string()),
             path: "com/example/app/1.0.0/app-1.0.0.jar".to_string(),
+            format: hort_domain::entities::repository::RepositoryFormat::Maven,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// A Maven-POM scan target: the `Fs`-mode single-file counterpart to
+    /// [`jar_coords`], for cases that must pin `Fs`-mode behaviour
+    /// specifically rather than `Rootfs`-mode's.
+    fn pom_coords() -> hort_domain::types::ArtifactCoords {
+        hort_domain::types::ArtifactCoords {
+            name: "com.example:app".to_string(),
+            name_as_published: "com.example:app".to_string(),
+            version: Some("1.0.0".to_string()),
+            path: "com/example/app/1.0.0/app-1.0.0.pom".to_string(),
             format: hort_domain::entities::repository::RepositoryFormat::Maven,
             metadata: serde_json::Value::Null,
         }
@@ -719,6 +775,18 @@ mod tests {
             format: "maven",
             coords,
             kind: hort_domain::types::ArtifactKind::MavenJar,
+        }
+    }
+
+    fn pom_target<'a>(
+        hash: &'a Ch,
+        coords: &'a hort_domain::types::ArtifactCoords,
+    ) -> ScanTarget<'a> {
+        ScanTarget {
+            content_hash: hash,
+            format: "maven",
+            coords,
+            kind: hort_domain::types::ArtifactKind::MavenPom,
         }
     }
 
@@ -1082,14 +1150,17 @@ mod tests {
     // -- "nothing analysable" vs "clean" ----------------------------------
 
     /// Materialise a fake `trivy` that prints `stdout_json` and exits 0,
-    /// point the adapter at it, and scan a Maven-JAR target.
+    /// point the adapter at it, and scan the given target.
     ///
     /// A real binary standing in for Trivy is what makes the
     /// `Results`-present / `Results`-absent distinction testable at all:
     /// it is a property of the report the child emits, not of anything
     /// the adapter can be asked directly.
     #[cfg(unix)]
-    async fn scan_against_fake_trivy(stdout_json: &str) -> DomainResult<ScanAnalysis> {
+    async fn scan_against_fake_trivy_target(
+        stdout_json: &str,
+        target: &ScanTarget<'_>,
+    ) -> DomainResult<ScanAnalysis> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -1116,19 +1187,27 @@ mod tests {
             trivy_bin: script,
             ..TrivyConfig::default()
         };
-        let a = TrivyAdapter::new(c, StubStorage::bytes(b"PK\x03\x04fake jar"));
+        let a = TrivyAdapter::new(c, StubStorage::bytes(b"PK\x03\x04fake payload"));
+        a.scan(target, None).await
+    }
+
+    /// [`scan_against_fake_trivy_target`] against a Maven-JAR (`Rootfs`
+    /// mode) target — the shape most of this module's fake-Trivy tests
+    /// want.
+    #[cfg(unix)]
+    async fn scan_against_fake_trivy(stdout_json: &str) -> DomainResult<ScanAnalysis> {
         let h = sample_hash();
         let coords = jar_coords();
-        a.scan(&jar_target(&h, &coords), None).await
+        scan_against_fake_trivy_target(stdout_json, &jar_target(&h, &coords)).await
     }
 
     /// A report with no `Results` section means no analyzer claimed
-    /// anything in the workspace. That is the absence of a verdict, and
-    /// it must NOT come back as an empty finding list — an empty list is
-    /// a clean verdict and carries release authority.
+    /// anything in the workspace. In `Rootfs` mode that is a completed
+    /// "no package surface" fact, not the absence of a verdict — it must
+    /// NOT hold the artifact.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_report_with_no_results_is_nothing_analysable_not_clean() {
+    async fn a_report_with_no_results_in_rootfs_mode_is_not_applicable() {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
@@ -1138,8 +1217,32 @@ mod tests {
                 .expect("the child exited 0, so the scan itself succeeded");
             assert_eq!(
                 analysis,
+                ScanAnalysis::NothingAnalysable(NotAnalysable::NotApplicable),
+                "report {report} over a rootfs target must read as nothing to assess, not a hold"
+            );
+        }
+    }
+
+    /// The `Fs`-mode counterpart: one artifact's analyzer either engages
+    /// or it does not, so an empty report there stays the absence of a
+    /// verdict — it must NOT come back as an empty finding list (a clean
+    /// verdict) nor as `NotApplicable` (no hold).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_with_no_results_in_fs_mode_is_nothing_analysable_not_clean() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let h = sample_hash();
+        let coords = pom_coords();
+        for report in [r#"{}"#, r#"{"Results":null}"#, r#"{"Results":[]}"#] {
+            let analysis = scan_against_fake_trivy_target(report, &pom_target(&h, &coords))
+                .await
+                .expect("the child exited 0, so the scan itself succeeded");
+            assert_eq!(
+                analysis,
                 ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched),
-                "report {report} must not be read as a clean verdict"
+                "report {report} over an fs target must not be read as a clean verdict"
             );
         }
     }

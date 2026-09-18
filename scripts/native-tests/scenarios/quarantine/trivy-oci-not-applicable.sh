@@ -20,13 +20,25 @@
 # assertions do not depend on which CVEs the base image carries today —
 # only on whether each row got a completed assessment at all.
 #
-# Source image: a single-arch, single-layer Alpine. Single-layer matters:
-# every layer has to become releasable for the pull to succeed, and an
-# Alpine rootfs carries an apk database, which is the thing Trivy's
-# `rootfs` target actually analyses. A layer with no package database
-# would abstain with `no_analyzer_matched` — a genuine, still-correct
-# fail-closed hold — and this scenario would (rightly) fail for a reason
-# that is not what it is testing.
+# Source image: a TWO-LAYER fixture built from a single-arch Alpine base
+# plus one synthetic package-less layer appended locally (a lone
+# certificate file, no package database — the shape a `ca-certificates`
+# layer takes in a real multi-arch image such as `nginx:alpine`). A
+# MULTI-LAYER source is load-bearing: every layer of an image is scanned
+# on its own, and Trivy's `rootfs` target runs every OS-package, language
+# and binary analyzer over each one independently. A single-layer Alpine
+# base can only ever exercise the "layer carries a package database"
+# outcome; the defect this scenario pins is specific to the OTHER
+# outcome — a layer that carries files but no package database at all,
+# which every analyzer agrees has nothing to assess and which must record
+# `not_applicable`, not the fail-closed `no_analyzer_matched` hold that
+# used to apply there. A single-layer source cannot produce that second
+# outcome, so the regression it caused (every multi-layer image holding
+# forever) was invisible to it. The fixture is assembled in-process
+# (`skopeo copy ... dir:`, then a synthetic layer + config edited in
+# place) rather than pulling a real multi-layer image, so the layer count
+# and contents are pinned and cannot drift out from under this scenario
+# the way an upstream tag's shape can.
 #
 # ORDER OF THE LEGS IS LOAD-BEARING. The per-row digest resolution reads
 # the manifest back over HTTP, and while the content is held that read is
@@ -34,21 +46,25 @@
 # rows out through the database first, pulls once they are released, and
 # only then maps digests to rows:
 #
-#   1. Push. The write path is ungated, so every row is ingested and held.
-#   2. DB: three rows appear (1 manifest + 2 blobs) and every one of them
-#      records a COMPLETED scan. `record_scan_indeterminate` does not
-#      advance `last_scan_at`, so a row still NULL here took the hold path
-#      — which is exactly the regression this scenario exists to catch.
+#   1. Assemble the two-layer fixture locally, then push it. The write
+#      path is ungated, so every row is ingested and held.
+#   2. DB: four rows appear (1 manifest + 1 config + 2 layers) and every
+#      one of them records a COMPLETED scan. `record_scan_indeterminate`
+#      does not advance `last_scan_at`, so a row still NULL here took the
+#      hold path — which is exactly the regression this scenario exists
+#      to catch.
 #   3. DB: every row reaches `released` once the window elapses.
 #   4. ANONYMOUS pull of the whole image. A released image must serve
 #      without credentials; an authenticated pull could not tell a
 #      released row from a read-authorized hold exemption.
 #   5. Now that the content serves, read the manifest, map its config and
 #      layer digests onto the rows, and assert the ASSESSMENT recorded for
-#      each: manifest and config = `not_applicable`, layers = `analysed`.
-#      This is the point of the whole item — a not-applicable row must
-#      never read as "analysed, clean", and a layer must never read as
-#      "not applicable".
+#      each: manifest and config = `not_applicable`, the apk-database
+#      layer = `analysed`, the package-less layer = `not_applicable`. This
+#      is the point of the whole scenario — a not-applicable row must
+#      never read as "analysed, clean", an analysable layer must never
+#      read as "not applicable", and a package-less layer must never read
+#      as an unassessed hold.
 
 # shellcheck source=../../lib/common.sh
 # shellcheck disable=SC1091
@@ -66,7 +82,8 @@ REPO_KEY="${TRIVY_OCI_REPO_KEY:-oci-trivy-e2e}"
 REGISTRY_HOST="${HORT_URL#http://}"
 REGISTRY_HOST="${REGISTRY_HOST#https://}"
 
-# Single-arch, single-layer, apk-database-carrying source. See header.
+# Single-arch, single-layer, apk-database-carrying base for the fixture.
+# See header for why a second, package-less layer is appended locally.
 SOURCE_IMAGE="${SOURCE_IMAGE:-alpine:3.19}"
 TEST_IMAGE_NAME="${TEST_IMAGE_NAME:-trivyimg}"
 TEST_TAG="${TEST_TAG:-v0}"
@@ -74,23 +91,26 @@ TEST_TAG="${TEST_TAG:-v0}"
 DEST_IMAGE="${REGISTRY_HOST}/${REPO_KEY}/${TEST_IMAGE_NAME}:${TEST_TAG}"
 PULLED_ARCHIVE="/tmp/oci-trivy-pulled-${TEST_IMAGE_NAME}.tar"
 RAW_MANIFEST_FILE="$(mktemp)"
+FIXTURE_DIR="$(mktemp -d)"
+BASE_LAYOUT="${FIXTURE_DIR}/base"
 
 # The policy's `quarantineDuration`. Kept as a variable so the waits below
 # read as "the window plus scan turnaround", not as magic numbers.
 WINDOW_SECS="${TRIVY_OCI_WINDOW_SECS:-20}"
 
-# 1 manifest + 1 config blob + 1 layer blob. Asserted rather than assumed:
-# a multi-layer or multi-arch source would silently change what the legs
-# below are actually testing.
-EXPECTED_ROWS="${TRIVY_OCI_EXPECTED_ROWS:-3}"
+# 1 manifest + 1 config blob + 2 layer blobs (the apk-database base layer
+# and the synthetic package-less layer). Asserted rather than assumed: a
+# change to how the fixture is assembled would otherwise silently change
+# what the legs below are actually testing.
+EXPECTED_ROWS="${TRIVY_OCI_EXPECTED_ROWS:-4}"
 
 log "==> Trivy OCI not-applicable e2e"
 log "registry : ${HORT_URL}"
 log "repo     : ${REPO_KEY} (trivy ScanPolicy, ${WINDOW_SECS}s window, record mode)"
-log "source   : ${SOURCE_IMAGE}"
+log "source   : ${SOURCE_IMAGE} + one synthetic package-less layer"
 log "dest     : ${DEST_IMAGE}"
 
-trap 'rm -f "$PULLED_ARCHIVE" "$RAW_MANIFEST_FILE"' EXIT
+trap 'rm -f "$PULLED_ARCHIVE" "$RAW_MANIFEST_FILE"; rm -rf "$FIXTURE_DIR"' EXIT
 
 REPO_ID="$(psql_one "SELECT id FROM repositories WHERE key = '${REPO_KEY}' LIMIT 1;")"
 [ -n "$REPO_ID" ] || skip "repositories row for key='${REPO_KEY}' absent — gitops apply has not run against this DB"
@@ -120,21 +140,98 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# (1) Push. The write path is ungated by the quarantine hold, so this must
-# succeed even though every ingested row lands `quarantined`.
+# (1a) Assemble the two-layer fixture locally: pull the Alpine base into an
+# OCI `dir:` layout, then append one synthetic package-less layer (a lone
+# certificate file) and fold its diff ID into the config. `dir:` lays each
+# blob out as a plain file named by its hex digest plus a `manifest.json`,
+# which is what makes editing it in place possible without a container
+# build tool.
 # ---------------------------------------------------------------------------
 log ""
-log "--- (1) Push ${SOURCE_IMAGE} -> docker://${DEST_IMAGE}"
+log "--- (1a) Pull ${SOURCE_IMAGE} into a local OCI layout"
+if ! skopeo copy --insecure-policy "docker://${SOURCE_IMAGE}" "dir:${BASE_LAYOUT}" 2>&1; then
+    fail "(1a) pull ${SOURCE_IMAGE} into a local OCI layout" \
+        "skopeo copy docker://${SOURCE_IMAGE} -> dir:${BASE_LAYOUT} exited non-zero; is docker.io reachable?"
+    summary
+fi
+
+BASE_MANIFEST="${BASE_LAYOUT}/manifest.json"
+BASE_LAYER_COUNT="$(jq '.layers | length' "$BASE_MANIFEST")"
+if [ "$BASE_LAYER_COUNT" -ne 1 ]; then
+    fail "(1a) ${SOURCE_IMAGE} must be a single-layer base for this fixture" \
+        "found ${BASE_LAYER_COUNT} layers in the pulled manifest -- pick an Alpine tag with one layer, or teach this scenario to locate the apk-database layer instead of assuming index 0."
+    summary
+fi
+BASE_LAYER_DIGEST="$(jq -r '.layers[0].digest' "$BASE_MANIFEST")"
+BASE_LAYER_MEDIA_TYPE="$(jq -r '.layers[0].mediaType' "$BASE_MANIFEST")"
+BASE_CONFIG_DIGEST="$(jq -r '.config.digest' "$BASE_MANIFEST")"
+BASE_CONFIG_MEDIA_TYPE="$(jq -r '.config.mediaType' "$BASE_MANIFEST")"
+BASE_CONFIG_HEX="${BASE_CONFIG_DIGEST#sha256:}"
+log "  base layer  : ${BASE_LAYER_DIGEST} (apk database)"
+
+# The synthetic package-less layer: one certificate file, no package
+# database at all -- the shape a `ca-certificates` layer takes in a real
+# image, and the layer class no OS-package/language/binary analyzer can
+# ever claim anything in.
+LAYER_ROOT="${FIXTURE_DIR}/layer-root/usr/share/ca-certificates"
+mkdir -p "$LAYER_ROOT"
+cat > "${LAYER_ROOT}/hort-e2e-fixture.crt" <<'CERT'
+-----BEGIN CERTIFICATE-----
+hort e2e fixture -- not a real certificate, no package database nearby
+-----END CERTIFICATE-----
+CERT
+
+LAYER_TAR="${FIXTURE_DIR}/pkgless-layer.tar"
+LAYER_TAR_GZ="${FIXTURE_DIR}/pkgless-layer.tar.gz"
+# `-C dir .` puts the archive's own root directory (`./`) in as the first
+# entry, the shape every tar-based layer builder emits -- this scenario is
+# the representative fixture for that producer shape, left as-is on purpose.
+tar --numeric-owner --owner=0 --group=0 -cf "$LAYER_TAR" -C "${FIXTURE_DIR}/layer-root" .
+NEW_DIFF_ID="sha256:$(sha256sum "$LAYER_TAR" | cut -d' ' -f1)"
+gzip -c "$LAYER_TAR" > "$LAYER_TAR_GZ"
+NEW_LAYER_HEX="$(sha256sum "$LAYER_TAR_GZ" | cut -d' ' -f1)"
+NEW_LAYER_SIZE="$(stat -c%s "$LAYER_TAR_GZ")"
+cp "$LAYER_TAR_GZ" "${BASE_LAYOUT}/${NEW_LAYER_HEX}"
+log "  new layer   : sha256:${NEW_LAYER_HEX} (package-less)"
+
+# Fold the new layer's diff ID into a copy of the base config -- this is
+# the only edit that makes the appended layer part of the image's rootfs
+# rather than an orphaned blob the manifest happens to also list.
+NEW_CONFIG="${FIXTURE_DIR}/config.json"
+jq --arg diffid "$NEW_DIFF_ID" \
+   '.rootfs.diff_ids += [$diffid]
+    | .history += [{"created": "1970-01-01T00:00:00Z",
+                     "comment": "hort e2e fixture: package-less ca-certificates layer",
+                     "empty_layer": false}]' \
+   "${BASE_LAYOUT}/${BASE_CONFIG_HEX}" > "$NEW_CONFIG"
+NEW_CONFIG_HEX="$(sha256sum "$NEW_CONFIG" | cut -d' ' -f1)"
+NEW_CONFIG_SIZE="$(stat -c%s "$NEW_CONFIG")"
+cp "$NEW_CONFIG" "${BASE_LAYOUT}/${NEW_CONFIG_HEX}"
+
+jq --arg cfgmt "$BASE_CONFIG_MEDIA_TYPE" --arg cfgdigest "sha256:${NEW_CONFIG_HEX}" --argjson cfgsize "$NEW_CONFIG_SIZE" \
+   --arg lmt "$BASE_LAYER_MEDIA_TYPE" --arg ldigest "sha256:${NEW_LAYER_HEX}" --argjson lsize "$NEW_LAYER_SIZE" \
+   '.config = {mediaType: $cfgmt, digest: $cfgdigest, size: $cfgsize}
+    | .layers += [{mediaType: $lmt, digest: $ldigest, size: $lsize}]' \
+   "$BASE_MANIFEST" > "${BASE_MANIFEST}.new"
+mv "${BASE_MANIFEST}.new" "$BASE_MANIFEST"
+
+# ---------------------------------------------------------------------------
+# (1b) Push the assembled two-layer fixture. The write path is ungated by
+# the quarantine hold, so this must succeed even though every ingested row
+# lands `quarantined`.
+# ---------------------------------------------------------------------------
+log ""
+log "--- (1b) Push the two-layer fixture -> docker://${DEST_IMAGE}"
 if skopeo copy \
         --insecure-policy \
         --dest-tls-verify=false \
         --dest-creds "$DEST_CREDS" \
-        "docker://${SOURCE_IMAGE}" \
+        "dir:${BASE_LAYOUT}" \
         "docker://${DEST_IMAGE}" 2>&1; then
-    pass "(1) push to the Trivy-policed repo succeeded"
+    pass "(1) push of the two-layer fixture to the Trivy-policed repo succeeded"
 else
-    fail "(1) push to the Trivy-policed repo" \
-        "skopeo copy ${SOURCE_IMAGE} -> ${DEST_IMAGE} exited non-zero; is the source registry reachable?"
+    fail "(1) push of the two-layer fixture to the Trivy-policed repo" \
+        "skopeo copy dir:${BASE_LAYOUT} -> ${DEST_IMAGE} exited non-zero"
     summary
 fi
 
@@ -147,8 +244,8 @@ log ""
 log "--- (2) Awaiting a completed scan for all ${EXPECTED_ROWS} rows"
 ROW_COUNT="$(psql_one "SELECT count(*) FROM artifacts WHERE repository_id = '${REPO_ID}';")"
 if [ "${ROW_COUNT:-0}" -ne "$EXPECTED_ROWS" ]; then
-    fail "(2) the push must ingest exactly ${EXPECTED_ROWS} rows (manifest + config + layer)" \
-        "found ${ROW_COUNT:-0} artifacts rows for repository_id='${REPO_ID}' -- a multi-layer or multi-arch ${SOURCE_IMAGE} changes what the legs below test; set TRIVY_OCI_EXPECTED_ROWS if that is intended."
+    fail "(2) the push must ingest exactly ${EXPECTED_ROWS} rows (manifest + config + 2 layers)" \
+        "found ${ROW_COUNT:-0} artifacts rows for repository_id='${REPO_ID}' -- an unexpected fixture shape changes what the legs below test; set TRIVY_OCI_EXPECTED_ROWS if that is intended."
     summary
 fi
 pass "(2) ${EXPECTED_ROWS} rows ingested"
@@ -268,6 +365,15 @@ for pair in "manifest:${MANIFEST_ID}" "config:${CONFIG_ID}"; do
     fi
 done
 
+# The two layers must land on OPPOSITE sides of the assessment split, so
+# each is matched against the digest it is known to be (captured while
+# assembling the fixture in (1a)) rather than by position -- this is what
+# actually distinguishes "the apk-database layer stayed analysable" from
+# "the package-less layer stopped being held".
+if [ "${#LAYER_DIGESTS[@]}" -ne 2 ]; then
+    fail "(5) the manifest must name exactly 2 layers" \
+        "found ${#LAYER_DIGESTS[@]}: ${LAYER_DIGESTS[*]:-<none>}"
+fi
 for d in "${LAYER_DIGESTS[@]}"; do
     lid="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/${d}';")"
     if [ -z "$lid" ]; then
@@ -275,12 +381,23 @@ for d in "${LAYER_DIGESTS[@]}"; do
             "no artifacts row for repository_id='${REPO_ID}' path='blobs/${d}'"
         continue
     fi
-    got="$(assessment_of "$lid")"
-    if [ "$got" = "analysed" ]; then
-        pass "(5) layer row ${lid} recorded 'analysed' (a real verdict)"
+    if [ "$d" = "$BASE_LAYER_DIGEST" ]; then
+        label="apk-database base layer"
+        expected="analysed"
+    elif [ "$d" = "sha256:${NEW_LAYER_HEX}" ]; then
+        label="package-less (ca-certificate) layer"
+        expected="not_applicable"
     else
-        fail "(5) layer rows must still record a real verdict" \
-            "latest ScanCompleted for artifact-${lid} carries assessment='${got:-<no ScanCompleted>}'. A layer rootfs IS analysable; 'not_applicable' here means the adapter stopped classifying layer content as a scannable surface."
+        fail "(5) unrecognised layer digest ${d}" \
+            "matches neither the base layer (${BASE_LAYER_DIGEST}) nor the synthetic layer (sha256:${NEW_LAYER_HEX})"
+        continue
+    fi
+    got="$(assessment_of "$lid")"
+    if [ "$got" = "$expected" ]; then
+        pass "(5) ${label} recorded '${got}' as expected"
+    else
+        fail "(5) ${label} must record '${expected}'" \
+            "latest ScanCompleted for artifact-${lid} carries assessment='${got:-<no ScanCompleted>}'."
     fi
 done
 

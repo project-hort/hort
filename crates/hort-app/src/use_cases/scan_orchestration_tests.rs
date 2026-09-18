@@ -4652,6 +4652,44 @@ async fn run_scan_all_not_applicable_is_a_completed_not_applicable_assessment() 
     );
 }
 
+/// Pins the specific regression observed in staging UAT: a Trivy `rootfs`
+/// scan of a package-less OCI layer (a CA-certificate-only layer, no
+/// package database) reports an empty result, the adapter abstains
+/// `NotApplicable`, and that abstention must release the layer — never
+/// hold it as `scan_indeterminate`. This is the same partition
+/// `run_scan_all_not_applicable_is_a_completed_not_applicable_assessment`
+/// pins generically, kept as its own test because it is the exact shape
+/// (`OciBlob`, single backend) that hung every multi-layer image before
+/// the fix.
+#[tokio::test]
+async fn run_scan_releases_a_package_less_layer_whose_rootfs_scan_came_back_empty() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        handler_map("oci", ArtifactKind::OciBlob),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("a package-less layer must be released, not held, got {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::NotApplicable);
+    assert!(findings.is_empty());
+}
+
 /// One gating abstention among not-applicable ones still holds: the
 /// expected surface it could not assess is still unassessed.
 #[tokio::test]

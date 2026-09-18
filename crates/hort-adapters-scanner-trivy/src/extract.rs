@@ -189,15 +189,29 @@ impl ByteBudget {
     }
 }
 
-/// Lexically validate an archive entry path and return it as a
-/// root-relative path.
+/// How an archive entry's lexically-validated path relates to the
+/// extraction root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PathContainment {
+    /// A safe, non-empty, root-relative path.
+    Relative(PathBuf),
+    /// The name normalises to the workspace root itself: made only of
+    /// `CurDir` components (`.`, `./`, `./.`, …). Every `tar -C dir .`
+    /// producer emits this as the archive's own first entry, and it
+    /// names a location that already exists — not a traversal.
+    Root,
+}
+
+/// Lexically validate an archive entry path.
 ///
 /// Returns `None` — meaning refuse the archive — for an absolute path, a
-/// Windows prefix, any `..` component, or a path that normalises to
-/// nothing. `.` components are dropped. **No filesystem call happens
-/// here**: containment is decided from the bytes of the path alone, so a
-/// hostile entry never reaches a `create_dir_all` or an `open`.
-fn contained_relative_path(raw: &Path) -> Option<PathBuf> {
+/// Windows prefix, or any `..` component. `.` components are dropped; if
+/// that drops the path to nothing, the entry named the workspace root
+/// itself ([`PathContainment::Root`]), not an escape. **No filesystem
+/// call happens here**: containment is decided from the bytes of the
+/// path alone, so a hostile entry never reaches a `create_dir_all` or an
+/// `open`.
+fn contained_relative_path(raw: &Path) -> Option<PathContainment> {
     let mut out = PathBuf::new();
     for component in raw.components() {
         match component {
@@ -212,9 +226,9 @@ fn contained_relative_path(raw: &Path) -> Option<PathBuf> {
         }
     }
     if out.as_os_str().is_empty() {
-        return None;
+        return Some(PathContainment::Root);
     }
-    Some(out)
+    Some(PathContainment::Relative(out))
 }
 
 /// Create `root`-relative `rel` as a directory with permissions stripped
@@ -325,8 +339,22 @@ pub(crate) fn extract_tar<R: Read>(
             .path()
             .map_err(|e| ExtractError::Malformed(format!("tar entry path: {e}")))?
             .into_owned();
-        let Some(rel) = contained_relative_path(&raw) else {
-            return Err(ExtractError::UncontainedPath);
+        let rel = match contained_relative_path(&raw) {
+            None => return Err(ExtractError::UncontainedPath),
+            Some(PathContainment::Root) => {
+                // The archive's own root entry: nothing to create for a
+                // directory, since the root already exists. A regular
+                // file cannot be named "the workspace root" — refuse
+                // only if it actually carries a body; an empty one is
+                // the same no-op as the directory case.
+                if entry_type.is_dir() || entry.size() == 0 {
+                    continue;
+                }
+                return Err(ExtractError::Malformed(
+                    "archive root entry cannot be a regular file with content".to_string(),
+                ));
+            }
+            Some(PathContainment::Relative(rel)) => rel,
         };
 
         if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -388,8 +416,21 @@ pub(crate) fn extract_zip<R: Read + io::Seek>(
         // crate's own sanitiser, so one rule governs both containers and
         // a hostile name is a refusal in both.
         let raw = PathBuf::from(entry.name());
-        let Some(rel) = contained_relative_path(&raw) else {
-            return Err(ExtractError::UncontainedPath);
+        let rel = match contained_relative_path(&raw) {
+            None => return Err(ExtractError::UncontainedPath),
+            Some(PathContainment::Root) => {
+                // Same reasoning as the tar path: the archive's own root
+                // entry is a no-op for a directory (or an empty file),
+                // and a refusal only if a "root" file actually carries a
+                // body.
+                if entry.is_dir() || entry.size() == 0 {
+                    continue;
+                }
+                return Err(ExtractError::Malformed(
+                    "archive root entry cannot be a regular file with content".to_string(),
+                ));
+            }
+            Some(PathContainment::Relative(rel)) => rel,
         };
 
         if entry.is_symlink() {
@@ -783,6 +824,66 @@ mod tests {
         assert_eq!(err, ExtractError::UncontainedPath);
     }
 
+    /// The shape every `tar -C dir .` producer emits: the archive's own
+    /// first entry is the root directory `./`, followed by ordinary
+    /// `./`-prefixed paths. None of it is a traversal — `./` names the
+    /// workspace root, which already exists — so the whole archive must
+    /// extract, not refuse on the first entry.
+    #[test]
+    fn extract_tar_accepts_its_own_root_entry() {
+        let bytes = file_tar(&[("./", b""), ("./usr/", b""), ("./usr/share/x.crt", b"cert")]);
+        let dir = root();
+        let len = bytes.len() as u64;
+        let stats = extract_tar(
+            Cursor::new(bytes),
+            len,
+            dir.path(),
+            ExtractBounds::default_for_scan_materialisation(),
+        )
+        .expect("a tar -C dir . root entry must not refuse the archive");
+        assert_eq!(
+            fs::read(dir.path().join("usr/share/x.crt")).expect("read"),
+            b"cert"
+        );
+        assert_eq!(stats.entries, 3);
+    }
+
+    #[test]
+    fn extract_zip_accepts_its_own_root_entry() {
+        let bytes = zip_bytes(&[("./", b""), ("./usr/share/x.crt", b"cert")]);
+        let dir = root();
+        let len = bytes.len() as u64;
+        extract_zip(
+            Cursor::new(bytes),
+            len,
+            dir.path(),
+            ExtractBounds::default_for_scan_materialisation(),
+        )
+        .expect("a zip root entry must not refuse the archive");
+        assert_eq!(
+            fs::read(dir.path().join("usr/share/x.crt")).expect("read"),
+            b"cert"
+        );
+    }
+
+    /// A root entry carrying an actual body is a malformed archive shape
+    /// (a regular file cannot be named "the workspace root"), not a path
+    /// escape — the refusal must be `Malformed`, not `UncontainedPath`.
+    #[test]
+    fn extract_tar_refuses_a_root_entry_with_a_body_as_malformed() {
+        let bytes = tar_bytes(&[(".", tar::EntryType::Regular, b"unexpected")]);
+        let dir = root();
+        let len = bytes.len() as u64;
+        let err = extract_tar(
+            Cursor::new(bytes),
+            len,
+            dir.path(),
+            ExtractBounds::default_for_scan_materialisation(),
+        )
+        .expect_err("a root entry with a body must be refused");
+        assert!(matches!(err, ExtractError::Malformed(_)), "{err:?}");
+    }
+
     // -- links: skipped and counted, never a refusal --------------------
 
     #[test]
@@ -954,14 +1055,24 @@ mod tests {
     fn contained_relative_path_normalises_and_refuses() {
         assert_eq!(
             contained_relative_path(Path::new("./a/./b")),
-            Some(PathBuf::from("a/b"))
+            Some(PathContainment::Relative(PathBuf::from("a/b")))
         );
         assert_eq!(
             contained_relative_path(Path::new("a/b")),
-            Some(PathBuf::from("a/b"))
+            Some(PathContainment::Relative(PathBuf::from("a/b")))
         );
-        assert_eq!(contained_relative_path(Path::new("")), None);
-        assert_eq!(contained_relative_path(Path::new(".")), None);
+        assert_eq!(
+            contained_relative_path(Path::new("")),
+            Some(PathContainment::Root)
+        );
+        assert_eq!(
+            contained_relative_path(Path::new(".")),
+            Some(PathContainment::Root)
+        );
+        assert_eq!(
+            contained_relative_path(Path::new("./")),
+            Some(PathContainment::Root)
+        );
         assert_eq!(contained_relative_path(Path::new("/abs")), None);
         assert_eq!(contained_relative_path(Path::new("../up")), None);
         assert_eq!(contained_relative_path(Path::new("a/../../up")), None);

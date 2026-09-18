@@ -190,6 +190,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An empty Trivy report over a fully materialised root filesystem is now
+  "nothing to assess", not a hold** (#274). Staging UAT surfaced a
+  `nginx:alpine` pull through a Trivy policy where the base layer scanned
+  and released normally but a package-less layer (the image's
+  CA-certificate files, no OS package database) never did: Trivy's
+  `rootfs` target came back with no analysed target, which the adapter
+  read the same way regardless of which target produced it — an
+  *unassessed* surface, held `scan_indeterminate` forever. Nearly every
+  real multi-layer image carries a layer like this, so every such image
+  under a Trivy policy hung indefinitely. `rootfs` runs every OS-package,
+  language and binary analyzer over the whole extracted tree, so an empty
+  result there is those analyzers agreeing the tree has no package surface
+  at all — the same completed "not applicable" fact an OCI manifest or
+  config blob already records, reached this time by actually running the
+  scan. An `fs`-mode empty report is unchanged: that target is one
+  artifact whose analyzer either engages or does not, so it still holds as
+  an unassessed surface.
+
 - **A policy created with `enforcement: record` now records from its first
   apply** (#267). `create_policy` built the rest of the policy projection
   from the submitted command but hard-coded `enforcement` to `reject`, so a
@@ -264,10 +282,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *not applicable* rather than *analysed, clean* — a distinction the
   `ScanCompleted` event now carries explicitly, so the two can never be
   confused when reading an artifact's history.
-  `hort_scan_terminal_total` gains a matching `not_applicable` result. An
-  image's layers are unaffected: they carry real package content and still
-  get real verdicts. Scan results recorded before this release read back as
-  analysed, which is what they were.
+  `hort_scan_terminal_total` gains a matching `not_applicable` result. A
+  layer that carries an OS package database still gets a real, analysed
+  verdict. Scan results recorded before this release read back as analysed,
+  which is what they were.
 
   **Operators should expect new holds.** A Trivy-only policy on a cargo
   repository now holds a library crate rather than releasing it clean: a
