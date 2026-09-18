@@ -4,18 +4,23 @@
 //! by serialising the supplied [`Sbom`] into a CycloneDX 1.5 JSON
 //! document, shelling out to
 //! `osv-scanner scan source --format json --sbom <path>`,
-//! parsing the JSON output, and returning `Vec<Finding>`.
+//! parsing the JSON output, and returning the lowered findings.
 //!
 //! Unlike the Trivy adapter, this scanner does **not** consume the
 //! artifact's content bytes. osv-scanner derives every match from the
-//! SBOM's PURLs; the underlying `content_hash` is unused (the
-//! parameter is kept for trait conformance and for future caching keys).
+//! SBOM's PURLs, so nothing on the
+//! [`ScanTarget`](hort_domain::ports::scanner::ScanTarget) — not the
+//! content hash, not the artifact kind — is read: there is no payload for
+//! this backend to materialise. The parameter is kept for trait
+//! conformance and for future caching keys.
 //!
-//! Behaviour when `sbom: None`: the adapter logs `info!` and returns
-//! `Ok(vec![])`. osv-scanner needs an SBOM input — there is no
+//! Behaviour when `sbom: None`: the adapter logs `info!` and returns a
+//! clean (empty) verdict. osv-scanner needs an SBOM input — there is no
 //! payload-based fallback. The orchestrator chains scanners
 //! sequentially; an empty result here is the documented "skip" signal,
-//! not an error.
+//! not an error, and it is a *verdict* rather than an abstention — a
+//! deliberate non-change, since reclassifying it would alter what every
+//! SBOM-less format records under an OSV policy.
 //!
 //! Module layout:
 //! - [`severity`] — score / label → `SeverityThreshold` (pure)
@@ -39,9 +44,11 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER};
+use hort_domain::ports::scanner::{
+    ScanAnalysis, ScanTarget, ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER,
+};
 use hort_domain::ports::BoxFuture;
-use hort_domain::types::{ContentHash, Finding, Sbom};
+use hort_domain::types::{Finding, Sbom};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -402,18 +409,29 @@ impl ScannerPort for OsvScannerAdapter {
         "osv"
     }
 
+    /// OSV-scanner adjudicates the **SBOM**, not the payload, so the
+    /// materialisation facts on [`ScanTarget`] (the kind, the coords, the
+    /// content hash) are not consulted: there is nothing for this backend
+    /// to put on disk. Its input is whatever the format handler extracted.
+    ///
+    /// Its no-SBOM behaviour is unchanged by the format-aware port: a
+    /// missing SBOM stays a documented empty verdict, not an abstention.
+    /// That is deliberately out of scope here — changing it would alter
+    /// what a Trivy-plus-OSV policy records for every format whose handler
+    /// produces no SBOM, which is a decision about OSV's coverage map, not
+    /// about Trivy's materialisation.
     fn scan<'a>(
         &'a self,
-        _content_hash: &'a ContentHash,
+        _target: &'a ScanTarget<'a>,
         sbom: Option<&'a Sbom>,
-    ) -> BoxFuture<'a, DomainResult<Vec<Finding>>> {
+    ) -> BoxFuture<'a, DomainResult<ScanAnalysis>> {
         Box::pin(async move {
             let Some(sbom) = sbom else {
                 tracing::info!(
                     scanner = "osv",
                     "osv adapter: scan skipped — no SBOM provided"
                 );
-                return Ok(Vec::new());
+                return Ok(ScanAnalysis::clean());
             };
 
             // 1. Materialise SBOM into a TempDir. RAII drop on
@@ -437,7 +455,7 @@ impl ScannerPort for OsvScannerAdapter {
             );
 
             // 4. ws drops here — TempDir cleanup runs.
-            Ok(findings)
+            Ok(ScanAnalysis::Analysed(findings))
         })
     }
 
@@ -489,10 +507,35 @@ mod tests {
         OsvScannerAdapter::new(cfg())
     }
 
-    fn sample_hash() -> ContentHash {
+    fn sample_hash() -> hort_domain::types::ContentHash {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             .parse()
             .unwrap()
+    }
+
+    fn sample_coords() -> hort_domain::types::ArtifactCoords {
+        hort_domain::types::ArtifactCoords {
+            name: "lodash".to_string(),
+            name_as_published: "lodash".to_string(),
+            version: Some("4.17.21".to_string()),
+            path: "lodash/-/lodash-4.17.21.tgz".to_string(),
+            format: hort_domain::entities::repository::RepositoryFormat::Npm,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// A scan target this backend ignores every payload fact of — it
+    /// scans the SBOM. Present so the port's shape is exercised.
+    fn sample_target<'a>(
+        hash: &'a hort_domain::types::ContentHash,
+        coords: &'a hort_domain::types::ArtifactCoords,
+    ) -> ScanTarget<'a> {
+        ScanTarget {
+            content_hash: hash,
+            format: "npm",
+            coords,
+            kind: hort_domain::types::ArtifactKind::NpmTarball,
+        }
     }
 
     // ----- argv shape (no real binary needed) ------------------------------
@@ -673,8 +716,18 @@ mod tests {
         };
         let a = OsvScannerAdapter::new(c);
         let h = sample_hash();
-        let r = a.scan(&h, None).await.expect("none-sbom returns Ok");
-        assert!(r.is_empty(), "scan(None) must produce no findings");
+        let coords = sample_coords();
+        let r = a
+            .scan(&sample_target(&h, &coords), None)
+            .await
+            .expect("none-sbom returns Ok");
+        // Unchanged by the format-aware port: a missing SBOM is still a
+        // documented empty verdict for this backend, not an abstention.
+        assert_eq!(
+            r,
+            ScanAnalysis::clean(),
+            "scan(None) must stay a clean verdict"
+        );
     }
 
     // ----- runtime smoke (no real binary needed) ---------------------------
@@ -706,11 +759,12 @@ mod tests {
         };
         let a = OsvScannerAdapter::new(c);
         let h = sample_hash();
+        let coords = sample_coords();
         let sbom = Sbom {
             subject: None,
             components: vec![],
         };
-        let r = a.scan(&h, Some(&sbom)).await;
+        let r = a.scan(&sample_target(&h, &coords), Some(&sbom)).await;
         assert!(matches!(r, Err(DomainError::Invariant(_))));
     }
 

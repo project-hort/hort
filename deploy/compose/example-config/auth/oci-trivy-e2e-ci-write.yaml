@@ -1,0 +1,17 @@
+# PermissionGrant: serviceAccount oci-trivy-e2e-ci -> write oci-trivy-e2e
+# (native-token-mode skopeo push in
+# scripts/native-tests/scenarios/quarantine/trivy-oci-not-applicable.sh).
+# Resolves at apply to the SA's backing user (GrantSubject::User).
+#
+# Paired with oci-trivy-e2e-ci-read.yaml: the native-token mint scopes one
+# token for the whole run, and skopeo's copy issues reads on it too.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-trivy-e2e-ci-write
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-trivy-e2e-ci
+  permission: write
+  repository: oci-trivy-e2e

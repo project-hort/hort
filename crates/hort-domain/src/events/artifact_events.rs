@@ -216,6 +216,75 @@ impl ScanRequested {
     }
 }
 
+/// What kind of assessment a [`ScanCompleted`] records.
+///
+/// An empty `finding_count` means two very different things and the
+/// audit trail has to be able to tell them apart: a backend looked at a
+/// package surface and found nothing wrong, versus there was no package
+/// surface to look at. Both open the release gate — an artifact that
+/// structurally cannot carry a package vulnerability is outside the scan
+/// axis, so the time gate alone governs it — but only the first is a
+/// clean verdict, and reporting the second as one would overstate what
+/// was actually checked.
+///
+/// The code-level definition of "no package surface" is
+/// [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable);
+/// the other `NotAnalysable` variants are an *expected* surface that
+/// could not be assessed and still fail closed, so they never reach this
+/// type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanAssessment {
+    /// A backend examined the artifact. An empty finding set here **is**
+    /// a clean verdict and carries the release authority of one. The
+    /// `#[serde(default)]` value, so every event written before this
+    /// field existed reads back as what it was: an analysed scan.
+    #[default]
+    Analysed,
+    /// The artifact carries no package surface by construction — an OCI
+    /// manifest row, a non-tar OCI blob such as the image config — so
+    /// every configured backend abstained with
+    /// [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable).
+    /// A completed assessment with nothing to assess: scan authority
+    /// exists, `finding_count` is necessarily zero, and the trail says
+    /// "not applicable" rather than "analysed, clean".
+    NotApplicable,
+}
+
+impl ScanAssessment {
+    /// Stable lowercase identifier for logs, metric labels and the job
+    /// result summary. Matches the serde wire form.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Analysed => "analysed",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+
+    /// True when this assessment records that there was nothing to
+    /// assess rather than an examination that came back clean.
+    #[must_use]
+    pub fn is_not_applicable(&self) -> bool {
+        matches!(self, Self::NotApplicable)
+    }
+
+    /// True for the default assessment. Exists as a named predicate
+    /// because it is [`ScanCompleted::assessment`]'s
+    /// `skip_serializing_if` — see that field for why the default must
+    /// leave no trace on the wire.
+    #[must_use]
+    pub fn is_analysed(&self) -> bool {
+        matches!(self, Self::Analysed)
+    }
+}
+
+impl std::fmt::Display for ScanAssessment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Aggregate scan-result event for a single scanner backend run against
 /// an artifact. Carries fast aggregate counts (`finding_count`,
 /// `severity_summary`) inline for O(1) projection updates and a
@@ -227,6 +296,9 @@ impl ScanRequested {
 ///   reference a blob; non-clean scans always do. A `Some` paired with
 ///   zero findings (or a `None` paired with positive findings) is a bug.
 /// - `severity_summary.sum() == finding_count` — independent invariant.
+/// - `assessment == NotApplicable` implies `finding_count == 0` — there
+///   was no surface to assess, so a finding attributed to it could not
+///   have come from anywhere.
 ///
 /// # `findings_blob` layout
 ///
@@ -239,12 +311,16 @@ impl ScanRequested {
 ///
 /// # Schema evolution
 ///
-/// `findings_blob` carries `#[serde(default)]` for forward-compat,
-/// matching the
+/// `findings_blob` and `assessment` carry `#[serde(default)]` for
+/// forward-compat, matching the
 /// `UpstreamPublishedChecksum::deserialize_without_re_validating`
 /// precedent: every event payload must accept any shape that was once
 /// written, in case in-flight test fixtures or replay logs still carry
-/// an older shape.
+/// an older shape. An event written before `assessment` existed reads
+/// back as [`ScanAssessment::Analysed`], which is what it was — and
+/// re-serialises to the same bytes it was hashed with, because
+/// `assessment` also carries `skip_serializing_if`. See that field for
+/// why the event chain makes that mandatory rather than cosmetic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanCompleted {
     pub artifact_id: Uuid,
@@ -256,6 +332,26 @@ pub struct ScanCompleted {
     /// invariant and the `#[serde(default)]` rationale.
     #[serde(default)]
     pub findings_blob: Option<ContentHash>,
+    /// Whether this scan examined a package surface or recorded that
+    /// there was none to examine. See [`ScanAssessment`].
+    ///
+    /// **`skip_serializing_if` is load-bearing, not a size
+    /// optimisation.** The tamper-evident event chain (ADR 0002) hashes
+    /// `canonical_payload_bytes(typed DomainEvent)`, and verification
+    /// *re-derives* those bytes by deserialising the stored payload and
+    /// serialising it again. A field that always writes a key would
+    /// therefore make every `ScanCompleted` appended before this field
+    /// existed re-serialise to different bytes than it was hashed
+    /// with — a `HashMismatch` on every such stream, indistinguishable
+    /// from tampering, on a verifier that is default-on (ADR 0057).
+    /// Skipping the default value keeps the historical payload byte-identical:
+    /// only the new, non-default `not_applicable` state adds a key, and
+    /// it only ever appears on events written after this field existed.
+    /// Round-trip identity is preserved in both directions (absent ⇒
+    /// `Analysed` ⇒ absent; present ⇒ `NotApplicable` ⇒ present), which
+    /// is what `canonical_payload_bytes_round_trip_all_variants` pins.
+    #[serde(default, skip_serializing_if = "ScanAssessment::is_analysed")]
+    pub assessment: ScanAssessment,
 }
 
 impl ScanCompleted {
@@ -285,6 +381,15 @@ impl ScanCompleted {
                 ));
             }
             _ => {}
+        }
+        // Invariant: "nothing to assess" cannot carry a finding. A
+        // finding attributed to an artifact with no package surface has
+        // no producer that could have found it.
+        if self.assessment.is_not_applicable() && self.finding_count > 0 {
+            return Err(DomainError::Validation(format!(
+                "ScanCompleted is not_applicable but carries {} findings",
+                self.finding_count
+            )));
         }
         Ok(())
     }

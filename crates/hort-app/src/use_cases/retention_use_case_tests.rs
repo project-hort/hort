@@ -23,8 +23,8 @@ use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
-    ArtifactBecameVulnerable, DomainEvent, IngestSource, PersistedEvent, ScanCompleted,
-    SeveritySummary, StreamId,
+    ArtifactBecameVulnerable, DomainEvent, IngestSource, PersistedEvent, ScanAssessment,
+    ScanCompleted, SeveritySummary, StreamId,
 };
 use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
@@ -207,6 +207,7 @@ fn scan_completed(artifact_id: Uuid) -> DomainEvent {
             negligible: 0,
         },
         findings_blob: None,
+        assessment: ScanAssessment::Analysed,
     })
 }
 

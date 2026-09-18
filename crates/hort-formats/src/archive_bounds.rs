@@ -1,8 +1,19 @@
 //! # archive_bounds — bounded archive metadata extraction
 //!
-//! **Preventive helper.** All ZIP/gzip-tar extraction in this workspace
-//! routes through this module to clamp the decompression-bomb attack
+//! **Preventive helper.** Archive *metadata* reads in this workspace
+//! route through this module to clamp the decompression-bomb attack
 //! surface — bounded output, bounded entry count, no nested archives.
+//!
+//! Scope: this module reads **one named entry into memory** and never
+//! touches a filesystem path. It deliberately offers no extract-to-disk
+//! API, so the one job it cannot serve is scan materialisation —
+//! unpacking a wheel, tarball or image layer onto disk so a scanner's
+//! analyzers can find the paths inside it. That lives in
+//! `hort-adapters-scanner-trivy::extract`, which carries the equivalent
+//! caps plus the path-containment and link-escape guards that only a
+//! to-disk extractor needs; `deny.toml`'s `[bans]` rule names both
+//! crates as the only sanctioned direct consumers of `tar` / `zip` /
+//! `flate2`.
 //!
 //! ## Invariants the helper enforces
 //!
@@ -34,8 +45,10 @@
 //! formats` module and write the extraction inline — at which point the
 //! caps are easy to forget. By putting the helper here first and adding
 //! the `cargo-deny [bans]` rule that limits `tar` / `zip` / `flate2` /
-//! `bzip2` / `xz2` to the `hort-formats` crate (via the `wrappers`
-//! exception), every new archive consumer is forced through this module.
+//! `bzip2` / `xz2` to a named set of crates (via the `wrappers`
+//! exception), every new archive consumer is forced through an audited
+//! module — this one for metadata reads, and the scanner adapter's
+//! `extract` for materialisation.
 //!
 //! ## How a future caller integrates a real archive crate
 //!

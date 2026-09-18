@@ -1,22 +1,59 @@
-//! Trivy [`ScannerPort`] adapter (filesystem mode).
+//! Trivy [`ScannerPort`] adapter (CLI).
 //!
 //! `TrivyAdapter` implements [`ScannerPort`](hort_domain::ports::scanner::ScannerPort)
-//! by shelling out to the `trivy` CLI in `trivy fs --format json
-//! --quiet <dir>` mode. The adapter owns its workspace lifecycle: it
-//! pulls the artifact bytes from `StoragePort::get`, writes them into
-//! a `tempfile::TempDir` (auto-removed on drop, including the panic
-//! and error paths), invokes `trivy`, parses the JSON output, and
-//! returns `Vec<Finding>`.
+//! by shelling out to the `trivy` CLI. The adapter owns its workspace
+//! lifecycle: it materialises the artifact's bytes into a
+//! `tempfile::TempDir` (auto-removed on drop, including the panic and
+//! error paths) in the shape the scanner's analyzers expect, invokes
+//! `trivy`, parses the JSON output, and reports what came of it.
+//!
+//! # Materialisation is the evidence
+//!
+//! Trivy selects analyzers by file name, extension and directory layout,
+//! and it does not open archives. A directory holding one opaque blob
+//! therefore yields a report with no `Results` — which, read as a finding
+//! list, is an empty one, indistinguishable from a clean scan. So the
+//! adapter materialises **by artifact kind**: a Java archive keeps its
+//! extension, a POM becomes `pom.xml`, an npm tarball is planted under
+//! `node_modules/<name>/`, wheels and sdists and `.crate` files are
+//! extracted, an OCI layer becomes a root filesystem.
+//!
+//! The **subcommand** comes from the kind too, and for the same reason.
+//! Trivy's coverage matrix runs each analyzer under only some of its four
+//! targets: a post-build artifact (Java archive, wheel/egg,
+//! `package.json` under `node_modules`) is claimed by the Image and
+//! Rootfs targets, a pre-build declaration (`pom.xml`, lockfiles) by
+//! Filesystem and Repository. Pointing `trivy fs` at a JAR runs no
+//! analyzer at all. [`workspace`] holds the table and the reasoning.
+//!
+//! # "Nothing analysable" is not "clean"
+//!
+//! The adapter distinguishes three outcomes, which is why
+//! [`ScannerPort::scan`] returns
+//! [`ScanAnalysis`](hort_domain::ports::scanner::ScanAnalysis) rather
+//! than a bare finding list:
+//!
+//! - **A verdict** — Trivy reported at least one analysed target. The
+//!   finding list, empty or not, is the verdict.
+//! - **Nothing to analyse** — no materialisation applies to this kind,
+//!   the payload's container could not be safely opened, or Trivy
+//!   returned a report with no `Results` at all. There is no verdict, and
+//!   the orchestrator holds the artifact fail-closed (ADR 0007) rather
+//!   than recording a clean scan of bytes nothing examined.
+//! - **A failure** — the binary is missing, the child timed out, the
+//!   report blew its cap. `Err`, and retryable.
 //!
 //! Module layout:
 //! - [`severity`] — Trivy severity string → `SeverityThreshold` (pure)
 //! - [`purl`] — Trivy `Type` + `PkgName` + `InstalledVersion` → PURL (pure)
 //! - [`parse`] — Trivy JSON wire types + finding mapper (pure)
-//! - [`workspace`] — temp-dir + payload write (adapter-internal I/O)
+//! - [`extract`] — bounded, path-safe archive extraction
+//! - [`workspace`] — materialisation by kind (adapter-internal I/O)
 //! - this module — `TrivyAdapter` itself + the `ScannerPort` impl
 //!
 //! See `docs/architecture/explanation/scanning-pipeline.md`.
 
+mod extract;
 mod parse;
 mod purl;
 mod severity;
@@ -28,15 +65,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER};
+use hort_domain::ports::scanner::{
+    NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER,
+};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::BoxFuture;
-use hort_domain::types::{ContentHash, Finding, Sbom};
+use hort_domain::types::{Finding, Sbom};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::parse::{aggregate_findings, parse_trivy_report};
-use crate::workspace::prepare_workspace;
+use crate::workspace::{materialise, Materialised, ScanMode};
 
 /// Drain `pipe` into a `Vec`, bounded to
 /// `cap + 1` bytes via [`AsyncReadExt::take`]. Returns the drained
@@ -120,7 +159,7 @@ where
 // Public parser entry point
 // ---------------------------------------------------------------------------
 
-/// Parse a `trivy fs --format json` document and return the lowered
+/// Parse a `trivy <fs|rootfs> --format json` document and return the lowered
 /// [`Finding`] list, applying the same per-finding cap filter
 /// [`TrivyAdapter::scan`] applies.
 ///
@@ -235,12 +274,18 @@ impl TrivyAdapter {
         Self { config, storage }
     }
 
-    /// Build the argv vector for `trivy fs --format json …`. Pulled
-    /// out of [`Self::run_scan`] so it is unit-testable without
+    /// Build the argv vector for `trivy <fs|rootfs> --format json …`.
+    /// Pulled out of [`Self::run_scan`] so it is unit-testable without
     /// touching the real binary.
-    fn scan_argv(&self, target_dir: &str) -> Vec<String> {
+    ///
+    /// The subcommand comes from the materialisation: an extracted image
+    /// layer is a root filesystem, and only `trivy rootfs` runs the
+    /// OS-package analyzers over it
+    /// (<https://trivy.dev/latest/docs/target/rootfs/>). Every other flag
+    /// is identical between the two targets.
+    fn scan_argv(&self, mode: ScanMode, target_dir: &str) -> Vec<String> {
         let mut argv: Vec<String> = vec![
-            "fs".to_string(),
+            mode.subcommand().to_string(),
             "--format".to_string(),
             "json".to_string(),
             "--quiet".to_string(),
@@ -291,14 +336,24 @@ impl TrivyAdapter {
     /// stderr heuristic is preserved and now coexists with the hard
     /// Rust timeout (the cooperative path still produces the tuned
     /// message; the Rust timeout is the backstop for a true hang).
-    async fn run_scan(&self, target_dir: &str) -> DomainResult<parse::TrivyReport> {
+    /// On success returns the parsed report **and the child's stderr**.
+    /// Trivy under `--quiet` still writes DB-download progress, analyzer
+    /// warnings and "no such file" complaints there, and that text is the
+    /// only evidence available when the report comes back with no
+    /// analysed target — so it is carried out rather than dropped.
+    async fn run_scan(
+        &self,
+        mode: ScanMode,
+        target_dir: &str,
+    ) -> DomainResult<(parse::TrivyReport, Vec<u8>)> {
         tracing::debug!(
             scanner = "trivy",
             bin = %self.config.trivy_bin.display(),
+            subcommand = mode.subcommand(),
             "trivy adapter: invoking CLI"
         );
         let mut cmd = Command::new(&self.config.trivy_bin);
-        cmd.args(self.scan_argv(target_dir))
+        cmd.args(self.scan_argv(mode, target_dir))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -431,9 +486,26 @@ impl TrivyAdapter {
             )));
         }
 
-        parse_trivy_report(&stdout_buf)
-            .map_err(|e| DomainError::Validation(format!("trivy adapter: malformed JSON: {e}")))
+        let report = parse_trivy_report(&stdout_buf)
+            .map_err(|e| DomainError::Validation(format!("trivy adapter: malformed JSON: {e}")))?;
+        Ok((report, stderr_buf))
     }
+}
+
+/// Bytes of the child's stderr carried into the "no analysed target"
+/// diagnostic.
+const STDERR_TAIL_BYTES: usize = 1024;
+
+/// The tail of a captured stderr buffer, for one log field.
+///
+/// The **tail** rather than the head because Trivy's last words are the
+/// ones about the scan that just produced nothing; the earlier bytes are
+/// DB bookkeeping. Lossy UTF-8 decoding is deliberate: the cut can land
+/// mid-codepoint, and a replacement character at the front of a
+/// diagnostic is better than dropping the diagnostic.
+fn stderr_tail(stderr: &[u8]) -> String {
+    let start = stderr.len().saturating_sub(STDERR_TAIL_BYTES);
+    String::from_utf8_lossy(&stderr[start..]).trim().to_string()
 }
 
 impl ScannerPort for TrivyAdapter {
@@ -443,33 +515,77 @@ impl ScannerPort for TrivyAdapter {
 
     fn scan<'a>(
         &'a self,
-        content_hash: &'a ContentHash,
+        target: &'a ScanTarget<'a>,
         _sbom: Option<&'a Sbom>,
-    ) -> BoxFuture<'a, DomainResult<Vec<Finding>>> {
+    ) -> BoxFuture<'a, DomainResult<ScanAnalysis>> {
         Box::pin(async move {
-            // 1. Materialise content into a TempDir. RAII drop on
-            //    success / error / panic removes the directory tree.
-            let ws = prepare_workspace(&self.storage, content_hash, self.config.max_artifact_size)
-                .await?;
+            // 1. Materialise by kind into a TempDir. RAII drop on
+            //    success / error / panic removes the directory tree. A
+            //    kind with no materialisation, or a payload whose
+            //    container cannot be safely opened, ends here with no
+            //    verdict — never with an empty finding list.
+            let (ws, mode) =
+                match materialise(&self.storage, target, self.config.max_artifact_size).await? {
+                    Materialised::Ready { ws, mode } => (ws, mode),
+                    Materialised::Nothing(reason) => {
+                        return Ok(ScanAnalysis::NothingAnalysable(reason));
+                    }
+                };
             let dir = ws.dir().to_string_lossy().into_owned();
 
-            // 2. Run Trivy.
-            let report = self.run_scan(&dir).await?;
+            // 2. Run Trivy against the materialised tree.
+            let (report, stderr) = self.run_scan(mode, &dir).await?;
 
-            // 3. Lower into Vec<Finding>. Findings that fail
+            // 3. No `Results` section at all means no analyzer claimed
+            //    anything in the workspace — Trivy found nothing to
+            //    analyse, which is NOT the same fact as "analysed and
+            //    found no vulnerabilities" (that comes back as a
+            //    `Results` entry with an empty `Vulnerabilities` list).
+            //    Collapsing the two is the defect this distinction
+            //    exists to remove: the first has no verdict to give.
+            if report.results.is_empty() {
+                // The two facts that make this warning actionable: what
+                // the scanner said on its way to saying nothing, and what
+                // the tree it was pointed at actually contained. Without
+                // them "no analyzer matched" is indistinguishable from a
+                // materialisation this adapter got wrong.
+                //
+                // Both are computed *before* the macro: a `.await`
+                // inside `warn!` would hold the event's `Arguments`
+                // across it and make the whole future non-`Send`.
+                let materialised = ws.listing().await;
+                tracing::warn!(
+                    scanner = "trivy",
+                    kind = target.kind.as_str(),
+                    format = target.format,
+                    subcommand = mode.subcommand(),
+                    stderr_tail = stderr_tail(&stderr),
+                    materialised,
+                    skipped_links = ws.skipped_links(),
+                    "trivy adapter: report carries no analysed target; no verdict"
+                );
+                return Ok(ScanAnalysis::NothingAnalysable(
+                    NotAnalysable::NoAnalyzerMatched,
+                ));
+            }
+
+            // 4. Lower into Vec<Finding>. Findings that fail
             //    Finding::validate are dropped with tracing::warn!
             //    inside aggregate_findings.
             let findings = aggregate_findings(&report);
 
             tracing::info!(
                 scanner = "trivy",
-                content_hash = %content_hash,
+                content_hash = %target.content_hash,
+                kind = target.kind.as_str(),
+                subcommand = mode.subcommand(),
+                analysed_targets = report.results.len(),
                 finding_count = findings.len(),
                 "trivy adapter: scan completed"
             );
 
-            // 4. ws drops here — TempDir cleanup runs.
-            Ok(findings)
+            // 5. ws drops here — TempDir cleanup runs.
+            Ok(ScanAnalysis::Analysed(findings))
         })
     }
 
@@ -512,16 +628,52 @@ mod tests {
     use hort_domain::types::{ByteRange, ContentHash as Ch};
     use tokio::io::AsyncRead;
 
-    /// Storage stub used purely as a `#[cfg(test)]` placeholder where the
-    /// adapter won't actually call `get`. All methods panic if invoked.
-    /// Test-only stub, not a production residual.
-    struct UnusedStorage;
-    impl P for UnusedStorage {
+    /// What the one test storage stub does when the adapter calls `get`.
+    /// Every other `StoragePort` method is unreachable in these tests, so
+    /// one impl with a behaviour selector replaces what would otherwise be
+    /// five near-identical stubs.
+    enum Get {
+        /// Yield these bytes.
+        Bytes(Vec<u8>),
+        /// Fail the read, to assert the error propagates.
+        NotFound,
+        /// Panic — asserts a code path must not read storage at all.
+        Forbidden,
+    }
+
+    struct StubStorage(Get);
+
+    impl StubStorage {
+        fn unused() -> Arc<Self> {
+            Arc::new(Self(Get::Forbidden))
+        }
+        fn bytes(b: &[u8]) -> Arc<Self> {
+            Arc::new(Self(Get::Bytes(b.to_vec())))
+        }
+    }
+
+    impl P for StubStorage {
         fn put(&self, _s: Box<dyn AsyncRead + Send + Unpin>) -> Bf<'_, DomainResult<PutResult>> {
-            Box::pin(async { unreachable!() })
+            Box::pin(async { unreachable!("tests never write") })
         }
         fn get(&self, _h: &Ch) -> Bf<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
-            Box::pin(async { unreachable!() })
+            let bytes = match &self.0 {
+                Get::Bytes(b) => Some(b.clone()),
+                Get::NotFound => None,
+                Get::Forbidden => panic!("this code path must not read storage"),
+            };
+            Box::pin(async move {
+                match bytes {
+                    Some(b) => {
+                        let r: Box<dyn AsyncRead + Send + Unpin> = Box::new(Cursor::new(b));
+                        Ok(r)
+                    }
+                    None => Err(DomainError::NotFound {
+                        entity: "content",
+                        id: "x".into(),
+                    }),
+                }
+            })
         }
         fn get_range(
             &self,
@@ -538,6 +690,38 @@ mod tests {
         }
     }
 
+    /// A Maven-JAR scan target: the only kind whose materialisation is a
+    /// single file, so the CLI paths below are exercised without also
+    /// exercising archive extraction.
+    fn jar_coords() -> hort_domain::types::ArtifactCoords {
+        hort_domain::types::ArtifactCoords {
+            name: "com.example:app".to_string(),
+            name_as_published: "com.example:app".to_string(),
+            version: Some("1.0.0".to_string()),
+            path: "com/example/app/1.0.0/app-1.0.0.jar".to_string(),
+            format: hort_domain::entities::repository::RepositoryFormat::Maven,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    fn sample_hash() -> Ch {
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .parse()
+            .expect("64 hex chars parse")
+    }
+
+    fn jar_target<'a>(
+        hash: &'a Ch,
+        coords: &'a hort_domain::types::ArtifactCoords,
+    ) -> ScanTarget<'a> {
+        ScanTarget {
+            content_hash: hash,
+            format: "maven",
+            coords,
+            kind: hort_domain::types::ArtifactKind::MavenJar,
+        }
+    }
+
     fn cfg() -> TrivyConfig {
         TrivyConfig {
             trivy_bin: PathBuf::from("/usr/local/bin/trivy"),
@@ -551,7 +735,7 @@ mod tests {
     }
 
     fn adapter() -> TrivyAdapter {
-        TrivyAdapter::new(cfg(), Arc::new(UnusedStorage))
+        TrivyAdapter::new(cfg(), StubStorage::unused())
     }
 
     #[test]
@@ -561,33 +745,33 @@ mod tests {
 
     #[test]
     fn scan_argv_starts_with_fs_subcommand() {
-        let argv = adapter().scan_argv("/tmp/scan");
+        let argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan");
         assert_eq!(argv[0], "fs");
     }
 
     #[test]
     fn scan_argv_emits_format_json() {
-        let argv = adapter().scan_argv("/tmp/scan");
+        let argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan");
         let i = argv.iter().position(|s| s == "--format").unwrap();
         assert_eq!(argv[i + 1], "json");
     }
 
     #[test]
     fn scan_argv_emits_quiet_flag() {
-        let argv = adapter().scan_argv("/tmp/scan");
+        let argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan");
         assert!(argv.iter().any(|s| s == "--quiet"), "argv: {argv:?}");
     }
 
     #[test]
     fn scan_argv_emits_severity_filter_csv() {
-        let argv = adapter().scan_argv("/tmp/scan");
+        let argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan");
         let i = argv.iter().position(|s| s == "--severity").unwrap();
         assert_eq!(argv[i + 1], "CRITICAL,HIGH");
     }
 
     #[test]
     fn scan_argv_emits_cache_dir_when_db_dir_set() {
-        let argv = adapter().scan_argv("/tmp/scan");
+        let argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan");
         let i = argv.iter().position(|s| s == "--cache-dir").unwrap();
         assert_eq!(argv[i + 1], "/var/cache/trivy");
     }
@@ -596,8 +780,8 @@ mod tests {
     fn scan_argv_omits_cache_dir_when_db_dir_unset() {
         let mut c = cfg();
         c.db_dir = None;
-        let a = TrivyAdapter::new(c, Arc::new(UnusedStorage));
-        let argv = a.scan_argv("/tmp/scan");
+        let a = TrivyAdapter::new(c, StubStorage::unused());
+        let argv = a.scan_argv(ScanMode::Fs, "/tmp/scan");
         assert!(
             !argv.iter().any(|s| s == "--cache-dir"),
             "argv must not include --cache-dir: {argv:?}"
@@ -606,13 +790,13 @@ mod tests {
 
     #[test]
     fn scan_argv_target_dir_is_last_argument() {
-        let argv = adapter().scan_argv("/tmp/scan-here");
+        let argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan-here");
         assert_eq!(argv.last().map(String::as_str), Some("/tmp/scan-here"));
     }
 
     #[test]
     fn scan_argv_emits_timeout_in_seconds() {
-        let argv = adapter().scan_argv("/tmp/scan");
+        let argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan");
         let i = argv.iter().position(|s| s == "--timeout").unwrap();
         assert_eq!(argv[i + 1], "120s");
     }
@@ -621,9 +805,53 @@ mod tests {
     fn scan_argv_omits_severity_filter_when_empty() {
         let mut c = cfg();
         c.severity_filter = Vec::new();
-        let a = TrivyAdapter::new(c, Arc::new(UnusedStorage));
-        let argv = a.scan_argv("/tmp/scan");
+        let a = TrivyAdapter::new(c, StubStorage::unused());
+        let argv = a.scan_argv(ScanMode::Fs, "/tmp/scan");
         assert!(!argv.iter().any(|s| s == "--severity"), "argv: {argv:?}");
+    }
+
+    #[test]
+    fn scan_argv_uses_the_rootfs_subcommand_for_an_extracted_layer() {
+        let argv = adapter().scan_argv(ScanMode::Rootfs, "/tmp/scan");
+        assert_eq!(
+            argv[0], "rootfs",
+            "an extracted image layer is only read by the rootfs target"
+        );
+        // Every other flag is identical between the two targets, so the
+        // rest of the argv must not drift from the `fs` form.
+        let fs_argv = adapter().scan_argv(ScanMode::Fs, "/tmp/scan");
+        assert_eq!(argv[1..], fs_argv[1..]);
+    }
+
+    // -- empty-report diagnostics ---------------------------------------
+
+    #[test]
+    fn stderr_tail_keeps_the_last_bytes_and_trims_whitespace() {
+        assert_eq!(
+            stderr_tail(b"\n  db download failed  \n"),
+            "db download failed"
+        );
+        assert_eq!(stderr_tail(b""), "");
+        let long: Vec<u8> = std::iter::repeat_n(b'a', STDERR_TAIL_BYTES)
+            .chain(b"THE-LAST-WORDS".iter().copied())
+            .collect();
+        let tail = stderr_tail(&long);
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        assert!(
+            tail.ends_with("THE-LAST-WORDS"),
+            "the tail is what Trivy said last, not what it said first"
+        );
+    }
+
+    /// A cut landing mid-codepoint must not cost the diagnostic. Lossy
+    /// decoding turns the partial byte into a replacement character and
+    /// the rest of the text survives.
+    #[test]
+    fn stderr_tail_survives_a_cut_inside_a_multibyte_character() {
+        let mut bytes = vec![b'z'; STDERR_TAIL_BYTES];
+        bytes.extend_from_slice("é ok".as_bytes());
+        let tail = stderr_tail(&bytes);
+        assert!(tail.ends_with("ok"), "{tail}");
     }
 
     #[test]
@@ -670,7 +898,7 @@ mod tests {
         let mut c = cfg();
         c.subprocess_ca_bundle = Some(bundle_path.clone());
 
-        let a = TrivyAdapter::new(c, Arc::new(UnusedStorage));
+        let a = TrivyAdapter::new(c, StubStorage::unused());
 
         // Spawn `sh -c 'echo ${SSL_CERT_FILE:-unset}'` through
         // apply_subprocess_ca to confirm the env-var lands on the
@@ -697,7 +925,7 @@ mod tests {
     /// don't set `HORT_EXTRA_CA_BUNDLE`.
     #[tokio::test]
     async fn apply_subprocess_ca_default_leaves_ssl_cert_file_untouched() {
-        let a = TrivyAdapter::new(cfg(), Arc::new(UnusedStorage));
+        let a = TrivyAdapter::new(cfg(), StubStorage::unused());
 
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "printf %s \"${SSL_CERT_FILE:-unset}\""])
@@ -717,41 +945,10 @@ mod tests {
 
     #[tokio::test]
     async fn scan_propagates_storage_get_failure() {
-        struct ErrStorage;
-        impl P for ErrStorage {
-            fn put(
-                &self,
-                _s: Box<dyn AsyncRead + Send + Unpin>,
-            ) -> Bf<'_, DomainResult<PutResult>> {
-                Box::pin(async { unreachable!() })
-            }
-            fn get(&self, _h: &Ch) -> Bf<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
-                Box::pin(async {
-                    Err(DomainError::NotFound {
-                        entity: "content",
-                        id: "x".into(),
-                    })
-                })
-            }
-            fn get_range(
-                &self,
-                _h: &Ch,
-                _r: ByteRange,
-            ) -> Bf<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
-                Box::pin(async { unreachable!() })
-            }
-            fn exists(&self, _h: &Ch) -> Bf<'_, DomainResult<bool>> {
-                Box::pin(async { unreachable!() })
-            }
-            fn size_of(&self, _h: &Ch) -> Bf<'_, DomainResult<u64>> {
-                Box::pin(async { unreachable!() })
-            }
-        }
-        let a = TrivyAdapter::new(TrivyConfig::default(), Arc::new(ErrStorage));
-        let h: Ch = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            .parse()
-            .unwrap();
-        let r = a.scan(&h, None).await;
+        let a = TrivyAdapter::new(TrivyConfig::default(), Arc::new(StubStorage(Get::NotFound)));
+        let h = sample_hash();
+        let c = jar_coords();
+        let r = a.scan(&jar_target(&h, &c), None).await;
         assert!(matches!(r, Err(DomainError::NotFound { .. })));
     }
 
@@ -761,7 +958,7 @@ mod tests {
             trivy_bin: PathBuf::from("/no/such/trivy/binary/exists/here"),
             ..TrivyConfig::default()
         };
-        let a = TrivyAdapter::new(c, Arc::new(UnusedStorage));
+        let a = TrivyAdapter::new(c, StubStorage::unused());
         let r = a.health_check().await;
         match r {
             Err(DomainError::Invariant(msg)) => {
@@ -857,15 +1054,15 @@ mod tests {
             max_report_size: 1024,
             ..TrivyConfig::default()
         };
-        let a = TrivyAdapter::new(c, Arc::new(UnusedStorage));
+        let a = TrivyAdapter::new(c, StubStorage::unused());
         // Retry the spawn a few times to absorb any residual ETXTBSY on
         // slow filesystems — the cap-hit behaviour is what we assert.
-        let mut r = a.run_scan("/tmp/ignored").await;
+        let mut r = a.run_scan(ScanMode::Fs, "/tmp/ignored").await;
         for _ in 0..5 {
             match &r {
                 Err(DomainError::Invariant(msg)) if msg.contains("Text file busy") => {
                     tokio::time::sleep(Duration::from_millis(20)).await;
-                    r = a.run_scan("/tmp/ignored").await;
+                    r = a.run_scan(ScanMode::Fs, "/tmp/ignored").await;
                 }
                 _ => break,
             }
@@ -882,48 +1079,146 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn scan_with_missing_binary_returns_invariant_error() {
-        // Stub storage with an empty payload so we get past
-        // `prepare_workspace` and into the CLI invocation.
-        struct OkStorage;
-        impl P for OkStorage {
-            fn put(
-                &self,
-                _s: Box<dyn AsyncRead + Send + Unpin>,
-            ) -> Bf<'_, DomainResult<PutResult>> {
-                Box::pin(async { unreachable!() })
-            }
-            fn get(&self, _h: &Ch) -> Bf<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
-                Box::pin(async {
-                    let r: Box<dyn AsyncRead + Send + Unpin> =
-                        Box::new(Cursor::new(Vec::<u8>::new()));
-                    Ok(r)
-                })
-            }
-            fn get_range(
-                &self,
-                _h: &Ch,
-                _r: ByteRange,
-            ) -> Bf<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
-                Box::pin(async { unreachable!() })
-            }
-            fn exists(&self, _h: &Ch) -> Bf<'_, DomainResult<bool>> {
-                Box::pin(async { unreachable!() })
-            }
-            fn size_of(&self, _h: &Ch) -> Bf<'_, DomainResult<u64>> {
-                Box::pin(async { unreachable!() })
-            }
+    // -- "nothing analysable" vs "clean" ----------------------------------
+
+    /// Materialise a fake `trivy` that prints `stdout_json` and exits 0,
+    /// point the adapter at it, and scan a Maven-JAR target.
+    ///
+    /// A real binary standing in for Trivy is what makes the
+    /// `Results`-present / `Results`-absent distinction testable at all:
+    /// it is a property of the report the child emits, not of anything
+    /// the adapter can be asked directly.
+    #[cfg(unix)]
+    async fn scan_against_fake_trivy(stdout_json: &str) -> DomainResult<ScanAnalysis> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script = dir.path().join("fake-trivy.sh");
+        {
+            // Write through a handle we sync and drop before exec so the
+            // kernel holds no writable fd on the file (ETXTBSY).
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o700)
+                .open(&script)
+                .expect("create script");
+            writeln!(f, "#!/bin/sh").expect("write");
+            writeln!(f, "cat <<'TRIVY_REPORT'").expect("write");
+            writeln!(f, "{stdout_json}").expect("write");
+            writeln!(f, "TRIVY_REPORT").expect("write");
+            writeln!(f, "exit 0").expect("write");
+            f.sync_all().expect("sync");
         }
+        let c = TrivyConfig {
+            trivy_bin: script,
+            ..TrivyConfig::default()
+        };
+        let a = TrivyAdapter::new(c, StubStorage::bytes(b"PK\x03\x04fake jar"));
+        let h = sample_hash();
+        let coords = jar_coords();
+        a.scan(&jar_target(&h, &coords), None).await
+    }
+
+    /// A report with no `Results` section means no analyzer claimed
+    /// anything in the workspace. That is the absence of a verdict, and
+    /// it must NOT come back as an empty finding list — an empty list is
+    /// a clean verdict and carries release authority.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_with_no_results_is_nothing_analysable_not_clean() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        for report in [r#"{}"#, r#"{"Results":null}"#, r#"{"Results":[]}"#] {
+            let analysis = scan_against_fake_trivy(report)
+                .await
+                .expect("the child exited 0, so the scan itself succeeded");
+            assert_eq!(
+                analysis,
+                ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched),
+                "report {report} must not be read as a clean verdict"
+            );
+        }
+    }
+
+    /// The other side of the same distinction: a report that *does* carry
+    /// an analysed target with no vulnerabilities IS a clean verdict.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_with_an_analysed_target_and_no_vulnerabilities_is_a_clean_verdict() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let report = r#"{"Results":[{"Target":"app-1.0.0.jar","Class":"lang-pkgs","Type":"jar"}]}"#;
+        let analysis = scan_against_fake_trivy(report).await.expect("scan");
+        assert_eq!(
+            analysis,
+            ScanAnalysis::clean(),
+            "an analysed target with no vulnerabilities is a real clean verdict"
+        );
+    }
+
+    /// And a report carrying a vulnerability lowers into findings.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_report_with_a_vulnerability_is_a_verdict_with_findings() {
+        if !std::path::Path::new("/bin/sh").exists() {
+            return;
+        }
+        let report = r#"{"Results":[{"Target":"app-1.0.0.jar","Class":"lang-pkgs","Type":"jar",
+            "Vulnerabilities":[{"VulnerabilityID":"CVE-2021-44228",
+            "PkgName":"org.apache.logging.log4j:log4j-core",
+            "InstalledVersion":"2.14.1","Severity":"CRITICAL"}]}]}"#;
+        let analysis = scan_against_fake_trivy(report).await.expect("scan");
+        match analysis {
+            ScanAnalysis::Analysed(findings) => {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].vulnerability_id, "CVE-2021-44228");
+            }
+            other => panic!("expected a verdict with findings, got {other:?}"),
+        }
+    }
+
+    /// A kind with no materialisation never spawns the CLI at all — the
+    /// bogus binary path proves it, since reaching the invocation would
+    /// surface as a "not found" `Invariant`.
+    #[tokio::test]
+    async fn an_unclaimed_kind_abstains_without_invoking_the_cli() {
         let c = TrivyConfig {
             trivy_bin: PathBuf::from("/no/such/trivy/binary/exists/here"),
             ..TrivyConfig::default()
         };
-        let a = TrivyAdapter::new(c, Arc::new(OkStorage));
-        let h: Ch = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-            .parse()
-            .unwrap();
-        let r = a.scan(&h, None).await;
+        let a = TrivyAdapter::new(c, StubStorage::unused());
+        let h = sample_hash();
+        let coords = jar_coords();
+        let target = ScanTarget {
+            content_hash: &h,
+            format: "oci",
+            coords: &coords,
+            kind: hort_domain::types::ArtifactKind::OciManifest,
+        };
+        let r = a.scan(&target, None).await.expect("no CLI, no error");
+        assert_eq!(
+            r,
+            ScanAnalysis::NothingAnalysable(NotAnalysable::NotApplicable)
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_with_missing_binary_returns_invariant_error() {
+        // Stub storage with an empty payload so we get past
+        // `prepare_workspace` and into the CLI invocation.
+        let c = TrivyConfig {
+            trivy_bin: PathBuf::from("/no/such/trivy/binary/exists/here"),
+            ..TrivyConfig::default()
+        };
+        let a = TrivyAdapter::new(c, StubStorage::bytes(&[]));
+        let h = sample_hash();
+        let c = jar_coords();
+        let r = a.scan(&jar_target(&h, &c), None).await;
         assert!(matches!(r, Err(DomainError::Invariant(_))));
     }
 }

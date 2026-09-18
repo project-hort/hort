@@ -21,7 +21,9 @@ use hort_domain::ports::format_handler::{
 };
 use hort_domain::ports::upstream_proxy::CountingReader;
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
-use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
+use hort_domain::types::{
+    ArtifactCoords, ArtifactKind, Ecosystem, PayloadAccess, Sbom, SbomComponent,
+};
 
 use crate::range_resolvers::resolve_semver_range_max;
 use crate::sbom_helpers::{build_subject_component, strip_version_constraint};
@@ -220,6 +222,23 @@ pub fn validate_cargo_version(version: &str) -> DomainResult<()> {
 impl FormatHandler for CargoFormatHandler {
     fn format_key(&self) -> &str {
         "cargo"
+    }
+
+    /// cargo publishes exactly one payload shape: the gzip-tar `.crate`
+    /// file. Anything else under a cargo repository is index or API
+    /// metadata rather than an artifact row with scannable bytes.
+    ///
+    /// A `.crate` for a library carries `Cargo.toml` (dependency
+    /// *requirements*) and no `Cargo.lock`, so a scanner reading the
+    /// extracted tree finds licence and package identity but no resolved
+    /// versions to match advisories against. Binary crates published with
+    /// a lockfile are the exception, and there the scanner reads it.
+    fn scan_kind(&self, artifact: &hort_domain::entities::artifact::Artifact) -> ArtifactKind {
+        if artifact.path.to_ascii_lowercase().ends_with(".crate") {
+            ArtifactKind::CargoCrate
+        } else {
+            ArtifactKind::Other
+        }
     }
 
     /// Parse `api/v1/crates/{name}/{version}/download` into coordinates.
@@ -3059,5 +3078,31 @@ dependencies = [
             matches!(err, DomainError::Validation(ref m) if m.contains("cargo crate max is")),
             "{err:?}"
         );
+    }
+
+    // -- scan_kind -----------------------------------------------------------
+
+    /// cargo's only scannable payload is the `.crate` gzip-tar; anything
+    /// else under a cargo repository is index or API metadata.
+    #[test]
+    fn scan_kind_claims_only_the_crate_file() {
+        let h = CargoFormatHandler;
+        for path in [
+            "crates/tokio/1.35.1/tokio-1.35.1.crate",
+            "crates/tokio/1.35.1/TOKIO-1.35.1.CRATE",
+        ] {
+            assert_eq!(
+                h.scan_kind(&crate::test_support::artifact_row_at(path)),
+                ArtifactKind::CargoCrate,
+                "{path}"
+            );
+        }
+        for path in ["crates/tokio/1.35.1/index.json", "to/ki/tokio", "tokio.tgz"] {
+            assert_eq!(
+                h.scan_kind(&crate::test_support::artifact_row_at(path)),
+                ArtifactKind::Other,
+                "{path}"
+            );
+        }
     }
 }

@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::DomainError;
+use hort_domain::events::ScanAssessment;
 use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
@@ -45,9 +46,13 @@ use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::jobs_repository::{JobsRepository, ScanJob};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
-use hort_domain::ports::scanner::{ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER};
+use hort_domain::ports::scanner::{
+    NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER,
+};
 use hort_domain::ports::storage::StoragePort;
-use hort_domain::types::{severity_label, ArtifactCoords, Finding, PayloadAccess, Sbom};
+use hort_domain::types::{
+    severity_label, ArtifactCoords, ArtifactKind, Finding, PayloadAccess, Sbom,
+};
 
 use crate::error::AppResult;
 use crate::metrics::{
@@ -178,6 +183,13 @@ pub enum ScanRunOutcome {
         scanner: String,
         /// Deduplicated findings in scanner-emit order.
         findings: Vec<Finding>,
+        /// Whether a package surface was examined, or there was none to
+        /// examine. [`ScanAssessment::NotApplicable`] is reached only
+        /// via the all-`NotAnalysable::NotApplicable` partition in
+        /// `run_scan` and always pairs with an empty `findings`; it
+        /// lands on `ScanCompleted.assessment` so the trail never reads
+        /// "analysed, clean" for an artifact nothing could analyse.
+        assessment: ScanAssessment,
         /// The SBOM extracted at the start of
         /// `run_scan`. `None` for formats whose handler does not
         /// produce one (the format is opaque, or no handler is
@@ -191,6 +203,34 @@ pub enum ScanRunOutcome {
     /// Policy declared no scan backends — emit a clean
     /// `ScanCompleted(0)` and complete the job.
     SkippedNoBackends,
+    /// Every configured backend ran without error and **none of them
+    /// produced a verdict**: each reported it had nothing to analyse
+    /// (`ScanAnalysis::NothingAnalysable`), and at least one of those
+    /// abstentions was an unassessed *expected* surface
+    /// ([`NotAnalysable::gates_release`]). The artifact was never
+    /// examined, so there is no clean result to record — it fails closed
+    /// to `ScanIndeterminate` (ADR 0007).
+    ///
+    /// The all-`NotApplicable` case does **not** land here: an artifact
+    /// with no package surface by construction has nothing for a hold to
+    /// wait on, and takes the [`Self::Completed`] arm with
+    /// [`ScanAssessment::NotApplicable`] instead.
+    ///
+    /// Distinct from [`Self::Failed`] because the two call for opposite
+    /// job handling: a backend that *errored* may succeed on the next
+    /// attempt, so `Failed` earns the retry budget. A backend that had
+    /// nothing to analyse will have nothing to analyse again — the
+    /// artifact's kind and the backend's analyzers are both fixed — so
+    /// retrying only delays the hold by `max_attempts` backoffs. This
+    /// arm goes terminal immediately.
+    NothingAnalysable {
+        /// Comma-joined backend names that were asked, for the
+        /// `ScanIndeterminate` event's audit label.
+        scanner: String,
+        /// Human-readable `backend=reason` breakdown, e.g.
+        /// `"trivy=no_analyzer_matched"`. Lands on the event's reason.
+        reason: String,
+    },
     /// Every configured backend errored. `record_outcome` reschedules
     /// or marks failed based on the job's attempt count.
     Failed(String),
@@ -372,6 +412,26 @@ impl ScanOrchestrationUseCase {
             None => Vec::new(),
         };
 
+        // Describe the target, so an adapter can materialise the bytes
+        // the way its analyzers expect: a content scanner selects
+        // analyzers by file name and directory layout, and a bare content
+        // hash cannot answer "under what name?". `kind` is asked of the
+        // artifact's own format handler — the only component that knows
+        // its layout — and is `Other` when no handler is registered for
+        // the format, which is the honest "no materialisation applies"
+        // answer rather than a guess that would let an unexamined
+        // artifact look clean.
+        let kind = self
+            .handlers
+            .get(&job.format)
+            .map_or(ArtifactKind::Other, |handler| handler.scan_kind(&artifact));
+        let target = ScanTarget {
+            content_hash: &artifact.sha256_checksum,
+            format: &job.format,
+            coords: &subject.coords,
+            kind,
+        };
+
         // Step 7-8: invoke each configured backend in declared order.
         // `hort_scan_duration_seconds{scanner}` brackets
         // exactly the `ScannerPort::scan` call (start before, observe
@@ -380,6 +440,11 @@ impl ScanOrchestrationUseCase {
         let mut contributors: Vec<String> = Vec::new();
         let mut total_attempted: u32 = 0;
         let mut total_failed: u32 = 0;
+        // Backends that ran cleanly but produced no verdict, with the
+        // reason each gave — the material for the outcome partition
+        // below (fail-closed hold vs. completed not-applicable
+        // assessment).
+        let mut abstentions: Vec<(String, NotAnalysable)> = Vec::new();
         for backend in &backends {
             total_attempted += 1;
             let Some(scanner) = self.scanners.get(backend) else {
@@ -394,10 +459,10 @@ impl ScanOrchestrationUseCase {
                 continue;
             };
             let started = Instant::now();
-            let scan_result = scanner.scan(&artifact.sha256_checksum, sbom.as_ref()).await;
+            let scan_result = scanner.scan(&target, sbom.as_ref()).await;
             observe_scan_duration(backend, started.elapsed());
             match scan_result {
-                Ok(mut findings) => {
+                Ok(ScanAnalysis::Analysed(mut findings)) => {
                     contributors.push(backend.clone());
                     accumulated.append(&mut findings);
                     tracing::info!(
@@ -406,6 +471,50 @@ impl ScanOrchestrationUseCase {
                         finding_count = accumulated.len(),
                         "scan completed",
                     );
+                }
+                Ok(ScanAnalysis::NothingAnalysable(why)) => {
+                    // The backend ran and reported it had nothing to
+                    // analyse. It contributes NO verdict: folding this
+                    // into the finding set would make it indistinguishable
+                    // from "examined and clean", which is exactly the
+                    // release authority an unexamined artifact must not
+                    // earn (ADR 0007).
+                    //
+                    // The log level follows `gates_release`, because the
+                    // two abstention classes ask different things of an
+                    // operator. An unassessed *expected* surface is
+                    // actionable — `warn!` naming format × backend, since
+                    // the actionable fact is the *pairing*: an operator
+                    // seeing `format=npm scanner=trivy` reads it as "this
+                    // backend cannot adjudicate this format" and changes
+                    // the policy. An artifact with no package surface at
+                    // all (an OCI manifest row, an image config blob) is
+                    // the expected steady state for every OCI push and
+                    // asks nothing of anyone, so it is `debug!`: warning
+                    // once per blob would bury the actionable half.
+                    // Per-artifact detail stays on the span either way.
+                    if why.gates_release() {
+                        tracing::warn!(
+                            artifact_id = %artifact.id,
+                            scanner = backend,
+                            format = %job.format,
+                            kind = kind.as_str(),
+                            reason = why.as_str(),
+                            "scan backend had nothing to analyse — no verdict from this backend",
+                        );
+                        emit_scan_failure(ScanFailureResult::NothingAnalysable, backend);
+                    } else {
+                        tracing::debug!(
+                            artifact_id = %artifact.id,
+                            scanner = backend,
+                            format = %job.format,
+                            kind = kind.as_str(),
+                            reason = why.as_str(),
+                            "scan backend has no package surface to analyse for this artifact \
+                             kind — nothing to assess",
+                        );
+                    }
+                    abstentions.push((backend.clone(), why));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -432,12 +541,90 @@ impl ScanOrchestrationUseCase {
                 }
             }
         }
-        // If every configured backend errored, treat as Failed.
-        if total_attempted > 0 && total_failed == total_attempted {
-            return Ok(ScanRunOutcome::Failed(format!(
-                "all {total_attempted} scan backends failed for artifact {}",
-                artifact.id
-            )));
+        // No backend produced a verdict. Two different situations, and
+        // the error case takes precedence: an errored backend might
+        // succeed on retry, so if even one failed we take the retryable
+        // `Failed` path exactly as before. Only when every backend ran
+        // cleanly and every one of them abstained is the no-verdict
+        // deterministic, and then retrying is pure delay.
+        let abstained = abstentions.len() as u32;
+        let no_verdict = total_failed + abstained;
+        if total_attempted > 0 && no_verdict == total_attempted {
+            if total_failed > 0 {
+                // Wording preserved for the all-errored case (the only
+                // one reachable before abstentions existed); a mixed run
+                // names the split so an operator is not told a backend
+                // that ran cleanly "failed".
+                return Ok(ScanRunOutcome::Failed(if abstained == 0 {
+                    format!(
+                        "all {total_attempted} scan backends failed for artifact {}",
+                        artifact.id
+                    )
+                } else {
+                    format!(
+                        "no scan backend produced a verdict for artifact {} \
+                         ({total_failed} of {total_attempted} failed, {abstained} had \
+                         nothing to analyse)",
+                        artifact.id
+                    )
+                }));
+            }
+
+            // Partition the abstentions. Two classes that must not be
+            // conflated:
+            //
+            // - An *expected* surface that could not be assessed
+            //   (`UnusableArchive`, `NoAnalyzerMatched`) is the absent
+            //   verdict ADR 0007 holds on: fail closed, exactly as
+            //   before. One of these is enough to hold the artifact even
+            //   when the rest are not-applicable — the unassessed
+            //   surface is still unassessed.
+            // - An artifact with *no* package surface by construction
+            //   (an OCI manifest row, a non-tar OCI blob such as the
+            //   image config) is outside the scan axis entirely. No
+            //   scanner can find a threat level in it, so a hold has
+            //   nothing to wait on and would hold forever. It records a
+            //   completed assessment with nothing assessed: scan
+            //   authority exists, the release gate opens on the time
+            //   gate alone, and the trail says "not applicable".
+            //
+            // `accumulated` is non-empty here only when the advisory
+            // enrichment produced findings while every backend
+            // abstained. Something did have an opinion about this
+            // artifact, so "nothing to assess" would be a false
+            // statement and would drop a real finding — that case keeps
+            // the fail-closed hold.
+            if accumulated.is_empty() && !abstentions.iter().any(|(_, why)| why.gates_release()) {
+                tracing::info!(
+                    artifact_id = %artifact.id,
+                    format = %job.format,
+                    kind = kind.as_str(),
+                    scanner = %backends.join(","),
+                    "artifact carries no package surface — recording a completed \
+                     not-applicable assessment (nothing to assess, so nothing to hold for)",
+                );
+                return Ok(ScanRunOutcome::Completed {
+                    scanner: backends.join(","),
+                    findings: Vec::new(),
+                    assessment: ScanAssessment::NotApplicable,
+                    sbom,
+                });
+            }
+
+            return Ok(ScanRunOutcome::NothingAnalysable {
+                scanner: backends.join(","),
+                reason: format!(
+                    "no scan backend could analyse artifact {} (format {}, kind {}): {}",
+                    artifact.id,
+                    job.format,
+                    kind.as_str(),
+                    abstentions
+                        .iter()
+                        .map(|(backend, why)| format!("{backend}={}", why.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            });
         }
 
         // Step 9: dedupe across backends + advisory.
@@ -473,6 +660,7 @@ impl ScanOrchestrationUseCase {
         Ok(ScanRunOutcome::Completed {
             scanner: scanner_label,
             findings: merged,
+            assessment: ScanAssessment::Analysed,
             sbom,
         })
     }
@@ -503,8 +691,18 @@ impl ScanOrchestrationUseCase {
                 // skipped-no-backends path (we never reached step 3),
                 // so the consumer is invoked with `sbom = None` and
                 // the `sbom_components` projection write is skipped.
+                // `Analysed`: the operator waived the scan, they did not
+                // declare the artifact unscannable. Recording it as
+                // not-applicable would attribute the waiver to the
+                // artifact's shape.
                 self.quarantine
-                    .record_scan_result(job.artifact_id, "(none)".to_string(), Vec::new(), None)
+                    .record_scan_result(
+                        job.artifact_id,
+                        "(none)".to_string(),
+                        Vec::new(),
+                        ScanAssessment::Analysed,
+                        None,
+                    )
                     .await?;
                 // H17 — scan's forensics are the ScanCompleted event + the
                 // findings projection; the JSON `result_summary`
@@ -522,18 +720,26 @@ impl ScanOrchestrationUseCase {
             ScanRunOutcome::Completed {
                 scanner,
                 findings,
+                assessment,
                 sbom,
             } => {
                 // Classify the artifact-terminal
                 // decision BEFORE the consumer moves `findings`: a
                 // non-empty finding set rejects the artifact; an empty
-                // one is a clean completion. (The consumer owns the
-                // actual reject transition; this only labels the
-                // terminal-outcome counter — one metric, one layer.)
-                let terminal = if findings.is_empty() {
-                    ScanTerminalResult::Completed
-                } else {
-                    ScanTerminalResult::Rejected
+                // one is a clean completion, unless there was nothing to
+                // assess in the first place — which is a completed
+                // assessment of its own and gets its own label rather
+                // than borrowing `completed`'s claim of an examination.
+                // (The consumer owns the actual reject transition; this
+                // only labels the terminal-outcome counter — one metric,
+                // one layer.)
+                let terminal = match (findings.is_empty(), assessment.is_not_applicable()) {
+                    (true, true) => ScanTerminalResult::NotApplicable,
+                    (true, false) => ScanTerminalResult::Completed,
+                    // `NotApplicable` with findings is rejected by
+                    // `ScanCompleted::validate` before it can commit;
+                    // the verdict still governs the label.
+                    (false, _) => ScanTerminalResult::Rejected,
                 };
                 // Pass the full findings vec to the consumer; it owns
                 // the per-scan path (CAS write + scan_findings projection
@@ -546,7 +752,13 @@ impl ScanOrchestrationUseCase {
                 // registered) signals "skip the projection write,
                 // existing rows preserved" per the design contract.
                 self.quarantine
-                    .record_scan_result(job.artifact_id, scanner, findings, sbom.as_ref())
+                    .record_scan_result(
+                        job.artifact_id,
+                        scanner,
+                        findings,
+                        assessment,
+                        sbom.as_ref(),
+                    )
                     .await?;
                 // H17 — scan's forensics are the ScanCompleted event + the
                 // findings projection; the JSON `result_summary`
@@ -558,6 +770,46 @@ impl ScanOrchestrationUseCase {
                     .await?;
                 emit_scan_jobs(ScanJobsResult::Completed);
                 emit_scan_terminal(terminal);
+                Ok(())
+            }
+            ScanRunOutcome::NothingAnalysable { scanner, reason } => {
+                // FAIL-CLOSED (ADR 0007). Every backend ran and none
+                // examined the artifact, so no verdict exists — the same
+                // situation an absent verdict already puts the scan axis
+                // in, and it gets the same terminal state. Recording a
+                // clean `ScanCompleted(0)` here is the defect this arm
+                // exists to remove: it would hand release authority to a
+                // scan that never looked at the bytes.
+                //
+                // No retry budget and no "stay quarantined" carve-out.
+                // The retry-exhausted `Failed` arm below keeps an
+                // already-`Quarantined` artifact where it is because a
+                // scanner *outage* is transient and the rescan sweep will
+                // re-pick it on recovery. Here nothing is transient: the
+                // artifact's kind and the backend's analyzers are both
+                // fixed, so the next attempt has the same outcome.
+                // `record_scan_indeterminate` is idempotent on an
+                // already-terminal artifact.
+                tracing::warn!(
+                    artifact_id = %job.artifact_id,
+                    format = %job.format,
+                    scanner = %scanner,
+                    reason = %reason,
+                    "no scan backend produced a verdict — holding artifact scan_indeterminate \
+                     (fail-closed); a backend that cannot analyse this format is a policy \
+                     mismatch, not a clean scan",
+                );
+                self.quarantine
+                    .record_scan_indeterminate(
+                        job.artifact_id,
+                        scanner,
+                        reason.clone(),
+                        job.attempts,
+                    )
+                    .await?;
+                self.jobs.mark_failed(job.id, &reason).await?;
+                emit_scan_jobs(ScanJobsResult::Failed);
+                emit_scan_terminal(ScanTerminalResult::Indeterminate);
                 Ok(())
             }
             ScanRunOutcome::Failed(err) => {

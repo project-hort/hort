@@ -210,6 +210,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when its dependency versions cannot be resolved from the POM alone (a
   version inherited from a parent POM or an imported BOM, for instance).
 
+- **Trivy scans now examine the artifact's actual content, and a scan with
+  nothing to examine no longer counts as clean** (#264). The Trivy adapter
+  wrote every artifact to disk as `<sha256>.bin` and pointed `trivy fs` at the
+  directory. Trivy chooses its analyzers by file name and directory layout and
+  does not open archives, so a lone `.bin` matched nothing for every format:
+  the report came back with no analysed target, the empty finding list was
+  recorded as a clean scan, and the artifact was released on that basis. Since
+  `["trivy"]` is the backend list a deployment gets without configuring a scan
+  policy, this was the default path. A pull of a known-vulnerable
+  `log4j-core-2.14.1.jar` through a Trivy-policy Maven proxy reported zero
+  findings.
+
+  Artifacts are now materialised the way the analyzers expect: a Java archive
+  keeps its `.jar`/`.war`/`.ear`/`.par` name, a POM is written as `pom.xml`,
+  wheels and sdists and `.crate` files are extracted, an npm tarball is
+  extracted to `node_modules/<name>/` (the only place Trivy reads a
+  `package.json`), and an OCI image layer is extracted as a root filesystem so
+  its OS package database is read.
+
+  Each kind is also scanned with the **subcommand its analyzer actually runs
+  under**. Trivy's coverage matrix splits its analyzers between targets along
+  the pre-build / post-build line: a built artifact — a Java archive, a Python
+  wheel or egg, a `package.json` under `node_modules` — is analysed by the
+  Image and Rootfs targets only, while a declaration such as `pom.xml` or
+  `requirements.txt` is analysed by the Filesystem and Repository targets only.
+  Pointing `trivy fs` at a JAR therefore runs no analyzer at all, which is why
+  the `log4j-core` JAR still produced no verdict once it was correctly named:
+  post-build kinds now use `trivy rootfs`, pre-build ones stay on `trivy fs`,
+  and the same `log4j-core` pull reports CVE-2021-44228. When a report still
+  comes back with no analysed target, the warning now carries Trivy's stderr
+  tail and a listing of what was actually materialised, so the next such case
+  is diagnosable from the log.
+
+  **Second half, and the reason the first was invisible for so long:** a
+  scanner that found nothing to analyse is no longer recorded as a scanner
+  that found nothing wrong. Those were the same empty list; they are now
+  different results. When no configured backend produces a verdict — the
+  payload is an archive Hort refuses to unpack, or no analyzer claimed
+  anything — the artifact is held `scan_indeterminate` (the existing
+  fail-closed hold for a missing verdict) with a warning naming the format
+  and the backend, and
+  `hort_scan_record_outcome_failures_total{result="nothing_analysable"}`.
+
+  **"Nothing to assess" is its own answer, and it is not a hold.** Some
+  artifacts carry no package surface at all: an OCI image's manifest row and
+  its config blob are metadata about the image, not content anyone could
+  find a CVE in. Holding them would not be caution — no scan could ever
+  clear them, so a Trivy-policed OCI repository would hold every image it
+  ingested, forever. These now record a completed assessment with nothing
+  assessed: the scan axis is satisfied, the observation window alone governs
+  the release (it is not shortened or skipped), and the audit trail says
+  *not applicable* rather than *analysed, clean* — a distinction the
+  `ScanCompleted` event now carries explicitly, so the two can never be
+  confused when reading an artifact's history.
+  `hort_scan_terminal_total` gains a matching `not_applicable` result. An
+  image's layers are unaffected: they carry real package content and still
+  get real verdicts. Scan results recorded before this release read back as
+  analysed, which is what they were.
+
+  **Operators should expect new holds.** A Trivy-only policy on a cargo
+  repository now holds a library crate rather than releasing it clean: a
+  published `.crate` carries dependency ranges and, for a library, no
+  `Cargo.lock`, so nothing can be attributed to a concrete version and there
+  never was a real scan. The same applies to `zstd`-compressed image layers,
+  which Hort cannot currently unpack. An npm tarball is now placed
+  where Trivy's analyzer looks for it, so it may well come back as an
+  analysed target — but read what that verdict means: a tarball pins no
+  dependency versions, so a clean result there says the package's identity
+  was read, not that its dependencies were checked against advisories. The
+  fix in each case is the repository's `scanBackends`, not the scanner. See
+  `docs/architecture/explanation/scanning-pipeline.md` for the per-format
+  coverage table.
+
+  Archive extraction is bounded and fail-closed — extracted-bytes,
+  decompression-ratio and entry-count caps, entry-name path-traversal
+  rejection, permissions stripped — and a tripped bound refuses the whole
+  archive rather than scanning a fragment. One further latent bug fixed along
+  the way: a Trivy report whose `Results` field was an explicit JSON `null`
+  (what Go emits for an empty result set) failed to parse and was charged to
+  the retry budget as a scanner malfunction.
+
+  **A layer's own symlinks no longer hold it forever.** A symlink or hardlink
+  entry is never materialised — it carries no bytes, so creating it would
+  only hand the scanner another path to follow — but extraction still refused
+  the *whole archive* whenever such a link's target was absolute or pointed
+  outside the workspace. A root filesystem is full of exactly that shape
+  (`/bin/sh -> /bin/busybox`, merged-usr `lib -> usr/lib`), so every real OCI
+  layer under a Trivy policy held indefinitely: manifest and config recorded
+  `not_applicable` and released, but the one layer that actually carries the
+  package database never got a verdict. Since the target is never followed,
+  an out-of-root target cannot write, read or expose anything either — link
+  entries are now skipped and counted (surfaced in the adapter's logs)
+  regardless of where they point, and only an entry's own escaping *name*
+  remains a refusal.
+
 - **A curator looking at an artifact the integrity scrubber condemned now sees
   why** (#245). When the CAS scrubber re-reads a stored blob and the bytes do
   not hash to their content hash, it tombstones the artifact — marks it

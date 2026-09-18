@@ -2433,7 +2433,7 @@ pub fn emit_scan_jobs(result: ScanJobsResult) {
 
 /// Outcome label of `hort_scan_terminal_total` (the release-gate
 /// predicate observability — ADR 0007).
-/// Closed taxonomy of 3 — every *artifact-terminal* scan decision the
+/// Closed taxonomy of 4 — every *artifact-terminal* scan decision the
 /// orchestrator drives maps to exactly one variant. Distinct from
 /// [`ScanJobsResult`] (per-job-attempt state) — this counts
 /// artifact-terminal decisions and must NOT double-count.
@@ -2442,9 +2442,19 @@ pub fn emit_scan_jobs(result: ScanJobsResult) {
 /// `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanTerminalResult {
-    /// The scanner decided: clean. Emitted on the `Completed{[]}` and
-    /// `SkippedNoBackends` (operator waiver) arms of `record_outcome`.
+    /// The scanner decided: clean. Emitted on the
+    /// `Completed{[], assessment: Analysed}` and `SkippedNoBackends`
+    /// (operator waiver) arms of `record_outcome`.
     Completed,
+    /// There was nothing to decide: the artifact carries no package
+    /// surface, every configured backend abstained with
+    /// `NotAnalysable::NotApplicable`, and the assessment was recorded
+    /// as `ScanAssessment::NotApplicable`. Emitted on the
+    /// `Completed{assessment: NotApplicable}` arm — a completed
+    /// assessment, so it is deliberately NOT folded into `completed`
+    /// (which would claim an examination that never happened) nor into
+    /// `indeterminate` (which would claim a hold that does not exist).
+    NotApplicable,
     /// The scanner could not decide: terminal scan failure after retry
     /// exhaustion. Emitted on the retry-exhausted `Failed` arm — the
     /// artifact transitioned to `scan_indeterminate`.
@@ -2461,6 +2471,7 @@ impl ScanTerminalResult {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Completed => "completed",
+            Self::NotApplicable => "not_applicable",
             Self::Indeterminate => "indeterminate",
             Self::Rejected => "rejected",
         }
@@ -2504,6 +2515,22 @@ pub enum ScanFailureResult {
     /// killed the child and returned the distinguishable bounded-drain
     /// error. `scanner` carries the originating backend name.
     ReportTooLarge,
+    /// Emitted by `ScanOrchestrationUseCase::run_scan` once per backend
+    /// that ran cleanly and reported it had **nothing to analyse** —
+    /// `ScanAnalysis::NothingAnalysable`. The artifact was never
+    /// examined, so the backend contributes no verdict and (if it is the
+    /// only backend) the artifact is held `scan_indeterminate`.
+    ///
+    /// `scanner` carries the abstaining backend name. The *format* is
+    /// deliberately not a label: the actionable pairing goes on the
+    /// `warn!` span, and adding a second high-cardinality dimension to
+    /// an alerting counter buys nothing an operator cannot get from the
+    /// log line.
+    ///
+    /// A sustained non-zero rate on this label means a repository is
+    /// paired with a backend that cannot adjudicate its format, and every
+    /// artifact there is being held rather than scanned.
+    NothingAnalysable,
 }
 
 impl ScanFailureResult {
@@ -2513,6 +2540,7 @@ impl ScanFailureResult {
         match self {
             Self::FailedBranch => "failed_branch",
             Self::ReportTooLarge => "report_too_large",
+            Self::NothingAnalysable => "nothing_analysable",
         }
     }
 }
@@ -5963,6 +5991,10 @@ mod tests {
     fn scan_terminal_result_as_str_values() {
         assert_eq!(super::ScanTerminalResult::Completed.as_str(), "completed");
         assert_eq!(
+            super::ScanTerminalResult::NotApplicable.as_str(),
+            "not_applicable"
+        );
+        assert_eq!(
             super::ScanTerminalResult::Indeterminate.as_str(),
             "indeterminate"
         );
@@ -5973,6 +6005,7 @@ mod tests {
     fn scan_terminal_result_values_are_unique() {
         let variants = [
             super::ScanTerminalResult::Completed,
+            super::ScanTerminalResult::NotApplicable,
             super::ScanTerminalResult::Indeterminate,
             super::ScanTerminalResult::Rejected,
         ];
@@ -5984,20 +6017,21 @@ mod tests {
     }
 
     /// `hort_scan_terminal_total{result}` fires for
-    /// each of the 3 closed-taxonomy `result` labels under a
+    /// each of the 4 closed-taxonomy `result` labels under a
     /// `DebuggingRecorder` (acceptance: catalog test with each label).
     #[test]
-    fn emit_scan_terminal_fires_for_each_of_the_three_results() {
+    fn emit_scan_terminal_fires_for_each_of_the_four_results() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
             super::emit_scan_terminal(super::ScanTerminalResult::Completed);
+            super::emit_scan_terminal(super::ScanTerminalResult::NotApplicable);
             super::emit_scan_terminal(super::ScanTerminalResult::Indeterminate);
             super::emit_scan_terminal(super::ScanTerminalResult::Rejected);
         });
         let snap = snapshotter.snapshot().into_vec();
-        for want in ["completed", "indeterminate", "rejected"] {
+        for want in ["completed", "not_applicable", "indeterminate", "rejected"] {
             let found = snap.iter().find(|(k, _, _, _)| {
                 k.key().name() == "hort_scan_terminal_total"
                     && k.key()

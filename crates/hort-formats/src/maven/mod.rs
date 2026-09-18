@@ -43,7 +43,9 @@ use hort_domain::ports::format_handler::{
     SbomResolution, VersionDiscovery,
 };
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
-use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
+use hort_domain::types::{
+    ArtifactCoords, ArtifactKind, Ecosystem, PayloadAccess, Sbom, SbomComponent,
+};
 
 use crate::sbom_helpers::build_subject_component;
 
@@ -104,6 +106,42 @@ fn classify_role(filename: &str) -> Option<&'static str> {
     Some("jar")
 }
 
+/// File extensions Trivy's Java-archive analyzer claims. Trivy selects
+/// that analyzer by extension alone — it then opens the archive itself and
+/// reads the embedded `META-INF/maven/**/pom.properties` coordinates — so
+/// an artifact materialised under any other suffix is never inspected.
+///
+/// Source: Trivy's documented "Java" language coverage, which lists
+/// `*.jar`, `*.war`, `*.ear` and `*.par` as the JAR-analyzer targets
+/// (<https://trivy.dev/latest/docs/coverage/language/java/>).
+const JAVA_ARCHIVE_EXTENSIONS: &[&str] = &["jar", "war", "ear", "par"];
+
+/// Classify a stored Maven path into the payload shape a content scanner
+/// has to materialise.
+///
+/// Extension-driven, because that is the only packaging signal a Maven
+/// repository path carries — the POM's `<packaging>` element lives inside
+/// the XML this pure path-level module does not parse.
+///
+/// Everything outside the Java-archive set and `.pom` is
+/// [`ArtifactKind::Other`]: checksum sidecars, `maven-metadata.xml`,
+/// `.module` descriptors and `.aar`/`.zip`/`.tar.gz` packagings carry no
+/// surface any analyzer reads from a Maven layout.
+fn classify_scan_kind(path: &str) -> ArtifactKind {
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let Some((_, ext)) = filename.rsplit_once('.') else {
+        return ArtifactKind::Other;
+    };
+    let ext = ext.to_ascii_lowercase();
+    if JAVA_ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+        ArtifactKind::MavenJar
+    } else if ext == "pom" {
+        ArtifactKind::MavenPom
+    } else {
+        ArtifactKind::Other
+    }
+}
+
 impl MavenFormatHandler {
     /// The group's primary role is the binary `jar`.
     ///
@@ -134,6 +172,16 @@ impl FormatHandler for MavenFormatHandler {
     /// on `metadata` (`maven_path_kind`). See [`coords::parse_download_path`].
     fn parse_download_path(&self, path: &str) -> DomainResult<ArtifactCoords> {
         parse_download_path(path)
+    }
+
+    /// A Maven row's own path names its packaging, so the classification
+    /// is the extension: the Java-archive set
+    /// ([`JAVA_ARCHIVE_EXTENSIONS`]) is analysed as a single file that
+    /// must keep its suffix, a `.pom` is analysed as `pom.xml`, and
+    /// anything else (sidecars, `maven-metadata.xml`, `.module`, `.aar`)
+    /// has no analyser.
+    fn scan_kind(&self, artifact: &hort_domain::entities::artifact::Artifact) -> ArtifactKind {
+        classify_scan_kind(&artifact.path)
     }
 
     /// Build the stored logical path for a Maven file. `filename` is
@@ -1989,5 +2037,89 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // -- scan_kind -----------------------------------------------------------
+
+    /// Maven's classification is the path extension: the Java-archive set
+    /// keeps its suffix for Trivy's JAR analyser, a `.pom` is analysed as
+    /// `pom.xml`, and every other Maven row (sidecars, `maven-metadata.xml`,
+    /// `.module`, `.aar`) has no analyser at all.
+    #[test]
+    fn scan_kind_classifies_maven_paths_by_extension() {
+        let cases: &[(&str, ArtifactKind)] = &[
+            (
+                "org/apache/logging/log4j/log4j-core/2.14.1/log4j-core-2.14.1.jar",
+                ArtifactKind::MavenJar,
+            ),
+            (
+                "com/example/app/1.0.0/app-1.0.0.war",
+                ArtifactKind::MavenJar,
+            ),
+            (
+                "com/example/app/1.0.0/app-1.0.0.ear",
+                ArtifactKind::MavenJar,
+            ),
+            (
+                "com/example/app/1.0.0/app-1.0.0.par",
+                ArtifactKind::MavenJar,
+            ),
+            (
+                "com/example/app/1.0.0/APP-1.0.0.JAR",
+                ArtifactKind::MavenJar,
+            ),
+            (
+                "com/example/lib/1.0.0/lib-1.0.0-sources.jar",
+                ArtifactKind::MavenJar,
+            ),
+            (
+                "com/example/lib/1.0.0/lib-1.0.0.pom",
+                ArtifactKind::MavenPom,
+            ),
+            (
+                "com/example/lib/1.0.0/lib-1.0.0.jar.sha1",
+                ArtifactKind::Other,
+            ),
+            (
+                "com/example/lib/1.0.0/lib-1.0.0.module",
+                ArtifactKind::Other,
+            ),
+            ("com/example/lib/1.0.0/lib-1.0.0.aar", ArtifactKind::Other),
+            ("com/example/lib/maven-metadata.xml", ArtifactKind::Other),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                MavenFormatHandler.scan_kind(&crate::test_support::artifact_row_at(path)),
+                *expected,
+                "{path}"
+            );
+        }
+    }
+
+    /// A filename with no dot at all cannot name a packaging, so it
+    /// classifies as `Other` rather than panicking on the missing
+    /// extension.
+    #[test]
+    fn scan_kind_handles_a_path_with_no_extension() {
+        assert_eq!(
+            MavenFormatHandler.scan_kind(&crate::test_support::artifact_row_at("noextension")),
+            ArtifactKind::Other
+        );
+        assert_eq!(
+            MavenFormatHandler.scan_kind(&crate::test_support::artifact_row_at("a/b/c/plain")),
+            ArtifactKind::Other
+        );
+    }
+
+    /// A dot in a *directory* name must not be mistaken for the file's
+    /// extension — the classification reads the last path segment only.
+    #[test]
+    fn scan_kind_reads_the_extension_from_the_last_segment() {
+        assert_eq!(
+            MavenFormatHandler.scan_kind(&crate::test_support::artifact_row_at(
+                "com/example.jar/lib/lib"
+            )),
+            ArtifactKind::Other
+        );
     }
 }

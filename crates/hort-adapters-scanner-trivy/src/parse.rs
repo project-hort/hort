@@ -26,13 +26,34 @@ use crate::severity::trivy_severity_to_threshold;
 // Wire types
 // ---------------------------------------------------------------------------
 
-/// Top-level Trivy JSON document. `Results` is empty on a clean scan;
-/// the `default` deserialise allows either a missing key or a present
-/// `null` (Trivy's CLI elides the key when there are no findings).
+/// Top-level Trivy JSON document.
+///
+/// `Results` **absent or `null` means nothing was analysed** — no
+/// analyzer claimed any file in the workspace — which is a different fact
+/// from a present-but-vulnerability-free result, and the adapter maps the
+/// two to different outcomes. Both shapes occur in practice: Trivy elides
+/// the key entirely in some modes, and Go marshals a nil result slice as
+/// an explicit `null`.
+///
+/// `#[serde(default)]` alone covers only the *missing* key — serde still
+/// fails on an explicit `null` for a non-`Option` field — so the field
+/// deserialises through [`null_as_empty`]. Without that, a `null` report
+/// is a parse error, which fails the scan as a backend malfunction and
+/// burns the retry budget instead of being read as what it is.
 #[derive(Debug, Deserialize, Default)]
 pub(crate) struct TrivyReport {
-    #[serde(rename = "Results", default)]
+    #[serde(rename = "Results", default, deserialize_with = "null_as_empty")]
     pub(crate) results: Vec<TrivyResult>,
+}
+
+/// Deserialise a possibly-`null` JSON array into a `Vec`, mapping `null`
+/// to the empty vector. See [`TrivyReport::results`].
+fn null_as_empty<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// One scan target inside a Trivy report. `Type` carries the package
@@ -277,6 +298,40 @@ mod tests {
             vendor_ids: Vec::new(),
             cvss: BTreeMap::new(),
         }
+    }
+
+    // ----- the three "nothing analysed" report shapes -----------------------
+
+    /// All three shapes Trivy emits when no analyzer claimed anything must
+    /// parse to zero results — not to a parse error. A parse error here
+    /// would be read as a backend malfunction: the scan would fail,
+    /// consume a retry, and only reach the fail-closed hold after the
+    /// attempt budget ran out, mislabelled as an execution failure.
+    #[test]
+    fn a_report_with_no_analysed_target_parses_to_zero_results() {
+        for doc in [
+            // Key elided entirely.
+            &b"{}"[..],
+            // Explicit JSON null — what Go produces for a nil slice.
+            &b"{\"Results\":null}"[..],
+            // Present and empty.
+            &b"{\"Results\":[]}"[..],
+        ] {
+            let report = parse_trivy_report(doc)
+                .unwrap_or_else(|e| panic!("{} must parse: {e}", String::from_utf8_lossy(doc)));
+            assert!(
+                report.results.is_empty(),
+                "{} must yield zero results",
+                String::from_utf8_lossy(doc)
+            );
+        }
+    }
+
+    /// A malformed `Results` value is still a parse error — the
+    /// null-tolerance above must not turn into "accept anything".
+    #[test]
+    fn a_report_with_a_non_array_results_value_is_still_a_parse_error() {
+        assert!(parse_trivy_report(b"{\"Results\":\"nope\"}").is_err());
     }
 
     // ----- empty stdout fallback --------------------------------------------

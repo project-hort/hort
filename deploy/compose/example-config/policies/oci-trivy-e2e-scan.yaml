@@ -1,0 +1,25 @@
+# ScanPolicy for oci-trivy-e2e — mirrors maven-trivy-e2e-scan.yaml's
+# posture (record mode, short real window) for the OCI format.
+#
+# `enforcement: record` means a Trivy verdict never gates the image, so
+# the scenario's release assertions are never at the mercy of whichever
+# CVEs the base image happens to carry on the day the suite runs — only
+# of whether each row got a completed assessment at all.
+#
+# `quarantineDuration: 20s` keeps a genuine observation window (the
+# point of the fixture is that the window, not a scan verdict, is what
+# the release waits on) while staying inside a scenario's patience.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: oci-trivy-e2e-scan
+spec:
+  scope:
+    repository: oci-trivy-e2e
+  severityThreshold: high
+  quarantineDuration: 20s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["trivy"]
+  enforcement: record
+  licensePolicy: {}

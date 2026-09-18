@@ -26,14 +26,28 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use hort_adapters_scanner_osv::{OsvScannerAdapter, OsvScannerConfig};
+use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::DomainError;
-use hort_domain::ports::scanner::ScannerPort;
-use hort_domain::types::{ContentHash, Sbom};
+use hort_domain::ports::scanner::{ScanTarget, ScannerPort};
+use hort_domain::types::{ArtifactCoords, ArtifactKind, ContentHash, Sbom};
 
 fn placeholder_hash() -> ContentHash {
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         .parse()
         .unwrap()
+}
+
+/// Coordinates this backend never reads — it adjudicates the SBOM.
+/// Present only to satisfy the port's target shape.
+fn placeholder_coords() -> ArtifactCoords {
+    ArtifactCoords {
+        name: "lodash".to_string(),
+        name_as_published: "lodash".to_string(),
+        version: Some("4.17.21".to_string()),
+        path: "lodash/-/lodash-4.17.21.tgz".to_string(),
+        format: RepositoryFormat::Npm,
+        metadata: serde_json::Value::Null,
+    }
 }
 
 fn empty_sbom() -> Sbom {
@@ -85,7 +99,14 @@ async fn osv_scan_timeout_kills_hung_child_within_configured_window() {
     let sbom = empty_sbom();
 
     let started = Instant::now();
-    let result = adapter.scan(&hash, Some(&sbom)).await;
+    let coords = placeholder_coords();
+    let target = ScanTarget {
+        content_hash: &hash,
+        format: "npm",
+        coords: &coords,
+        kind: ArtifactKind::NpmTarball,
+    };
+    let result = adapter.scan(&target, Some(&sbom)).await;
     let elapsed = started.elapsed();
 
     // The timeout (100ms) plus kill + cleanup overhead should land

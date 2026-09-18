@@ -153,21 +153,41 @@ deny = [
     # Decompression-bomb defences (output bytes / entry count / nesting
     # caps) live in `crates/hort-formats/src/archive_bounds.rs`. Every
     # archive metadata extractor MUST go through that helper. Direct
-    # use of `tar`, `zip`, `flate2`, `bzip2`, `xz2` outside `hort-formats`
-    # bypasses the helper and re-opens the M-7 attack surface — clippy
-    # has no path-scoped "direct dep use" lint and grep is bypassable,
-    # so cargo-deny `wrappers` is the enforcement point. The helper
-    # crate (`hort-formats`) is the only allowed direct consumer; any
-    # transitive consumer (e.g. `flate2` via `tower-http` →
+    # use of `tar`, `zip`, `flate2`, `bzip2`, `xz2` outside the crates
+    # named below bypasses the audited caps and re-opens the M-7 attack
+    # surface — clippy has no path-scoped "direct dep use" lint and grep
+    # is bypassable, so cargo-deny `wrappers` is the enforcement point.
+    # Any transitive consumer (e.g. `flate2` via `tower-http` →
     # `async-compression` → `compression-codecs` for HTTP-level
     # response compression) is also permitted because it is unrelated
-    # to archive metadata extraction.
+    # to archive extraction.
     #
-    # A verification pass confirmed zero archive-extraction call sites
-    # outside the helper; this is preventive.
-    { crate = "tar",    wrappers = ["hort-formats"], reason = "archive extractors must go through hort-formats::archive_bounds" },
-    { crate = "zip",    wrappers = ["hort-formats"], reason = "archive extractors must go through hort-formats::archive_bounds" },
-    { crate = "flate2", wrappers = ["hort-formats", "compression-codecs", "zip"], reason = "gzip metadata parsers must go through hort-formats::archive_bounds; compression-codecs wrapper covers the transitive HTTP-compression path via tower-http; zip is itself locked to hort-formats so zip→flate2 is within the controlled chain" },
+    # There are exactly TWO sanctioned direct consumers, and they serve
+    # different jobs:
+    #
+    #   * `hort-formats` — archive *metadata* reads. `archive_bounds`
+    #     pulls one named entry into memory and never touches a
+    #     filesystem path.
+    #
+    #   * `hort-adapters-scanner-trivy` — scan *materialisation*. Trivy's
+    #     filesystem mode does not open archives, so a wheel / npm
+    #     tarball / `.crate` / OCI layer has to be unpacked ONTO DISK
+    #     before any analyzer sees it. `archive_bounds` has no
+    #     extract-to-disk API, and the scanner adapter depends only on
+    #     `hort-domain` per the `ScannerPort` contract, so it cannot
+    #     reach that helper. Its equivalent caps — extracted bytes,
+    #     entry count, compression ratio — plus lexical path containment
+    #     and link-escape rejection live in
+    #     `crates/hort-adapters-scanner-trivy/src/extract.rs`, which is
+    #     the only module in that crate permitted to touch these deps.
+    #
+    # A third direct consumer needs the same treatment: audited caps in
+    # a single reviewed module, named here with its reason. Adding a
+    # crate to this list without that module is the regression the rule
+    # exists to prevent.
+    { crate = "tar",    wrappers = ["hort-formats", "hort-adapters-scanner-trivy"], reason = "archive extractors must go through hort-formats::archive_bounds (metadata reads) or hort-adapters-scanner-trivy::extract (scan materialisation)" },
+    { crate = "zip",    wrappers = ["hort-formats", "hort-adapters-scanner-trivy"], reason = "archive extractors must go through hort-formats::archive_bounds (metadata reads) or hort-adapters-scanner-trivy::extract (scan materialisation)" },
+    { crate = "flate2", wrappers = ["hort-formats", "hort-adapters-scanner-trivy", "compression-codecs", "zip"], reason = "gzip parsers must go through hort-formats::archive_bounds or hort-adapters-scanner-trivy::extract; compression-codecs wrapper covers the transitive HTTP-compression path via tower-http; zip is itself locked to those crates so zip→flate2 is within the controlled chain" },
     { crate = "bzip2",  wrappers = ["hort-formats"], reason = "archive extractors must go through hort-formats::archive_bounds" },
     { crate = "xz2",    wrappers = ["hort-formats"], reason = "archive extractors must go through hort-formats::archive_bounds" },
 ]

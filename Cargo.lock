@@ -2620,14 +2620,17 @@ name = "hort-adapters-scanner-trivy"
 version = "0.14.0-dev"
 dependencies = [
  "bytes",
+ "flate2",
  "futures",
  "hort-domain",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]

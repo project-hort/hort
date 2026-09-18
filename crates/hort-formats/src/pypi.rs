@@ -5,7 +5,9 @@ use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::format_handler::{DependencySpec, FormatHandler, VersionDiscovery};
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
-use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
+use hort_domain::types::{
+    ArtifactCoords, ArtifactKind, Ecosystem, PayloadAccess, Sbom, SbomComponent,
+};
 
 use crate::range_resolvers::resolve_pep440_range_max;
 use crate::sbom_helpers::build_subject_component;
@@ -478,6 +480,32 @@ fn is_wheel_metadata_path(name: &str) -> bool {
 impl FormatHandler for PyPiFormatHandler {
     fn format_key(&self) -> &str {
         "pypi"
+    }
+
+    /// A PyPI file's own name states its distribution format: `.whl` is
+    /// the PEP 427 zip carrying `*.dist-info/METADATA`, and a `.tar.gz`
+    /// is the sdist carrying `PKG-INFO`. Those are the two containers a
+    /// scanner can be handed as an extracted tree.
+    ///
+    /// The long-tail sdist containers PyPI still hosts — `.zip`,
+    /// `.tar.bz2`, `.egg` — classify as [`ArtifactKind::Other`] rather
+    /// than `PySdist`: the variant names both a metadata layout *and* a
+    /// container, and claiming a container the materialiser cannot open
+    /// would turn a clean refusal into an extraction failure.
+    fn scan_kind(&self, artifact: &hort_domain::entities::artifact::Artifact) -> ArtifactKind {
+        let filename = artifact
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&artifact.path)
+            .to_ascii_lowercase();
+        if filename.ends_with(".whl") {
+            ArtifactKind::PyWheel
+        } else if filename.ends_with(".tar.gz") {
+            ArtifactKind::PySdist
+        } else {
+            ArtifactKind::Other
+        }
     }
 
     /// Parse a download path like `simple/{project}/{filename}` into coordinates.
@@ -3885,5 +3913,43 @@ Long description body.\n" as &[u8];
             err.to_string().contains("pypi distribution container"),
             "error must name the container mismatch: {err}"
         );
+    }
+
+    // -- scan_kind -----------------------------------------------------------
+
+    /// A PyPI file's own name states its distribution format. Only the
+    /// two containers the materialiser can open are claimed; the
+    /// long-tail sdist containers PyPI still hosts classify as `Other`,
+    /// because claiming `PySdist` for a `.zip` would turn a clean refusal
+    /// into an extraction failure.
+    #[test]
+    fn scan_kind_claims_wheels_and_gzip_sdists_only() {
+        let h = PyPiFormatHandler;
+        let cases: &[(&str, ArtifactKind)] = &[
+            (
+                "simple/urllib3/urllib3-1.26.4-py2.py3-none-any.whl",
+                ArtifactKind::PyWheel,
+            ),
+            (
+                "simple/urllib3/urllib3-1.26.4-PY3-NONE-ANY.WHL",
+                ArtifactKind::PyWheel,
+            ),
+            (
+                "simple/urllib3/urllib3-1.26.4.tar.gz",
+                ArtifactKind::PySdist,
+            ),
+            ("simple/legacy/legacy-1.0.zip", ArtifactKind::Other),
+            ("simple/legacy/legacy-1.0.tar.bz2", ArtifactKind::Other),
+            ("simple/legacy/legacy-1.0-py3.7.egg", ArtifactKind::Other),
+            ("simple/legacy/legacy-1.0.tgz", ArtifactKind::Other),
+            ("simple/legacy", ArtifactKind::Other),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                h.scan_kind(&crate::test_support::artifact_row_at(path)),
+                *expected,
+                "{path}"
+            );
+        }
     }
 }

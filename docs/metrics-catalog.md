@@ -2671,7 +2671,7 @@ intentionally NOT operator-tunable.
 | `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
 | `hort_sbom_components_skipped_total` | counter | `format` | — | — (the skip count rides the counter's value) |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
-| `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
+| `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large, nothing_analysable}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
 
 Source of truth for the result enums:
 - `hort_app::metrics::ScanJobsResult` for `hort_scan_jobs_total.result`.
@@ -2903,10 +2903,35 @@ state — this counter only fires when that very transition could not
 be written.
 
 Operators alert on
-`rate(hort_scan_record_outcome_failures_total[5m]) > 0` to surface
-DB-side outages; sustained non-zero rate means scan jobs are
+`rate(hort_scan_record_outcome_failures_total{result="failed_branch"}[5m]) > 0`
+to surface DB-side outages; sustained non-zero rate means scan jobs are
 silently looping back into pending without their backoff state
 landing.
+
+The counter's other two `result` values are emitted by
+[`ScanOrchestrationUseCase::run_scan`](../crates/hort-app/src/use_cases/scan_orchestration.rs)
+and are per-*backend*, not per-transition-failure:
+
+- `report_too_large` — the backend's report drain hit
+  `HORT_SCANNER_MAX_REPORT_SIZE`; the adapter killed the child and the
+  failure flows through the normal retry-then-indeterminate route.
+- `nothing_analysable` — the backend ran cleanly and reported it had
+  **nothing to analyse** (`ScanAnalysis::NothingAnalysable`): the artifact
+  kind carries no package surface for it, the payload was an archive it
+  refused to materialise, or no analyzer claimed anything in the
+  materialised tree. The backend contributes no verdict, and if it is the
+  only configured backend the artifact is held `scan_indeterminate`
+  (fail-closed, [ADR 0007](adr/0007-fail-closed-quarantine-release-predicate.md)
+  — see the scanning-pipeline page's *"Nothing analysable" is not
+  "clean"*). A sustained non-zero rate on this label means a repository is
+  paired with a backend that cannot adjudicate its format, and every
+  artifact there is being held rather than scanned — the fix is the
+  policy's `scanBackends`, not the scanner.
+
+  The *format* is deliberately not a label: the actionable pairing goes on
+  the accompanying `warn!` (which names format × backend × kind), and a
+  second high-cardinality dimension on an alerting counter buys nothing
+  the log line does not already give.
 
 `result` carries the failure classifier (closed taxonomy of 2):
 
@@ -2970,7 +2995,7 @@ metric label space entirely.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_scan_terminal_total` | counter | `result` | — | `completed`, `indeterminate`, `rejected` |
+| `hort_scan_terminal_total` | counter | `result` | — | `completed`, `not_applicable`, `indeterminate`, `rejected` |
 
 Source of truth for the result enum:
 - `hort_app::metrics::ScanTerminalResult` for `hort_scan_terminal_total.result`.
@@ -2985,11 +3010,23 @@ One increment per **artifact-terminal scan decision**. Distinct from
 `hort_scan_jobs_total` (per-job-attempt state) — this counts
 artifact-terminal outcomes, never job attempts, and must NOT
 double-count (architect "one metric, one layer"). Closed taxonomy of
-3:
+4:
 
 - `completed` — the scanner decided: clean. Ticks on the
-  `Completed{findings: []}` arm and the `SkippedNoBackends` arm (the
-  operator `scan_backends: []` waiver — a decision, not a failure).
+  `Completed{findings: [], assessment: analysed}` arm and the
+  `SkippedNoBackends` arm (the operator `scan_backends: []` waiver — a
+  decision, not a failure).
+- `not_applicable` — there was nothing to decide. The artifact carries
+  no package surface by construction (an OCI manifest row, a non-tar OCI
+  blob such as the image config), so every configured backend abstained
+  with `NotAnalysable::NotApplicable` and the assessment was recorded as
+  `ScanAssessment::NotApplicable`. Ticks on the
+  `Completed{findings: [], assessment: not_applicable}` arm. Deliberately
+  its own value rather than folded into `completed` (which would claim an
+  examination that never happened) or `indeterminate` (which would claim
+  a hold that does not exist — scan authority *is* recorded and the
+  release gate opens on the time gate alone). A steady stream of these
+  from an OCI repository is the expected shape, not an alert.
 - `indeterminate` — the scanner could not decide: terminal scan
   failure after retry exhaustion, for a prior status OTHER than
   `Quarantined` (issue #6 narrowed this — see below). Ticks only when
@@ -3012,7 +3049,7 @@ tick this metric at all.** When the artifact's prior status is
 genuinely-ambiguous result), the artifact stays exactly where it is: no
 `scan_indeterminate` transition, no event, `quarantine_status`
 untouched. That is *not* an artifact-terminal decision, so it does not
-belong in this counter's closed taxonomy of 3 — it produces zero
+belong in this counter's closed taxonomy of 4 — it produces zero
 `hort_scan_terminal_total` ticks. The per-job-attempt
 `hort_scan_jobs_total{result=failed}` still fires (job exhausted
 `max_attempts`), and the persisted "last scan errored" fact
@@ -3022,7 +3059,7 @@ reads to re-pick the artifact once the scanner recovers — see the
 `hort_cron_rescan_stranded_eligible_artifacts` gauge below and
 `docs/architecture/how-to/recover-stranded-artifacts.md`.
 
-Cardinality: 3 result values → 3 series ceiling. `artifact_id` is
+Cardinality: 4 result values → 4 series ceiling. `artifact_id` is
 NOT a label (architect "high-cardinality metric labels" rule);
 per-artifact drill-down is the `info!` audit line on the
 `→ scan_indeterminate` transition
