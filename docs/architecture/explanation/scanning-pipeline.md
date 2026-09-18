@@ -479,13 +479,20 @@ A backend returns `NothingAnalysable(reason)` in three situations:
 
 - `not_applicable` — the kind carries no package surface (an OCI manifest
   or image config, a payload no handler claims). No scanner is invoked and
-  no CAS read is paid.
+  no CAS read is paid. The same reason also covers a Trivy `rootfs`-mode
+  invocation that *was* run and came back with no `Results` section: that
+  target runs every OS-package, language and binary analyzer over the
+  whole materialised tree, so an empty report there is those analyzers
+  agreeing the tree has no package surface at all — a completed fact, not
+  an unassessed pairing.
 - `unusable_archive` — the payload is an archive the adapter refused to
   materialise (a guard tripped, or the container is one it cannot open,
   such as a `zstd`-compressed layer).
-- `no_analyzer_matched` — the backend ran against a materialised tree and
-  reported no analysed target at all. For Trivy this is a report with no
-  `Results` section (absent, `null`, or empty).
+- `no_analyzer_matched` — the backend ran against a materialised tree in
+  `fs` mode and reported no analysed target at all (for Trivy, a report
+  with no `Results` section — absent, `null`, or empty). `fs` mode targets
+  one artifact whose analyzer either engages or does not, so an empty
+  result there stays an expected surface left unassessed.
 
 The three reasons do **not** all gate the artifact, and
 `NotAnalysable::gates_release` is the single place that split is decided.

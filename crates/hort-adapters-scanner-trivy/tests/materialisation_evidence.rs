@@ -51,11 +51,15 @@
 //! | `MavenPom`| a POM naming a vulnerable dependency             | `fs`     | analysed |
 //! | `NpmTarball` | a manifest-only tarball                       | `rootfs` | analysed, no findings |
 //! | `CargoCrate` | a lockfile-less `.crate`                      | `fs`     | analysed, no findings |
+//! | `OciBlob` | a CA-certificate-only layer, no package database | `rootfs` | `NotApplicable` |
 //!
-//! The last two rows are the honest "no" cells: those formats publish no
-//! lockfile, so the extracted tree carries package identity but nothing
-//! to match advisories against. Asserting *zero* findings there is the
-//! point — it documents the ceiling rather than pretending to coverage.
+//! The `NpmTarball`/`CargoCrate` rows are the honest "no" cells: those
+//! formats publish no lockfile, so the extracted tree carries package
+//! identity but nothing to match advisories against. Asserting *zero*
+//! findings there is the point — it documents the ceiling rather than
+//! pretending to coverage. The CA-certificate-layer row is a different
+//! outcome: no package identity at all, which every analyzer agrees on,
+//! so it must come back `NotApplicable` rather than held.
 //!
 //! # Fixtures are built here, not committed
 //!
@@ -74,7 +78,7 @@ use std::sync::Arc;
 use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{ScanAnalysis, ScanTarget, ScannerPort};
+use hort_domain::ports::scanner::{NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort};
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ByteRange, ContentHash, Finding};
@@ -446,6 +450,58 @@ async fn a_pom_is_analysed_rather_than_ignored() {
     // A verdict of any shape proves the pom.xml name reached the Maven
     // analyzer; an abstention would mean it did not.
     let _ = expect_verdict(result, "a POM materialised as pom.xml");
+}
+
+/// A `tar+gzip` image layer with no package database at all: a handful of
+/// CA-certificate files (the shape a real multi-layer image carries — see
+/// `nginx:alpine`'s certificate layer) plus one absolute symlink, and
+/// nothing an OS-package, language or binary analyzer claims.
+///
+/// Every real OS-package analyzer runs over this tree and finds no
+/// package surface, which is a completed "nothing to assess" fact about
+/// the layer, not an unassessed pairing.
+fn package_less_layer() -> Vec<u8> {
+    gzip(&tar_bytes(&[
+        (
+            "usr/share/ca-certificates/example.crt",
+            tar::EntryType::Regular,
+            b"-----BEGIN CERTIFICATE-----\nnot a real certificate\n-----END CERTIFICATE-----\n"
+                as &[u8],
+        ),
+        (
+            "etc/ssl/certs/example.pem",
+            tar::EntryType::Symlink,
+            b"/usr/share/ca-certificates/example.crt" as &[u8],
+        ),
+    ]))
+}
+
+// ---------------------------------------------------------------------------
+// "nothing to assess" cell — rootfs walked, no package surface at all
+// ---------------------------------------------------------------------------
+
+/// The other half of the OS-package layer test above: a layer that
+/// carries files but no package database at all must come back
+/// `NotApplicable`, not held as `NoAnalyzerMatched` — the defect observed
+/// in staging UAT on `nginx:alpine`'s CA-certificate layer.
+#[tokio::test]
+async fn a_package_less_layer_is_not_applicable() {
+    let c = coords(
+        "library/nginx",
+        None,
+        "blobs/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        RepositoryFormat::Oci,
+    );
+    let Some(result) = scan_fixture(ArtifactKind::OciBlob, &c, package_less_layer()).await else {
+        return;
+    };
+    match result {
+        Ok(ScanAnalysis::NothingAnalysable(NotAnalysable::NotApplicable)) => {}
+        Ok(other) => {
+            panic!("package-less layer: expected NotApplicable (nothing to assess), got {other:?}")
+        }
+        Err(e) => panic!("package-less layer: the trivy invocation failed: {e:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------

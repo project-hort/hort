@@ -85,7 +85,13 @@ pub struct ScanTarget<'a> {
 pub enum NotAnalysable {
     /// The artifact carries no package surface for this backend to look
     /// at — an OCI manifest or image config, or a payload no format
-    /// handler claims. No scanner invocation was attempted.
+    /// handler claims. No scanner invocation was attempted. The same
+    /// arm also covers a `rootfs`-mode invocation that *was* attempted
+    /// and reported an empty result: Trivy's `rootfs` target runs every
+    /// OS-package, language and binary analyzer over the whole
+    /// materialised tree, so an empty report there is those analyzers
+    /// agreeing the tree has no package surface at all — a completed
+    /// fact about the artifact, not an unassessed pairing.
     ///
     /// Does not gate: see the type-level docs.
     NotApplicable,

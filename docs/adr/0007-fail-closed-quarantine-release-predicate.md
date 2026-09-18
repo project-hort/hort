@@ -118,6 +118,8 @@ The **code-level definition** of "no package surface" is `NotAnalysable::NotAppl
 
 Consequence for future work: a new `NotAnalysable` variant has to state which side of `gates_release` it falls on (the match is exhaustive, so it cannot inherit an answer), and "not applicable" must never be widened into a way to *skip* a scan an operator asked for — `scan_backends: []` is the sanctioned waiver (authority 2) and stays the only one.
 
+**Further clarification (same date, still no new authority): a `rootfs`-target scan that comes back empty is "not applicable", not unassessed.** Trivy's `rootfs` target runs every OS-package, language and binary analyzer over the *whole* materialised tree, so an empty result there is those analyzers agreeing the tree carries no package surface at all — the same completed fact as an OCI manifest or config blob, reached by running the scan rather than by skipping it. A `fs`-target scan is the other shape: it targets one artifact whose analyzer either engages or does not, so an empty result there stays an *expected* surface left unassessed and keeps the fail-closed `NoAnalyzerMatched` hold.
+
 ### A sixth authority: `ScanRecorded` under `enforcement: record` (amended 2026-08-21)
 
 `ScanPolicy` gained an `enforcement: reject | record` mode. Under `record`
