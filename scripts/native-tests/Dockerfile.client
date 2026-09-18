@@ -54,9 +54,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
-# Rust/cargo (matches the retired run-e2e CARGO_IMAGE 1.88).
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.88.0
-ENV PATH="/root/.cargo/bin:${PATH}"
 # Python publish/build tooling baked in so scenarios never pip-install at runtime.
 # (The base image's pip is not externally-managed, so no --break-system-packages.)
 RUN python3 -m pip install --no-cache-dir build twine
@@ -107,6 +104,18 @@ RUN curl -fsSL -o /usr/local/bin/cosign \
 # so the .gitlab/ path resolves.
 COPY .gitlab/ci/cosign-sign.sh /usr/local/bin/hort-cosign-sign.sh
 RUN chmod +x /usr/local/bin/hort-cosign-sign.sh
+# Rust/cargo — copied from the cli-builder stage (rust:1.97-slim-trixie, the
+# workspace's pinned MSRV) instead of a curl-piped rustup install. Docker's
+# default RUN shell has no `pipefail`, so `curl ... | sh ...` reports success
+# even when the curl leg fails outright (empty stdin, `sh` exits 0) — the
+# toolchain would silently never land while the build stays green. Copying
+# the already-built stage's toolchain directory removes that failure mode
+# entirely and keeps the version pinned to the same place cli-builder's is.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH="/usr/local/cargo/bin:${PATH}"
+COPY --from=cli-builder /usr/local/rustup /usr/local/rustup
+COPY --from=cli-builder /usr/local/cargo /usr/local/cargo
 # The hort-cli admin client (built in stage 1) — used by the quarantine +
 # scanning scenarios that drive admin/release/rescan flows over HTTP.
 COPY --from=cli-builder /usr/local/bin/hort-cli /usr/local/bin/hort-cli
