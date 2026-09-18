@@ -571,7 +571,7 @@ mod tests {
     };
     use hort_domain::events::{
         system_actor, Actor, ApprovalDecision, DomainEvent, PolicyResult, PolicyScope,
-        ScanCompleted, SeveritySummary,
+        ScanAssessment, ScanCompleted, SeveritySummary,
     };
     use hort_domain::types::ContentHash;
 
@@ -665,6 +665,7 @@ mod tests {
             finding_count,
             severity_summary: summary,
             findings_blob,
+            assessment: ScanAssessment::Analysed,
         });
         events.set_stream(
             &stream_id,
@@ -887,6 +888,7 @@ mod tests {
                             .parse::<ContentHash>()
                             .expect("static valid SHA-256 hex"),
                     ),
+                    assessment: ScanAssessment::Analysed,
                 }),
             )],
         );

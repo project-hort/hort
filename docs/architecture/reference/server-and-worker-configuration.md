@@ -621,7 +621,7 @@ neither set the error surfaces the name `"DATABASE_URL"`.
 | `HORT_SCANNER_TRIVY_ENABLED` | bool | `true` | No | **Load-bearing.** When `false`, the worker does NOT register the Trivy backend even if its `--version` probe would pass — the flag is the enabling gate; the probe is a secondary health check that only runs on flag-enabled backends. Set from `worker.scanner.trivy.enabled`. |
 | `HORT_SCANNER_OSV_ENABLED` | bool | `true` | No | **Load-bearing**, same contract as `HORT_SCANNER_TRIVY_ENABLED`. Set from `worker.scanner.osv.enabled`. Disabling **both** backends is a hard boot error (a scanner worker with no backends has nothing to scan). |
 | `HORT_SCANNER_TRIVY_BIN` | path | `trivy` | No | Trivy binary path/name. |
-| `HORT_SCANNER_TRIVY_DB_DIR` | path | _unset → Trivy default cache_ | No | Trivy `--cache-dir`; omitted when unset. |
+| `HORT_SCANNER_TRIVY_DB_DIR` | path | _unset → Trivy default cache_ | No | Trivy `--cache-dir`; omitted when unset. Must be **writable**: besides the vulnerability DB, Trivy downloads `trivy-java-db` on demand when it meets a JAR whose embedded `pom.properties` / `MANIFEST.MF` do not identify it. A read-only cache turns that case into a scan failure. See [the scanning pipeline](../explanation/scanning-pipeline.md). |
 | `HORT_SCANNER_OSV_BIN` | path | `osv-scanner` | No | osv-scanner binary path/name. |
 | `HORT_ADVISORY_OSV_API_URL` | URL | `https://api.osv.dev/v1/querybatch` | No | OSV per-component `querybatch` endpoint. |
 | `HORT_ADVISORY_OSV_BULK_URL` | URL | `https://osv-vulnerabilities.storage.googleapis.com` | No | Base URL for per-ecosystem OSV bulk archives (advisory-watch tick). |

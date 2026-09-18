@@ -1,0 +1,30 @@
+# Hosted OCI repo under a Trivy ScanPolicy with a real (but short)
+# observation window. Used by
+# scripts/native-tests/scenarios/quarantine/trivy-oci-not-applicable.sh .
+#
+# Distinct from the other hosted OCI fixtures on purpose:
+#   - oci-e2e is permissive (no scanning posture),
+#   - oci-quarantine-e2e holds on a 24h timer with `scanBackends: []`
+#     (its push-under-quarantine scenario depends on the hold never
+#     lifting),
+# and neither can express "the scan runs, every row completes, and the
+# image becomes pullable" — which is what this fixture exists to prove.
+#
+# `isPublic: true` so the post-window leg can assert an ANONYMOUS pull
+# succeeds: a released image must be servable without credentials, and
+# an authenticated-only assertion could not tell a released row from a
+# read-authorized hold exemption.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: oci-trivy-e2e
+spec:
+  name: "OCI Trivy Scan E2E"
+  description: "Hosted OCI repo under a short-window Trivy ScanPolicy; used to confirm a scanned image's manifest and config rows record a not-applicable assessment, its layers record analysed verdicts, and the whole image releases. requires: egress."
+  format: oci
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/oci-trivy-e2e
+  isPublic: true
+  replicationPriority: local_only

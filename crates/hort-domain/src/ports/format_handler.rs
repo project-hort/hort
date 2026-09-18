@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::error::{DomainError, DomainResult};
 use crate::types::checksum::UpstreamPublishedChecksum;
-use crate::types::{ArtifactCoords, PayloadAccess, Sbom};
+use crate::types::{ArtifactCoords, ArtifactKind, PayloadAccess, Sbom};
 
 /// How a format handler wants ingest to persist its payload metadata.
 ///
@@ -756,6 +756,33 @@ pub trait FormatHandler: Send + Sync {
         None
     }
 
+    /// What this artifact's stored bytes **are**, so a content scanner
+    /// can materialise them the way its analyzers expect.
+    ///
+    /// A scanner like Trivy selects analyzers by file name, extension and
+    /// directory layout and does not open archives in filesystem mode, so
+    /// an adapter handed only a content hash has no way to write the
+    /// bytes down under a name any analyzer will look at. The knowledge
+    /// of what the bytes are belongs to the format, so it is answered
+    /// here and travels to the adapter on
+    /// [`ScanTarget`](crate::ports::scanner::ScanTarget).
+    ///
+    /// Answer from what the handler already knows about its own layout —
+    /// a Maven path's extension, an OCI row's path prefix, the one
+    /// payload shape npm and cargo publish. This is a classification of
+    /// the row, not an inspection of the payload: no I/O, and the
+    /// `Artifact` is the only input.
+    ///
+    /// Default [`ArtifactKind::Other`] — the honest answer for a format
+    /// whose payload is opaque. It does **not** mean "scan it
+    /// generically": there is no generic materialisation, so a scanner
+    /// handed `Other` reports that it had nothing to analyse rather than
+    /// an empty (clean-looking) finding list.
+    fn scan_kind(&self, artifact: &crate::entities::artifact::Artifact) -> ArtifactKind {
+        let _ = artifact;
+        ArtifactKind::Other
+    }
+
     /// Extract a deterministic SBOM from the ingested payload.
     ///
     /// `format_metadata` is the JSON the handler already extracted at
@@ -998,6 +1025,61 @@ mod tests {
     #[test]
     fn default_metadata_expected_max_bytes_is_64_kb() {
         assert_eq!(DefaultsOnlyHandler.metadata_expected_max_bytes(), 64 * 1024);
+    }
+
+    /// Build an artifact row good enough to classify. Only `path` and
+    /// `content_type` carry any signal for `scan_kind`; the rest exists
+    /// to satisfy the struct.
+    fn scan_kind_artifact(path: &str) -> crate::entities::artifact::Artifact {
+        use crate::entities::artifact::{Artifact, QuarantineStatus};
+        Artifact {
+            id: uuid::Uuid::nil(),
+            repository_id: uuid::Uuid::nil(),
+            name: "x".into(),
+            name_as_published: "x".into(),
+            version: Some("1.0.0".into()),
+            path: path.into(),
+            size_bytes: 1,
+            sha256_checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            provenance_hold_indefinite: false,
+            deleted_at: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A handler that does not classify its payload inherits `Other` —
+    /// "no materialisation makes these bytes analysable" — and never the
+    /// optimistic guess that would let an unexamined artifact look clean.
+    #[test]
+    fn default_scan_kind_is_other() {
+        assert_eq!(
+            DefaultsOnlyHandler.scan_kind(&scan_kind_artifact("whatever/1.0.0/thing.jar")),
+            ArtifactKind::Other
+        );
+    }
+
+    /// The default ignores every field of the row: it is a declaration of
+    /// non-participation, not a heuristic that happens to look at paths.
+    #[test]
+    fn default_scan_kind_ignores_the_artifact_row() {
+        let jar = scan_kind_artifact("g/a/1.0/a-1.0.jar");
+        let pom = scan_kind_artifact("g/a/1.0/a-1.0.pom");
+        assert_eq!(
+            DefaultsOnlyHandler.scan_kind(&jar),
+            DefaultsOnlyHandler.scan_kind(&pom)
+        );
     }
 
     #[test]

@@ -13,8 +13,8 @@ use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, timer_actor};
 use hort_domain::events::{
     Actor, ApiActor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PolicyEvaluated,
-    PolicyResult, PolicyViolation, ReleaseReason, ScanCompleted, SeveritySummary, StreamId,
-    NO_POLICY,
+    PolicyResult, PolicyViolation, ReleaseReason, ScanAssessment, ScanCompleted, SeveritySummary,
+    StreamId, NO_POLICY,
 };
 use hort_domain::policy::scan_delta::compute_added_findings;
 use hort_domain::policy::{
@@ -871,12 +871,23 @@ impl QuarantineUseCase {
     /// rows are preserved — the artifact had no extractable SBOM
     /// (e.g. an opaque format with no manifest), and stale-row
     /// cleanup for retired SBOMs is a future concern.
+    ///
+    /// **`assessment` parameter.** Lands verbatim on
+    /// `ScanCompleted.assessment`. [`ScanAssessment::NotApplicable`]
+    /// records a completed assessment of an artifact with no package
+    /// surface — it opens the release gate exactly as a clean verdict
+    /// does, but the trail can tell the two apart. The caller is the
+    /// orchestrator's outcome partition; every other path passes
+    /// [`ScanAssessment::Analysed`]. A `NotApplicable` paired with a
+    /// non-empty `findings` fails `ScanCompleted::validate` before
+    /// anything is persisted.
     #[tracing::instrument(skip(self, findings, sbom))]
     pub async fn record_scan_result(
         &self,
         artifact_id: Uuid,
         scanner: String,
         findings: Vec<Finding>,
+        assessment: ScanAssessment,
         sbom: Option<&Sbom>,
     ) -> AppResult<()> {
         let stream_id = StreamId::artifact(artifact_id);
@@ -961,6 +972,7 @@ impl QuarantineUseCase {
             finding_count,
             severity_summary: severity.clone(),
             findings_blob: blob_hash.clone(),
+            assessment,
         };
         scan_event.validate()?;
 
@@ -2443,6 +2455,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -2487,6 +2500,7 @@ mod tests {
                 } else {
                     None
                 },
+                assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -2667,6 +2681,7 @@ mod tests {
                 negligible: 0,
             },
             findings_blob: None,
+            assessment: ScanAssessment::Analysed,
         });
         lifecycle
             .commit_scan_result_with_score(
@@ -2740,6 +2755,7 @@ mod tests {
                 negligible: 0,
             },
             findings_blob: None,
+            assessment: ScanAssessment::Analysed,
         });
         let err = lifecycle
             .commit_scan_result_with_score(
@@ -2913,6 +2929,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -2986,6 +3003,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3050,6 +3068,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3097,6 +3116,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3152,6 +3172,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3192,6 +3213,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3263,6 +3285,7 @@ mod tests {
                 artifact_id,
                 "trivy".into(),
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await;
@@ -3317,6 +3340,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3367,6 +3391,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3414,6 +3439,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3458,6 +3484,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3506,6 +3533,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3555,6 +3583,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3597,6 +3626,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3650,9 +3680,15 @@ mod tests {
             informational_class: None,
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
         }];
-        uc.record_scan_result(artifact_id, "trivy".into(), findings, None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings,
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Clean path: ScanCompleted only — no Reject events. The
         // clean dual-write routes through the lifecycle
@@ -3706,6 +3742,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3743,6 +3780,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3786,6 +3824,7 @@ mod tests {
                 artifact_id,
                 big_scanner,
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await
@@ -3810,6 +3849,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3843,6 +3883,7 @@ mod tests {
                 artifact_id,
                 "trivy".into(),
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await
@@ -3882,6 +3923,7 @@ mod tests {
                 artifact_id,
                 "trivy".into(),
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await
@@ -3933,9 +3975,15 @@ mod tests {
             seed_quarantined_with_anchor(&artifacts, &repositories, chrono::Duration::hours(25));
 
         // Clean scan — no findings.
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Exactly one transactional commit, carrying BOTH events.
         let transitions = lifecycle.committed_transitions();
@@ -4017,9 +4065,15 @@ mod tests {
                 // stream ⇒ clearance resolves to `Pending`.
                 seed_required_provenance_policy(&projections, repo_id);
 
-                uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-                    .await
-                    .unwrap();
+                uc.record_scan_result(
+                    artifact_id,
+                    "trivy".into(),
+                    Vec::new(),
+                    ScanAssessment::Analysed,
+                    None,
+                )
+                .await
+                .unwrap();
 
                 let transitions = lifecycle.committed_transitions();
                 assert_eq!(transitions.len(), 1);
@@ -4074,9 +4128,15 @@ mod tests {
         // Stream carries a `ProvenanceVerified` ⇒ clearance `Cleared`.
         seed_stream_scanned_and_provenance_verified(&events, artifact_id);
 
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         let transitions = lifecycle.committed_transitions();
         assert_eq!(transitions.len(), 1);
@@ -4113,9 +4173,15 @@ mod tests {
         let artifact_id =
             seed_quarantined_with_anchor(&artifacts, &repositories, chrono::Duration::hours(1));
 
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Exactly one transactional commit, carrying ONLY ScanCompleted.
         let transitions = lifecycle.committed_transitions();
@@ -4192,9 +4258,15 @@ mod tests {
 
         // Clean scan — no findings — so the dual-write commits cleanly
         // through the lifecycle mock (no policy interaction).
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), Some(&sbom))
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            Some(&sbom),
+        )
+        .await
+        .unwrap();
 
         let calls = lifecycle.sbom_replace_calls();
         assert_eq!(calls.len(), 1, "expected one lifecycle call");
@@ -4218,9 +4290,15 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
 
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         let calls = lifecycle.sbom_replace_calls();
         assert_eq!(calls.len(), 1);
@@ -4251,9 +4329,15 @@ mod tests {
             subject: None,
             components: vec![],
         };
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), Some(&sbom))
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            Some(&sbom),
+        )
+        .await
+        .unwrap();
 
         let calls = lifecycle.sbom_replace_calls();
         assert_eq!(calls.len(), 1);
@@ -4337,6 +4421,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -4421,6 +4506,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -4479,6 +4565,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -5099,6 +5186,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -6659,6 +6747,7 @@ mod tests {
                     artifact_id,
                     "trivy".into(),
                     findings_from_summary(&severity),
+                    ScanAssessment::Analysed,
                     None,
                 )
                 .await
@@ -6717,6 +6806,7 @@ mod tests {
                     artifact_id,
                     "trivy".into(),
                     findings_from_summary(&severity),
+                    ScanAssessment::Analysed,
                     None,
                 )
                 .await
@@ -6929,6 +7019,7 @@ mod tests {
                 artifact_id,
                 "trivy".into(),
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await
@@ -7029,6 +7120,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -7061,6 +7153,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -7104,6 +7197,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -7163,9 +7257,15 @@ mod tests {
         // Clean re-scan (no findings) of a terminal artifact: returns Ok —
         // not the hard `cannot record clean scan for artifact in state rejected`
         // error that looped the job.
-        uc.record_scan_result(artifact_id, "trivy".into(), vec![], None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            vec![],
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         // The fresh clean scan IS recorded (the dual-write fired) so a rescan
         // refreshes the stored result — not a silent no-op and not a loop.
@@ -7302,7 +7402,13 @@ mod tests {
         );
 
         let err = uc
-            .record_scan_result(artifact_id, "trivy".into(), findings, None)
+            .record_scan_result(
+                artifact_id,
+                "trivy".into(),
+                findings,
+                ScanAssessment::Analysed,
+                None,
+            )
             .await
             .expect_err("oversize findings blob must surface as an error");
         match err {

@@ -139,15 +139,31 @@ impl TaskHandler for ScanTaskHandler {
                 ScanRunOutcome::Completed {
                     scanner,
                     findings,
+                    assessment,
                     sbom: _,
                 } => {
+                    // `assessment` rides the summary so the jobs row
+                    // reads the same story the `ScanCompleted` event
+                    // tells: a zero `finding_count` under
+                    // `not_applicable` is "there was nothing to
+                    // assess", not "examined and clean".
                     serde_json::json!({
                         "scanner": scanner,
                         "finding_count": findings.len(),
+                        "assessment": assessment.as_str(),
                     })
                 }
                 ScanRunOutcome::SkippedNoBackends => {
                     serde_json::json!({ "skipped": "no_backends" })
+                }
+                ScanRunOutcome::NothingAnalysable { scanner, reason } => {
+                    // Not an `error`: every backend ran. The job still
+                    // ends terminal-failed (there is no verdict to
+                    // record), so the summary names what abstained.
+                    serde_json::json!({
+                        "scanner": scanner,
+                        "nothing_analysable": reason,
+                    })
                 }
                 ScanRunOutcome::Failed(reason) => {
                     serde_json::json!({ "error": reason })

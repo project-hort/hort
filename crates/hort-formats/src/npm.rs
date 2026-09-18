@@ -5,7 +5,9 @@ use hort_domain::ports::format_handler::{
     DependencySpec, FormatHandler, MetadataStrategy, VersionDiscovery,
 };
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
-use hort_domain::types::{ArtifactCoords, Ecosystem, PayloadAccess, Sbom, SbomComponent};
+use hort_domain::types::{
+    ArtifactCoords, ArtifactKind, Ecosystem, PayloadAccess, Sbom, SbomComponent,
+};
 
 use hort_domain::ports::upstream_proxy::MetadataProjector;
 
@@ -364,6 +366,25 @@ pub fn extract_install_v1_manifest(
 impl FormatHandler for NpmFormatHandler {
     fn format_key(&self) -> &str {
         "npm"
+    }
+
+    /// npm publishes exactly one payload shape: the gzip-tar package
+    /// tarball, stored at a `.tgz` path. Anything else under an npm
+    /// repository is a packument (metadata, never an artifact row with
+    /// scannable bytes), so the classification is that single check.
+    ///
+    /// Note what an extracted npm tarball actually offers an analyzer:
+    /// `package/package.json` names direct dependency *ranges*, not a
+    /// resolved set. A published tarball carries no lockfile, so no
+    /// scanner can attribute a vulnerability to a concrete dependency
+    /// version from it — the honest coverage for this format is metadata,
+    /// not vulnerability detection.
+    fn scan_kind(&self, artifact: &hort_domain::entities::artifact::Artifact) -> ArtifactKind {
+        if artifact.path.to_ascii_lowercase().ends_with(".tgz") {
+            ArtifactKind::NpmTarball
+        } else {
+            ArtifactKind::Other
+        }
     }
 
     /// Parse a tarball download path into coordinates.
@@ -3762,5 +3783,32 @@ mod tests {
             err.to_string().contains("requires a version in coords"),
             "unexpected message: {err}"
         );
+    }
+
+    // -- scan_kind -----------------------------------------------------------
+
+    /// npm's only scannable payload is the `.tgz` package tarball;
+    /// anything else under an npm repository is packument metadata.
+    #[test]
+    fn scan_kind_claims_only_the_package_tarball() {
+        let h = NpmFormatHandler;
+        for path in ["lodash/-/lodash-4.17.21.tgz", "@scope/pkg/-/pkg-1.0.0.TGZ"] {
+            assert_eq!(
+                h.scan_kind(&crate::test_support::artifact_row_at(path)),
+                ArtifactKind::NpmTarball,
+                "{path}"
+            );
+        }
+        for path in [
+            "lodash/-/lodash-4.17.21.json",
+            "lodash",
+            "lodash/-/x.tar.gz",
+        ] {
+            assert_eq!(
+                h.scan_kind(&crate::test_support::artifact_row_at(path)),
+                ArtifactKind::Other,
+                "{path}"
+            );
+        }
     }
 }

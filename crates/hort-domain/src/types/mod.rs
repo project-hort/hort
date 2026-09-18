@@ -8,12 +8,14 @@ use crate::entities::repository::RepositoryFormat;
 use crate::error::DomainError;
 
 pub mod alias_group;
+pub mod artifact_kind;
 pub mod checksum;
 pub mod finding;
 pub mod idempotency_key;
 pub mod sbom;
 
 pub use alias_group::collapse_alias_groups;
+pub use artifact_kind::ArtifactKind;
 pub use checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 pub use finding::{
     highest_severity, is_informational_class, severity_label, severity_summary_from_findings,

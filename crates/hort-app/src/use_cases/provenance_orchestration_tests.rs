@@ -25,7 +25,7 @@ use hort_domain::entities::scan_policy::{
     NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SignerIdentityPattern,
 };
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::events::{DomainEvent, PolicyScope};
+use hort_domain::events::{DomainEvent, PolicyScope, ScanAssessment};
 use hort_domain::ports::content_reference_index::ContentReference;
 use hort_domain::ports::provenance::{
     AttestationBundle, ProvenanceOutcome, ProvenancePort, ProvenanceRejectReason,
@@ -2127,6 +2127,7 @@ impl ProvenancePort for InterleavingProvenancePort {
                         negligible: 0,
                     },
                     findings_blob: Some("f".repeat(64).parse().unwrap()),
+                    assessment: ScanAssessment::Analysed,
                 }),
                 correlation_id: Uuid::new_v4(),
                 causation_id: None,

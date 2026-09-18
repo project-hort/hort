@@ -201,7 +201,8 @@ mod tests {
     use hort_domain::entities::scan_policy::SeverityThreshold;
     use hort_domain::events::{
         Actor, ApprovalDecided, ApprovalDecision, ArtifactQuarantined, ArtifactRejected,
-        DomainEvent, PersistedEvent, RejectionReason, ScanCompleted, SeveritySummary, StreamId,
+        DomainEvent, PersistedEvent, RejectionReason, ScanAssessment, ScanCompleted,
+        SeveritySummary, StreamId,
     };
     use hort_domain::ports::storage::StoragePort;
     use hort_domain::types::{ContentHash, Finding};
@@ -391,6 +392,7 @@ mod tests {
                     finding_count: 3,
                     severity_summary: summary(3),
                     findings_blob: Some(blob.clone()),
+                    assessment: ScanAssessment::Analysed,
                 }),
             )],
         );
@@ -421,6 +423,7 @@ mod tests {
                         finding_count: 1,
                         severity_summary: summary(1),
                         findings_blob: Some(placeholder_findings_blob()),
+                        assessment: ScanAssessment::Analysed,
                     }),
                 ),
                 persisted(
@@ -441,6 +444,7 @@ mod tests {
                         finding_count: 5,
                         severity_summary: summary(5),
                         findings_blob: Some(placeholder_findings_blob()),
+                        assessment: ScanAssessment::Analysed,
                     }),
                 ),
             ],
@@ -472,6 +476,7 @@ mod tests {
                         finding_count: 7,
                         severity_summary: summary(7),
                         findings_blob: Some(placeholder_findings_blob()),
+                        assessment: ScanAssessment::Analysed,
                     }),
                 ),
                 persisted(
@@ -527,6 +532,7 @@ mod tests {
                     finding_count: 0,
                     severity_summary: summary(0),
                     findings_blob: None,
+                    assessment: ScanAssessment::Analysed,
                 }),
             )],
         );
@@ -571,6 +577,7 @@ mod tests {
                         negligible: 0,
                     },
                     findings_blob: Some(blob_hash),
+                    assessment: ScanAssessment::Analysed,
                 }),
             )],
         );
@@ -605,6 +612,7 @@ mod tests {
                     finding_count: 1,
                     severity_summary: summary(1),
                     findings_blob: Some(placeholder_findings_blob()),
+                    assessment: ScanAssessment::Analysed,
                 }),
             )],
         );
@@ -644,6 +652,7 @@ mod tests {
                     finding_count: 1,
                     severity_summary: summary(1),
                     findings_blob: Some(blob_hash),
+                    assessment: ScanAssessment::Analysed,
                 }),
             )],
         );

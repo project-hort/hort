@@ -7,7 +7,7 @@ use hort_domain::entities::artifact::Artifact;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::oci::{ManifestBlobRef, OCI_BLOB_PATH_PREFIX};
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership};
-use hort_domain::types::ArtifactCoords;
+use hort_domain::types::{ArtifactCoords, ArtifactKind};
 
 /// Upper bound on the manifest bytes [`OciFormatHandler::extract_oci_manifest_blob_refs`]
 /// reads from the caller's stream before parsing. Mirrors the write path's
@@ -37,6 +37,35 @@ pub struct OciFormatHandler;
 impl FormatHandler for OciFormatHandler {
     fn format_key(&self) -> &str {
         "oci"
+    }
+
+    /// An OCI row's path prefix is the only role signal it carries.
+    ///
+    /// `blobs/sha256:<hex>` is a blob — a layer or the image config — and
+    /// `manifests/…` is a manifest or index. The two prefixes are
+    /// disjoint by construction (they are what keeps a manifest and a
+    /// blob sharing bytes from colliding on `(repository_id, path)`).
+    ///
+    /// **Why a layer and a config share one kind.** Every blob is stored
+    /// with `content_type: application/octet-stream` regardless of the
+    /// role the manifest that names it assigns it (see
+    /// [`is_provenance_constituent`](Self::is_provenance_constituent) for
+    /// the same reasoning applied to provenance), and the role lives in
+    /// the *manifest's* descriptor, not on the blob's own row. So no
+    /// classification of the row can tell a `tar+gzip` layer from a JSON
+    /// config, and inventing the distinction here would mean guessing.
+    /// [`ArtifactKind::OciBlob`] states the honest fact and leaves the
+    /// container decision to the materialiser, which has the bytes: a tar
+    /// is a layer and becomes a root filesystem, anything else carries no
+    /// package surface.
+    fn scan_kind(&self, artifact: &Artifact) -> ArtifactKind {
+        if artifact.path.starts_with(OCI_BLOB_PATH_PREFIX) {
+            ArtifactKind::OciBlob
+        } else if artifact.path.starts_with("manifests/") {
+            ArtifactKind::OciManifest
+        } else {
+            ArtifactKind::Other
+        }
     }
 
     /// OCI image names are canonical as uploaded — the spec's name grammar
@@ -371,5 +400,32 @@ mod tests {
         // A different digest algorithm is not the CAS keyspace OCI blobs
         // are projected into, so it is not a blob row either.
         assert!(!handler().is_provenance_constituent(&artifact_at(&format!("blobs/sha512:{hex}"))));
+    }
+
+    // -- scan_kind -----------------------------------------------------------
+
+    /// The path prefix is the only role signal an OCI row carries: a
+    /// blob is a blob (layer or config — indistinguishable from the row),
+    /// a manifest is a manifest, and anything else is unclaimed.
+    #[test]
+    fn scan_kind_splits_blobs_from_manifests_by_path_prefix() {
+        let h = handler();
+        let hex = "c".repeat(64);
+        assert_eq!(
+            h.scan_kind(&artifact_at(&format!("{OCI_BLOB_PATH_PREFIX}{hex}"))),
+            ArtifactKind::OciBlob
+        );
+        assert_eq!(
+            h.scan_kind(&artifact_at(&format!("manifests/sha256:{hex}"))),
+            ArtifactKind::OciManifest
+        );
+        assert_eq!(
+            h.scan_kind(&artifact_at("manifests/v1.2.3")),
+            ArtifactKind::OciManifest
+        );
+        assert_eq!(
+            h.scan_kind(&artifact_at("referrers/sha256:abc")),
+            ArtifactKind::Other
+        );
     }
 }

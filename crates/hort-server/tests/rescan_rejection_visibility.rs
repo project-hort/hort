@@ -234,6 +234,7 @@ async fn invoke_rescan_reject(ctx: &Arc<AppContext>, artifact_id: Uuid) {
             artifact_id,
             "rescan-rejection-test-scanner".into(),
             single_critical_finding(),
+            hort_domain::events::ScanAssessment::Analysed,
             None,
         )
         .await

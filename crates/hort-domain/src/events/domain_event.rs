@@ -755,7 +755,7 @@ pub(crate) mod tests {
     use super::super::artifact_events::{
         ApprovalDecision, ArtifactCorrupted, ArtifactDeleted, ArtifactExpired, ArtifactPurged,
         IngestSource, PolicyResult, ProvenanceRejected, ProvenanceVerified, ReEvaluationTrigger,
-        RejectionReason, ReleaseReason, SeveritySummary,
+        RejectionReason, ReleaseReason, ScanAssessment, SeveritySummary,
     };
     use super::super::artifact_group_events::{
         ArtifactGroupInitiated, ArtifactGroupMemberAdded, ArtifactGroupMemberRemoved,
@@ -869,6 +869,7 @@ pub(crate) mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                assessment: ScanAssessment::Analysed,
             }),
             DomainEvent::ArtifactBecameVulnerable(ArtifactBecameVulnerable {
                 artifact_id: Uuid::nil(),

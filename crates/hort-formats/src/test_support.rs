@@ -49,6 +49,44 @@ pub fn build_wheel_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
     buf
 }
 
+/// An artifact row carrying nothing but a `path`, for exercising
+/// [`FormatHandler::scan_kind`](hort_domain::ports::format_handler::FormatHandler::scan_kind).
+///
+/// Every handler's classification reads the stored path and nothing else
+/// (an OCI blob's `content_type` is `application/octet-stream` whatever
+/// role the manifest assigns it, so it carries no signal), which is why
+/// one fixture serves all of them. Centralised here so five handler test
+/// modules plus the cross-format classification guard do not each carry a
+/// copy of the struct literal.
+pub fn artifact_row_at(path: &str) -> hort_domain::entities::artifact::Artifact {
+    use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
+    Artifact {
+        // `Default::default()` rather than a named `Uuid` — hort-formats
+        // has no direct `uuid` dependency to name the type with.
+        id: Default::default(),
+        repository_id: Default::default(),
+        name: "fixture".into(),
+        name_as_published: "fixture".into(),
+        version: Some("1.0.0".into()),
+        path: path.into(),
+        size_bytes: 1,
+        sha256_checksum: "a".repeat(64).parse().expect("64 hex chars parse"),
+        sha1_checksum: None,
+        md5_checksum: None,
+        content_type: "application/octet-stream".into(),
+        quarantine_status: QuarantineStatus::Quarantined,
+        rejection_reason: None,
+        quarantine_window_start: None,
+        quarantine_deadline: None,
+        provenance_hold_indefinite: false,
+        upstream_published_at: None,
+        uploaded_by: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        deleted_at: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

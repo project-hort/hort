@@ -1,0 +1,21 @@
+# ScanPolicy for maven-trivy-e2e — record mode so a Trivy verdict never
+# blocks the scenario (mirrors hort-crates-scan.yaml's record-mode posture,
+# the scenario needs). Unlike hort-crates-scan's quarantineDuration: 0s
+# (permissive skip-quarantine opt-out), this repo keeps a real — but short —
+# observation window: the point of this fixture is a genuine quarantined
+# pull-through with a Trivy verdict landing inside it, not an immediately-
+# servable artifact.
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: maven-trivy-e2e-scan
+spec:
+  scope:
+    repository: maven-trivy-e2e
+  severityThreshold: high
+  quarantineDuration: 20s
+  requireApproval: false
+  provenanceMode: off
+  scanBackends: ["trivy"]
+  enforcement: record
+  licensePolicy: {}

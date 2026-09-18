@@ -108,6 +108,16 @@ regular upload per the spec, with no handler-level special case. A
 quarantined and scanned under the rule above, so no unscanned bytes serve,
 and refusing it would break legitimate mid-window mounts for no gain.
 
+### The scan axis covers artifacts with a scannable surface (clarified 2026-09-18, no new authority)
+
+Authority 1 ("a successful `ScanCompleted`") presumes there is something for a scanner to examine. Some artifacts carry **no package surface at all, by construction** — an OCI manifest row, a non-tar OCI blob such as the image config JSON. No scanner can assign them a threat level, because there is nothing in them for an analyzer to claim. Treating the resulting absence of a verdict as the fail-closed absence this ADR holds on is a category error rather than caution: the hold has nothing to wait on, so it never lifts and a Trivy-policed OCI repository holds every image it ingests, forever.
+
+**Clarification (no authority added, none changed):** the fail-closed rule governs an *expected* surface that could not be assessed. For an artifact with no surface, the recorded assessment is **"not applicable"** — a completed assessment with nothing to assess. It satisfies authority 1 exactly as a clean verdict does, and the **time gate alone** governs the release; the observation window is not shortened, skipped or otherwise weakened. The trail stays honest: `ScanCompleted.assessment` distinguishes `analysed` from `not_applicable`, so a reader can never mistake "nothing to assess" for "examined and clean", and the terminal-decision counter `hort_scan_terminal_total{result="not_applicable"}` keeps the two apart in monitoring.
+
+The **code-level definition** of "no package surface" is `NotAnalysable::NotApplicable` (`crates/hort-domain/src/ports/scanner.rs`), and `NotAnalysable::gates_release` is the single place the split is decided. Its siblings `UnusableArchive` (an archive the adapter refused to unpack) and `NoAnalyzerMatched` (a materialised target no analyzer claimed) are an expected surface left unassessed and keep the fail-closed `scan_indeterminate` hold unchanged — a single one of them among the abstentions holds the artifact even when every other backend abstained as not-applicable. Advisory enrichment that produced a finding while every backend abstained also keeps the hold: something did have an opinion, so "nothing to assess" would be a false statement.
+
+Consequence for future work: a new `NotAnalysable` variant has to state which side of `gates_release` it falls on (the match is exhaustive, so it cannot inherit an answer), and "not applicable" must never be widened into a way to *skip* a scan an operator asked for — `scan_backends: []` is the sanctioned waiver (authority 2) and stays the only one.
+
 ### A sixth authority: `ScanRecorded` under `enforcement: record` (amended 2026-08-21)
 
 `ScanPolicy` gained an `enforcement: reject | record` mode. Under `record`
@@ -190,6 +200,7 @@ The zero-window carve-out above still leaves a **read-side** race: a cold pull-t
 ## References
 
 - `crates/hort-domain/src/entities/artifact.rs` (`Artifact::release`) and `crates/hort-domain/src/ports/quarantine_release.rs` — the release predicate and `ScanIndeterminate` status.
+- `crates/hort-domain/src/ports/scanner.rs` (`NotAnalysable::gates_release`), `crates/hort-domain/src/events/artifact_events.rs` (`ScanAssessment`) and `ScanOrchestrationUseCase::run_scan`'s abstention partition — the 2026-09-18 "scannable surface" clarification above.
 - The architect skill → Quarantine Invariants; anti-pattern *scanner clean → immediate release*.
 - `docs/architecture/how-to/curator-workflow.md` — the curator-waiver authority in practice.
 - `docs/architecture/how-to/recover-stranded-artifacts.md`; `ScanOrchestrationUseCase::record_outcome` and `RescanCandidatesRepository::select_stranded` — the issue #6 exhaustion-split / stranded-scan recovery amended in above (commit `55a93e40`; ratified by decision issue #32, 2026-07-14).

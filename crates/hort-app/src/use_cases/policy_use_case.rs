@@ -4077,7 +4077,9 @@ mod tests {
     // -- add_exclusion: post-exclusion-add re-evaluation pass ----------------
 
     use hort_domain::entities::artifact::Artifact;
-    use hort_domain::events::{IngestSource, ReleaseReason, ScanCompleted, SeveritySummary};
+    use hort_domain::events::{
+        IngestSource, ReleaseReason, ScanAssessment, ScanCompleted, SeveritySummary,
+    };
     use hort_domain::types::ContentHash;
 
     const VALID_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -5806,6 +5808,7 @@ mod tests {
                     finding_count,
                     severity_summary: summary,
                     findings_blob,
+                    assessment: ScanAssessment::Analysed,
                 }),
                 correlation_id: Uuid::new_v4(),
                 causation_id: None,
@@ -6151,6 +6154,7 @@ mod tests {
                             negligible: 0,
                         },
                         findings_blob: Some(blob_hash.clone()),
+                        assessment: ScanAssessment::Analysed,
                     }),
                     correlation_id: Uuid::new_v4(),
                     causation_id: None,
@@ -6248,6 +6252,7 @@ mod tests {
                         finding_count: 1,
                         severity_summary: summary,
                         findings_blob: Some(blob_hash),
+                        assessment: ScanAssessment::Analysed,
                     }),
                     correlation_id: Uuid::new_v4(),
                     causation_id: None,

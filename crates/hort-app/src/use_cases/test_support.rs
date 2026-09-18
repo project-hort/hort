@@ -28,7 +28,7 @@ use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
     Actor, ApiActor, ArtifactQuarantined, ArtifactRejected, DomainEvent, PersistedEvent,
-    RejectionReason, ScanCompleted, SeveritySummary, StreamCategory, StreamId,
+    RejectionReason, ScanAssessment, ScanCompleted, SeveritySummary, StreamCategory, StreamId,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -3713,6 +3713,7 @@ pub fn persisted_scan_completed(
                 negligible: 0,
             },
             findings_blob,
+            assessment: ScanAssessment::Analysed,
         }),
         correlation_id: Uuid::new_v4(),
         causation_id: None,

@@ -29,17 +29,32 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
+use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::ScannerPort;
+use hort_domain::ports::scanner::{ScanTarget, ScannerPort};
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::ports::BoxFuture;
-use hort_domain::types::{ByteRange, ContentHash};
+use hort_domain::types::{ArtifactCoords, ArtifactKind, ByteRange, ContentHash};
 use tokio::io::AsyncRead;
 
 fn placeholder_hash() -> ContentHash {
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         .parse()
         .unwrap()
+}
+
+/// A Maven-JAR target: its materialisation is a single named file, so the
+/// workspace step is trivial and the test lands squarely in the CLI
+/// invocation the hung child is standing in for.
+fn jar_coords() -> ArtifactCoords {
+    ArtifactCoords {
+        name: "com.example:app".to_string(),
+        name_as_published: "com.example:app".to_string(),
+        version: Some("1.0.0".to_string()),
+        path: "com/example/app/1.0.0/app-1.0.0.jar".to_string(),
+        format: RepositoryFormat::Maven,
+        metadata: serde_json::Value::Null,
+    }
 }
 
 /// Storage stub returning a tiny payload so `prepare_workspace`
@@ -102,9 +117,16 @@ async fn trivy_scan_timeout_kills_hung_child_within_configured_window() {
     };
     let adapter = TrivyAdapter::new(cfg, Arc::new(TinyStorage));
     let hash = placeholder_hash();
+    let coords = jar_coords();
+    let target = ScanTarget {
+        content_hash: &hash,
+        format: "maven",
+        coords: &coords,
+        kind: ArtifactKind::MavenJar,
+    };
 
     let started = Instant::now();
-    let result = adapter.scan(&hash, None).await;
+    let result = adapter.scan(&target, None).await;
     let elapsed = started.elapsed();
 
     // 100ms timeout + kill/cleanup overhead must land well under 2s.
@@ -134,9 +156,9 @@ async fn trivy_scan_timeout_kills_hung_child_within_configured_window() {
                 "wording must match the uniform cross-backend contract; got: {msg}"
             );
         }
-        Ok(findings) => panic!(
+        Ok(analysis) => panic!(
             "timeout regression: scan must NOT return Ok when the child hangs; \
-             got findings={findings:?}"
+             got {analysis:?}"
         ),
         Err(other) => panic!(
             "timeout regression: scan must surface DomainError::Invariant on timeout; \

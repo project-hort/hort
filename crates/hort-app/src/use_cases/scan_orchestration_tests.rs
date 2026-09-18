@@ -24,7 +24,7 @@ use std::time::Duration;
 use chrono::Utc;
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::QuarantineStatus;
+use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::repository::RepositoryType;
 use hort_domain::entities::scan_policy::{
     NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
@@ -38,11 +38,11 @@ use hort_domain::ports::format_handler::{
     FormatHandler, PayloadSbom, PayloadSbomExtraction, SbomResolution,
 };
 use hort_domain::ports::jobs_repository::{JobStatus, JobsRepository, ScanJob, TriggerSource};
-use hort_domain::ports::scanner::ScannerPort;
+use hort_domain::ports::scanner::{NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{
-    ArtifactCoords, ContentHash, Ecosystem, Finding, PayloadAccess, Sbom, SbomComponent,
-    SeverityBasis,
+    ArtifactCoords, ArtifactKind, ContentHash, Ecosystem, Finding, PayloadAccess, Sbom,
+    SbomComponent, SeverityBasis,
 };
 
 use super::*;
@@ -158,20 +158,52 @@ impl JobsRepository for MockJobsRepository {
 
 struct MockScanner {
     name_: String,
-    /// `Some(Ok(findings))` = succeeds with findings; `Some(Err(_))` =
-    /// fails; `None` = panics (tests should always seed an outcome).
-    response: Mutex<Option<DomainResult<Vec<Finding>>>>,
+    /// `Some(Ok(analysis))` = the backend returned that analysis;
+    /// `Some(Err(_))` = it failed; `None` = panics (tests should always
+    /// seed an outcome).
+    response: Mutex<Option<DomainResult<ScanAnalysis>>>,
     /// Number of times `scan` was invoked.
     calls: Mutex<u32>,
+    /// The [`ArtifactKind`] the last `scan` call was handed, so tests can
+    /// assert the orchestrator resolved it from the format handler rather
+    /// than defaulting.
+    seen_kind: Mutex<Option<ArtifactKind>>,
+    /// The format key the last `scan` call was handed.
+    seen_format: Mutex<Option<String>>,
+    /// The stored path the last `scan` call's coords carried.
+    seen_path: Mutex<Option<String>>,
 }
 
 impl MockScanner {
+    /// A backend that produces a verdict — the common case, so it keeps
+    /// the plain `Vec<Finding>` constructor.
     fn new(name: impl Into<String>, response: DomainResult<Vec<Finding>>) -> Self {
+        Self::with_analysis(name, response.map(ScanAnalysis::Analysed))
+    }
+
+    /// A backend whose whole `ScanAnalysis` the test chooses — used for
+    /// the `NothingAnalysable` arms.
+    fn with_analysis(name: impl Into<String>, response: DomainResult<ScanAnalysis>) -> Self {
         Self {
             name_: name.into(),
             response: Mutex::new(Some(response)),
             calls: Mutex::new(0),
+            seen_kind: Mutex::new(None),
+            seen_format: Mutex::new(None),
+            seen_path: Mutex::new(None),
         }
+    }
+
+    fn seen_kind(&self) -> Option<ArtifactKind> {
+        *self.seen_kind.lock().unwrap()
+    }
+
+    fn seen_format(&self) -> Option<String> {
+        self.seen_format.lock().unwrap().clone()
+    }
+
+    fn seen_path(&self) -> Option<String> {
+        self.seen_path.lock().unwrap().clone()
     }
 }
 
@@ -181,10 +213,13 @@ impl ScannerPort for MockScanner {
     }
     fn scan<'a>(
         &'a self,
-        _content_hash: &'a ContentHash,
+        target: &'a ScanTarget<'a>,
         _sbom: Option<&'a Sbom>,
-    ) -> BoxFuture<'a, DomainResult<Vec<Finding>>> {
+    ) -> BoxFuture<'a, DomainResult<ScanAnalysis>> {
         *self.calls.lock().unwrap() += 1;
+        *self.seen_kind.lock().unwrap() = Some(target.kind);
+        *self.seen_format.lock().unwrap() = Some(target.format.to_string());
+        *self.seen_path.lock().unwrap() = Some(target.coords.path.clone());
         let resp = self
             .response
             .lock()
@@ -587,6 +622,7 @@ fn persisted_scan_completed(
             finding_count,
             severity_summary: severity,
             findings_blob,
+            assessment: ScanAssessment::Analysed,
         }),
         correlation_id: Uuid::new_v4(),
         causation_id: None,
@@ -911,6 +947,7 @@ async fn run_scan_completed_with_single_backend_returns_findings_without_writing
 
     let outcome = uc.run_scan(&job).await.expect("run_scan");
     let ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner,
         findings,
         sbom: _,
@@ -986,6 +1023,7 @@ async fn run_scan_continues_when_one_of_two_backends_fails() {
 
     let outcome = uc.run_scan(&job).await.expect("run_scan");
     let ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner,
         findings,
         sbom: _,
@@ -1373,6 +1411,7 @@ async fn record_outcome_completed_first_ever_scan_emits_no_artifact_became_vulne
         SeverityThreshold::Critical,
     )];
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: findings.clone(),
         sbom: None,
@@ -1426,6 +1465,7 @@ async fn record_outcome_completed_with_prior_clean_emits_artifact_became_vulnera
 
     let new_findings = vec![finding("pkg:npm/foo@1", "CVE-1", SeverityThreshold::High)];
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: new_findings.clone(),
         sbom: None,
@@ -1500,6 +1540,7 @@ async fn record_outcome_completed_with_prior_partial_overlap_emits_only_new_find
         finding("pkg:npm/foo@1", "CVE-B", SeverityThreshold::Critical),
     ];
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: current,
         sbom: None,
@@ -1560,6 +1601,7 @@ async fn record_outcome_completed_identical_findings_emits_no_artifact_became_vu
     );
 
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: prior_findings.clone(),
         sbom: None,
@@ -2078,6 +2120,7 @@ async fn record_outcome_path_a_single_batch_after_item_12() {
     );
 
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: vec![finding("pkg:npm/foo@1", "CVE-1", SeverityThreshold::High)],
         sbom: None,
@@ -3368,6 +3411,7 @@ mod metrics_emission_tests {
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 1);
                 let outcome = ScanRunOutcome::Completed {
+                    assessment: ScanAssessment::Analysed,
                     scanner: "trivy".into(),
                     findings: vec![],
                     sbom: None,
@@ -3396,6 +3440,7 @@ mod metrics_emission_tests {
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 1);
                 let outcome = ScanRunOutcome::Completed {
+                    assessment: ScanAssessment::Analysed,
                     scanner: "trivy".into(),
                     findings: vec![finding(
                         "pkg:npm/foo@1",
@@ -3645,6 +3690,7 @@ mod metrics_emission_tests {
                     );
 
                     let outcome = ScanRunOutcome::Completed {
+                        assessment: ScanAssessment::Analysed,
                         scanner: "trivy".into(),
                         findings: vec![
                             // Mix High + Critical — the metric label must
@@ -3723,6 +3769,7 @@ mod metrics_emission_tests {
                         ],
                     );
                     let outcome = ScanRunOutcome::Completed {
+                        assessment: ScanAssessment::Analysed,
                         scanner: "trivy".into(),
                         findings: vec![finding("pkg:npm/foo@1", "CVE-9", SeverityThreshold::High)],
                         sbom: None,
@@ -4198,4 +4245,640 @@ mod metrics_emission_tests {
             Some(1),
         );
     }
+}
+
+// ===========================================================================
+// FORMAT-AWARE SCAN TARGET + "nothing analysable" is not "clean"
+// ===========================================================================
+
+/// A handler that answers `scan_kind` with a fixed value, so a test can
+/// prove the orchestrator asks the artifact's own handler rather than
+/// defaulting.
+struct FixedKindHandler {
+    key: &'static str,
+    kind: ArtifactKind,
+}
+
+impl FormatHandler for FixedKindHandler {
+    fn format_key(&self) -> &str {
+        self.key
+    }
+    fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+        Err(DomainError::Validation("not used by these tests".into()))
+    }
+    fn normalize_name(&self, name: &str) -> String {
+        name.to_string()
+    }
+    fn scan_kind(&self, _artifact: &Artifact) -> ArtifactKind {
+        self.kind
+    }
+}
+
+fn handler_map(key: &'static str, kind: ArtifactKind) -> HashMap<String, Arc<dyn FormatHandler>> {
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert(key.to_string(), Arc::new(FixedKindHandler { key, kind }));
+    handlers
+}
+
+/// Wire a use case with one scanner, one handler, and a global policy
+/// naming `backends`.
+#[allow(clippy::type_complexity)]
+fn make_uc_with_handler(
+    backends: Vec<String>,
+    scanners: HashMap<String, Arc<dyn ScannerPort>>,
+    handlers: HashMap<String, Arc<dyn FormatHandler>>,
+) -> (
+    ScanOrchestrationUseCase,
+    Arc<MockJobsRepository>,
+    Arc<MockEventStore>,
+    Arc<MockArtifactRepository>,
+    Arc<MockRepositoryRepository>,
+) {
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(backends));
+    let (uc, jobs, events, _storage, artifacts, repositories, _policy, _metadata) =
+        make_uc_with_policy_repo_and_handlers(
+            scanners,
+            Arc::new(MockAdvisory::ok(vec![])),
+            policy_projections,
+            handlers,
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    (uc, jobs, events, artifacts, repositories)
+}
+
+fn one_scanner(scanner: Arc<MockScanner>) -> HashMap<String, Arc<dyn ScannerPort>> {
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert(scanner.name().to_string(), scanner);
+    scanners
+}
+
+/// The scan target carries the artifact's identity and the kind its own
+/// format handler assigned. Without this the adapter cannot materialise
+/// anything an analyzer will look at.
+#[tokio::test]
+async fn run_scan_hands_the_backend_the_kind_from_the_artifacts_format_handler() {
+    let scanner = Arc::new(MockScanner::new("trivy", Ok(vec![])));
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner.clone()),
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.run_scan(&job).await.expect("run_scan");
+    assert_eq!(scanner.seen_kind(), Some(ArtifactKind::NpmTarball));
+    assert_eq!(scanner.seen_format().as_deref(), Some("npm"));
+    assert_eq!(
+        scanner.seen_path().as_deref(),
+        Some("my-pkg/1.0.0/my-pkg-1.0.0.tar.gz"),
+        "the target must carry the artifact's real coordinates, not a digest"
+    );
+}
+
+/// With no handler registered for the repository's format there is no one
+/// to classify the payload, and the orchestrator must not guess: `Other`
+/// is the honest answer, and it is what makes the backend abstain rather
+/// than report an unexamined artifact clean.
+#[tokio::test]
+async fn run_scan_passes_other_when_no_handler_is_registered_for_the_format() {
+    let scanner = Arc::new(MockScanner::new("trivy", Ok(vec![])));
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner.clone()),
+        HashMap::new(),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.run_scan(&job).await.expect("run_scan");
+    assert_eq!(scanner.seen_kind(), Some(ArtifactKind::Other));
+}
+
+/// The core regression. A backend that could not assess an *expected*
+/// surface must NOT produce a clean `Completed` outcome:
+/// `Completed { findings: [], assessment: Analysed }` is a clean verdict
+/// carrying release authority, and nothing examined the bytes.
+/// `NotApplicable` is deliberately absent from this loop — it is not an
+/// unassessed surface but the absence of one, and has its own tests
+/// below.
+#[tokio::test]
+async fn run_scan_returns_nothing_analysable_not_a_clean_completion() {
+    for reason in [
+        NotAnalysable::UnusableArchive,
+        NotAnalysable::NoAnalyzerMatched,
+    ] {
+        let scanner = Arc::new(MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(reason)),
+        ));
+        let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+            vec!["trivy".into()],
+            one_scanner(scanner),
+            handler_map("npm", ArtifactKind::NpmTarball),
+        );
+        let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+        let job = sample_scan_job(artifact_id, 1);
+
+        let outcome = uc.run_scan(&job).await.expect("run_scan");
+        let ScanRunOutcome::NothingAnalysable {
+            scanner: label,
+            reason: detail,
+        } = outcome
+        else {
+            panic!("expected NothingAnalysable for {reason}, got {outcome:?}");
+        };
+        assert_eq!(label, "trivy");
+        assert!(
+            detail.contains("trivy") && detail.contains(reason.as_str()),
+            "the reason must name the backend and why it abstained: {detail}"
+        );
+        assert!(
+            detail.contains("npm_tarball"),
+            "the reason must name the kind the backend was handed: {detail}"
+        );
+    }
+}
+
+/// One backend abstaining does not lose another's verdict. A real scan
+/// happened, so the artifact gets a real result — and the abstention is
+/// only a log line and a metric.
+#[tokio::test]
+async fn run_scan_keeps_a_verdict_when_only_one_of_two_backends_abstains() {
+    let abstaining = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NoAnalyzerMatched,
+        )),
+    ));
+    let verdict = Arc::new(MockScanner::new(
+        "osv",
+        Ok(vec![finding(
+            "pkg:npm/foo@1",
+            "CVE-1",
+            SeverityThreshold::High,
+        )]),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), abstaining);
+    scanners.insert("osv".into(), verdict);
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
+        scanner,
+        findings,
+        ..
+    } = outcome
+    else {
+        panic!("expected Completed from the backend that did analyse, got {outcome:?}");
+    };
+    assert_eq!(
+        scanner, "osv",
+        "the scanner label must name only the contributing backend"
+    );
+    assert_eq!(findings.len(), 1);
+}
+
+/// An *errored* backend still wins over an abstaining one: the error may
+/// be transient, so the outcome stays the retryable `Failed` rather than
+/// the immediately-terminal abstention.
+#[tokio::test]
+async fn run_scan_prefers_the_retryable_failure_when_one_backend_errored() {
+    let abstaining = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let broken = Arc::new(MockScanner::new(
+        "osv",
+        Err(DomainError::Invariant("osv-scanner not found".into())),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), abstaining);
+    scanners.insert("osv".into(), broken);
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Failed(reason) = outcome else {
+        panic!("an errored backend must keep the retryable path, got {outcome:?}");
+    };
+    // A mixed run must not tell an operator that the backend which ran
+    // cleanly "failed" — the message names the split.
+    assert!(
+        reason.contains("1 of 2 failed") && reason.contains("1 had nothing to analyse"),
+        "the reason must distinguish the failure from the abstention: {reason}"
+    );
+}
+
+/// A materialisation a backend cannot analyse is a policy mismatch, not a
+/// clean scan: the artifact goes terminal `scan_indeterminate` and the job
+/// goes terminal `failed` with no retry budget spent, because the next
+/// attempt would reach the same answer.
+#[tokio::test]
+async fn record_outcome_nothing_analysable_holds_the_artifact_and_does_not_retry() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NoAnalyzerMatched,
+        )),
+    ));
+    let (uc, jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.record_outcome(
+        &job,
+        ScanRunOutcome::NothingAnalysable {
+            scanner: "trivy".into(),
+            reason: "no scan backend could analyse artifact (kind npm_tarball): \
+                     trivy=no_analyzer_matched"
+                .into(),
+        },
+    )
+    .await
+    .expect("record_outcome");
+
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("artifact")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "an artifact nothing examined must be held, never released"
+    );
+    assert_eq!(
+        jobs.failed_calls().len(),
+        1,
+        "the job must go terminal, not be rescheduled"
+    );
+    assert!(
+        jobs.rescheduled_calls().is_empty(),
+        "a deterministic abstention must not spend the retry budget"
+    );
+    assert!(
+        jobs.completed_calls().is_empty(),
+        "marking the job completed would read as a successful scan"
+    );
+
+    // The terminal state itself is the proof that no `ScanCompleted`
+    // was recorded: `record_scan_result` would have driven the artifact
+    // to a released or rejected status, never to `ScanIndeterminate`.
+    assert!(
+        !artifacts
+            .get(artifact_id)
+            .expect("artifact")
+            .is_downloadable(),
+        "an unexamined artifact must not be downloadable"
+    );
+}
+
+/// The abstention path is idempotent on an already-terminal artifact —
+/// the same recoverable skip the retry-exhausted path relies on, so a
+/// re-driven job cannot double-append.
+#[tokio::test]
+async fn record_outcome_nothing_analysable_is_idempotent_on_a_terminal_artifact() {
+    let scanner = Arc::new(MockScanner::new("trivy", Ok(vec![])));
+    let (uc, jobs, events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact = sample_artifact(QuarantineStatus::ScanIndeterminate);
+    let mut repo = sample_repository();
+    repo.id = artifact.repository_id;
+    let artifact_id = artifact.id;
+    artifacts.insert(artifact);
+    repositories.insert(repo);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.record_outcome(
+        &job,
+        ScanRunOutcome::NothingAnalysable {
+            scanner: "trivy".into(),
+            reason: "trivy=not_applicable".into(),
+        },
+    )
+    .await
+    .expect("record_outcome must treat an already-terminal artifact as a skip");
+
+    let appended: Vec<DomainEvent> = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|batch| batch.events.into_iter().map(|e| e.event))
+        .collect();
+    assert!(
+        !appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScanIndeterminate(_))),
+        "no duplicate ScanIndeterminate on an already-terminal artifact"
+    );
+    assert_eq!(jobs.failed_calls().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// "Not applicable" is a completed assessment, not a hold
+//
+// An artifact with no package surface by construction — an OCI manifest
+// row, a non-tar OCI blob such as the image config — is outside the scan
+// axis. No scanner can find a threat level in it, so a fail-closed hold
+// has nothing to wait on and never lifts: a Trivy-policed OCI repository
+// would hold every image it ingests, forever. These pin the partition and
+// the trail that keeps it honest (ADR 0007, 2026-09-18 clarification).
+// ---------------------------------------------------------------------------
+
+/// Every backend abstained, and every abstention was `NotApplicable` →
+/// a completed assessment with nothing assessed, never a hold and never
+/// a clean verdict.
+#[tokio::test]
+async fn run_scan_all_not_applicable_is_a_completed_not_applicable_assessment() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        scanner: label,
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("an artifact with no package surface must not be held, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::NotApplicable,
+        "the outcome must say there was nothing to assess, not that it was clean"
+    );
+    assert!(
+        findings.is_empty(),
+        "there is no surface a finding could have come from"
+    );
+    assert_eq!(
+        label, "trivy",
+        "the asked backends stay on the audit label even though none adjudicated"
+    );
+}
+
+/// One gating abstention among not-applicable ones still holds: the
+/// expected surface it could not assess is still unassessed.
+#[tokio::test]
+async fn run_scan_holds_when_a_gating_abstention_joins_a_not_applicable_one() {
+    for gating in [
+        NotAnalysable::UnusableArchive,
+        NotAnalysable::NoAnalyzerMatched,
+    ] {
+        let not_applicable = Arc::new(MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        ));
+        let gating_backend = Arc::new(MockScanner::with_analysis(
+            "osv",
+            Ok(ScanAnalysis::NothingAnalysable(gating)),
+        ));
+        let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+        scanners.insert("trivy".into(), not_applicable);
+        scanners.insert("osv".into(), gating_backend);
+
+        let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+            vec!["trivy".into(), "osv".into()],
+            scanners,
+            handler_map("npm", ArtifactKind::NpmTarball),
+        );
+        let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+        let job = sample_scan_job(artifact_id, 1);
+
+        let outcome = uc.run_scan(&job).await.expect("run_scan");
+        let ScanRunOutcome::NothingAnalysable { reason, .. } = outcome else {
+            panic!("a {gating} abstention must still hold, got {outcome:?}");
+        };
+        assert!(
+            reason.contains(gating.as_str()) && reason.contains("not_applicable"),
+            "the reason must name both abstentions: {reason}"
+        );
+    }
+}
+
+/// A real verdict from one backend is unaffected by another's
+/// not-applicable abstention — the artifact gets the analysed result.
+#[tokio::test]
+async fn run_scan_keeps_the_analysed_verdict_over_a_not_applicable_abstention() {
+    let not_applicable = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let verdict = Arc::new(MockScanner::new(
+        "osv",
+        Ok(vec![finding(
+            "pkg:npm/foo@1",
+            "CVE-1",
+            SeverityThreshold::High,
+        )]),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), not_applicable);
+    scanners.insert("osv".into(), verdict);
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        scanner,
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("expected the analysed verdict to stand, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::Analysed,
+        "a backend did analyse this artifact — the assessment is analysed"
+    );
+    assert_eq!(scanner, "osv");
+    assert_eq!(findings.len(), 1);
+}
+
+/// Guard rail on the not-applicable arm: if advisory enrichment produced
+/// a finding while every backend abstained, something DID have an opinion
+/// about this artifact. Recording "nothing to assess" would be a false
+/// statement and would drop a real finding, so the fail-closed hold
+/// applies instead.
+#[tokio::test]
+async fn run_scan_holds_when_advisory_found_something_and_every_backend_abstained() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("npm".to_string(), Arc::new(NpmShapedSbomHandler));
+
+    let (uc, _jobs, _events, _storage, artifacts, repositories, _policy, _metadata) = make_uc_full(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        Arc::new(MockAdvisory::ok(vec![finding(
+            "pkg:npm/foo@1",
+            "CVE-1",
+            SeverityThreshold::Critical,
+        )])),
+        handlers,
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    assert!(
+        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+        "an advisory finding must not be dropped into a not-applicable assessment, \
+         got {outcome:?}"
+    );
+}
+
+/// The consumer half: a not-applicable outcome goes through
+/// `record_scan_result` (so scan authority exists and the release gate
+/// opens on the time gate alone), completes the job, and never touches
+/// the fail-closed `scan_indeterminate` hold. The `ScanCompleted` it
+/// appends carries the assessment so the trail can never read as
+/// "analysed, clean".
+#[tokio::test]
+async fn record_outcome_not_applicable_records_scan_authority_and_does_not_hold() {
+    let (uc, jobs, events, _storage, artifacts, repositories, _policy) = make_uc(
+        vec!["trivy".into()],
+        HashMap::new(),
+        Arc::new(MockAdvisory::ok(vec![])),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.record_outcome(
+        &job,
+        ScanRunOutcome::Completed {
+            scanner: "trivy".into(),
+            findings: Vec::new(),
+            assessment: ScanAssessment::NotApplicable,
+            sbom: None,
+        },
+    )
+    .await
+    .expect("record_outcome");
+
+    assert_eq!(
+        jobs.completed_calls(),
+        vec![job.id],
+        "a completed assessment completes the job"
+    );
+    assert!(
+        jobs.failed_calls().is_empty(),
+        "nothing failed — there was simply nothing to assess"
+    );
+    assert_ne!(
+        artifacts
+            .get(artifact_id)
+            .expect("artifact")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "an artifact with no package surface must not be held on the scan axis"
+    );
+
+    let appended: Vec<DomainEvent> = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|batch| batch.events.into_iter().map(|e| e.event))
+        .collect();
+    assert!(
+        !appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScanIndeterminate(_))),
+        "the fail-closed hold is for an unassessed surface, not an absent one"
+    );
+    let scan_completed = appended
+        .iter()
+        .find_map(|e| match e {
+            DomainEvent::ScanCompleted(sc) => Some(sc),
+            _ => None,
+        })
+        .expect("scan authority must be recorded — a ScanCompleted on the stream");
+    assert_eq!(
+        scan_completed.assessment,
+        ScanAssessment::NotApplicable,
+        "the trail must say 'not applicable', never 'analysed, clean'"
+    );
+    assert_eq!(scan_completed.finding_count, 0);
+    assert!(scan_completed.validate().is_ok());
+}
+
+/// `SkippedNoBackends` is unchanged: the operator waived the scan, they
+/// did not declare the artifact unscannable, so the recorded assessment
+/// stays `Analysed`.
+#[tokio::test]
+async fn record_outcome_skipped_no_backends_still_records_an_analysed_assessment() {
+    let (uc, jobs, events, _storage, artifacts, repositories, _policy) = make_uc(
+        vec!["trivy".into()],
+        HashMap::new(),
+        Arc::new(MockAdvisory::ok(vec![])),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.record_outcome(&job, ScanRunOutcome::SkippedNoBackends)
+        .await
+        .expect("record_outcome");
+
+    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    let scan_completed = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|batch| batch.events.into_iter().map(|e| e.event))
+        .find_map(|e| match e {
+            DomainEvent::ScanCompleted(sc) => Some(sc),
+            _ => None,
+        })
+        .expect("the waiver still records a ScanCompleted");
+    assert_eq!(scan_completed.assessment, ScanAssessment::Analysed);
+    assert_eq!(scan_completed.scanner, "(none)");
 }

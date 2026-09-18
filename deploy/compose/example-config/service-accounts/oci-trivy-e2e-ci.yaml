@@ -1,0 +1,22 @@
+# ServiceAccount (e2e): the native-token-mode pusher for
+# scripts/native-tests/scenarios/quarantine/trivy-oci-not-applicable.sh.
+#
+# PAT-only SA (no federatedIdentities / fallbackRotation): under the
+# native-tokens compose overlay the `/v2/auth` mint validates the Basic
+# password strictly as a PAT, so dev-user's claims-based Keycloak JWT
+# can never complete the push. The scenario admin-mints an hort_svc_*
+# token for this SA and uses it as skopeo's `--dest-creds` instead.
+# Authority is the sibling serviceAccount-subject PermissionGrants in
+# auth/oci-trivy-e2e-ci-{read,write}.yaml. Inert in legacy (no-overlay)
+# runs: the SA row exists, nothing mints for it.
+#
+# The read leg is there because skopeo's push issues reads on the same
+# minted token (pre-flight blob existence, manifest read-back); the
+# scenario's post-release pull leg is anonymous by design, since the
+# repository is public and the assertion is that a RELEASED image serves
+# without credentials at all.
+apiVersion: project-hort.de/v1
+kind: ServiceAccount
+metadata:
+  name: oci-trivy-e2e-ci
+spec: {}

@@ -1517,6 +1517,7 @@ fn event_type_scan_completed() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        assessment: ScanAssessment::Analysed,
     });
     assert_eq!(e.event_type(), "ScanCompleted");
 }
@@ -1867,6 +1868,7 @@ fn serde_roundtrip_scan_completed() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        assessment: ScanAssessment::Analysed,
     });
     let json = serde_json::to_string(&event).unwrap();
     let back: DomainEvent = serde_json::from_str(&json).unwrap();
@@ -2308,6 +2310,7 @@ fn validate_scan_completed_finding_count_mismatch() {
         finding_count: 999,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        assessment: ScanAssessment::Analysed,
     };
     let err = e.validate().unwrap_err();
     assert!(err.to_string().contains("finding_count"));
@@ -2321,6 +2324,7 @@ fn validate_scan_completed_valid() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        assessment: ScanAssessment::Analysed,
     };
     assert!(e.validate().is_ok());
 }
@@ -2347,6 +2351,7 @@ fn scan_completed_validate_rejects_findings_blob_set_with_zero_findings() {
             negligible: 0,
         },
         findings_blob: Some(hash()),
+        assessment: ScanAssessment::Analysed,
     };
     let err = e.validate().unwrap_err();
     assert!(
@@ -2363,6 +2368,7 @@ fn scan_completed_validate_rejects_finding_count_positive_with_no_findings_blob(
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: None,
+        assessment: ScanAssessment::Analysed,
     };
     let err = e.validate().unwrap_err();
     assert!(
@@ -2385,6 +2391,7 @@ fn scan_completed_validate_accepts_zero_findings_with_no_blob() {
             negligible: 0,
         },
         findings_blob: None,
+        assessment: ScanAssessment::Analysed,
     };
     assert!(e.validate().is_ok());
 }
@@ -2397,6 +2404,7 @@ fn scan_completed_validate_accepts_positive_findings_with_blob() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        assessment: ScanAssessment::Analysed,
     };
     assert!(e.validate().is_ok());
 }
@@ -2435,6 +2443,7 @@ fn scan_completed_round_trips_with_findings_blob_some() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        assessment: ScanAssessment::Analysed,
     };
     let json = serde_json::to_string(&event).unwrap();
     // On-wire: findings_blob must serialise as the 64-char hex string.
@@ -2462,11 +2471,165 @@ fn scan_completed_round_trips_with_findings_blob_none() {
             negligible: 0,
         },
         findings_blob: None,
+        assessment: ScanAssessment::Analysed,
     };
     let json = serde_json::to_string(&event).unwrap();
     let back: ScanCompleted = serde_json::from_str(&json).unwrap();
     assert_eq!(event, back);
     assert_eq!(back.findings_blob, None);
+}
+
+// ---------------------------------------------------------------------------
+// ScanCompleted.assessment
+//
+// The field that keeps "examined and found nothing" apart from "there was
+// nothing to examine". Additive and `#[serde(default)]`, so both
+// directions of the wire contract are pinned: an old event must read as
+// `Analysed`, and a new event must round-trip its own value.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_assessment_defaults_to_analysed() {
+    assert_eq!(ScanAssessment::default(), ScanAssessment::Analysed);
+    assert!(!ScanAssessment::Analysed.is_not_applicable());
+    assert!(ScanAssessment::NotApplicable.is_not_applicable());
+    assert!(ScanAssessment::Analysed.is_analysed());
+    assert!(!ScanAssessment::NotApplicable.is_analysed());
+}
+
+#[test]
+fn scan_assessment_labels_are_stable_snake_case_and_match_display() {
+    assert_eq!(ScanAssessment::Analysed.as_str(), "analysed");
+    assert_eq!(ScanAssessment::NotApplicable.as_str(), "not_applicable");
+    assert_eq!(ScanAssessment::Analysed.to_string(), "analysed");
+    assert_eq!(ScanAssessment::NotApplicable.to_string(), "not_applicable");
+}
+
+/// The wire form must be the same snake_case token the logs and the job
+/// result summary carry, so an operator grepping one finds the other.
+#[test]
+fn scan_assessment_serialises_as_its_label() {
+    assert_eq!(
+        serde_json::to_string(&ScanAssessment::NotApplicable).unwrap(),
+        "\"not_applicable\""
+    );
+    assert_eq!(
+        serde_json::to_string(&ScanAssessment::Analysed).unwrap(),
+        "\"analysed\""
+    );
+}
+
+/// Backwards direction of the schema-evolution contract: an event
+/// written before the field existed carries no `assessment` key and must
+/// deserialise as `Analysed` — which is what it was.
+#[test]
+fn scan_completed_without_assessment_reads_as_analysed() {
+    let raw = serde_json::json!({
+        "artifact_id": Uuid::nil(),
+        "scanner": "trivy",
+        "finding_count": 0,
+        "severity_summary": {
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
+            "negligible": 0
+        }
+    })
+    .to_string();
+    let parsed: ScanCompleted = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed.assessment, ScanAssessment::Analysed);
+    assert!(parsed.validate().is_ok());
+}
+
+/// The tamper-evidence property, pinned at the serde layer where it is
+/// decided.
+///
+/// The event chain (ADR 0002) hashes the canonical bytes of the typed
+/// event, and verification re-derives them by deserialising the stored
+/// payload and serialising it again. So a `ScanCompleted` appended
+/// before `assessment` existed must re-serialise to **byte-identical**
+/// JSON after the round-trip — otherwise every historical stream reports
+/// `HashMismatch`, indistinguishable from tampering, on a verifier that
+/// is default-on (ADR 0057). Dropping `skip_serializing_if` from
+/// `assessment` breaks exactly this assertion.
+#[test]
+fn a_pre_assessment_scan_completed_payload_round_trips_byte_identical() {
+    let legacy = serde_json::json!({
+        "artifact_id": Uuid::nil(),
+        "finding_count": 0,
+        "findings_blob": serde_json::Value::Null,
+        "scanner": "trivy",
+        "severity_summary": {
+            "critical": 0,
+            "high": 0,
+            "low": 0,
+            "medium": 0,
+            "negligible": 0
+        }
+    });
+    let before = serde_json::to_string(&legacy).unwrap();
+    let parsed: ScanCompleted = serde_json::from_value(legacy).unwrap();
+    // Compare as values, not strings: key ORDER is normalised by the
+    // chain's `canonicalize_json` before hashing, but key PRESENCE is
+    // not — an extra `"assessment"` key is a different payload.
+    let after: serde_json::Value = serde_json::to_value(&parsed).unwrap();
+    assert_eq!(
+        after,
+        serde_json::from_str::<serde_json::Value>(&before).unwrap(),
+        "a pre-assessment ScanCompleted must re-serialise to the same payload it was \
+         hashed with — an added key here is a HashMismatch on every historical stream"
+    );
+}
+
+/// Forwards direction: a not-applicable assessment round-trips, and the
+/// key is actually on the wire (a `skip_serializing_if` regression would
+/// make a not-applicable scan read back as analysed).
+#[test]
+fn scan_completed_round_trips_not_applicable() {
+    let event = ScanCompleted {
+        artifact_id: Uuid::nil(),
+        scanner: "trivy".into(),
+        finding_count: 0,
+        severity_summary: SeveritySummary {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        },
+        findings_blob: None,
+        assessment: ScanAssessment::NotApplicable,
+    };
+    let json = serde_json::to_string(&event).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        raw["assessment"],
+        serde_json::Value::String("not_applicable".into())
+    );
+    let back: ScanCompleted = serde_json::from_str(&json).unwrap();
+    assert_eq!(event, back);
+    assert_eq!(back.assessment, ScanAssessment::NotApplicable);
+    assert!(back.validate().is_ok());
+}
+
+/// A finding attributed to an artifact with no package surface has no
+/// producer that could have found it — reject before it can commit.
+#[test]
+fn validate_rejects_not_applicable_with_findings() {
+    let e = ScanCompleted {
+        artifact_id: id(),
+        scanner: "trivy".into(),
+        finding_count: 3,
+        severity_summary: sample_severity_summary(),
+        findings_blob: Some(hash()),
+        assessment: ScanAssessment::NotApplicable,
+    };
+    let err = e.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("not_applicable"),
+        "the error must name the contradiction: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

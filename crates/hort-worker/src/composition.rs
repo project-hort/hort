@@ -2407,8 +2407,9 @@ mod tests {
 
     use super::*;
     use hort_domain::error::{DomainError, DomainResult};
+    use hort_domain::ports::scanner::{ScanAnalysis, ScanTarget};
     use hort_domain::ports::BoxFuture;
-    use hort_domain::types::{ContentHash, Finding, Sbom};
+    use hort_domain::types::Sbom;
 
     #[test]
     fn split_pem_public_keys_splits_multiple_blocks_for_rotation_overlap() {
@@ -2462,10 +2463,10 @@ BBBB
         }
         fn scan<'a>(
             &'a self,
-            _content_hash: &'a ContentHash,
+            _target: &'a ScanTarget<'a>,
             _sbom: Option<&'a Sbom>,
-        ) -> BoxFuture<'a, DomainResult<Vec<Finding>>> {
-            Box::pin(async { Ok(Vec::new()) })
+        ) -> BoxFuture<'a, DomainResult<ScanAnalysis>> {
+            Box::pin(async { Ok(ScanAnalysis::clean()) })
         }
         fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
             let healthy = self.healthy;
