@@ -97,6 +97,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **SBOM extraction from the stored payload now runs for proxy, virtual and
+  staging repositories as well, not just hosted ones** (#266). A format that
+  derives its SBOM from the artifact's own payload — cargo's embedded
+  `Cargo.lock` today — previously read that payload only for artifacts in a
+  `Hosted` repository, so a proxy with no metadata fallback (a Maven proxy,
+  for instance) got no SBOM at all: `osv` scanned nothing while the
+  repository's policy still claimed a threat level. The scanner now delivers
+  what the repository configuration declares for every repository class the
+  handler applies to; whether a finding against it blocks a release is
+  `enforcement`'s decision, not the scanner's. `enforcement: record` is the
+  recommended mode on proxied lockfile-resolving formats, since there a
+  resolved component names the upstream author's dev-time resolve rather than
+  the consumer's own build. See `docs/adr/0056-resolved-component-sboms-from-payload.md`'s
+  amendment.
+
 - **A signature that arrives late will no longer cost you the artifact**
   (#242) — recorded as a standing decision; the enforcement change follows. Under
   `provenanceMode: required`, an artifact whose signature had not reached Hort

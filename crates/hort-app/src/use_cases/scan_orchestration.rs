@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
-use hort_domain::entities::repository::RepositoryType;
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::DomainError;
 use hort_domain::policy::scan::DefaultPolicy;
@@ -197,16 +196,11 @@ pub enum ScanRunOutcome {
     Failed(String),
 }
 
-/// The artifact's repository row, reduced to the two facts the SBOM
-/// step reads off it. Resolved once per scan by
+/// The artifact's repository row, reduced to the fact the SBOM step
+/// reads off it. Resolved once per scan by
 /// [`ScanOrchestrationUseCase::subject_for_artifact`].
 struct ScanSubject {
     coords: ArtifactCoords,
-    /// Decides whether the payload-closure SBOM path applies — see
-    /// [`ScanOrchestrationUseCase::try_extract_sbom`] for why the
-    /// answer depends on the repository class rather than the format
-    /// alone.
-    repo_type: RepositoryType,
 }
 
 // ---------------------------------------------------------------------------
@@ -675,39 +669,32 @@ impl ScanOrchestrationUseCase {
 
     /// Extract the scan's SBOM, reading the artifact's stored payload
     /// when — and only when — the format handler declares it derives its
-    /// components from the payload
-    /// (`FormatHandler::payload_sbom() == Some(_)`) **and** the artifact
-    /// lives in a [`RepositoryType::Hosted`] repository.
+    /// components from the payload (`FormatHandler::payload_sbom() ==
+    /// Some(_)`). The repository class the artifact lives in plays no
+    /// part in the decision: a scanner must be able to deliver the
+    /// threat level the repository's configuration declares, for every
+    /// class the configuration allows.
     ///
-    /// # Why the repository class gates the payload path
+    /// # Operator note: proxied lockfile formats
     ///
     /// An archive like a `.crate` does not contain its dependencies'
     /// code, so a finding derived from its embedded lockfile is a claim
     /// about code that is **not in the artifact** — unlike a container
     /// image, where the scanner reads the vulnerable bytes themselves.
-    /// The evidentiary weight of that claim depends on who wrote the
-    /// lockfile:
-    ///
-    /// - **Hosted** — the lockfile is the authenticated publisher's own
-    ///   build witness. Holding their release gate to it is the point:
-    ///   they resolved those versions, they shipped them.
-    /// - **Proxy / virtual / staging** — the lockfile is the upstream
-    ///   author's dev-time resolve. Consumers of a library re-resolve
-    ///   and never run it, so a stale upstream resolve would carry gate
-    ///   power (the shipped default is `enforcement: reject`) over a
-    ///   crate every consumer would resolve safely — the
-    ///   false-positive-with-gate-power class this path exists to
-    ///   remove, reintroduced on the other face.
-    ///
-    /// The known counter-nuance, deliberately left open rather than
-    /// decided here: a **binary** crate installed with
-    /// `cargo install --locked` really does run its embedded resolve,
-    /// so for bins the upstream signal is real — but bin and lib cannot
-    /// be told apart cheaply at scan time.
-    ///
-    /// Note that `Staging` is excluded even though
-    /// [`RepositoryType::is_hosted`] counts it as upload-accepting: the
-    /// gate is a literal `Hosted` match, not that predicate.
+    /// On a proxy, that lockfile is the upstream author's dev-time
+    /// resolve, not the consumer's: a consumer of a library re-resolves
+    /// and never runs it, so a finding against a stale upstream resolve
+    /// is hearsay about code nobody downstream will build. Under
+    /// `enforcement: reject` that hearsay carries gate power over an
+    /// artifact every consumer would in fact resolve safely.
+    /// `enforcement: record` is the recommended mode on proxied
+    /// lockfile-resolving formats for exactly this reason — the finding
+    /// is kept and observable without becoming release authority. A
+    /// **binary** crate installed with `cargo install --locked` really
+    /// does run its embedded resolve, so for bins the upstream signal is
+    /// genuine; bin and lib cannot be told apart cheaply at scan time,
+    /// which is why this stays an operator-facing note rather than a
+    /// per-class code decision.
     ///
     /// Two counters fire exactly once per call and answer different
     /// questions: `hort_sbom_extraction_total{format, result}` — did a
@@ -716,8 +703,7 @@ impl ScanOrchestrationUseCase {
     /// `unsupported_format` arm of the first covers both "no handler
     /// registered for this format" and "handler returned `Ok(None)`":
     /// both surface to operators as "this format does not produce an
-    /// SBOM" with no actionable distinction. The second's `hosted_only`
-    /// arm is the gate above firing.
+    /// SBOM" with no actionable distinction.
     ///
     /// **Fail-soft.** Nothing here can fail the scan run. A storage read
     /// that fails degrades to the same no-SBOM path a format with no
@@ -737,25 +723,18 @@ impl ScanOrchestrationUseCase {
             return None;
         };
 
-        let resolution = if handler.payload_sbom().is_none() {
-            // Metadata-only format — there is no resolved-dependency
-            // document to look for in the first place.
-            SbomResolutionResult::NotApplicable
-        } else if matches!(subject.repo_type, RepositoryType::Hosted) {
+        if handler.payload_sbom().is_some() {
             let handler = Arc::clone(handler);
             return self
                 .extract_sbom_from_stored_payload(handler, artifact, &subject.coords, format_key)
                 .await;
-        } else {
-            SbomResolutionResult::HostedOnly
-        };
+        }
 
-        // The metadata-only path — reached by a format that never
-        // consumes the payload, and by a payload-consuming format whose
-        // repository class the gate above turned away. Unchanged from
-        // before the payload path existed: no storage read, and the
-        // empty-payload call the handlers have always ignored.
-        emit_sbom_resolution(format_key, resolution);
+        // The metadata-only path — reached only by a format that never
+        // consumes the payload. Unchanged from before the payload path
+        // existed: no storage read, and the empty-payload call the
+        // handlers have always ignored.
+        emit_sbom_resolution(format_key, SbomResolutionResult::NotApplicable);
         match handler.extract_sbom(
             &subject.coords,
             &subject.coords.metadata,
@@ -876,10 +855,8 @@ impl ScanOrchestrationUseCase {
 
     /// Everything the SBOM step needs off the artifact's repository row,
     /// resolved in the single `find_by_id` this path already pays for:
-    /// the coords a format handler speaks, plus the repository class
-    /// that decides whether the payload-closure path applies at all.
-    /// Reading the type here rather than re-querying keeps the scan at
-    /// one repository lookup.
+    /// the coords a format handler speaks. Reading the row here rather
+    /// than re-querying keeps the scan at one repository lookup.
     async fn subject_for_artifact(&self, artifact: &Artifact) -> AppResult<ScanSubject> {
         let repo = self.repositories.find_by_id(artifact.repository_id).await?;
         // `format_metadata` on `extract_sbom` is the
@@ -905,7 +882,6 @@ impl ScanOrchestrationUseCase {
                 format: repo.format,
                 metadata,
             },
-            repo_type: repo.repo_type,
         })
     }
 
