@@ -1062,23 +1062,25 @@ impl ApplyConfigUseCase {
             return Err(AppError::Domain(DomainError::Validation(joined)));
         }
 
-        // ----- Post-row-4 snapshot-free rejects (rows 5,6,6b,7,7b),
+        // ----- Post-row-4 snapshot-free rejects (rows 5,6,6b,7,7b,7c),
         //       collected by `StaticConfigValidator` above. -----
         //
         // Reproduce the historical first-failing-row abort byte-
-        // identically for rows 5/6/7/7b; row 6b is new but joins the same
-        // row order and the same rows-5/6 shape. Walk the rule order
-        // [trust_pt, prefetch-max-age, prefetch-trigger, provenance,
-        // storage-backend] and, on the FIRST rule with any error finding,
-        // emit that rule's metric (where it has one — rows 5/6/6b only,
-        // via `LinterRule::metric_rule`) once per finding, log the same
-        // `error!`, and return that rule's
+        // identically for rows 5/6/7/7b; rows 6b and 7c are newer but
+        // join the same row order and the same rows-5/6 shape. Walk the
+        // rule order [trust_pt, prefetch-max-age, prefetch-trigger,
+        // provenance, storage-backend, scan-backend-capability] and, on
+        // the FIRST rule with any error finding,
+        // emit that rule's metric (where it has one — rows 5/6/6b/7c
+        // only, via `LinterRule::metric_rule`) once per finding, log the
+        // same `error!`, and return that rule's
         // `AppError::Domain(DomainError::Validation(_))`. Later rules are
         // NOT emitted/reported.
         //
         // - Rows 5 (trust_upstream_publish_time × scan_backends:[]),
-        //   6 (PrefetchPolicy.max_age_days), and 6b
-        //   (PrefetchPolicy.triggers requiring VersionDiscovery)
+        //   6 (PrefetchPolicy.max_age_days), 6b
+        //   (PrefetchPolicy.triggers requiring VersionDiscovery) and 7c
+        //   (scanBackends × repository-format capability)
         //   `"; "`-join every finding of the row AND tick
         //   `hort_apply_config_linter_total{rule, result=reject}` once per
         //   finding (cardinality bounded by mappings / repositories).
@@ -1108,6 +1110,10 @@ impl ApplyConfigUseCase {
                 LinterRule::RepoStorageBackendMismatch,
                 "gitops apply: rejected — per-repository storage backend differs from the deployment's effective global backend; per-repository storage routing is unsupported in v2",
             ),
+            (
+                LinterRule::ScanBackendCapability,
+                "gitops apply: scanBackends linter rejected ScanPolicy envelope(s) (backend cannot analyse a governed repository's format — scanner capability map)",
+            ),
         ] {
             let messages: Vec<&str> = report
                 .errors
@@ -1118,7 +1124,7 @@ impl ApplyConfigUseCase {
             if messages.is_empty() {
                 continue;
             }
-            // Per-rule metric (rows 5/6 only — `metric_rule` is `None`
+            // Per-rule metric (rows 5/6/6b/7c — `metric_rule` is `None`
             // for rows 7/7b). One increment per offending finding.
             if let Some(metric_rule) = rule.metric_rule() {
                 tracing::error!(error_count = messages.len(), "{error_log}");
@@ -6178,6 +6184,21 @@ mod tests {
                 effective_backend: Some(
                     crate::storage_backend::EffectiveStorageBackend::Filesystem,
                 ),
+            },
+            // Row 7c — `osv` paired with an OCI repository (no SBOM
+            // source, so the backend can never produce a verdict there).
+            Case {
+                desired: DesiredState {
+                    repositories: vec![repo_env_with_format("oci-proxy", "proxy", "oci")],
+                    scan_policies: vec![scan_policy_with_repo_scope_and_backends(
+                        "p-oci-osv",
+                        "oci-proxy",
+                        vec!["osv"],
+                    )],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::ScanBackendCapability,
+                effective_backend: None,
             },
         ];
 

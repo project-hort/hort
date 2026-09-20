@@ -1,0 +1,22 @@
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: alpha-pypi-proxy
+spec:
+  # Repository-scoped, so it wins over the global `alpha-default`
+  # policy for this repository alone (repo-scoped beats global at
+  # resolution time — the whole policy is replaced, not merged, which is
+  # why every setting below repeats `alpha-default`'s value verbatim).
+  scope:
+    repository: pypi-proxy
+  severityThreshold: critical
+  quarantineDuration: 60s
+  requireApproval: false
+  provenanceMode: verify_if_present
+  # Both backends. Artifacts in a `pypi` repository carry an SBOM the
+  # format handler can extract, so `osv` has something to adjudicate
+  # here — which the global Trivy-only policy cannot give it without
+  # also pairing `osv` with the OCI repositories, where it would
+  # analyse nothing.
+  scanBackends: [trivy, osv]
+  licensePolicy: {}

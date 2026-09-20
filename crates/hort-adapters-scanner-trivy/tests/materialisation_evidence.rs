@@ -49,17 +49,30 @@
 //! | `PyWheel` | wheel with `urllib3 1.26.4` `dist-info/METADATA`  | `rootfs` | ≥ 1 finding |
 //! | `OciBlob` | layer tar with a vulnerable `var/lib/dpkg/status`| `rootfs` | ≥ 1 finding |
 //! | `MavenPom`| a POM naming a vulnerable dependency             | `fs`     | analysed |
+//! | `NpmTarball` | a tarball naming itself `lodash 4.17.20`      | `rootfs` | a `lodash@4.17.20` finding |
+//! | `CargoCrate` | a `.crate` whose `Cargo.lock` pins `smallvec 1.6.0` | `fs` | a `smallvec` finding |
 //! | `NpmTarball` | a manifest-only tarball                       | `rootfs` | analysed, no findings |
 //! | `CargoCrate` | a lockfile-less `.crate`                      | `fs`     | analysed, no findings |
 //! | `OciBlob` | a CA-certificate-only layer, no package database | `rootfs` | `NotApplicable` |
 //!
-//! The `NpmTarball`/`CargoCrate` rows are the honest "no" cells: those
-//! formats publish no lockfile, so the extracted tree carries package
-//! identity but nothing to match advisories against. Asserting *zero*
-//! findings there is the point — it documents the ceiling rather than
-//! pretending to coverage. The CA-certificate-layer row is a different
-//! outcome: no package identity at all, which every analyzer agrees on,
-//! so it must come back `NotApplicable` rather than held.
+//! Together these are the evidence behind every "yes" in the scanner
+//! capability map's `trivy` row — the rule being that a cell is "yes"
+//! only where a known-vulnerable fixture of that format yields at least
+//! one finding through this adapter.
+//!
+//! The two paired `NpmTarball` / `CargoCrate` rows say what each "yes"
+//! covers, which is not the same for both halves. For npm it is the
+//! package's **own identity**: the tarball names itself, so its own
+//! advisories are attributable, while the dependency *ranges* its
+//! `package.json` declares are not. For cargo it is the opposite — the
+//! lockfile pins exact dependency versions, and a `.crate` without one
+//! carries nothing to match. Asserting *zero* findings in the second
+//! row of each pair documents that ceiling rather than pretending to
+//! coverage; if a future Trivy release starts attributing advisories to
+//! `package.json` ranges, that test failing is the signal to revisit the
+//! map, not a defect. The CA-certificate-layer row is a different
+//! outcome again: no package identity at all, which every analyzer
+//! agrees on, so it must come back `NotApplicable` rather than held.
 //!
 //! # Fixtures are built here, not committed
 //!
@@ -507,6 +520,115 @@ async fn a_package_less_layer_is_not_applicable() {
 // ---------------------------------------------------------------------------
 // "no" cells — analysed, but with nothing to attribute
 // ---------------------------------------------------------------------------
+
+/// A known-vulnerable npm package must produce its **own** advisories.
+///
+/// This is the npm cell of the capability map, and it is about identity
+/// rather than dependencies: the tarball names itself `lodash@4.17.20`,
+/// a version with published advisories, and extraction into
+/// `node_modules/lodash/` is what lets Trivy's Node analyzer read that
+/// name at all. A tarball planted anywhere else yields nothing, which
+/// is indistinguishable from a clean scan — the defect this file exists
+/// to catch.
+///
+/// The sibling test below pins the other half of the same ceiling: no
+/// advisory is attributed to the *ranges* a `package.json` declares.
+/// Together they say exactly what a "yes" on `trivy × npm` covers.
+#[tokio::test]
+async fn a_known_vulnerable_npm_tarball_yields_its_own_advisory() {
+    let manifest = br#"{"name":"lodash","version":"4.17.20"}"#;
+    let tarball = gzip(&tar_of(&[
+        ("package/package.json", manifest),
+        ("package/index.js", b"module.exports = {};\n"),
+    ]));
+    let c = coords(
+        "lodash",
+        Some("4.17.20"),
+        "lodash/-/lodash-4.17.20.tgz",
+        RepositoryFormat::Npm,
+    );
+    let Some(result) = scan_fixture(ArtifactKind::NpmTarball, &c, tarball).await else {
+        return;
+    };
+    let findings = expect_verdict(result, "lodash 4.17.20 tarball");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.purl.contains("lodash") && f.purl.contains("4.17.20")),
+        "expected an advisory attributed to lodash@4.17.20 (CVE-2021-23337 / \
+         CVE-2020-28500 era); the tarball's package.json must have been planted \
+         under node_modules/ for Trivy's node analyzer to claim it. Got {:?}",
+        findings
+            .iter()
+            .map(|f| (f.vulnerability_id.as_str(), f.purl.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A binary crate published with a `Cargo.lock` pins exact dependency
+/// versions, and Trivy's Cargo analyzer reads that lockfile under every
+/// target — so this is the one `.crate` shape whose declared
+/// dependencies can be matched against advisories.
+///
+/// `smallvec 1.6.0` carries RUSTSEC-2021-0003 / CVE-2021-25900. The
+/// manifest alone (`smallvec = "1"`) is a range and proves nothing; the
+/// lockfile is what makes the finding attributable, which is precisely
+/// the distinction the `trivy × cargo` cell rests on.
+#[tokio::test]
+async fn a_binary_crate_with_a_lockfile_yields_a_dependency_advisory() {
+    let manifest = br#"[package]
+name = "evidence"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+smallvec = "1"
+"#;
+    // Cargo lockfile format v3, the shape `cargo` has written since
+    // 1.53 and the one a published binary crate ships.
+    let lockfile = br#"# This file is automatically @generated by Cargo.
+# It is not intended for manual editing.
+version = 3
+
+[[package]]
+name = "evidence"
+version = "1.0.0"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
+name = "smallvec"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a55ca5f3b68e41c979bf8c46a6f1da892ca4db8f94023ce0bd32407573b1ac0"
+"#;
+    let crate_file = gzip(&tar_of(&[
+        ("evidence-1.0.0/Cargo.toml", manifest),
+        ("evidence-1.0.0/Cargo.lock", lockfile),
+        ("evidence-1.0.0/src/main.rs", b"fn main() {}\n"),
+    ]));
+    let c = coords(
+        "evidence",
+        Some("1.0.0"),
+        "crates/evidence/1.0.0/evidence-1.0.0.crate",
+        RepositoryFormat::Cargo,
+    );
+    let Some(result) = scan_fixture(ArtifactKind::CargoCrate, &c, crate_file).await else {
+        return;
+    };
+    let findings = expect_verdict(result, "binary crate with a Cargo.lock");
+    assert!(
+        findings.iter().any(|f| f.purl.contains("smallvec")),
+        "expected an advisory attributed to smallvec 1.6.0 (CVE-2021-25900 / \
+         RUSTSEC-2021-0003); the .crate's Cargo.lock must have reached Trivy's \
+         cargo analyzer. Got {:?}",
+        findings
+            .iter()
+            .map(|f| (f.vulnerability_id.as_str(), f.purl.as_str()))
+            .collect::<Vec<_>>()
+    );
+}
 
 /// An npm tarball carries a `package.json`: dependency *ranges*, not a
 /// resolved set. Extraction into `node_modules/<name>/` — the only place

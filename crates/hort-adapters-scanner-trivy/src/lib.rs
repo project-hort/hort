@@ -518,6 +518,16 @@ impl ScannerPort for TrivyAdapter {
         "trivy"
     }
 
+    /// Trivy's half of the scanner capability map, answered from this
+    /// adapter's own materialisation truth: a format is analysable when
+    /// one of its artifact kinds has a materialisation plan *and* a
+    /// known-vulnerable fixture of that format has been shown to yield a
+    /// finding through it. [`workspace::format_is_analysable`] holds the
+    /// table and names the evidence test behind each cell.
+    fn applies_to(&self, format: &str) -> bool {
+        workspace::format_is_analysable(format)
+    }
+
     fn scan<'a>(
         &'a self,
         target: &'a ScanTarget<'a>,

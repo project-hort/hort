@@ -415,28 +415,81 @@ to 20 relative file names from the workspace. Those last two are what
 separate "no analyzer claimed this, correctly" from "this adapter built
 the wrong tree", which are otherwise the same log line.
 
-### Honest per-format coverage
+### The scanner capability map
 
-The table is not a promise of vulnerability detection everywhere it says
-"extracted". What the extracted tree offers differs by format:
+Whether a backend can produce a verdict for a repository format is a
+**compiled-in fact of this build**, not an operator choice. The backends
+own it (`ScannerPort::applies_to`); `hort_app::scanning` mirrors it for
+the apply path, which constructs no adapters; and the `hort-worker`
+parity guard asserts the two never disagree.
 
-| format | what the analyzer finds | vulnerability detection |
+| backend | `oci` | `maven` | `pypi` | `npm` | `cargo` | any other format |
+|---|---|---|---|---|---|---|
+| `trivy` | **yes** | **yes** | **yes** | **yes** | **yes** | no |
+| `osv` | no | **yes** | **yes** | **yes** | **yes** | no |
+
+**A cell is "yes" only where a test exists in which a known-vulnerable
+fixture of that format yields at least one finding through that
+backend.** Materialising bytes a scanner never claims is not evidence —
+it produces the *absence* of a verdict, which is precisely the inert
+pairing this map exists to name.
+
+What each "yes" actually covers, and what proves it:
+
+| cell | what is covered | evidence |
 |---|---|---|
-| Maven JAR | embedded coordinates, matched against `trivy-java-db` | yes |
-| Maven POM | declared dependencies | yes, as far as they resolve |
-| PyPI wheel / sdist | `*.dist-info/METADATA` / `PKG-INFO` | yes |
-| OCI layer | OS package database, shipped lockfiles | yes |
-| npm tarball | `node_modules/<name>/package.json` | **no** — ranges, no lockfile |
-| cargo `.crate` | `Cargo.toml` (and `Cargo.lock` for binary crates) | **no** for libraries |
+| `trivy` × `oci` | the layer's OS package database (`var/lib/dpkg/status`, `lib/apk/db/installed`, `var/lib/rpm/*`) and any lockfiles it ships | `an_oci_layer_with_an_os_package_database_yields_findings` (layer tar carrying `zlib1g 1:1.2.11.dfsg-2`); the compose e2e `oci-trivy-e2e` scenario |
+| `trivy` × `maven` | a JAR's embedded coordinates, matched against `trivy-java-db` (SHA-1 fallback when the archive carries no usable identity); a `pom.xml`'s declared dependencies as far as their versions are literal | `a_known_vulnerable_jar_yields_its_cve` (`log4j-core 2.14.1`), `a_pom_is_analysed_rather_than_ignored`; the compose e2e `maven-trivy-e2e` scenario |
+| `trivy` × `pypi` | the wheel's / sdist's own identity from `*.dist-info/METADATA` or `PKG-INFO` | `a_known_vulnerable_wheel_yields_at_least_one_finding` (`urllib3 1.26.4`) |
+| `trivy` × `npm` | **the package's own `name@version` only.** A published tarball declares dependency *ranges*, never a resolved set, so nothing else in it is attributable | `a_known_vulnerable_npm_tarball_yields_its_own_advisory` (`lodash 4.17.20` → 5 advisories); `an_npm_tarball_is_analysed_with_nothing_to_attribute` pins the ceiling |
+| `trivy` × `cargo` | **a shipped `Cargo.lock` only** — i.e. published *binary* crates. A library crate (`Cargo.toml` alone, the common case on crates.io) still yields nothing attributable under Trivy; `osv` × `cargo` is the cell that covers it | `a_binary_crate_with_a_lockfile_yields_a_dependency_advisory` (`smallvec 1.6.0`); `a_cargo_crate_is_analysed_with_nothing_to_attribute` pins the ceiling |
+| `osv` × `npm` / `pypi` / `cargo` / `maven` | the payload SBOM the format handler extracts, subject **and** components ([ADR 0056](../../adr/0056-payload-sbom-extraction.md)) — which is what covers a library crate's declared dependency set where Trivy cannot | `a_known_vulnerable_{npm,pypi,cargo,maven}_sbom_yields_a_finding`; the compose e2e `maven-osv-e2e` scenario; the dogfood `hort-crates` / `npm-proxy` policies in production |
+| `osv` × `oci` | — **no cell.** OCI exposes no SBOM source, so this backend has nothing to read. The parity guard asserts the OCI handler is not SBOM-capable, so the "no" cannot rot into a "yes" by accident | `oci_is_covered_by_trivy_alone_and_the_handler_confirms_it_has_no_sbom` |
 
-The two "no" rows are a property of what those ecosystems publish, not a
-gap in the adapter: a published npm tarball or library `.crate` carries
-dependency *requirements*, never a resolved set, so no scanner can
-attribute an advisory to a concrete dependency version from it. Under a
-Trivy-only policy those formats therefore produce no verdict and their
-artifacts are **held** (next section) — which is the correct reading of
-"this backend cannot adjudicate this format", and is what the scanner
-capability map is intended to reject at apply time instead.
+Both new Trivy cells (`npm`, `cargo`) were proven against **Trivy
+0.70.0**, the version `docker/Dockerfile.worker` pins, and neither rests
+on a contractual upstream guarantee: `npm` rests on the Node analyzer
+claiming a `package.json` under `node_modules/`, `cargo` on the Cargo
+analyzer reading `Cargo.lock`. A Trivy release that *widens* attribution
+turns the paired "nothing to attribute" tests red — which is the designed
+signal to revisit this table, not a defect.
+
+The map is deliberately **binary**. What a "yes" covers varies (the
+column above), but a third "partial" state would attach a caveat to
+nearly every non-OCI cell, which is noise rather than signal. The nuance
+belongs here, in prose, not in the type.
+
+**Two consumers, one record.**
+
+- **At apply time**, the `StaticConfigValidator`'s row 7c rejects a
+  `ScanPolicy.scanBackends` entry paired with a repository format it
+  cannot analyse, naming the pairing and the backends that *do* cover
+  the format. A format no backend covers is the other rejection shape,
+  and points at the explicit waiver instead. The unit of evaluation is
+  the **effective** pairing: runtime resolution is repo-scoped-wins-over-
+  global, so a global policy is linted only against the repositories
+  that declare no policy of their own. `hort-server validate-config`
+  catches both offline. The one thing the row never rejects is
+  `scanBackends: []` — that is the operator's explicit "this repository
+  is not scanned", a decision rather than an inert pairing.
+- **At scan time**, the orchestrator consults the same map before
+  invoking a backend, which covers the paths apply-time rejection cannot
+  reach: the built-in default backend list (no policy declared at all)
+  and a policy that predates the row. A backend that does not apply is
+  never invoked; the abstention it records instead is
+  `no_analyzer_matched` when another backend covers the format (the
+  pairing is wrong, so the surface stays unassessed and the artifact
+  holds — see [*"Nothing analysable" is not "clean"*](#nothing-analysable-is-not-clean)),
+  ticking `hort_scan_record_outcome_failures_total{result="inert_pairing"}`,
+  and `not_applicable` when nobody covers it (there is no surface to
+  assess, so a hold would have nothing to wait on).
+
+The operator consequence of the `osv` × `oci` "no" is concrete: a
+**global** `scanBackends: [trivy, osv]` over a deployment that also
+serves OCI repositories is rejected at apply. The fix is to split it —
+a global `[trivy]` plus per-repository policies adding `osv` where the
+format has an SBOM — which is exactly what
+`scripts/alpha-fixtures/gitops-config/base/policies/` models.
 
 ### Extraction is bounded and fail-closed
 
@@ -493,6 +546,16 @@ A backend returns `NothingAnalysable(reason)` in three situations:
   with no `Results` section — absent, `null`, or empty). `fs` mode targets
   one artifact whose analyzer either engages or does not, so an empty
   result there stays an expected surface left unassessed.
+
+The orchestrator records the last two reasons on a backend's behalf in
+one case: when [the scanner capability map](#the-scanner-capability-map)
+already says this backend cannot analyse this format. The backend is
+then never invoked at all — the answer is known, and paying a CAS read
+and a subprocess for it would also lose the one fact an operator needs,
+that the *pairing* is wrong. Another backend covers the format ⇒
+`no_analyzer_matched` (plus `result="inert_pairing"`, which distinguishes
+"never invoked" from "ran and found nothing"); nobody covers it ⇒
+`not_applicable`.
 
 The three reasons do **not** all gate the artifact, and
 `NotAnalysable::gates_release` is the single place that split is decided.

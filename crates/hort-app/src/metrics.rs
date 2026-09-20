@@ -2531,6 +2531,24 @@ pub enum ScanFailureResult {
     /// paired with a backend that cannot adjudicate its format, and every
     /// artifact there is being held rather than scanned.
     NothingAnalysable,
+    /// Emitted by `ScanOrchestrationUseCase::run_scan` once per backend
+    /// the **scanner capability map** says cannot analyse the job's
+    /// repository format, while some other compiled-in backend can. The
+    /// backend is **not invoked**: an invocation could only return the
+    /// absence of a verdict, so the orchestrator records the abstention
+    /// directly and the artifact holds fail-closed.
+    ///
+    /// Distinct from [`Self::NothingAnalysable`], which is a backend that
+    /// *ran* and found nothing to analyse. This one never ran — the
+    /// pairing itself is the defect, and it is one an operator fixes in
+    /// the policy's `scanBackends` (or by removing the repository from
+    /// that policy's scope), not in the scanner.
+    ///
+    /// Apply-time validation (`StaticConfigValidator` row 7c) rejects
+    /// this pairing, so a non-zero rate means either the built-in default
+    /// backend list reached a format it does not cover, or a policy that
+    /// predates the row is still in the database.
+    InertPairing,
 }
 
 impl ScanFailureResult {
@@ -2541,6 +2559,7 @@ impl ScanFailureResult {
             Self::FailedBranch => "failed_branch",
             Self::ReportTooLarge => "report_too_large",
             Self::NothingAnalysable => "nothing_analysable",
+            Self::InertPairing => "inert_pairing",
         }
     }
 }
@@ -6061,6 +6080,14 @@ mod tests {
             super::ScanFailureResult::ReportTooLarge.as_str(),
             "report_too_large"
         );
+        assert_eq!(
+            super::ScanFailureResult::NothingAnalysable.as_str(),
+            "nothing_analysable"
+        );
+        assert_eq!(
+            super::ScanFailureResult::InertPairing.as_str(),
+            "inert_pairing"
+        );
     }
 
     #[test]
@@ -6068,6 +6095,8 @@ mod tests {
         let variants = [
             super::ScanFailureResult::FailedBranch,
             super::ScanFailureResult::ReportTooLarge,
+            super::ScanFailureResult::NothingAnalysable,
+            super::ScanFailureResult::InertPairing,
         ];
         let set: HashSet<&'static str> = variants
             .iter()

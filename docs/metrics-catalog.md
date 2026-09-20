@@ -608,7 +608,7 @@ so they don't all hit the snapshot queries on the same edge
 | Metric | Type | Labels | Unit | Description |
 |---|---|---|---|---|
 | `hort_dispatcher_principal_resolved_total` | counter | `source ∈ {snapshot_present, snapshot_empty_admin, snapshot_empty_no_admin}` | — | One increment per principal synthesis in the subscription-delivery dispatcher. 3-series. `snapshot_present` = `subscription.snapshot_claims` was non-empty and was used as the evaluation claim set; `snapshot_empty_admin` = `snapshot_claims` empty but the owner carries the admin bit (evaluates with admin authority); `snapshot_empty_no_admin` = `snapshot_claims` empty and owner is not an admin — the operator diagnostic for "subscription created via PAT by a non-admin user" (such a subscription can never match a claims-scoped grant). |
-| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository (the ADR 0015 inert-field rule). `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented` — cardinality is fixed at the rule count (6). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 6 rules × 3 results = 18. |
+| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format. `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability` — cardinality is fixed at the rule count (8). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 8 rules × 3 results = 24. |
 | `hort_effective_permissions_lookups_total` | counter | `result ∈ {ok, denied, not_found}` | — | One increment per call to the admin effective-permissions endpoint (`GET /api/v1/admin/users/:user_id/effective-permissions`). 3-series. `ok` = admin caller, inspected user resolved, view returned; `denied` = `require_admin()` rejected the caller (emitted before the early return; the inspected user was never resolved); `not_found` = caller was admin but the inspected `user_id` did not resolve to a user row. |
 
 Emitted by
@@ -2671,7 +2671,7 @@ intentionally NOT operator-tunable.
 | `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
 | `hort_sbom_components_skipped_total` | counter | `format` | — | — (the skip count rides the counter's value) |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
-| `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large, nothing_analysable}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
+| `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large, nothing_analysable, inert_pairing}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
 
 Source of truth for the result enums:
 - `hort_app::metrics::ScanJobsResult` for `hort_scan_jobs_total.result`.
@@ -2908,7 +2908,7 @@ to surface DB-side outages; sustained non-zero rate means scan jobs are
 silently looping back into pending without their backoff state
 landing.
 
-The counter's other two `result` values are emitted by
+The counter's other three `result` values are emitted by
 [`ScanOrchestrationUseCase::run_scan`](../crates/hort-app/src/use_cases/scan_orchestration.rs)
 and are per-*backend*, not per-transition-failure:
 
@@ -2932,8 +2932,25 @@ and are per-*backend*, not per-transition-failure:
   the accompanying `warn!` (which names format × backend × kind), and a
   second high-cardinality dimension on an alerting counter buys nothing
   the log line does not already give.
+- `inert_pairing` — the **scanner capability map** says this backend
+  cannot analyse this repository format, while another compiled-in
+  backend can, so the orchestrator **never invoked it**. The distinction
+  from `nothing_analysable` is exactly that: there, a backend ran and
+  found nothing to analyse; here the pairing itself is the defect and no
+  CAS read, materialisation or subprocess was spent on it. The artifact
+  holds fail-closed all the same (the expected surface went unassessed),
+  and the fix is the policy's `scanBackends` — or removing the
+  repository from that policy's scope.
 
-`result` carries the failure classifier (closed taxonomy of 2):
+  Apply-time validation rejects this pairing (the `StaticConfigValidator`
+  row `scan_backend_capability`), so a non-zero rate means one of two
+  things: a repository with no `ScanPolicy` at all fell back to the
+  built-in default `["trivy"]` on a format Trivy does not cover, or a
+  policy that predates the row is still in the database. A format **no**
+  backend covers is not counted here — there is no covering backend to
+  switch to, so it asks nothing of an operator and logs at `debug!`.
+
+`result` carries the failure classifier (closed taxonomy of 4):
 
 - `failed_branch` — emitted by
   [`hort_worker::poll_loop::emit_failed_branch_alert`](../crates/hort-worker/src/poll_loop.rs)
@@ -2954,10 +2971,14 @@ and are per-*backend*, not per-transition-failure:
   ADR 0007); this value only attributes *why*. `scanner` carries the
   originating backend name (`trivy` / `osv` / a registered backend),
   so an operator can tell which scanner produced the oversized report.
+- `nothing_analysable` / `inert_pairing` — the two per-backend
+  no-verdict values documented above. `scanner` carries the abstaining
+  (respectively skipped) backend name.
 
 `scanner` carries the originating scanner backend's name when the
-failure is attributable to one (the `report_too_large` path), otherwise
-the `(none)` sentinel (the `failed_branch` path).
+failure is attributable to one (the `report_too_large`,
+`nothing_analysable` and `inert_pairing` paths), otherwise the `(none)`
+sentinel (the `failed_branch` path).
 
 Cardinality:
 - `hort_scan_jobs_total`: 4 result values → 4 series ceiling.

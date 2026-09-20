@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A scan policy can no longer pair a scanner with a format it cannot
+  analyse** (#259). Which backend produces a verdict for which repository
+  format is a fixed property of the build — `trivy` reads the payload and
+  covers every format it can materialise; `osv` reads only the payload
+  SBOM, so it covers `npm`, `pypi`, `cargo` and `maven`, but not `oci`,
+  which exposes no SBOM. Until now a `ScanPolicy` could name `osv` over an
+  OCI repository and Hort accepted it: the policy read as two scan
+  authorities and one of them analysed nothing, every artifact there being
+  held rather than scanned. That map is now written down, backed by a test
+  per cell in which a known-vulnerable fixture yields a real finding, and a
+  guard asserts the record and the scanners themselves can never disagree.
+
+  **`hort validate-config` and gitops apply now reject the inert pairing**,
+  in one of two shapes: a backend that cannot analyse a governed
+  repository's format (the message names the pairing and the backends that
+  *do* cover it), or a repository whose format no compiled-in backend
+  covers at all (the message points at the explicit waiver). What is
+  checked is the pairing the runtime will actually form: a repo-scoped
+  policy wins over a global one, so a global policy is never rejected for a
+  repository that declares its own. `scanBackends: []` is untouched — it is
+  the operator's explicit "do not scan this repository", a decision rather
+  than an inert pairing.
+
+  **Operator action, one shape only:** a **global** `scanBackends: [trivy,
+  osv]` over a deployment that also serves OCI repositories will be
+  rejected at the next apply. Split it into a global `[trivy]` plus
+  per-repository policies adding `osv` where the format has an SBOM
+  (`npm` / `pypi` / `cargo` / `maven`); note that a repo-scoped policy
+  replaces the global one rather than merging with it, so the scoped policy
+  repeats the settings. The shipped alpha-fixture tree is the worked
+  example. No other pairing in any shipped or documented configuration
+  changes.
+
+  At scan time the worker consults the same map before invoking a backend,
+  which covers what apply-time rejection cannot reach — a repository with
+  no policy at all falling back to the built-in default, or a policy that
+  predates the rule. Such a backend is no longer invoked at all (no
+  download, no unpack, no scanner process), and the run records why:
+  `hort_scan_record_outcome_failures_total{result="inert_pairing"}` when
+  another backend covers the format, which keeps the artifact held exactly
+  as before while naming the pairing as the thing to fix.
+
 - **Prefetch now works on Maven repositories** (#233). A Maven proxy could
   already be configured with `prefetchPolicy.triggers: [scheduled]` and the
   configuration was accepted, but nothing happened at run time: the scheduled
@@ -189,6 +231,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicitly set the value keep whatever they set.
 
 ### Fixed
+
+- **`osv` no longer returns a clean verdict for an artifact it never
+  examined** (#259). The OSV backend adjudicates the payload SBOM and
+  nothing else, and when no SBOM was available it returned an empty
+  finding set — which is the value that *means* "examined, found nothing
+  wrong". An `oci` artifact under a policy naming `osv` therefore earned a
+  clean scan verdict from a backend that had read none of its bytes, and
+  that verdict carried release authority. It now abstains instead: no
+  verdict, recorded as not-applicable, and release rests on whatever
+  backend actually looked (`trivy` for OCI). Deployments whose OCI policies
+  name only `osv` will see those artifacts held rather than released — the
+  apply-time rejection above is what stops that configuration being
+  written in the first place.
 
 - **An empty Trivy report over a fully materialised root filesystem is now
   "nothing to assess", not a hold** (#274). Staging UAT surfaced a

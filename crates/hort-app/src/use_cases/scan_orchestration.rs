@@ -61,6 +61,7 @@ use crate::metrics::{
     SbomExtractionResult, SbomResolutionResult, ScanFailureResult, ScanJobsResult,
     ScanTerminalResult,
 };
+use crate::scanning::any_scan_backend_applies_to;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 
@@ -458,6 +459,48 @@ impl ScanOrchestrationUseCase {
                 total_failed += 1;
                 continue;
             };
+            // Consult the scanner capability map before spending an
+            // invocation. A backend that cannot analyse this format can
+            // only ever return the absence of a verdict, so invoking it
+            // buys a CAS read, a materialisation and a subprocess for an
+            // answer already known — and, worse, the answer arrives as
+            // an abstention indistinguishable from "this artifact had no
+            // surface", losing the one fact an operator needs: the
+            // *pairing* is wrong.
+            //
+            // The abstention arm follows the same two-flavour split the
+            // apply-time linter rejects on. Another backend covers this
+            // format ⇒ the policy simply names the wrong one, an
+            // expected surface goes unassessed, and the artifact holds
+            // fail-closed (ADR 0007). Nobody covers it ⇒ there is no
+            // surface any scanner could assess, so a hold would have
+            // nothing to wait on.
+            if !scanner.applies_to(&job.format) {
+                if any_scan_backend_applies_to(&job.format) {
+                    tracing::warn!(
+                        artifact_id = %artifact.id,
+                        scanner = backend,
+                        format = %job.format,
+                        kind = kind.as_str(),
+                        "capability map: this backend does not analyse this format; the policy \
+                         (or the built-in default `[trivy]`) is inert for this repository — \
+                         configure a covering backend or waive scanning explicitly",
+                    );
+                    emit_scan_failure(ScanFailureResult::InertPairing, backend);
+                    abstentions.push((backend.clone(), NotAnalysable::NoAnalyzerMatched));
+                } else {
+                    tracing::debug!(
+                        artifact_id = %artifact.id,
+                        scanner = backend,
+                        format = %job.format,
+                        kind = kind.as_str(),
+                        "capability map: no compiled-in backend analyses this format — nothing \
+                         to assess, so no scanner is invoked",
+                    );
+                    abstentions.push((backend.clone(), NotAnalysable::NotApplicable));
+                }
+                continue;
+            }
             let started = Instant::now();
             let scan_result = scanner.scan(&target, sbom.as_ref()).await;
             observe_scan_duration(backend, started.elapsed());

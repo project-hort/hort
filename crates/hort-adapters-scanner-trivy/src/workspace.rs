@@ -305,6 +305,87 @@ enum Plan {
     NotApplicable,
 }
 
+/// Whether this adapter has a materialisation for `kind` at all — the
+/// kind axis of the capability map.
+///
+/// Exhaustive by construction so a future [`ArtifactKind`] has to state
+/// its answer rather than inherit one, and pinned against [`plan_for`]
+/// by `kind_materialisation_agrees_with_the_plan_table` so the two can
+/// never drift: a kind that maps to [`Plan::NotApplicable`] is a kind no
+/// scanner invocation is attempted for, which is exactly the kind this
+/// predicate must call unanalysable.
+fn kind_is_materialisable(kind: ArtifactKind) -> bool {
+    match kind {
+        ArtifactKind::MavenJar
+        | ArtifactKind::MavenPom
+        | ArtifactKind::NpmTarball
+        | ArtifactKind::CargoCrate
+        | ArtifactKind::PySdist
+        | ArtifactKind::PyWheel
+        // An OCI blob that is a layer becomes a root filesystem; one
+        // that is not (the image config) yields `NotApplicable` at
+        // sniff time. The format is analysable because the first shape
+        // exists, and that is what a per-format answer can say.
+        | ArtifactKind::OciBlob => true,
+        ArtifactKind::OciManifest | ArtifactKind::Other => false,
+    }
+}
+
+/// The artifact kinds each compiled-in format handler declares through
+/// `FormatHandler::scan_kind`.
+///
+/// The adapter is handed only the format string, and it must not depend
+/// on `hort-formats` (a scanner adapter depends on `hort-domain` alone),
+/// so the association is static here. The worker's parity guard is what
+/// keeps it honest: it asks every registered handler for its key and
+/// compares this adapter's answer against the static record the apply
+/// path reads, so a handler whose kinds change without this table
+/// changing fails the build's test gate rather than silently shrinking
+/// the map.
+const FORMAT_KINDS: &[(&str, &[ArtifactKind])] = &[
+    ("oci", &[ArtifactKind::OciBlob, ArtifactKind::OciManifest]),
+    ("maven", &[ArtifactKind::MavenJar, ArtifactKind::MavenPom]),
+    ("pypi", &[ArtifactKind::PyWheel, ArtifactKind::PySdist]),
+    ("npm", &[ArtifactKind::NpmTarball]),
+    ("cargo", &[ArtifactKind::CargoCrate]),
+];
+
+/// Whether Trivy can produce a verdict for at least one artifact kind of
+/// `format` — the adapter's own half of the scanner capability map.
+///
+/// Two conditions, and both are load-bearing:
+///
+/// 1. **Materialisation.** At least one of the format's kinds has a
+///    [`Plan`] other than [`Plan::NotApplicable`]. Derived here from
+///    [`FORMAT_KINDS`] × [`kind_is_materialisable`] rather than
+///    hand-listed, so the answer is computed from the very table that
+///    decides what lands on disk.
+/// 2. **Evidence.** A test materialises a known-vulnerable fixture of
+///    that format through this adapter and gets back at least one
+///    finding. Materialisation alone only proves bytes reach the
+///    scanner, not that an analyzer claims them — and a format whose
+///    bytes no analyzer claims is a pairing that would accept at apply
+///    and analyse nothing at runtime. The evidence per format lives in
+///    `tests/materialisation_evidence.rs`:
+///
+///    | format  | evidence test |
+///    |---------|---------------|
+///    | `oci`   | `an_oci_layer_with_an_os_package_database_yields_findings` |
+///    | `maven` | `a_known_vulnerable_jar_yields_its_cve`, `a_pom_is_analysed_rather_than_ignored` |
+///    | `pypi`  | `a_known_vulnerable_wheel_yields_at_least_one_finding` |
+///    | `npm`   | `a_known_vulnerable_npm_tarball_yields_its_own_advisory` |
+///    | `cargo` | `a_binary_crate_with_a_lockfile_yields_a_dependency_advisory` |
+///
+/// Every format in [`FORMAT_KINDS`] currently carries such a test, so
+/// the second condition adds no exclusion today. It is stated because
+/// removing a cell is the correct response to losing its evidence — not
+/// leaving the cell standing on the materialisation half alone.
+pub(crate) fn format_is_analysable(format: &str) -> bool {
+    FORMAT_KINDS
+        .iter()
+        .any(|(f, kinds)| *f == format && kinds.iter().copied().any(kind_is_materialisable))
+}
+
 /// Decide the materialisation for a target. The module doc's table is
 /// this function; the "why that mode" column cites Trivy's coverage
 /// matrix, which is the authority on which target runs which analyzer.
@@ -1113,6 +1194,71 @@ mod tests {
             (ArtifactKind::Other, None),
         ] {
             assert_eq!(subcommand_of(kind), expected, "{kind}");
+        }
+    }
+
+    // -- capability map (pure) -----------------------------------------
+
+    /// The kind axis of the capability map must not drift from the plan
+    /// table it summarises: a kind with no plan is a kind no invocation
+    /// is attempted for, so it can never yield a verdict.
+    #[test]
+    fn kind_materialisation_agrees_with_the_plan_table() {
+        let c = coords("g:a", Some("1.0"), "g/a/1.0/a-1.0.jar");
+        for kind in [
+            ArtifactKind::MavenJar,
+            ArtifactKind::MavenPom,
+            ArtifactKind::NpmTarball,
+            ArtifactKind::CargoCrate,
+            ArtifactKind::PySdist,
+            ArtifactKind::PyWheel,
+            ArtifactKind::OciBlob,
+            ArtifactKind::OciManifest,
+            ArtifactKind::Other,
+        ] {
+            assert_eq!(
+                kind_is_materialisable(kind),
+                plan_of(kind, &c) != Plan::NotApplicable,
+                "{kind}: the capability answer must follow the plan table"
+            );
+        }
+    }
+
+    /// Pin the format set. A change here is a deliberate capability
+    /// change — a cell gained or lost its known-vulnerable-fixture
+    /// evidence — and the worker's parity guard makes the static record
+    /// the apply path reads move with it.
+    #[test]
+    fn analysable_formats_are_the_five_compiled_in_handler_keys() {
+        for format in ["oci", "maven", "pypi", "npm", "cargo"] {
+            assert!(format_is_analysable(format), "{format} must be analysable");
+        }
+        // No compiled-in handler serves these, so every artifact under
+        // them is kind `Other` and no materialisation applies.
+        for format in ["gradle", "generic", "nuget", "", "OCI"] {
+            assert!(
+                !format_is_analysable(format),
+                "{format} has no materialisable kind"
+            );
+        }
+    }
+
+    /// The format axis is derived, not hand-listed: every entry in the
+    /// table owes its "yes" to a kind the plan table materialises.
+    #[test]
+    fn every_analysable_format_owes_its_answer_to_a_materialisable_kind() {
+        let c = coords("g:a", Some("1.0"), "g/a/1.0/a-1.0.jar");
+        for (format, kinds) in FORMAT_KINDS {
+            let materialisable: Vec<ArtifactKind> = kinds
+                .iter()
+                .copied()
+                .filter(|k| plan_of(*k, &c) != Plan::NotApplicable)
+                .collect();
+            assert!(
+                !materialisable.is_empty(),
+                "{format} claims coverage but no kind of it has a plan"
+            );
+            assert!(format_is_analysable(format));
         }
     }
 

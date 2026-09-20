@@ -702,6 +702,63 @@ spec:
         assert_eq!(code_str(code), exit(1));
     }
 
+    /// Row 7c — a `scanBackends` entry the scanner capability map says
+    /// cannot analyse the governed repository's format → exit 1.
+    ///
+    /// The row reads the compiled-in map directly rather than an
+    /// injected set, which is what makes it reach this offline CLI *by
+    /// construction*: nothing here wires a capability fact, and the
+    /// rejection still fires.
+    #[test]
+    fn validate_tree_row_7c_inert_scan_backend_pairing_is_exit_1() {
+        let policy = "\
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: p-oci-osv
+spec:
+  scope:
+    repository: oci-hosted
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  provenanceMode: off
+  licensePolicy: {}
+  scanBackends: [trivy, osv]
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "policies/p.yaml", policy);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), exit(1));
+    }
+
+    /// The same tree with `osv` dropped is clean — so the rejection
+    /// above is the pairing, not the presence of a scan policy.
+    #[test]
+    fn validate_tree_row_7c_covering_backend_alone_is_success() {
+        let policy = "\
+apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: p-oci-trivy
+spec:
+  scope:
+    repository: oci-hosted
+  severityThreshold: high
+  quarantineDuration: 24h
+  requireApproval: true
+  provenanceMode: off
+  licensePolicy: {}
+  scanBackends: [trivy]
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "policies/p.yaml", policy);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), success());
+    }
+
     /// Row 6 — accepted-but-inert `prefetchPolicy.maxAgeDays` → exit 1.
     #[test]
     fn validate_tree_row_6_prefetch_max_age_days_is_exit_1() {
