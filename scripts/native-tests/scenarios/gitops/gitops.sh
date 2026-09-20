@@ -51,7 +51,7 @@ if metrics_scrape_preflight "gitops boot-apply metrics"; then
         pass 'hort_gitops_apply_total{result=ok} >= 1'
     else
         fail 'hort_gitops_apply_total{result=ok} >= 1' \
-            "metric absent or zero after 15s poll — gitops boot may have skipped or failed silently -- last scrape: $(metrics_scrape_diag "${METRICS_URL}")"
+            "no line matched ^hort_gitops_apply_total{[^}]*result=\"ok\"[^}]*} +[1-9] after 15s poll -- last scrape: $(metrics_scrape_diag "${METRICS_URL}" "hort_gitops_")"
     fi
 
     if bounded_poll "gitops objects_total emitted" 15 \
@@ -59,7 +59,7 @@ if metrics_scrape_preflight "gitops boot-apply metrics"; then
         pass "hort_gitops_objects_total emitted at least once"
     else
         fail "hort_gitops_objects_total emitted" \
-            "metric absent in scrape after 15s poll -- last scrape: $(metrics_scrape_diag "${METRICS_URL}")"
+            "no line matched ^hort_gitops_objects_total{ after 15s poll -- last scrape: $(metrics_scrape_diag "${METRICS_URL}" "hort_gitops_")"
     fi
 fi
 
