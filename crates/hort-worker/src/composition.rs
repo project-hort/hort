@@ -189,6 +189,28 @@ pub struct BuildOutput {
     pub dispatcher: TaskDispatcher,
 }
 
+/// The compiled-in format-handler registry, keyed by handler key.
+///
+/// Until the WASM module loader lands this is the canonical list, and
+/// it is the same one `hort-server` wires. Extracted from
+/// [`build_app_context`] so the scanner-capability parity guard can ask
+/// the *actual* registry which keys exist and what each handler
+/// declares — a second list maintained alongside this one would be free
+/// to drift, and a guard that drifts with the thing it guards proves
+/// nothing.
+///
+/// Constructing it opens nothing: every handler is a unit struct.
+#[must_use]
+pub fn compiled_in_format_handlers() -> HashMap<String, Arc<dyn FormatHandler>> {
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("pypi".into(), Arc::new(PyPiFormatHandler));
+    handlers.insert("cargo".into(), Arc::new(CargoFormatHandler));
+    handlers.insert("npm".into(), Arc::new(NpmFormatHandler));
+    handlers.insert("oci".into(), Arc::new(OciFormatHandler));
+    handlers.insert("maven".into(), Arc::new(MavenFormatHandler));
+    handlers
+}
+
 /// Build the full worker context. Steps mirror `hort-server`'s
 /// `build_app_context` shape but diverge at the leaf adapter layer
 /// (scanner / advisory adapters here; HTTP / OIDC adapters there).
@@ -476,12 +498,7 @@ pub async fn build_app_context(
     //    rows for a Maven repo short-circuit as "no FormatHandler
     //    registered" before ever reaching the Maven pull-through arm.
     // -----------------------------------------------------------------
-    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
-    handlers.insert("pypi".into(), Arc::new(PyPiFormatHandler));
-    handlers.insert("cargo".into(), Arc::new(CargoFormatHandler));
-    handlers.insert("npm".into(), Arc::new(NpmFormatHandler));
-    handlers.insert("oci".into(), Arc::new(OciFormatHandler));
-    handlers.insert("maven".into(), Arc::new(MavenFormatHandler));
+    let handlers = compiled_in_format_handlers();
 
     // -----------------------------------------------------------------
     // 8. QuarantineUseCase — the consumer of the orchestrator's
@@ -2460,6 +2477,12 @@ BBBB
     impl ScannerPort for MockScanner {
         fn name(&self) -> &str {
             &self.name
+        }
+        fn applies_to(&self, _format: &str) -> bool {
+            // The health-check tests below never dispatch, so the
+            // capability answer is irrelevant to them. The parity guard
+            // uses the real adapters, not this mock.
+            true
         }
         fn scan<'a>(
             &'a self,

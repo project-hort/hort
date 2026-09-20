@@ -572,9 +572,21 @@ trivy --version          # ≥ 0.50
 osv-scanner --version    # ≥ 1.7
 ```
 
-The default policy (`…/base/policies/20-default-scan-policy.yaml`) declares
-`scan_backends: [trivy, osv]`, `severity_threshold: Critical`,
+The fixture tree ships a **global** policy
+(`…/base/policies/20-default-scan-policy.yaml`, `scan_backends: [trivy]`)
+plus one **per-repository** policy for each npm / PyPI / cargo repository
+(`…/base/policies/2{1..6}-*-scan-policy.yaml`, `scan_backends: [trivy,
+osv]`). Every one of them declares `severity_threshold: Critical` and
 `quarantine_duration_secs: 60`.
+
+The split is not cosmetic: `osv` reads only the payload SBOM and an OCI
+blob exposes none, so a global `[trivy, osv]` would pair `osv` with the
+`oci-proxy` / `oci-hosted` repositories where it can never produce a
+verdict — a pairing apply-time validation rejects (the scanner capability
+map). A repo-scoped policy *replaces* the global one rather than merging,
+which is why each scoped file repeats the global policy's settings.
+`event-stream@3.3.6` still scans under both backends because it lands in
+an npm repository, which the scoped policies cover.
 
 ### §8.2 — A clean artifact's lifecycle
 

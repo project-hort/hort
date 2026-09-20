@@ -602,6 +602,52 @@ spec:
 **Idempotency:** reapply with no YAML change emits zero events and
 no projection writes. The `unchanged` counter ticks instead.
 
+#### `scanBackends` — apply rejects a backend that cannot analyse the format
+
+A backend's coverage is a compiled-in fact of the build, not an operator
+choice: `trivy` reads the payload and covers every format whose artifacts
+it can materialise; `osv` reads only the payload SBOM, so it covers every
+format whose handler exposes one — `oci` exposes none. The full table
+with per-cell evidence is
+[*The scanner capability map*](../explanation/scanning-pipeline.md#the-scanner-capability-map).
+
+Apply-time validation (`scan_backend_capability`) rejects a pairing that
+would accept here and analyse nothing at runtime. **The unit is the
+effective pairing, not the declared scope**: repo-scoped policy wins over
+global at resolution time, so a global policy is checked only against
+the repositories that declare no policy of their own.
+
+Two rejection shapes:
+
+```text
+ScanPolicy `alpha-default`: scanBackends entry `osv` cannot analyse repository
+`oci-proxy` (format `oci`) — static scanner capability map; `osv` produces no
+verdict for any oci artifact, so this pairing would accept at apply and analyse
+nothing at runtime. Use a backend that covers oci (`trivy`), remove `osv` from
+this policy, or scope a separate policy to this repository. Coverage per format:
+docs/architecture/explanation/scanning-pipeline.md.
+```
+
+```text
+ScanPolicy `p-gradle`: repository `gradle-hosted` (format `gradle`) has no
+compiled-in scanner coverage — every gradle artifact would record a
+not-applicable assessment, never a scan. Waive scanning explicitly for it
+(`scanBackends: []` in a policy scoped to `gradle-hosted`) or exclude it from
+this policy's scope.
+```
+
+The first shape's canonical trigger is a **global** `[trivy, osv]` over a
+deployment that also serves OCI repositories. Split it: a global
+`[trivy]`, plus per-repository policies adding `osv` where the format has
+an SBOM (`npm`, `pypi`, `cargo`, `maven`) —
+`scripts/alpha-fixtures/gitops-config/base/policies/` is the worked
+example. Remember that a repo-scoped policy *replaces* the global one
+rather than merging with it, so the scoped policy repeats every setting.
+
+`scanBackends: []` never trips this rule: it is the explicit operator
+waiver, a decision rather than an inert pairing. `hort-server
+validate-config` catches both shapes offline.
+
 #### `enforcement: reject | record` — what a blocking verdict *does*
 
 `severityThreshold`, `licensePolicy` and `negligibleAction` decide
@@ -1186,10 +1232,15 @@ structural (parse + cross-validate), per-envelope domain, and static-linter
 checks. It does **not** run the **current-state** checks (managed-by
 ownership, immutable-field changes — they need the live `ManagedBy=Local`
 snapshot), which run at apply/boot against the running deployment. It also
-does not currently run the `scanBackends` supported-backend check (apply
+does not currently run the `scanBackends` supported-**name** check (apply
 validates each entry against the binary's compiled-in scanner set,
 `KNOWN_SCAN_BACKENDS` — a static set the offline validator could check but
-does not yet). The command prints a one-line footer saying so.
+does not yet). The `scanBackends` **capability** rule above
+(`scan_backend_capability`) is a different check and *does* run offline; it
+happens to catch most typos too, because a name this build does not compile
+in analyses nothing — but it reports the pairing rather than the typo, and
+it says nothing at all about a policy whose scope reaches no declared
+repository. The command prints a one-line footer saying so.
 
 The validating binary **is** the version validated against: the
 provenance-capable format set and the linter defaults are baked into the same

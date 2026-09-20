@@ -210,6 +210,29 @@ pub trait ScannerPort: Send + Sync {
     /// `"osv"`). Must match the registry name registered at startup.
     fn name(&self) -> &str;
 
+    /// Whether this backend can produce a verdict for at least one
+    /// artifact kind of the given repository format (`trivy` → every
+    /// format whose kinds it can materialise; `osv` → every format whose
+    /// handler exposes an SBOM). The orchestrator does not invoke a
+    /// backend on a format it does not apply to, because such an
+    /// invocation can only ever return the absence of a verdict — an
+    /// inert pairing that would look like coverage in a policy while
+    /// analysing nothing at runtime.
+    ///
+    /// The mirror of
+    /// [`ProvenancePort::applies_to`](crate::ports::provenance::ProvenancePort::applies_to)
+    /// on the scan axis. The answer is the **adapter's own truth**: it
+    /// derives from that backend's materialisation (or SBOM) capability
+    /// and is mirrored — never duplicated by hand — by the static record
+    /// the apply path reads, which has no adapters to ask.
+    ///
+    /// A backend answers `true` for a format only where a test proves a
+    /// known-vulnerable fixture of that format yields at least one
+    /// finding through this backend. No such test means `false`: a cell
+    /// claimed without evidence is the false release authority the split
+    /// between a verdict and an abstention exists to prevent.
+    fn applies_to(&self, format: &str) -> bool;
+
     /// Run the scanner against the target and return what came of it.
     ///
     /// `Ok(ScanAnalysis::Analysed(_))` is a verdict — including an empty
@@ -239,6 +262,38 @@ mod tests {
     #[test]
     fn scanner_port_is_dyn_compatible() {
         let _ = size_of::<&dyn ScannerPort>();
+    }
+
+    /// `applies_to` is a required method with no default, so a new
+    /// adapter cannot inherit a blanket "yes" (or "no") for every
+    /// format: it has to state its own capability. This stub proves the
+    /// method is dispatchable through the trait object the orchestrator
+    /// holds.
+    #[test]
+    fn applies_to_is_answered_per_format_through_the_trait_object() {
+        struct OnlyMaven;
+        impl ScannerPort for OnlyMaven {
+            fn name(&self) -> &str {
+                "only-maven"
+            }
+            fn applies_to(&self, format: &str) -> bool {
+                format == "maven"
+            }
+            fn scan<'a>(
+                &'a self,
+                _target: &'a ScanTarget<'a>,
+                _sbom: Option<&'a Sbom>,
+            ) -> BoxFuture<'a, DomainResult<ScanAnalysis>> {
+                Box::pin(async { Ok(ScanAnalysis::clean()) })
+            }
+            fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+        let port: &dyn ScannerPort = &OnlyMaven;
+        assert!(port.applies_to("maven"));
+        assert!(!port.applies_to("oci"));
+        assert!(!port.applies_to("gradle"));
     }
 
     /// `Box<dyn ScannerPort>` resolves — proves the trait can be

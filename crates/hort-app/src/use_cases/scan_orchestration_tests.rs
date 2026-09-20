@@ -172,6 +172,11 @@ struct MockScanner {
     seen_format: Mutex<Option<String>>,
     /// The stored path the last `scan` call's coords carried.
     seen_path: Mutex<Option<String>>,
+    /// The formats this backend claims to analyse — the mock's
+    /// programmable [`ScannerPort::applies_to`]. `None` (the default)
+    /// means "every format", which is what the tests that drive
+    /// dispatch purely from the policy's backend list want.
+    covers: Option<Vec<String>>,
 }
 
 impl MockScanner {
@@ -191,7 +196,23 @@ impl MockScanner {
             seen_kind: Mutex::new(None),
             seen_format: Mutex::new(None),
             seen_path: Mutex::new(None),
+            covers: None,
         }
+    }
+
+    /// Narrow this backend's capability to `formats` — the mock's half
+    /// of the scanner capability map. Used by the tests that pin the
+    /// orchestrator's consult-before-invoke behaviour, where the whole
+    /// point is a backend that answers `false` for the job's format.
+    fn covering(mut self, formats: &[&str]) -> Self {
+        self.covers = Some(formats.iter().map(|f| (*f).to_string()).collect());
+        self
+    }
+
+    /// How many times `scan` was invoked — the assertion that separates
+    /// "the backend abstained" from "the backend was never asked".
+    fn calls(&self) -> u32 {
+        *self.calls.lock().unwrap()
     }
 
     fn seen_kind(&self) -> Option<ArtifactKind> {
@@ -210,6 +231,17 @@ impl MockScanner {
 impl ScannerPort for MockScanner {
     fn name(&self) -> &str {
         &self.name_
+    }
+    /// Programmable via [`MockScanner::covering`]. The default is "every
+    /// format", because most tests here drive dispatch from the policy's
+    /// backend list rather than from the capability map; the tests that
+    /// pin the orchestrator's consult narrow it deliberately. The map's
+    /// real truth is asserted against the static record and the live
+    /// adapters in the worker's parity guard.
+    fn applies_to(&self, format: &str) -> bool {
+        self.covers
+            .as_ref()
+            .is_none_or(|formats| formats.iter().any(|f| f == format))
     }
     fn scan<'a>(
         &'a self,
@@ -3856,6 +3888,101 @@ mod metrics_emission_tests {
     }
 
     // ---------------------------------------------------------------
+    // hort_scan_record_outcome_failures_total{result=inert_pairing}
+    // ---------------------------------------------------------------
+
+    /// A backend the capability map says cannot analyse the job's format
+    /// attributes `result="inert_pairing"` to its own name — the
+    /// alerting signal for "this repository is paired with a backend
+    /// that adjudicates nothing there". The covering backend beside it
+    /// emits nothing: it ran and produced a verdict.
+    ///
+    /// `inert_pairing` and `nothing_analysable` stay apart: the first is
+    /// a backend that was never invoked (the pairing is the defect), the
+    /// second is one that ran and found nothing to analyse.
+    #[test]
+    fn run_scan_emits_inert_pairing_metric_for_the_backend_it_skips() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let trivy: Arc<dyn ScannerPort> = Arc::new(
+                    MockScanner::new("trivy", Ok(vec![]))
+                        .covering(&["oci", "maven", "pypi", "npm", "cargo"]),
+                );
+                let osv: Arc<dyn ScannerPort> = Arc::new(
+                    MockScanner::new("osv", Ok(vec![]))
+                        .covering(&["npm", "pypi", "cargo", "maven"]),
+                );
+                let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+                scanners.insert("trivy".into(), trivy);
+                scanners.insert("osv".into(), osv);
+                let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+                    vec!["trivy".into(), "osv".into()],
+                    scanners,
+                    handler_map("oci", ArtifactKind::OciBlob),
+                );
+                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let job = scan_job_for_format(artifact_id, "oci");
+                let outcome = uc.run_scan(&job).await.expect("run_scan");
+                assert!(matches!(outcome, ScanRunOutcome::Completed { .. }));
+            })
+        });
+        let osv_inert = find_counter(&snap, "hort_scan_record_outcome_failures_total", |labels| {
+            labels.get("result") == Some(&"inert_pairing") && labels.get("scanner") == Some(&"osv")
+        });
+        assert_eq!(
+            osv_inert,
+            Some(1),
+            "the skipped backend must attribute inert_pairing to its own name"
+        );
+        let trivy_inert =
+            find_counter(&snap, "hort_scan_record_outcome_failures_total", |labels| {
+                labels.get("result") == Some(&"inert_pairing")
+                    && labels.get("scanner") == Some(&"trivy")
+            });
+        assert_eq!(
+            trivy_inert, None,
+            "a backend that covers the format and ran must not emit inert_pairing"
+        );
+        let nothing_analysable =
+            find_counter(&snap, "hort_scan_record_outcome_failures_total", |labels| {
+                labels.get("result") == Some(&"nothing_analysable")
+            });
+        assert_eq!(
+            nothing_analysable, None,
+            "a backend that was never invoked did not 'run and find nothing'"
+        );
+    }
+
+    /// The non-gating arm is silent on the failure counter: a format no
+    /// backend covers asks nothing of an operator (there is no covering
+    /// backend to switch to), so it logs at `debug!` and emits nothing.
+    #[test]
+    fn run_scan_emits_no_failure_metric_when_no_backend_covers_the_format() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let trivy: Arc<dyn ScannerPort> =
+                    Arc::new(MockScanner::new("trivy", Ok(vec![])).covering(&["oci"]));
+                let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+                scanners.insert("trivy".into(), trivy);
+                let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+                    vec!["trivy".into()],
+                    scanners,
+                    handler_map("maven", ArtifactKind::MavenJar),
+                );
+                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let job = scan_job_for_format(artifact_id, "gradle");
+                let outcome = uc.run_scan(&job).await.expect("run_scan");
+                assert!(matches!(outcome, ScanRunOutcome::Completed { .. }));
+            })
+        });
+        let any = find_counter(&snap, "hort_scan_record_outcome_failures_total", |_| true);
+        assert_eq!(
+            any, None,
+            "an uncovered format is not a failure to alert on"
+        );
+    }
+
+    // ---------------------------------------------------------------
     // Helper: build a `PersistedEvent::ArtifactIngested(...)` so
     // `set_stream` can seed the source-resolution path.
     // ---------------------------------------------------------------
@@ -4690,6 +4817,73 @@ async fn run_scan_releases_a_package_less_layer_whose_rootfs_scan_came_back_empt
     assert!(findings.is_empty());
 }
 
+/// The false-authority case the scanner capability map closes.
+///
+/// An OCI repository policed by `[trivy, osv]` on a package-less layer:
+/// Trivy walks the root filesystem, finds no package surface and abstains
+/// `NotApplicable`; `osv` has no SBOM to read, because OCI has no SBOM
+/// source at all. The outcome must be a completed **not-applicable**
+/// assessment — the honest "nothing to assess".
+///
+/// What must not happen is a clean `ScanCompleted`. An empty finding
+/// list is a *verdict*, so a backend that answered a missing SBOM with
+/// one would become the sole contributor here: the artifact would record
+/// an analysed-and-clean scan, and every OCI blob in the repository would
+/// earn the release authority of a scan that examined nothing. That clean
+/// verdict is indistinguishable from a real one — nothing in the trail
+/// says which backend looked at what — which is why the absence of a
+/// verdict has to be its own value rather than an empty list.
+#[tokio::test]
+async fn run_scan_on_an_oci_layer_neither_backend_can_read_records_not_applicable() {
+    let trivy = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    // The OSV adapter's own no-SBOM answer: an abstention, not a clean
+    // verdict. OCI exposes no SBOM, so this is every OCI blob's outcome
+    // under a policy that names `osv`.
+    let osv = Arc::new(MockScanner::with_analysis(
+        "osv",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy);
+    scanners.insert("osv".into(), osv);
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("oci", ArtifactKind::OciBlob),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("nothing to assess must not hold the layer, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::NotApplicable,
+        "the trail must say nothing was assessed, not that the layer scanned clean"
+    );
+    assert_ne!(
+        assessment,
+        ScanAssessment::Analysed,
+        "an empty finding list from a backend that read no SBOM is not a verdict"
+    );
+    assert!(findings.is_empty());
+}
+
 /// One gating abstention among not-applicable ones still holds: the
 /// expected surface it could not assess is still unassessed.
 #[tokio::test]
@@ -4919,4 +5113,136 @@ async fn record_outcome_skipped_no_backends_still_records_an_analysed_assessment
         .expect("the waiver still records a ScanCompleted");
     assert_eq!(scan_completed.assessment, ScanAssessment::Analysed);
     assert_eq!(scan_completed.scanner, "(none)");
+}
+
+// ---------------------------------------------------------------------------
+// The capability-map consult: a backend is never invoked on a format it
+// does not analyse
+// ---------------------------------------------------------------------------
+
+/// A scan job for `format`, so the capability consult can be driven at
+/// formats other than [`sample_scan_job`]'s `npm`.
+fn scan_job_for_format(artifact_id: Uuid, format: &str) -> ScanJob {
+    ScanJob {
+        format: format.to_string(),
+        ..sample_scan_job(artifact_id, 1)
+    }
+}
+
+/// The built-in default `[trivy]` pointed at a format Trivy does not
+/// analyse, while another compiled-in backend does. The backend is never
+/// invoked — an invocation could only return the absence of a verdict —
+/// and the expected-but-unassessed surface holds the artifact
+/// fail-closed, exactly as a `NoAnalyzerMatched` abstention does.
+#[tokio::test]
+async fn run_scan_does_not_invoke_a_backend_that_cannot_analyse_the_format() {
+    let trivy = Arc::new(MockScanner::new("trivy", Ok(vec![])).covering(&["oci"]));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy.clone());
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        scanners,
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    // `osv` covers npm, so the pairing is a policy mistake rather than
+    // an unscannable format — the gating arm.
+    let job = scan_job_for_format(artifact_id, "npm");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    assert!(
+        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+        "an inert pairing leaves the surface unassessed and must hold, got {outcome:?}"
+    );
+    assert_eq!(
+        trivy.calls(),
+        0,
+        "the orchestrator must consult the capability map BEFORE spending an invocation"
+    );
+}
+
+/// A covering backend's verdict stands while the inert one beside it is
+/// skipped: `[trivy, osv]` on OCI, where OSV exposes no SBOM source.
+/// Trivy analyses, OSV is never asked, and the artifact completes on
+/// Trivy's verdict alone rather than being held by OSV's abstention.
+#[tokio::test]
+async fn run_scan_keeps_the_covering_backends_verdict_and_never_invokes_the_inert_one() {
+    let trivy = Arc::new(
+        MockScanner::new(
+            "trivy",
+            Ok(vec![finding(
+                "pkg:oci/zlib1g@1.2.11",
+                "CVE-2018-25032",
+                SeverityThreshold::High,
+            )]),
+        )
+        .covering(&["oci", "maven", "pypi", "npm", "cargo"]),
+    );
+    let osv =
+        Arc::new(MockScanner::new("osv", Ok(vec![])).covering(&["npm", "pypi", "cargo", "maven"]));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy.clone());
+    scanners.insert("osv".into(), osv.clone());
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("oci", ArtifactKind::OciBlob),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "oci");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        scanner,
+        ..
+    } = outcome
+    else {
+        panic!("a covering backend produced a verdict; the run must complete, got {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::Analysed);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(scanner, "trivy", "only the covering backend contributed");
+    assert_eq!(trivy.calls(), 1);
+    assert_eq!(osv.calls(), 0, "osv reads an SBOM and OCI exposes none");
+}
+
+/// A format no compiled-in backend covers. Choosing a different backend
+/// cannot help and there is no surface to assess, so no scanner is
+/// spawned and the artifact records a completed not-applicable
+/// assessment instead of holding forever.
+#[tokio::test]
+async fn run_scan_records_not_applicable_when_no_backend_covers_the_format() {
+    let trivy = Arc::new(MockScanner::new("trivy", Ok(vec![])).covering(&["oci"]));
+    let osv = Arc::new(MockScanner::new("osv", Ok(vec![])).covering(&["npm"]));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy.clone());
+    scanners.insert("osv".into(), osv.clone());
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        // No handler is registered under `gradle`, so its artifacts are
+        // kind `Other` — the map's own answer for the format.
+        handler_map("maven", ArtifactKind::MavenJar),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "gradle");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("nothing to assess must not hold the artifact, got {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::NotApplicable);
+    assert!(findings.is_empty());
+    assert_eq!(trivy.calls(), 0);
+    assert_eq!(osv.calls(), 0);
 }

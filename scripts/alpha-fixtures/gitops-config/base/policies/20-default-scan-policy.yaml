@@ -25,9 +25,13 @@ spec:
   # gates release, so the alpha walk's unsigned artifacts ingest normally.
   # Switch to `required` + provenanceIdentities to enforce signed releases.
   provenanceMode: verify_if_present
-  # Both scanner backends. The worker dispatches per-artifact scan
-  # jobs to each in sequence; either flagging the artifact at
-  # severityThreshold or higher transitions it to Rejected.
-  scanBackends: [trivy, osv]
+  # Trivy only, because this policy governs the OCI repositories too and
+  # `osv` reads nothing but the payload SBOM — an OCI blob exposes none,
+  # so `osv` there would accept at apply and analyse nothing at runtime.
+  # Apply-time validation rejects that pairing (the scanner capability
+  # map), which is why this tree declares a global Trivy policy plus the
+  # per-repository policies beside this file that add `osv` where the
+  # format actually has an SBOM (npm, PyPI, cargo).
+  scanBackends: [trivy]
   # No license restrictions for alpha.
   licensePolicy: {}
