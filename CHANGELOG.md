@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-20
+
 ### Added
 
 - **A scan policy can no longer pair a scanner with a format it cannot
