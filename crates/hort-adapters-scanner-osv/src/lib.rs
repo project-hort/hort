@@ -550,6 +550,17 @@ mod tests {
     use hort_domain::ports::scanner::SCAN_REPORT_TOO_LARGE_MARKER;
     use std::io::Cursor;
 
+    /// Serializes every write-then-exec fixture in this test binary. An
+    /// executable's write descriptor stays open (and inherited across a
+    /// fork) until whichever process holds it execs or closes it — so a
+    /// second thread that forks a child while our script is still open for
+    /// writing can keep that descriptor alive in the child even after we
+    /// close our own handle, and our own later exec of the same path fails
+    /// with `ETXTBSY`. Held from script creation through the `run_scan`
+    /// call that execs it, so no other thread in this process can fork
+    /// while a script is open for writing.
+    static SCRIPT_WRITE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn cfg() -> OsvScannerConfig {
         OsvScannerConfig {
             osv_scanner_bin: PathBuf::from("/usr/local/bin/osv-scanner"),
@@ -714,6 +725,7 @@ mod tests {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
+        let _guard = SCRIPT_WRITE_GUARD.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join("fake-osv.sh");
         {

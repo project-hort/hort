@@ -37,6 +37,17 @@ use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ByteRange, ContentHash};
 use tokio::io::AsyncRead;
 
+/// Serializes every write-then-exec fixture in this test binary. An
+/// executable's write descriptor stays open (and inherited across a fork)
+/// until whichever process holds it execs or closes it — so a second
+/// thread that forks a child while our script is still open for writing
+/// can keep that descriptor alive in the child even after we close our own
+/// handle, and our own later exec of the same path fails with `ETXTBSY`.
+/// Held from script creation through the `scan` call that execs it, so no
+/// other thread in this process can fork while a script is open for
+/// writing.
+static SCRIPT_WRITE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn placeholder_hash() -> ContentHash {
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         .parse()
@@ -109,6 +120,7 @@ fn hung_child_script(secs: u64) -> tempfile::TempPath {
 
 #[tokio::test]
 async fn trivy_scan_timeout_kills_hung_child_within_configured_window() {
+    let _guard = SCRIPT_WRITE_GUARD.lock().await;
     let script = hung_child_script(30);
     let cfg = TrivyConfig {
         trivy_bin: script.to_path_buf(),
