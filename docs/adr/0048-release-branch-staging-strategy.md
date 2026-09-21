@@ -56,11 +56,20 @@ Internal pre-releases are named `alpha.N`, not `beta.N` / `rc.N`. Because semver
 `alpha < beta < rc`, this reserves `beta`/`rc` for a possible future **public**
 pre-release track without collision. `alpha` = purely internal.
 
-### D3 — Staging is continuous and multi-source
+### D3 — Staging deploys from published artifacts: alpha tags and `main`
 
-The staging/test environment deploys from `develop`, from `test/*` pre-release branches,
-and from `main`. There is always a current artifact to deploy; staging is not gated on a
-`main` cut.
+The staging/test environment deploys from the Helm chart + images that a tag-driven
+build actually publishes: an internal `alpha` tag (`test/vX.Y.Z-alpha.N`) and `main`.
+`develop` publishes neither an image nor a chart — `build-images:*` and
+`helm:lint-and-publish` gate on `$CI_COMMIT_TAG` (semver, including `-alpha.N`) or
+`$CI_COMMIT_BRANCH == "main"` / `release/*`; there is no `develop`-branch rule — so
+there is nothing for staging to roll from `develop` merges alone. Staging is not gated
+on a `main` cut, but it *is* gated on the next alpha: a merge to `develop` reaches
+staging only once an alpha tag is cut from it.
+
+Alpha cadence is on demand — cut when there is something worth verifying, no schedule
+and no cron. Prefer cutting one right after a risky change lands rather than waiting
+for several to accumulate (see the bisection trade-off below).
 
 ### D4 — Alpha artifacts are internal-only, but they ARE built
 
@@ -74,15 +83,30 @@ of "internal-only": internal registry yes, public registry no.
 ### D5 — Workflow resting states
 
 `ready-for-staging → in-uat → closed` are resting states decoupled from `main`
-promotion. An issue rests in `ready-for-staging` (merged to `develop`, on staging) or
-`in-uat` until a release; a single `develop → main` promotion may close many such issues
-at once. Issues auto-close only on merge to the default branch (`main`), so a fix's
+promotion. An issue whose fix merges to `develop` rests in `ready-for-staging`:
+merged to `develop` and eligible for the next alpha, **not** reachable on staging yet
+— staging has nothing to roll until an alpha tag exists. `in-uat` begins only once an
+alpha has been cut whose commit actually contains that issue's merge, confirmed via
+`git merge-base --is-ancestor` (a tag can predate the change it is supposed to carry —
+that is how a beta once shipped without its feature). An issue then rests `in-uat`
+until a release; a single `develop → main` promotion may close many such issues at
+once. Issues auto-close only on merge to the default branch (`main`), so a fix's
 `Closes #…` references belong on the promotion MR, not the feature MR into `develop`.
 
 ## Consequences
 
-- Staging always has a deployable artifact (develop / test-branch / main), independent
-  of release cadence.
+- Staging has a deployable artifact whenever an alpha or `main` build has run
+  (test-branch / main); it is not continuous and it does not roll on bare `develop`
+  merges. A `ready-for-staging` issue waits for the next alpha, on demand rather than
+  scheduled.
+- Tag provenance must be verified, not assumed. Before a UAT for an issue is
+  dispatched against alpha *X*, *X*'s commit must be confirmed to contain that
+  issue's merge (`git merge-base --is-ancestor`). Under batched alphas this is the
+  normal check, not an edge case.
+- Batching costs bisection granularity. One alpha usually carries several issues, so
+  a failing UAT does not immediately identify the cause. This is ordinary release
+  testing and an accepted trade-off — it is why an alpha is cut right after a risky
+  change lands rather than only once work has piled up.
 - Internal alpha builds never leak to the public registry; the public ghcr surface stays
   final + (future) beta/rc only.
 - `develop` and `main` keep a clean history: no per-alpha version-bump commits. Trade-off:

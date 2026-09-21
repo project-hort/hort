@@ -70,10 +70,20 @@
 //! than hiding inside an `info!` line that reads like a normal policy
 //! outcome.
 //!
-//! **No new metric.** Reuse
+//! **Metrics.** Releases stay on
 //! `hort_quarantine_released_total{reason=timer}` — that counter fires
-//! inside `release_expired` itself on each successful release. The
-//! handler's `info!` line is the per-tick observability.
+//! inside `release_expired` itself on each successful release; the
+//! handler adds none for them, and its `info!` line carries the rest of
+//! the per-tick outcome.
+//!
+//! The **held** population carries no per-tick metric. A gauge fed from
+//! one tick's candidate batch — capped at [`BATCH_SIZE`], rotating under
+//! the anti-starvation cursor — cannot describe the population it would
+//! claim to report: it saturates once the population exceeds a batch,
+//! jumps as candidates rotate, and falls without any release. The
+//! authoritative view of the held set is the projection surface instead
+//! — today the admin curation queue, later retention's overview — never
+//! a metric derived from this handler's batch.
 //!
 //! **Authority discipline (ADR 0007).** The candidacy
 //! filter and the release-authority gate live in different layers, by
@@ -542,9 +552,10 @@ mod tests {
 
     // ---------- tracing capture ------------------------------------------
     //
-    // The per-tick log line IS the observability contract here (there is
-    // no per-tick metric — see the module docs), so the stall signal and
-    // the per-cause counts are asserted on the emitted records. Mirrors
+    // The per-tick log line carries the sweep's whole observability
+    // contract — the handler emits no metrics of its own — so the stall
+    // signal and the per-cause counts are asserted on the emitted
+    // records. Mirrors
     // the capture block in `use_cases/quarantine_use_case.rs`: a global
     // passthrough subscriber is installed once so callsite interest is
     // not cached as "never", then each test layers a thread-local

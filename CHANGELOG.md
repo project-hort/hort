@@ -7,6 +7,459 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-20
+
+### Added
+
+- **A scan policy can no longer pair a scanner with a format it cannot
+  analyse** (#259). Which backend produces a verdict for which repository
+  format is a fixed property of the build — `trivy` reads the payload and
+  covers every format it can materialise; `osv` reads only the payload
+  SBOM, so it covers `npm`, `pypi`, `cargo` and `maven`, but not `oci`,
+  which exposes no SBOM. Until now a `ScanPolicy` could name `osv` over an
+  OCI repository and Hort accepted it: the policy read as two scan
+  authorities and one of them analysed nothing, every artifact there being
+  held rather than scanned. That map is now written down, backed by a test
+  per cell in which a known-vulnerable fixture yields a real finding, and a
+  guard asserts the record and the scanners themselves can never disagree.
+
+  **`hort validate-config` and gitops apply now reject the inert pairing**,
+  in one of two shapes: a backend that cannot analyse a governed
+  repository's format (the message names the pairing and the backends that
+  *do* cover it), or a repository whose format no compiled-in backend
+  covers at all (the message points at the explicit waiver). What is
+  checked is the pairing the runtime will actually form: a repo-scoped
+  policy wins over a global one, so a global policy is never rejected for a
+  repository that declares its own. `scanBackends: []` is untouched — it is
+  the operator's explicit "do not scan this repository", a decision rather
+  than an inert pairing.
+
+  **Operator action, one shape only:** a **global** `scanBackends: [trivy,
+  osv]` over a deployment that also serves OCI repositories will be
+  rejected at the next apply. Split it into a global `[trivy]` plus
+  per-repository policies adding `osv` where the format has an SBOM
+  (`npm` / `pypi` / `cargo` / `maven`); note that a repo-scoped policy
+  replaces the global one rather than merging with it, so the scoped policy
+  repeats the settings. The shipped alpha-fixture tree is the worked
+  example. No other pairing in any shipped or documented configuration
+  changes.
+
+  At scan time the worker consults the same map before invoking a backend,
+  which covers what apply-time rejection cannot reach — a repository with
+  no policy at all falling back to the built-in default, or a policy that
+  predates the rule. Such a backend is no longer invoked at all (no
+  download, no unpack, no scanner process), and the run records why:
+  `hort_scan_record_outcome_failures_total{result="inert_pairing"}` when
+  another backend covers the format, which keeps the artifact held exactly
+  as before while naming the pairing as the thing to fix.
+
+- **Prefetch now works on Maven repositories** (#233). A Maven proxy could
+  already be configured with `prefetchPolicy.triggers: [scheduled]` and the
+  configuration was accepted, but nothing happened at run time: the scheduled
+  tick had no way to compare two Maven versions, so it skipped the repository
+  without a word. It now reads the upstream's `maven-metadata.xml`, compares
+  versions with Maven's own version-ordering rules (so `1.10.0` is newer than
+  `1.9.0`, which a naive text comparison gets backwards), and warms the newest
+  releases like any other format. `hort-cli prefetch` against a Maven
+  repository works the same way, including resolving "the latest version" when
+  none is given — previously it was refused as an unsupported format.
+
+  Which formats can be prefetched is now decided in exactly one place instead
+  of three, and a test enforces that a format able to discover upstream
+  versions can always order them. That pairing is what a repository's accepted
+  prefetch policy rests on, so it can no longer be half-configured: a policy
+  Hort accepts is a policy Hort acts on. In the impossible case that the two
+  halves are ever changed apart, the tick now says so loudly and increments
+  `hort_prefetch_ordering_missing_total` rather than skipping in silence.
+
+- **A proxied multi-arch image index now starts its children's quarantine
+  windows at index ingest, not at first client access** (#229). Pulling a
+  multi-arch image through a proxy repository ingests the image index and
+  records the child manifests it declares — but until now those children were
+  fetched only when a client later asked for one, so the index's observation
+  window and each child's ran back to back. A base-image bump therefore cost
+  two full windows before the image was pullable. Every pull-through leg that
+  mints an index artifact — a pull by digest, a pull by tag, and a
+  request coalesced behind another repository's pull — now queues one
+  background ingest per declared child, so the windows run concurrently and the
+  image becomes pullable roughly a window sooner.
+
+  **No window is shortened.** Each child is held on ingest exactly as it would
+  have been on a later client pull, and its window is anchored the same way it
+  would have been then; a window that would have started tomorrow simply starts
+  today. Every child still needs its own window *and* its own scan verdict to
+  release, and releasing an index still does not release a held child. The
+  children are fetched by the worker, off the request path: an index pull's
+  own response is unchanged, and if the queue is unavailable the child simply
+  falls back to being fetched on first access as before. Eager child ingest is
+  unconditional — an index's children are the declared contents of the artifact
+  a client just asked for, not speculation — and adds no configuration.
+
+  **The fan-out is bounded.** A child that is itself an index queues its own
+  children, so a nested chain could otherwise grow without limit from a single
+  client pull of a pathological upstream. Alongside the existing per-index
+  child cap, the recursion now stops after four levels — real image trees nest
+  one — and says so in the log; children below the cap are not lost, they are
+  simply fetched on first access as before. Both bounds are fixed internal
+  limits, not settings: there is nothing here for an operator to tune.
+
+- **An npm packument now says which versions Hort is holding, instead of
+  leaving them looking as if they never existed** (#251). Two surfaces of the
+  same registry used to contradict each other. Asking for a held version's
+  tarball returned `503` with a `Retry-After` — the truth. Asking the catalog
+  what versions exist left it out of `versions{}` and out of `dist-tags`, so
+  anyone checking concluded the version was missing upstream. In production
+  that cost two days: a pinned `package-lock.json` install failed, and every
+  human who then read the packument drew the wrong conclusion.
+
+  The packument now carries an additional top-level `hort` block naming each
+  withheld version, why it is withheld, and — for a version inside its
+  observation window — when the hold lifts:
+
+  ```json
+  "hort": { "held": [ { "version": "7.29.7", "status": "quarantined",
+                        "available_after": "2026-08-26T08:18:00Z" } ] }
+  ```
+
+  `status` distinguishes a version that is *waiting* (`quarantined`) from one a
+  scan verdict went against (`rejected`, `scan_indeterminate`) — telling a
+  client to wait for a rejected version would be a lie in the other direction,
+  so those carry no deadline at all. `available_after` is computed from the
+  same window the tarball route's `Retry-After` counts down to, so the two
+  answers cannot drift; where Hort cannot compute it the field is absent rather
+  than guessed. The whole block is omitted when nothing is held, so an ordinary
+  packument does not grow a key.
+
+  **Nothing about resolution changes.** `versions{}` and `dist-tags` come out
+  byte-identical to before, and the per-version route still refuses a held
+  version, so a version range, a bare `npm install` or `latest` still cannot
+  resolve to something that would `503`. That is the reason the versions are
+  withheld in the first place; the block only stops the catalog being silent
+  about it. `npm-pull-through.md` now documents the whole diagnosis path,
+  including how to tell a `503` (Hort has it, briefly) from a `404` (nobody
+  published it).
+
+### Changed
+
+- **SBOM extraction from the stored payload now runs for proxy, virtual and
+  staging repositories as well, not just hosted ones** (#266). A format that
+  derives its SBOM from the artifact's own payload — cargo's embedded
+  `Cargo.lock` today — previously read that payload only for artifacts in a
+  `Hosted` repository, so a proxy with no metadata fallback (a Maven proxy,
+  for instance) got no SBOM at all: `osv` scanned nothing while the
+  repository's policy still claimed a threat level. The scanner now delivers
+  what the repository configuration declares for every repository class the
+  handler applies to; whether a finding against it blocks a release is
+  `enforcement`'s decision, not the scanner's. `enforcement: record` is the
+  recommended mode on proxied lockfile-resolving formats, since there a
+  resolved component names the upstream author's dev-time resolve rather than
+  the consumer's own build. See `docs/adr/0056-resolved-component-sboms-from-payload.md`'s
+  amendment.
+
+- **A signature that arrives late will no longer cost you the artifact**
+  (#242) — recorded as a standing decision; the enforcement change follows. Under
+  `provenanceMode: required`, an artifact whose signature had not reached Hort
+  by the end of its observation window was rejected permanently, and no later
+  successful verification could lift it — while with `cosign` the signature
+  always follows the image it signs, so a short `quarantineDuration` (a
+  sensible *exposure* choice for first-party CI, and nothing in its name says
+  it also bounds how long signing may take) silently doubled as a signing
+  deadline. The decision now says such an artifact is **held** — still
+  unpullable, still fail-closed — for as long as it takes, and that only a
+  signature which is present and invalid is ever terminal. See
+  `docs/adr/0039-keyed-provenance-verification.md`.
+
+- **Rolling a release back no longer requires rolling the schema back with
+  it** (#226). Every start of `hort-server` and `hort-worker` re-runs the
+  migration step with the installed binary, and the serving binary
+  separately re-checked the schema version at boot. Both refused any schema
+  newer than the binary, so a deployment that had applied even a purely
+  additive migration could not be rolled back to the previous release: the
+  older binary would not start, although the expand/contract discipline
+  guarantees it serves that schema correctly. Both checks now ask the same
+  question — is this schema one this binary supports? — and a schema that is
+  merely newer is accepted, logged as a warning so an operator can see the
+  fleet is not on the schema's own release.
+
+  **The strictness that mattered is kept.** A schema *older* than the binary
+  is still the normal upgrade path (the migrations get applied), and a
+  genuinely broken history — a recorded migration the binary does not know
+  sitting below ones it does, or a migration missing from the middle of the
+  applied sequence — is still refused by both checks, now naming the
+  offending versions in the refusal. Checksum verification of the migrations
+  the two sides share is unchanged and still aborts a mismatch.
+
+  **How far back a rollback may go is now answered from the schema itself,
+  not assumed** (#226). An older binary fails against a newer schema for
+  exactly one reason: one of the migrations it does not carry removed
+  something it still references. Migrations that only add are harmless
+  however many of them there are, so five releases without a removal are as
+  safe as one, and a fixed "one release back" bound would refuse rollbacks
+  that are provably fine. Applying a migration now records, in the database,
+  the oldest release that migration tolerates — taken from the destructive-DDL
+  manifest the applying release ships — and both boot checks read those
+  records back for exactly the migrations they do not carry. A binary old
+  enough to be affected is refused, and the refusal names the migration that
+  blocks it and the version it would work from; anything else starts,
+  whatever the distance. A migration with no record at all is treated as one
+  that removed something: silence is not evidence. Every start also reports
+  how far back the current schema tolerates a binary, alongside the schema
+  versions it already logged — the question a rollback decision turns on and
+  that nothing could answer before.
+
+- **The prefetch-row retention sweep now also collects the background
+  index-child ingest's finished rows** (#229). `prefetch-row-retention-sweep`
+  previously covered only the transitive prefetch cascade, so the new
+  per-child ingest rows would have been kept forever. They are the same kind
+  of work — high-churn, best-effort, holding nothing durable — and re-running
+  a collected one is a no-op rather than a re-fetch, so they ride the same
+  sweep rather than getting one of their own.
+
+- **The prefetch-row retention sweep now ships enabled** (#229).
+  `scheduledTasks.prefetchRowRetentionSweep.enabled` defaulted to `false` on
+  the reasoning that the transitive prefetch cascade is opt-in per repository,
+  so a deployment that never opted in accumulated nothing for the sweep to
+  collect. That stopped being true once the background index-child ingest's
+  rows joined it: those accrue on any OCI proxy repository with no opt-in at
+  all, one per declared child manifest per image-index pull. A retention fix
+  that only reaches operators who had already enabled a sweep for an unrelated
+  feature is not a fix, so the default flips — the same day-one-rows reasoning
+  that has the scan-row sweep shipping enabled. **Both deployment flavours
+  move**: the Helm chart's `scheduledTasks.prefetchRowRetentionSweep.enabled`
+  and the Ansible role's `prefetch-row-retention-sweep` timer, which was
+  disabled for the same reason and additionally filed under "needs extra
+  infrastructure" although it needs none. An operator using neither feature
+  gains one idle scheduled task whose delete matches nothing. Operators who had
+  explicitly set the value keep whatever they set.
+
+### Fixed
+
+- **`osv` no longer returns a clean verdict for an artifact it never
+  examined** (#259). The OSV backend adjudicates the payload SBOM and
+  nothing else, and when no SBOM was available it returned an empty
+  finding set — which is the value that *means* "examined, found nothing
+  wrong". An `oci` artifact under a policy naming `osv` therefore earned a
+  clean scan verdict from a backend that had read none of its bytes, and
+  that verdict carried release authority. It now abstains instead: no
+  verdict, recorded as not-applicable, and release rests on whatever
+  backend actually looked (`trivy` for OCI). Deployments whose OCI policies
+  name only `osv` will see those artifacts held rather than released — the
+  apply-time rejection above is what stops that configuration being
+  written in the first place.
+
+- **An empty Trivy report over a fully materialised root filesystem is now
+  "nothing to assess", not a hold** (#274). Staging UAT surfaced a
+  `nginx:alpine` pull through a Trivy policy where the base layer scanned
+  and released normally but a package-less layer (the image's
+  CA-certificate files, no OS package database) never did: Trivy's
+  `rootfs` target came back with no analysed target, which the adapter
+  read the same way regardless of which target produced it — an
+  *unassessed* surface, held `scan_indeterminate` forever. Nearly every
+  real multi-layer image carries a layer like this, so every such image
+  under a Trivy policy hung indefinitely. `rootfs` runs every OS-package,
+  language and binary analyzer over the whole extracted tree, so an empty
+  result there is those analyzers agreeing the tree has no package surface
+  at all — the same completed "not applicable" fact an OCI manifest or
+  config blob already records, reached this time by actually running the
+  scan. An `fs`-mode empty report is unchanged: that target is one
+  artifact whose analyzer either engages or does not, so it still holds as
+  an unassessed surface.
+
+- **A policy created with `enforcement: record` now records from its first
+  apply** (#267). `create_policy` built the rest of the policy projection
+  from the submitted command but hard-coded `enforcement` to `reject`, so a
+  freshly-applied `record` policy enforced `reject` until a later apply
+  diffed and corrected it. The projection now takes `enforcement` from the
+  command like every other field.
+- **OSV scanning now covers Maven artifacts** (#265). `scan_backends:
+  ["osv"]` on a Maven repository was accepted at apply time but scanned
+  nothing at run time — the Maven format handler had every piece the
+  scanner needed (the POM reader, the coordinates, the `Maven` ecosystem,
+  the `maven` purl type) but never wired them into an SBOM, so
+  `OsvScanner::scan` always logged "scan skipped — no SBOM provided" and
+  moved on. A published `.pom` now yields its declared compile- and
+  runtime-scope dependencies as scannable components, and a `.jar`/`.war`
+  yields the same from its embedded `META-INF/maven/{groupId}/{artifactId}/pom.xml`
+  when present; either way the artifact's own coordinate is always in the
+  SBOM as the subject, so osv-scanner can flag the artifact itself even
+  when its dependency versions cannot be resolved from the POM alone (a
+  version inherited from a parent POM or an imported BOM, for instance).
+
+- **Trivy scans now examine the artifact's actual content, and a scan with
+  nothing to examine no longer counts as clean** (#264). The Trivy adapter
+  wrote every artifact to disk as `<sha256>.bin` and pointed `trivy fs` at the
+  directory. Trivy chooses its analyzers by file name and directory layout and
+  does not open archives, so a lone `.bin` matched nothing for every format:
+  the report came back with no analysed target, the empty finding list was
+  recorded as a clean scan, and the artifact was released on that basis. Since
+  `["trivy"]` is the backend list a deployment gets without configuring a scan
+  policy, this was the default path. A pull of a known-vulnerable
+  `log4j-core-2.14.1.jar` through a Trivy-policy Maven proxy reported zero
+  findings.
+
+  Artifacts are now materialised the way the analyzers expect: a Java archive
+  keeps its `.jar`/`.war`/`.ear`/`.par` name, a POM is written as `pom.xml`,
+  wheels and sdists and `.crate` files are extracted, an npm tarball is
+  extracted to `node_modules/<name>/` (the only place Trivy reads a
+  `package.json`), and an OCI image layer is extracted as a root filesystem so
+  its OS package database is read.
+
+  Each kind is also scanned with the **subcommand its analyzer actually runs
+  under**. Trivy's coverage matrix splits its analyzers between targets along
+  the pre-build / post-build line: a built artifact — a Java archive, a Python
+  wheel or egg, a `package.json` under `node_modules` — is analysed by the
+  Image and Rootfs targets only, while a declaration such as `pom.xml` or
+  `requirements.txt` is analysed by the Filesystem and Repository targets only.
+  Pointing `trivy fs` at a JAR therefore runs no analyzer at all, which is why
+  the `log4j-core` JAR still produced no verdict once it was correctly named:
+  post-build kinds now use `trivy rootfs`, pre-build ones stay on `trivy fs`,
+  and the same `log4j-core` pull reports CVE-2021-44228. When a report still
+  comes back with no analysed target, the warning now carries Trivy's stderr
+  tail and a listing of what was actually materialised, so the next such case
+  is diagnosable from the log.
+
+  **Second half, and the reason the first was invisible for so long:** a
+  scanner that found nothing to analyse is no longer recorded as a scanner
+  that found nothing wrong. Those were the same empty list; they are now
+  different results. When no configured backend produces a verdict — the
+  payload is an archive Hort refuses to unpack, or no analyzer claimed
+  anything — the artifact is held `scan_indeterminate` (the existing
+  fail-closed hold for a missing verdict) with a warning naming the format
+  and the backend, and
+  `hort_scan_record_outcome_failures_total{result="nothing_analysable"}`.
+
+  **"Nothing to assess" is its own answer, and it is not a hold.** Some
+  artifacts carry no package surface at all: an OCI image's manifest row and
+  its config blob are metadata about the image, not content anyone could
+  find a CVE in. Holding them would not be caution — no scan could ever
+  clear them, so a Trivy-policed OCI repository would hold every image it
+  ingested, forever. These now record a completed assessment with nothing
+  assessed: the scan axis is satisfied, the observation window alone governs
+  the release (it is not shortened or skipped), and the audit trail says
+  *not applicable* rather than *analysed, clean* — a distinction the
+  `ScanCompleted` event now carries explicitly, so the two can never be
+  confused when reading an artifact's history.
+  `hort_scan_terminal_total` gains a matching `not_applicable` result. A
+  layer that carries an OS package database still gets a real, analysed
+  verdict. Scan results recorded before this release read back as analysed,
+  which is what they were.
+
+  **Operators should expect new holds.** A Trivy-only policy on a cargo
+  repository now holds a library crate rather than releasing it clean: a
+  published `.crate` carries dependency ranges and, for a library, no
+  `Cargo.lock`, so nothing can be attributed to a concrete version and there
+  never was a real scan. The same applies to `zstd`-compressed image layers,
+  which Hort cannot currently unpack. An npm tarball is now placed
+  where Trivy's analyzer looks for it, so it may well come back as an
+  analysed target — but read what that verdict means: a tarball pins no
+  dependency versions, so a clean result there says the package's identity
+  was read, not that its dependencies were checked against advisories. The
+  fix in each case is the repository's `scanBackends`, not the scanner. See
+  `docs/architecture/explanation/scanning-pipeline.md` for the per-format
+  coverage table.
+
+  Archive extraction is bounded and fail-closed — extracted-bytes,
+  decompression-ratio and entry-count caps, entry-name path-traversal
+  rejection, permissions stripped — and a tripped bound refuses the whole
+  archive rather than scanning a fragment. One further latent bug fixed along
+  the way: a Trivy report whose `Results` field was an explicit JSON `null`
+  (what Go emits for an empty result set) failed to parse and was charged to
+  the retry budget as a scanner malfunction.
+
+  **A layer's own symlinks no longer hold it forever.** A symlink or hardlink
+  entry is never materialised — it carries no bytes, so creating it would
+  only hand the scanner another path to follow — but extraction still refused
+  the *whole archive* whenever such a link's target was absolute or pointed
+  outside the workspace. A root filesystem is full of exactly that shape
+  (`/bin/sh -> /bin/busybox`, merged-usr `lib -> usr/lib`), so every real OCI
+  layer under a Trivy policy held indefinitely: manifest and config recorded
+  `not_applicable` and released, but the one layer that actually carries the
+  package database never got a verdict. Since the target is never followed,
+  an out-of-root target cannot write, read or expose anything either — link
+  entries are now skipped and counted (surfaced in the adapter's logs)
+  regardless of where they point, and only an entry's own escaping *name*
+  remains a refusal.
+
+- **A curator looking at an artifact the integrity scrubber condemned now sees
+  why** (#245). When the CAS scrubber re-reads a stored blob and the bytes do
+  not hash to their content hash, it tombstones the artifact — marks it
+  `rejected` so nothing can download it again. It recorded the corruption
+  itself, but not the rejection, and the curation queue reads a row's reason
+  from the rejection record: the artifact showed up condemned with no
+  explanation next to it, and no way to list exactly those artifacts. The
+  tombstone now records the rejection alongside the corruption, in one write,
+  so the queue shows the reason `corruption` and `?reason=corruption` (or
+  `hort-cli curation queue --reason corruption`) lists them.
+
+  Corruption is deliberately **not** clearable by a scan: a clean scan of
+  corrupt bytes is a clean scan of somebody else's content. Recovering from a
+  false positive — an operator restoring the blob from a known-good backup —
+  is the admin release, as before. Artifacts tombstoned by an earlier version
+  keep their old record, so they still show an empty reason and will not match
+  the new filter; they remain condemned either way.
+
+  `hort-cli curation queue --reason` no longer keeps its own list of accepted
+  values. It had gone stale — the CLI refused `provenance`, `admin` and
+  `scan_policy_retroactive` client-side while the server was serving rows
+  carrying exactly those — so the value is now passed through and the server,
+  which derives the list from the rejection reasons it can actually record,
+  answers.
+
+- **An image whose signature arrives a moment after it is pushed is no longer
+  rejected for being unsigned** (#243). Under `provenanceMode: required`, hort
+  verified provenance as soon as the manifest landed — but with cosign the
+  signer must resolve the manifest before it can attach a signature to it, so
+  the verify routinely ran first and found nothing. That was treated as a
+  terminal verdict: the image went `rejected`, and the signature that arrived a
+  second later changed nothing. A missing signature is a statement about a
+  point in time, so it can never be terminal; it is now an indefinite **hold**
+  instead, and the image clears and releases the moment the signature is seen,
+  whether that is a second or a day later. Only a *positive disproof* — a
+  signature that is present and invalid — still rejects, and it now writes the
+  terminal event that every other rejection axis already wrote, so a rejected
+  image can be audited from its own stream instead of from a status with
+  nothing behind it.
+
+  Two operator-facing consequences. A held image's `503` no longer carries
+  `Retry-After`: the hold waits on an external event rather than on the clock,
+  and advertising a retry schedule it does not have put well-behaved clients in
+  an unbounded retry loop. And the standing held population is now visible —
+  `hort_provenance_held_artifacts` and `hort_provenance_hold_oldest_age_seconds`
+  report how many artifacts are waiting and how long the oldest has waited,
+  split by whether they are waiting for their own signature or their parent's.
+
+  For the images already stranded by the old behaviour there is a one-shot,
+  admin-only repair — `POST /api/v1/admin/quarantine/provenance-misrejections/repair`,
+  **dry-run by default** — that returns them to the hold so the ordinary
+  release sweep can release them. It touches only artifacts whose own event
+  stream contradicts their rejection, and leaves every genuine rejection alone;
+  see *Recovering stranded artifacts* §5 in the docs. Relatedly, the curation
+  queue's `?reason=` filter no longer answers `400` for discriminators the
+  queue itself emits (`provenance`, `admin`, `scan_policy_retroactive`).
+
+- **A proxied image index served under a single-image `Content-Type` now gets
+  its membership rows written** (#229). The pull-through path decided whether a
+  manifest was an index from the upstream's declared media type, while the rest
+  of the OCI ingest path decides from the manifest body. Where an upstream
+  mislabels an index — the bytes are an index, the header says single image —
+  the two disagreed, and the index's child-membership rows were silently never
+  recorded, which is the same incomplete-membership state the membership-edge
+  backfill exists to repair. Digest verification cannot catch this: the bytes
+  match their digest, only the header is wrong. The body now decides
+  everywhere; the declared type is still checked against it and a disagreement
+  is logged, but it no longer determines what is recorded.
+- **The worker's ingest path now runs the late-joiner provenance clearance**
+  (#263), so eager-ingested children of a signed proxied image index no longer
+  stay held under `provenanceMode: required`.
+
+### Removed
+
+- **The provenance-hold population gauges**, `hort_provenance_held_artifacts`
+  and `hort_provenance_hold_oldest_age_seconds` (#260). They were set from one
+  release-sweep tick's candidate batch and could not describe the held
+  population — no replacement metric; the operator's view of the held set is
+  the admin curation queue.
+
 ## [0.13.0] - 2026-09-04
 
 ### Fixed

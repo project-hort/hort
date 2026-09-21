@@ -86,6 +86,32 @@ pub(crate) const RULE_TRUST_UPSTREAM_PUBLISH_TIME_REQUIRES_SCAN_BACKENDS: &str =
 pub(crate) const RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED: &str =
     "prefetch_max_age_days_not_implemented";
 
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `PrefetchPolicy`
+/// envelope declares `transitive_deps` or `scheduled` on a format whose
+/// handler does not declare the `VersionDiscovery` capability group
+/// (ADR 0005) — the same accepted-but-inert anti-pattern
+/// [`RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED`] closes for
+/// `maxAgeDays`. One increment per offending trigger.
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_PREFETCH_TRIGGER_REQUIRES_VERSION_DISCOVERY: &str =
+    "prefetch_trigger_requires_version_discovery";
+
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `ScanPolicy` pairs a
+/// `scanBackends` entry with a repository whose format that backend
+/// cannot analyse — the scanner capability map applied to the apply
+/// path. The same accepted-but-inert anti-pattern
+/// [`RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED`] closes for
+/// `maxAgeDays`, on the scan axis (ADR 0015). One increment per
+/// offending finding.
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_SCAN_BACKEND_CAPABILITY: &str = "scan_backend_capability";
+
 /// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
@@ -106,6 +132,13 @@ pub enum LinterRule {
     /// Row 6 — accepted-but-inert `PrefetchPolicy.max_age_days`.
     /// Reject + metric.
     PrefetchMaxAgeDaysNotImplemented,
+    /// Row 6b — a `PrefetchPolicy.triggers` entry (`transitive_deps` /
+    /// `scheduled`) that requires the `VersionDiscovery` capability group
+    /// on a format whose handler does not declare it. Reject + metric.
+    /// The capability set is a required [`StaticConfigValidator::new`]
+    /// parameter (see [`StaticConfigValidator::version_discovery_capable_formats`]),
+    /// so this row always runs.
+    PrefetchTriggerRequiresVersionDiscovery,
     /// Row 7 — provenance-config linter: backend/identity
     /// domain rules + the apply-only no-verifier-format rule (reject) and
     /// the `verify_if_present`-without-identities advisory (warn). No
@@ -114,6 +147,14 @@ pub enum LinterRule {
     /// Row 7b — per-repo `storage.backend` ≠ the deployment's effective
     /// global backend. Reject (no metric today).
     RepoStorageBackendMismatch,
+    /// Row 7c — a `ScanPolicy.scanBackends` entry paired with a
+    /// repository whose format that backend cannot analyse, or a
+    /// repository whose format no compiled-in backend covers at all.
+    /// Reject + metric. The record is the compiled-in scanner capability
+    /// map ([`hort_app::scanning::scan_backend_applies_to`](crate::scanning::scan_backend_applies_to)),
+    /// read directly like `KNOWN_SCAN_BACKENDS` is — no injected set, so
+    /// the row always runs wherever the validator does.
+    ScanBackendCapability,
     /// Row 8 — the permission-grant linter
     /// ([`crate::lint::lint_permission_grants`]) run **offline** for the
     /// `validate-config` CLI. Reject *or* warn,
@@ -145,6 +186,10 @@ impl LinterRule {
             Self::PrefetchMaxAgeDaysNotImplemented => {
                 Some(RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED)
             }
+            Self::PrefetchTriggerRequiresVersionDiscovery => {
+                Some(RULE_PREFETCH_TRIGGER_REQUIRES_VERSION_DISCOVERY)
+            }
+            Self::ScanBackendCapability => Some(RULE_SCAN_BACKEND_CAPABILITY),
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
             | Self::ProvenanceConfig
@@ -246,6 +291,18 @@ pub struct StaticConfigValidator {
     /// hard reject (no verifier ⇒ the artifact would stay `Pending`
     /// forever).
     provenance_capable_formats: Arc<HashSet<String>>,
+    /// Row 6b — the set of repository-format strings whose compiled-in
+    /// `FormatHandler` declares the `VersionDiscovery` capability group
+    /// (ADR 0005). A **required** [`Self::new`] parameter: there is no
+    /// runtime default that answers row 6b's rejection question
+    /// correctly in either direction, so a caller that forgets to supply
+    /// the real set fails to build instead of silently skipping the row.
+    /// Production (`gitops_boot` / the offline `validate-config` CLI)
+    /// passes the set derived from the real handler registry's own
+    /// declarations — never a maintained format list, so a format that
+    /// gains (or loses) the capability changes row 6b's verdict with no
+    /// edit here.
+    version_discovery_capable_formats: Arc<HashSet<String>>,
     /// Row 7b — the deployment's effective global storage backend kind.
     /// `None` ⇒ row 7b is skipped (the apply harness / a composition that
     /// did not opt in); the CLI always supplies `Some`.
@@ -277,10 +334,12 @@ impl StaticConfigValidator {
     /// opts in via [`Self::with_grant_lint_base`].
     pub fn new(
         provenance_capable_formats: Arc<HashSet<String>>,
+        version_discovery_capable_formats: Arc<HashSet<String>>,
         effective_storage_backend: Option<EffectiveStorageBackend>,
     ) -> Self {
         Self {
             provenance_capable_formats,
+            version_discovery_capable_formats,
             effective_storage_backend,
             grant_lint_base: None,
         }
@@ -358,8 +417,21 @@ impl StaticConfigValidator {
             ));
         }
 
-        // Row 7 — provenance-config linter.
-        self.collect_provenance_config(desired, &mut report);
+        // Row 6b — PrefetchPolicy.triggers entries that require the
+        // VersionDiscovery capability group on a format whose handler
+        // does not declare it.
+        for err in hort_config::desired::validate_prefetch_triggers_require_version_discovery(
+            desired,
+            self.version_discovery_capable_formats.as_ref(),
+        ) {
+            report.errors.push(LintFinding::error(
+                LinterRule::PrefetchTriggerRequiresVersionDiscovery,
+                err.to_string(),
+            ));
+        }
+
+        // Rows 7 and 7c — the per-`ScanPolicy` pass.
+        self.collect_scan_policy_rows(desired, &mut report);
 
         // Row 7b — per-repo vs global storage-backend mismatch.
         for message in self.collect_repo_storage_backend_mismatch(desired) {
@@ -553,108 +625,151 @@ impl StaticConfigValidator {
         }
     }
 
-    /// Row 7 — collect provenance-config findings (errors + the
-    /// `verify_if_present`-without-identities warning), in the same
-    /// per-policy sub-order the apply path evaluates: the domain hook
-    /// (`NonOffWithoutBackends` → `RequiredWithoutIdentities`, plus the
-    /// warn) first, then the apply-only `Required`-no-verifier rule.
+    /// Rows 7 and 7c — the single pass over `desired.scan_policies`.
     ///
-    /// Collect-all: unlike the apply path (which aborts on the first
-    /// violation within the row), this pushes every policy's findings so
-    /// the CLI can surface them all. The apply caller still aborts on the
-    /// first error finding — preserving the historical single-message
-    /// reject.
-    fn collect_provenance_config(&self, desired: &DesiredState, report: &mut StaticLintReport) {
+    /// Both rows are functions of one `ScanPolicy` envelope plus the
+    /// declared repositories' formats, so they share one walk and one
+    /// `repo_format_by_name` map. Findings interleave per policy (row 7
+    /// then row 7c for each envelope); that is invisible to the apply
+    /// caller, which selects findings by [`LinterRule`] rather than by
+    /// report position.
+    fn collect_scan_policy_rows(&self, desired: &DesiredState, report: &mut StaticLintReport) {
         let repo_format_by_name: HashMap<&str, &str> = desired
             .repositories
             .iter()
             .map(|r| (r.metadata.name.as_str(), r.spec.format.as_str()))
             .collect();
+        // Row 7c reads (name, format) pairs in declaration order, so its
+        // findings are deterministic and every repository it walks has a
+        // format by construction — no lookup that could miss.
+        let declared_repos: Vec<(&str, &str)> = desired
+            .repositories
+            .iter()
+            .map(|r| (r.metadata.name.as_str(), r.spec.format.as_str()))
+            .collect();
+        // Row 7c — the repositories that carry a policy of their own.
+        // Runtime resolution is repo-scoped-wins-over-global
+        // (`use_cases::policy_resolution`), so a global policy never
+        // reaches one of these and must not be linted against it.
+        let repos_with_scoped_policy: HashSet<&str> = desired
+            .scan_policies
+            .iter()
+            .filter_map(|env| match &env.spec.scope {
+                ScopeSpec::Repository(r) => Some(r.repository.as_str()),
+                ScopeSpec::Global => None,
+            })
+            .collect();
 
         for env in &desired.scan_policies {
-            let policy_name = env.metadata.name.as_str();
-            let mode = provenance_mode_from_spec(&env.spec.provenance_mode);
+            self.collect_provenance_config(env, &repo_format_by_name, report);
+            collect_scan_backend_capability(
+                env,
+                &repos_with_scoped_policy,
+                &declared_repos,
+                report,
+            );
+        }
+    }
 
-            // (1) Domain hook — backend/identity rules + the warn.
-            match provenance_projection_for_lint(env, mode).validate_provenance_config() {
-                Err(ProvenanceConfigError::NonOffWithoutBackends) => {
-                    report.errors.push(LintFinding::error(
-                        LinterRule::ProvenanceConfig,
-                        format!(
-                            "ScanPolicy `{policy_name}`: provenanceMode `{mode}` requires a \
-                             non-empty `provenanceBackends` — with no verifier backend the mode \
-                             is inert. Set `provenanceBackends: [cosign]` or `provenanceMode: off`."
-                        ),
-                    ));
-                }
-                Err(ProvenanceConfigError::RequiredWithoutIdentities) => {
-                    report.errors.push(LintFinding::error(
-                        LinterRule::ProvenanceConfig,
-                        format!(
-                            "ScanPolicy `{policy_name}`: provenanceMode `required` with an empty \
-                             `provenanceIdentities` would accept ANY signer (the any-signer \
-                             footgun). Declare at least one allowed `{{issuer, san}}` pattern."
-                        ),
-                    ));
-                }
-                Err(ProvenanceConfigError::KeyedBackendWithInertIdentities) => {
-                    report.errors.push(LintFinding::error(
-                        LinterRule::ProvenanceConfig,
-                        format!(
-                            "ScanPolicy `{policy_name}`: a `cosign-key`-only scope sets \
-                             `provenanceIdentities`, but identity patterns are INERT for the keyed \
-                             backend — the pinned public key is the trust anchor (ADR 0039). Remove \
-                             `provenanceIdentities`, or add the keyless `cosign` backend that uses them."
-                        ),
-                    ));
-                }
-                Ok(warnings) => {
-                    for w in warnings {
-                        match w {
-                            ProvenanceConfigWarning::VerifyIfPresentWithoutIdentities => {
-                                // CLI message folds the policy name in (so the
-                                // printed line names it); the `warn_context`
-                                // carries `policy` as the structured field the
-                                // apply path re-emits byte-identically to the
-                                // original `warn!(policy = …, "…")` (review L1).
-                                report.warnings.push(LintFinding::warning(
-                                    LinterRule::ProvenanceConfig,
-                                    format!(
-                                        "gitops apply: ScanPolicy provenanceMode \
-                                         `verify_if_present` with empty `provenanceIdentities` — \
-                                         tampering is detected (a forged/untrusted signature is \
-                                         rejected) but no signer is pinned. Often intended; \
-                                         declare `provenanceIdentities` to enforce which signer \
-                                         is trusted. (policy: `{policy_name}`)"
-                                    ),
-                                    Some(WarnContext::ProvenanceVerifyIfPresent {
-                                        policy: policy_name.to_string(),
-                                    }),
-                                ));
-                            }
+    /// Row 7 — collect one `ScanPolicy`'s provenance-config findings
+    /// (errors + the `verify_if_present`-without-identities warning), in
+    /// the same sub-order the apply path evaluates: the domain hook
+    /// (`NonOffWithoutBackends` → `RequiredWithoutIdentities`, plus the
+    /// warn) first, then the apply-only `Required`-no-verifier rule.
+    ///
+    /// Collect-all: unlike the apply path (which aborts on the first
+    /// violation within the row), the caller pushes every policy's
+    /// findings so the CLI can surface them all. The apply caller still
+    /// aborts on the first error finding — preserving the historical
+    /// single-message reject.
+    fn collect_provenance_config<'a>(
+        &self,
+        env: &Envelope<ScanPolicySpec>,
+        repo_format_by_name: &HashMap<&'a str, &'a str>,
+        report: &mut StaticLintReport,
+    ) {
+        let policy_name = env.metadata.name.as_str();
+        let mode = provenance_mode_from_spec(&env.spec.provenance_mode);
+
+        // (1) Domain hook — backend/identity rules + the warn.
+        match provenance_projection_for_lint(env, mode).validate_provenance_config() {
+            Err(ProvenanceConfigError::NonOffWithoutBackends) => {
+                report.errors.push(LintFinding::error(
+                    LinterRule::ProvenanceConfig,
+                    format!(
+                        "ScanPolicy `{policy_name}`: provenanceMode `{mode}` requires a \
+                         non-empty `provenanceBackends` — with no verifier backend the mode \
+                         is inert. Set `provenanceBackends: [cosign]` or `provenanceMode: off`."
+                    ),
+                ));
+            }
+            Err(ProvenanceConfigError::RequiredWithoutIdentities) => {
+                report.errors.push(LintFinding::error(
+                    LinterRule::ProvenanceConfig,
+                    format!(
+                        "ScanPolicy `{policy_name}`: provenanceMode `required` with an empty \
+                         `provenanceIdentities` would accept ANY signer (the any-signer \
+                         footgun). Declare at least one allowed `{{issuer, san}}` pattern."
+                    ),
+                ));
+            }
+            Err(ProvenanceConfigError::KeyedBackendWithInertIdentities) => {
+                report.errors.push(LintFinding::error(
+                    LinterRule::ProvenanceConfig,
+                    format!(
+                        "ScanPolicy `{policy_name}`: a `cosign-key`-only scope sets \
+                         `provenanceIdentities`, but identity patterns are INERT for the keyed \
+                         backend — the pinned public key is the trust anchor (ADR 0039). Remove \
+                         `provenanceIdentities`, or add the keyless `cosign` backend that uses them."
+                    ),
+                ));
+            }
+            Ok(warnings) => {
+                for w in warnings {
+                    match w {
+                        ProvenanceConfigWarning::VerifyIfPresentWithoutIdentities => {
+                            // CLI message folds the policy name in (so the
+                            // printed line names it); the `warn_context`
+                            // carries `policy` as the structured field the
+                            // apply path re-emits byte-identically to the
+                            // original `warn!(policy = …, "…")` (review L1).
+                            report.warnings.push(LintFinding::warning(
+                                LinterRule::ProvenanceConfig,
+                                format!(
+                                    "gitops apply: ScanPolicy provenanceMode \
+                                     `verify_if_present` with empty `provenanceIdentities` — \
+                                     tampering is detected (a forged/untrusted signature is \
+                                     rejected) but no signer is pinned. Often intended; \
+                                     declare `provenanceIdentities` to enforce which signer \
+                                     is trusted. (policy: `{policy_name}`)"
+                                ),
+                                Some(WarnContext::ProvenanceVerifyIfPresent {
+                                    policy: policy_name.to_string(),
+                                }),
+                            ));
                         }
                     }
                 }
             }
+        }
 
-            // (2) Apply-only rule — `Required` on a no-verifier format.
-            if mode == ProvenanceMode::Required {
-                if let Some(format) =
-                    self.first_uncovered_required_format(&env.spec.scope, &repo_format_by_name)
-                {
-                    report.errors.push(LintFinding::error(
-                        LinterRule::ProvenanceConfig,
-                        format!(
-                            "ScanPolicy `{policy_name}`: provenanceMode `required` resolves to \
-                             repository format `{format}`, which has no registered provenance \
-                             verifier (static backend→format capability map; Tier 1 covers `oci` \
-                             via cosign). A `required` policy on a no-verifier format leaves \
-                             artifacts `Pending` forever (never timer-releasing). Use \
-                             `provenanceMode: verify_if_present`/`off`, or scope this policy to an \
-                             OCI repository — npm/PyPI/cargo/Maven verifiers are not yet implemented."
-                        ),
-                    ));
-                }
+        // (2) Apply-only rule — `Required` on a no-verifier format.
+        if mode == ProvenanceMode::Required {
+            if let Some(format) =
+                self.first_uncovered_required_format(&env.spec.scope, repo_format_by_name)
+            {
+                report.errors.push(LintFinding::error(
+                    LinterRule::ProvenanceConfig,
+                    format!(
+                        "ScanPolicy `{policy_name}`: provenanceMode `required` resolves to \
+                         repository format `{format}`, which has no registered provenance \
+                         verifier (static backend→format capability map; Tier 1 covers `oci` \
+                         via cosign). A `required` policy on a no-verifier format leaves \
+                         artifacts `Pending` forever (never timer-releasing). Use \
+                         `provenanceMode: verify_if_present`/`off`, or scope this policy to an \
+                         OCI repository — npm/PyPI/cargo/Maven verifiers are not yet implemented."
+                    ),
+                ));
             }
         }
     }
@@ -729,6 +844,143 @@ impl StaticConfigValidator {
         }
         messages
     }
+}
+
+/// Row 7c — reject a `ScanPolicy.scanBackends` entry that cannot
+/// produce a verdict for a repository the policy actually governs.
+///
+/// The record is the compiled-in **scanner capability map**
+/// ([`crate::scanning::scan_backend_applies_to`] /
+/// [`crate::scanning::any_scan_backend_applies_to`]), read directly the
+/// way `KNOWN_SCAN_BACKENDS` is — not an injected set. That is
+/// deliberate: the offline `validate-config` CLI, `gitops_boot` and the
+/// apply-test harness all reach this row through the same call, so the
+/// row always runs and cannot silently skip on a caller that forgot to
+/// supply a capability set. The map is a permanent property of the
+/// build, so there is no boot-ordering hazard in reading it here.
+///
+/// This is ADR 0015's accepted-but-inert rejection on the scan axis: a
+/// `scanBackends` entry that produces no verdict for a repository's
+/// format reads in the policy as a second scan authority while
+/// analysing nothing at runtime, which is precisely the
+/// field-accepted-but-inert shape that decision closes fail-closed.
+///
+/// # The unit of evaluation is the effective pairing, not the scope
+///
+/// Runtime policy resolution is **repo-scoped wins over global**
+/// ([`crate::use_cases::policy_resolution`]), so a global policy never
+/// reaches a repository that declares one of its own. Linting the
+/// declared scope would therefore reject a global `[trivy, osv]` for an
+/// OCI repository whose own scoped policy already says `[trivy]` — a
+/// pairing the runtime never forms. This row lints what the runtime
+/// will do instead, which is the one deliberate difference from row 7
+/// (which lints the declared scope).
+///
+/// An unresolved scope repository name yields no finding: the
+/// scope-existence validator owns that error, and double-reporting one
+/// root cause is the behaviour row 7 already avoids.
+///
+/// An empty `scanBackends` never triggers the row — it is the explicit
+/// operator waiver ("this repository is not scanned"), a decision, not
+/// an inert pairing.
+///
+/// Two rejection shapes, both hard errors, deterministic order
+/// (policy declaration order × repository declaration order × backend
+/// declaration order):
+///
+/// 1. **The backend does not analyse the format** but another compiled-in
+///    backend does — the operator has a fix available, so the message
+///    names it.
+/// 2. **No compiled-in backend covers the format at all** — choosing a
+///    different backend cannot help, so the only honest remedies are the
+///    explicit waiver or removing the repository from the scope. Emitted
+///    once per (policy, repository): the shape is a property of the
+///    format, so repeating it per backend would say the same thing
+///    twice.
+fn collect_scan_backend_capability(
+    env: &Envelope<ScanPolicySpec>,
+    repos_with_scoped_policy: &HashSet<&str>,
+    declared_repos: &[(&str, &str)],
+    report: &mut StaticLintReport,
+) {
+    if env.spec.scan_backends.is_empty() {
+        return;
+    }
+    let policy_name = env.metadata.name.as_str();
+    // The repository's declared `format:` IS the format-handler registry
+    // key: both composition roots register handlers under the literal
+    // format string (`hort_worker::composition::compiled_in_format_handlers`),
+    // and the capability map answers in those same keys. A format with no
+    // handler registered under its own name — `gradle`, served by the
+    // Maven handler at the protocol level but registered only under
+    // `maven` — resolves no handler and so falls into shape 2, which is
+    // the honest answer: its artifacts are kind `Other` and no backend
+    // can assess them.
+    for (repo, format) in
+        effective_repositories_for(&env.spec.scope, repos_with_scoped_policy, declared_repos)
+    {
+        let covering = crate::scanning::scan_backends_covering(format);
+        if covering.is_empty() {
+            report.errors.push(LintFinding::error(
+                LinterRule::ScanBackendCapability,
+                format!(
+                    "ScanPolicy `{policy_name}`: repository `{repo}` (format `{format}`) has \
+                     no compiled-in scanner coverage — every {format} artifact would record a \
+                     not-applicable assessment, never a scan. Waive scanning explicitly for it \
+                     (`scanBackends: []` in a policy scoped to `{repo}`) or exclude it from \
+                     this policy's scope."
+                ),
+            ));
+            continue;
+        }
+        let alternatives = covering
+            .iter()
+            .map(|b| format!("`{b}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for backend in &env.spec.scan_backends {
+            if crate::scanning::scan_backend_applies_to(backend, format) {
+                continue;
+            }
+            report.errors.push(LintFinding::error(
+                LinterRule::ScanBackendCapability,
+                format!(
+                    "ScanPolicy `{policy_name}`: scanBackends entry `{backend}` cannot analyse \
+                     repository `{repo}` (format `{format}`) — static scanner capability map; \
+                     `{backend}` produces no verdict for any {format} artifact, so this pairing \
+                     would accept at apply and analyse nothing at runtime. Use a backend that \
+                     covers {format} ({alternatives}), remove `{backend}` from this policy, or \
+                     scope a separate policy to this repository. Coverage per format: \
+                     docs/architecture/explanation/scanning-pipeline.md."
+                ),
+            ));
+        }
+    }
+}
+
+/// Row 7c helper — the declared repositories a policy's `scanBackends`
+/// actually govern at runtime, as `(name, format)` pairs in declaration
+/// order.
+///
+/// - `Repository(name)` → that repository alone, and only when it is
+///   declared (an unresolved name belongs to the scope-existence
+///   validator).
+/// - `Global` → every declared repository that does **not** carry a
+///   repository-scoped policy of its own, because the scoped one wins
+///   and the global never reaches it.
+fn effective_repositories_for<'a>(
+    scope: &ScopeSpec,
+    repos_with_scoped_policy: &HashSet<&str>,
+    declared_repos: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    declared_repos
+        .iter()
+        .copied()
+        .filter(|(name, _)| match scope {
+            ScopeSpec::Repository(r) => *name == r.repository.as_str(),
+            ScopeSpec::Global => !repos_with_scoped_policy.contains(name),
+        })
+        .collect()
 }
 
 /// Row 2 — `ServiceAccount.federatedIdentities[].issuer` cross-kind FK
@@ -849,7 +1101,8 @@ mod tests {
     }
 
     fn oci_validator() -> StaticConfigValidator {
-        StaticConfigValidator::new(formats(&["oci"]), None)
+        // No test in this module exercises row 6b.
+        StaticConfigValidator::new(formats(&["oci"]), formats(&[]), None)
     }
 
     // ---- envelope builders (mirror the apply test-module shapes) ------
@@ -1012,6 +1265,32 @@ mod tests {
         }
     }
 
+    /// A global-scope `ScanPolicy` with the given `scan_backends` and no
+    /// provenance configuration (so only row 7c can fire).
+    fn scan_policy_global(name: &str, scan_backends: Vec<&str>) -> Envelope<ScanPolicySpec> {
+        let mut env = scan_policy_repo_scope(name, "unused", "off", vec![], vec![], scan_backends);
+        env.spec.scope = ScopeSpec::Global;
+        env
+    }
+
+    /// A repository-scoped `ScanPolicy` with the given `scan_backends`
+    /// and no provenance configuration (so only row 7c can fire).
+    fn scan_policy_scoped(
+        name: &str,
+        repository: &str,
+        scan_backends: Vec<&str>,
+    ) -> Envelope<ScanPolicySpec> {
+        scan_policy_repo_scope(name, repository, "off", vec![], vec![], scan_backends)
+    }
+
+    fn capability_errors(report: &StaticLintReport) -> Vec<&LintFinding> {
+        report
+            .errors
+            .iter()
+            .filter(|f| f.rule == LinterRule::ScanBackendCapability)
+            .collect()
+    }
+
     // ---- metric_rule() -------------------------------------------------
 
     #[test]
@@ -1031,6 +1310,10 @@ mod tests {
         );
         assert_eq!(LinterRule::ProvenanceConfig.metric_rule(), None);
         assert_eq!(LinterRule::RepoStorageBackendMismatch.metric_rule(), None);
+        assert_eq!(
+            LinterRule::ScanBackendCapability.metric_rule(),
+            Some(RULE_SCAN_BACKEND_CAPABILITY)
+        );
     }
 
     // ---- clean desired -------------------------------------------------
@@ -1421,6 +1704,7 @@ mod tests {
         };
         let v = StaticConfigValidator::new(
             formats(&["oci"]),
+            formats(&[]),
             Some(EffectiveStorageBackend::Filesystem),
         );
         let report = v.validate(&desired);
@@ -1443,6 +1727,7 @@ mod tests {
         };
         let v = StaticConfigValidator::new(
             formats(&["oci"]),
+            formats(&[]),
             Some(EffectiveStorageBackend::Filesystem),
         );
         let report = v.validate(&desired);
@@ -1482,12 +1767,253 @@ mod tests {
             repositories: vec![repo],
             ..Default::default()
         };
-        let v = StaticConfigValidator::new(formats(&["oci"]), Some(EffectiveStorageBackend::S3));
+        let v = StaticConfigValidator::new(
+            formats(&["oci"]),
+            formats(&[]),
+            Some(EffectiveStorageBackend::S3),
+        );
         let report = v.validate(&desired);
         assert!(
             report.errors.is_empty(),
             "omitted storage inherits — no mismatch: {:?}",
             report.errors
+        );
+    }
+
+    // ---- row 7c: scan-backend capability ------------------------------
+
+    /// Shape 1 on a repository-scoped policy: `osv` reads only an SBOM
+    /// and OCI exposes none, so the pairing analyses nothing. The
+    /// message must carry the pairing, the reason and the alternative.
+    #[test]
+    fn scan_backend_that_cannot_analyse_the_format_is_reported_on_a_scoped_policy() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-proxy", "oci")],
+            scan_policies: vec![scan_policy_scoped(
+                "p-oci",
+                "oci-proxy",
+                vec!["trivy", "osv"],
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let hits = capability_errors(&report);
+        assert_eq!(hits.len(), 1, "{:?}", report.errors);
+        let msg = &hits[0].message;
+        assert_eq!(
+            *msg,
+            "ScanPolicy `p-oci`: scanBackends entry `osv` cannot analyse repository \
+             `oci-proxy` (format `oci`) — static scanner capability map; `osv` produces no \
+             verdict for any oci artifact, so this pairing would accept at apply and analyse \
+             nothing at runtime. Use a backend that covers oci (`trivy`), remove `osv` from \
+             this policy, or scope a separate policy to this repository. Coverage per format: \
+             docs/architecture/explanation/scanning-pipeline.md."
+        );
+    }
+
+    /// Shape 1 on a global policy: the pairing is formed per repository,
+    /// so a global `[trivy, osv]` over an OCI repository is rejected for
+    /// that repository even though the policy names no repository at all
+    /// — the alpha-fixture shape.
+    #[test]
+    fn global_policy_is_reported_per_governed_repository() {
+        let desired = DesiredState {
+            repositories: vec![
+                repo_env("npm-proxy", "npm"),
+                repo_env("oci-proxy", "oci"),
+                repo_env("oci-hosted", "oci"),
+            ],
+            scan_policies: vec![scan_policy_global("alpha-default", vec!["trivy", "osv"])],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let hits = capability_errors(&report);
+        assert_eq!(
+            hits.len(),
+            2,
+            "one finding per governed OCI repository, none for npm: {:?}",
+            report.errors
+        );
+        assert!(
+            hits[0].message.contains("`oci-proxy`"),
+            "{}",
+            hits[0].message
+        );
+        assert!(
+            hits[1].message.contains("`oci-hosted`"),
+            "{}",
+            hits[1].message
+        );
+    }
+
+    /// Shape 2: `gradle` is served by the Maven handler at the protocol
+    /// level but no handler is registered under that key, so no backend
+    /// can assess its artifacts. Choosing a different backend cannot
+    /// help, so the message offers the waiver instead — and says it once
+    /// per repository, not once per backend.
+    #[test]
+    fn a_format_no_backend_covers_is_reported_once_with_the_waiver_remedy() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("gradle-hosted", "gradle")],
+            scan_policies: vec![scan_policy_scoped(
+                "p-gradle",
+                "gradle-hosted",
+                vec!["trivy", "osv"],
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let hits = capability_errors(&report);
+        assert_eq!(hits.len(), 1, "{:?}", report.errors);
+        assert_eq!(
+            hits[0].message,
+            "ScanPolicy `p-gradle`: repository `gradle-hosted` (format `gradle`) has no \
+             compiled-in scanner coverage — every gradle artifact would record a \
+             not-applicable assessment, never a scan. Waive scanning explicitly for it \
+             (`scanBackends: []` in a policy scoped to `gradle-hosted`) or exclude it from \
+             this policy's scope."
+        );
+    }
+
+    /// Shape 2 reaches a global policy the same way shape 1 does.
+    #[test]
+    fn a_format_no_backend_covers_is_reported_under_a_global_policy_too() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("generic-hosted", "generic")],
+            scan_policies: vec![scan_policy_global("p-global", vec!["trivy"])],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let hits = capability_errors(&report);
+        assert_eq!(hits.len(), 1, "{:?}", report.errors);
+        assert!(hits[0].message.contains("no compiled-in scanner coverage"));
+        assert!(hits[0].message.contains("`generic-hosted`"));
+    }
+
+    /// The deliberate difference from row 7: the unit of evaluation is
+    /// the EFFECTIVE pairing. A repository with its own scoped policy is
+    /// never reached by the global one, so the global's backends are not
+    /// linted against it.
+    #[test]
+    fn a_repository_with_its_own_policy_is_not_linted_against_the_global_one() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("npm-proxy", "npm"), repo_env("oci-proxy", "oci")],
+            scan_policies: vec![
+                scan_policy_global("global-both", vec!["trivy", "osv"]),
+                // The OCI repository overrides the global policy, so the
+                // inert `osv × oci` pairing never forms at runtime.
+                scan_policy_scoped("oci-only-trivy", "oci-proxy", vec!["trivy"]),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            capability_errors(&report).is_empty(),
+            "the scoped policy wins at runtime, so the global pairing is never formed: {:?}",
+            report.errors
+        );
+    }
+
+    /// The explicit waiver is a decision, not an inert pairing — it never
+    /// trips the row, whatever the repository's format.
+    #[test]
+    fn an_empty_scan_backends_list_never_triggers_the_row() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("gradle-hosted", "gradle"), repo_env("oci", "oci")],
+            scan_policies: vec![
+                scan_policy_scoped("p-gradle", "gradle-hosted", vec![]),
+                scan_policy_scoped("p-oci", "oci", vec![]),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            capability_errors(&report).is_empty(),
+            "an explicit waiver is never an inert pairing: {:?}",
+            report.errors
+        );
+    }
+
+    /// An unresolved scope repository name belongs to the
+    /// scope-existence validator; row 7c stays quiet so one root cause
+    /// produces one error (the row-7 precedent).
+    #[test]
+    fn an_unresolved_scope_repository_produces_no_capability_finding() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-proxy", "oci")],
+            scan_policies: vec![scan_policy_scoped(
+                "p-dangling",
+                "does-not-exist",
+                vec!["osv"],
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            capability_errors(&report).is_empty(),
+            "dangling scope is the scope-existence validator's error: {:?}",
+            report.errors
+        );
+    }
+
+    /// Every pairing the shipped staging / dogfood trees declare must
+    /// pass — the row would otherwise park a real deployment at boot.
+    #[test]
+    fn every_shipped_staging_and_dogfood_pairing_passes() {
+        let desired = DesiredState {
+            repositories: vec![
+                repo_env("ttrekkbar-maven", "maven"),
+                repo_env("hort-crates", "cargo"),
+                repo_env("npm-proxy", "npm"),
+                repo_env("docker-io", "oci"),
+                repo_env("maven-proxy", "maven"),
+            ],
+            scan_policies: vec![
+                scan_policy_scoped("maven-scan", "ttrekkbar-maven", vec!["trivy"]),
+                scan_policy_scoped("hort-crates-scan", "hort-crates", vec!["osv"]),
+                scan_policy_scoped("npm-scan", "npm-proxy", vec!["osv", "trivy"]),
+                scan_policy_scoped("dockerhub-scan", "docker-io", vec!["trivy"]),
+                scan_policy_scoped("maven-proxy-scan", "maven-proxy", vec!["osv"]),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            capability_errors(&report).is_empty(),
+            "no shipped pairing may be rejected: {:?}",
+            report.errors
+        );
+    }
+
+    /// One finding per (policy, repository, backend): two inert entries
+    /// on one OCI repository under one policy yield two findings, in the
+    /// policy's own backend order.
+    #[test]
+    fn findings_are_one_per_policy_repository_backend_in_declared_order() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-proxy", "oci")],
+            scan_policies: vec![scan_policy_scoped(
+                "p-oci",
+                "oci-proxy",
+                // `grype` is not a compiled-in backend at all; the map
+                // answers `false` for every format, so it is inert here
+                // for the same reason `osv` is.
+                vec!["osv", "trivy", "grype"],
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let hits = capability_errors(&report);
+        assert_eq!(hits.len(), 2, "{:?}", report.errors);
+        assert!(
+            hits[0].message.contains("entry `osv`"),
+            "{}",
+            hits[0].message
+        );
+        assert!(
+            hits[1].message.contains("entry `grype`"),
+            "{}",
+            hits[1].message
         );
     }
 
@@ -1525,6 +2051,7 @@ mod tests {
         };
         let v = StaticConfigValidator::new(
             formats(&["oci"]),
+            formats(&[]),
             Some(EffectiveStorageBackend::Filesystem),
         );
         let report = v.validate(&desired);
@@ -1579,7 +2106,7 @@ mod tests {
 
     /// A validator with row 8 ENABLED at the secure-default base config.
     fn grant_lint_validator() -> StaticConfigValidator {
-        StaticConfigValidator::new(formats(&["oci"]), None)
+        StaticConfigValidator::new(formats(&["oci"]), formats(&[]), None)
             .with_grant_lint_base(LintConfig::default())
     }
 

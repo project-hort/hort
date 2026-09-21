@@ -505,6 +505,20 @@ pub struct ApplyConfigUseCase {
     /// from the format-/registry-agnostic domain hook
     /// [`hort_domain::entities::scan_policy::ScanPolicyProjection::validate_provenance_config`].
     provenance_capable_formats: Arc<HashSet<String>>,
+    /// Row 6b — the set of repository-format strings whose compiled-in
+    /// `FormatHandler` declares the `VersionDiscovery` capability group
+    /// (ADR 0005). A **required** [`Self::new`] parameter, not an
+    /// optional builder: unlike [`Self::provenance_capable_formats`],
+    /// there is no runtime default that answers row 6b's rejection
+    /// question correctly in both directions (empty would reject
+    /// `transitive_deps`/`scheduled` on every capable format; skip-when-
+    /// absent is exactly the fail-open hole ADR 0015's structural close
+    /// exists to prevent). So a composition point that forgets to supply
+    /// the set fails to build rather than silently disabling the rule.
+    /// The composition root passes the real set derived from the
+    /// compiled-in handler registry; [`Self::with_version_discovery_capable_formats`]
+    /// lets a caller override the initial value after construction.
+    version_discovery_capable_formats: Arc<HashSet<String>>,
 }
 
 /// The retention-policy apply dependencies, installed as
@@ -610,6 +624,7 @@ impl ApplyConfigUseCase {
         oidc_issuers: Arc<dyn OidcIssuerRepository>,
         service_accounts: Arc<dyn ServiceAccountRepository>,
         users: Arc<dyn UserRepository>,
+        version_discovery_capable_formats: Arc<HashSet<String>>,
     ) -> Self {
         Self {
             repositories,
@@ -658,7 +673,31 @@ impl ApplyConfigUseCase {
             // is apply-rejected until the operator's deployment proves a
             // verifier applies (mirrors the IngestUseCase default).
             provenance_capable_formats: Arc::new(HashSet::new()),
+            version_discovery_capable_formats,
         }
+    }
+
+    /// Override the set of repository-format strings whose compiled-in
+    /// `FormatHandler` declares the `VersionDiscovery` capability group
+    /// (ADR 0005), installed as a required [`Self::new`] parameter.
+    /// Builder-style purely for call-site ergonomics (a caller that wants
+    /// a different set than the one it constructed with does not need to
+    /// re-supply every other constructor argument); it does not make the
+    /// capability set optional — [`Self::new`] already requires an
+    /// initial value.
+    ///
+    /// The apply-time linter consults this set together with each
+    /// repository's declared `prefetchPolicy.triggers`: a `transitive_deps`
+    /// or `scheduled` trigger on a format **absent** from the set is
+    /// rejected (the trigger is accepted but never fires without the
+    /// capability). `on_dist_tag_move` never consults this set.
+    #[must_use]
+    pub fn with_version_discovery_capable_formats(
+        mut self,
+        formats: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.version_discovery_capable_formats = Arc::new(formats.into_iter().collect());
+        self
     }
 
     /// Install the set of repository-format
@@ -912,7 +951,7 @@ impl ApplyConfigUseCase {
             return Err(AppError::Domain(DomainError::Validation(errs.to_string())));
         }
 
-        // The snapshot-free rows (rows 2,3,5,6,
+        // The snapshot-free rows (rows 2,3,5,6,6b,
         // 7,7b) are collected by the pure `StaticConfigValidator`, in
         // apply's row order, with NO early return / metric / `tracing`.
         // This caller walks the report below and reproduces the historical
@@ -921,11 +960,12 @@ impl ApplyConfigUseCase {
         // `hort-server validate-config` command. The env/DB rows (1 above,
         // 4 below) stay inline.
         use crate::lint::{LinterRule, StaticConfigValidator};
-        let report = StaticConfigValidator::new(
+        let validator = StaticConfigValidator::new(
             self.provenance_capable_formats.clone(),
+            self.version_discovery_capable_formats.clone(),
             self.effective_storage_backend,
-        )
-        .validate(desired);
+        );
+        let report = validator.validate(desired);
 
         // Row 2 (SA→issuer cross-kind FK) precedes row 4: first-failing-
         // row aborts. Same `tracing::error!` + `"; "`-joined
@@ -1022,20 +1062,25 @@ impl ApplyConfigUseCase {
             return Err(AppError::Domain(DomainError::Validation(joined)));
         }
 
-        // ----- Post-row-4 snapshot-free rejects (rows 5,6,7,7b),
+        // ----- Post-row-4 snapshot-free rejects (rows 5,6,6b,7,7b,7c),
         //       collected by `StaticConfigValidator` above. -----
         //
         // Reproduce the historical first-failing-row abort byte-
-        // identically: walk the rule order [trust_pt, prefetch,
-        // provenance, storage-backend] and, on the FIRST rule with any
-        // error finding, emit that rule's metric (where it has one — rows
-        // 5/6 only, via `LinterRule::metric_rule`) once per finding, log
-        // the same `error!`, and return that rule's
+        // identically for rows 5/6/7/7b; rows 6b and 7c are newer but
+        // join the same row order and the same rows-5/6 shape. Walk the
+        // rule order [trust_pt, prefetch-max-age, prefetch-trigger,
+        // provenance, storage-backend, scan-backend-capability] and, on
+        // the FIRST rule with any error finding,
+        // emit that rule's metric (where it has one — rows 5/6/6b/7c
+        // only, via `LinterRule::metric_rule`) once per finding, log the
+        // same `error!`, and return that rule's
         // `AppError::Domain(DomainError::Validation(_))`. Later rules are
         // NOT emitted/reported.
         //
-        // - Rows 5 (trust_upstream_publish_time × scan_backends:[])
-        //   and 6 (PrefetchPolicy.max_age_days) historically
+        // - Rows 5 (trust_upstream_publish_time × scan_backends:[]),
+        //   6 (PrefetchPolicy.max_age_days), 6b
+        //   (PrefetchPolicy.triggers requiring VersionDiscovery) and 7c
+        //   (scanBackends × repository-format capability)
         //   `"; "`-join every finding of the row AND tick
         //   `hort_apply_config_linter_total{rule, result=reject}` once per
         //   finding (cardinality bounded by mappings / repositories).
@@ -1054,12 +1099,20 @@ impl ApplyConfigUseCase {
                 "gitops apply: prefetchPolicy.maxAgeDays linter rejected envelope(s) (field accepted-but-inert)",
             ),
             (
+                LinterRule::PrefetchTriggerRequiresVersionDiscovery,
+                "gitops apply: prefetchPolicy.triggers linter rejected envelope(s) (trigger requires VersionDiscovery, format handler does not declare it)",
+            ),
+            (
                 LinterRule::ProvenanceConfig,
                 "gitops apply: provenanceMode linter rejected ScanPolicy envelope(s)",
             ),
             (
                 LinterRule::RepoStorageBackendMismatch,
                 "gitops apply: rejected — per-repository storage backend differs from the deployment's effective global backend; per-repository storage routing is unsupported in v2",
+            ),
+            (
+                LinterRule::ScanBackendCapability,
+                "gitops apply: scanBackends linter rejected ScanPolicy envelope(s) (backend cannot analyse a governed repository's format — scanner capability map)",
             ),
         ] {
             let messages: Vec<&str> = report
@@ -1071,7 +1124,7 @@ impl ApplyConfigUseCase {
             if messages.is_empty() {
                 continue;
             }
-            // Per-rule metric (rows 5/6 only — `metric_rule` is `None`
+            // Per-rule metric (rows 5/6/6b/7c — `metric_rule` is `None`
             // for rows 7/7b). One increment per offending finding.
             if let Some(metric_rule) = rule.metric_rule() {
                 tracing::error!(error_count = messages.len(), "{error_log}");
@@ -2639,6 +2692,11 @@ mod tests {
             oidc_issuers.clone(),
             service_accounts.clone(),
             users.clone(),
+            // Default test posture: "npm" is VersionDiscovery-capable so
+            // the pre-existing (pre-row-6b) prefetch-trigger tests that
+            // don't care about this rule keep passing unmodified. Tests
+            // that DO care override via `with_version_discovery_capable_formats`.
+            Arc::new(["npm".to_string()].into_iter().collect()),
         )
         // The caller supplies the `LintConfig`.
         // `build_harness` passes `permissive_for_tests()` (the
@@ -2716,6 +2774,8 @@ mod tests {
             oidc_issuers.clone(),
             service_accounts.clone(),
             users.clone(),
+            // See `build_harness_with_lint_config` — same default posture.
+            Arc::new(["npm".to_string()].into_iter().collect()),
         )
         // Permissive linter (see `build_harness`).
         .with_lint_config(crate::lint::LintConfig::permissive_for_tests());
@@ -5283,6 +5343,7 @@ mod tests {
             h.oidc_issuers.clone(),
             h.service_accounts.clone(),
             h.users.clone(),
+            Arc::new(["npm".to_string()].into_iter().collect()),
         );
         let without_mapping = DesiredState {
             repositories: vec![repo_env("oci-mirror", "proxy")],
@@ -5795,6 +5856,227 @@ mod tests {
     }
 
     // ===================================================================
+    // Gitops apply linter rejecting a `PrefetchPolicy.triggers` entry a
+    // repository's format cannot honour (row 6b). `transitive_deps` and
+    // `scheduled` both require the format's handler to declare the
+    // `VersionDiscovery` capability group (ADR 0005); `on_dist_tag_move`
+    // does not (OCI fires it today with no `VersionDiscovery`
+    // implementation) and must never be rejected. The capability set is a
+    // required `ApplyConfigUseCase::new` argument — `build_harness`
+    // supplies `{"npm"}` as its default test posture, and these tests
+    // override it via `with_version_discovery_capable_formats` to
+    // exercise both the rejecting and the accepting side of the rule.
+    // ===================================================================
+
+    /// A `transitive_deps` trigger on a format absent from the wired
+    /// capability set is rejected, naming the repository, the format, and
+    /// the offending trigger; the linter metric ticks once.
+    #[test]
+    fn apply_rejects_transitive_deps_trigger_on_non_version_discovery_format() {
+        use hort_domain::entities::repository::{PrefetchPolicy, PrefetchTrigger};
+
+        use crate::metrics::capture_metrics;
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let uc =
+                    h.uc.with_version_discovery_capable_formats(["npm".to_string()]);
+                let mut env = repo_env("maven-transitive", "proxy");
+                env.spec.format = "maven".into();
+                env.spec.prefetch_policy = PrefetchPolicy {
+                    enabled: true,
+                    triggers: vec![PrefetchTrigger::TransitiveDeps],
+                    ..PrefetchPolicy::default()
+                };
+                let mut desired = DesiredState::default();
+                desired.repositories.push(env);
+                captured_err = Some(uc.apply(desired, env_oidc()).await.expect_err(
+                    "apply must reject transitive_deps on a non-VersionDiscovery format",
+                ));
+            });
+        });
+        let err = captured_err.expect("apply must have errored");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(msg.contains("maven-transitive"), "got: {msg}");
+                assert!(msg.contains("maven"), "got: {msg}");
+                assert!(msg.contains("transitive_deps"), "got: {msg}");
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+        let entries = snap.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &entries,
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "prefetch_trigger_requires_version_discovery"),
+                    ("result", "reject"),
+                ],
+            ),
+            1,
+            "linter metric must tick once for the offending trigger",
+        );
+    }
+
+    /// A `scheduled` trigger on a format absent from the wired capability
+    /// set is rejected the same way.
+    #[test]
+    fn apply_rejects_scheduled_trigger_on_non_version_discovery_format() {
+        use hort_domain::entities::repository::{PrefetchPolicy, PrefetchTrigger};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let h = build_harness();
+            let uc =
+                h.uc.with_version_discovery_capable_formats(["npm".to_string()]);
+            let mut env = repo_env("helm-scheduled", "proxy");
+            env.spec.format = "helm".into();
+            env.spec.prefetch_policy = PrefetchPolicy {
+                enabled: true,
+                triggers: vec![PrefetchTrigger::Scheduled],
+                ..PrefetchPolicy::default()
+            };
+            let mut desired = DesiredState::default();
+            desired.repositories.push(env);
+            let err = uc
+                .apply(desired, env_oidc())
+                .await
+                .expect_err("apply must reject scheduled on a non-VersionDiscovery format");
+            match err {
+                AppError::Domain(DomainError::Validation(msg)) => {
+                    assert!(msg.contains("helm-scheduled"), "got: {msg}");
+                    assert!(msg.contains("scheduled"), "got: {msg}");
+                }
+                other => {
+                    panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}")
+                }
+            }
+        });
+    }
+
+    /// `on_dist_tag_move` never requires `VersionDiscovery` — OCI fires it
+    /// today with no such implementation. A repository declaring only
+    /// this trigger on a format absent from the capability set still
+    /// applies cleanly.
+    #[test]
+    fn apply_accepts_on_dist_tag_move_trigger_on_non_version_discovery_format() {
+        use hort_domain::entities::repository::{PrefetchPolicy, PrefetchTrigger};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let h = build_harness();
+            let uc =
+                h.uc.with_version_discovery_capable_formats(["npm".to_string()]);
+            let mut env = repo_env("oci-tag-move", "proxy");
+            env.spec.format = "oci".into();
+            env.spec.prefetch_policy = PrefetchPolicy {
+                enabled: true,
+                triggers: vec![PrefetchTrigger::OnDistTagMove],
+                ..PrefetchPolicy::default()
+            };
+            let mut desired = DesiredState::default();
+            desired.repositories.push(env);
+            uc.apply(desired, env_oidc())
+                .await
+                .expect("on_dist_tag_move must apply cleanly on any format");
+        });
+    }
+
+    /// A `transitive_deps` trigger on a format the wired capability set
+    /// DOES include applies cleanly.
+    #[test]
+    fn apply_accepts_transitive_deps_trigger_on_version_discovery_format() {
+        use hort_domain::entities::repository::{PrefetchPolicy, PrefetchTrigger};
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let h = build_harness();
+            let uc =
+                h.uc.with_version_discovery_capable_formats(["npm".to_string()]);
+            let mut env = repo_env("npm-transitive", "proxy");
+            env.spec.prefetch_policy = PrefetchPolicy {
+                enabled: true,
+                triggers: vec![PrefetchTrigger::TransitiveDeps],
+                ..PrefetchPolicy::default()
+            };
+            let mut desired = DesiredState::default();
+            desired.repositories.push(env);
+            uc.apply(desired, env_oidc())
+                .await
+                .expect("transitive_deps must apply cleanly on a VersionDiscovery-capable format");
+        });
+    }
+
+    /// `build_harness`'s default capability set (`{"npm"}`) is itself the
+    /// live proof the rule is not skippable: a `transitive_deps` trigger
+    /// on maven — a format absent from that default, with no override —
+    /// is rejected through the harness's own baseline construction, not
+    /// through a test-specific opt-in.
+    #[test]
+    fn apply_rejects_trigger_on_non_capable_format_via_harness_default_capability_set() {
+        use hort_domain::entities::repository::{PrefetchPolicy, PrefetchTrigger};
+
+        use crate::metrics::capture_metrics;
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut env = repo_env("maven-default-set", "proxy");
+                env.spec.format = "maven".into();
+                env.spec.prefetch_policy = PrefetchPolicy {
+                    enabled: true,
+                    triggers: vec![PrefetchTrigger::TransitiveDeps],
+                    ..PrefetchPolicy::default()
+                };
+                let mut desired = DesiredState::default();
+                desired.repositories.push(env);
+                captured_err = Some(h.uc.apply(desired, env_oidc()).await.expect_err(
+                    "the harness's own default capability set must reject a non-capable format",
+                ));
+            });
+        });
+        let err = captured_err.expect("apply must have errored");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(msg.contains("maven-default-set"), "got: {msg}");
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+        let entries = snap.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &entries,
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "prefetch_trigger_requires_version_discovery"),
+                    ("result", "reject"),
+                ],
+            ),
+            1,
+            "linter metric must tick once — the rule is not skippable",
+        );
+    }
+
+    // ===================================================================
     // `StaticConfigValidator` extraction.
     // (a) No-drift parity: the apply pre-write pass's static subset
     //     and `StaticConfigValidator::validate` agree on the reject SET
@@ -5903,12 +6185,29 @@ mod tests {
                     crate::storage_backend::EffectiveStorageBackend::Filesystem,
                 ),
             },
+            // Row 7c — `osv` paired with an OCI repository (no SBOM
+            // source, so the backend can never produce a verdict there).
+            Case {
+                desired: DesiredState {
+                    repositories: vec![repo_env_with_format("oci-proxy", "proxy", "oci")],
+                    scan_policies: vec![scan_policy_with_repo_scope_and_backends(
+                        "p-oci-osv",
+                        "oci-proxy",
+                        vec!["osv"],
+                    )],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::ScanBackendCapability,
+                effective_backend: None,
+            },
         ];
 
         for case in cases {
             // The pure validator's first-error-in-row-order rule.
             let validator = StaticConfigValidator::new(
                 Arc::new(["oci".to_string()].into_iter().collect()),
+                // No case in this corpus exercises row 6b.
+                Arc::new(HashSet::new()),
                 case.effective_backend,
             );
             let report = validator.validate(&case.desired);
@@ -6044,6 +6343,8 @@ mod tests {
             // --- offline validator (row 8 enabled) ---
             let validator = StaticConfigValidator::new(
                 Arc::new(["oci".to_string()].into_iter().collect()),
+                // No case in this corpus exercises row 6b.
+                Arc::new(HashSet::new()),
                 None,
             )
             .with_grant_lint_base(crate::lint::LintConfig::default());

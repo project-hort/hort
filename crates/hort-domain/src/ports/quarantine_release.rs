@@ -124,9 +124,7 @@ mod tests {
                 Box::pin(async move {
                     Ok(ReleaseExpiredSummary {
                         released: ids,
-                        skipped_no_scan_authority: 0,
-                        skipped_provenance_pending: 0,
-                        held_parent_gated: 0,
+                        ..Default::default()
                     })
                 })
             }
@@ -156,22 +154,16 @@ mod tests {
     #[test]
     fn release_expired_summary_counters_are_independent() {
         let provenance_only = ReleaseExpiredSummary {
-            released: Vec::new(),
-            skipped_no_scan_authority: 0,
             skipped_provenance_pending: 7,
-            held_parent_gated: 0,
+            ..Default::default()
         };
         let authority_only = ReleaseExpiredSummary {
-            released: Vec::new(),
             skipped_no_scan_authority: 7,
-            skipped_provenance_pending: 0,
-            held_parent_gated: 0,
+            ..Default::default()
         };
         let parent_gated_only = ReleaseExpiredSummary {
-            released: Vec::new(),
-            skipped_no_scan_authority: 0,
-            skipped_provenance_pending: 0,
             held_parent_gated: 7,
+            ..Default::default()
         };
         assert_ne!(provenance_only, authority_only);
         assert_ne!(provenance_only, parent_gated_only);

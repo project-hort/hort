@@ -159,6 +159,7 @@ fn fresh_artifact() -> Artifact {
         rejection_reason: None,
         quarantine_window_start: None,
         quarantine_deadline: None,
+        provenance_hold_indefinite: false,
         deleted_at: None,
         upstream_published_at: None,
         uploaded_by: None,
@@ -187,8 +188,6 @@ fn reject_violation() -> ScanOutcome {
 struct Aux {
     provenance_mode: ProvenanceMode,
     window_open: bool,
-    is_referenced_descendant: bool,
-    is_constituent: bool,
     curation_blocked: bool,
     provenance_verified: bool,
 }
@@ -198,8 +197,6 @@ impl Aux {
         Aux {
             provenance_mode: ProvenanceMode::Off,
             window_open: false,
-            is_referenced_descendant: false,
-            is_constituent: false,
             curation_blocked: false,
             provenance_verified: false,
         }
@@ -248,8 +245,6 @@ enum Action {
     ProvenanceNoAttestation,
     CascadeClearance,
     ElapseWindow,
-    SetDescendant(bool),
-    SetConstituent(bool),
     SetCurationBlocked(bool),
     SetProvenanceMode(ProvenanceMode),
     ReleaseAdmin,
@@ -282,8 +277,6 @@ fn action_strategy() -> impl Strategy<Value = Action> {
         Just(Action::ProvenanceNoAttestation),
         Just(Action::CascadeClearance),
         Just(Action::ElapseWindow),
-        any::<bool>().prop_map(Action::SetDescendant),
-        any::<bool>().prop_map(Action::SetConstituent),
         any::<bool>().prop_map(Action::SetCurationBlocked),
         provenance_mode_strategy().prop_map(Action::SetProvenanceMode),
         Just(Action::ReleaseAdmin),
@@ -321,11 +314,7 @@ fn event_for(action: Action) -> Option<QuarantineEvent> {
         }
         Action::ReleaseCuratorWaiver => Some(QuarantineEvent::ReleaseCuratorWaiver),
         Action::ReEvaluate => Some(QuarantineEvent::ReEvaluate),
-        Action::ElapseWindow
-        | Action::SetDescendant(_)
-        | Action::SetConstituent(_)
-        | Action::SetCurationBlocked(_)
-        | Action::SetProvenanceMode(_) => None,
+        Action::ElapseWindow | Action::SetCurationBlocked(_) | Action::SetProvenanceMode(_) => None,
     }
 }
 
@@ -362,34 +351,16 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
             .fail_scan_indeterminate("trivy".into(), "exhausted".into(), 3)
             .is_ok(),
         Action::ProvenanceVerify => artifact
-            .complete_provenance(
-                ProvenanceVerdict::verified(fixed_signer(), None),
-                aux.provenance_mode,
-                "cosign",
-                aux.window_open,
-                aux.is_referenced_descendant,
-                aux.is_constituent,
-            )
+            .complete_provenance(ProvenanceVerdict::verified(fixed_signer(), None), "cosign")
             .is_ok(),
         Action::ProvenanceReject => artifact
             .complete_provenance(
                 ProvenanceVerdict::rejected(ProvenanceRejectReason::UntrustedIdentity),
-                aux.provenance_mode,
                 "cosign",
-                aux.window_open,
-                aux.is_referenced_descendant,
-                aux.is_constituent,
             )
             .is_ok(),
         Action::ProvenanceNoAttestation => artifact
-            .complete_provenance(
-                ProvenanceVerdict::no_attestation(),
-                aux.provenance_mode,
-                "cosign",
-                aux.window_open,
-                aux.is_referenced_descendant,
-                aux.is_constituent,
-            )
+            .complete_provenance(ProvenanceVerdict::no_attestation(), "cosign")
             .is_ok(),
         Action::CascadeClearance => artifact
             .cascade_provenance_clearance(fixed_hash(), fixed_signer(), None, "cosign")
@@ -432,11 +403,9 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
                 aux.curation_clearance(),
             )
             .is_ok(),
-        Action::ElapseWindow
-        | Action::SetDescendant(_)
-        | Action::SetConstituent(_)
-        | Action::SetCurationBlocked(_)
-        | Action::SetProvenanceMode(_) => unreachable!("pure aux actions never call perform"),
+        Action::ElapseWindow | Action::SetCurationBlocked(_) | Action::SetProvenanceMode(_) => {
+            unreachable!("pure aux actions never call perform")
+        }
     }
 }
 
@@ -455,11 +424,7 @@ fn run_walk(actions: &[Action]) {
     for &action in actions {
         if matches!(
             action,
-            Action::ElapseWindow
-                | Action::SetDescendant(_)
-                | Action::SetConstituent(_)
-                | Action::SetCurationBlocked(_)
-                | Action::SetProvenanceMode(_)
+            Action::ElapseWindow | Action::SetCurationBlocked(_) | Action::SetProvenanceMode(_)
         ) {
             match action {
                 Action::ElapseWindow => {
@@ -468,8 +433,6 @@ fn run_walk(actions: &[Action]) {
                         artifact.quarantine_deadline = Some(past_deadline());
                     }
                 }
-                Action::SetDescendant(b) => aux.is_referenced_descendant = b,
-                Action::SetConstituent(b) => aux.is_constituent = b,
                 Action::SetCurationBlocked(b) => aux.curation_blocked = b,
                 Action::SetProvenanceMode(m) => aux.provenance_mode = m,
                 _ => unreachable!(),
@@ -551,9 +514,6 @@ fn run_walk(actions: &[Action]) {
                 }
                 Action::ProvenanceVerify => aux.provenance_verified = true,
                 Action::ProvenanceReject => aux.provenance_verified = false,
-                Action::ProvenanceNoAttestation if after_status == QuarantineStatus::Rejected => {
-                    aux.provenance_verified = false;
-                }
                 Action::CascadeClearance => aux.provenance_verified = true,
                 Action::ReEvaluate if after_status == QuarantineStatus::Quarantined => {
                     // Re-quarantine preserves the original (still-open) window.
@@ -590,11 +550,7 @@ fn run_walk(actions: &[Action]) {
                 let ok = artifact
                     .complete_provenance(
                         ProvenanceVerdict::verified(fixed_signer(), None),
-                        aux.provenance_mode,
                         "cosign",
-                        aux.window_open,
-                        aux.is_referenced_descendant,
-                        aux.is_constituent,
                     )
                     .is_ok();
                 assert!(ok, "a pending provenance verify must always be acceptable");
@@ -636,11 +592,7 @@ fn run_walk(actions: &[Action]) {
                     let ok = artifact
                         .complete_provenance(
                             ProvenanceVerdict::verified(fixed_signer(), None),
-                            aux.provenance_mode,
                             "cosign",
-                            aux.window_open,
-                            aux.is_referenced_descendant,
-                            aux.is_constituent,
                         )
                         .is_ok();
                     assert!(ok);

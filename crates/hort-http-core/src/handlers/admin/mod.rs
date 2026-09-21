@@ -6,6 +6,7 @@
 //! - `GET    /gitops/apply-status`                        — this process's boot apply (read-only)
 //! - `GET    /quarantine/patch-candidates`                — list patch-candidate surface
 //! - `POST   /quarantine/:artifact_id/release`            — admin override release
+//! - `POST   /quarantine/provenance-misrejections/repair` — one-shot repair of D6's illegal state (dry-run by default)
 //!
 //! Mounted under `/api/v1/admin` by [`crate::router::build_router`].
 //! Every handler
@@ -87,6 +88,13 @@ pub mod curation;
 /// `admin_routes()` tree.
 pub mod policies;
 
+/// The one-shot corrective path for artifacts stranded `Rejected` with no
+/// `ArtifactRejected` behind them (ADR 0039's 2026-09-12 amendment, D6).
+/// Unlike [`curation`] and [`policies`], this one IS part of this
+/// module's [`AdminPrincipal`]-gated `admin_routes()` tree — see the
+/// module's own docs for why the admin gate rather than the curator one.
+pub mod provenance_misrejections;
+
 /// Maximum byte length of the operator-supplied justification on
 /// `POST /admin/quarantine/:artifact_id/release`. Mirrors the
 /// 512-byte cap enforced by [`hort_domain::events::ArtifactReleased::validate`]
@@ -134,6 +142,18 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
         .route(
             "/quarantine/{artifact_id}/release",
             post(post_quarantine_release),
+        )
+        // One-shot corrective path for the artifacts the pre-amendment
+        // provenance arm stranded in an illegal terminal state (ADR 0039's
+        // 2026-09-12 amendment, D6). Dry-run by default: an absent or
+        // `dry_run`-less body reports the affected set and writes nothing.
+        // Admin-gated rather than curator-gated on purpose — it withdraws
+        // a structurally invalid rejection rather than making a curation
+        // decision, and ADR 0038's non-admin service accounts are what
+        // keep it out of pipelines.
+        .route(
+            "/quarantine/provenance-misrejections/repair",
+            post(provenance_misrejections::post_repair_provenance_misrejections),
         )
         // Admin-only effective-permissions
         // inspection. Gated by the `AdminPrincipal` extractor (same

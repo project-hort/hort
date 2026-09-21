@@ -62,7 +62,11 @@ spec:
             # `admin_task_invoke` grant, instead of minting a token that
             # every admin-task CronJob then 403s on at run time. The grant
             # is operator-declared gitops (see the `adminTasksEnabled`
-            # comment in values.yaml) — this chart never provisions it.
+            # comment in values.yaml) — this chart never provisions it. The
+            # check always runs; authorityRepository only aims it: set, it
+            # checks that repository's scope; unset, the bare flag's scope
+            # follows `repository` above (global if that is also unset) —
+            # the byte-compatible default this chart has always rendered.
             - --require-authority
           env:
             # Canonical HORT_DATABASE_URL (the binary falls back to bare

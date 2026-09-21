@@ -1,0 +1,18 @@
+# PermissionGrant: [developer, ci-pusher] -> write oci-trivy-e2e
+# (dev-user skopeo push via --dest-creds, legacy/no-overlay mode of
+# scripts/native-tests/scenarios/quarantine/trivy-oci-not-applicable.sh).
+# Mirror of dev-write-oci-quarantine-e2e.yaml — per-repo + two-claim
+# subject passes the allowlist linter. Rationale: see ci-pushers.yaml.
+#
+# No read grant is needed: the repository is public, and the scenario's
+# post-window pull leg is deliberately anonymous.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: dev-write-oci-trivy-e2e
+spec:
+  subject:
+    kind: claims
+    required: [developer, ci-pusher]
+  permission: write
+  repository: oci-trivy-e2e

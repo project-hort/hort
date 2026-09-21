@@ -216,6 +216,75 @@ impl ScanRequested {
     }
 }
 
+/// What kind of assessment a [`ScanCompleted`] records.
+///
+/// An empty `finding_count` means two very different things and the
+/// audit trail has to be able to tell them apart: a backend looked at a
+/// package surface and found nothing wrong, versus there was no package
+/// surface to look at. Both open the release gate — an artifact that
+/// structurally cannot carry a package vulnerability is outside the scan
+/// axis, so the time gate alone governs it — but only the first is a
+/// clean verdict, and reporting the second as one would overstate what
+/// was actually checked.
+///
+/// The code-level definition of "no package surface" is
+/// [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable);
+/// the other `NotAnalysable` variants are an *expected* surface that
+/// could not be assessed and still fail closed, so they never reach this
+/// type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanAssessment {
+    /// A backend examined the artifact. An empty finding set here **is**
+    /// a clean verdict and carries the release authority of one. The
+    /// `#[serde(default)]` value, so every event written before this
+    /// field existed reads back as what it was: an analysed scan.
+    #[default]
+    Analysed,
+    /// The artifact carries no package surface by construction — an OCI
+    /// manifest row, a non-tar OCI blob such as the image config — so
+    /// every configured backend abstained with
+    /// [`NotAnalysable::NotApplicable`](crate::ports::scanner::NotAnalysable::NotApplicable).
+    /// A completed assessment with nothing to assess: scan authority
+    /// exists, `finding_count` is necessarily zero, and the trail says
+    /// "not applicable" rather than "analysed, clean".
+    NotApplicable,
+}
+
+impl ScanAssessment {
+    /// Stable lowercase identifier for logs, metric labels and the job
+    /// result summary. Matches the serde wire form.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Analysed => "analysed",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+
+    /// True when this assessment records that there was nothing to
+    /// assess rather than an examination that came back clean.
+    #[must_use]
+    pub fn is_not_applicable(&self) -> bool {
+        matches!(self, Self::NotApplicable)
+    }
+
+    /// True for the default assessment. Exists as a named predicate
+    /// because it is [`ScanCompleted::assessment`]'s
+    /// `skip_serializing_if` — see that field for why the default must
+    /// leave no trace on the wire.
+    #[must_use]
+    pub fn is_analysed(&self) -> bool {
+        matches!(self, Self::Analysed)
+    }
+}
+
+impl std::fmt::Display for ScanAssessment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Aggregate scan-result event for a single scanner backend run against
 /// an artifact. Carries fast aggregate counts (`finding_count`,
 /// `severity_summary`) inline for O(1) projection updates and a
@@ -227,6 +296,9 @@ impl ScanRequested {
 ///   reference a blob; non-clean scans always do. A `Some` paired with
 ///   zero findings (or a `None` paired with positive findings) is a bug.
 /// - `severity_summary.sum() == finding_count` — independent invariant.
+/// - `assessment == NotApplicable` implies `finding_count == 0` — there
+///   was no surface to assess, so a finding attributed to it could not
+///   have come from anywhere.
 ///
 /// # `findings_blob` layout
 ///
@@ -239,12 +311,16 @@ impl ScanRequested {
 ///
 /// # Schema evolution
 ///
-/// `findings_blob` carries `#[serde(default)]` for forward-compat,
-/// matching the
+/// `findings_blob` and `assessment` carry `#[serde(default)]` for
+/// forward-compat, matching the
 /// `UpstreamPublishedChecksum::deserialize_without_re_validating`
 /// precedent: every event payload must accept any shape that was once
 /// written, in case in-flight test fixtures or replay logs still carry
-/// an older shape.
+/// an older shape. An event written before `assessment` existed reads
+/// back as [`ScanAssessment::Analysed`], which is what it was — and
+/// re-serialises to the same bytes it was hashed with, because
+/// `assessment` also carries `skip_serializing_if`. See that field for
+/// why the event chain makes that mandatory rather than cosmetic.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanCompleted {
     pub artifact_id: Uuid,
@@ -256,6 +332,26 @@ pub struct ScanCompleted {
     /// invariant and the `#[serde(default)]` rationale.
     #[serde(default)]
     pub findings_blob: Option<ContentHash>,
+    /// Whether this scan examined a package surface or recorded that
+    /// there was none to examine. See [`ScanAssessment`].
+    ///
+    /// **`skip_serializing_if` is load-bearing, not a size
+    /// optimisation.** The tamper-evident event chain (ADR 0002) hashes
+    /// `canonical_payload_bytes(typed DomainEvent)`, and verification
+    /// *re-derives* those bytes by deserialising the stored payload and
+    /// serialising it again. A field that always writes a key would
+    /// therefore make every `ScanCompleted` appended before this field
+    /// existed re-serialise to different bytes than it was hashed
+    /// with — a `HashMismatch` on every such stream, indistinguishable
+    /// from tampering, on a verifier that is default-on (ADR 0057).
+    /// Skipping the default value keeps the historical payload byte-identical:
+    /// only the new, non-default `not_applicable` state adds a key, and
+    /// it only ever appears on events written after this field existed.
+    /// Round-trip identity is preserved in both directions (absent ⇒
+    /// `Analysed` ⇒ absent; present ⇒ `NotApplicable` ⇒ present), which
+    /// is what `canonical_payload_bytes_round_trip_all_variants` pins.
+    #[serde(default, skip_serializing_if = "ScanAssessment::is_analysed")]
+    pub assessment: ScanAssessment,
 }
 
 impl ScanCompleted {
@@ -285,6 +381,15 @@ impl ScanCompleted {
                 ));
             }
             _ => {}
+        }
+        // Invariant: "nothing to assess" cannot carry a finding. A
+        // finding attributed to an artifact with no package surface has
+        // no producer that could have found it.
+        if self.assessment.is_not_applicable() && self.finding_count > 0 {
+            return Err(DomainError::Validation(format!(
+                "ScanCompleted is not_applicable but carries {} findings",
+                self.finding_count
+            )));
         }
         Ok(())
     }
@@ -518,6 +623,19 @@ pub enum ReEvaluationTrigger {
     /// "an operator asked for this," which the loosen-direction
     /// population pass can never say about itself.
     CuratorRequested,
+    /// An operator invoked the corrective path out of the illegal state
+    /// ADR 0039's 2026-09-12 amendment (D6) names —
+    /// [`Artifact::repair_provenance_misrejection`](crate::entities::artifact::Artifact::repair_provenance_misrejection).
+    /// Like [`Self::CuratorRequested`] there is no policy-side change to
+    /// name: nothing about the policy or its exclusions moved, and no
+    /// scan evidence was re-judged. What happened is that a `Rejected`
+    /// status with no `ArtifactRejected` behind it — contradicted by a
+    /// `ProvenanceVerified` on the same stream — was returned to the
+    /// hold. Distinct from `CuratorRequested` so an audit query can tell
+    /// "a curator asked for a re-judgement" apart from "an operator
+    /// repaired a structurally invalid rejection"; the operator's
+    /// identity rides the append envelope's `actor`.
+    ProvenanceMisrejectionRepair,
 }
 
 /// Audit record for a re-evaluation pass decision (ADR 0041).
@@ -532,11 +650,20 @@ pub enum ReEvaluationTrigger {
 /// [`ArtifactQuarantined`] / [`ArtifactReleased`] / [`ArtifactRejected`]
 /// events on the same stream.
 ///
-/// `trigger` is the [`ReEvaluationTrigger`] discriminator naming which
-/// policy-change event drove the pass (invariant #3) — answers "what
-/// loosened/tightened this artifact?" without re-running the evaluator.
+/// Also emitted for the two **operator-invoked** transitions that have no
+/// policy-side change to name — the curator's single-artifact
+/// re-evaluation ([`ReEvaluationTrigger::CuratorRequested`]) and the
+/// corrective path out of D6's illegal state
+/// ([`ReEvaluationTrigger::ProvenanceMisrejectionRepair`]) — so the
+/// "every transition that happened" audit projection stays complete
+/// whatever drove the transition.
+///
+/// `trigger` is the [`ReEvaluationTrigger`] discriminator naming what
+/// drove the pass (invariant #3) — answers "what loosened/tightened this
+/// artifact?" without re-running the evaluator.
 /// `policy_id` is the policy the pass evaluated against, for symmetry
-/// with [`PolicyEvaluated`].
+/// with [`PolicyEvaluated`]; the operator-invoked triggers carry
+/// [`NO_POLICY`] since no policy was consulted.
 ///
 /// # Schema evolution (ADR 0002, append-only)
 ///
@@ -912,6 +1039,122 @@ pub enum RejectionReason {
     Curator {
         curator_id: Uuid,
     },
+    /// A **positive disproof** on the provenance axis: a signature that is
+    /// present and invalid — signed by an untrusted key, bound to a
+    /// different digest, a broken certificate chain, a malformed bundle.
+    /// Set by
+    /// [`Artifact::complete_provenance`](crate::entities::artifact::Artifact::complete_provenance)'s
+    /// `Rejected` arm, which appends this `ArtifactRejected` alongside the
+    /// axis-specific `ProvenanceRejected` so the terminal
+    /// `quarantine_status` has a terminal event behind it (ADR 0039's
+    /// 2026-09-12 amendment, D6 — a status is a projection, the stream is
+    /// the record).
+    ///
+    /// A **missing** signature never produces this: absence of evidence is
+    /// a statement about a point in time, so it holds (`Quarantined`)
+    /// rather than rejecting (same amendment, D1).
+    ///
+    /// **Not scan-clearable (ADR 0041 invariant #6(a)).** A forged
+    /// signature does not become acceptable because a scan later passed, so
+    /// [`is_scan_clearable`](crate::entities::artifact::is_scan_clearable)
+    /// refuses it — as it already refused the reason-less rejection this
+    /// event replaces.
+    Provenance,
+    /// The CAS integrity scrub re-streamed the stored bytes and they did
+    /// not hash to the artifact's content hash. Set by
+    /// [`Artifact::tombstone_from_corruption`](crate::entities::artifact::Artifact::tombstone_from_corruption),
+    /// which appends this `ArtifactRejected` alongside the axis-specific
+    /// `ArtifactCorrupted` so the terminal `quarantine_status` has a
+    /// terminal event behind it (ADR 0039's 2026-09-12 amendment, D6).
+    ///
+    /// A **unit** variant, like [`Provenance`](Self::Provenance): the
+    /// mismatching hashes are on the companion
+    /// [`ArtifactCorrupted`] event, so a payload here would only duplicate
+    /// them.
+    ///
+    /// **Not scan-clearable (ADR 0041 invariant #6(a)).** Bytes that do
+    /// not match their content hash do not become servable because a scan
+    /// later passed — there is nothing a scanner can observe that bears on
+    /// a hash mismatch at all. The admin-release override remains the
+    /// human-review escape hatch for a false positive (e.g. the operator
+    /// restored the blob from a known-good backup).
+    Corruption,
+}
+
+impl RejectionReason {
+    /// One sample of **every** variant, in declaration order — the single
+    /// source the rejection-reason discriminator vocabulary is derived
+    /// from.
+    ///
+    /// The curation-queue projection reads `ArtifactRejected.rejected_by`
+    /// off the stream and renders a discriminator
+    /// ([`Self::wire_kind`]); the admin queue's `?reason=` filter must
+    /// accept exactly that vocabulary, or an operator gets a `400` for
+    /// rows that demonstrably exist. Deriving both ends from this list
+    /// removes the hand-copied second list that produced exactly that
+    /// trap for `provenance`, `admin` and `scan_policy_retroactive`.
+    ///
+    /// Payload-carrying variants use nil ids: only the discriminator is
+    /// read from a sample, never the payload.
+    pub const ALL_KIND_SAMPLES: &'static [RejectionReason] = &[
+        RejectionReason::Scanner,
+        RejectionReason::Admin,
+        RejectionReason::CurationRetroactive {
+            rule_id: Uuid::nil(),
+        },
+        RejectionReason::ScanPolicyRetroactive,
+        RejectionReason::Curator {
+            curator_id: Uuid::nil(),
+        },
+        RejectionReason::Provenance,
+        RejectionReason::Corruption,
+    ];
+
+    /// The **serialised** discriminator: the JSON key serde writes for
+    /// this variant (a bare string for a unit variant, the single object
+    /// key for a payload-carrying one). This is what the curation-queue
+    /// projection reads out of the event JSONB.
+    ///
+    /// Exhaustive `match`, **no wildcard arm** — a new variant fails this
+    /// to compile until its discriminator and its wire form are both
+    /// decided here.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Scanner => "Scanner",
+            Self::Admin => "Admin",
+            Self::CurationRetroactive { .. } => "CurationRetroactive",
+            Self::ScanPolicyRetroactive => "ScanPolicyRetroactive",
+            Self::Curator { .. } => "Curator",
+            Self::Provenance => "Provenance",
+            Self::Corruption => "Corruption",
+        }
+    }
+
+    /// The **operator-facing** discriminator: the lowercase / snake_case
+    /// form the curation-queue row renders and the `?reason=` filter
+    /// accepts. Exhaustive `match`, no wildcard arm.
+    pub fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::Scanner => "scanner",
+            Self::Admin => "admin",
+            Self::CurationRetroactive { .. } => "curation_retroactive",
+            Self::ScanPolicyRetroactive => "scan_policy_retroactive",
+            Self::Curator { .. } => "curator",
+            Self::Provenance => "provenance",
+            Self::Corruption => "corruption",
+        }
+    }
+
+    /// Every wire discriminator the projection can emit, derived from
+    /// [`Self::ALL_KIND_SAMPLES`]. Callers that need a closed accepted
+    /// set (the admin queue filter) build it from here rather than
+    /// restating one.
+    pub fn all_wire_kinds() -> Vec<&'static str> {
+        Self::ALL_KIND_SAMPLES
+            .iter()
+            .map(RejectionReason::wire_kind)
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1823,5 +2066,74 @@ mod re_evaluated_event_tests {
         let back: ArtifactRejected = serde_json::from_value(json).unwrap();
         assert_eq!(ev, back);
         assert_eq!(back.rejected_by, RejectionReason::ScanPolicyRetroactive);
+    }
+
+    /// The provenance-disproof companion's wire form. A **unit** variant,
+    /// so it serialises as the bare string discriminator — which is the
+    /// shape the curation-queue projection's JSONB `CASE` keys on
+    /// (`jsonb_typeof(... ->'rejected_by') = 'string'`); a tuple variant
+    /// would land in the object branch instead.
+    #[test]
+    fn provenance_rejection_reason_round_trips_inside_artifact_rejected() {
+        let reason = RejectionReason::Provenance;
+        assert_eq!(
+            serde_json::to_value(&reason).unwrap(),
+            serde_json::json!("Provenance")
+        );
+
+        let ev = ArtifactRejected {
+            artifact_id: Uuid::from_u128(2),
+            rejected_by: reason,
+            reason: "provenance verification failed (UntrustedIdentity) — backend cosign".into(),
+        };
+        ev.validate().expect("valid");
+        let json = serde_json::to_value(&ev).unwrap();
+        let back: ArtifactRejected = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+        assert_eq!(back.rejected_by, RejectionReason::Provenance);
+    }
+
+    /// The CAS-corruption companion's wire form — the sibling of
+    /// `provenance_rejection_reason_round_trips_inside_artifact_rejected`
+    /// and pinned for the same reason. A **unit** variant, so it
+    /// serialises as the bare string discriminator, which is the shape the
+    /// curation-queue projection's JSONB `CASE` keys on
+    /// (`jsonb_typeof(... ->'rejected_by') = 'string'`); a tuple variant
+    /// would land in the object branch instead, and the difference is one
+    /// the adapter cannot tell you about until a row exists.
+    #[test]
+    fn corruption_rejection_reason_round_trips_inside_artifact_rejected() {
+        let reason = RejectionReason::Corruption;
+        assert_eq!(
+            serde_json::to_value(&reason).unwrap(),
+            serde_json::json!("Corruption")
+        );
+
+        let ev = ArtifactRejected {
+            artifact_id: Uuid::from_u128(3),
+            rejected_by: reason,
+            reason: "CAS integrity mismatch".into(),
+        };
+        ev.validate().expect("valid");
+        let json = serde_json::to_value(&ev).unwrap();
+        let back: ArtifactRejected = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+        assert_eq!(back.rejected_by, RejectionReason::Corruption);
+    }
+
+    /// Both halves of the discriminator vocabulary agree for the new
+    /// variant: the serialised form is its `variant_name()`, and the
+    /// operator-facing form is its `wire_kind()`. The adapter's SQL `CASE`
+    /// maps the first to the second, so a disagreement here is what makes
+    /// `?reason=corruption` match nothing.
+    #[test]
+    fn corruption_discriminators_match_its_serialised_form() {
+        let reason = RejectionReason::Corruption;
+        assert_eq!(
+            serde_json::to_value(&reason).unwrap(),
+            serde_json::json!(reason.variant_name())
+        );
+        assert_eq!(reason.wire_kind(), "corruption");
+        assert!(RejectionReason::all_wire_kinds().contains(&"corruption"));
     }
 }

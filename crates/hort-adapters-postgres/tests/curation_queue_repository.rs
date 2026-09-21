@@ -619,13 +619,89 @@ async fn list_queue_lateral_extracts_rejection_reason_curation_retroactive() {
     cleanup_repo(&pool, repo_id).await;
 }
 
+/// **A corruption-tombstoned artifact surfaces WITH a reason.** Before the
+/// CAS-integrity tombstone appended its `ArtifactRejected{Corruption}`
+/// companion (ADR 0039's 2026-09-12 amendment, D6), the LATERAL found no
+/// `ArtifactRejected` on such a stream at all and the curator saw a
+/// `rejected` row whose reason column was NULL — no way to tell it apart
+/// from any other unexplained rejection.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_lateral_extracts_rejection_reason_corruption() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = Utc::now();
+    let id = seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
+    // Unit variant: bare-string payload — the same branch of the `CASE`
+    // the scanner/provenance reasons land in.
+    seed_artifact_rejected_event(&pool, id, 0, json!("Corruption")).await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            status: Some(QuarantineStatus::Rejected),
+            ..CurationQueueFilter::default()
+        })
+        .await
+        .expect("list_queue");
+    let row = rows
+        .into_iter()
+        .find(|r| r.artifact_id == id)
+        .expect("corruption-tombstoned artifact must surface");
+    assert_eq!(
+        row.rejection_reason_kind.as_deref(),
+        Some("corruption"),
+        "a curator must see WHY a corruption-tombstoned artifact is rejected"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+/// The `?reason=corruption` filter reaches exactly the corruption rows.
+/// The filter and the output column are computed by the same SQL
+/// expression, so this also pins their case-symmetry for the new arm.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_filter_by_rejection_reason_kind_corruption() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "npm").await;
+    let now = Utc::now();
+    let id_corrupt =
+        seed_artifact(&pool, repo_id, "p", "1.0", Some("rejected"), now, Some(now)).await;
+    seed_artifact_rejected_event(&pool, id_corrupt, 0, json!("Corruption")).await;
+    let id_scanner =
+        seed_artifact(&pool, repo_id, "p", "2.0", Some("rejected"), now, Some(now)).await;
+    seed_artifact_rejected_event(&pool, id_scanner, 0, json!("Scanner")).await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            status: Some(QuarantineStatus::Rejected),
+            rejection_reason_kind: Some("corruption".into()),
+            ..CurationQueueFilter::default()
+        })
+        .await
+        .expect("list_queue");
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.artifact_id).collect();
+    assert!(ids.contains(&id_corrupt), "corruption row must match");
+    assert!(!ids.contains(&id_scanner), "scanner row must not match");
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
 // ---------------------------------------------------------------------------
 // Test 8 — `rejection_reason_kind` filter narrows to matching rows.
 //
 // **Spec-compliance test.** The filter value is the *lowercase* wire format
 // the curation queue design specifies — the same strings the HTTP query
-// param `?reason=<kind>` and the `hort-cli` flag
-// `--reason <scanner|curator|curation_retroactive|corruption>` accept,
+// param `?reason=<kind>` and the `hort-cli` `--reason` flag accept (both
+// derived from `RejectionReason`'s own vocabulary rather than restated),
 // and the same strings the output `rejection_reason_kind` column
 // normalises to.
 //

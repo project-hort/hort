@@ -827,9 +827,9 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chacha20"
-version = "0.10.0"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f8d983286843e49675a4b7a2d174efe136dc93a18d69130dd18198a6c167601"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.0",
@@ -891,9 +891,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.6"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
+checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -901,9 +901,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.6"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
+checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
 dependencies = [
  "anstream",
  "anstyle",
@@ -913,9 +913,9 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.6.9"
+version = "4.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
+checksum = "037e2a1a92236d0aff7e845093f64661d6df4c02c9fcc61a60e9e1d736fa392f"
 dependencies = [
  "clap",
  "clap_lex",
@@ -925,9 +925,9 @@ dependencies = [
 
 [[package]]
 name = "clap_derive"
-version = "4.6.4"
+version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d012d2b9d65aca7f18f4d9878a045bc17899bba951561ba5ec3c2ba1eed9a061"
+checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
 dependencies = [
  "heck",
  "proc-macro2",
@@ -977,7 +977,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1550,7 +1550,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1782,7 +1782,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-advisory-osv"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-checkpoint-anchor"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2467,7 +2467,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-ephemeral-memory"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-ephemeral-redis"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-kubernetes"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -2516,7 +2516,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-oidc"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -2526,7 +2526,7 @@ dependencies = [
  "futures",
  "hort-config",
  "hort-domain",
- "jsonwebtoken 11.0.0",
+ "jsonwebtoken 11.1.0",
  "metrics",
  "metrics-util",
  "rcgen",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-postgres"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "hort-app",
@@ -2565,7 +2565,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-provenance-cosign-key"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "hort-domain",
  "p256 0.14.0",
@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-provenance-sigstore"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-scanner-osv"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "cvss",
@@ -2617,22 +2617,25 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-scanner-trivy"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
+ "flate2",
  "futures",
  "hort-domain",
  "serde",
  "serde_json",
+ "tar",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]
 name = "hort-adapters-secrets"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "hort-domain",
  "metrics",
@@ -2647,7 +2650,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-storage"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "futures",
@@ -2671,7 +2674,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-upstream-http"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2708,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "hort-app"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -2723,7 +2726,7 @@ dependencies = [
  "hort-config",
  "hort-domain",
  "humantime",
- "jsonwebtoken 11.0.0",
+ "jsonwebtoken 11.1.0",
  "lru",
  "metrics",
  "metrics-util",
@@ -2747,11 +2750,11 @@ dependencies = [
 
 [[package]]
 name = "hort-attribution"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "hort-cli"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2783,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "hort-config"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "hort-domain",
@@ -2799,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "hort-domain"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -2821,7 +2824,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2830,6 +2833,7 @@ dependencies = [
  "hort-app",
  "hort-domain",
  "pep440_rs",
+ "quick-xml",
  "semver",
  "serde",
  "serde_json",
@@ -2844,7 +2848,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats-upstream"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2863,7 +2867,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-admin-security"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2885,7 +2889,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-admin-tasks"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2907,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-cargo"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2940,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2975,7 +2979,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-discovery"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2996,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-events"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3018,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-maven"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3049,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-npm"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3085,7 +3089,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-oci"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3124,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-pypi"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3159,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-subscriptions"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3180,11 +3184,11 @@ dependencies = [
 
 [[package]]
 name = "hort-net-egress"
-version = "0.13.0"
+version = "0.14.0"
 
 [[package]]
 name = "hort-notifier-nats"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-nats",
  "bytes",
@@ -3204,7 +3208,7 @@ dependencies = [
 
 [[package]]
 name = "hort-notifier-webhook"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "hex",
@@ -3228,7 +3232,7 @@ dependencies = [
 
 [[package]]
 name = "hort-server"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3294,7 +3298,7 @@ dependencies = [
 
 [[package]]
 name = "hort-worker"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3492,7 +3496,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3698,9 +3702,9 @@ dependencies = [
 
 [[package]]
 name = "ipnet"
-version = "2.12.1"
+version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
+checksum = "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
 
 [[package]]
 name = "is_executable"
@@ -3762,7 +3766,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3893,9 +3897,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "11.0.0"
+version = "11.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65"
+checksum = "e75fe14a82d81e5f5af639997db37d8b96045938a7ac6ab18cdbe1c7467e05e1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -4353,7 +4357,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4468,7 +4472,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.21.7",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -4531,13 +4535,13 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.14.1"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d354792e39fa5f0009e47623cf8b15b099bf9a652fa55c6f817fe28ac84fea50"
+checksum = "f1796bc93603f78c5760a69f2d58badc9618d22adade0a95385bb2adbae4eb94"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "crc-fast",
@@ -5324,7 +5328,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -5362,9 +5366,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5609,11 +5613,11 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "encoding_rs",
  "futures-channel",
@@ -5762,14 +5766,14 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -5821,7 +5825,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5832,9 +5836,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -6057,7 +6061,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.22.1",
+ "base64 0.21.7",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser",
@@ -6949,7 +6953,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7208,9 +7212,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
 dependencies = [
  "indexmap 2.14.0",
  "serde_core",
@@ -7647,9 +7651,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.26.0"
+version = "1.26.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
+checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -7930,7 +7934,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8299,13 +8303,14 @@ dependencies = [
 
 [[package]]
 name = "wnaf"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab12e7090f27e2ffd9322651492942d50c2926094af30601e1964337db39daf1"
+checksum = "795ca18b3fdb5e62bf982199278341ddcf7ebf7d32e25e212ad05d496e95f6fa"
 dependencies = [
  "ff 0.14.0",
  "group 0.14.0",
  "hybrid-array",
+ "primefield",
 ]
 
 [[package]]

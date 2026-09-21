@@ -25,20 +25,43 @@ producer-side contribution is enqueueing.
 Two outbound ports cover everything that produces vulnerability data.
 
 **`ScannerPort`** (`crates/hort-domain/src/ports/scanner.rs`) is the
-content-adjudicating port: `scan(content_hash, sbom) ->
-Vec<Finding>`, plus a `name()` that must match the identifier
-operators write in `ScanPolicy.scan_backends`, and a `health_check()`
-probed at worker boot. Scanner adapters live in their own crates and
-depend only on `hort-domain`; the orchestrator treats them as opaque
-hash-in, findings-out functions. Two families ship:
+content-adjudicating port: `scan(target, sbom) -> ScanAnalysis`, plus a
+`name()` that must match the identifier operators write in
+`ScanPolicy.scan_backends`, and a `health_check()` probed at worker boot.
+Scanner adapters live in their own crates and depend only on
+`hort-domain`.
+
+The port is **format-aware**, and both halves of its signature are
+load-bearing:
+
+- `ScanTarget` carries the content hash *plus* the artifact's format key,
+  its coordinates, and an `ArtifactKind` — what the bytes are
+  (`MavenJar`, `MavenPom`, `NpmTarball`, `CargoCrate`, `PyWheel`,
+  `PySdist`, `OciBlob`, `OciManifest`, `Other`). A content scanner
+  selects its analyzers by file name and directory layout, so an adapter
+  handed only a hash has no way to write the bytes down under a name any
+  analyzer will look at. The kind comes from the artifact's own format
+  handler (`FormatHandler::scan_kind`), classified from what that handler
+  already knows about its layout — a Maven path's extension, an OCI row's
+  path prefix, the single payload shape npm and cargo publish. A format
+  with no registered handler gets `Other`, which is a refusal rather than
+  a guess.
+- `ScanAnalysis` separates **a verdict** (`Analysed(findings)`, empty or
+  not) from **no verdict** (`NothingAnalysable(reason)`). See
+  *["Nothing analysable" is not "clean"](#nothing-analysable-is-not-clean)*
+  below for why a `Vec<Finding>` return type could not express that and
+  what went wrong while it did not.
+
+Two families ship:
 
 - **Trivy** (`crates/hort-adapters-scanner-trivy/`) pulls the artifact
-  bytes from `StoragePort::get`, writes them into a `tempfile::TempDir`
-  (removed on drop, including panic and error paths), shells out to
-  `trivy fs --format json`, and parses the report. It ignores the
-  supplied SBOM and rediscovers components from the payload itself —
-  which is exactly what makes it the adjudicator of record against
-  the actual bytes.
+  bytes from `StoragePort::get`, **materialises them by kind** into a
+  `tempfile::TempDir` (removed on drop, including panic and error paths),
+  shells out to `trivy fs` or `trivy rootfs` with `--format json`, and
+  parses the report. It ignores the supplied SBOM and rediscovers
+  components from the payload itself — which is exactly what makes it the
+  adjudicator of record against the actual bytes, and exactly why the
+  materialisation has to be right.
 - **OSV-scanner** (`crates/hort-adapters-scanner-osv/`) goes the other
   way: it never touches the content bytes. It serialises the supplied
   `Sbom` into a CycloneDX 1.5 document and runs
@@ -294,6 +317,306 @@ attribute `result="report_too_large"` on the failure metric — and the
 failure then flows through the normal retry-then-indeterminate route.
 A runaway report can cost a scan; it cannot OOM the worker or sneak an
 artifact past the gate.
+
+## Materialisation: how the bytes reach an analyzer
+
+Trivy selects analyzers by **file name, extension and directory layout**,
+and in filesystem mode it does not open archives. A directory holding one
+opaque blob is therefore handing it nothing: no analyzer claims the file,
+the report comes back with no analysed target, and — read as a finding
+list — that is an empty one. So the Trivy adapter materialises each
+artifact according to its `ArtifactKind`
+(`crates/hort-adapters-scanner-trivy/src/workspace.rs`):
+
+| kind | on disk | Trivy target | why that target |
+|---|---|---|---|
+| `MavenJar` | one file, keeping its `.jar` / `.war` / `.ear` / `.par` name | `rootfs` | a Java archive is post-build: Image and Rootfs only |
+| `MavenPom` | one file named `pom.xml` | `fs` | `pom.xml` is pre-build: Filesystem and Repository only |
+| `NpmTarball` | gzip-tar extracted to `node_modules/<name>/`, the archive's own root directory stripped | `rootfs` | a `package.json` is claimed only under `node_modules`, by the Image and Rootfs targets |
+| `CargoCrate` | gzip-tar extracted into the workspace | `fs` | `Cargo.lock` is read by every target; `fs` also reads the pre-build side |
+| `PySdist` | gzip-tar extracted into the workspace | `rootfs` | `*.egg-info/PKG-INFO` is post-build egg metadata: Image and Rootfs only |
+| `PyWheel` | ZIP extracted into the workspace | `rootfs` | `*.dist-info/METADATA` is post-build: Image and Rootfs only |
+| `OciBlob` — a tar layer | tar / gzip-tar extracted as a root filesystem | `rootfs` | a layer *is* a root filesystem |
+| `OciBlob` — anything else | nothing; no invocation | — | an image config carries no package surface |
+| `OciManifest` | nothing; no invocation | — | a manifest carries no package surface |
+| `Other` | nothing; no invocation | — | no handler claims these bytes |
+
+**The target column is not a free choice.** Trivy's
+[coverage matrix](https://trivy.dev/docs/latest/coverage/language/)
+states, per analyzer, which of its four targets — Container Image,
+Filesystem, Rootfs, Repository — runs it, and the split falls almost
+exactly along the pre-build / post-build line. A **built artifact**
+(`JAR`/`WAR`/`EAR`/`PAR`, a Python `egg`/`wheel`, a `package.json`
+under `node_modules`, a cargo-auditable or Go binary) is analysed by
+**Image and Rootfs only**; a **pre-build declaration** (`pom.xml`,
+`package-lock.json`, `requirements.txt`, `poetry.lock`, `uv.lock`,
+`gradle.lockfile`) by **Filesystem and Repository only**; `Cargo.lock`
+by all four. Hort has no container image to scan, so every row is
+`rootfs` or `fs` — and picking the wrong one is silent: the analyzer
+never runs, the report names no analysed target, and the artifact can
+never get a verdict. A JAR scanned with `trivy fs` produces exactly that
+non-result.
+
+The layouts follow from what the analyzers read. A **Java archive**
+needs only its extension: Trivy's JAR analyzer opens the archive itself
+and reads the embedded `META-INF/maven/**/pom.properties` coordinates
+([Trivy Java coverage](https://trivy.dev/latest/docs/coverage/language/java/)).
+A **POM** is claimed by the Maven analyzer, which keys on the literal
+name `pom.xml` — the artifact's own `log4j-core-2.14.1.pom` matches
+nothing. **Wheels and sdists** are claimed through paths *inside* them
+(`*.dist-info/METADATA`, `PKG-INFO` —
+[Python coverage](https://trivy.dev/latest/docs/coverage/language/python/)),
+so the container has to be opened. An **npm tarball** needs both the
+extraction and the *installed* layout: Trivy claims a `package.json`
+only under `node_modules`, so the package is planted at
+`node_modules/<name>/` (a scoped name keeping its `@scope/` directory)
+with the tarball's own root directory — conventionally `package/` —
+stripped, which is what `npm install` does with the same bytes. An
+**OCI layer** is a root filesystem whose evidence is the distro package
+database (`var/lib/dpkg/status`, `lib/apk/db/installed`,
+`var/lib/rpm/*`) plus any shipped lockfiles, and
+[`trivy rootfs`](https://trivy.dev/latest/docs/target/rootfs/) is the
+target documented for that shape.
+
+**An OCI layer and an OCI image config are one kind on purpose.** Every
+blob is stored with `content_type: application/octet-stream` whatever role
+the manifest that names it assigns it, and the role lives in the
+manifest's descriptor rather than on the blob's own row — so no
+classification of the row can tell them apart. `OciBlob` states that
+honestly and the materialiser decides by container: a tar (plain or gzip)
+is a layer; anything else (the config JSON) has no package surface.
+
+### The Java vulnerability database
+
+Trivy identifies a Java archive from the coordinates *inside* it — the
+`META-INF/maven/**/pom.properties` written by the Maven build, or the
+`MANIFEST.MF` attributes as a weaker fallback. When neither identifies
+the archive, it falls back to matching the JAR's SHA-1 against
+`trivy-java-db`, a **separate** database from the vulnerability DB that
+it downloads on demand the first time it meets such a JAR.
+
+The operational consequence is that the worker's Trivy cache directory
+must be **writable**, not merely present: an artifact whose JAR carries
+no usable identity turns a read-only cache into a scan failure rather
+than a missing finding. That directory is
+`HORT_SCANNER_TRIVY_DB_DIR` → Trivy's `--cache-dir`; when it is unset
+Trivy uses its own default and the same requirement applies there. There
+is no knob for the Java DB itself — it is Trivy's own fetch, on Trivy's
+own schedule, and an air-gapped deployment warms the cache the same way
+it warms the vulnerability DB.
+
+### Empty-report diagnostics
+
+When Trivy returns a report with no analysed target, the adapter's
+`warn!` carries the artifact kind, the format, the subcommand it chose,
+the **tail of Trivy's stderr** (last ~1 KiB, which under `--quiet` is
+where DB and analyzer complaints still land) and **`materialised`** — up
+to 20 relative file names from the workspace. Those last two are what
+separate "no analyzer claimed this, correctly" from "this adapter built
+the wrong tree", which are otherwise the same log line.
+
+### The scanner capability map
+
+Whether a backend can produce a verdict for a repository format is a
+**compiled-in fact of this build**, not an operator choice. The backends
+own it (`ScannerPort::applies_to`); `hort_app::scanning` mirrors it for
+the apply path, which constructs no adapters; and the `hort-worker`
+parity guard asserts the two never disagree.
+
+| backend | `oci` | `maven` | `pypi` | `npm` | `cargo` | any other format |
+|---|---|---|---|---|---|---|
+| `trivy` | **yes** | **yes** | **yes** | **yes** | **yes** | no |
+| `osv` | no | **yes** | **yes** | **yes** | **yes** | no |
+
+**A cell is "yes" only where a test exists in which a known-vulnerable
+fixture of that format yields at least one finding through that
+backend.** Materialising bytes a scanner never claims is not evidence —
+it produces the *absence* of a verdict, which is precisely the inert
+pairing this map exists to name.
+
+What each "yes" actually covers, and what proves it:
+
+| cell | what is covered | evidence |
+|---|---|---|
+| `trivy` × `oci` | the layer's OS package database (`var/lib/dpkg/status`, `lib/apk/db/installed`, `var/lib/rpm/*`) and any lockfiles it ships | `an_oci_layer_with_an_os_package_database_yields_findings` (layer tar carrying `zlib1g 1:1.2.11.dfsg-2`); the compose e2e `oci-trivy-e2e` scenario |
+| `trivy` × `maven` | a JAR's embedded coordinates, matched against `trivy-java-db` (SHA-1 fallback when the archive carries no usable identity); a `pom.xml`'s declared dependencies as far as their versions are literal | `a_known_vulnerable_jar_yields_its_cve` (`log4j-core 2.14.1`), `a_pom_is_analysed_rather_than_ignored`; the compose e2e `maven-trivy-e2e` scenario |
+| `trivy` × `pypi` | the wheel's / sdist's own identity from `*.dist-info/METADATA` or `PKG-INFO` | `a_known_vulnerable_wheel_yields_at_least_one_finding` (`urllib3 1.26.4`) |
+| `trivy` × `npm` | **the package's own `name@version` only.** A published tarball declares dependency *ranges*, never a resolved set, so nothing else in it is attributable | `a_known_vulnerable_npm_tarball_yields_its_own_advisory` (`lodash 4.17.20` → 5 advisories); `an_npm_tarball_is_analysed_with_nothing_to_attribute` pins the ceiling |
+| `trivy` × `cargo` | **a shipped `Cargo.lock` only** — i.e. published *binary* crates. A library crate (`Cargo.toml` alone, the common case on crates.io) still yields nothing attributable under Trivy; `osv` × `cargo` is the cell that covers it | `a_binary_crate_with_a_lockfile_yields_a_dependency_advisory` (`smallvec 1.6.0`); `a_cargo_crate_is_analysed_with_nothing_to_attribute` pins the ceiling |
+| `osv` × `npm` / `pypi` / `cargo` / `maven` | the payload SBOM the format handler extracts, subject **and** components ([ADR 0056](../../adr/0056-payload-sbom-extraction.md)) — which is what covers a library crate's declared dependency set where Trivy cannot | `a_known_vulnerable_{npm,pypi,cargo,maven}_sbom_yields_a_finding`; the compose e2e `maven-osv-e2e` scenario; the dogfood `hort-crates` / `npm-proxy` policies in production |
+| `osv` × `oci` | — **no cell.** OCI exposes no SBOM source, so this backend has nothing to read. The parity guard asserts the OCI handler is not SBOM-capable, so the "no" cannot rot into a "yes" by accident | `oci_is_covered_by_trivy_alone_and_the_handler_confirms_it_has_no_sbom` |
+
+Both new Trivy cells (`npm`, `cargo`) were proven against **Trivy
+0.70.0**, the version `docker/Dockerfile.worker` pins, and neither rests
+on a contractual upstream guarantee: `npm` rests on the Node analyzer
+claiming a `package.json` under `node_modules/`, `cargo` on the Cargo
+analyzer reading `Cargo.lock`. A Trivy release that *widens* attribution
+turns the paired "nothing to attribute" tests red — which is the designed
+signal to revisit this table, not a defect.
+
+The map is deliberately **binary**. What a "yes" covers varies (the
+column above), but a third "partial" state would attach a caveat to
+nearly every non-OCI cell, which is noise rather than signal. The nuance
+belongs here, in prose, not in the type.
+
+**Two consumers, one record.**
+
+- **At apply time**, the `StaticConfigValidator`'s row 7c rejects a
+  `ScanPolicy.scanBackends` entry paired with a repository format it
+  cannot analyse, naming the pairing and the backends that *do* cover
+  the format. A format no backend covers is the other rejection shape,
+  and points at the explicit waiver instead. The unit of evaluation is
+  the **effective** pairing: runtime resolution is repo-scoped-wins-over-
+  global, so a global policy is linted only against the repositories
+  that declare no policy of their own. `hort-server validate-config`
+  catches both offline. The one thing the row never rejects is
+  `scanBackends: []` — that is the operator's explicit "this repository
+  is not scanned", a decision rather than an inert pairing.
+- **At scan time**, the orchestrator consults the same map before
+  invoking a backend, which covers the paths apply-time rejection cannot
+  reach: the built-in default backend list (no policy declared at all)
+  and a policy that predates the row. A backend that does not apply is
+  never invoked; the abstention it records instead is
+  `no_analyzer_matched` when another backend covers the format (the
+  pairing is wrong, so the surface stays unassessed and the artifact
+  holds — see [*"Nothing analysable" is not "clean"*](#nothing-analysable-is-not-clean)),
+  ticking `hort_scan_record_outcome_failures_total{result="inert_pairing"}`,
+  and `not_applicable` when nobody covers it (there is no surface to
+  assess, so a hold would have nothing to wait on).
+
+The operator consequence of the `osv` × `oci` "no" is concrete: a
+**global** `scanBackends: [trivy, osv]` over a deployment that also
+serves OCI repositories is rejected at apply. The fix is to split it —
+a global `[trivy]` plus per-repository policies adding `osv` where the
+format has an SBOM — which is exactly what
+`scripts/alpha-fixtures/gitops-config/base/policies/` models.
+
+### Extraction is bounded and fail-closed
+
+Extraction is the one place in the workspace that writes
+attacker-supplied archive entries to a filesystem path, so every guard
+lives in one module (`crates/hort-adapters-scanner-trivy/src/extract.rs`)
+and every guard refuses the **whole archive** rather than skipping an
+entry: extracted-bytes cap, decompression-ratio cap, entry-count cap, and
+lexical path containment on the entry's own **name** (relative, no `..`,
+checked before any filesystem call) — the one property that decides
+whether extraction ever writes outside the root. Files and directories
+land with permissions stripped to a fixed mode.
+
+A symlink or hardlink entry is **never materialised**, so its **target**
+is never validated and never a reason to refuse: a link carries no bytes
+of its own, and since it is never created, an absolute or escaping target
+cannot write, read or expose anything either. It is skipped and counted
+instead (`skipped_links`, surfaced in the adapter's logs), because an
+absolute target is the ordinary shape of a root filesystem
+(`/bin/sh -> /bin/busybox`), not an attack — treating it as one refuses
+every real OS layer.
+
+A tripped guard yields `NothingAnalysable(UnusableArchive)`, never a
+partially-extracted tree. A half-unpacked archive scanned as if it were
+whole is a false-clean, which is worse than a refusal.
+
+These caps are **not** an operator surface: they are safety bounds on
+untrusted input, and an operator able to raise them could re-open the
+bomb surface they close.
+
+## "Nothing analysable" is not "clean"
+
+An empty finding list is only a clean verdict **when something was
+actually analysed.** `ScanAnalysis` exists to keep those apart, because
+while the port returned a bare `Vec<Finding>` they were the same value —
+and every Trivy scan of every format produced the second while being
+recorded as the first.
+
+A backend returns `NothingAnalysable(reason)` in three situations:
+
+- `not_applicable` — the kind carries no package surface (an OCI manifest
+  or image config, a payload no handler claims). No scanner is invoked and
+  no CAS read is paid. The same reason also covers a Trivy `rootfs`-mode
+  invocation that *was* run and came back with no `Results` section: that
+  target runs every OS-package, language and binary analyzer over the
+  whole materialised tree, so an empty report there is those analyzers
+  agreeing the tree has no package surface at all — a completed fact, not
+  an unassessed pairing.
+- `unusable_archive` — the payload is an archive the adapter refused to
+  materialise (a guard tripped, or the container is one it cannot open,
+  such as a `zstd`-compressed layer).
+- `no_analyzer_matched` — the backend ran against a materialised tree in
+  `fs` mode and reported no analysed target at all (for Trivy, a report
+  with no `Results` section — absent, `null`, or empty). `fs` mode targets
+  one artifact whose analyzer either engages or does not, so an empty
+  result there stays an expected surface left unassessed.
+
+The orchestrator records the last two reasons on a backend's behalf in
+one case: when [the scanner capability map](#the-scanner-capability-map)
+already says this backend cannot analyse this format. The backend is
+then never invoked at all — the answer is known, and paying a CAS read
+and a subprocess for it would also lose the one fact an operator needs,
+that the *pairing* is wrong. Another backend covers the format ⇒
+`no_analyzer_matched` (plus `result="inert_pairing"`, which distinguishes
+"never invoked" from "ran and found nothing"); nobody covers it ⇒
+`not_applicable`.
+
+The three reasons do **not** all gate the artifact, and
+`NotAnalysable::gates_release` is the single place that split is decided.
+`unusable_archive` and `no_analyzer_matched` are an *expected* surface
+that went unassessed — the absent verdict ADR 0007 holds on. By contrast
+`not_applicable` is the absence of a surface: no scanner could ever find
+a threat level in an OCI manifest row or an image config blob, so a hold
+has nothing to wait on and would never lift.
+
+The orchestrator treats an abstention as **no contribution**. If any other
+backend produced a verdict, that verdict stands and the abstention is a
+`warn!` naming format × backend plus
+`hort_scan_record_outcome_failures_total{result="nothing_analysable"}` —
+the actionable fact is the *pairing*, because "this backend cannot
+adjudicate this format" is a policy mismatch an operator fixes in policy.
+(A `not_applicable` abstention asks nothing of anyone, so it logs at
+`debug!` and emits no failure counter: it is the expected steady state for
+every OCI push, and warning once per blob would bury the actionable half.)
+If no backend produced a verdict:
+
+- **Any backend errored** → the existing retryable `Failed` path. An error
+  may be transient.
+- **Every backend abstained, at least one of them gating** → the artifact
+  transitions straight to the terminal `scan_indeterminate` status, with
+  no retry budget spent. The artifact's kind and the backend's analyzers
+  are both fixed, so the next attempt reaches the same answer; retrying
+  would only delay the hold by the backoff schedule.
+- **Every abstention was `not_applicable`** → a **completed assessment
+  with nothing to assess.** The orchestrator records a `ScanCompleted`
+  with no findings and `assessment = not_applicable`, so scan authority
+  exists and the release gate opens on the time gate alone, and ticks
+  `hort_scan_terminal_total{result="not_applicable"}`. This is what makes
+  a Trivy-policed OCI repository work at all: an image's manifest row and
+  config blob carry no package content, its layers do, and only the layers
+  get an analysed verdict.
+
+That hold is the same fail-closed state an absent verdict already
+receives ([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)),
+and it is deliberately *not* a zero-finding `ScanCompleted`: recording one
+would hand release authority to a scan that never looked at the bytes. The
+not-applicable arm is not an exception to that — it records a
+`ScanCompleted` whose `assessment` field says, in the trail itself, that
+nothing was examined, which is why it can never be read as "analysed,
+clean". Events written before that field existed deserialise as
+`analysed`, which is what they were. One guard rail on the arm: if
+advisory enrichment produced a finding while every backend abstained,
+something *did* have an opinion about this artifact, so the fail-closed
+hold applies instead — "nothing to assess" would be a false statement and
+would drop a real finding.
+
+One consequence worth knowing when reading the database: an abstained
+artifact's `artifacts.last_scan_at` is **not** advanced. The transition
+goes through `commit_transition_with_score`, which writes the status and
+the `ScanIndeterminate` event but not the scan timestamp — the same is
+already true of the retry-exhausted path above. So "`last_scan_at` is
+still NULL and `quarantine_status = 'scan_indeterminate'`" reads as *no
+scan ever produced a verdict for this artifact*, which is exactly the
+fact the hold rests on. A not-applicable artifact is the other way round:
+it took the `record_scan_result` path, so `last_scan_at` **is** set and
+the row reads as a completed scan — the `ScanCompleted.assessment` field
+is what says which kind.
 
 ## Rescan and advisory watch
 

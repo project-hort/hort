@@ -1,0 +1,23 @@
+# Hosted Maven repo dedicated to the OSV-scan-over-Maven smoke
+# (scripts/native-tests/scenarios/dogfood/maven-osv-scan.sh).
+#
+# Separate from `maven-e2e` on purpose: that repo's ScanPolicy
+# (maven-e2e-permissive.yaml) runs `scanBackends: []` so the mvn-deploy /
+# mvn-dependency:get round trip in scenarios/clients/maven.sh is never
+# confounded by a scan verdict. This repo exists so a Maven-specific
+# ScanPolicy (maven-osv-e2e-scan.yaml) can turn `osv` on without touching
+# that other scenario's premise.
+apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: maven-osv-e2e
+spec:
+  name: "Maven OSV Scan E2E"
+  description: "Hosted Maven repo with osv scanning enabled; target of scripts/native-tests/scenarios/dogfood/maven-osv-scan.sh."
+  format: maven
+  type: hosted
+  storage:
+    backend: filesystem
+    path: /var/lib/hort-server/cas/maven-osv-e2e
+  isPublic: true
+  replicationPriority: local_only

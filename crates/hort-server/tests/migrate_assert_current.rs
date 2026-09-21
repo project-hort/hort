@@ -16,7 +16,7 @@
 //! (matches the convention in `hort_adapters_postgres::events_role_hardening`)
 //! so the suite stays green in dev environments without a database.
 //!
-//! What each test covers (the five branches of `assert_current`):
+//! What each test covers (the branches of `assert_current`):
 //!
 //! 1. `fresh_db_bails_with_table_missing` — `_sqlx_migrations` does
 //!    not exist; assert_current bails with the
@@ -25,19 +25,37 @@
 //!    returns Ok(()).
 //! 3. `behind_schema_bails_with_mismatch` — highest-version row deleted;
 //!    assert_current bails with `applied=N-1, binary expects=N`.
-//! 4. `ahead_schema_bails_with_mismatch` — fake row inserted at
-//!    version=expected+1; assert_current bails with
-//!    `applied=N+1, binary expects=N`.
-//! 5. `permission_denied_bails_with_grant_message` — connect as a role
-//!    that has no SELECT on `_sqlx_migrations`; assert_current bails
-//!    with the "permission denied reading _sqlx_migrations" message.
+//! 4. `ahead_schema_is_supported` — fake row inserted at
+//!    version=expected+1 and registered as an expansion; assert_current
+//!    returns Ok(()), because a newer schema whose extra migrations
+//!    removed nothing is a supported serving state under the
+//!    expand/contract discipline (ADR 0030). This is the binary-rollback
+//!    case.
+//! 5. `many_newer_expansions_are_supported` — five releases of
+//!    expansions ahead, all accepted: expansions do not accumulate into a
+//!    refusal, which is exactly what a fixed release bound got wrong.
+//! 6. `newer_contraction_above_this_binary_bails_and_names_the_way_out` —
+//!    a registered contraction whose minimum this binary does not meet;
+//!    the refusal names the migration and the version it would work from.
+//! 7. `newer_migration_without_a_register_row_bails` — fail closed:
+//!    silence is not evidence of an expansion.
+//! 8. `unknown_version_below_the_waterline_bails` — fake row inserted
+//!    *below* the newest embedded version; assert_current refuses and
+//!    names it. A gap below the waterline is a broken history, not a
+//!    version skew.
+//! 9. `missing_mid_sequence_version_bails` — a shared-prefix row deleted
+//!    while a newer one remains; assert_current refuses and names it.
+//! 10. `permission_denied_bails_with_grant_message` — connect as a role
+//!     that has no SELECT on `_sqlx_migrations`; assert_current bails
+//!     with the "permission denied reading _sqlx_migrations" message.
 //!
-//! Each test creates a uniquely-named throwaway database (and, for #5,
+//! Each test creates a uniquely-named throwaway database (and, for #10,
 //! a throwaway role) so concurrent `cargo test` runs don't collide on
 //! shared schema state. Resources are dropped in test teardown.
 
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::env;
 use std::time::Duration;
 
@@ -123,6 +141,61 @@ fn expected_version() -> i64 {
         .map(|m| m.version)
         .max()
         .expect("migration set is non-empty at compile time")
+}
+
+/// Every version the binary embeds.
+fn embedded_versions() -> BTreeSet<i64> {
+    MIGRATOR.iter().map(|m| m.version).collect()
+}
+
+/// The second-highest embedded version — deleting its row leaves a hole
+/// *below* a still-applied newer version, which is what distinguishes a
+/// divergent history from a merely-behind schema.
+fn second_newest_version() -> i64 {
+    let versions = embedded_versions();
+    let mut descending = versions.iter().rev();
+    descending.next();
+    *descending
+        .next()
+        .expect("the migration set has at least two versions")
+}
+
+/// A version the binary does not embed that nonetheless sits below the
+/// newest one it does. Computed rather than hardcoded so a renumbering of
+/// the migration sequence cannot silently turn this into a version the
+/// binary actually embeds.
+fn unused_version_below_waterline() -> i64 {
+    let versions = embedded_versions();
+    let newest = expected_version();
+    (0..newest)
+        .find(|v| !versions.contains(v))
+        .expect("the migration sequence starts above 0, so 0 is never taken")
+}
+
+/// Record `version` in `schema_compat_register` the way a newer binary's
+/// `migrate` would have: `None` for an expansion, `Some("X.Y.Z")` for a
+/// contraction's `reference_removed_in`.
+async fn insert_register_row(pool: &PgPool, version: i64, min_binary_version: Option<&str>) {
+    sqlx::query("INSERT INTO schema_compat_register (version, min_binary_version) VALUES ($1, $2)")
+        .bind(version)
+        .bind(min_binary_version)
+        .execute(pool)
+        .await
+        .expect("insert schema_compat_register row");
+}
+
+/// Record `version` in `_sqlx_migrations` without running anything — the
+/// bookkeeping half of a migration another binary applied.
+async fn insert_fake_migration(pool: &PgPool, version: i64) {
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations \
+         (version, description, installed_on, success, checksum, execution_time) \
+         VALUES ($1, 'fake-migration', now(), true, decode('00', 'hex'), 0)",
+    )
+    .bind(version)
+    .execute(pool)
+    .await
+    .expect("insert fake migration row");
 }
 
 // ---------------------------------------------------------------------------
@@ -231,11 +304,11 @@ async fn behind_schema_bails_with_mismatch() {
 }
 
 // ---------------------------------------------------------------------------
-// Branch 4 — applied > expected
+// Branch 4 — applied strictly ahead of the embedded set (binary rollback)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn ahead_schema_bails_with_mismatch() {
+async fn ahead_schema_is_supported() {
     let Some(admin) = admin_pool().await else {
         return;
     };
@@ -246,43 +319,216 @@ async fn ahead_schema_bails_with_mismatch() {
         .await
         .expect("migrations apply cleanly to fresh DB");
 
-    let expected = expected_version();
-    let ahead = expected + 1;
-    // Simulate "rolling-upgrade misordering" (an old binary booting
-    // against a DB that a newer binary has already migrated) by
-    // inserting a fake row at expected + 1.
-    sqlx::query(
-        "INSERT INTO _sqlx_migrations \
-         (version, description, installed_on, success, checksum, execution_time) \
-         VALUES ($1, 'fake-future-migration', now(), true, decode('00', 'hex'), 0)",
-    )
-    .bind(ahead)
-    .execute(&pool)
-    .await
-    .expect("insert fake-future-migration row");
+    // The binary-rollback shape: the database has been migrated by a
+    // newer release, so it records a version this binary does not embed,
+    // strictly newer than everything it does. The newer binary recorded
+    // it as an expansion, which is what makes serving it safe — a
+    // structurally-newer schema alone is no longer sufficient.
+    let newer = expected_version() + 1;
+    insert_fake_migration(&pool, newer).await;
+    insert_register_row(&pool, newer, None).await;
+
+    assert_current(&pool)
+        .await
+        .expect("a newer schema whose extra migrations are expansions must be accepted");
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+// ---------------------------------------------------------------------------
+// Branch 5 — many newer expansions: the fixed-bound case the register
+// exists to stop refusing.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn many_newer_expansions_are_supported() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("migrations apply cleanly to fresh DB");
+
+    // Five releases' worth of expansions ahead of this binary. Nothing
+    // was removed, so there is nothing this binary can reference and
+    // fail to find: it serves the schema regardless of the distance.
+    for offset in 1..=5 {
+        let version = expected_version() + offset;
+        insert_fake_migration(&pool, version).await;
+        insert_register_row(&pool, version, None).await;
+    }
+
+    assert_current(&pool)
+        .await
+        .expect("expansions do not accumulate into a refusal");
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+// ---------------------------------------------------------------------------
+// Branch 6 — a newer contraction the binary is too old for
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn newer_contraction_above_this_binary_bails_and_names_the_way_out() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("migrations apply cleanly to fresh DB");
+
+    // A future release removed an identifier this binary's code still
+    // names, and recorded the release that stopped naming it. `999.0.0`
+    // is unreachable from any real workspace version, so this stays a
+    // refusal whatever the tree is versioned at.
+    let newer = expected_version() + 1;
+    insert_fake_migration(&pool, newer).await;
+    insert_register_row(&pool, newer, Some("999.0.0")).await;
 
     let err = assert_current(&pool)
         .await
-        .expect_err("ahead schema must bail");
+        .expect_err("a contraction above this binary must bail");
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("schema version mismatch"),
-        "unexpected error message: {msg}"
+        msg.contains(&format!("migration {newer}")),
+        "the refusal must name the migration that blocks the rollback: {msg}"
     );
     assert!(
-        msg.contains(&format!("applied={ahead}")),
-        "error must report applied={ahead}: {msg}"
-    );
-    assert!(
-        msg.contains(&format!("expects={expected}")),
-        "error must report expects={expected}: {msg}"
+        msg.contains("999.0.0 or newer"),
+        "the refusal must name the version it would work from: {msg}"
     );
 
     drop_temp_db(&admin, &db_name, pool).await;
 }
 
 // ---------------------------------------------------------------------------
-// Branch 5 — SELECT denied (42501)
+// Branch 7 — a newer migration with no register row at all: fail closed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn newer_migration_without_a_register_row_bails() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("migrations apply cleanly to fresh DB");
+
+    // Silence is not evidence of an expansion.
+    let newer = expected_version() + 1;
+    insert_fake_migration(&pool, newer).await;
+
+    let err = assert_current(&pool)
+        .await
+        .expect_err("an unregistered newer migration must bail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&format!("migration {newer}")),
+        "the refusal must name the migration: {msg}"
+    );
+    assert!(
+        msg.contains("absent from the schema compatibility register"),
+        "the refusal must say why it refused: {msg}"
+    );
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+// ---------------------------------------------------------------------------
+// Branch 8 — divergence: an applied version below the embedded waterline
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unknown_version_below_the_waterline_bails() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("migrations apply cleanly to fresh DB");
+
+    // A version the binary does not embed, sitting *below* the newest one
+    // it does. Unlike branch 4 this is not a version skew — the shared
+    // prefix is immutable (ADR 0022), so an unknown version inside it
+    // means the histories genuinely diverged.
+    let unknown = unused_version_below_waterline();
+    insert_fake_migration(&pool, unknown).await;
+
+    let err = assert_current(&pool)
+        .await
+        .expect_err("a below-the-waterline unknown version must bail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("divergent migration history"),
+        "unexpected error message: {msg}"
+    );
+    assert!(
+        msg.contains(&unknown.to_string()),
+        "error must name the offending version {unknown}: {msg}"
+    );
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+// ---------------------------------------------------------------------------
+// Branch 9 — divergence: an embedded version unapplied below the applied
+// waterline
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn missing_mid_sequence_version_bails() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+
+    MIGRATOR
+        .run(&pool)
+        .await
+        .expect("migrations apply cleanly to fresh DB");
+
+    // Delete a shared-prefix row while newer ones remain applied: the
+    // database skipped a migration this binary embeds. Distinguishable
+    // from branch 3 (behind schema) precisely because a newer version is
+    // still recorded above the hole.
+    let hole = second_newest_version();
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = $1")
+        .bind(hole)
+        .execute(&pool)
+        .await
+        .expect("delete a mid-sequence row");
+
+    let err = assert_current(&pool)
+        .await
+        .expect_err("a mid-sequence hole must bail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("divergent migration history"),
+        "unexpected error message: {msg}"
+    );
+    assert!(
+        msg.contains(&hole.to_string()),
+        "error must name the offending version {hole}: {msg}"
+    );
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+// ---------------------------------------------------------------------------
+// Branch 10 — SELECT denied (42501)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

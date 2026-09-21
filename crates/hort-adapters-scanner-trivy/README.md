@@ -1,4 +1,4 @@
-# hort-adapters-scanner-trivy — Trivy Filesystem Scanner Adapter
+# hort-adapters-scanner-trivy — Trivy CLI Scanner Adapter
 
 ## Layer
 
@@ -8,10 +8,18 @@ artifact bytes). Requires >= 85% coverage.
 
 ## Responsibility
 
-Filesystem-mode scanner: pulls artifact bytes via `StoragePort::get`,
-writes them to a `tempfile::TempDir`, runs `trivy fs --format json --quiet
-<dir>`, and parses the output into `Vec<Finding>`. Owns its
+CLI-backed scanner: pulls artifact bytes via `StoragePort::get`,
+materialises them into a `tempfile::TempDir` in the shape the analyzers
+expect for that `ArtifactKind`, runs `trivy <fs|rootfs> --format json
+--quiet <dir>`, and parses the output into `Vec<Finding>`. Owns its
 workspace/tempdir lifecycle including panic/error cleanup.
+
+The layout **and** the subcommand come from the kind: Trivy's coverage
+matrix runs post-build analyzers (Java archives, wheels/eggs, a
+`package.json` under `node_modules`) only under the Image and Rootfs
+targets, and pre-build ones (`pom.xml`, lockfiles) only under Filesystem
+and Repository. `src/workspace.rs` holds the table; a mismatch there is
+silent — the analyzer simply never runs.
 
 ## Ports
 

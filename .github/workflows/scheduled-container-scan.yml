@@ -40,13 +40,17 @@ jobs:
           docker rm "$CONTAINER_ID"
           trivy --version
 
-      - name: Trivy scan - server
+      # SARIF mode ignores the severity filter ("Building SARIF report with
+      # all severities"), so this scan is the full-severity inventory that
+      # keeps the Security tab complete — it is not the policy. The JSON
+      # scan below is the policy: SARIF = inventory, JSON = policy, and the
+      # issue-opener and step summary read only the JSON.
+      - name: Trivy scan - server (SARIF, all severities)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:latest
           format: 'sarif'
           output: 'server-trivy.sarif'
-          severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
           exit-code: '0'
           skip-setup-trivy: true
@@ -58,6 +62,17 @@ jobs:
           sarif_file: 'server-trivy.sarif'
           category: 'trivy-server-scheduled'
 
+      - name: Trivy policy scan - server (JSON, CRITICAL/HIGH, drives issue-opener)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}:latest
+          format: 'json'
+          output: 'server-trivy-policy.json'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+          exit-code: '0'
+          skip-setup-trivy: true
+
       - name: Upload Trivy reports
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
@@ -65,6 +80,7 @@ jobs:
           name: trivy-weekly-reports
           path: |
             server-trivy.sarif
+            server-trivy-policy.json
           retention-days: 90
 
       - name: Check for new findings and create issue
@@ -74,17 +90,20 @@ jobs:
           script: |
             const fs = require('fs');
 
+            // The policy JSON (CRITICAL/HIGH, fixable-only), not the SARIF,
+            // is the count source: SARIF carries every severity, so counting
+            // it here would title the issue "CRITICAL/HIGH" for MEDIUM/LOW.
             let totalFindings = 0;
             const summaries = [];
 
-            for (const [name, file] of [['Server', 'server-trivy.sarif']]) {
+            for (const [name, file] of [['Server', 'server-trivy-policy.json']]) {
               if (!fs.existsSync(file)) {
                 summaries.push(`- **${name}**: Scan skipped or failed`);
                 continue;
               }
-              const sarif = JSON.parse(fs.readFileSync(file, 'utf8'));
-              const results = sarif.runs?.[0]?.results || [];
-              const count = results.length;
+              const policy = JSON.parse(fs.readFileSync(file, 'utf8'));
+              const results = policy.Results || [];
+              const count = results.reduce((sum, r) => sum + (r.Vulnerabilities || []).length, 0);
               totalFindings += count;
               summaries.push(`- **${name}**: ${count} finding(s)`);
             }
@@ -130,8 +149,12 @@ jobs:
       - name: Scan summary
         if: always()
         run: |
+          COUNT=0
+          if [ -f server-trivy-policy.json ]; then
+            COUNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' server-trivy-policy.json)
+          fi
           echo "## Weekly Container Scan Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Server**: $([ -f server-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          echo "- **Server**: $([ -f server-trivy.sarif ] && echo 'Scanned' || echo 'Skipped') — ${COUNT} CRITICAL/HIGH finding(s) with available fixes" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "SARIF reports uploaded to Security tab and as workflow artifacts." >> $GITHUB_STEP_SUMMARY

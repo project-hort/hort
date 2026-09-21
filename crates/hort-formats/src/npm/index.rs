@@ -36,9 +36,46 @@
 //!   },
 //!   // The served tag map (stored map ∩ served set) plus the derived
 //!   // `latest` fallback. Omitted entirely when `entries` is empty.
-//!   "dist-tags": { "latest": "1.2.3", "next": "2.0.0-rc.1" }
+//!   "dist-tags": { "latest": "1.2.3", "next": "2.0.0-rc.1" },
+//!   // Diagnostic only — outside the resolution surface. Omitted
+//!   // entirely when nothing is held. See the section below.
+//!   "hort": { "held": [ { "version": "7.29.7", "status": "quarantined",
+//!                         "available_after": "2026-08-26T08:18:00Z" } ] }
 //! }
 //! ```
+//!
+//! # The `hort.held` block
+//!
+//! `versions{}` and `dist-tags` carry only what hort will serve, so a
+//! version the filter pipeline withheld is absent from both. Absent from
+//! the catalog reads as "this version does not exist" — while the same
+//! registry's content route answers that exact version with `503` and a
+//! `Retry-After`. The two surfaces contradicting each other is a
+//! diagnosis trap: a pinned install fails, the catalog is consulted, and
+//! the version looks like it was never published.
+//!
+//! The block closes that without touching the resolution surface.
+//! `versions{}` and `dist-tags` are byte-identical to what the same input
+//! produced before it existed — a range, a bare install or `latest` still
+//! cannot resolve to something that would `503`, which is the whole
+//! reason the filter drops those versions. What changes is only that the
+//! catalog now says *why* a version is missing instead of being silent
+//! about it.
+//!
+//! Three rules carry the honesty of the block:
+//!
+//! - **Omitted when nothing is held.** The common packument must not grow
+//!   a key.
+//! - **`status` distinguishes a timed hold from a verdict**
+//!   ([`HeldReason`]). Describing a `rejected` version as held-until-`T`
+//!   would be a lie in the opposite direction from the one this fixes, so
+//!   [`HeldVersion::new`] drops an `available_after` offered for one.
+//! - **`available_after` is absent when unknown**, never a guess. It
+//!   comes from the same anchor + resolved policy duration the content
+//!   route's `Retry-After` is computed from
+//!   (`ArtifactUseCase::package_hold_deadlines` and
+//!   `ArtifactUseCase::hydrate_quarantine_deadline` share one window
+//!   resolver), so the two surfaces cannot name different instants.
 //!
 //! # `dist-tags` invariant
 //!
@@ -114,11 +151,129 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use chrono::{DateTime, SecondsFormat, Utc};
 use hort_app::use_cases::index_serve::{
     BuildContext, IndexBuilder, PerVersionPayload, VersionEntry, VersionOrdering,
 };
+use hort_domain::entities::artifact::QuarantineStatus;
 
 pub use hort_app::use_cases::index_serve::NpmVersionPayload;
+
+/// Why the served index withholds a version — the value the packument's
+/// `hort.held[].status` carries.
+///
+/// One variant per non-servable [`QuarantineStatus`], so the wire cannot
+/// blur a timed hold into a verdict or the other way round. The
+/// distinction is the point: a client told a version is *waiting* will
+/// retry, and telling it that about a version that was **rejected** is a
+/// lie in the opposite direction from the one this block exists to fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldReason {
+    /// A timed hold pending a verdict — the observation window has not
+    /// elapsed. Resolves on its own; the only reason that carries an
+    /// `available_after`.
+    Quarantined,
+    /// A verdict was reached and it was negative. Terminal: no deadline,
+    /// nothing to wait for.
+    Rejected,
+    /// The scanner could not decide. Terminal and fail-closed, with no
+    /// self-resolving deadline (ADR 0007).
+    ScanIndeterminate,
+}
+
+impl HeldReason {
+    /// Classify a status the served index withholds, or `None` for one it
+    /// serves.
+    ///
+    /// Exhaustive over [`QuarantineStatus`] with no wildcard arm: a future
+    /// variant is a compile error here rather than silently becoming
+    /// either "served" or "held". This mirrors
+    /// `hort_app::use_cases::index_filters::HeldVisibility::admits`, whose
+    /// `Hidden` row decides which versions reach this block in the first
+    /// place — the two must keep agreeing about which statuses are
+    /// non-servable.
+    pub fn from_status(status: QuarantineStatus) -> Option<Self> {
+        match status {
+            QuarantineStatus::Released | QuarantineStatus::None => None,
+            QuarantineStatus::Quarantined => Some(Self::Quarantined),
+            QuarantineStatus::Rejected => Some(Self::Rejected),
+            QuarantineStatus::ScanIndeterminate => Some(Self::ScanIndeterminate),
+        }
+    }
+
+    /// The wire token. Snake-case, matching the status vocabulary the
+    /// rest of hort's JSON surfaces use.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Quarantined => "quarantined",
+            Self::Rejected => "rejected",
+            Self::ScanIndeterminate => "scan_indeterminate",
+        }
+    }
+}
+
+/// One withheld version, as the packument's `hort.held[]` array carries
+/// it.
+///
+/// Constructed through [`HeldVersion::new`], which drops a deadline
+/// supplied for anything but [`HeldReason::Quarantined`]: the
+/// "a verdict is never presented as pending" rule is enforced by the
+/// type, not by each caller remembering it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldVersion {
+    /// The withheld version string, exactly as the source produced it —
+    /// the same spelling a client would have pinned in its lockfile.
+    pub version: String,
+    /// Why it is withheld.
+    pub reason: HeldReason,
+    /// When the hold elapses, for a timed hold whose deadline is known.
+    /// `None` is emitted as an **absent** field, never `null` or a zero
+    /// instant: an absent field is honest about not knowing, a guessed
+    /// timestamp is not.
+    pub available_after: Option<DateTime<Utc>>,
+}
+
+impl HeldVersion {
+    /// Build an entry, keeping `available_after` only where it can be
+    /// true. A terminal verdict has no deadline by definition, so one
+    /// offered for a `Rejected` / `ScanIndeterminate` version is dropped
+    /// rather than emitted.
+    pub fn new(
+        version: String,
+        reason: HeldReason,
+        available_after: Option<DateTime<Utc>>,
+    ) -> Self {
+        let available_after = match reason {
+            HeldReason::Quarantined => available_after,
+            HeldReason::Rejected | HeldReason::ScanIndeterminate => None,
+        };
+        Self {
+            version,
+            reason,
+            available_after,
+        }
+    }
+
+    /// The `hort.held[]` element: `{version, status, available_after?}`.
+    fn to_json(&self) -> serde_json::Value {
+        let mut out = serde_json::Map::with_capacity(3);
+        out.insert(
+            "version".to_string(),
+            serde_json::Value::String(self.version.clone()),
+        );
+        out.insert(
+            "status".to_string(),
+            serde_json::Value::String(self.reason.wire().to_string()),
+        );
+        if let Some(deadline) = self.available_after {
+            out.insert(
+                "available_after".to_string(),
+                serde_json::Value::String(deadline.to_rfc3339_opts(SecondsFormat::Secs, true)),
+            );
+        }
+        serde_json::Value::Object(out)
+    }
+}
 
 /// Intersect a stored `dist-tags` map with the **post-filter served
 /// set**: a tag whose target version is not served is DROPPED, never
@@ -268,13 +423,33 @@ pub struct NpmIndexBuilder {
     /// verbatim; the only value this builder ever synthesises is the
     /// `latest` fallback below.
     dist_tags: BTreeMap<String, String>,
+    /// The versions the filter pipeline withheld, for the diagnostic
+    /// `hort.held` block. Empty — the default — emits no `hort` key at
+    /// all, so a packument with nothing held keeps exactly the shape it
+    /// had before this block existed.
+    held: Vec<HeldVersion>,
 }
 
 impl NpmIndexBuilder {
     /// Build with an already-intersected tag map (see
     /// [`intersect_dist_tags`]). Entries are emitted verbatim.
     pub fn new(dist_tags: BTreeMap<String, String>) -> Self {
-        Self { dist_tags }
+        Self {
+            dist_tags,
+            held: Vec::new(),
+        }
+    }
+
+    /// Attach the withheld-version list the `hort.held` block reports.
+    ///
+    /// Separate from [`Self::new`] because it is optional in the strong
+    /// sense: an empty list is not merely a degenerate case but the
+    /// common one, and it must leave the emitted packument byte-identical
+    /// to a build that never called this.
+    #[must_use]
+    pub fn with_held(mut self, held: Vec<HeldVersion>) -> Self {
+        self.held = held;
+        self
     }
 }
 
@@ -338,6 +513,23 @@ impl IndexBuilder for NpmIndexBuilder {
                 .map(|(tag, version)| (tag, serde_json::Value::String(version)))
                 .collect();
             packument.insert("dist-tags".to_string(), serde_json::Value::Object(wire));
+        }
+
+        // The held block is additive and lives OUTSIDE the resolution
+        // surface: it is not `versions{}` and not `dist-tags`, so no
+        // resolver can reach a withheld version through it. It exists
+        // because a version dropped from both of those is otherwise
+        // indistinguishable from one that never existed — which is what
+        // the content route already contradicts by answering a held
+        // version with `503` rather than `404`.
+        //
+        // Omitted entirely when nothing is held, so the common packument
+        // does not grow a key.
+        if !self.held.is_empty() {
+            let held: Vec<serde_json::Value> = self.held.iter().map(HeldVersion::to_json).collect();
+            let mut hort = serde_json::Map::with_capacity(1);
+            hort.insert("held".to_string(), serde_json::Value::Array(held));
+            packument.insert("hort".to_string(), serde_json::Value::Object(hort));
         }
 
         // `serde_json::to_vec` on a `serde_json::Map` is infallible
@@ -852,6 +1044,279 @@ mod tests {
             json.get("dist-tags").is_none(),
             "an empty served set must never emit a dist-tags block"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // The `hort.held` block.
+    //
+    // Read the first test first: it is the one that protects the property
+    // the filter pipeline exists for. Everything else here is about the
+    // block's own honesty.
+    // -----------------------------------------------------------------
+
+    /// Emit the packument bytes for a given `(entries, tags, held)`
+    /// triple — the raw builder output, not a re-serialised `Value`, so
+    /// the byte-identity test below compares what actually goes on the
+    /// wire.
+    fn build_bytes(
+        entries: Vec<VersionEntry>,
+        base: &str,
+        dist_tags: BTreeMap<String, String>,
+        held: Vec<HeldVersion>,
+    ) -> Bytes {
+        NpmIndexBuilder::new(dist_tags).with_held(held).build(
+            BuildContext {
+                package_name: "p",
+                base_url: base,
+                index_mode: IndexMode::ReleasedOnly,
+                ordering: &NpmSemverOrdering,
+            },
+            entries,
+        )
+    }
+
+    fn held_fixture() -> Vec<HeldVersion> {
+        vec![
+            HeldVersion::new(
+                "7.29.7".to_string(),
+                HeldReason::Quarantined,
+                DateTime::parse_from_rfc3339("2026-08-26T08:18:00Z")
+                    .map(|d| d.with_timezone(&Utc))
+                    .ok(),
+            ),
+            HeldVersion::new("6.0.0".to_string(), HeldReason::Rejected, None),
+        ]
+    }
+
+    #[test]
+    fn the_held_block_leaves_the_resolution_surface_byte_identical() {
+        // THE regression guard for this whole feature. For one and the
+        // same input, the packument with a held block must differ from
+        // the packument without it by the added `hort` key and by
+        // NOTHING else — so `versions{}` and `dist-tags`, the two
+        // members any resolver reads, come out byte for byte as they did
+        // before the block existed. A range, a bare install or `latest`
+        // therefore still cannot resolve to a version hort would refuse
+        // to serve.
+        let base = "https://r.example/npm/m";
+        let stored = tags(&[("latest", "1.2.3"), ("next", "2.0.0-rc.1")]);
+
+        let baseline = build_bytes(three_version_entries(), base, stored.clone(), Vec::new());
+        let with_held = build_bytes(three_version_entries(), base, stored, held_fixture());
+
+        assert_ne!(baseline, with_held, "the block must actually be emitted");
+
+        let mut stripped: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&with_held).expect("builder emits a JSON object");
+        stripped
+            .remove("hort")
+            .expect("the held block is the key that was added");
+        assert_eq!(
+            serde_json::to_vec(&serde_json::Value::Object(stripped)).unwrap(),
+            baseline.to_vec(),
+            "the held block must add a key and change nothing else — `versions{{}}` and \
+             `dist-tags` are byte-identical to the same input's output without it"
+        );
+    }
+
+    #[test]
+    fn no_hort_key_at_all_when_nothing_is_held() {
+        // The common case. A packument for a package with nothing held
+        // must not grow a key.
+        let json = build(three_version_entries(), "p", "https://r.example/npm/m");
+        assert!(
+            json.get("hort").is_none(),
+            "an empty held list emits no `hort` key: {json}"
+        );
+    }
+
+    #[test]
+    fn held_entry_carries_version_status_and_available_after() {
+        let bytes = build_bytes(
+            three_version_entries(),
+            "https://r.example/npm/m",
+            BTreeMap::new(),
+            held_fixture(),
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["hort"]["held"][0],
+            serde_json::json!({
+                "version": "7.29.7",
+                "status": "quarantined",
+                "available_after": "2026-08-26T08:18:00Z",
+            }),
+            "a timed hold names itself, says it is a hold, and says when it lifts"
+        );
+    }
+
+    #[test]
+    fn a_rejected_version_is_never_presented_as_pending() {
+        // The one way this block can make things worse rather than
+        // better: telling a client to wait for a version that was
+        // rejected. `HeldVersion::new` drops a deadline offered for a
+        // terminal verdict, so the lie is not constructible.
+        let deadline = DateTime::parse_from_rfc3339("2026-08-26T08:18:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let held = vec![HeldVersion::new(
+            "6.0.0".to_string(),
+            HeldReason::Rejected,
+            Some(deadline),
+        )];
+        let bytes = build_bytes(
+            three_version_entries(),
+            "https://r.example/npm/m",
+            BTreeMap::new(),
+            held,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let entry = &json["hort"]["held"][0];
+        assert_eq!(entry["status"].as_str().unwrap(), "rejected");
+        assert!(
+            entry.get("available_after").is_none(),
+            "a verdict is not waiting for anything — it must carry no deadline: {entry}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_deadline_is_an_absent_field_not_a_null() {
+        let held = vec![HeldVersion::new(
+            "7.29.7".to_string(),
+            HeldReason::Quarantined,
+            None,
+        )];
+        let bytes = build_bytes(
+            three_version_entries(),
+            "https://r.example/npm/m",
+            BTreeMap::new(),
+            held,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let entry = &json["hort"]["held"][0];
+        assert_eq!(entry["status"].as_str().unwrap(), "quarantined");
+        assert!(
+            entry.get("available_after").is_none(),
+            "an unknown deadline is omitted — never null, never a zero instant: {entry}"
+        );
+    }
+
+    #[test]
+    fn held_reason_classifies_exactly_the_non_servable_statuses() {
+        // Must agree with `HeldVisibility::Hidden::admits` — the filter
+        // decides which versions reach this block, this decides how they
+        // are described, and a disagreement would either drop a withheld
+        // version from the report or report a served one.
+        assert_eq!(HeldReason::from_status(QuarantineStatus::Released), None);
+        assert_eq!(HeldReason::from_status(QuarantineStatus::None), None);
+        assert_eq!(
+            HeldReason::from_status(QuarantineStatus::Quarantined),
+            Some(HeldReason::Quarantined)
+        );
+        assert_eq!(
+            HeldReason::from_status(QuarantineStatus::Rejected),
+            Some(HeldReason::Rejected)
+        );
+        assert_eq!(
+            HeldReason::from_status(QuarantineStatus::ScanIndeterminate),
+            Some(HeldReason::ScanIndeterminate)
+        );
+    }
+
+    #[test]
+    fn held_reason_wire_tokens_are_distinct_and_snake_case() {
+        assert_eq!(HeldReason::Quarantined.wire(), "quarantined");
+        assert_eq!(HeldReason::Rejected.wire(), "rejected");
+        assert_eq!(HeldReason::ScanIndeterminate.wire(), "scan_indeterminate");
+    }
+
+    #[test]
+    fn scan_indeterminate_is_reported_as_terminal_too() {
+        let held = vec![HeldVersion::new(
+            "6.0.0".to_string(),
+            HeldReason::ScanIndeterminate,
+            Some(Utc::now()),
+        )];
+        let bytes = build_bytes(
+            three_version_entries(),
+            "https://r.example/npm/m",
+            BTreeMap::new(),
+            held,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let entry = &json["hort"]["held"][0];
+        assert_eq!(entry["status"].as_str().unwrap(), "scan_indeterminate");
+        assert!(
+            entry.get("available_after").is_none(),
+            "a fail-closed block has no self-resolving deadline: {entry}"
+        );
+    }
+
+    #[test]
+    fn available_after_is_second_precision_utc_with_a_z_suffix() {
+        // Sub-second precision is noise in an hours-long observation
+        // window, and an offset other than `Z` would make two hort
+        // instances render the same instant differently.
+        let deadline = DateTime::parse_from_rfc3339("2026-08-26T08:18:00.123456Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let held = vec![HeldVersion::new(
+            "7.29.7".to_string(),
+            HeldReason::Quarantined,
+            Some(deadline),
+        )];
+        let bytes = build_bytes(
+            three_version_entries(),
+            "https://r.example/npm/m",
+            BTreeMap::new(),
+            held,
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            json["hort"]["held"][0]["available_after"].as_str().unwrap(),
+            "2026-08-26T08:18:00Z"
+        );
+    }
+
+    #[test]
+    fn held_entries_keep_the_order_the_source_produced() {
+        let bytes = build_bytes(
+            three_version_entries(),
+            "https://r.example/npm/m",
+            BTreeMap::new(),
+            held_fixture(),
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let versions: Vec<&str> = json["hort"]["held"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["version"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            versions,
+            vec!["7.29.7", "6.0.0"],
+            "the array preserves input order; it is not re-sorted"
+        );
+    }
+
+    #[test]
+    fn an_empty_served_set_still_reports_what_is_held() {
+        // Every version of a package is held: `versions{}` is empty and
+        // there is no `dist-tags` block — the exact shape that used to
+        // read as "this package does not exist here". The held block is
+        // the only thing that distinguishes it from one that really
+        // doesn't.
+        let bytes = build_bytes(
+            Vec::new(),
+            "https://r.example/npm/m",
+            BTreeMap::new(),
+            held_fixture(),
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json["versions"].as_object().unwrap().is_empty());
+        assert!(json.get("dist-tags").is_none());
+        assert_eq!(json["hort"]["held"].as_array().unwrap().len(), 2);
     }
 
     // -----------------------------------------------------------------

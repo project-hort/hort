@@ -1083,7 +1083,11 @@ worker:
     # container port, and (when networkPolicy.enabled) co-renders a worker NetworkPolicy adding a
     # Prometheus-scoped Ingress allowance on <port>. The listener has NO per-request auth — the
     # NetworkPolicy is the control. The default-on server NetworkPolicy already DENIES this port;
-    # this knob adds the scrape allowance.
+    # this knob adds the scrape allowance. worker.enabled:true with enabled:true and
+    # networkPolicy.enabled:false is REJECTED at helm template — that combination would turn the
+    # listener on with no NetworkPolicy protecting it at all (see
+    # templates/worker-networkpolicy.yaml). worker.enabled:false makes this flag inert (no worker
+    # pod, no listener), so that case renders fine regardless of networkPolicy.enabled.
     enabled: false
     port: 9090
     # scrapeFrom: a list of k8s NetworkPolicyPeer objects (from[]) allowed to scrape — e.g. your
@@ -1390,11 +1394,10 @@ scheduledTasks:
   #                 `sa:<name>` backing user.
   #   permissions — ALL of these are minted via repeated `--permission`
   #                 flags. Every one of them must be backed by a live
-  #                 `PermissionGrant` for this identity AT THIS ENTRY'S
-  #                 SCOPE: a global identity (no `repository:` below)
-  #                 needs a GLOBAL grant per permission; a repo-scoped
-  #                 identity (`repository:` set below) needs the grant
-  #                 scoped to that SAME repository — a global grant also
+  #                 `PermissionGrant` for this identity AT THE SCOPE
+  #                 `authorityRepository` BELOW DECLARES: unset, that's a
+  #                 GLOBAL grant per permission; set, it's a grant scoped
+  #                 to that SAME repository — a global grant also
   #                 satisfies it (global ⊇ repo), exactly as at runtime.
   #                 `issue-svc-token`'s `--require-authority` preflight
   #                 checks the declared scope with the SAME evaluator
@@ -1402,21 +1405,39 @@ scheduledTasks:
   #                 partial declaration strands the sibling grants:
   #                 effective authority is capability ∩ grants, so an
   #                 unbacked permission here is dead weight even if
-  #                 minted. `--require-authority` makes the mint (and
-  #                 therefore the hook Job, and therefore the helm
-  #                 upgrade) FAIL LOUD when a listed permission has no
-  #                 backing grant at its scope, rather than silently
+  #                 minted. The preflight is always on — nothing in this
+  #                 entry can switch it off, only aim it — and makes the
+  #                 mint (and therefore the hook Job, and therefore the
+  #                 helm upgrade) FAIL LOUD when a listed permission has
+  #                 no backing grant at its scope, rather than silently
   #                 minting a token that 403s at CronJob run time.
-  #   repository  — optional. Scopes the minted token to a single
-  #                 repository by its `key`: the identity's cap carries
-  #                 `repository_ids: [<repo_id>]` instead of the default
-  #                 global `null`, and (with `--require-authority`) the
-  #                 preflight checks each permission at this repository
-  #                 rather than globally. Omit (default) for a
-  #                 global-scope identity — unchanged behaviour,
+  #   repository  — optional. Scopes the minted token's CAP ONLY to a
+  #                 single repository by its `key`: the identity's cap
+  #                 carries `repository_ids: [<repo_id>]` instead of the
+  #                 default global `null`. Does NOT affect the
+  #                 `--require-authority` preflight's scope — see
+  #                 `authorityRepository` below for that. Omit (default)
+  #                 for a global-cap identity — unchanged behaviour,
   #                 byte-compatible with every prior release. Single
   #                 value only; multiple repositories per identity is a
   #                 future need, out of scope here.
+  #   authorityRepository — optional. Aims the `--require-authority`
+  #                 preflight at this repository's scope, independent of
+  #                 `repository` above — so an identity can carry a
+  #                 global cap while its authority is still checked at a
+  #                 specific repository, e.g. a UAT-smoke identity that
+  #                 needs an unscoped token but only has repo-scoped
+  #                 grants. Omit (default) for the byte-compatible
+  #                 behaviour every prior release rendered: the preflight
+  #                 (always on) checks GLOBAL scope unless `repository`
+  #                 above is set, in which case it follows `repository`'s
+  #                 scope instead. An empty string is rejected by the
+  #                 chart schema — there is no value here that disables
+  #                 the preflight, only ones that aim it: the guard exists
+  #                 specifically to catch a missing-or-misspelled grant
+  #                 before it becomes a silent CronJob 403, and a boolean
+  #                 (or empty-string) opt-out would be one copied values
+  #                 file away from switching that off by accident.
   #   secretName  — the cluster Secret this identity's token is written
   #                 to. `secretName` IS AN RBAC ANCHOR: the bootstrap
   #                 Role's `resourceNames` binds to it by literal
@@ -1603,8 +1624,10 @@ scheduledTasks:
   # ONE `kind='prefetch-row-retention-sweep'` row into `public.jobs`
   # every tick using the RUNTIME DSN; the worker picks it up and runs
   # `PrefetchRowRetentionSweepHandler`, which deletes terminal
-  # (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'`
-  # rows older than a configurable horizon (default 7 days).
+  # (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` and
+  # `kind = 'oci-index-child-ingest'` rows older than a configurable
+  # horizon (default 7 days) — the pull-through ingest cascade's rows,
+  # none of which hold durable state.
   #
   # Pairs with the per-table autovacuum tuning on `public.jobs`
   # (migration 009: `autovacuum_vacuum_scale_factor = 0.02`). The
@@ -1617,12 +1640,18 @@ scheduledTasks:
   # `hort-http-admin-tasks` HTTP route.
   prefetchRowRetentionSweep:
     executionPath: dsn-direct
-    # Render the CronJob. **Default false.** The cascade is opt-in
-    # per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`;
-    # if no repo opts in the `jobs` table accumulates nothing and the
-    # sweep has nothing to delete. An operator enabling the cascade
-    # should also enable this sweep so `jobs` does not grow unbounded.
-    enabled: false
+    # Render the CronJob. **Default true**, because this sweep's rows
+    # accrue unconditionally: an OCI proxy repository mints one terminal
+    # `oci-index-child-ingest` row per declared child manifest on every
+    # pull-through of an image index, from day one and with no per-repo
+    # opt-in. Without the sweep those rows are retained permanently.
+    #
+    # The transitive prefetch cascade's own `prefetch%` rows ARE opt-in
+    # per-repo (`prefetch_policy.triggers.contains(TransitiveDeps)`), so
+    # a deployment that opts into neither feature simply runs an idle
+    # CronJob whose DELETE matches nothing — a far smaller cost than the
+    # unbounded table growth the default-off setting left in place.
+    enabled: true
     # Cron schedule. Default: daily at 02:00 UTC. The 7-day retention
     # 7-day retention horizon gives 6 days of headroom even after a
     # missed run; daily cadence + autovacuum tuning is sufficient for

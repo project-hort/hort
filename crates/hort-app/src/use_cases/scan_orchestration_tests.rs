@@ -24,7 +24,8 @@ use std::time::Duration;
 use chrono::Utc;
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::QuarantineStatus;
+use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
+use hort_domain::entities::repository::RepositoryType;
 use hort_domain::entities::scan_policy::{
     NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
@@ -37,11 +38,11 @@ use hort_domain::ports::format_handler::{
     FormatHandler, PayloadSbom, PayloadSbomExtraction, SbomResolution,
 };
 use hort_domain::ports::jobs_repository::{JobStatus, JobsRepository, ScanJob, TriggerSource};
-use hort_domain::ports::scanner::ScannerPort;
+use hort_domain::ports::scanner::{NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{
-    ArtifactCoords, ContentHash, Ecosystem, Finding, PayloadAccess, Sbom, SbomComponent,
-    SeverityBasis,
+    ArtifactCoords, ArtifactKind, ContentHash, Ecosystem, Finding, PayloadAccess, Sbom,
+    SbomComponent, SeverityBasis,
 };
 
 use super::*;
@@ -157,20 +158,73 @@ impl JobsRepository for MockJobsRepository {
 
 struct MockScanner {
     name_: String,
-    /// `Some(Ok(findings))` = succeeds with findings; `Some(Err(_))` =
-    /// fails; `None` = panics (tests should always seed an outcome).
-    response: Mutex<Option<DomainResult<Vec<Finding>>>>,
+    /// `Some(Ok(analysis))` = the backend returned that analysis;
+    /// `Some(Err(_))` = it failed; `None` = panics (tests should always
+    /// seed an outcome).
+    response: Mutex<Option<DomainResult<ScanAnalysis>>>,
     /// Number of times `scan` was invoked.
     calls: Mutex<u32>,
+    /// The [`ArtifactKind`] the last `scan` call was handed, so tests can
+    /// assert the orchestrator resolved it from the format handler rather
+    /// than defaulting.
+    seen_kind: Mutex<Option<ArtifactKind>>,
+    /// The format key the last `scan` call was handed.
+    seen_format: Mutex<Option<String>>,
+    /// The stored path the last `scan` call's coords carried.
+    seen_path: Mutex<Option<String>>,
+    /// The formats this backend claims to analyse — the mock's
+    /// programmable [`ScannerPort::applies_to`]. `None` (the default)
+    /// means "every format", which is what the tests that drive
+    /// dispatch purely from the policy's backend list want.
+    covers: Option<Vec<String>>,
 }
 
 impl MockScanner {
+    /// A backend that produces a verdict — the common case, so it keeps
+    /// the plain `Vec<Finding>` constructor.
     fn new(name: impl Into<String>, response: DomainResult<Vec<Finding>>) -> Self {
+        Self::with_analysis(name, response.map(ScanAnalysis::Analysed))
+    }
+
+    /// A backend whose whole `ScanAnalysis` the test chooses — used for
+    /// the `NothingAnalysable` arms.
+    fn with_analysis(name: impl Into<String>, response: DomainResult<ScanAnalysis>) -> Self {
         Self {
             name_: name.into(),
             response: Mutex::new(Some(response)),
             calls: Mutex::new(0),
+            seen_kind: Mutex::new(None),
+            seen_format: Mutex::new(None),
+            seen_path: Mutex::new(None),
+            covers: None,
         }
+    }
+
+    /// Narrow this backend's capability to `formats` — the mock's half
+    /// of the scanner capability map. Used by the tests that pin the
+    /// orchestrator's consult-before-invoke behaviour, where the whole
+    /// point is a backend that answers `false` for the job's format.
+    fn covering(mut self, formats: &[&str]) -> Self {
+        self.covers = Some(formats.iter().map(|f| (*f).to_string()).collect());
+        self
+    }
+
+    /// How many times `scan` was invoked — the assertion that separates
+    /// "the backend abstained" from "the backend was never asked".
+    fn calls(&self) -> u32 {
+        *self.calls.lock().unwrap()
+    }
+
+    fn seen_kind(&self) -> Option<ArtifactKind> {
+        *self.seen_kind.lock().unwrap()
+    }
+
+    fn seen_format(&self) -> Option<String> {
+        self.seen_format.lock().unwrap().clone()
+    }
+
+    fn seen_path(&self) -> Option<String> {
+        self.seen_path.lock().unwrap().clone()
     }
 }
 
@@ -178,12 +232,26 @@ impl ScannerPort for MockScanner {
     fn name(&self) -> &str {
         &self.name_
     }
+    /// Programmable via [`MockScanner::covering`]. The default is "every
+    /// format", because most tests here drive dispatch from the policy's
+    /// backend list rather than from the capability map; the tests that
+    /// pin the orchestrator's consult narrow it deliberately. The map's
+    /// real truth is asserted against the static record and the live
+    /// adapters in the worker's parity guard.
+    fn applies_to(&self, format: &str) -> bool {
+        self.covers
+            .as_ref()
+            .is_none_or(|formats| formats.iter().any(|f| f == format))
+    }
     fn scan<'a>(
         &'a self,
-        _content_hash: &'a ContentHash,
+        target: &'a ScanTarget<'a>,
         _sbom: Option<&'a Sbom>,
-    ) -> BoxFuture<'a, DomainResult<Vec<Finding>>> {
+    ) -> BoxFuture<'a, DomainResult<ScanAnalysis>> {
         *self.calls.lock().unwrap() += 1;
+        *self.seen_kind.lock().unwrap() = Some(target.kind);
+        *self.seen_format.lock().unwrap() = Some(target.format.to_string());
+        *self.seen_path.lock().unwrap() = Some(target.coords.path.clone());
         let resp = self
             .response
             .lock()
@@ -586,6 +654,7 @@ fn persisted_scan_completed(
             finding_count,
             severity_summary: severity,
             findings_blob,
+            assessment: ScanAssessment::Analysed,
         }),
         correlation_id: Uuid::new_v4(),
         causation_id: None,
@@ -910,6 +979,7 @@ async fn run_scan_completed_with_single_backend_returns_findings_without_writing
 
     let outcome = uc.run_scan(&job).await.expect("run_scan");
     let ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner,
         findings,
         sbom: _,
@@ -985,6 +1055,7 @@ async fn run_scan_continues_when_one_of_two_backends_fails() {
 
     let outcome = uc.run_scan(&job).await.expect("run_scan");
     let ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner,
         findings,
         sbom: _,
@@ -1372,6 +1443,7 @@ async fn record_outcome_completed_first_ever_scan_emits_no_artifact_became_vulne
         SeverityThreshold::Critical,
     )];
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: findings.clone(),
         sbom: None,
@@ -1425,6 +1497,7 @@ async fn record_outcome_completed_with_prior_clean_emits_artifact_became_vulnera
 
     let new_findings = vec![finding("pkg:npm/foo@1", "CVE-1", SeverityThreshold::High)];
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: new_findings.clone(),
         sbom: None,
@@ -1499,6 +1572,7 @@ async fn record_outcome_completed_with_prior_partial_overlap_emits_only_new_find
         finding("pkg:npm/foo@1", "CVE-B", SeverityThreshold::Critical),
     ];
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: current,
         sbom: None,
@@ -1559,6 +1633,7 @@ async fn record_outcome_completed_identical_findings_emits_no_artifact_became_vu
     );
 
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: prior_findings.clone(),
         sbom: None,
@@ -2077,6 +2152,7 @@ async fn record_outcome_path_a_single_batch_after_item_12() {
     );
 
     let outcome = ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
         scanner: "trivy".into(),
         findings: vec![finding("pkg:npm/foo@1", "CVE-1", SeverityThreshold::High)],
         sbom: None,
@@ -2582,8 +2658,9 @@ fn component(purl: &str) -> SbomComponent {
 
 /// Seed a cargo artifact whose stored CAS content is `payload`, with the
 /// artifact row's `sha256_checksum` pointing at it — the only handle the
-/// orchestrator has on the bytes. The repository is `Hosted`, the one
-/// class whose artifacts take the payload path.
+/// orchestrator has on the bytes. The repository is `Hosted`; every
+/// class takes the payload path, so callers that need a different one
+/// use [`seed_cargo_artifact_in_repo_type`] directly.
 ///
 /// `metadata_json` is the stored `ArtifactMetadata.metadata` row (the
 /// registry-index document). Note what is deliberately absent: no
@@ -2611,7 +2688,7 @@ async fn seed_cargo_artifact_with_payload(
 }
 
 /// As [`seed_cargo_artifact_with_payload`], with the repository class
-/// chosen by the caller — the input the payload-path gate reads.
+/// chosen by the caller.
 #[allow(clippy::too_many_arguments)]
 async fn seed_cargo_artifact_in_repo_type(
     repo_type: RepositoryType,
@@ -2854,55 +2931,51 @@ async fn payload_scan_survives_an_unreadable_stored_payload() {
 }
 
 #[tokio::test]
-async fn payload_scan_in_a_proxy_repo_never_pays_for_a_cas_read() {
-    // The gate's cost half. A proxied cargo artifact's embedded lockfile
-    // is the upstream author's dev-time resolve, which no consumer of the
-    // library ever runs — so the registry must not stream the payload out
-    // of CAS to read it. `payload_sbom()` still answers `Some` for cargo;
-    // the repository class is what turns the read away, and it does so
-    // before the storage handle is touched at all.
+async fn payload_scan_in_a_proxy_repo_reads_the_stored_payload() {
+    // ADR 0056's amendment: the repository class no longer decides
+    // whether the payload path runs. `payload_sbom()` answering `Some`
+    // for cargo is now sufficient by itself, so a proxied artifact reads
+    // CAS exactly as a hosted one does.
     let (_queried, handler, storage) =
         run_cargo_scan_in_repo_type(RepositoryType::Proxy, b"RESOLVED:serde@1.0.200").await;
 
     assert_eq!(
         storage.get_call_count(),
-        0,
-        "a proxied cargo artifact must not read CAS for its SBOM"
+        1,
+        "a proxied cargo artifact reads CAS for its SBOM, same as hosted"
     );
     assert!(
-        handler.seen_payload.lock().unwrap().is_none(),
-        "the payload capability is never dispatched for a non-hosted repository"
+        handler.seen_payload.lock().unwrap().is_some(),
+        "the payload capability is dispatched for a proxied repository"
     );
 }
 
 #[tokio::test]
-async fn payload_scan_in_a_proxy_repo_produces_the_pre_payload_metadata_sbom() {
-    // The gate's behaviour half: a proxied cargo scan is byte-identical
-    // to what it produced before the payload path existed — the
-    // handler's metadata-only `extract_sbom`, declared-range components
-    // and all. This arm must not change: findings against an upstream
-    // author's stale resolve would carry gate power (the shipped
-    // `enforcement: reject` default) over a crate every consumer would
-    // resolve safely.
+async fn payload_scan_in_a_proxy_repo_resolves_from_the_payload() {
+    // The behaviour half of the same reversal: a proxied cargo scan now
+    // produces the resolved-lockfile SBOM, not the declared-range one.
+    // The false-positive-with-gate-power risk this used to guard against
+    // is addressed by `enforcement: record` on proxied lockfile formats
+    // (an operator setting, not a scanner-side gate) rather than by
+    // withholding the SBOM.
     let (queried, _handler, _storage) =
         run_cargo_scan_in_repo_type(RepositoryType::Proxy, b"RESOLVED:serde@1.0.200").await;
 
-    assert_eq!(
-        queried.iter().map(|c| c.purl.as_str()).collect::<Vec<_>>(),
-        vec!["pkg:cargo/declared@1"],
-        "the proxy path must be exactly the metadata-only SBOM"
+    assert!(
+        queried.iter().any(|c| c.purl == "pkg:cargo/serde@1.0.200"),
+        "the proxy path must resolve from the payload, not the declared range: {queried:?}"
     );
 }
 
 #[tokio::test]
-async fn payload_scan_is_gated_off_for_every_non_hosted_repository_class() {
-    // `Staging` is gated off with `Proxy` and `Virtual` even though
-    // `RepositoryType::is_hosted()` counts it as upload-accepting — the
-    // gate is a literal `Hosted` match, and this test is what stops a
-    // future edit from "simplifying" it into that predicate. Widening
-    // the gate to staging is a policy decision about which publishes a
-    // lockfile may gate, not a helper rename.
+async fn payload_scan_runs_for_every_repository_class() {
+    // Every `RepositoryType` takes the payload path once the handler
+    // declares `payload_sbom()`. This is what stops a future edit from
+    // reintroducing a per-class gate — the scanner must be able to
+    // deliver the threat level the repository configuration declares,
+    // for every class that configuration allows.
     for repo_type in [
+        RepositoryType::Hosted,
         RepositoryType::Proxy,
         RepositoryType::Virtual,
         RepositoryType::Staging,
@@ -2911,26 +2984,25 @@ async fn payload_scan_is_gated_off_for_every_non_hosted_repository_class() {
             run_cargo_scan_in_repo_type(repo_type, b"RESOLVED:serde@1.0.200").await;
         assert_eq!(
             storage.get_call_count(),
-            0,
-            "{repo_type:?} must not read CAS for its SBOM"
+            1,
+            "{repo_type:?} must read CAS for its SBOM"
         );
         assert!(
-            handler.seen_payload.lock().unwrap().is_none(),
-            "{repo_type:?} must not dispatch the payload capability"
+            handler.seen_payload.lock().unwrap().is_some(),
+            "{repo_type:?} must dispatch the payload capability"
         );
-        assert_eq!(
-            queried.iter().map(|c| c.purl.as_str()).collect::<Vec<_>>(),
-            vec!["pkg:cargo/declared@1"],
-            "{repo_type:?} must take the metadata-only path"
+        assert!(
+            queried.iter().any(|c| c.purl == "pkg:cargo/serde@1.0.200"),
+            "{repo_type:?} must take the payload path: {queried:?}"
         );
     }
 }
 
 #[tokio::test]
 async fn payload_scan_in_a_hosted_repo_still_resolves_from_the_payload() {
-    // The gate's other side, pinned next to the negative cases so a
-    // change that over-tightens it fails here rather than silently
-    // turning every cargo scan into a subject-only one.
+    // Pinned on its own so a future change that narrows the payload
+    // path fails here rather than silently turning a hosted cargo scan
+    // into a subject-only one.
     let (queried, handler, storage) =
         run_cargo_scan_in_repo_type(RepositoryType::Hosted, b"RESOLVED:serde@1.0.200").await;
 
@@ -3371,6 +3443,7 @@ mod metrics_emission_tests {
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 1);
                 let outcome = ScanRunOutcome::Completed {
+                    assessment: ScanAssessment::Analysed,
                     scanner: "trivy".into(),
                     findings: vec![],
                     sbom: None,
@@ -3399,6 +3472,7 @@ mod metrics_emission_tests {
                 let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
                 let job = sample_scan_job(artifact_id, 1);
                 let outcome = ScanRunOutcome::Completed {
+                    assessment: ScanAssessment::Analysed,
                     scanner: "trivy".into(),
                     findings: vec![finding(
                         "pkg:npm/foo@1",
@@ -3648,6 +3722,7 @@ mod metrics_emission_tests {
                     );
 
                     let outcome = ScanRunOutcome::Completed {
+                        assessment: ScanAssessment::Analysed,
                         scanner: "trivy".into(),
                         findings: vec![
                             // Mix High + Critical — the metric label must
@@ -3726,6 +3801,7 @@ mod metrics_emission_tests {
                         ],
                     );
                     let outcome = ScanRunOutcome::Completed {
+                        assessment: ScanAssessment::Analysed,
                         scanner: "trivy".into(),
                         findings: vec![finding("pkg:npm/foo@1", "CVE-9", SeverityThreshold::High)],
                         sbom: None,
@@ -3808,6 +3884,101 @@ mod metrics_emission_tests {
         assert_eq!(
             osv_cap, None,
             "a non-cap backend error must NOT emit the report_too_large metric"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // hort_scan_record_outcome_failures_total{result=inert_pairing}
+    // ---------------------------------------------------------------
+
+    /// A backend the capability map says cannot analyse the job's format
+    /// attributes `result="inert_pairing"` to its own name — the
+    /// alerting signal for "this repository is paired with a backend
+    /// that adjudicates nothing there". The covering backend beside it
+    /// emits nothing: it ran and produced a verdict.
+    ///
+    /// `inert_pairing` and `nothing_analysable` stay apart: the first is
+    /// a backend that was never invoked (the pairing is the defect), the
+    /// second is one that ran and found nothing to analyse.
+    #[test]
+    fn run_scan_emits_inert_pairing_metric_for_the_backend_it_skips() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let trivy: Arc<dyn ScannerPort> = Arc::new(
+                    MockScanner::new("trivy", Ok(vec![]))
+                        .covering(&["oci", "maven", "pypi", "npm", "cargo"]),
+                );
+                let osv: Arc<dyn ScannerPort> = Arc::new(
+                    MockScanner::new("osv", Ok(vec![]))
+                        .covering(&["npm", "pypi", "cargo", "maven"]),
+                );
+                let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+                scanners.insert("trivy".into(), trivy);
+                scanners.insert("osv".into(), osv);
+                let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+                    vec!["trivy".into(), "osv".into()],
+                    scanners,
+                    handler_map("oci", ArtifactKind::OciBlob),
+                );
+                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let job = scan_job_for_format(artifact_id, "oci");
+                let outcome = uc.run_scan(&job).await.expect("run_scan");
+                assert!(matches!(outcome, ScanRunOutcome::Completed { .. }));
+            })
+        });
+        let osv_inert = find_counter(&snap, "hort_scan_record_outcome_failures_total", |labels| {
+            labels.get("result") == Some(&"inert_pairing") && labels.get("scanner") == Some(&"osv")
+        });
+        assert_eq!(
+            osv_inert,
+            Some(1),
+            "the skipped backend must attribute inert_pairing to its own name"
+        );
+        let trivy_inert =
+            find_counter(&snap, "hort_scan_record_outcome_failures_total", |labels| {
+                labels.get("result") == Some(&"inert_pairing")
+                    && labels.get("scanner") == Some(&"trivy")
+            });
+        assert_eq!(
+            trivy_inert, None,
+            "a backend that covers the format and ran must not emit inert_pairing"
+        );
+        let nothing_analysable =
+            find_counter(&snap, "hort_scan_record_outcome_failures_total", |labels| {
+                labels.get("result") == Some(&"nothing_analysable")
+            });
+        assert_eq!(
+            nothing_analysable, None,
+            "a backend that was never invoked did not 'run and find nothing'"
+        );
+    }
+
+    /// The non-gating arm is silent on the failure counter: a format no
+    /// backend covers asks nothing of an operator (there is no covering
+    /// backend to switch to), so it logs at `debug!` and emits nothing.
+    #[test]
+    fn run_scan_emits_no_failure_metric_when_no_backend_covers_the_format() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let trivy: Arc<dyn ScannerPort> =
+                    Arc::new(MockScanner::new("trivy", Ok(vec![])).covering(&["oci"]));
+                let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+                scanners.insert("trivy".into(), trivy);
+                let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+                    vec!["trivy".into()],
+                    scanners,
+                    handler_map("maven", ArtifactKind::MavenJar),
+                );
+                let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+                let job = scan_job_for_format(artifact_id, "gradle");
+                let outcome = uc.run_scan(&job).await.expect("run_scan");
+                assert!(matches!(outcome, ScanRunOutcome::Completed { .. }));
+            })
+        });
+        let any = find_counter(&snap, "hort_scan_record_outcome_failures_total", |_| true);
+        assert_eq!(
+            any, None,
+            "an uncovered format is not a failure to alert on"
         );
     }
 
@@ -3925,7 +4096,6 @@ mod metrics_emission_tests {
             "unusable_lockfile",
             "payload_unavailable",
             "not_applicable",
-            "hosted_only",
         ] {
             let hit = find_counter(&snap, "hort_sbom_resolution_total", |labels| {
                 labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&candidate)
@@ -4135,15 +4305,10 @@ mod metrics_emission_tests {
     }
 
     #[test]
-    fn hort_sbom_resolution_total_fires_hosted_only_for_a_non_hosted_repository() {
-        // The gated-off case gets its own label rather than sharing
-        // `not_applicable`. Sharing would collide on the same `format`
-        // label with two facts an operator must be able to separate:
-        // "cargo has no handler registered" and "cargo has one, and this
-        // repository class deliberately does not use its payload path".
-        // A cargo registry whose scans are all `hosted_only` when its
-        // operator believes those repositories are hosted has a
-        // misconfiguration no other series would reveal.
+    fn hort_sbom_resolution_total_fires_resolved_for_a_proxy_repository() {
+        // ADR 0056's amendment: `hosted_only` is retired, and a proxied
+        // cargo scan now ticks `resolved` exactly as a hosted one does —
+        // the repository class no longer changes which label fires.
         let snap = capture_async_metrics(|| {
             Box::pin(async move {
                 let _ =
@@ -4153,8 +4318,7 @@ mod metrics_emission_tests {
         });
         assert_eq!(
             find_counter(&snap, "hort_sbom_resolution_total", |labels| {
-                labels.get("format") == Some(&"cargo")
-                    && labels.get("result") == Some(&"hosted_only")
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"resolved")
             }),
             Some(1),
         );
@@ -4164,16 +4328,36 @@ mod metrics_emission_tests {
                     && labels.get("result") == Some(&"not_applicable")
             }),
             None,
-            "the gated-off case must not also tick not_applicable"
+            "a payload-capable format must not also tick not_applicable"
         );
     }
 
     #[test]
-    fn hort_sbom_extraction_total_still_reports_the_metadata_bom_when_gated_off() {
-        // The two counters stay orthogonal across the gate: resolution
-        // says the payload path was declined, extraction says a BOM
-        // still came out — the metadata one. An operator reading
-        // `hosted_only` must not conclude the scan produced nothing.
+    fn hort_sbom_resolution_total_fires_resolved_for_a_staging_repository() {
+        // `Staging` was excluded on purpose by the retired gate (it
+        // counts as upload-accepting under `RepositoryType::is_hosted`
+        // but the gate was a literal `Hosted` match). The amendment
+        // removes the gate entirely, so `Staging` now resolves too.
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ =
+                    run_cargo_scan_in_repo_type(RepositoryType::Staging, b"RESOLVED:serde@1.0.200")
+                        .await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"resolved")
+            }),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn hort_sbom_extraction_total_reports_success_for_a_proxy_repository() {
+        // The two counters stay orthogonal: resolution says the basis
+        // (`resolved`), extraction says a BOM came out (`success`) —
+        // unchanged by which repository class produced it.
         let snap = capture_async_metrics(|| {
             Box::pin(async move {
                 let _ =
@@ -4188,4 +4372,877 @@ mod metrics_emission_tests {
             Some(1),
         );
     }
+}
+
+// ===========================================================================
+// FORMAT-AWARE SCAN TARGET + "nothing analysable" is not "clean"
+// ===========================================================================
+
+/// A handler that answers `scan_kind` with a fixed value, so a test can
+/// prove the orchestrator asks the artifact's own handler rather than
+/// defaulting.
+struct FixedKindHandler {
+    key: &'static str,
+    kind: ArtifactKind,
+}
+
+impl FormatHandler for FixedKindHandler {
+    fn format_key(&self) -> &str {
+        self.key
+    }
+    fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+        Err(DomainError::Validation("not used by these tests".into()))
+    }
+    fn normalize_name(&self, name: &str) -> String {
+        name.to_string()
+    }
+    fn scan_kind(&self, _artifact: &Artifact) -> ArtifactKind {
+        self.kind
+    }
+}
+
+fn handler_map(key: &'static str, kind: ArtifactKind) -> HashMap<String, Arc<dyn FormatHandler>> {
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert(key.to_string(), Arc::new(FixedKindHandler { key, kind }));
+    handlers
+}
+
+/// Wire a use case with one scanner, one handler, and a global policy
+/// naming `backends`.
+#[allow(clippy::type_complexity)]
+fn make_uc_with_handler(
+    backends: Vec<String>,
+    scanners: HashMap<String, Arc<dyn ScannerPort>>,
+    handlers: HashMap<String, Arc<dyn FormatHandler>>,
+) -> (
+    ScanOrchestrationUseCase,
+    Arc<MockJobsRepository>,
+    Arc<MockEventStore>,
+    Arc<MockArtifactRepository>,
+    Arc<MockRepositoryRepository>,
+) {
+    let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
+    policy_projections.insert(seed_global_policy(backends));
+    let (uc, jobs, events, _storage, artifacts, repositories, _policy, _metadata) =
+        make_uc_with_policy_repo_and_handlers(
+            scanners,
+            Arc::new(MockAdvisory::ok(vec![])),
+            policy_projections,
+            handlers,
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    (uc, jobs, events, artifacts, repositories)
+}
+
+fn one_scanner(scanner: Arc<MockScanner>) -> HashMap<String, Arc<dyn ScannerPort>> {
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert(scanner.name().to_string(), scanner);
+    scanners
+}
+
+/// The scan target carries the artifact's identity and the kind its own
+/// format handler assigned. Without this the adapter cannot materialise
+/// anything an analyzer will look at.
+#[tokio::test]
+async fn run_scan_hands_the_backend_the_kind_from_the_artifacts_format_handler() {
+    let scanner = Arc::new(MockScanner::new("trivy", Ok(vec![])));
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner.clone()),
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.run_scan(&job).await.expect("run_scan");
+    assert_eq!(scanner.seen_kind(), Some(ArtifactKind::NpmTarball));
+    assert_eq!(scanner.seen_format().as_deref(), Some("npm"));
+    assert_eq!(
+        scanner.seen_path().as_deref(),
+        Some("my-pkg/1.0.0/my-pkg-1.0.0.tar.gz"),
+        "the target must carry the artifact's real coordinates, not a digest"
+    );
+}
+
+/// With no handler registered for the repository's format there is no one
+/// to classify the payload, and the orchestrator must not guess: `Other`
+/// is the honest answer, and it is what makes the backend abstain rather
+/// than report an unexamined artifact clean.
+#[tokio::test]
+async fn run_scan_passes_other_when_no_handler_is_registered_for_the_format() {
+    let scanner = Arc::new(MockScanner::new("trivy", Ok(vec![])));
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner.clone()),
+        HashMap::new(),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.run_scan(&job).await.expect("run_scan");
+    assert_eq!(scanner.seen_kind(), Some(ArtifactKind::Other));
+}
+
+/// The core regression. A backend that could not assess an *expected*
+/// surface must NOT produce a clean `Completed` outcome:
+/// `Completed { findings: [], assessment: Analysed }` is a clean verdict
+/// carrying release authority, and nothing examined the bytes.
+/// `NotApplicable` is deliberately absent from this loop — it is not an
+/// unassessed surface but the absence of one, and has its own tests
+/// below.
+#[tokio::test]
+async fn run_scan_returns_nothing_analysable_not_a_clean_completion() {
+    for reason in [
+        NotAnalysable::UnusableArchive,
+        NotAnalysable::NoAnalyzerMatched,
+    ] {
+        let scanner = Arc::new(MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(reason)),
+        ));
+        let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+            vec!["trivy".into()],
+            one_scanner(scanner),
+            handler_map("npm", ArtifactKind::NpmTarball),
+        );
+        let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+        let job = sample_scan_job(artifact_id, 1);
+
+        let outcome = uc.run_scan(&job).await.expect("run_scan");
+        let ScanRunOutcome::NothingAnalysable {
+            scanner: label,
+            reason: detail,
+        } = outcome
+        else {
+            panic!("expected NothingAnalysable for {reason}, got {outcome:?}");
+        };
+        assert_eq!(label, "trivy");
+        assert!(
+            detail.contains("trivy") && detail.contains(reason.as_str()),
+            "the reason must name the backend and why it abstained: {detail}"
+        );
+        assert!(
+            detail.contains("npm_tarball"),
+            "the reason must name the kind the backend was handed: {detail}"
+        );
+    }
+}
+
+/// One backend abstaining does not lose another's verdict. A real scan
+/// happened, so the artifact gets a real result — and the abstention is
+/// only a log line and a metric.
+#[tokio::test]
+async fn run_scan_keeps_a_verdict_when_only_one_of_two_backends_abstains() {
+    let abstaining = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NoAnalyzerMatched,
+        )),
+    ));
+    let verdict = Arc::new(MockScanner::new(
+        "osv",
+        Ok(vec![finding(
+            "pkg:npm/foo@1",
+            "CVE-1",
+            SeverityThreshold::High,
+        )]),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), abstaining);
+    scanners.insert("osv".into(), verdict);
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        assessment: ScanAssessment::Analysed,
+        scanner,
+        findings,
+        ..
+    } = outcome
+    else {
+        panic!("expected Completed from the backend that did analyse, got {outcome:?}");
+    };
+    assert_eq!(
+        scanner, "osv",
+        "the scanner label must name only the contributing backend"
+    );
+    assert_eq!(findings.len(), 1);
+}
+
+/// An *errored* backend still wins over an abstaining one: the error may
+/// be transient, so the outcome stays the retryable `Failed` rather than
+/// the immediately-terminal abstention.
+#[tokio::test]
+async fn run_scan_prefers_the_retryable_failure_when_one_backend_errored() {
+    let abstaining = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let broken = Arc::new(MockScanner::new(
+        "osv",
+        Err(DomainError::Invariant("osv-scanner not found".into())),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), abstaining);
+    scanners.insert("osv".into(), broken);
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Failed(reason) = outcome else {
+        panic!("an errored backend must keep the retryable path, got {outcome:?}");
+    };
+    // A mixed run must not tell an operator that the backend which ran
+    // cleanly "failed" — the message names the split.
+    assert!(
+        reason.contains("1 of 2 failed") && reason.contains("1 had nothing to analyse"),
+        "the reason must distinguish the failure from the abstention: {reason}"
+    );
+}
+
+/// A materialisation a backend cannot analyse is a policy mismatch, not a
+/// clean scan: the artifact goes terminal `scan_indeterminate` and the job
+/// goes terminal `failed` with no retry budget spent, because the next
+/// attempt would reach the same answer.
+#[tokio::test]
+async fn record_outcome_nothing_analysable_holds_the_artifact_and_does_not_retry() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NoAnalyzerMatched,
+        )),
+    ));
+    let (uc, jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.record_outcome(
+        &job,
+        ScanRunOutcome::NothingAnalysable {
+            scanner: "trivy".into(),
+            reason: "no scan backend could analyse artifact (kind npm_tarball): \
+                     trivy=no_analyzer_matched"
+                .into(),
+        },
+    )
+    .await
+    .expect("record_outcome");
+
+    assert_eq!(
+        artifacts
+            .get(artifact_id)
+            .expect("artifact")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "an artifact nothing examined must be held, never released"
+    );
+    assert_eq!(
+        jobs.failed_calls().len(),
+        1,
+        "the job must go terminal, not be rescheduled"
+    );
+    assert!(
+        jobs.rescheduled_calls().is_empty(),
+        "a deterministic abstention must not spend the retry budget"
+    );
+    assert!(
+        jobs.completed_calls().is_empty(),
+        "marking the job completed would read as a successful scan"
+    );
+
+    // The terminal state itself is the proof that no `ScanCompleted`
+    // was recorded: `record_scan_result` would have driven the artifact
+    // to a released or rejected status, never to `ScanIndeterminate`.
+    assert!(
+        !artifacts
+            .get(artifact_id)
+            .expect("artifact")
+            .is_downloadable(),
+        "an unexamined artifact must not be downloadable"
+    );
+}
+
+/// The abstention path is idempotent on an already-terminal artifact —
+/// the same recoverable skip the retry-exhausted path relies on, so a
+/// re-driven job cannot double-append.
+#[tokio::test]
+async fn record_outcome_nothing_analysable_is_idempotent_on_a_terminal_artifact() {
+    let scanner = Arc::new(MockScanner::new("trivy", Ok(vec![])));
+    let (uc, jobs, events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact = sample_artifact(QuarantineStatus::ScanIndeterminate);
+    let mut repo = sample_repository();
+    repo.id = artifact.repository_id;
+    let artifact_id = artifact.id;
+    artifacts.insert(artifact);
+    repositories.insert(repo);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.record_outcome(
+        &job,
+        ScanRunOutcome::NothingAnalysable {
+            scanner: "trivy".into(),
+            reason: "trivy=not_applicable".into(),
+        },
+    )
+    .await
+    .expect("record_outcome must treat an already-terminal artifact as a skip");
+
+    let appended: Vec<DomainEvent> = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|batch| batch.events.into_iter().map(|e| e.event))
+        .collect();
+    assert!(
+        !appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScanIndeterminate(_))),
+        "no duplicate ScanIndeterminate on an already-terminal artifact"
+    );
+    assert_eq!(jobs.failed_calls().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// "Not applicable" is a completed assessment, not a hold
+//
+// An artifact with no package surface by construction — an OCI manifest
+// row, a non-tar OCI blob such as the image config — is outside the scan
+// axis. No scanner can find a threat level in it, so a fail-closed hold
+// has nothing to wait on and never lifts: a Trivy-policed OCI repository
+// would hold every image it ingests, forever. These pin the partition and
+// the trail that keeps it honest (ADR 0007, 2026-09-18 clarification).
+// ---------------------------------------------------------------------------
+
+/// Every backend abstained, and every abstention was `NotApplicable` →
+/// a completed assessment with nothing assessed, never a hold and never
+/// a clean verdict.
+#[tokio::test]
+async fn run_scan_all_not_applicable_is_a_completed_not_applicable_assessment() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        handler_map("oci", ArtifactKind::OciManifest),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        scanner: label,
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("an artifact with no package surface must not be held, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::NotApplicable,
+        "the outcome must say there was nothing to assess, not that it was clean"
+    );
+    assert!(
+        findings.is_empty(),
+        "there is no surface a finding could have come from"
+    );
+    assert_eq!(
+        label, "trivy",
+        "the asked backends stay on the audit label even though none adjudicated"
+    );
+}
+
+/// Pins the specific regression observed in staging UAT: a Trivy `rootfs`
+/// scan of a package-less OCI layer (a CA-certificate-only layer, no
+/// package database) reports an empty result, the adapter abstains
+/// `NotApplicable`, and that abstention must release the layer — never
+/// hold it as `scan_indeterminate`. This is the same partition
+/// `run_scan_all_not_applicable_is_a_completed_not_applicable_assessment`
+/// pins generically, kept as its own test because it is the exact shape
+/// (`OciBlob`, single backend) that hung every multi-layer image before
+/// the fix.
+#[tokio::test]
+async fn run_scan_releases_a_package_less_layer_whose_rootfs_scan_came_back_empty() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        handler_map("oci", ArtifactKind::OciBlob),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("a package-less layer must be released, not held, got {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::NotApplicable);
+    assert!(findings.is_empty());
+}
+
+/// The false-authority case the scanner capability map closes.
+///
+/// An OCI repository policed by `[trivy, osv]` on a package-less layer:
+/// Trivy walks the root filesystem, finds no package surface and abstains
+/// `NotApplicable`; `osv` has no SBOM to read, because OCI has no SBOM
+/// source at all. The outcome must be a completed **not-applicable**
+/// assessment — the honest "nothing to assess".
+///
+/// What must not happen is a clean `ScanCompleted`. An empty finding
+/// list is a *verdict*, so a backend that answered a missing SBOM with
+/// one would become the sole contributor here: the artifact would record
+/// an analysed-and-clean scan, and every OCI blob in the repository would
+/// earn the release authority of a scan that examined nothing. That clean
+/// verdict is indistinguishable from a real one — nothing in the trail
+/// says which backend looked at what — which is why the absence of a
+/// verdict has to be its own value rather than an empty list.
+#[tokio::test]
+async fn run_scan_on_an_oci_layer_neither_backend_can_read_records_not_applicable() {
+    let trivy = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    // The OSV adapter's own no-SBOM answer: an abstention, not a clean
+    // verdict. OCI exposes no SBOM, so this is every OCI blob's outcome
+    // under a policy that names `osv`.
+    let osv = Arc::new(MockScanner::with_analysis(
+        "osv",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy);
+    scanners.insert("osv".into(), osv);
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("oci", ArtifactKind::OciBlob),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("nothing to assess must not hold the layer, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::NotApplicable,
+        "the trail must say nothing was assessed, not that the layer scanned clean"
+    );
+    assert_ne!(
+        assessment,
+        ScanAssessment::Analysed,
+        "an empty finding list from a backend that read no SBOM is not a verdict"
+    );
+    assert!(findings.is_empty());
+}
+
+/// One gating abstention among not-applicable ones still holds: the
+/// expected surface it could not assess is still unassessed.
+#[tokio::test]
+async fn run_scan_holds_when_a_gating_abstention_joins_a_not_applicable_one() {
+    for gating in [
+        NotAnalysable::UnusableArchive,
+        NotAnalysable::NoAnalyzerMatched,
+    ] {
+        let not_applicable = Arc::new(MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        ));
+        let gating_backend = Arc::new(MockScanner::with_analysis(
+            "osv",
+            Ok(ScanAnalysis::NothingAnalysable(gating)),
+        ));
+        let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+        scanners.insert("trivy".into(), not_applicable);
+        scanners.insert("osv".into(), gating_backend);
+
+        let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+            vec!["trivy".into(), "osv".into()],
+            scanners,
+            handler_map("npm", ArtifactKind::NpmTarball),
+        );
+        let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+        let job = sample_scan_job(artifact_id, 1);
+
+        let outcome = uc.run_scan(&job).await.expect("run_scan");
+        let ScanRunOutcome::NothingAnalysable { reason, .. } = outcome else {
+            panic!("a {gating} abstention must still hold, got {outcome:?}");
+        };
+        assert!(
+            reason.contains(gating.as_str()) && reason.contains("not_applicable"),
+            "the reason must name both abstentions: {reason}"
+        );
+    }
+}
+
+/// A real verdict from one backend is unaffected by another's
+/// not-applicable abstention — the artifact gets the analysed result.
+#[tokio::test]
+async fn run_scan_keeps_the_analysed_verdict_over_a_not_applicable_abstention() {
+    let not_applicable = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let verdict = Arc::new(MockScanner::new(
+        "osv",
+        Ok(vec![finding(
+            "pkg:npm/foo@1",
+            "CVE-1",
+            SeverityThreshold::High,
+        )]),
+    ));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), not_applicable);
+    scanners.insert("osv".into(), verdict);
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        scanner,
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("expected the analysed verdict to stand, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::Analysed,
+        "a backend did analyse this artifact — the assessment is analysed"
+    );
+    assert_eq!(scanner, "osv");
+    assert_eq!(findings.len(), 1);
+}
+
+/// Guard rail on the not-applicable arm: if advisory enrichment produced
+/// a finding while every backend abstained, something DID have an opinion
+/// about this artifact. Recording "nothing to assess" would be a false
+/// statement and would drop a real finding, so the fail-closed hold
+/// applies instead.
+#[tokio::test]
+async fn run_scan_holds_when_advisory_found_something_and_every_backend_abstained() {
+    let scanner = Arc::new(MockScanner::with_analysis(
+        "trivy",
+        Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        )),
+    ));
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("npm".to_string(), Arc::new(NpmShapedSbomHandler));
+
+    let (uc, _jobs, _events, _storage, artifacts, repositories, _policy, _metadata) = make_uc_full(
+        vec!["trivy".into()],
+        one_scanner(scanner),
+        Arc::new(MockAdvisory::ok(vec![finding(
+            "pkg:npm/foo@1",
+            "CVE-1",
+            SeverityThreshold::Critical,
+        )])),
+        handlers,
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    assert!(
+        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+        "an advisory finding must not be dropped into a not-applicable assessment, \
+         got {outcome:?}"
+    );
+}
+
+/// The consumer half: a not-applicable outcome goes through
+/// `record_scan_result` (so scan authority exists and the release gate
+/// opens on the time gate alone), completes the job, and never touches
+/// the fail-closed `scan_indeterminate` hold. The `ScanCompleted` it
+/// appends carries the assessment so the trail can never read as
+/// "analysed, clean".
+#[tokio::test]
+async fn record_outcome_not_applicable_records_scan_authority_and_does_not_hold() {
+    let (uc, jobs, events, _storage, artifacts, repositories, _policy) = make_uc(
+        vec!["trivy".into()],
+        HashMap::new(),
+        Arc::new(MockAdvisory::ok(vec![])),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.record_outcome(
+        &job,
+        ScanRunOutcome::Completed {
+            scanner: "trivy".into(),
+            findings: Vec::new(),
+            assessment: ScanAssessment::NotApplicable,
+            sbom: None,
+        },
+    )
+    .await
+    .expect("record_outcome");
+
+    assert_eq!(
+        jobs.completed_calls(),
+        vec![job.id],
+        "a completed assessment completes the job"
+    );
+    assert!(
+        jobs.failed_calls().is_empty(),
+        "nothing failed — there was simply nothing to assess"
+    );
+    assert_ne!(
+        artifacts
+            .get(artifact_id)
+            .expect("artifact")
+            .quarantine_status,
+        QuarantineStatus::ScanIndeterminate,
+        "an artifact with no package surface must not be held on the scan axis"
+    );
+
+    let appended: Vec<DomainEvent> = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|batch| batch.events.into_iter().map(|e| e.event))
+        .collect();
+    assert!(
+        !appended
+            .iter()
+            .any(|e| matches!(e, DomainEvent::ScanIndeterminate(_))),
+        "the fail-closed hold is for an unassessed surface, not an absent one"
+    );
+    let scan_completed = appended
+        .iter()
+        .find_map(|e| match e {
+            DomainEvent::ScanCompleted(sc) => Some(sc),
+            _ => None,
+        })
+        .expect("scan authority must be recorded — a ScanCompleted on the stream");
+    assert_eq!(
+        scan_completed.assessment,
+        ScanAssessment::NotApplicable,
+        "the trail must say 'not applicable', never 'analysed, clean'"
+    );
+    assert_eq!(scan_completed.finding_count, 0);
+    assert!(scan_completed.validate().is_ok());
+}
+
+/// `SkippedNoBackends` is unchanged: the operator waived the scan, they
+/// did not declare the artifact unscannable, so the recorded assessment
+/// stays `Analysed`.
+#[tokio::test]
+async fn record_outcome_skipped_no_backends_still_records_an_analysed_assessment() {
+    let (uc, jobs, events, _storage, artifacts, repositories, _policy) = make_uc(
+        vec!["trivy".into()],
+        HashMap::new(),
+        Arc::new(MockAdvisory::ok(vec![])),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    uc.record_outcome(&job, ScanRunOutcome::SkippedNoBackends)
+        .await
+        .expect("record_outcome");
+
+    assert_eq!(jobs.completed_calls(), vec![job.id]);
+    let scan_completed = events
+        .appended_batches()
+        .into_iter()
+        .flat_map(|batch| batch.events.into_iter().map(|e| e.event))
+        .find_map(|e| match e {
+            DomainEvent::ScanCompleted(sc) => Some(sc),
+            _ => None,
+        })
+        .expect("the waiver still records a ScanCompleted");
+    assert_eq!(scan_completed.assessment, ScanAssessment::Analysed);
+    assert_eq!(scan_completed.scanner, "(none)");
+}
+
+// ---------------------------------------------------------------------------
+// The capability-map consult: a backend is never invoked on a format it
+// does not analyse
+// ---------------------------------------------------------------------------
+
+/// A scan job for `format`, so the capability consult can be driven at
+/// formats other than [`sample_scan_job`]'s `npm`.
+fn scan_job_for_format(artifact_id: Uuid, format: &str) -> ScanJob {
+    ScanJob {
+        format: format.to_string(),
+        ..sample_scan_job(artifact_id, 1)
+    }
+}
+
+/// The built-in default `[trivy]` pointed at a format Trivy does not
+/// analyse, while another compiled-in backend does. The backend is never
+/// invoked — an invocation could only return the absence of a verdict —
+/// and the expected-but-unassessed surface holds the artifact
+/// fail-closed, exactly as a `NoAnalyzerMatched` abstention does.
+#[tokio::test]
+async fn run_scan_does_not_invoke_a_backend_that_cannot_analyse_the_format() {
+    let trivy = Arc::new(MockScanner::new("trivy", Ok(vec![])).covering(&["oci"]));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy.clone());
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into()],
+        scanners,
+        handler_map("npm", ArtifactKind::NpmTarball),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    // `osv` covers npm, so the pairing is a policy mistake rather than
+    // an unscannable format — the gating arm.
+    let job = scan_job_for_format(artifact_id, "npm");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    assert!(
+        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
+        "an inert pairing leaves the surface unassessed and must hold, got {outcome:?}"
+    );
+    assert_eq!(
+        trivy.calls(),
+        0,
+        "the orchestrator must consult the capability map BEFORE spending an invocation"
+    );
+}
+
+/// A covering backend's verdict stands while the inert one beside it is
+/// skipped: `[trivy, osv]` on OCI, where OSV exposes no SBOM source.
+/// Trivy analyses, OSV is never asked, and the artifact completes on
+/// Trivy's verdict alone rather than being held by OSV's abstention.
+#[tokio::test]
+async fn run_scan_keeps_the_covering_backends_verdict_and_never_invokes_the_inert_one() {
+    let trivy = Arc::new(
+        MockScanner::new(
+            "trivy",
+            Ok(vec![finding(
+                "pkg:oci/zlib1g@1.2.11",
+                "CVE-2018-25032",
+                SeverityThreshold::High,
+            )]),
+        )
+        .covering(&["oci", "maven", "pypi", "npm", "cargo"]),
+    );
+    let osv =
+        Arc::new(MockScanner::new("osv", Ok(vec![])).covering(&["npm", "pypi", "cargo", "maven"]));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy.clone());
+    scanners.insert("osv".into(), osv.clone());
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        handler_map("oci", ArtifactKind::OciBlob),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "oci");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        scanner,
+        ..
+    } = outcome
+    else {
+        panic!("a covering backend produced a verdict; the run must complete, got {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::Analysed);
+    assert_eq!(findings.len(), 1);
+    assert_eq!(scanner, "trivy", "only the covering backend contributed");
+    assert_eq!(trivy.calls(), 1);
+    assert_eq!(osv.calls(), 0, "osv reads an SBOM and OCI exposes none");
+}
+
+/// A format no compiled-in backend covers. Choosing a different backend
+/// cannot help and there is no surface to assess, so no scanner is
+/// spawned and the artifact records a completed not-applicable
+/// assessment instead of holding forever.
+#[tokio::test]
+async fn run_scan_records_not_applicable_when_no_backend_covers_the_format() {
+    let trivy = Arc::new(MockScanner::new("trivy", Ok(vec![])).covering(&["oci"]));
+    let osv = Arc::new(MockScanner::new("osv", Ok(vec![])).covering(&["npm"]));
+    let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+    scanners.insert("trivy".into(), trivy.clone());
+    scanners.insert("osv".into(), osv.clone());
+
+    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+        vec!["trivy".into(), "osv".into()],
+        scanners,
+        // No handler is registered under `gradle`, so its artifacts are
+        // kind `Other` — the map's own answer for the format.
+        handler_map("maven", ArtifactKind::MavenJar),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = scan_job_for_format(artifact_id, "gradle");
+
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+    let ScanRunOutcome::Completed {
+        findings,
+        assessment,
+        ..
+    } = outcome
+    else {
+        panic!("nothing to assess must not hold the artifact, got {outcome:?}");
+    };
+    assert_eq!(assessment, ScanAssessment::NotApplicable);
+    assert!(findings.is_empty());
+    assert_eq!(trivy.calls(), 0);
+    assert_eq!(osv.calls(), 0);
 }

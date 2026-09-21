@@ -454,7 +454,7 @@ impl PolicyUseCase {
             scan_backends: cmd.scan_backends,
             rescan_interval_hours: cmd.rescan_interval_hours,
             negligible_action: cmd.negligible_action,
-            enforcement: ScanEnforcement::Reject,
+            enforcement: cmd.enforcement,
             stream_version: result.stream_position,
             created_at: now,
             updated_at: now,
@@ -3171,6 +3171,95 @@ mod tests {
         assert_eq!(events.appended_batches().len(), 1);
     }
 
+    #[tokio::test]
+    async fn create_policy_with_record_enforcement_projects_record() {
+        let (uc, _events, projections) = make_use_case();
+        let mut cmd = sample_create_command("record-policy");
+        cmd.enforcement = ScanEnforcement::Record;
+
+        let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
+
+        let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
+        assert_eq!(projection.enforcement, ScanEnforcement::Record);
+    }
+
+    #[tokio::test]
+    async fn create_policy_with_reject_enforcement_projects_reject() {
+        let (uc, _events, projections) = make_use_case();
+        let mut cmd = sample_create_command("reject-policy");
+        cmd.enforcement = ScanEnforcement::Reject;
+
+        let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
+
+        let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
+        assert_eq!(projection.enforcement, ScanEnforcement::Reject);
+    }
+
+    /// Parity: every field `build_config_snapshot` records for the
+    /// `PolicyCreated` event must match what `create_policy` wrote into
+    /// the projection — the snapshot's `to_string()`-rendered enums
+    /// (`provenance_mode`, `negligible_action`, `enforcement`) are
+    /// compared against the same `Display` rendering on the projection
+    /// side, and the remaining fields are compared as JSON so a future
+    /// field added to `CreatePolicyCommand` but left out of the
+    /// projection literal fails here instead of shipping.
+    #[tokio::test]
+    async fn create_policy_projection_matches_config_snapshot_field_by_field() {
+        let (uc, _events, projections) = make_use_case();
+        let mut cmd = sample_create_command("parity-check");
+        cmd.enforcement = ScanEnforcement::Record;
+        let snapshot = build_config_snapshot(&cmd);
+
+        let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
+
+        let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
+
+        assert_eq!(snapshot["name"], serde_json::json!(projection.name));
+        assert_eq!(snapshot["scope"], serde_json::json!(projection.scope));
+        assert_eq!(
+            snapshot["severity_threshold"],
+            serde_json::json!(projection.severity_threshold)
+        );
+        assert_eq!(
+            snapshot["quarantine_duration_secs"],
+            serde_json::json!(projection.quarantine_duration_secs)
+        );
+        assert_eq!(
+            snapshot["require_approval"],
+            serde_json::json!(projection.require_approval)
+        );
+        assert_eq!(
+            snapshot["provenance_mode"],
+            projection.provenance_mode.to_string()
+        );
+        assert_eq!(
+            snapshot["provenance_backends"],
+            serde_json::json!(projection.provenance_backends)
+        );
+        assert_eq!(
+            snapshot["provenance_identities"],
+            serde_json::json!(projection.provenance_identities)
+        );
+        assert_eq!(
+            snapshot["max_artifact_age_secs"],
+            serde_json::json!(projection.max_artifact_age_secs)
+        );
+        assert_eq!(snapshot["license_policy"], projection.license_policy);
+        assert_eq!(
+            snapshot["scan_backends"],
+            serde_json::json!(projection.scan_backends)
+        );
+        assert_eq!(
+            snapshot["rescan_interval_hours"],
+            serde_json::json!(projection.rescan_interval_hours)
+        );
+        assert_eq!(
+            snapshot["negligible_action"],
+            projection.negligible_action.to_string()
+        );
+        assert_eq!(snapshot["enforcement"], projection.enforcement.to_string());
+    }
+
     // -- update_policy -------------------------------------------------------
 
     #[tokio::test]
@@ -3988,7 +4077,9 @@ mod tests {
     // -- add_exclusion: post-exclusion-add re-evaluation pass ----------------
 
     use hort_domain::entities::artifact::Artifact;
-    use hort_domain::events::{IngestSource, ReleaseReason, ScanCompleted, SeveritySummary};
+    use hort_domain::events::{
+        IngestSource, ReleaseReason, ScanAssessment, ScanCompleted, SeveritySummary,
+    };
     use hort_domain::types::ContentHash;
 
     const VALID_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -4022,6 +4113,7 @@ mod tests {
             rejection_reason: Some(RejectionReason::Scanner),
             quarantine_window_start: Some(Utc::now() - chrono::Duration::hours(25)),
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -5640,6 +5732,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: Some(Utc::now() - chrono::Duration::hours(25)),
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -5715,6 +5808,7 @@ mod tests {
                     finding_count,
                     severity_summary: summary,
                     findings_blob,
+                    assessment: ScanAssessment::Analysed,
                 }),
                 correlation_id: Uuid::new_v4(),
                 causation_id: None,
@@ -6060,6 +6154,7 @@ mod tests {
                             negligible: 0,
                         },
                         findings_blob: Some(blob_hash.clone()),
+                        assessment: ScanAssessment::Analysed,
                     }),
                     correlation_id: Uuid::new_v4(),
                     causation_id: None,
@@ -6157,6 +6252,7 @@ mod tests {
                         finding_count: 1,
                         severity_summary: summary,
                         findings_blob: Some(blob_hash),
+                        assessment: ScanAssessment::Analysed,
                     }),
                     correlation_id: Uuid::new_v4(),
                     causation_id: None,

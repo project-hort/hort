@@ -21,6 +21,18 @@ tracing    = { workspace = true }
 bytes      = { workspace = true }
 tempfile   = { workspace = true }
 thiserror  = { workspace = true }
+# Archive extraction for scan materialisation. Trivy's filesystem mode
+# does not open archives, so a wheel / npm tarball / `.crate` / OCI layer
+# has to be unpacked on disk before any analyzer sees it. `deny.toml`'s
+# `[bans]` rule names this crate as a `wrappers` exception alongside
+# `hort-formats`: that crate's `archive_bounds` helper reads one entry
+# into memory and has no extract-to-disk API, and this adapter depends
+# only on `hort-domain` per the scanner-port contract, so it cannot reach
+# it. The equivalent caps (extracted bytes, entry count, compression
+# ratio) plus path- and link-containment live in `src/extract.rs`.
+tar        = { workspace = true }
+zip        = { workspace = true }
+flate2     = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros"] }

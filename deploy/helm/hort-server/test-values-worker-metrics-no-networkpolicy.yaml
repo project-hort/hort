@@ -1,0 +1,57 @@
+# Regression fixture: worker ENABLED with /metrics enabled and
+# `networkPolicy.enabled: false` MUST be rejected at `helm template`.
+#
+# `worker.enabled: true` + `worker.metrics.enabled: true` +
+# `networkPolicy.enabled: false` is the one combination of the three flags
+# nothing else rejects: a worker pod exists, its listener turns on, the
+# additive `*-worker-metrics` NetworkPolicy does not render (it is itself
+# gated on `networkPolicy.enabled`), and the default-on server NetworkPolicy
+# that would otherwise deny the port is also gone — an unauthenticated
+# scrape port with no NetworkPolicy at all. Enabling the listener and
+# rendering its NetworkPolicy are meant to be ONE structural action
+# (`templates/worker-networkpolicy.yaml`'s header); this pairing silently
+# collapses that to nothing, so the chart fails the render instead. This
+# fixture pins `worker.enabled: true` explicitly (also the chart default)
+# because the hazard requires an actual worker pod — see the paired
+# worker-disabled fixture below for the case this is NOT true.
+#
+# Paired permitted fixtures:
+#   - test-values-worker-metrics.yaml (identical except `networkPolicy.enabled`
+#     stays at its chart default of `true` → renders, with the NetworkPolicy
+#     in place).
+#   - test-values-worker-metrics-worker-disabled.yaml (`worker.enabled: false`
+#     with the same metrics/networkPolicy flags as this fixture → renders
+#     fine, because there is no worker pod and therefore no listener to
+#     protect).
+publicBaseUrl: https://hort.example.com
+
+auth:
+  provider: oidc
+  oidc:
+    issuerUrl: https://idp.example.com/realms/hort
+    audience: hort-server
+
+postgres:
+  app:
+    existingSecret: hort-postgres-app
+  admin:
+    existingSecret: hort-postgres-admin
+
+storage:
+  backend: filesystem
+
+networkPolicy:
+  enabled: false
+
+worker:
+  enabled: true
+  metrics:
+    enabled: true
+    port: 9090
+    scrapeFrom:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: prometheus

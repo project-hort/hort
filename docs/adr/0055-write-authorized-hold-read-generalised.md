@@ -12,9 +12,12 @@
   `hort_app::use_cases::repository_access::RepositoryAccessUseCase::resolve_granted_write`
   (the `AuthorityBasis::GrantedOnly` predicate, shared by every call site),
   `hort_app::use_cases::index_filters::HeldVisibility` (the served-status truth
-  table, exhaustive over `QuarantineStatus` with no wildcard arm), and the
+  table, exhaustive over `QuarantineStatus` with no wildcard arm), the
   per-site predicates in `crates/hort-http-oci/src/{manifests,blobs}.rs` and
-  `crates/hort-http-cargo/src/serve.rs`.
+  `crates/hort-http-cargo/src/serve.rs`, and — for qualifier 3's
+  resolution-document boundary on npm — `HeldReason` / `HeldVersion` in
+  `crates/hort-formats/src/npm/index.rs` and `collect_held` in
+  `crates/hort-http-npm/src/serve.rs`.
 - **Relates:** [0007](0007-fail-closed-quarantine-release-predicate.md) (the
   quarantine window this reads across, unchanged),
   [0036](0036-oci-auth-capability-token.md) (the cap-intersection invariant this
@@ -35,9 +38,44 @@ Three qualifiers carry the whole security argument, and none is decorative:
 2. **"Metadata"** means the resolution document a client reads to learn a
    version exists and what its bytes hash to — an OCI manifest, a cargo
    sparse-index entry. Never the content.
-3. **"Held"** means `Quarantined` — a hold *pending* a verdict. A verdict
-   already reached (`Rejected`, `ScanIndeterminate`) is terminal and stays
-   hidden from every caller, publisher included.
+3. **"Held"** means `Quarantined` — a hold *pending* a verdict, and this
+   qualifier governs the **resolution document** qualifier 2 names — an OCI
+   manifest, a cargo sparse-index entry, an npm packument's `versions{}` /
+   `dist-tags` — not the refusal a caller receives when they ask for one
+   directly. A verdict already reached (`Rejected`, `ScanIndeterminate`) is
+   terminal: it makes the version unresolvable in that document, for
+   everyone, publisher included, exactly as `Quarantined` does — neither
+   status ever yields a manifest, an index entry, or a packument entry that
+   resolves to bytes.
+
+   Resolvability is gated by this qualifier; diagnosability is not. *Why* a
+   version cannot be resolved is information, not access, and every byte
+   route is free to say so to any caller holding `Read`. npm, Maven and
+   Cargo do: `503 … quarantined` + `Retry-After` for the timed hold, `403 …
+   rejected` / `403 … scan is indeterminate` for the terminal verdicts
+   (`crates/hort-http-npm/src/lib.rs`, `crates/hort-http-maven/src/lib.rs`,
+   `crates/hort-http-cargo/src/lib.rs`). OCI's `Rejected` and PyPI's
+   `.metadata` route take the opposite, format-specific anti-enumeration
+   choice instead — `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN`
+   (`crates/hort-http-oci/src/{manifests,blobs}.rs`) or a plain 404
+   (`crates/hort-http-pypi/src/metadata_endpoint.rs`), collapsing the
+   verdict into the same answer as "does not exist". Both choices satisfy
+   this qualifier: it constrains what the resolution document resolves to,
+   not whether the refusal names its reason.
+
+   **Clarified 2026-09-17 — npm's packument enumerates withheld versions;
+   the rule did not change.** `hort.held[]` names every withheld version and
+   its reason (`HeldReason` / `HeldVersion`,
+   `crates/hort-formats/src/npm/index.rs`; collected by `collect_held`,
+   `crates/hort-http-npm/src/serve.rs`) — an accepted consequence (#251): a
+   `Read` holder who previously needed a version number to ask about it can
+   now read the list (upstream's numbers, on a proxy repository; the
+   maintainer's own, on a hosted one). `hort.held[]` still never resolves a
+   withheld version to a `versions{}` entry, so resolvability stays gated;
+   only diagnosability widens, from "ask and be told" to "enumerated up
+   front" — still the narrow reading, not the wide one rejected on #254
+   (answering every hold and verdict alike with a plain `404`, which would
+   replace "we withhold this" with "this does not exist").
 
 ## Context
 

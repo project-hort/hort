@@ -37,6 +37,33 @@
 //! [`hort_formats::npm::index::NpmIndexBuilder`] for the per-builder
 //! contract.
 //!
+//! # The `hort.held` block
+//!
+//! The filter pipeline's job is **resolution** safety: the served index
+//! lists only versions hort holds in a servable status, so a range, a bare
+//! install or `latest` can never resolve to something the content route
+//! would answer `503`. That property says nothing about whether the
+//! catalog may explain *why* a version is missing — and being silent
+//! about it makes the two surfaces contradict each other, because the
+//! tarball route answers a held version with `503` + `Retry-After` while
+//! the packument answers "no such version".
+//!
+//! So the packument carries an additive top-level `hort.held` array
+//! naming the withheld versions, their reason, and (for a timed hold) when
+//! the hold elapses. It is outside the resolution surface —
+//! `versions{}` and `dist-tags` come out byte-identical to what the same
+//! input produced before it existed — and the abbreviated per-version /
+//! tag route resolves through the filtered set alone, so nothing here
+//! makes a held version reachable. The block is omitted entirely when
+//! nothing is held. Wire shape and the honesty rules:
+//! [`hort_formats::npm::index::HeldVersion`].
+//!
+//! Unlike the cargo index's hold-read exemption (ADR 0055), this block is
+//! **identity-independent**: npm composes the pipeline with the ordinary
+//! reader's `HeldVisibility::Hidden` for every caller, and the held list
+//! is derived from repository state alone. The response therefore stays
+//! as cacheable as it was — no `Vary: Authorization` is implied.
+//!
 //! # Truncation `Warning: 299` header
 //!
 //! Threaded through [`IndexSourceOutput::truncated`]. Only the
@@ -75,7 +102,8 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{IndexMode, Repository, RepositoryType};
 use hort_formats::index_serve::IndexBuilder;
 use hort_formats::npm::index::{
-    intersect_dist_tags, resolve_served_latest, version_entry_json, NpmIndexBuilder,
+    intersect_dist_tags, resolve_served_latest, version_entry_json, HeldReason, HeldVersion,
+    NpmIndexBuilder,
 };
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
@@ -100,10 +128,51 @@ struct ResolvedIndex {
     /// fallback stays at the two emission sites, which both call the
     /// single `resolve_served_latest` definition.
     dist_tags: BTreeMap<String, String>,
+    /// The versions the filter pipeline withheld, for the packument's
+    /// diagnostic `hort.held` block. Captured from the PRE-filter entry
+    /// set — after the pipeline runs there is nothing left to report.
+    ///
+    /// Read only by the full-packument emission site: the abbreviated
+    /// per-version/tag route resolves through `filtered` alone, so a held
+    /// version stays unreachable there.
+    held: Vec<HeldVersion>,
     canonical_name: String,
     base_str: String,
     truncated: bool,
     index_mode: IndexMode,
+}
+
+/// Classify the entries the filter pipeline withholds — in the order the
+/// source produced them, not re-sorted — and attach each timed hold's
+/// deadline.
+///
+/// Operates on the PRE-filter set for the obvious reason that the
+/// post-filter set no longer contains them. The classification is
+/// [`HeldReason::from_status`], which is exhaustive over
+/// `QuarantineStatus`, so this set is exactly the one
+/// `NonServableStatusFilter` drops.
+///
+/// A never-ingested entry (`status == None`) is deliberately NOT reported.
+/// `IndexModeFilter` withholds those under `ReleasedOnly`, but hort has no
+/// verdict on them and no hold over them: asking for one pulls it through
+/// normally rather than answering `503`. They are "not fetched yet", not
+/// "held" — and on a proxy repo they are most of the upstream catalog,
+/// which would turn a diagnostic block into a second copy of it.
+fn collect_held(
+    entries: &[VersionEntry],
+    deadlines: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
+) -> Vec<HeldVersion> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let reason = HeldReason::from_status(entry.status?)?;
+            Some(HeldVersion::new(
+                entry.version.clone(),
+                reason,
+                deadlines.get(&entry.version).copied(),
+            ))
+        })
+        .collect()
 }
 
 /// Resolve the repo, run the Source → Filter pipeline (`NonServableStatusFilter`
@@ -184,6 +253,40 @@ async fn resolve_served_versions(
     // `IndexModeFilter` for the mode-specific never-ingested handling.
     // Future operator-exclusion filters append at the end of this list.
     let upstream_count = output.entries.len();
+
+    // ---- Step 1b: what the pipeline is about to withhold --------------
+    // Captured before the filters run, and rendered outside the
+    // resolution surface (`hort.held`). The deadline read is skipped
+    // entirely unless something is held under a timed hold, so a package
+    // with nothing quarantined pays nothing for this.
+    //
+    // The lookup is keyed by the repository the request named. A virtual
+    // repository holds no artifact rows of its own (ADR 0031) — its
+    // entries belong to members — so it resolves no deadlines and its
+    // held entries are reported without an `available_after` rather than
+    // with a fabricated one.
+    let deadlines =
+        if output.entries.iter().any(|e| {
+            e.status == Some(hort_domain::entities::artifact::QuarantineStatus::Quarantined)
+        }) {
+            ctx.artifact_use_case
+                .package_hold_deadlines(repo.id, &output.canonical_name)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!(
+                        error = %e,
+                        package = %pkg_name,
+                        repository = %repo_key,
+                        "npm serve: hold-deadline read failed; held versions reported without \
+                         available_after",
+                    );
+                    std::collections::HashMap::new()
+                })
+        } else {
+            std::collections::HashMap::new()
+        };
+    let held = collect_held(&output.entries, &deadlines);
+
     let filters: Vec<Arc<dyn IndexFilter>> = vec![
         Arc::new(NonServableStatusFilter::default()),
         Arc::new(IndexModeFilter::new(repo.index_mode)),
@@ -222,12 +325,14 @@ async fn resolve_served_versions(
         filtered_versions = filtered_count,
         served_dist_tags = dist_tags.len(),
         dropped_dist_tags = dropped_tags,
+        held_versions = held.len(),
         "npm unified packument serve completed",
     );
 
     Ok(ResolvedIndex {
         filtered,
         dist_tags,
+        held,
         canonical_name: output.canonical_name,
         base_str,
         truncated: output.truncated,
@@ -263,7 +368,7 @@ pub(crate) async fn serve_packument_unified(
     let resolved = resolve_served_versions(ctx, repo_key, pkg_name, trust, caller).await?;
 
     // ---- Build the wire bytes -----------------------------------------
-    let builder = NpmIndexBuilder::new(resolved.dist_tags);
+    let builder = NpmIndexBuilder::new(resolved.dist_tags).with_held(resolved.held);
     let body_bytes = builder.build(
         BuildContext {
             package_name: &resolved.canonical_name,
@@ -309,9 +414,13 @@ pub(crate) async fn serve_packument_unified(
 ///   docs). No other tag has a fallback: present or absent;
 /// - anything else → `None`, which this function turns into the same
 ///   anti-enumeration `Artifact NotFound` envelope
-///   [`serve_packument_unified`] uses for an unknown package. Unknown
-///   tag, unknown version, held version, unknown package, and invisible
-///   repo are therefore indistinguishable on the wire.
+///   [`serve_packument_unified`] uses for an unknown package. On this
+///   abbreviated route, unknown tag, unknown version, held version,
+///   unknown package, and invisible repo are therefore indistinguishable
+///   on the wire. The full packument is not: its `hort.held[]` block
+///   (see [`HeldVersion`]) names a held version and the reason it is
+///   withheld, so a held version IS distinguishable there from an unknown
+///   one — only this single-version/tag resolution collapses the two.
 ///
 /// On a match, the response body is exactly the per-version object the
 /// packument serves (`{name, version, dist: {tarball, shasum,
@@ -508,6 +617,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -1126,6 +1236,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -1912,6 +2023,435 @@ mod tests {
         assert!(
             !tags.contains_key("beta"),
             "the proxy member's tags are suppressed for an owned name: {tags:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The `hort.held` block — the catalog says "held", not "absent".
+    //
+    // The first test is the one to read first: it protects the property
+    // the filter pipeline exists for. Its byte-level twin (the whole
+    // document differs by the added key and nothing else) lives with the
+    // builder, in `hort_formats::npm::index::tests`.
+    // -----------------------------------------------------------------
+
+    /// Seed an artifact in a non-servable status, with the immutable
+    /// quarantine anchor the deadline is computed from. `window_start`
+    /// is what `package_version_anchors` reads; `None` models a held row
+    /// whose anchor was never set.
+    fn insert_anchored_artifact(
+        mocks: &hort_http_core::test_support::MockPorts,
+        repo_id: Uuid,
+        version: &str,
+        status: QuarantineStatus,
+        window_start: Option<chrono::DateTime<Utc>>,
+    ) -> Artifact {
+        let mut artifact = insert_artifact(
+            mocks,
+            repo_id,
+            "pkg",
+            version,
+            &format!("pkg-{version}.tgz"),
+            "aaa",
+            status,
+        );
+        artifact.quarantine_window_start = window_start;
+        mocks.artifacts.insert(artifact.clone());
+        artifact
+    }
+
+    /// The held array of a served packument, or `None` when the response
+    /// carries no `hort` key at all.
+    fn held_block(json: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+        json.get("hort")?.get("held")?.as_array()
+    }
+
+    #[tokio::test]
+    async fn naming_held_versions_does_not_change_versions_or_dist_tags() {
+        // The resolution surface is untouched: a held and a rejected
+        // version stay out of `versions{}` and out of `dist-tags`, so no
+        // range, bare install or `latest` can resolve to one. All the
+        // block does is stop the catalog being silent about them.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(&mocks, repo.id, "1.0.0", QuarantineStatus::Released, None);
+        insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "1.1.0",
+            QuarantineStatus::Quarantined,
+            Some(Utc::now()),
+        );
+        insert_anchored_artifact(&mocks, repo.id, "1.2.0", QuarantineStatus::Released, None);
+        insert_anchored_artifact(&mocks, repo.id, "1.3.0", QuarantineStatus::Rejected, None);
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+
+        let served: Vec<&str> = json["versions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            served,
+            vec!["1.0.0", "1.2.0"],
+            "the served set is exactly the servable versions — the held block adds none of \
+             the withheld ones back"
+        );
+        assert_eq!(
+            json["dist-tags"],
+            serde_json::json!({"latest": "1.2.0"}),
+            "dist-tags still names only a served version"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_packument_names_each_held_version_with_its_reason() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(&mocks, repo.id, "1.0.0", QuarantineStatus::Released, None);
+        insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "1.1.0",
+            QuarantineStatus::Quarantined,
+            Some(Utc::now()),
+        );
+        insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "1.2.0",
+            QuarantineStatus::ScanIndeterminate,
+            None,
+        );
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+
+        let held = held_block(&json).expect("held versions must be reported");
+        let by_version: BTreeMap<&str, &str> = held
+            .iter()
+            .map(|e| {
+                (
+                    e["version"].as_str().unwrap(),
+                    e["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            by_version,
+            [("1.1.0", "quarantined"), ("1.2.0", "scan_indeterminate")]
+                .into_iter()
+                .collect(),
+            "every version the filter withheld is named, with the reason it was withheld"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_version_is_not_reported_as_waiting() {
+        // The lie in the other direction: a version that was rejected
+        // must never be described as held-until-T, whatever deadline
+        // machinery is around it.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(&mocks, repo.id, "1.0.0", QuarantineStatus::Released, None);
+        // An anchor on the row: a rejected artifact keeps the anchor of
+        // the window it was rejected during. It must still not produce
+        // an `available_after`.
+        insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "1.1.0",
+            QuarantineStatus::Rejected,
+            Some(Utc::now()),
+        );
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+
+        let held = held_block(&json).expect("the rejected version must be reported");
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0]["version"].as_str().unwrap(), "1.1.0");
+        assert_eq!(held[0]["status"].as_str().unwrap(), "rejected");
+        assert!(
+            held[0].get("available_after").is_none(),
+            "a rejected version is not pending release: {}",
+            held[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_hort_key_when_nothing_is_held() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(&mocks, repo.id, "1.0.0", QuarantineStatus::Released, None);
+        insert_anchored_artifact(&mocks, repo.id, "2.0.0", QuarantineStatus::Released, None);
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+        assert!(
+            json.get("hort").is_none(),
+            "the common packument must not grow a key: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn available_after_is_the_deadline_the_tarball_route_would_use() {
+        // The two surfaces must name the same instant for the same
+        // artifact. `find_visible_by_path` hydrates exactly the
+        // `quarantine_deadline` the tarball route turns into its
+        // `Retry-After`; the packument's `available_after` must equal it.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(&mocks, repo.id, "1.0.0", QuarantineStatus::Released, None);
+        let anchor = Utc::now();
+        let held_artifact = insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "1.1.0",
+            QuarantineStatus::Quarantined,
+            Some(anchor),
+        );
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+
+        let (_repo, hydrated) = ctx
+            .artifact_use_case
+            .find_visible_by_path(&repo.key, &held_artifact.path, None)
+            .await
+            .unwrap_or_else(|_| panic!("the held artifact must resolve on the content path"));
+        let tarball_deadline = hydrated
+            .quarantine_deadline
+            .expect("the content route computes a deadline for a held artifact");
+
+        let held = held_block(&json).expect("the held version must be reported");
+        let advertised = held[0]["available_after"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a timed hold with a known anchor advertises a deadline"));
+        assert_eq!(
+            advertised,
+            tarball_deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "the catalog's `available_after` and the tarball 503's `Retry-After` must be \
+             computed from the same deadline — the wire form differs only in rendering it \
+             at whole-second precision, which is noise in an hours-long window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_held_version_with_no_anchor_is_named_without_a_guessed_deadline() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(&mocks, repo.id, "1.0.0", QuarantineStatus::Released, None);
+        insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "1.1.0",
+            QuarantineStatus::Quarantined,
+            None,
+        );
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+
+        let held = held_block(&json).expect("the held version must still be named");
+        assert_eq!(held[0]["status"].as_str().unwrap(), "quarantined");
+        assert!(
+            held[0].get("available_after").is_none(),
+            "an unknown deadline is omitted, never guessed: {}",
+            held[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_held_block_does_not_make_a_held_version_resolvable() {
+        // The abbreviated per-version / tag route resolves through the
+        // FILTERED set; the held block never reaches it. A held version
+        // stays the same anti-enumeration 404 it was.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(&mocks, repo.id, "1.0.0", QuarantineStatus::Released, None);
+        insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "1.1.0",
+            QuarantineStatus::Quarantined,
+            Some(Utc::now()),
+        );
+        // A maintainer tag pointing at the held version — dropped by the
+        // intersection, and the held block must not resurrect it.
+        insert_dist_tag(&mocks, repo.id, "pkg", "next", "1.1.0");
+
+        let trust = trust_for_tests();
+        // The packument does report it as held...
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+        assert_eq!(held_block(&json).unwrap()[0]["version"], "1.1.0");
+
+        // ...and every resolution route still refuses it.
+        for version_or_tag in ["1.1.0", "next"] {
+            let err =
+                serve_npm_version_unified(&ctx, "npm-test", "pkg", version_or_tag, &trust, None)
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                err.into_response().status(),
+                StatusCode::NOT_FOUND,
+                "`{version_or_tag}` must stay unresolvable",
+            );
+        }
+        let res = serve_npm_version_unified(&ctx, "npm-test", "pkg", "latest", &trust, None)
+            .await
+            .unwrap_or_else(|_| panic!("latest must still resolve to the served version"));
+        assert_eq!(body_json(res).await["version"].as_str().unwrap(), "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn every_version_held_still_answers_held_rather_than_absent() {
+        // The production shape that cost two days: a pinned install
+        // fails with 503 and the packument has an empty `versions{}`.
+        // Before the block that was indistinguishable from a package
+        // upstream never published.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_hosted_repo(&mocks, "npm-test", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "7.29.7",
+            QuarantineStatus::Quarantined,
+            Some(Utc::now()),
+        );
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-test", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("hosted serve must succeed")),
+        )
+        .await;
+        assert!(json["versions"].as_object().unwrap().is_empty());
+        assert!(json.get("dist-tags").is_none());
+        assert_eq!(held_block(&json).unwrap()[0]["version"], "7.29.7");
+    }
+
+    #[tokio::test]
+    async fn a_proxy_repos_never_ingested_versions_are_not_reported_as_held() {
+        // `ReleasedOnly` also withholds upstream versions hort has never
+        // ingested — but hort has no verdict on those and no hold over
+        // them, and on a proxy they are most of the catalog. They are
+        // "not fetched", not "held".
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let repo = insert_proxy_repo(&mocks, "npm-mirror", IndexMode::ReleasedOnly);
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/pkg",
+            serde_json::to_vec(&upstream_with_three_tags()).unwrap(),
+        );
+        // One of upstream's three versions is locally held; the other two
+        // hort has never ingested.
+        insert_anchored_artifact(
+            &mocks,
+            repo.id,
+            "1.2.3",
+            QuarantineStatus::Quarantined,
+            Some(Utc::now()),
+        );
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-mirror", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("proxy serve must succeed")),
+        )
+        .await;
+        assert!(
+            json["versions"].as_object().unwrap().is_empty(),
+            "ReleasedOnly serves none of them"
+        );
+        let held = held_block(&json).expect("the locally-held version is reported");
+        assert_eq!(held.len(), 1, "only the held one: {held:?}");
+        assert_eq!(held[0]["version"], "1.2.3");
+        assert_eq!(held[0]["status"], "quarantined");
+    }
+
+    #[tokio::test]
+    async fn a_virtual_repo_names_its_members_held_versions_without_a_deadline() {
+        // A virtual repository holds no artifact rows of its own (ADR
+        // 0031), so the per-repository deadline read resolves nothing for
+        // it. The member's held version is still named — the field is
+        // omitted rather than fabricated.
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let ctx = with_trust_config(&ctx, trust_config_untrusted_peer_fallback());
+        let member = insert_hosted_repo(&mocks, "npm-host", IndexMode::ReleasedOnly);
+        insert_anchored_artifact(&mocks, member.id, "1.0.0", QuarantineStatus::Released, None);
+        insert_anchored_artifact(
+            &mocks,
+            member.id,
+            "1.1.0",
+            QuarantineStatus::Quarantined,
+            Some(Utc::now()),
+        );
+        insert_virtual_repo(&mocks, "npm-virt", &[&member]);
+
+        let trust = trust_for_tests();
+        let json = body_json(
+            serve_packument_unified(&ctx, "npm-virt", "pkg", &trust, None)
+                .await
+                .unwrap_or_else(|_| panic!("virtual serve must succeed")),
+        )
+        .await;
+        let held = held_block(&json).expect("the member's held version is still named");
+        assert_eq!(held[0]["version"], "1.1.0");
+        assert_eq!(held[0]["status"], "quarantined");
+        assert!(
+            held[0].get("available_after").is_none(),
+            "the aggregator owns no row to compute a deadline from: {}",
+            held[0]
         );
     }
 

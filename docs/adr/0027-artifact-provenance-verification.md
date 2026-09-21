@@ -166,6 +166,17 @@ verify identically.**
 
 ## Amendment (2026-07-02, issue #13 — hold-until-signed)
 
+> **Superseded in part.** The "window closed ⇒ terminal `Rejected` +
+> `ProvenanceRejected{Unsigned}`" arm of this amendment (point 1 below, and the
+> expiry outcome in point 2) is superseded by
+> [ADR 0039](0039-keyed-provenance-verification.md)'s 2026-09-12 amendment: a
+> missing signature is a statement about a point in time and never produces a
+> terminal state, so the hold has no expiry on the provenance axis. Everything
+> else here stands — the hold itself, its window-awareness, the
+> `Verified`/`Rejected` arms never consulting `window_open`, the
+> re-verification triggers, and the write-authorized hold-read. That ADR owns
+> the argument; it is not restated here.
+
 The original decision applied the `NoAttestation × Required` verdict
 **terminally at ingest**. Because a keyed cosign signature signs the
 *already-pushed* digest, the image must exist before it can be signed, so the
@@ -229,17 +240,25 @@ any new release authority.
    write-authorized manifest HEAD — no anonymous manifest-metadata disclosure,
    and the proxy/Artifactory retry semantics are untouched.
 
-4. **Observability.** The held-pending-signature case (the `Ok(None)` under
-   `Required` with the window open) ticks a distinct `held_pending_signature`
-   value of `hort_provenance_verify_total{result}` (via
-   `ProvenanceVerifyResult::HeldPendingSignature`), separable from the
+4. **Observability.** The held-pending-signature case (the empty-event
+   `NoAttestation` arm under `Required`) ticks a distinct
+   `held_pending_signature` value of `hort_provenance_verify_total{result}`
+   (via `ProvenanceVerifyResult::HeldPendingSignature`), separable from the
    allowed-unsigned `no_attestation` no-op, plus an `info!` audit line — so an
    operator can see images *waiting to be signed*. A **constituent** held
    because it can never carry its own attestation (an OCI config/layer blob)
    ticks the separate `held_pending_subject` value instead: it is waiting for
    its subject's clearance, not for a signer, and reporting it as
-   `held_pending_signature` would misdirect the operator. See ADR 0016's
-   `provenance_mode: required` × short-`quarantine_duration_secs` row.
+   `held_pending_signature` would misdirect the operator. The split is the
+   constituent classification alone — neither the observation window nor an
+   inbound reference edge is consulted, both having been removed as hold
+   predicates by ADR 0039's 2026-09-12 amendment (D3). Because that
+   amendment also makes the hold indefinite (D4), the counter — which
+   counts verify *events*, not the standing population — is not the whole
+   picture; the operator's view of the standing held set is the
+   authoritative projection surface instead (ADR 0039 D4), never a metric.
+   See ADR 0016's `provenance_mode: required` ×
+   short-`quarantine_duration_secs` row.
 
 The fail-closed release predicate (ADR 0007), the digest binding, the
 pure-bundle quarantine exemption, and the apply-time linter are all unchanged;

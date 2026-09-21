@@ -40,4 +40,5 @@ digraph ArtifactQuarantineLifecycle {
     "quarantined" -> "rejected" [label="complete_provenance"];
     "released" -> "rejected" [label="complete_provenance"];
     "scan_indeterminate" -> "rejected" [label="complete_provenance"];
+    "rejected" -> "quarantined" [label="repair_provenance_misrejection"];
 }

@@ -45,9 +45,11 @@ use hort_app::use_cases::policy_use_case::PolicyUseCase;
 // use-case surface, NOT because it has constructor dependencies.
 use hort_app::use_cases::prefetch_use_case::PrefetchUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
+use hort_app::use_cases::provenance_misrejection_repair::ProvenanceMisrejectionRepairUseCase;
 // Repo-keyed self-service prefetch endpoint use
 // case (`POST /api/v1/repositories/{repo_key}/prefetch`). Consumed by
 // the `hort-http-discovery` inbound adapter.
+use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
 use hort_app::use_cases::ref_use_case::RefUseCase;
@@ -259,6 +261,12 @@ pub struct AppContext {
     /// path and the no-authz write methods carry an explicit trust
     /// contract (ADR 0008).
     pub content_reference_use_case: Arc<ContentReferenceUseCase>,
+    /// Queues eager ingest of an OCI image index's declared children from
+    /// the pull-through legs. Format crates enqueue through here because
+    /// the `jobs` port is `pub(crate)` (ADR 0008), and because keeping the
+    /// producer beside its consumer task handler gives the row's params and
+    /// dedupe key one compiler-checked definition.
+    pub oci_index_child_enqueue_use_case: Arc<OciIndexChildEnqueueUseCase>,
     pub ingest_use_case: Arc<IngestUseCase>,
     pub user_use_case: Arc<UserUseCase>,
     /// Native API token issuance / revocation
@@ -395,6 +403,16 @@ pub struct AppContext {
     /// `list_*` methods on the same use case back the
     /// queue / decisions / exclusions read surfaces.
     pub curation_use_case: Arc<CurationUseCase>,
+    /// One-shot corrective path for the artifacts stranded `Rejected`
+    /// with no `ArtifactRejected` behind them by the defect ADR 0039's
+    /// 2026-09-12 amendment removed. Driven by
+    /// `POST /api/v1/admin/quarantine/provenance-misrejections/repair`,
+    /// which sits behind the [`crate::authz::AdminPrincipal`] gate — not
+    /// the curator gate that protects `/api/v1/admin/curation/*`: this is
+    /// not a curation decision about an artifact, it withdraws a
+    /// structurally invalid one, and ADR 0038's "service accounts are
+    /// strictly non-admin" is what keeps it out of pipelines.
+    pub provenance_misrejection_repair_use_case: Arc<ProvenanceMisrejectionRepairUseCase>,
     /// Finding-exclusion HTTP write surface.
     /// The inbound adapter (`handlers/admin/policies/exclusions.rs`)
     /// calls `PolicyUseCase::{add_exclusion, remove_exclusion}` from
@@ -881,6 +899,8 @@ pub struct AppContextParts {
     /// See [`AppContext::virtual_resolution_use_case`].
     pub virtual_resolution_use_case: Arc<VirtualResolutionUseCase>,
     pub content_reference_use_case: Arc<ContentReferenceUseCase>,
+    /// See [`AppContext::oci_index_child_enqueue_use_case`].
+    pub oci_index_child_enqueue_use_case: Arc<OciIndexChildEnqueueUseCase>,
     pub ingest_use_case: Arc<IngestUseCase>,
     pub user_use_case: Arc<UserUseCase>,
     /// See [`AppContext::api_token_use_case`].
@@ -913,6 +933,8 @@ pub struct AppContextParts {
 
     /// See [`AppContext::curation_use_case`].
     pub curation_use_case: Arc<CurationUseCase>,
+    /// See [`AppContext::provenance_misrejection_repair_use_case`].
+    pub provenance_misrejection_repair_use_case: Arc<ProvenanceMisrejectionRepairUseCase>,
     /// See [`AppContext::policy_use_case`].
     pub policy_use_case: Arc<PolicyUseCase>,
     /// See [`AppContext::wheel_metadata_use_case`].
@@ -1018,6 +1040,7 @@ impl AppContext {
             repository_access_use_case: parts.repository_access_use_case,
             virtual_resolution_use_case: parts.virtual_resolution_use_case,
             content_reference_use_case: parts.content_reference_use_case,
+            oci_index_child_enqueue_use_case: parts.oci_index_child_enqueue_use_case,
             ingest_use_case: parts.ingest_use_case,
             user_use_case: parts.user_use_case,
             api_token_use_case: parts.api_token_use_case,
@@ -1036,6 +1059,7 @@ impl AppContext {
             rbac_resolve_use_case: parts.rbac_resolve_use_case,
             subscription_use_case: parts.subscription_use_case,
             curation_use_case: parts.curation_use_case,
+            provenance_misrejection_repair_use_case: parts.provenance_misrejection_repair_use_case,
             policy_use_case: parts.policy_use_case,
             wheel_metadata_use_case: parts.wheel_metadata_use_case,
             // Wired after `new` via `with_discovery_use_cases`: the use

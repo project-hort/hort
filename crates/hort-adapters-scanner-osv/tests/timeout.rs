@@ -26,14 +26,39 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 use hort_adapters_scanner_osv::{OsvScannerAdapter, OsvScannerConfig};
+use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::DomainError;
-use hort_domain::ports::scanner::ScannerPort;
-use hort_domain::types::{ContentHash, Sbom};
+use hort_domain::ports::scanner::{ScanTarget, ScannerPort};
+use hort_domain::types::{ArtifactCoords, ArtifactKind, ContentHash, Sbom};
+
+/// Serializes every write-then-exec fixture in this test binary. An
+/// executable's write descriptor stays open (and inherited across a fork)
+/// until whichever process holds it execs or closes it — so a second
+/// thread that forks a child while our script is still open for writing
+/// can keep that descriptor alive in the child even after we close our own
+/// handle, and our own later exec of the same path fails with `ETXTBSY`.
+/// Held from script creation through the `scan` call that execs it, so no
+/// other thread in this process can fork while a script is open for
+/// writing.
+static SCRIPT_WRITE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn placeholder_hash() -> ContentHash {
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         .parse()
         .unwrap()
+}
+
+/// Coordinates this backend never reads — it adjudicates the SBOM.
+/// Present only to satisfy the port's target shape.
+fn placeholder_coords() -> ArtifactCoords {
+    ArtifactCoords {
+        name: "lodash".to_string(),
+        name_as_published: "lodash".to_string(),
+        version: Some("4.17.21".to_string()),
+        path: "lodash/-/lodash-4.17.21.tgz".to_string(),
+        format: RepositoryFormat::Npm,
+        metadata: serde_json::Value::Null,
+    }
 }
 
 fn empty_sbom() -> Sbom {
@@ -68,6 +93,7 @@ fn hung_child_script(secs: u64) -> tempfile::TempPath {
 
 #[tokio::test]
 async fn osv_scan_timeout_kills_hung_child_within_configured_window() {
+    let _guard = SCRIPT_WRITE_GUARD.lock().await;
     let script = hung_child_script(30);
     let cfg = OsvScannerConfig {
         // Substitute the hung-child script for the osv-scanner binary.
@@ -85,7 +111,14 @@ async fn osv_scan_timeout_kills_hung_child_within_configured_window() {
     let sbom = empty_sbom();
 
     let started = Instant::now();
-    let result = adapter.scan(&hash, Some(&sbom)).await;
+    let coords = placeholder_coords();
+    let target = ScanTarget {
+        content_hash: &hash,
+        format: "npm",
+        coords: &coords,
+        kind: ArtifactKind::NpmTarball,
+    };
+    let result = adapter.scan(&target, Some(&sbom)).await;
     let elapsed = started.elapsed();
 
     // The timeout (100ms) plus kill + cleanup overhead should land

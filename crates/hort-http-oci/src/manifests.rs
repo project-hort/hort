@@ -926,6 +926,16 @@ async fn try_upstream_manifest_pull_by_digest(
             // CAS) and write the SAME edges the hosted PUT path writes,
             // without fetching the referenced children/blobs.
             //
+            // The children of an index ARE fetched, but by the worker,
+            // off this request: one durable `oci-index-child-ingest` row
+            // per declared child, enqueued in the same breath as the
+            // membership edges that enumerate them. Each child's
+            // quarantine window therefore starts at index ingest rather
+            // than at the first client GET for it, so the index's window
+            // and its children's run concurrently. No window is
+            // shortened — the child's anchor still comes from
+            // `first_seen_for_checksum` (ADR 0054).
+            //
             // Also warm this manifest's own config + layer blobs (#51):
             // a digest-ref pull IS the client naming a specific child
             // architecture, so this is the earliest point that signal
@@ -943,6 +953,10 @@ async fn try_upstream_manifest_pull_by_digest(
                         &manifest_bytes,
                     )
                     .await;
+                    blob_ctx
+                        .oci_index_child_enqueue_use_case
+                        .enqueue_declared_children(blob_repo_id, name, &manifest_bytes)
+                        .await;
                     if blob_repo.prefetch_policy.enabled {
                         crate::prefetch::warm_manifest_blobs(
                             &blob_ctx,
@@ -1244,16 +1258,21 @@ async fn try_upstream_manifest_pull_by_tag(
             // LEADER-SIDE re-read of the manifest tempfile. The
             // bytes-broadcast retirement (ADR 0026) means this is the only
             // path that (briefly) holds the manifest bytes; read them once
-            // BEFORE the cleanup below and reuse for both consumers:
+            // BEFORE the cleanup below and reuse for all three consumers:
             // - Register-only content_references membership edges (#46
             //   Item 4 — the pull-through re-fix), UNCONDITIONALLY (not
             //   gated on prefetch, unlike the trigger below) — mirrors the
             //   hosted PUT path's edges, without fetching children/blobs.
+            // - The eager index-child ingest enqueue, likewise
+            //   unconditional: an index's children are the declared
+            //   membership of the artifact a client just requested, not
+            //   speculation, so it carries no policy gate (the blob warm
+            //   beside it keeps its own — the asymmetry is deliberate).
             // - The prefetch-on-tag-move trigger (only when prefetch is
             //   enabled and the tag moved — `fire_prefetch_trigger_oci`
             //   gates internally).
-            // Both are best-effort and non-fatal — a tempfile read failure
-            // here never affects the live response; the manifest is
+            // All three are best-effort and non-fatal — a tempfile read
+            // failure here never affects the live response; the manifest is
             // already in CAS.
             match tokio::fs::read(&cache_handle.path).await {
                 Ok(manifest_bytes) => {
@@ -1265,6 +1284,13 @@ async fn try_upstream_manifest_pull_by_tag(
                         &manifest_bytes,
                     )
                     .await;
+                    // A tag pull of a multi-arch image resolves to an
+                    // index too, so the same eager child-ingest enqueue
+                    // rides here. See the digest arm for why.
+                    meta_ctx
+                        .oci_index_child_enqueue_use_case
+                        .enqueue_declared_children(meta_repo_id, &meta_name, &manifest_bytes)
+                        .await;
                     if meta_repo.prefetch_policy.enabled {
                         crate::prefetch::fire_prefetch_trigger_oci(
                             &meta_ctx,
@@ -1556,6 +1582,7 @@ async fn finalise_manifest_pull(
                     register_follower_membership_edges(
                         ctx,
                         repo,
+                        name,
                         reference,
                         outcome.artifact.id,
                         &media_type,
@@ -1621,9 +1648,20 @@ async fn finalise_manifest_pull(
 /// row is already committed and the manifest is already serveable by the
 /// time this runs, so a CAS re-read or parse failure is logged and
 /// skipped rather than failing the pull.
+///
+/// # The eager child-ingest enqueue rides here too
+///
+/// A follower's repository needs its index's children as much as the
+/// leader's does — more so, because the leader's enqueue targeted the
+/// LEADER's repository and the dedupe key is per-repository (the
+/// quarantine anchor is per row, ADR 0054). The enqueue therefore fires
+/// from every leg that mints an index row, and `name` is the follower's
+/// own client-facing requested name so each child resolves through the
+/// mapping a client pull against THIS repository would use.
 async fn register_follower_membership_edges(
     ctx: &Arc<AppContext>,
     repo: &Repository,
+    name: &str,
     reference: &str,
     manifest_artifact_id: Uuid,
     media_type: &str,
@@ -1642,6 +1680,9 @@ async fn register_follower_membership_edges(
                 &manifest_bytes,
             )
             .await;
+            ctx.oci_index_child_enqueue_use_case
+                .enqueue_declared_children(repo.id, name, &manifest_bytes)
+                .await;
         }
         Err(e) => {
             tracing::warn!(
@@ -2453,6 +2494,158 @@ mod tests {
             parsed["errors"][0]["detail"]["retry_after_seconds"].is_i64(),
             "detail.retry_after_seconds must be a number"
         );
+    }
+
+    // -- ADR 0039 D5: no `Retry-After` on a hold with no deadline ------
+    //
+    // A `Required`-mode artifact that is still unsigned once its
+    // observation window has elapsed is waiting on a signature reaching
+    // Hort, not on the clock. The clamp in `check_quarantine` would
+    // otherwise answer `Retry-After: 1` on every pull, forever. These
+    // two tests drive the whole read path — policy resolution, the
+    // clearance stream read, the hydrated flag, the response — through
+    // the live handler for both verbs, because the plumbing between the
+    // use case and the header is exactly what the unit tests in
+    // `quarantine.rs` cannot see.
+
+    /// Seed a repo-scoped `provenance_mode: Required` policy. Repo-scoped
+    /// shadows the harness's permissive global seed
+    /// (`resolve_active_policy_for_repo` precedence), so the global stays
+    /// in place for every other test in this file.
+    fn seed_required_policy(
+        projections: &hort_app::use_cases::test_support::MockPolicyProjectionRepository,
+        repo_id: Uuid,
+        quarantine_duration_secs: i64,
+    ) {
+        use hort_domain::entities::scan_policy::{
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
+        };
+        use hort_domain::events::PolicyScope;
+        let now = Utc::now();
+        projections.insert(ScanPolicyProjection {
+            policy_id: Uuid::new_v4(),
+            name: "required-provenance".to_string(),
+            scope: PolicyScope::Repository(repo_id),
+            severity_threshold: SeverityThreshold::Critical,
+            quarantine_duration_secs,
+            require_approval: false,
+            provenance_mode: ProvenanceMode::Required,
+            provenance_backends: vec!["cosign".to_string()],
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: None,
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
+            stream_version: 0,
+            created_at: now,
+            updated_at: now,
+        });
+    }
+
+    /// Drive an anonymous read of an unsigned `Required` manifest whose
+    /// anchor is `anchor_age_secs` old under a `window_secs` window, and
+    /// return `(status, Retry-After)` for the requested verb.
+    fn unsigned_required_hold_read(
+        window_secs: i64,
+        anchor_age_secs: i64,
+        head: bool,
+    ) -> (StatusCode, Option<String>) {
+        let content = br#"{"schemaVersion":2}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            seed_required_policy(&mocks.policy_projections, repo_id, window_secs);
+            seed_manifest(
+                &mocks.artifacts,
+                &mocks.storage,
+                &mocks.artifact_metadata,
+                repo_id,
+                &hex,
+                &content,
+                None,
+                QuarantineStatus::Quarantined,
+            );
+            // Age the anchor. `seed_manifest` stamps `Utc::now()`; the
+            // hold only has no deadline once the window has elapsed.
+            let hash: ContentHash = hex.parse().unwrap();
+            let mut artifact = mocks
+                .artifacts
+                .find_by_repo_and_checksum(repo_id, &hash)
+                .await
+                .unwrap()
+                .expect("seeded manifest");
+            artifact.quarantine_window_start =
+                Some(Utc::now() - chrono::Duration::seconds(anchor_age_secs));
+            mocks.artifacts.insert(artifact);
+            // No `ProvenanceVerified` is ever seeded, so the clearance
+            // resolves `Pending` — the never-signed population.
+            //
+            // RBAC-enabled so the anonymous caller genuinely lacks
+            // Write (otherwise the ADR 0039 §10 hold-read exemption
+            // would serve the manifest instead of the 503), then the
+            // hydration wiring on top so the rebuilt use case keeps it.
+            let ctx = write_grant_ctx(&ctx, mocks.repositories.clone(), "ci-pusher");
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&ctx);
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{hex}"),
+                &HeaderMap::new(),
+                head,
+                /* anonymous */ None,
+            )
+            .await;
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_string());
+            (status, retry_after)
+        })
+    }
+
+    #[test]
+    fn unsigned_required_manifest_past_window_is_503_without_retry_after() {
+        for head in [false, true] {
+            let (status, retry_after) = unsigned_required_hold_read(1, 60, head);
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the hold still withholds the manifest (head={head})"
+            );
+            assert_eq!(
+                retry_after, None,
+                "an unsigned hold past its window must advertise no retry schedule (head={head})"
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_required_manifest_inside_window_keeps_its_retry_after() {
+        for head in [false, true] {
+            let (status, retry_after) = unsigned_required_hold_read(3600, 0, head);
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            let secs: i64 = retry_after
+                .unwrap_or_else(|| panic!("in-window hold must keep Retry-After (head={head})"))
+                .parse()
+                .unwrap();
+            assert!(
+                (1..=3600).contains(&secs),
+                "Retry-After out of range: {secs} (head={head})"
+            );
+        }
     }
 
     // -- Write-authorized manifest hold-read exemption (ADR 0039) --
@@ -3576,24 +3769,58 @@ mod tests {
     }
 
     // ================================================================
-    // #51 — warm a child manifest's layers on the digest path. The
-    // digest-ref pull-through is the client naming a specific
-    // architecture; `crate::prefetch::warm_manifest_blobs` is called
-    // right alongside `register_membership_edges_from_pull` above,
-    // gated on `repo.prefetch_policy.enabled` only (no planner call —
-    // design doc §4/§5).
+    // Two things ride alongside `register_membership_edges_from_pull` on
+    // the digest-ref pull-through, and the tests below separate them:
+    //
+    // - The blob warm (`crate::prefetch::warm_manifest_blobs`). A
+    //   digest-ref pull IS the client naming a specific architecture, so
+    //   the warm is gated on `repo.prefetch_policy.enabled` only — no
+    //   planner call. An index has no `config`/`layers`, so it warms
+    //   nothing for the index itself.
+    // - Eager child ingest. A pull-through that mints an image-index
+    //   artifact enqueues one durable `oci-index-child-ingest` row per
+    //   declared child in the same breath as the `oci_index_member`
+    //   edges that enumerate them, so each child's quarantine window
+    //   starts at index ingest instead of at the first client GET for it.
+    //   The children are NOT fetched on the request path — the worker
+    //   owns the fetch — which is why the child manifest stays
+    //   deliberately unseeded in the mock upstream throughout this block.
     // ================================================================
 
-    /// Prefetch enabled on a digest-ref INDEX pull: an index has no
-    /// `config`/`layers`, so `warm_manifest_blobs` must be a no-op —
-    /// verified by the pull still succeeding (200) and the
-    /// `oci_index_member` edge still being written exactly as in the
-    /// prefetch-disabled test above. If `warm_manifest_blobs` ever
-    /// mistakenly tried to fetch the index's declared child, this
-    /// test would panic: the child manifest is deliberately NOT seeded
-    /// in the mock upstream proxy.
+    /// The `jobs.kind` the eager child-ingest rows carry. Spelled out
+    /// rather than imported: the producer-side constant is `pub(crate)`
+    /// to `hort-app`, and this assertion is precisely that the wire
+    /// literal did not drift.
+    const CHILD_INGEST_KIND: &str = "oci-index-child-ingest";
+
+    /// Every eager child-ingest row the mock jobs port recorded, flattened
+    /// across cohorts in call order.
+    ///
+    /// The rows arrive as batches: an index's declared children are enqueued
+    /// in ONE statement, so a per-row entry-point call would mean the
+    /// producer regressed to a loop. Reading only the batched entry point
+    /// here is what makes that regression visible as an empty result rather
+    /// than a silent pass.
+    fn child_ingest_enqueues(
+        mocks: &hort_http_core::test_support::MockPorts,
+    ) -> Vec<hort_domain::ports::jobs_repository::IdempotentEnqueueRow> {
+        mocks
+            .jobs
+            .idempotent_batch_calls()
+            .into_iter()
+            .flatten()
+            .filter(|row| row.kind == CHILD_INGEST_KIND)
+            .collect()
+    }
+
+    /// Prefetch enabled on a digest-ref INDEX pull. The index has no
+    /// `config`/`layers`, so `warm_manifest_blobs` still warms nothing —
+    /// but the index's declared child now gets a durable
+    /// `oci-index-child-ingest` row, which is the whole point of eager
+    /// child ingest. The child manifest is deliberately NOT seeded in the
+    /// mock upstream: the enqueue must not fetch it on the request path.
     #[test]
-    fn pull_through_by_digest_index_with_prefetch_enabled_still_warms_nothing() {
+    fn pull_through_by_digest_index_enqueues_one_child_ingest_row_per_declared_child() {
         use hort_domain::ports::upstream_proxy::ManifestFetch;
 
         let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -3604,7 +3831,7 @@ mod tests {
         };
         let digest_ref = format!("sha256:{hex}");
 
-        let (status, member_rows) = run(async {
+        let (status, member_rows, enqueues, repo_id, child_artifact) = run(async {
             let handle = PrometheusBuilder::new().build_recorder().handle();
             let (ctx, mocks) = build_mock_ctx(handle);
             let mut repo = oci_repo("myrepo");
@@ -3642,7 +3869,7 @@ mod tests {
             let status = resp.status();
 
             // Let any (wrongly) spawned background task get a chance to
-            // run and panic on the unseeded child-manifest mock before
+            // run against the unseeded child-manifest mock before
             // asserting.
             for _ in 0..50 {
                 tokio::task::yield_now().await;
@@ -3654,14 +3881,313 @@ mod tests {
                 .find_by_target(repo_id, &child_hash, Some("oci_index_member"))
                 .await
                 .unwrap();
-            (status, member_rows)
+            let child_artifact = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{child_hex}"))
+                .await
+                .unwrap();
+            (
+                status,
+                member_rows,
+                child_ingest_enqueues(&mocks),
+                repo_id,
+                child_artifact,
+            )
         });
+
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             member_rows.len(),
             1,
             "the oci_index_member edge is unaffected by prefetch_policy.enabled"
         );
+        assert_eq!(
+            enqueues.len(),
+            1,
+            "one oci-index-child-ingest row per declared child of the pulled index"
+        );
+        let row = &enqueues[0];
+        assert_eq!(row.params["repository_id"], serde_json::json!(repo_id));
+        assert_eq!(
+            row.params["requested_name"],
+            format!("{UP_PREFIX}{UP_NAME}"),
+            "the CLIENT-FACING name travels, so the worker re-resolves the same \
+             prefix-scoped mapping this pull used"
+        );
+        assert_eq!(row.params["child_digest"], format!("sha256:{child_hex}"));
+        assert_eq!(
+            row.idempotency_key.as_str(),
+            format!("{CHILD_INGEST_KIND}:{repo_id}:sha256:{child_hex}"),
+            "the (repository, child digest) dedupe key is what makes concurrent \
+             pulls and both coalescing legs collapse onto one row"
+        );
+        assert!(
+            child_artifact.is_none(),
+            "the child is queued, NOT fetched on the request path"
+        );
+    }
+
+    /// A tag pull of a multi-arch image resolves to an index too, so the
+    /// tag arm enqueues its children just like the digest arm.
+    #[test]
+    fn pull_through_by_tag_index_enqueues_one_child_ingest_row_per_declared_child() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, enqueues, repo_id) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                "latest",
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/latest");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            (status, child_ingest_enqueues(&mocks), repo_id)
+        });
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            enqueues.len(),
+            1,
+            "the tag arm enqueues its index's children"
+        );
+        let row = &enqueues[0];
+        assert_eq!(row.params["child_digest"], format!("sha256:{child_hex}"));
+        assert_eq!(
+            row.idempotency_key.as_str(),
+            format!("{CHILD_INGEST_KIND}:{repo_id}:sha256:{child_hex}"),
+            "the tag arm presents the SAME key the digest arm would, so whichever \
+             leg runs second is absorbed by the jobs unique index"
+        );
+    }
+
+    /// A single-image manifest declares no children, so it queues nothing.
+    #[test]
+    fn pull_through_by_digest_single_image_manifest_enqueues_no_child_ingest_row() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let single_media = "application/vnd.oci.image.manifest.v1+json";
+        let content = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","size":0},"layers":[]}"#.to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, enqueues) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: single_media.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, single_media)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            (status, child_ingest_enqueues(&mocks))
+        });
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            enqueues.is_empty(),
+            "a single-image manifest declares no children; nothing to queue"
+        );
+    }
+
+    /// A second client pull of an index hort already holds never reaches
+    /// the pull-through at all, so it adds no second row — the ordinary
+    /// path by which repeat pulls stay idempotent. (The concurrent /
+    /// cross-leg case is absorbed by `jobs_idempotency_key_uq` on the key
+    /// the assertions above pin.)
+    #[test]
+    fn a_second_pull_of_a_cached_index_enqueues_no_further_child_rows() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (first_status, second_status, enqueues) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let get = || {
+                Request::get(&uri)
+                    .header(ACCEPT, INDEX_MEDIA)
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let first = manifest_router(ctx.clone()).oneshot(get()).await.unwrap();
+            let first_status = first.status();
+            let second = manifest_router(ctx).oneshot(get()).await.unwrap();
+            let second_status = second.status();
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            (first_status, second_status, child_ingest_enqueues(&mocks))
+        });
+
+        assert_eq!(first_status, StatusCode::OK);
+        assert_eq!(second_status, StatusCode::OK);
+        assert_eq!(
+            enqueues.len(),
+            1,
+            "the second pull is served from the local row and enqueues nothing further"
+        );
+    }
+
+    /// A jobs-table outage degrades eager child ingest to today's lazy
+    /// behaviour and is invisible to the client: the index still serves
+    /// 200 and its membership edges are still written.
+    #[test]
+    fn a_jobs_table_error_leaves_the_index_pull_response_unchanged() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, body_len, member_rows) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+            mocks
+                .jobs
+                .fail_next_enqueue(DomainError::Invariant("simulated jobs outage".into()));
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap();
+            (status, body.len(), member_rows)
+        });
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an enqueue failure never fails the pull — the child still reaches the \
+             repository through the lazy path"
+        );
+        assert_eq!(
+            body_len,
+            content.len(),
+            "the index body is served unchanged"
+        );
+        assert_eq!(member_rows.len(), 1, "the membership edge still lands");
     }
 
     /// Prefetch ENABLED on a digest-ref single-image manifest pull:
@@ -5037,6 +5563,84 @@ mod tests {
                 ),
             }
         })
+    }
+
+    /// The coalesced-follower leg enqueues eager child ingest for ITS OWN
+    /// repository. The dedupe key is per-repository (ADR 0054 anchors per
+    /// row), so the leader's enqueue against the leader's repository
+    /// covers nothing here — a follower that skipped the enqueue would
+    /// leave every child of its index on the lazy path.
+    #[test]
+    fn coalesced_follower_enqueues_child_ingest_for_its_own_repository() {
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (follower_repo_id, enqueues) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            assert_ne!(leader_repo.id, follower_repo.id);
+            mocks.repositories.insert(leader_repo.clone());
+            mocks.repositories.insert(follower_repo.clone());
+
+            // Only the LEADER's row exists, so `finalise_manifest_pull`
+            // takes its cross-repo follower branch for `follower_repo`.
+            seed_manifest(
+                &mocks.artifacts,
+                &mocks.storage,
+                &mocks.artifact_metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_manifest_pull(
+                &ctx,
+                &follower_repo,
+                "dockerhub/library/nginx",
+                &format!("sha256:{hex}"),
+                content_hash,
+                /*write_tag=*/ false,
+            )
+            .await;
+            match outcome {
+                UpstreamManifestPullOutcome::Ingested { artifact, .. } => assert_eq!(
+                    artifact.repository_id, follower_repo.id,
+                    "follower must register its own per-repo row"
+                ),
+                other => panic!(
+                    "expected Ingested from cross-repo follower re-register; got {}",
+                    manifest_outcome_variant_name(&other)
+                ),
+            }
+            (follower_repo.id, child_ingest_enqueues(&mocks))
+        });
+
+        assert_eq!(
+            enqueues.len(),
+            1,
+            "the follower leg queues its index's declared child for its OWN repository"
+        );
+        let row = &enqueues[0];
+        assert_eq!(
+            row.params["repository_id"],
+            serde_json::json!(follower_repo_id)
+        );
+        assert_eq!(row.params["requested_name"], "dockerhub/library/nginx");
+        assert_eq!(
+            row.idempotency_key.as_str(),
+            format!("{CHILD_INGEST_KIND}:{follower_repo_id}:sha256:{child_hex}"),
+            "keyed on the FOLLOWER's repository — the leader's row is a different \
+             unit of work with its own quarantine anchor"
+        );
     }
 
     /// Regression (issue #15, Item 5): a cross-repo / coalesced follower

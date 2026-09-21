@@ -13,6 +13,25 @@
   (`crates/hort-adapters-provenance-cosign-key`), the apply-time linter, and the
   worker wiring are on `develop` behind the same `ProvenancePort`. Code anchors
   below cite symbols, not line numbers.
+- **The 2026-09-12 amendment is enforced**, as of the implementing change
+  that landed with it. D1–D5 and D7 are in the code: `NoAttestation` under
+  every mode holds, the three shape predicates are gone, a positive disproof
+  appends an `ArtifactRejected` companion, a hold past its window drops its
+  `Retry-After`, and `RepairProvenanceMisrejection` gives the previously
+  exit-less state an exit. **D6 now has no known exception.** The one it had
+  — on an axis this amendment did not create —
+  was `Artifact::tombstone_from_corruption` driving `Rejected` while
+  appending only `ArtifactCorrupted`. It was pinned rather than papered over
+  as a named `KnownGap` in
+  `crates/hort-domain/tests/rejected_requires_terminal_event.rs`; closing it
+  needed a `RejectionReason` variant, which touches event serialisation, so
+  it landed as its own change. The tombstone now appends
+  `ArtifactRejected{Corruption}` alongside its axis event, and that guard has
+  no `KnownGap` verdict left — a future `Rejected`-reaching transition
+  without a companion fails it rather than being filed as an exception.
+  `TerminalRejectionRecord::CorruptionTombstone` survives that fix, because
+  the event store is append-only: tombstones written before it still carry
+  `ArtifactCorrupted` alone and must stay unrepairable.
 
 ## Context
 
@@ -103,9 +122,10 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
    than a bundle subject — but the invariant "the signed digest equals the
    served artifact's digest" is identical). Verdicts map as ADR 0027:
    valid signature + matching digest → `Verified`; absent signature →
-   `NoAttestation` (allowed under `VerifyIfPresent`, `Unsigned` under
-   `Required`); present but signature-invalid, wrong-key, **or digest-mismatch**
-   → `Rejected`. The path touches no network.
+   `NoAttestation` (allowed under `VerifyIfPresent`; **held** under `Required`,
+   never terminal — see the 2026-09-12 amendment below, which replaces the
+   earlier `Unsigned`-at-expiry rejection); present but signature-invalid,
+   wrong-key, **or digest-mismatch** → `Rejected`. The path touches no network.
 
 3. **Trust material is a pinned public key, parallel to `trusted_root.json`.**
    A boot-provisioned public key or key *set*
@@ -251,8 +271,11 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
    0027 §8 / `provenance_orchestration.rs`), **not** on the hosted push path: a
    signature pushed to a `sha256-<hex>.sig` tag carries no `subject` and so is
    never subject-linked into local carriage, stays invisible to the verifier,
-   and — under `provenance_mode: Required` with the hold-until-signed amendment
-   — the subject image is never cleared and rejects `Unsigned` at window expiry.
+   and — under `provenance_mode: Required` — the subject image is never cleared
+   and so stays **held** (`Quarantined`, 503) indefinitely, per the 2026-09-12
+   amendment below. Fail-closed either way, and unlike the terminal rejection
+   that outcome replaces, recoverable: re-sign with `oci-1-1` and the subject
+   verifies.
    Therefore **first-party hosted keyed signing MUST use
    `cosign sign --registry-referrers-mode=oci-1-1`** (subject-based referrers,
    already handled by carriage), and the enablement how-to states this. Legacy
@@ -292,7 +315,12 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
     read-only cap even when the principal's grants carry Write. A hold
     exemption keyed on the full cap-intersected `Write` resolve therefore
     never engages for a correctly-behaving signer: the held-manifest GET 503s,
-    `cosign sign` aborts, and the artifact expires `Rejected{Unsigned}`. The
+    `cosign sign` aborts, and the artifact is never signed at all — so it stays
+    held forever (under the 2026-09-12 amendment below; before that amendment
+    it expired `Rejected{Unsigned}`). Note that the amendment makes this
+    exemption *more* load-bearing rather than less: with no expiry to force the
+    issue, an exemption that does not engage means an image that is never
+    consumable, with nothing in the artifact's state to say why. The
     two exemption sites — the held-manifest HEAD/GET predicate in
     `manifests.rs` and the held-blob HEAD existence probe in `blobs.rs` —
     evaluate `RepositoryAccessUseCase::resolve_granted_write`, which runs
@@ -317,8 +345,12 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
     Required` the per-artifact gate alone therefore structurally rejects
     every constituent of a validly signed image: the subject verifies and
     releases, but its child manifests and config/layer blobs can never carry
-    a signature of their own and terminally reject `Unsigned` at window
-    expiry, leaving the released index unpullable (each child GET → 404).
+    a signature of their own, so without the cascade they never clear at all
+    and the released index stays unpullable (each child GET → 404). (As
+    originally built the constituents *terminally rejected* `Unsigned` at
+    window expiry; they now hold instead — the amendments below — but the
+    index is equally unpullable either way, which is what makes the cascade
+    load-bearing rather than merely convenient.)
 
     **Cryptographic justification.** The signed top-level digest binds the
     whole tree: an index's `manifests[]` child digests are inside the signed
@@ -367,8 +399,10 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
       index → child manifests → their `config`/`layers` blobs. A child that
       is itself an index contributes only its own digest — its children are
       never read — so grandchildren of an index-of-indexes remain
-      provenance-gated and terminally reject under `Required` (fail-closed;
-      such nesting is not supported for pull under `Required` today).
+      provenance-gated and never clear under `Required` (fail-closed; they
+      stay **held** per the 2026-09-12 amendment below, where they previously
+      rejected terminally — either way such nesting is not supported for pull
+      under `Required` today).
     - **Idempotent**: a constituent already carrying a `ProvenanceVerified`
       takes no duplicate. A per-constituent append that loses a version
       race (a concurrent event on the constituent's stream) retries once
@@ -378,7 +412,10 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
     importantly a cascade-cleared constituent whose S4 expiry-backstop
     verify was enqueued while it was still `Pending` — has no referrer
     surface of its own, so a window-closed re-verify would re-judge it to
-    `Rejected{Unsigned}`. The orchestrator therefore skips the verify
+    `Rejected{Unsigned}` (under the 2026-09-12 amendment below it would
+    instead re-judge it to a *hold* — which keeps this skip worth having:
+    an already-cleared artifact must not be reported as waiting for
+    evidence it does not need). The orchestrator therefore skips the verify
     (`SkippedAlreadyCleared`, `result_summary: skipped:already_cleared`)
     whenever a `Required`-mode artifact's stream already carries a
     `ProvenanceVerified`. When the stored clearance is a **direct**
@@ -421,8 +458,13 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
     rejecting `Unsigned` at expiry. Fail-closed either way — and unlike
     the terminal rejection it replaces, recoverable: sign the root, the S3
     hook re-verifies the subject, and the cascade clears the constituents.
-    The **root itself** is unchanged — it is not a descendant, so it still
-    rejects `Unsigned` at expiry.
+    The **root itself** was left unchanged by that amendment — it is not a
+    descendant, so it still rejected `Unsigned` at expiry. **The 2026-09-12
+    amendment below closes that last shape too:** the root is held on the same
+    terms as its constituents, because "the signature has not arrived yet" is
+    a statement about a point in time on every shape, the subject included.
+    After that amendment the never-signed path holds the whole tree, and the
+    recoverability described above applies to the root as well.
 
     **The late-joiner (constituent-end) trigger (amended 2026-08-08,
     issue #135; direction and this amendment approved on-issue).** The
@@ -571,9 +613,316 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
 - Hosted keyed signing has one operator requirement: sign with
   `--registry-referrers-mode=oci-1-1` (§9). A legacy `sha256-<hex>.sig`-tagged
   signature pushed to Hort is not subject-linked and stays invisible to the
-  verifier — under `Required` (with the ADR 0027 hold-until-signed amendment)
-  the image then rejects `Unsigned` at window expiry. The legacy tag scheme
-  remains honored only on the upstream-proxy fetch path.
+  verifier — under `Required` the image is therefore never cleared and stays
+  **held** indefinitely (`Quarantined`, 503; see the 2026-09-12 amendment
+  below, which replaces the earlier "rejects `Unsigned` at window expiry"
+  outcome). The legacy tag scheme remains honored only on the upstream-proxy
+  fetch path.
+
+## Amendment (2026-09-12) — absence of evidence is not evidence of absence: an unsigned hold is never terminal
+
+**The defect in one sentence.** A provenance verdict reached *before* the
+evidence could arrive becomes terminal, and no later successful verification
+lifts it. With cosign the signature necessarily follows the subject it signs —
+the signer must resolve the subject manifest before it can attach a signature
+to it (§10) — so "the verdict ran first" is the **normal** ordering, not an
+edge case.
+
+**This amendment extends a decision already made; it introduces no new
+concept.** ADR 0007 already governs "the check could not be completed" on the
+**scan** axis, and its answer is a hold: a scan that exhausts its retries
+mid-observation-window leaves the artifact `quarantined`, writes **no**
+status, and is re-scanned once the scanner recovers — *"self-healing without
+operator intervention"*. The provenance axis, in the **identical** situation
+("the evidence is not here yet"), does the opposite: it writes a terminal
+status. That asymmetry — not any single missing predicate — is the defect
+class, and closing it is all this amendment does. Everything below is ADR
+0007's existing answer, applied to the second axis.
+
+The decisions are numbered **D1–D7** to keep them distinct from the 1–12 of
+the *Decision* section above; they amend §11's never-signed path, the
+`NoAttestation × Required` arm the ADR 0027 hold-until-signed amendment
+introduced, and §10's expiry reasoning. They supersede, specifically, the
+"window closed on a subject ⇒ terminal `Rejected{Unsigned}`" arm of that
+amendment — and nothing else about it: the hold itself, its window-awareness,
+and its fail-closed release reading are unchanged.
+
+### Field evidence (one production instance)
+
+One affected artifact's complete event stream:
+
+```text
+ArtifactIngested / ChecksumVerified / ScanRequested / ArtifactQuarantined   (t+0)
+ArtifactGroupMemberAdded                                                     (t+0.09)
+ProvenanceRejected   reason=Unsigned  backend=(policy)                       (t+1.08)
+ProvenanceVerified   backend=cosign-key                                      (t+6.18)
+ScanCompleted                                                                (t+11.2)
+   — stream ends —
+```
+
+The scan was clean (0 findings). The signature *did* arrive and *did* verify,
+5.1 s after the rejection. **No `ArtifactRejected` event exists on the
+stream**, yet the artifact's `quarantine_status` is `rejected`, and the
+release sweep never picked it up again.
+
+The control group across the same instance: **18878** artifacts carrying a
+`ProvenanceVerified` with no prior `ProvenanceRejected` → **18878** released,
+zero exceptions. Every artifact carrying a *prior* `ProvenanceRejected` is
+stuck. Six such artifacts, all with zero scan findings, anchor→rejection
+1.01–2.78 s, rejection→verification ~5.1 s. All six affected repositories run
+`quarantine_duration_secs = 1` with `provenance_mode: required`; no
+`required` repository on that instance runs a larger window.
+
+### D1 — absence of evidence is not evidence of absence
+
+`ProvenanceRejected{Unsigned}` is a statement about **a point in time** — "no
+signature had reached Hort when this verify ran" — not a statement about the
+artifact. It must therefore **never** produce a terminal state.
+
+Only a **positive disproof** is a statement about the artifact: a signature
+that is *present* and invalid, forged, signed by an untrusted key, or bound to
+a different digest. That verdict is position-independent — it is equally wrong
+at every later moment — and it alone may be terminal.
+
+The distinction is not stylistic. A terminal state asserts "no future
+evidence can change this", and for a missing signature that assertion is
+simply false: the very next second can falsify it, and on the instance above
+it did — the signature landed ~5.1 s after the rejection in all six cases.
+The 18878 healthy artifacts are the same ordering winning the race rather
+than a different mechanism; the six lost it by one verify tick.
+
+### D2 — fail-closed is not the same as terminal
+
+"Do not release" and "never reconsider" are separate properties, and safety
+needs only the first.
+
+A held artifact is exactly as unrunnable as a rejected one. Under `Required`
+both answer `503` to a pull, neither is a release candidate (`Pending` at the
+release gate), and the layer bytes are withheld either way — `blobs.rs` keeps
+its hold-read extension to a **HEAD-only** existence probe (§10), so no
+runnable content leaves quarantine in either state. Holding therefore costs
+**nothing** in security, and preserves correctability.
+
+That is why D1 is not a trade-off, and why this amendment does not weigh
+safety against recoverability: there is no safety difference to weigh. The
+terminal status bought nothing that the hold does not already buy.
+
+### D3 — the shape enumeration goes away
+
+`Artifact::complete_provenance` today holds the `NoAttestation × Required`
+arm on `window_open || is_referenced_descendant || is_constituent`. Those
+three predicates accumulated from three separate incidents, and each one
+covers exactly one **shape** of "the evidence had not arrived yet":
+
+- `window_open` — the signature may still be coming (a late anchor);
+- `is_referenced_descendant` — an inbound `content_references` edge already
+  exists, so this row is somebody's constituent;
+- `is_constituent` — the format handler says this row can never carry an
+  attestation of its own, whether or not the edge exists yet.
+
+**The subject manifest is the fourth shape**, and it is the one shape the
+enumeration structurally cannot reach: a subject is *defined* by being the
+thing a signature is attached to, so "its signature has not arrived yet" is
+its normal state for the whole interval between push and sign.
+
+Under D1 the reason `Unsigned` holds **regardless of shape**, and the
+enumeration becomes unnecessary. Record this explicitly, because it is the
+measurable difference between implementing the decision and patching the
+symptom: **a correct implementation of this amendment removes code.** It
+deletes the three-predicate condition (and the plumbing that threads those
+flags from `ProvenanceOrchestrationUseCase::verify_artifact` into
+`complete_provenance` and `apply_verdict`) rather than adding a fourth
+condition to it. A change that adds a fourth predicate has not implemented
+this amendment; it has produced the fifth incident's precondition.
+
+### D4 — terminality on the provenance axis arises *only* from positive disproof
+
+No deadline. No time window for the signature. Under `Required`, unsigned ⇒
+held **indefinitely** (`Quarantined`, answering `503`). An artifact leaves
+the hold on the provenance axis only by being verified — directly, or by the
+§11 cascade — or through an operator authority that already exists: an admin
+release, a curator waiver, or an explicit deletion. Note that retention is
+**not** one of them, in either state: the GC-protection filter below excludes
+`quarantined` and `rejected` alike, so neither state ages out on its own.
+
+A deadline ("held, but rejected after N") was considered and is **rejected**.
+Each argument for one dissolves on inspection:
+
+- **Storage reclamation — no.** `retention_candidate_reader` filters
+  `quarantine_status NOT IN ('quarantined', 'rejected', 'scan_indeterminate')`
+  *before any retention predicate runs*, and `retention_use_case`'s invariant
+  1 names this GC-protection: *"a terminal-failure artifact is evidence, not
+  GC fodder."* `Rejected` is reclaimed exactly as little as `Quarantined`, so
+  a deadline moves an artifact between two equally GC-protected states and
+  buys no bytes back. Note the direction this existing decision actually
+  points: if both states are retained as evidence anyway, then **"waiting" is
+  the truthful label** for an artifact that is waiting.
+- **Sweep load is real, bounded, and load-bearing — it is not to be
+  optimised away.** *(Corrected 2026-09-12 during implementation; as first
+  written this bullet claimed a `Pending` artifact "can be skipped by the
+  candidate query without any status change". It cannot, and the reason
+  strengthens D4 rather than weakening it.)* A `provenance-verify` job is
+  enqueued from exactly two places — the ingest/seed path, and the release
+  sweep's `enqueue_final_provenance_verify` at window expiry. **There is no
+  cron re-verify.** Before this amendment the sweep's enqueue was what
+  *ended* the wait, by making the terminal `Unsigned` decision; with
+  terminality gone its remaining function is the one ADR 0027 named for it,
+  the backstop when the ingest enqueue was lost (job insert failed, worker
+  died mid-run, retries exhausted). Skip it and an artifact whose signature
+  exists but whose verify was never driven is stranded permanently, with
+  nothing left to notice the signature — the very failure this amendment
+  exists to end, arriving through another door. **So the repeated verify is
+  what makes an indefinite hold recoverable at all**, which is an argument
+  for having no deadline, not a cost of it. The load is bounded: the
+  `release_attempt_at` fairness cursor puts never-attempted rows first, so a
+  growing held population costs re-attempt ticks rather than starving fresh
+  artifacts. A candidate-query skip would additionally have to re-implement
+  the release gate's provenance conjunct in SQL — the second computation
+  `release_clearance.rs` exists to prevent.
+- **"Will this ever release?" is an observability question.** A status
+  column answers it worse than the alternative, because it discards the
+  **age**: a status transition collapses "held for 20 seconds" and "held for
+  20 days" into the same value, which is precisely the information an
+  operator needs — so writing no terminal status is right. But that
+  operator's view of the held set is **not a metric**: it is the
+  authoritative surface over the projection — today the admin curation
+  queue (reads `events` via `LATERAL`), and, once it exists, retention's
+  overview (#244), where disposal is decided operator-confirmed and never
+  automatically. The hold itself already ticks the existing
+  `hort_provenance_verify_total{result="held_pending_signature"}` value — no
+  new label value is required for it.
+- **The cost is concrete, and it is the reason this is a hard no.** A
+  deadline re-creates the very construct that has now failed three times
+  (`window_open` alone, then `|| is_referenced_descendant`, then
+  `|| is_constituent`), and it introduces an operator knob whose only failure
+  mode is the bug it exists to bound. There is no value an operator could set
+  that is better than "wait".
+
+**Stated plainly, the accepted cost.** A never-signed artifact's row and bytes
+persist indefinitely. That is not a new cost — the rejected population it
+replaces persists exactly as indefinitely, under the same GC-protection — but
+it is a real one, and it is accepted here rather than papered over. If it ever
+becomes load-bearing, the answer is a retention rule that can reclaim held or
+terminal *evidence* on its own explicit terms, not a status transition whose
+purpose is to smuggle the artifact past a filter that was written to protect
+it.
+
+### D5 — no `Retry-After` on a hold with no self-resolving deadline
+
+A permanent `503` **with** `Retry-After` tells a well-behaved client to keep
+coming back, forever. That is not a hypothetical: `check_quarantine` computes
+`Retry-After` from the hydrated deadline and clamps a past deadline to `1`,
+so a held-past-expiry artifact today answers `503 Retry-After: 1` on every
+pull — an unbounded retry loop advertised by us.
+
+The correct shape already exists in the same module. `check_scan_indeterminate`
+returns `503` **without** `Retry-After`, reasoned as *"no self-resolving
+deadline"*. An unsigned hold past its observation window has none either: the
+thing it waits for is an external event, not the passage of time. **Keep the
+`503`, drop the header** for that state; a hold whose window has *not* yet
+elapsed keeps its honest computed `Retry-After`, because there the deadline
+is real.
+
+**This amendment introduces no new configuration value.** The observation
+window keeps exactly the meaning ADR 0054 gives it — a proxy for elapsed
+**ecosystem exposure** — and gains no second job. That is the whole point of
+D4: the window stops being consulted as a signing deadline, so it goes back to
+meaning one thing.
+
+### D6 — the invariant that makes it machine-checkable
+
+**`quarantine_status = Rejected` without an `ArtifactRejected` event on the
+artifact's stream is an illegal state.** The status is a projection; the
+stream is the record (ADR 0002). A status with no event behind it cannot be
+audited, cannot be re-derived, and — as the field evidence above shows — is
+invisible to anyone reading the stream to find out what happened.
+
+The provenance axis is the producer, and it has **two** arms that produce it:
+`complete_provenance` sets `quarantine_status = Rejected` while appending only
+`ProvenanceRejected`, both for the unsigned-at-expiry policy decision and for a
+positive disproof. Every other axis already appends an `ArtifactRejected`
+alongside its own axis event (the scan path in `QuarantineUseCase`, curation in
+`CurationUseCase`, the retroactive policy path in `PolicyUseCase`); provenance
+is the one that does not.
+
+D1 removes the first arm — the one the field evidence caught, and the only one
+that was ever reachable without a real signature. It does **not** by itself
+remove the second: a positive disproof stays terminal (D1, D4), so it keeps
+producing `Rejected` off a `ProvenanceRejected` alone. Closing D6 therefore has
+a second half — the disproof arm must append an `ArtifactRejected` next to its
+`ProvenanceRejected` — and it is recorded here rather than folded silently into
+D1, because the two halves are independent: D1 is about *which verdicts may be
+terminal*, D6 is about *what a terminal verdict must write*. A terminal
+provenance rejection is a legitimate rejection and should look like one on the
+stream.
+
+### D7 — ADR 0041 invariant #6 is incomplete, not wrong
+
+ADR 0041 invariant #6(a) is correct in what it says: a *scan* re-judgement
+must not clear a provenance rejection, so only a scan-clearable rejection
+(`reason = Scanner`) is eligible for one. What is missing is the **provenance
+re-judgement** that should stand beside it.
+
+As-built, `Rejected` arising from a provenance rejection is a state with **no
+exit at all**:
+
+- `Artifact::release`'s source-state guard admits only `Quarantined` and
+  `ScanIndeterminate`; a `(Curator, CuratorWaiver)` release admits
+  `Quarantined` alone. So neither admin release nor curator waiver reaches a
+  `Rejected` artifact.
+- `Artifact::re_evaluate` is the only named exit from `Rejected` — and its
+  eligibility guard excludes exactly this rejection kind, because
+  `complete_provenance` deliberately leaves `rejection_reason = None` (not
+  `Scanner`) to satisfy invariant #6(a). Measured against a production
+  artifact, the re-evaluation endpoint returned `200
+  {"outcome":"still_rejected"}` and wrote nothing.
+
+Under D1 the state stops arising. The **exit vocabulary still has to name the
+gap**, because artifacts are in it now: the six above, and any others on
+deployed instances. Closing it is not a re-litigation of invariant #6 — a
+provenance-rejected artifact must still be ineligible for a *scan*
+re-judgement, exactly as #6(a) says. What it needs is a provenance-axis
+re-judgement with its own guard, or an explicit operator exit, and that
+naming is the implementing change's scope.
+
+### Operator-facing consequence: a mislabelled parameter, not careless operation
+
+Every affected repository was configured identically, and none of them was
+configured carelessly. `quarantine_duration_secs = 1` is a sensible
+**exposure** choice for a fast-CI first-party repository — the content is the
+operator's own, freshly built, and ADR 0054's ecosystem-exposure rationale
+does not apply to bytes nobody else has ever seen.
+
+Nothing in the parameter's name, its type, or its documentation signals that
+the same value also bounds **how long a signature may still arrive**. The
+window silently acquired a second job (ADR 0007's own amendment records it:
+*"the window is ALSO the `Required`-mode provenance hold predicate"*), and an
+operator tuning the first job could not see the second. That is why all six
+repositories look the same: the configuration was right for what the name
+says, and the name did not say the other thing. D4 and D5 remove the second
+job rather than renaming the parameter — one meaning per knob is the durable
+fix, and ADR 0029's hard-rename machinery is not needed for a field whose
+documented meaning is the one that survives.
+
+### What this amendment does not change
+
+- **The release gate.** `ProvenanceClearance` still resolves `Cleared` iff a
+  `ProvenanceVerified` exists on the stream; `Pending` is still the
+  fail-closed reading; the scan, curation and window conjuncts are untouched.
+  No release authority is added or widened.
+- **Positive disproof.** A forged, wrong-key, digest-mismatched or malformed
+  signature still rejects terminally, on every shape — subject, constituent,
+  descendant alike (§11's existing wording on that point stands verbatim).
+- **The §11 cascade and both its triggers**, including the
+  both-ends-trigger principle (§12). The amendment *widens* the population
+  the cascade is guaranteed to find in `Quarantined`: under D1 a subject can
+  no longer terminally reject itself before its own signature lands, which is
+  the subject-end analogue of what the descendant hold did for constituents.
+- **ADR 0016 is not triggered.** The amendment adds no operator opt-in and no
+  new input to the release-gate computation; it *removes* a transition. Its
+  only configuration effect is subtractive — the observation window stops
+  influencing the provenance axis (D5), which narrows, not widens, what an
+  operator setting can reach.
 
 ## Alternatives considered
 
@@ -639,8 +988,29 @@ filters to the modern Sigstore bundle and currently *drops* the legacy `.sig`
   single-verifier `applicable[0]` selection, the `backend` metric label, and the
   verdict fold this ADR makes the first multi-verifier user of.
 - `crates/hort-domain/src/entities/artifact.rs` — `ProvenanceClearance` /
-  `complete_provenance` (now window-aware — ADR 0027 hold-until-signed
-  amendment) / the release timer-arm AND-precondition, reused unchanged.
+  `complete_provenance` (window-aware per the ADR 0027 hold-until-signed
+  amendment; its `NoAttestation × Required` shape enumeration is what the
+  2026-09-12 amendment's D3 removes) / the release timer-arm
+  AND-precondition, reused unchanged; `release`'s source-state guard and
+  `re_evaluate`'s eligibility guard — together the reason a
+  provenance-derived `Rejected` has no exit (D7).
+- `crates/hort-app/src/use_cases/release_clearance.rs` —
+  `resolve_provenance_clearance`, the single-source `Cleared`/`Pending`
+  resolution the release sweep and the ADR 0041 re-evaluation callers share;
+  and the reason a `Pending` artifact must keep being re-driven rather than
+  skipped (D4).
+- `crates/hort-http-oci/src/quarantine.rs` — `check_quarantine` (computed
+  `Retry-After`, clamped to 1 on a past deadline) and
+  `check_scan_indeterminate` (`503`, no `Retry-After`, *"no self-resolving
+  deadline"*) — the two shapes D5 chooses between.
+- `crates/hort-adapters-postgres/src/retention_candidate_reader.rs` and
+  `crates/hort-app/src/use_cases/retention_use_case.rs` — the
+  `quarantine_status NOT IN ('quarantined', 'rejected', 'scan_indeterminate')`
+  GC-protection filter and its invariant 1 (*"a terminal-failure artifact is
+  evidence, not GC fodder"*): why a deadline reclaims nothing (D4).
+- ADR 0054 — the quarantine window as a proxy for elapsed **ecosystem
+  exposure**, the single meaning D5 keeps it to.
+- ADR 0041 — invariant #6, which D7 records as incomplete rather than wrong.
 - `crates/hort-http-oci/src/manifests_write.rs` — the `oci_subject`
   content-reference row that subject-links a pushed referrer (why §9 requires
   `--registry-referrers-mode=oci-1-1` for hosted keyed signing).

@@ -1306,6 +1306,7 @@ mod tests {
                         negligible: 0,
                     },
                     findings_blob: None,
+                    assessment: crate::events::ScanAssessment::Analysed,
                 }),
                 EventTypeKind::ScanCompleted,
                 None,

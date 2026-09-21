@@ -52,6 +52,7 @@ use hort_app::use_cases::policy_use_case::PolicyUseCase;
 // `AppContext` so format-crate tests can drive the trigger path.
 use hort_app::use_cases::prefetch_use_case::PrefetchUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
+use hort_app::use_cases::provenance_misrejection_repair::ProvenanceMisrejectionRepairUseCase;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
 use hort_app::use_cases::ref_use_case::RefUseCase;
@@ -63,6 +64,7 @@ use hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase;
 // Wired into the mock `AppContext` so the `hort-http-discovery` handler
 // tests can drive `POST /api/v1/repositories/:repo_key/prefetch` through
 // the shared harness.
+use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
 use hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase;
 use hort_app::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
 use hort_app::use_cases::task_use_case::TaskUseCase;
@@ -1255,6 +1257,18 @@ pub fn build_mock_ctx_with_label_flag(
         storage.clone(),
     ));
 
+    // Admin-gated one-shot repair of the artifacts stranded `Rejected`
+    // with no `ArtifactRejected` behind them (ADR 0039's 2026-09-12
+    // amendment, D6). Shares the curation-queue mock, so a handler test
+    // seeds candidates through the same `mocks.curation_queue` handle.
+    let provenance_misrejection_repair_use_case =
+        Arc::new(ProvenanceMisrejectionRepairUseCase::new(
+            event_publisher.clone(),
+            artifacts.clone(),
+            lifecycle.clone(),
+            curation_queue.clone(),
+        ));
+
     // `PolicyUseCase` wired with the same ports
     // the production composition root threads (event_publisher,
     // policy_projections, artifacts, lifecycle, storage). The
@@ -1334,6 +1348,7 @@ pub fn build_mock_ctx_with_label_flag(
         repository_access_use_case,
         virtual_resolution_use_case,
         content_reference_use_case,
+        oci_index_child_enqueue_use_case: Arc::new(OciIndexChildEnqueueUseCase::new(jobs.clone())),
         ingest_use_case,
         user_use_case,
         api_token_use_case,
@@ -1364,6 +1379,7 @@ pub fn build_mock_ctx_with_label_flag(
         subscription_use_case,
         // See field doc.
         curation_use_case,
+        provenance_misrejection_repair_use_case,
         // See field doc.
         policy_use_case,
         // See field doc.
@@ -1574,6 +1590,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         repository_access_use_case: base.repository_access_use_case.clone(),
         virtual_resolution_use_case: base.virtual_resolution_use_case.clone(),
         content_reference_use_case: base.content_reference_use_case.clone(),
+        oci_index_child_enqueue_use_case: base.oci_index_child_enqueue_use_case.clone(),
         ingest_use_case: base.ingest_use_case.clone(),
         user_use_case: base.user_use_case.clone(),
         api_token_use_case: base.api_token_use_case.clone(),
@@ -1637,6 +1654,9 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         // `RepositoryAccessUseCase`; no `with_*` helper rebuild is
         // needed when the access policy flips.
         curation_use_case: base.curation_use_case.clone(),
+        provenance_misrejection_repair_use_case: base
+            .provenance_misrejection_repair_use_case
+            .clone(),
         // Carry forward the same
         // `Arc<PolicyUseCase>`. The HTTP exclusion write endpoints
         // mount under `/api/v1/admin/policies/:policy_id/exclusions`
@@ -2028,6 +2048,37 @@ pub fn with_repositories(
     repos: Arc<dyn RepositoryRepository>,
 ) -> Arc<AppContext> {
     rebuild(base, |ctx| ctx.repositories = repos)
+}
+
+/// Rebuild `artifact_use_case` with the two ports
+/// [`ArtifactUseCase::hydrate_quarantine_deadline`] needs to resolve an
+/// ADR 0039 D5 hold on the read path: the live policy projections (the
+/// window duration **and** `provenance_mode`) and a read-only event-store
+/// handle (the `ProvenanceVerified` lookup behind
+/// `Artifact::provenance_hold_indefinite`).
+///
+/// Deliberately opt-in rather than part of the default mock build. The
+/// harness seeds a permissive global policy with
+/// `quarantine_duration_secs = 0`, so wiring the projections by default
+/// would collapse every quarantined artifact's computed deadline to its
+/// anchor and rewrite the `Retry-After` every existing handler test
+/// asserts. A test that wants the real resolution opts in here and seeds
+/// the policy it means to exercise.
+pub fn with_provenance_hold_hydration(base: &Arc<AppContext>) -> Arc<AppContext> {
+    rebuild(base, |ctx| {
+        ctx.artifact_use_case = Arc::new(
+            ArtifactUseCase::new(
+                ctx.artifacts.clone(),
+                ctx.storage.clone(),
+                ctx.repositories.clone(),
+                ctx.include_repository_label,
+            )
+            .with_repository_access(ctx.repository_access_use_case.clone())
+            .with_artifact_metadata(ctx.artifact_metadata.clone())
+            .with_policy_projections(ctx.policy_projections.clone())
+            .with_provenance_clearance_events(ctx.event_store.clone()),
+        );
+    })
 }
 
 /// Swap the wired

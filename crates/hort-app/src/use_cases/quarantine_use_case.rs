@@ -13,8 +13,8 @@ use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, timer_actor};
 use hort_domain::events::{
     Actor, ApiActor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PolicyEvaluated,
-    PolicyResult, PolicyViolation, ReleaseReason, ScanCompleted, SeveritySummary, StreamId,
-    NO_POLICY,
+    PolicyResult, PolicyViolation, ReleaseReason, ScanAssessment, ScanCompleted, SeveritySummary,
+    StreamId, NO_POLICY,
 };
 use hort_domain::policy::scan_delta::compute_added_findings;
 use hort_domain::policy::{
@@ -185,9 +185,10 @@ pub struct QuarantineUseCase {
     /// expiry, a `provenance_mode: Required` + `ProvenanceClearance::
     /// Pending` candidate can neither release (fail-closed — `Pending`
     /// denies the timer arm) nor stay held forever; the sweep enqueues a
-    /// **final** `provenance-verify` for it (which runs `window_open =
-    /// false` via Item 2 and either clears a just-in-time signature or
-    /// emits terminal `ProvenanceRejected{Unsigned}`). The enqueue is
+    /// **final** `provenance-verify` for it, which either clears a
+    /// just-in-time signature or re-holds the candidate (an unsigned
+    /// artifact is held indefinitely — ADR 0039's 2026-09-12 amendment,
+    /// D1/D4 — never terminally rejected). The enqueue is
     /// best-effort, non-gating (warn-and-continue) and idempotent per
     /// tick via [`JobsRepository::find_active_provenance_for_artifact`] —
     /// it never blocks the sweep and never releases a `Pending`
@@ -870,12 +871,23 @@ impl QuarantineUseCase {
     /// rows are preserved — the artifact had no extractable SBOM
     /// (e.g. an opaque format with no manifest), and stale-row
     /// cleanup for retired SBOMs is a future concern.
+    ///
+    /// **`assessment` parameter.** Lands verbatim on
+    /// `ScanCompleted.assessment`. [`ScanAssessment::NotApplicable`]
+    /// records a completed assessment of an artifact with no package
+    /// surface — it opens the release gate exactly as a clean verdict
+    /// does, but the trail can tell the two apart. The caller is the
+    /// orchestrator's outcome partition; every other path passes
+    /// [`ScanAssessment::Analysed`]. A `NotApplicable` paired with a
+    /// non-empty `findings` fails `ScanCompleted::validate` before
+    /// anything is persisted.
     #[tracing::instrument(skip(self, findings, sbom))]
     pub async fn record_scan_result(
         &self,
         artifact_id: Uuid,
         scanner: String,
         findings: Vec<Finding>,
+        assessment: ScanAssessment,
         sbom: Option<&Sbom>,
     ) -> AppResult<()> {
         let stream_id = StreamId::artifact(artifact_id);
@@ -960,6 +972,7 @@ impl QuarantineUseCase {
             finding_count,
             severity_summary: severity.clone(),
             findings_blob: blob_hash.clone(),
+            assessment,
         };
         scan_event.validate()?;
 
@@ -1674,10 +1687,10 @@ impl QuarantineUseCase {
             // `Required` + `Pending` candidate can neither release
             // (fail-closed — `Pending` denies the timer arm below) nor
             // stay held forever. Enqueue a FINAL `provenance-verify` for
-            // it: it runs with `window_open = false` (Item 2), so
-            // `complete_provenance` either CLEARS a signature that landed
-            // just before expiry or emits terminal
-            // `ProvenanceRejected{Unsigned}`. This is also the backstop if
+            // it: `complete_provenance` either CLEARS a signature that
+            // landed just before expiry or re-holds the candidate (an
+            // unsigned artifact is held indefinitely — ADR 0039's
+            // 2026-09-12 amendment, D1/D4). This is also the backstop if
             // the S3 signature-arrival enqueue was lost.
             //
             // The enqueue does NOT change the release decision — the
@@ -1693,9 +1706,9 @@ impl QuarantineUseCase {
             // attestation of its own (the OCI referrers `subject` is a
             // manifest descriptor; cosign signs manifest digests), so the
             // verify this would enqueue has exactly two reachable
-            // outcomes: the referenced-tree-descendant HOLD — which
-            // changes no state at all, and which every subsequent tick
-            // would re-enqueue forever — or, on a proxy scope whose
+            // outcomes: the unsigned HOLD — which changes no state at
+            // all, and which every subsequent tick would re-enqueue
+            // forever — or, on a proxy scope whose
             // upstream referrer fetch errors, the fail-closed
             // `Rejected{RekorNotFound}` that `apply_fetch_failure`
             // produces regardless of the descendant flag. The first is
@@ -2442,6 +2455,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -2486,6 +2500,7 @@ mod tests {
                 } else {
                     None
                 },
+                assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -2532,6 +2547,24 @@ mod tests {
         );
         p.scan_backends = vec![];
         projections.insert(p);
+    }
+
+    /// Seed an active repo-scoped policy whose quarantine window is the
+    /// **permissive zero** (`quarantine_duration_secs = 0`). Returned so
+    /// a test can assert the premise it depends on rather than inherit it
+    /// silently from [`projection`]'s defaults: permissive is an opt-in
+    /// on the observation window only, and the tests that use this exist
+    /// to pin that it changes nothing about the release gates.
+    fn seed_permissive_policy(
+        projections: &Arc<MockPolicyProjectionRepository>,
+        repository_id: Uuid,
+    ) -> ScanPolicyProjection {
+        let p = projection(
+            PolicyScope::Repository(repository_id),
+            SeverityThreshold::Critical,
+        );
+        projections.insert(p.clone());
+        p
     }
 
     /// Seed a repo-scoped policy in `enforcement: record` mode. Scanning
@@ -2648,6 +2681,7 @@ mod tests {
                 negligible: 0,
             },
             findings_blob: None,
+            assessment: ScanAssessment::Analysed,
         });
         lifecycle
             .commit_scan_result_with_score(
@@ -2721,6 +2755,7 @@ mod tests {
                 negligible: 0,
             },
             findings_blob: None,
+            assessment: ScanAssessment::Analysed,
         });
         let err = lifecycle
             .commit_scan_result_with_score(
@@ -2894,6 +2929,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -2967,6 +3003,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3031,6 +3068,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3078,6 +3116,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3133,6 +3172,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3173,6 +3213,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3244,6 +3285,7 @@ mod tests {
                 artifact_id,
                 "trivy".into(),
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await;
@@ -3298,6 +3340,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3348,6 +3391,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3395,6 +3439,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3439,6 +3484,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3487,6 +3533,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3536,6 +3583,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3578,6 +3626,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3631,9 +3680,15 @@ mod tests {
             informational_class: None,
             severity_basis: hort_domain::types::SeverityBasis::Assessed,
         }];
-        uc.record_scan_result(artifact_id, "trivy".into(), findings, None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings,
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Clean path: ScanCompleted only — no Reject events. The
         // clean dual-write routes through the lifecycle
@@ -3687,6 +3742,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3724,6 +3780,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3767,6 +3824,7 @@ mod tests {
                 artifact_id,
                 big_scanner,
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await
@@ -3791,6 +3849,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -3824,6 +3883,7 @@ mod tests {
                 artifact_id,
                 "trivy".into(),
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await
@@ -3863,6 +3923,7 @@ mod tests {
                 artifact_id,
                 "trivy".into(),
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await
@@ -3914,9 +3975,15 @@ mod tests {
             seed_quarantined_with_anchor(&artifacts, &repositories, chrono::Duration::hours(25));
 
         // Clean scan — no findings.
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Exactly one transactional commit, carrying BOTH events.
         let transitions = lifecycle.committed_transitions();
@@ -3998,9 +4065,15 @@ mod tests {
                 // stream ⇒ clearance resolves to `Pending`.
                 seed_required_provenance_policy(&projections, repo_id);
 
-                uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-                    .await
-                    .unwrap();
+                uc.record_scan_result(
+                    artifact_id,
+                    "trivy".into(),
+                    Vec::new(),
+                    ScanAssessment::Analysed,
+                    None,
+                )
+                .await
+                .unwrap();
 
                 let transitions = lifecycle.committed_transitions();
                 assert_eq!(transitions.len(), 1);
@@ -4055,9 +4128,15 @@ mod tests {
         // Stream carries a `ProvenanceVerified` ⇒ clearance `Cleared`.
         seed_stream_scanned_and_provenance_verified(&events, artifact_id);
 
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         let transitions = lifecycle.committed_transitions();
         assert_eq!(transitions.len(), 1);
@@ -4094,9 +4173,15 @@ mod tests {
         let artifact_id =
             seed_quarantined_with_anchor(&artifacts, &repositories, chrono::Duration::hours(1));
 
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Exactly one transactional commit, carrying ONLY ScanCompleted.
         let transitions = lifecycle.committed_transitions();
@@ -4173,9 +4258,15 @@ mod tests {
 
         // Clean scan — no findings — so the dual-write commits cleanly
         // through the lifecycle mock (no policy interaction).
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), Some(&sbom))
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            Some(&sbom),
+        )
+        .await
+        .unwrap();
 
         let calls = lifecycle.sbom_replace_calls();
         assert_eq!(calls.len(), 1, "expected one lifecycle call");
@@ -4199,9 +4290,15 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
 
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         let calls = lifecycle.sbom_replace_calls();
         assert_eq!(calls.len(), 1);
@@ -4232,9 +4329,15 @@ mod tests {
             subject: None,
             components: vec![],
         };
-        uc.record_scan_result(artifact_id, "trivy".into(), Vec::new(), Some(&sbom))
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            Some(&sbom),
+        )
+        .await
+        .unwrap();
 
         let calls = lifecycle.sbom_replace_calls();
         assert_eq!(calls.len(), 1);
@@ -4318,6 +4421,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -4402,6 +4506,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -4460,6 +4565,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -5021,7 +5127,7 @@ mod tests {
     fn seed_required_provenance_policy(
         projections: &Arc<MockPolicyProjectionRepository>,
         repository_id: Uuid,
-    ) {
+    ) -> ScanPolicyProjection {
         let mut p = projection(
             PolicyScope::Repository(repository_id),
             SeverityThreshold::Critical,
@@ -5035,7 +5141,8 @@ mod tests {
             )
             .expect("valid identity pattern"),
         ];
-        projections.insert(p);
+        projections.insert(p.clone());
+        p
     }
 
     /// Seed an artifact stream carrying
@@ -5079,6 +5186,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
             causation_id: None,
@@ -5145,6 +5253,173 @@ mod tests {
             lifecycle.committed_transitions().is_empty(),
             "fail-closed: no release transition committed"
         );
+    }
+
+    /// **An indefinitely-held artifact must never stop being a
+    /// candidate.** Under ADR 0039's 2026-09-12 amendment (D4) an
+    /// unsigned `Required` artifact holds forever rather than
+    /// terminalising, so the sweep re-examines it on every rotation. The
+    /// candidacy query selects on `quarantine_status = 'quarantined' AND
+    /// quarantine_window_start <= now - duration AND deleted_at IS NULL`
+    /// — and a held tick writes **none** of those three, which is what
+    /// makes the hold self-healing: the moment a `ProvenanceVerified`
+    /// lands, the very next tick releases the same row.
+    ///
+    /// This is the property any candidate-query skip for the held
+    /// population has to preserve, and the reason the sweep's per-tick
+    /// re-examination is load-bearing rather than waste (the final
+    /// `provenance-verify` it enqueues is the only backstop for a lost
+    /// signature-arrival enqueue — ADR 0027's "doubles as the backstop"
+    /// clause).
+    #[tokio::test]
+    async fn a_held_candidate_stays_selectable_and_releases_once_verified() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_stream_with_scan_completed(&events, artifact_id);
+        seed_required_provenance_policy(&projections, repo_id);
+        let before = artifacts.get(artifact_id).unwrap();
+
+        // Tick 1 — the signature has not arrived; the artifact holds.
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+        assert!(summary.released.is_empty());
+        assert_eq!(summary.skipped_provenance_pending, 1);
+        assert!(lifecycle.committed_transitions().is_empty());
+
+        // Every input the candidacy predicate reads is untouched, so the
+        // same row is served again on the next rotation.
+        let after = artifacts.get(artifact_id).unwrap();
+        assert_eq!(after.quarantine_status, QuarantineStatus::Quarantined);
+        assert_eq!(
+            after.quarantine_window_start, before.quarantine_window_start,
+            "a held tick must not move the anchor — the candidacy range scan keys on it"
+        );
+        assert!(after.deleted_at.is_none());
+
+        // The signature lands.
+        seed_stream_scanned_and_provenance_verified(&events, artifact_id);
+
+        // Tick 2 — the same candidate releases.
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+        assert_eq!(
+            summary.released,
+            vec![artifact_id],
+            "an artifact that was held indefinitely must still release the tick after \
+             its signature arrives"
+        );
+    }
+
+    // =====================================================================
+    // Permissive window (`quarantine_duration_secs = 0`) — what the sweep
+    // does with an artifact stranded by a mid-window switch to permissive.
+    //
+    // Candidacy is the adapter's half and is pinned there
+    // (`hort-adapters-postgres`'s
+    // `select_expired_zero_window_repo_still_selects_artifacts_held_under_a_prior_window`
+    // and `..._selects_a_provenance_required_candidate`): a zero-length
+    // window puts the cutoff at `now`, so every held artifact is past its
+    // deadline. These two pin the other half — that becoming a candidate
+    // buys no authority it did not already have.
+    // =====================================================================
+
+    /// A permissive repository's stranded artifact releases on the
+    /// ORDINARY scan-axis authority once the sweep reaches it: the
+    /// existing `(ReleaseReason::Timer,
+    /// ReleaseAuthorization::ScanSucceeded)` pair, minted from its own
+    /// clean `ScanCompleted`. The permissive window is not the reason it
+    /// releases — it is only the reason it is a candidate.
+    #[tokio::test]
+    async fn release_expired_releases_an_artifact_stranded_by_a_switch_to_a_zero_window() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        let policy = seed_permissive_policy(&projections, repo_id);
+        assert_eq!(
+            policy.quarantine_duration_secs, 0,
+            "premise: the repository's live window is the permissive zero"
+        );
+        seed_stream_with_scan_completed(&events, artifact_id);
+
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
+
+        assert_eq!(released, vec![artifact_id]);
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        let DomainEvent::ArtifactReleased(ev) = &batch.events[0].event else {
+            panic!("ArtifactReleased expected");
+        };
+        assert_eq!(
+            ev.released_by,
+            ReleaseReason::Timer,
+            "the timer arm, not a new permissive-mode authority"
+        );
+        assert!(ev.released_by_user_id.is_none());
+    }
+
+    /// **Permissive is an opt-in on the quarantine window, never an
+    /// opt-out of ADR 0027.** The same repository under `provenance_mode:
+    /// Required` with no `ProvenanceVerified`: the candidate is refused
+    /// fail-closed and receives its final `provenance-verify` instead.
+    ///
+    /// This is the security property the deadline-only candidacy query
+    /// must not collapse — an implementation that read "the repository is
+    /// permissive" as "release these artifacts" would hand out an
+    /// unverified artifact here.
+    #[tokio::test]
+    async fn release_expired_zero_window_repo_holds_a_provenance_required_candidate() {
+        let (uc, artifacts, events, lifecycle, repositories, projections, jobs) =
+            make_use_case_with_jobs();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // The scan gate passes; only provenance is outstanding.
+        seed_stream_with_scan_completed(&events, artifact_id);
+        let policy = seed_required_provenance_policy(&projections, repo_id);
+        assert_eq!(
+            policy.quarantine_duration_secs, 0,
+            "premise: the repository's live window is the permissive zero"
+        );
+        assert_eq!(policy.provenance_mode, ProvenanceMode::Required);
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            summary.released.is_empty(),
+            "a Required + Pending candidate is never released, permissive window or not"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "fail-closed: no release transition committed"
+        );
+        assert_eq!(
+            summary.skipped_provenance_pending, 1,
+            "the hold is attributed to the provenance gate"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Quarantined,
+            "the artifact stays held"
+        );
+
+        // …and the terminal decision is still pursued: one final
+        // provenance-verify for this artifact.
+        let calls = jobs.enqueue_calls();
+        assert_eq!(calls.len(), 1);
+        let (kind, params, actor_id) = &calls[0];
+        assert_eq!(kind, "provenance-verify");
+        assert_eq!(
+            params.get("artifact_id").and_then(|v| v.as_str()),
+            Some(artifact_id.to_string().as_str())
+        );
+        assert!(actor_id.is_none(), "expiry backstop is system-driven");
     }
 
     // -- release_expired per-cause skip attribution ---------------------------
@@ -5454,12 +5729,11 @@ mod tests {
     }
 
     // =====================================================================
-    // S4 — terminal decision at window expiry (design §2 S4). A Required +
+    // S4 — the final verify at window expiry (design §2 S4). A Required +
     // Pending + past-deadline candidate enqueues a FINAL provenance-verify
-    // (running window_open=false via Item 2) that either clears a
-    // just-in-time signature or emits terminal Rejected{Unsigned}. The
-    // sweep STILL never releases a Pending candidate; the enqueue is
-    // idempotent per tick.
+    // that either clears a just-in-time signature or re-holds the
+    // candidate. The sweep STILL never releases a Pending candidate; the
+    // enqueue is idempotent per tick.
     // =====================================================================
 
     /// S4: a `Required` + `Pending` (scan gate passing, NO
@@ -6473,6 +6747,7 @@ mod tests {
                     artifact_id,
                     "trivy".into(),
                     findings_from_summary(&severity),
+                    ScanAssessment::Analysed,
                     None,
                 )
                 .await
@@ -6531,6 +6806,7 @@ mod tests {
                     artifact_id,
                     "trivy".into(),
                     findings_from_summary(&severity),
+                    ScanAssessment::Analysed,
                     None,
                 )
                 .await
@@ -6743,6 +7019,7 @@ mod tests {
                 artifact_id,
                 "trivy".into(),
                 findings_from_summary(&severity),
+                ScanAssessment::Analysed,
                 None,
             )
             .await
@@ -6843,6 +7120,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -6875,6 +7153,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -6918,6 +7197,7 @@ mod tests {
             artifact_id,
             "trivy".into(),
             findings_from_summary(&severity),
+            ScanAssessment::Analysed,
             None,
         )
         .await
@@ -6977,9 +7257,15 @@ mod tests {
         // Clean re-scan (no findings) of a terminal artifact: returns Ok —
         // not the hard `cannot record clean scan for artifact in state rejected`
         // error that looped the job.
-        uc.record_scan_result(artifact_id, "trivy".into(), vec![], None)
-            .await
-            .unwrap();
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            vec![],
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
 
         // The fresh clean scan IS recorded (the dual-write fired) so a rescan
         // refreshes the stored result — not a silent no-op and not a loop.
@@ -7116,7 +7402,13 @@ mod tests {
         );
 
         let err = uc
-            .record_scan_result(artifact_id, "trivy".into(), findings, None)
+            .record_scan_result(
+                artifact_id,
+                "trivy".into(),
+                findings,
+                ScanAssessment::Analysed,
+                None,
+            )
             .await
             .expect_err("oversize findings blob must surface as an error");
         match err {

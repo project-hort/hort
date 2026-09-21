@@ -540,7 +540,7 @@ hort-cli curation unexclude-finding --policy <id> --cve <id> --justification <te
 hort-cli curation queue \
   [--repo <key>] \
   [--status <quarantined|rejected|scan_indeterminate>] \
-  [--reason <scanner|curator|curation_retroactive>] \
+  [--reason <scanner|admin|curator|curation_retroactive|scan_policy_retroactive|provenance|corruption>] \
   [--limit <n>] [--output json|table]
 
 hort-cli curation decisions \
@@ -563,11 +563,20 @@ hort-cli curation exclusions \
 
 **Notes:**
 
-- `curation queue` does **not** accept `--reason corruption` — corrupted
-  artifacts (the `ArtifactCorrupted` event) are a structurally
-  different concern from curator decisions. The endpoint returns `400`
-  on that value. Run the scrubber's separate listing if you need to
-  triage corrupted CAS content.
+- `--reason` is validated **server-side only**. Its accepted set is the
+  server's own rejection-reason vocabulary, so it widens whenever a new
+  rejection axis lands; an unknown value returns `400` listing the set the
+  server actually accepts. The CLI deliberately keeps no copy of that list
+  — a stale local copy refuses rows that demonstrably exist, which is
+  worse than a round trip.
+- `--reason corruption` **is** accepted, and lists artifacts the CAS
+  integrity scrubber tombstoned because their stored bytes no longer hash
+  to their content hash. It is not a curator decision, but it is a
+  rejection a curator will be asked about, and it is reachable here
+  because the tombstone records an `ArtifactRejected` of its own. Note
+  that a tombstone written by an older Hort carries no such record and
+  therefore shows an empty `REJECT_REASON`; it will not match
+  `--reason corruption`.
 - `curation decisions` defaults to **uncollapsed** (one row per event);
   `--by-correlation` groups by `correlation_id` so a bulk `block
   versions` operation surfaces as one logical decision rather than N

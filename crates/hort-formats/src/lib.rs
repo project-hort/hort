@@ -77,6 +77,229 @@ pub(crate) mod stream_helpers;
 pub mod test_support;
 
 #[cfg(test)]
+mod scan_kind_classification_tests {
+    //! `FormatHandler::scan_kind` classification guard.
+    //!
+    //! DB-free, network-free, sub-second structural guard over how each
+    //! shipped format handler classifies its stored rows for content
+    //! scanning — in the spirit of `version_discovery_participation` /
+    //! `retention_registration_guard`, but in-crate rather than a `tests/`
+    //! target: it needs nothing outside `hort-formats`, so living here lets
+    //! it share the `test_support` row fixture and count toward the crate's
+    //! `--lib` coverage. Its siblings below (the inherited-default guards)
+    //! are the same shape.
+    //!
+    //! ## Why this guard exists
+    //!
+    //! `scan_kind` is the single point where "what are these bytes" is
+    //! decided, and a scanner adapter cannot second-guess it: the whole
+    //! materialisation — the file name a Java archive keeps, whether a
+    //! payload is extracted, whether a scanner is invoked at all — follows
+    //! from the answer. A misclassification is therefore silent: the scan
+    //! still runs, still completes, and still writes a verdict; only the
+    //! *evidence* behind that verdict is gone. Nothing in the type system
+    //! catches that, so the classification is pinned here.
+    //!
+    //! ## What it asserts
+    //!
+    //! 1. **Exhaustiveness over [`ArtifactKind`].** [`representative_row`] is
+    //!    a `match` with **no `_` arm**: every variant names a shipped
+    //!    handler and a real stored path that must classify as it. A variant
+    //!    added in `hort-domain` fails to COMPILE until it is consciously
+    //!    placed — either with a producing handler, or as a kind no shipped
+    //!    handler produces.
+    //! 2. **Real stored-path shapes.** The paths are the ones the handlers'
+    //!    own `build_artifact_logical_path` produces, not invented strings.
+    //! 3. **Nothing claims a kind it cannot materialise.** A handler must
+    //!    never claim a container the adapter has no extraction for — the
+    //!    long-tail PyPI sdist containers (`.zip`, `.tar.bz2`, `.egg`) are
+    //!    the live case, and they must classify as `Other`.
+
+    use crate::cargo::CargoFormatHandler;
+    use crate::maven::MavenFormatHandler;
+    use crate::npm::NpmFormatHandler;
+    use crate::oci::OciFormatHandler;
+    use crate::pypi::PyPiFormatHandler;
+    use crate::test_support::artifact_row_at;
+    use hort_domain::ports::format_handler::FormatHandler;
+    use hort_domain::types::ArtifactKind;
+
+    fn handler(key: &str) -> Box<dyn FormatHandler> {
+        match key {
+            "maven" => Box::new(MavenFormatHandler),
+            "npm" => Box::new(NpmFormatHandler),
+            "cargo" => Box::new(CargoFormatHandler),
+            "pypi" => Box::new(PyPiFormatHandler),
+            "oci" => Box::new(OciFormatHandler),
+            other => panic!("no handler registered in this guard for key {other}"),
+        }
+    }
+
+    /// The `(handler key, stored path)` that must classify as `kind`.
+    ///
+    /// Exhaustive over [`ArtifactKind`] on purpose — **no `_` wildcard arm**.
+    /// Every variant is produced by a shipped handler today; a future variant
+    /// that no handler produces belongs here as a compile-forced decision
+    /// (return `None` and extend the caller), not as a silent wildcard.
+    fn representative_row(kind: ArtifactKind) -> (&'static str, &'static str) {
+        match kind {
+            ArtifactKind::MavenJar => (
+                "maven",
+                "org/apache/logging/log4j/log4j-core/2.14.1/log4j-core-2.14.1.jar",
+            ),
+            ArtifactKind::MavenPom => (
+                "maven",
+                "org/apache/logging/log4j/log4j-core/2.14.1/log4j-core-2.14.1.pom",
+            ),
+            ArtifactKind::NpmTarball => ("npm", "lodash/-/lodash-4.17.21.tgz"),
+            ArtifactKind::CargoCrate => ("cargo", "crates/tokio/1.35.1/tokio-1.35.1.crate"),
+            ArtifactKind::PyWheel => ("pypi", "simple/urllib3/urllib3-1.26.4-py2.py3-none-any.whl"),
+            ArtifactKind::PySdist => ("pypi", "simple/urllib3/urllib3-1.26.4.tar.gz"),
+            ArtifactKind::OciBlob => (
+                "oci",
+                "blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            ArtifactKind::OciManifest => (
+                "oci",
+                "manifests/sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ),
+            // A checksum sidecar: a real Maven row with no analyser.
+            ArtifactKind::Other => ("maven", "com/example/lib/1.0.0/lib-1.0.0.jar.sha1"),
+        }
+    }
+
+    /// Every [`ArtifactKind`], for iteration. Kept next to
+    /// [`representative_row`] so the two are edited together; the match there
+    /// is what makes forgetting one a compile error.
+    const ALL_KINDS: &[ArtifactKind] = &[
+        ArtifactKind::MavenJar,
+        ArtifactKind::MavenPom,
+        ArtifactKind::NpmTarball,
+        ArtifactKind::CargoCrate,
+        ArtifactKind::PyWheel,
+        ArtifactKind::PySdist,
+        ArtifactKind::OciBlob,
+        ArtifactKind::OciManifest,
+        ArtifactKind::Other,
+    ];
+
+    #[test]
+    fn every_artifact_kind_has_a_shipped_handler_that_produces_it() {
+        for kind in ALL_KINDS {
+            let (key, path) = representative_row(*kind);
+            let got = handler(key).scan_kind(&artifact_row_at(path));
+            assert_eq!(
+                got, *kind,
+                "{key} handler classified {path} as {got} — expected {kind}"
+            );
+        }
+    }
+
+    /// Further real stored paths per handler, beyond the one representative
+    /// each kind needs: the rest of the Java-archive extension set, a scoped
+    /// npm name, and every path shape that must land on `Other`.
+    #[test]
+    fn additional_stored_path_shapes_classify_as_expected() {
+        let cases: &[(&str, &str, ArtifactKind)] = &[
+            // The Java-archive extension set Trivy's JAR analyser claims.
+            (
+                "maven",
+                "com/example/app/1.0.0/app-1.0.0.war",
+                ArtifactKind::MavenJar,
+            ),
+            (
+                "maven",
+                "com/example/app/1.0.0/app-1.0.0.ear",
+                ArtifactKind::MavenJar,
+            ),
+            (
+                "maven",
+                "com/example/app/1.0.0/app-1.0.0.par",
+                ArtifactKind::MavenJar,
+            ),
+            // A classifier does not change the container.
+            (
+                "maven",
+                "com/example/lib/1.0.0/lib-1.0.0-sources.jar",
+                ArtifactKind::MavenJar,
+            ),
+            // Maven rows with no analyser: a Gradle module descriptor, an
+            // Android archive, the A-level metadata document.
+            (
+                "maven",
+                "com/example/lib/1.0.0/lib-1.0.0.module",
+                ArtifactKind::Other,
+            ),
+            (
+                "maven",
+                "com/example/lib/1.0.0/lib-1.0.0.aar",
+                ArtifactKind::Other,
+            ),
+            (
+                "maven",
+                "com/example/lib/maven-metadata.xml",
+                ArtifactKind::Other,
+            ),
+            // npm: a scoped package keeps the `.tgz` container.
+            (
+                "npm",
+                "@scope/pkg/-/pkg-1.0.0.tgz",
+                ArtifactKind::NpmTarball,
+            ),
+            // Long-tail PyPI sdist containers the materialiser has no
+            // extraction for. Claiming `PySdist` here would turn a clean
+            // refusal into an extraction failure.
+            ("pypi", "simple/legacy/legacy-1.0.zip", ArtifactKind::Other),
+            (
+                "pypi",
+                "simple/legacy/legacy-1.0.tar.bz2",
+                ArtifactKind::Other,
+            ),
+            (
+                "pypi",
+                "simple/legacy/legacy-1.0-py3.7.egg",
+                ArtifactKind::Other,
+            ),
+            // OCI: a tag-addressed manifest is still a manifest.
+            ("oci", "manifests/v1.2.3", ArtifactKind::OciManifest),
+        ];
+        for (key, path, expected) in cases {
+            let got = handler(key).scan_kind(&artifact_row_at(path));
+            assert_eq!(
+                got, *expected,
+                "{key} handler classified {path} as {got} — expected {expected}"
+            );
+        }
+    }
+
+    /// A format with no registered handler inherits the trait default, and
+    /// the default is the refusal, not a guess. Pinned through a
+    /// no-overrides stand-in so the assertion is about the trait default.
+    #[test]
+    fn unclaimed_formats_inherit_the_other_classification() {
+        struct NoOverrides;
+        impl FormatHandler for NoOverrides {
+            fn format_key(&self) -> &str {
+                "generic"
+            }
+            fn parse_download_path(
+                &self,
+                _path: &str,
+            ) -> hort_domain::error::DomainResult<hort_domain::types::ArtifactCoords> {
+                Err(hort_domain::error::DomainError::Validation("n/a".into()))
+            }
+            fn normalize_name(&self, name: &str) -> String {
+                name.to_string()
+            }
+        }
+        assert_eq!(
+            NoOverrides.scan_kind(&artifact_row_at("anything/at/all.jar")),
+            ArtifactKind::Other
+        );
+    }
+}
+
+#[cfg(test)]
 mod classify_group_member_default_tests {
     //! Regression guard: the three compiled-in format handlers (PyPI,
     //! cargo, npm) MUST inherit the trait-level default of

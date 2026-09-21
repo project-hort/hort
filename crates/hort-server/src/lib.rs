@@ -16,6 +16,7 @@ pub mod cli;
 pub mod composition;
 pub mod config;
 pub mod contractions;
+pub mod format_capabilities;
 pub mod gitops_boot;
 pub mod http;
 pub mod migrate;

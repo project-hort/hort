@@ -355,6 +355,19 @@ async fn apply_inner(
         oidc_issuers,
         service_accounts,
         users,
+        // The apply-time fail-closed `PrefetchPolicy.triggers` linter
+        // (row 6b, ADR 0015): a repository declaring `transitive_deps` or
+        // `scheduled` on a format whose handler does not declare
+        // `VersionDiscovery` (ADR 0005) is apply-rejected — the trigger
+        // would otherwise be accepted and never fire. A required
+        // constructor argument, not an opt-in builder, so a future
+        // composition point cannot inherit its way past the rejection by
+        // omission. The set is derived from the actual compiled-in
+        // `FormatHandler` registry (`crate::format_capabilities`), never
+        // a maintained format list, so the rejection lifts itself for
+        // any format the moment its handler starts declaring the
+        // capability.
+        Arc::new(crate::format_capabilities::version_discovery_capable_formats()),
     );
     let apply_uc = match federated_jwt_validator {
         Some(v) => apply_uc.with_federated_jwt_validator(v),
@@ -385,7 +398,6 @@ async fn apply_inner(
             .copied()
             .map(String::from),
     );
-
     // ---- 4. apply ----
     let env_snapshot = EnvSnapshot {
         auth_provider: match auth {
@@ -595,6 +607,7 @@ fn classify_and_emit_apply_metric(result: &Result<GitopsApplyStatus, GitopsBootE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use std::fs;
     use tempfile::TempDir;
 
@@ -879,6 +892,83 @@ spec:
         assert!(
             !is_park_eligible(&GitopsBootError::Apply("mid-flight".into())),
             "Apply is mid-write-capable — must crash (no rollback)"
+        );
+    }
+
+    // ---- `classify_and_emit_apply_metric` render pin ---------------------
+    //
+    // The recorder-scoped pattern mirrors `http.rs`'s
+    // `build_router_mounts_middleware_and_drops_metrics_to_admin_router`:
+    // install a local `PrometheusBuilder` recorder, run the emission inside
+    // it, then render the handle and assert on the text. This is the only
+    // place in the repository that pins the counter actually reaching a
+    // render — the emission call site alone does not prove the metrics
+    // facade renders it under the label the gitops smoke greps for.
+
+    fn ok_status() -> GitopsApplyStatus {
+        GitopsApplyStatus {
+            applied_at: chrono::Utc::now(),
+            generation: "test-generation".to_string(),
+            created: 1,
+            updated: 0,
+            deleted: 0,
+            unchanged: 0,
+            retro_warn_count: 0,
+            retro_block_count: 0,
+            per_kind: Default::default(),
+        }
+    }
+
+    /// A rendered Prometheus line for `hort_gitops_apply_total` carrying
+    /// `result="<label>"` with a value >= 1 — the same shape the gitops
+    /// smoke's `bounded_poll` predicate greps for
+    /// (`^hort_gitops_apply_total\{[^}]*result="<label>"[^}]*\} +[1-9]`).
+    fn has_apply_total_line(rendered: &str, label: &str) -> bool {
+        let needle = format!("result=\"{label}\"");
+        rendered.lines().any(|line| {
+            line.starts_with("hort_gitops_apply_total{")
+                && line.contains(&needle)
+                && line
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|value| value >= 1)
+        })
+    }
+
+    #[test]
+    fn classify_and_emit_apply_metric_renders_ok_result() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let rendered = metrics::with_local_recorder(&recorder, || {
+            classify_and_emit_apply_metric(&Ok(ok_status()));
+            handle.render()
+        });
+
+        assert!(
+            has_apply_total_line(&rendered, "ok"),
+            "expected hort_gitops_apply_total{{...result=\"ok\"...}} >= 1 in render:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn classify_and_emit_apply_metric_renders_failure_under_a_different_label() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+
+        let rendered = metrics::with_local_recorder(&recorder, || {
+            classify_and_emit_apply_metric(&Err(GitopsBootError::Parse("bad yaml".into())));
+            handle.render()
+        });
+
+        assert!(
+            has_apply_total_line(&rendered, "parse_error"),
+            "expected hort_gitops_apply_total{{...result=\"parse_error\"...}} >= 1 in render:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("result=\"ok\""),
+            "a failed apply must not render an ok-result line:\n{rendered}"
         );
     }
 }

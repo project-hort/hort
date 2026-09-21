@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 # ---------- Stage 2: runtime ----------
 # Digest-pinned (B10/INFRA-8).
-FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132 AS runtime
+FROM debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS runtime
 
 # Runtime deps: CA roots for outbound TLS (upstream fetch), nothing else.
 RUN apt-get update && \

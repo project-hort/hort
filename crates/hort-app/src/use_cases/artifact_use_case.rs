@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use chrono::{DateTime, Utc};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::Repository;
+use hort_domain::entities::scan_policy::ScanPolicyProjection;
 use hort_domain::error::DomainError;
 use hort_domain::events::{
     system_actor, Actor, ArtifactDownloaded, DomainEvent, DownloadActor, StreamId,
@@ -90,6 +92,16 @@ pub struct ArtifactUseCase {
     /// policy configured". The production composition root always
     /// wires this via [`Self::with_policy_projections`].
     policy_projections: Option<Arc<dyn PolicyProjectionRepository>>,
+    /// Read-only event-store handle consumed by
+    /// [`Self::hydrate_quarantine_deadline`] to resolve the provenance
+    /// side of the release gate for an already-expired hold (ADR 0039's
+    /// 2026-09-12 amendment, D5). Same optional-builder shape as
+    /// [`Self::policy_projections`]: `None` leaves
+    /// [`Artifact::provenance_hold_indefinite`] `false`, i.e. the
+    /// pre-amendment behaviour (every hold advertises a computed
+    /// `Retry-After`). The production composition root always wires it
+    /// via [`Self::with_provenance_clearance_events`].
+    provenance_clearance_events: Option<Arc<dyn EventStore>>,
 }
 
 impl ArtifactUseCase {
@@ -108,7 +120,18 @@ impl ArtifactUseCase {
             artifact_metadata: None,
             audit_events: None,
             policy_projections: None,
+            provenance_clearance_events: None,
         }
+    }
+
+    /// Wire the read-only [`EventStore`] handle consumed by
+    /// [`Self::hydrate_quarantine_deadline`] to decide whether an
+    /// already-expired hold is waiting on a signature (ADR 0039 D5). See
+    /// [`Self::with_repository_access`] for the optional-field rationale.
+    #[must_use]
+    pub fn with_provenance_clearance_events(mut self, events: Arc<dyn EventStore>) -> Self {
+        self.provenance_clearance_events = Some(events);
+        self
     }
 
     /// Wire the [`PolicyProjectionRepository`] port consumed by
@@ -469,7 +492,7 @@ impl ArtifactUseCase {
         // volume control; there is no throttle.
         if let (Some(gate), Some(repo)) = (&self.audit_events, repository.as_ref()) {
             if repo.download_audit_enabled {
-                let occurred_at = chrono::Utc::now();
+                let occurred_at = Utc::now();
                 let download_actor = match actor {
                     Some(p) => DownloadActor::User {
                         user_id: p.user_id,
@@ -613,9 +636,9 @@ impl ArtifactUseCase {
         }
     }
 
-    /// Hydrate the transient, non-persisted `quarantine_deadline`
-    /// onto an artifact about to be returned to a
-    /// format-crate read path.
+    /// Hydrate the transient, non-persisted `quarantine_deadline` and
+    /// `provenance_hold_indefinite` onto an artifact about to be
+    /// returned to a format-crate read path.
     ///
     /// The adapter-free `hort-http-<format>` crates cannot resolve a
     /// `ScanPolicy`, so they cannot compute the observation-window
@@ -648,31 +671,148 @@ impl ArtifactUseCase {
     /// (`QuarantineUseCase::is_window_elapsed`, untouched by this
     /// change) — see that method's own doc for why the two signals are
     /// deliberately distinct.
+    ///
+    /// ## `provenance_hold_indefinite` (ADR 0039 D5)
+    ///
+    /// The same resolved policy also carries `provenance_mode`, so the
+    /// provenance side of the release gate is answered here rather than
+    /// by the handler: a format crate must not reach past its use case
+    /// for it (ADR 0008), and `Retry-After` is a read-path concern that
+    /// already lives at this one hydration point.
+    ///
+    /// The stream read behind it is gated on the deadline having
+    /// **already elapsed**, which is exactly the state whose
+    /// `Retry-After` is a lie. A hold still inside its window keeps its
+    /// honest computed header and pays no extra I/O; only the expired
+    /// hold — the pathological population this amendment is about —
+    /// costs one bounded stream read per pull.
+    ///
+    /// The verdict itself comes from
+    /// [`release_clearance::resolve_provenance_clearance`](crate::use_cases::release_clearance::resolve_provenance_clearance),
+    /// the single source the release sweep and the ADR 0041
+    /// re-evaluation callers share, so a read-path answer can never
+    /// drift from the gate that actually decides release.
     async fn hydrate_quarantine_deadline(&self, mut artifact: Artifact) -> AppResult<Artifact> {
-        artifact.quarantine_deadline =
-            match (artifact.quarantine_status, artifact.quarantine_window_start) {
-                (QuarantineStatus::Quarantined, Some(anchor)) => {
-                    let duration_secs = match self.policy_projections.as_deref() {
-                        Some(policy_projections) => {
-                            let policy = resolve_active_policy_for_repo(
-                                policy_projections,
-                                artifact.repository_id,
-                            )
-                            .await?;
-                            policy
-                                .map(|p| p.quarantine_duration_secs)
-                                .unwrap_or_else(DefaultPolicy::quarantine_duration_secs)
-                        }
-                        None => DefaultPolicy::quarantine_duration_secs(),
-                    };
-                    Some(effective_quarantine_deadline(
-                        anchor,
-                        chrono::Duration::seconds(duration_secs),
-                    ))
-                }
-                _ => None,
-            };
+        let (QuarantineStatus::Quarantined, Some(anchor)) =
+            (artifact.quarantine_status, artifact.quarantine_window_start)
+        else {
+            artifact.quarantine_deadline = None;
+            artifact.provenance_hold_indefinite = false;
+            return Ok(artifact);
+        };
+
+        let (duration, policy) = self
+            .resolve_quarantine_window(artifact.repository_id)
+            .await?;
+        let deadline = effective_quarantine_deadline(anchor, duration);
+        artifact.quarantine_deadline = Some(deadline);
+
+        artifact.provenance_hold_indefinite = match self.provenance_clearance_events.as_deref() {
+            Some(events) if deadline <= Utc::now() => {
+                let mode = policy.map(|p| p.provenance_mode).unwrap_or_default();
+                matches!(
+                    crate::use_cases::release_clearance::resolve_provenance_clearance(
+                        events,
+                        artifact.id,
+                        mode,
+                    )
+                    .await?,
+                    hort_domain::entities::artifact::ProvenanceClearance::Pending
+                )
+            }
+            _ => false,
+        };
         Ok(artifact)
+    }
+
+    /// Resolve the active scan policy for `repository_id` together with
+    /// the quarantine observation-window duration it implies.
+    ///
+    /// The single definition both quarantine-deadline readers share:
+    /// [`Self::hydrate_quarantine_deadline`] (per artifact, behind a
+    /// content route's `Retry-After`) and [`Self::package_hold_deadlines`]
+    /// (per package, behind a served index's held block). Two surfaces
+    /// answering "available after when?" for the same artifact resolve
+    /// the same policy and the same duration here, so they cannot drift.
+    ///
+    /// Absent an active policy — or with [`Self::policy_projections`]
+    /// unwired, a test-only state — the duration falls back to
+    /// [`DefaultPolicy::quarantine_duration_secs`], the same default
+    /// `QuarantineUseCase::is_window_elapsed` uses (ADR 0007
+    /// quarantine-by-default posture).
+    ///
+    /// The policy itself rides back alongside the duration because
+    /// `hydrate_quarantine_deadline` also reads `provenance_mode` off it;
+    /// resolving it twice would double the port call this exists to make
+    /// once.
+    async fn resolve_quarantine_window(
+        &self,
+        repository_id: Uuid,
+    ) -> AppResult<(chrono::Duration, Option<ScanPolicyProjection>)> {
+        let policy = match self.policy_projections.as_deref() {
+            Some(policy_projections) => {
+                resolve_active_policy_for_repo(policy_projections, repository_id).await?
+            }
+            None => None,
+        };
+        let duration_secs = policy
+            .as_ref()
+            .map(|p| p.quarantine_duration_secs)
+            .unwrap_or_else(DefaultPolicy::quarantine_duration_secs);
+        Ok((chrono::Duration::seconds(duration_secs), policy))
+    }
+
+    /// Per-version quarantine deadlines for one `(repository, package)`
+    /// coordinate: every locally-held `Quarantined` version mapped to the
+    /// instant its observation window elapses.
+    ///
+    /// This is the catalog-side counterpart of the per-artifact deadline
+    /// [`Self::hydrate_quarantine_deadline`] puts on a row for a content
+    /// route's `Retry-After`. Both take the immutable anchor
+    /// (`quarantine_window_start`), the duration
+    /// [`Self::resolve_quarantine_window`] resolves, and the
+    /// [`effective_quarantine_deadline`] formula — so an index that says
+    /// "available after T" and a `503` that says "retry in N seconds"
+    /// name the same instant for the same artifact by construction.
+    ///
+    /// Only `Quarantined` rows carrying an anchor produce an entry. A
+    /// terminal verdict (`Rejected` / `ScanIndeterminate`) is not waiting
+    /// for anything and has no deadline to report; a `Quarantined` row
+    /// with no anchor yields no entry rather than a guessed instant, so a
+    /// caller rendering this can omit the field instead of inventing one.
+    ///
+    /// Cost: one `package_version_anchors` read (a heap fetch — this is
+    /// NOT the index-only `package_version_status` scan), plus one policy
+    /// resolution, and **only** when the package actually holds
+    /// something. A package with nothing held pays the one read and skips
+    /// the policy hop.
+    ///
+    /// Authorization is the caller's: `repository_id` is expected to be a
+    /// repository the caller has already resolved `Read` on.
+    #[tracing::instrument(skip(self))]
+    pub async fn package_hold_deadlines(
+        &self,
+        repository_id: Uuid,
+        package: &str,
+    ) -> AppResult<HashMap<String, DateTime<Utc>>> {
+        let held: Vec<(String, DateTime<Utc>)> = self
+            .artifacts
+            .package_version_anchors(repository_id, package)
+            .await?
+            .into_iter()
+            .filter_map(|(version, status, anchor)| match (status, anchor) {
+                (QuarantineStatus::Quarantined, Some(anchor)) => Some((version, anchor)),
+                _ => None,
+            })
+            .collect();
+        if held.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let (duration, _policy) = self.resolve_quarantine_window(repository_id).await?;
+        Ok(held
+            .into_iter()
+            .map(|(version, anchor)| (version, effective_quarantine_deadline(anchor, duration)))
+            .collect())
     }
 
     /// Same shape, by artifact id. Loads the artifact, then re-checks
@@ -1200,6 +1340,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -2638,7 +2779,7 @@ mod visibility_extension_tests {
     use crate::use_cases::repository_access::{AccessLevel, RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{
         sample_artifact, sample_repository, MockArtifactMetadataRepository, MockArtifactRepository,
-        MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
+        MockEventStore, MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
         StubFormatHandler, VALID_SHA256,
     };
 
@@ -2734,6 +2875,7 @@ mod visibility_extension_tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -2768,13 +2910,9 @@ mod visibility_extension_tests {
 
     // -- hydrate_quarantine_deadline (issue #76 item 2/2) -------------------
 
-    fn repo_scoped_policy(
-        repo_id: Uuid,
-        duration_secs: i64,
-    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+    fn repo_scoped_policy(repo_id: Uuid, duration_secs: i64) -> ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-            SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
 
@@ -2959,6 +3097,419 @@ mod visibility_extension_tests {
             got.quarantine_deadline,
             Some(anchor + chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs()))
         );
+    }
+
+    // -- package_hold_deadlines --------------------------------------------
+
+    /// Seed one artifact of `package` at `version` in `repo_id` with the
+    /// given status and anchor. Distinct paths so several versions of the
+    /// same package coexist.
+    fn seed_versioned(
+        artifacts: &MockArtifactRepository,
+        repo_id: Uuid,
+        version: &str,
+        status: QuarantineStatus,
+        anchor: Option<DateTime<Utc>>,
+    ) {
+        let mut a = artifact_in_repo(repo_id, &format!("pkg/{version}/pkg.tar.gz"), VALID_SHA256);
+        a.version = Some(version.to_string());
+        a.quarantine_status = status;
+        a.quarantine_window_start = anchor;
+        artifacts.insert(a);
+    }
+
+    /// The whole point of the method: the instant it reports for a held
+    /// version is the one `hydrate_quarantine_deadline` puts on the same
+    /// artifact for a content route's `Retry-After`. Both resolve the
+    /// same policy through `resolve_quarantine_window`, so they cannot
+    /// name different instants.
+    #[tokio::test]
+    async fn package_hold_deadlines_agrees_with_the_per_artifact_hydration() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_policy(repo_id, 600));
+
+        let anchor = Utc::now() - chrono::Duration::minutes(5);
+        let mut held = artifact_in_repo(repo_id, "pkg/1.1.0/pkg.tar.gz", VALID_SHA256);
+        held.version = Some("1.1.0".into());
+        held.quarantine_status = QuarantineStatus::Quarantined;
+        held.quarantine_window_start = Some(anchor);
+        artifacts.insert(held.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies.clone());
+
+        let catalog = uc.package_hold_deadlines(repo_id, "pkg").await.unwrap();
+        let (_, hydrated) = uc.find_visible_by_id(held.id, None).await.unwrap();
+
+        assert_eq!(
+            catalog.get("1.1.0").copied(),
+            hydrated.quarantine_deadline,
+            "the catalog-side deadline and the content-side one are the same instant"
+        );
+        assert_eq!(
+            catalog.get("1.1.0").copied(),
+            Some(anchor + chrono::Duration::seconds(600)),
+            "and both are anchor + the resolved policy duration"
+        );
+    }
+
+    /// No active policy: the window falls back to
+    /// `DefaultPolicy::quarantine_duration_secs` (ADR 0007), computed
+    /// from the real anchor.
+    #[tokio::test]
+    async fn package_hold_deadlines_falls_back_to_the_default_window() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let anchor = Utc::now() - chrono::Duration::minutes(5);
+        seed_versioned(
+            &artifacts,
+            repo_id,
+            "1.1.0",
+            QuarantineStatus::Quarantined,
+            Some(anchor),
+        );
+
+        // Deliberately unwired policy port — the same fallback the
+        // wired-but-no-active-policy case takes.
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        let got = uc.package_hold_deadlines(repo_id, "pkg").await.unwrap();
+        assert_eq!(
+            got.get("1.1.0").copied(),
+            Some(anchor + chrono::Duration::seconds(DefaultPolicy::quarantine_duration_secs()))
+        );
+    }
+
+    /// Only a timed hold has a deadline. A terminal verdict is not
+    /// waiting for anything, a servable version is not held at all, and a
+    /// held row with no anchor yields nothing rather than a guess.
+    #[tokio::test]
+    async fn package_hold_deadlines_reports_only_anchored_timed_holds() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let anchor = Utc::now();
+        seed_versioned(
+            &artifacts,
+            repo_id,
+            "1.0.0",
+            QuarantineStatus::Released,
+            Some(anchor),
+        );
+        seed_versioned(
+            &artifacts,
+            repo_id,
+            "1.1.0",
+            QuarantineStatus::Quarantined,
+            Some(anchor),
+        );
+        seed_versioned(
+            &artifacts,
+            repo_id,
+            "1.2.0",
+            QuarantineStatus::Quarantined,
+            None,
+        );
+        seed_versioned(
+            &artifacts,
+            repo_id,
+            "1.3.0",
+            QuarantineStatus::Rejected,
+            Some(anchor),
+        );
+        seed_versioned(
+            &artifacts,
+            repo_id,
+            "1.4.0",
+            QuarantineStatus::ScanIndeterminate,
+            Some(anchor),
+        );
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        let got = uc.package_hold_deadlines(repo_id, "pkg").await.unwrap();
+        let mut versions: Vec<&String> = got.keys().collect();
+        versions.sort();
+        assert_eq!(
+            versions,
+            vec!["1.1.0"],
+            "released, unanchored and terminally-verdicted versions carry no deadline"
+        );
+    }
+
+    /// Nothing held → no policy resolution at all. The read is on the
+    /// index-serve path; a package with nothing quarantined must not pay
+    /// for a policy hop it would discard.
+    #[tokio::test]
+    async fn package_hold_deadlines_skips_the_policy_read_when_nothing_is_held() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_policy(repo_id, 600));
+        seed_versioned(
+            &artifacts,
+            repo_id,
+            "1.0.0",
+            QuarantineStatus::Released,
+            None,
+        );
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies.clone());
+        assert!(uc
+            .package_hold_deadlines(repo_id, "pkg")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            policies.list_active_call_count(),
+            0,
+            "a package with nothing held must never call the policy port"
+        );
+    }
+
+    /// A repository that owns no rows for the package — the shape a
+    /// virtual (aggregating) repository always has, since its entries
+    /// belong to members (ADR 0031).
+    #[tokio::test]
+    async fn package_hold_deadlines_is_empty_for_a_repository_owning_no_rows() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert!(uc
+            .package_hold_deadlines(repo_id, "pkg")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // -- provenance_hold_indefinite (ADR 0039 D5) --------------------------
+
+    /// Same shape as [`repo_scoped_policy`] but under
+    /// `provenance_mode: Required` — the only mode whose clearance can
+    /// resolve `Pending`.
+    fn repo_scoped_required_policy(repo_id: Uuid, duration_secs: i64) -> ScanPolicyProjection {
+        ScanPolicyProjection {
+            provenance_mode: hort_domain::entities::scan_policy::ProvenanceMode::Required,
+            ..repo_scoped_policy(repo_id, duration_secs)
+        }
+    }
+
+    /// Seed one `Quarantined` artifact whose anchor is `anchor_age_secs`
+    /// old under a `window_secs` window and hydrate it. `verified`
+    /// controls whether a `ProvenanceVerified` sits on its stream.
+    async fn hydrated_required_hold(
+        window_secs: i64,
+        anchor_age_secs: i64,
+        verified: bool,
+    ) -> Artifact {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+        let events = Arc::new(MockEventStore::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_required_policy(repo_id, window_secs));
+
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(Utc::now() - chrono::Duration::seconds(anchor_age_secs));
+        artifacts.insert(a.clone());
+
+        if verified {
+            let stream_id = StreamId::artifact(a.id);
+            events.set_stream(
+                &stream_id,
+                vec![hort_domain::events::PersistedEvent {
+                    event_id: Uuid::new_v4(),
+                    stream_id: stream_id.clone(),
+                    stream_position: 0,
+                    global_position: 0,
+                    event: DomainEvent::ProvenanceVerified(
+                        hort_domain::events::ProvenanceVerified {
+                            artifact_id: a.id,
+                            content_hash: VALID_SHA256.parse().unwrap(),
+                            backend: "cosign".into(),
+                            signer: hort_domain::ports::provenance::SignerIdentity {
+                                issuer: "iss".into(),
+                                san: "san".into(),
+                            },
+                            predicate_type: None,
+                            cascaded_from: None,
+                        },
+                    ),
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: system_actor(),
+                    event_version: 1,
+                    stored_at: Utc::now(),
+                }],
+            );
+        }
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies)
+            .with_provenance_clearance_events(events);
+        uc.find_visible_by_id(a.id, None).await.unwrap().1
+    }
+
+    /// The never-signed `Required` artifact past its window: the hold
+    /// waits on a signature, so the read path must mark it as having no
+    /// self-resolving deadline.
+    #[tokio::test]
+    async fn hydrate_marks_an_unsigned_required_hold_past_its_window_as_indefinite() {
+        let got = hydrated_required_hold(1, 60, false).await;
+        assert!(got.provenance_hold_indefinite);
+        // The deadline is still hydrated — it is the elapsed-ness test
+        // the flag is derived from, and dropping it would change what
+        // every other consumer reads.
+        assert!(got.quarantine_deadline.is_some());
+    }
+
+    /// Still inside its window: the deadline is real and the hold is not
+    /// indefinite, whatever the provenance mode says.
+    #[tokio::test]
+    async fn hydrate_leaves_an_in_window_required_hold_alone() {
+        let got = hydrated_required_hold(3600, 0, false).await;
+        assert!(!got.provenance_hold_indefinite);
+    }
+
+    /// A signature has landed: the clearance resolves `Cleared`, so the
+    /// hold is no longer waiting on anything external.
+    #[tokio::test]
+    async fn hydrate_clears_the_flag_once_a_provenance_verified_exists() {
+        let got = hydrated_required_hold(1, 60, true).await;
+        assert!(!got.provenance_hold_indefinite);
+    }
+
+    /// `VerifyIfPresent` (the default mode) never gates release, so its
+    /// clearance is `NotRequired` and an expired hold there is a scan-axis
+    /// hold whose window-derived `Retry-After` stays correct.
+    #[tokio::test]
+    async fn hydrate_leaves_a_non_required_expired_hold_alone() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+        let events = Arc::new(MockEventStore::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_policy(repo_id, 1));
+
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(Utc::now() - chrono::Duration::seconds(60));
+        artifacts.insert(a.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies)
+            .with_provenance_clearance_events(events.clone());
+        let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
+
+        assert!(!got.provenance_hold_indefinite);
+        assert_eq!(
+            events.read_stream_call_count(),
+            0,
+            "a non-Required policy must not pay the clearance stream read"
+        );
+    }
+
+    /// The event-store handle unwired (test-only state; the composition
+    /// root always wires it): the flag stays `false`, i.e. the
+    /// pre-amendment behaviour, and nothing errors.
+    #[tokio::test]
+    async fn hydrate_without_the_events_port_leaves_the_flag_false() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_required_policy(repo_id, 1));
+
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(Utc::now() - chrono::Duration::seconds(60));
+        artifacts.insert(a.clone());
+
+        // No .with_provenance_clearance_events(..) — deliberately unwired.
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies);
+        let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
+
+        assert!(!got.provenance_hold_indefinite);
+    }
+
+    /// A non-`Quarantined` status never reaches the clearance read — the
+    /// happy read path pays zero extra I/O on this axis too.
+    #[tokio::test]
+    async fn hydrate_non_quarantined_makes_zero_clearance_reads() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+        let events = Arc::new(MockEventStore::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_required_policy(repo_id, 1));
+
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Released;
+        a.quarantine_window_start = Some(Utc::now() - chrono::Duration::days(1));
+        artifacts.insert(a.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies)
+            .with_provenance_clearance_events(events.clone());
+        let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
+
+        assert!(!got.provenance_hold_indefinite);
+        assert_eq!(events.read_stream_call_count(), 0);
     }
 
     #[tokio::test]

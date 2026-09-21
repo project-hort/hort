@@ -8,7 +8,11 @@
   write-authorized manifest HEAD-and-GET exemption the push-then-sign payoff
   reuses),
   [0008](0008-per-format-adapter-free-http-crates.md) (the index PUT writes its
-  membership rows through the content-reference use case, adapter-free).
+  membership rows through the content-reference use case, adapter-free),
+  [0054](0054-content-level-age-evidence-anchors-quarantine.md) /
+  [0015](0015-apply-time-linter-inert-fields-and-naming.md) (the anchor
+  derivation the eager-child-ingest amendment rests on, and the inert-field rule
+  that kept it off `PrefetchPolicy`).
 - **Closes:** issue #15 — accept, store, quarantine, serve, and sign OCI image
   indexes / Docker manifest lists on the hosted write path; and the inline
   "index support is deferred" note in
@@ -136,6 +140,129 @@ predicate. This closes the "stacked quarantine waves" operability gap a cold
 pull of an already-released multi-arch image previously hit — each descendant
 no longer has to sit out a fresh window after its own scan completes.
 
+### Eager child ingest on the pull-through path (issue #229, amended 2026-09-10)
+
+**What changed.** A pull-through ingest of an image index used to mint the index
+artifact, write its `oci_index_member` rows, and stop: the children it declares
+were fetched only when a client later asked for one. The index's quarantine
+window and its children's therefore ran **back to back**, so a fresh multi-arch
+base image cost two full observation windows instead of one. Every pull-through
+leg that mints an index artifact — the leader's digest arm, the leader's tag
+arm, and the coalesced-follower leg — now additionally enqueues one
+`oci-index-child-ingest` job row per declared child, in the same breath as the
+membership edges that enumerate them. Its handler performs, up front, exactly
+the verified upstream ingest a later lazy client pull would have performed:
+resolve the mapping through the pull path's own `UpstreamResolver`, short-circuit
+if the target repository already holds the content, fetch by digest, verify the
+upstream-declared digest against the requested one, ingest through
+`IngestUseCase::ingest_verified`, and re-derive the child's own
+`oci_config`/`oci_layer` edges so its blobs keep their GC keepalive. Index and
+children now run their windows **concurrently**.
+
+The vehicle is a **durable `jobs` row, not a fire-and-forget task**, and that is
+the whole point: the change exists to start a clock, and a lost enqueue reverts
+to the lazy path *silently* — the operator sees a slow pull weeks later with
+nothing to look at. The declared cohort goes in as one
+`INSERT … ON CONFLICT (idempotency_key) DO NOTHING` statement
+(`JobsRepository::enqueue_idempotent_batch`), dedupe key
+`(repository_id, child_digest)`. The statement failing is logged, counted, and
+never fails the pull — the client gets its normal response and every child is
+still reachable through the lazy path.
+
+**Why this is not a shortcut (load-bearing).** Eager ingest moves *when a
+child's window starts*. It does not compute that window's start and it cannot
+move *when the window is allowed to close*.
+[ADR 0054](0054-content-level-age-evidence-anchors-quarantine.md) derives the
+quarantine anchor inside `IngestUseCase` from content-level age evidence read
+live through `ArtifactRepository::first_seen_for_checksum` — the same minting
+path a lazy client pull goes through, and the only place an anchor is derived.
+An eagerly ingested child is therefore given exactly the anchor a later lazy
+pull of that child would have given it: same content, same age evidence, same
+derived anchor. Nothing on the eager path computes, passes or overrides an
+anchor — the `VerifiedIngestRequest` the handler builds carries no
+anchor-shaped field, and none may be added. **No window is shortened; a window
+that would have started tomorrow starts today.** An auditor of the quarantine
+model can settle this without reading the handler's logic: confirm the eager
+path reaches `ingest_verified` like any other ingest and hands it no anchor.
+
+**What is unchanged.** [ADR 0007](0007-fail-closed-quarantine-release-predicate.md)'s
+fail-closed release predicate: every child still releases only on its own
+elapsed window AND its own `ScanSucceeded` / `ScanWaived`. D4 above: a released
+index still does not release a held child. The per-child and per-layer
+consumption gating that the layer-level-safety rationale rests on. And the
+answer a client gets when it asks for a held child is the same answer it always
+got — a held child manifest is `503`, a rejected layer blob is `404`. Eager
+ingest changes the *timing* of a child's own lifecycle, and nothing about which
+gate that lifecycle has to pass.
+
+**Why it is unconditional.** An index's children are the **declared membership**
+of an artifact a client just asked for — the client that pulled the index is
+going to resolve one of them — not a guess about what it might want next. That
+makes eager child ingest a completion of the request rather than speculation,
+and its cost is bounded metadata: manifest JSON only, capped in count, with the
+children's *blobs* untouched. No `PrefetchPolicy` field was added, because
+[ADR 0015](0015-apply-time-linter-inert-fields-and-naming.md) requires an
+operator-visible field to be load-bearing the day it ships, and there is no
+value here an operator would set. The asymmetry with the blob warm beside it in
+the same pull-through leg — `warm_manifest_blobs`, which stays gated on
+`prefetchPolicy.enabled` — is deliberate: that one spawns background
+pull-throughs of *layer bytes*, an unbounded bandwidth and storage cost on
+content nobody has asked for yet, which is exactly the kind of trade-off an
+operator has the information to make.
+
+**Attestation manifests are included.** The enqueue enumerates `manifests[]`
+through the domain's `index_child_digests`, with no filter on `platform` or on a
+child's media type — an attestation manifest is a declared member of the index
+like any other. Excluding it (as a `platform: unknown/unknown` entry, say) would
+recreate the second lazy window for precisely the artifact that provenance
+verification has to reach, which inverts the point of the change.
+
+**Nested indexes recurse, under two hard internal constants.** When an ingested
+child is itself an index, the handler registers its `oci_index_member` rows and
+enqueues one row per grandchild — the recursion falls out of the handler
+enqueueing its own kind. It is bounded in both directions: **breadth** by the
+pre-existing per-index child cap in the domain (`MAX_INDEX_CHILDREN`, which
+rejects an over-cap index outright rather than truncating it), and **depth** by
+`MAX_CHILD_INGEST_DEPTH` in the handler. Depth is not redundant with breadth: a
+chain of distinct nested indexes fans out as (breadth cap)ⁿ, and priority and
+worker concurrency bound the *rate* at which such a tree drains, never its
+size — so one client pull of a hostile or merely pathological upstream tree
+could otherwise enqueue an arbitrarily large job tree. Both are **constants, not
+configuration**, and are to stay that way: they are safety bounds rather than
+trade-offs, an operator holds no information that would make a different value
+right, and a knob here would be operator surface with no demonstrated need
+behind it. Nothing is lost at either bound — the refused grandchildren stay
+reachable through the lazy pull path with their own full window, so hitting the
+depth cap is a completion (`ingested_depth_capped`, with a `warn!`), never a
+failure. This supersedes issue #229's D10 as written ("nested indexes recurse
+without a depth bound"): D10 remains right that there is no operator-visible
+knob, and was wrong that there is no bound.
+
+**The media-type asymmetry between the two write paths is deliberate.** Both
+paths decide index-versus-image on the **body's shape** (`is_image_index`), never
+on the declared media type; they differ only in what they do when the two
+disagree. The hosted PUT path **rejects** the manifest —
+`check_declared_media_type_matches_shape` returns 400 `MANIFEST_INVALID` before
+any state change — because the client is present, is the author of the
+disagreement, and can fix its push. The pull-through path **cannot** reject: the
+manifest is already committed to CAS by the time its edges are derived, and the
+upstream is not ours to correct. It therefore resolves the disagreement in favour
+of the bytes — those are what was hashed and stored — and logs it, because an
+upstream serving a structurally-index body under an image-manifest media type
+says something real about that upstream. Note that one digest verification cannot
+catch this case: the bytes match their digest and only the `Content-Type` lies.
+Deciding the pull path on the declared type instead would write no
+`oci_index_member` rows for such an index while its children were ingested
+anyway — the incomplete-membership defect `oci-membership-edge-backfill` exists
+to repair.
+
+**No retroactive backfill.** Only a fresh pull-through mint enqueues. An index
+row that already existed when this shipped does not acquire eager children —
+there is no sweep that walks existing `oci_index_member` rows and enqueues them.
+Its children continue to arrive lazily, on the first client GET, exactly as
+before. Deploying this and then wondering why an existing index's children are
+still lazy is the expected observation, not a bug.
+
 ## Consequences
 
 - **`content_references` is now the proper many-to-many.** The four existing
@@ -233,6 +360,18 @@ no longer has to sit out a fresh window after its own scan completes.
   referenced-tree-descendant zero-window carve-out amended into
   [ADR 0007](0007-fail-closed-quarantine-release-predicate.md) alongside this
   amendment.
+- Issue #229 — eager child ingest for proxied OCI image indexes; the
+  `oci-index-child-ingest` handler
+  (`crates/hort-app/src/task_handlers/oci_index_child_ingest.rs`, holding
+  `MAX_CHILD_INGEST_DEPTH`), the pull-through producer
+  (`crates/hort-app/src/use_cases/oci_index_child_enqueue.rs`), and the
+  `MAX_INDEX_CHILDREN` breadth cap in `crates/hort-domain/src/oci.rs`. D10 of
+  that issue is superseded on the depth-bound point by the amendment above.
+- [ADR 0054](0054-content-level-age-evidence-anchors-quarantine.md) — the
+  `first_seen_for_checksum` anchor derivation that makes eager child ingest
+  window-neutral;
+  [ADR 0015](0015-apply-time-linter-inert-fields-and-naming.md) — why no
+  `PrefetchPolicy` field was added for it.
 - E2E regression gate:
   `scripts/native-tests/scenarios/quarantine/oci-image-index.sh` (multi-arch
   push accepted, index served with the index Content-Type, and — under a hold —

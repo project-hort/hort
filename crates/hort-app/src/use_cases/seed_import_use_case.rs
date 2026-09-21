@@ -31,19 +31,16 @@
 //! before this fix — issue #115 Item 2, a separate change.)
 //!
 //! **Consequence: seeding into a `provenance_mode: Required` repo.**
-//! Seed-import's anchor is backdated, so `window_open` is already
-//! `false` by the time the enqueued `provenance-verify` job runs, and a
-//! freshly seed-imported artifact is never a referenced-tree descendant
-//! (no other already-ingested artifact's `content_references` targets
-//! it) — so neither the zero-window nor the descendant hold carve-out
-//! applies. Seeding **unsigned** content into a repository with
+//! Seeding **unsigned** content into a repository with
 //! `provenance_mode: Required` and a provenance-capable format
-//! (`IngestUseCase::provenance_capable_formats`) therefore resolves to
-//! an **immediate terminal `Rejected{Unsigned}`** the moment the
-//! enqueued job runs — not a stranded hold, not a delayed release. This
-//! is the policy-consistent fail-closed outcome, not a defect:
-//! `Required` means unsigned content never releases, whether it arrived
-//! via seed-import or a live push. Operators seed unsigned content into
+//! (`IngestUseCase::provenance_capable_formats`) leaves the artifact
+//! **held** (`Quarantined`, 503, `Pending` at the release gate) until a
+//! signature for it arrives — indefinitely, if none ever does (ADR 0039's
+//! 2026-09-12 amendment, D1/D4). Seed-import's backdated anchor does not
+//! change that: the observation window is not a signing deadline. This is
+//! the policy-consistent fail-closed outcome, not a defect: `Required`
+//! means unsigned content never releases, whether it arrived via
+//! seed-import or a live push. Operators seed unsigned content into
 //! repositories that are not `provenance_mode: Required`.
 //!
 //! **Critical invariant — the scan still gates.** Seed-import stamps
@@ -476,10 +473,10 @@ mod tests {
     // Test fixtures
     // -----------------------------------------------------------------------
 
-    /// Make a wired SeedImportUseCase with default-empty mocks +
-    /// a single pypi handler. Returns the use case + the underlying
-    /// mocks so tests can pre-populate CAS, set up policies, and
-    /// inspect the per-commit lifecycle log.
+    /// Make a wired SeedImportUseCase with default mocks + pypi and oci
+    /// handlers. Returns the use case + the underlying mocks so tests can
+    /// pre-populate CAS, set up policies, and inspect the per-commit
+    /// lifecycle log.
     #[allow(clippy::type_complexity)]
     fn make_use_case() -> (
         SeedImportUseCase,
@@ -489,33 +486,11 @@ mod tests {
         Arc<MockRepositoryRepository>,
         Arc<MockPolicyProjectionRepository>,
     ) {
-        build_use_case(Vec::new())
-    }
-
-    /// Same as [`make_use_case`], but wires
-    /// `IngestUseCase::with_provenance_capable_formats` with the given
-    /// set — needed by the #115 Item 1 provenance-enqueue-gate tests,
-    /// which must distinguish "format not capable" (empty set, the
-    /// `make_use_case` default) from "format capable" without changing
-    /// `make_use_case`'s signature and touching its 11 existing callers.
-    #[allow(clippy::type_complexity)]
-    fn make_use_case_with_provenance_formats(
-        formats: impl IntoIterator<Item = &'static str>,
-    ) -> (
-        SeedImportUseCase,
-        Arc<MockArtifactRepository>,
-        Arc<MockArtifactLifecycle>,
-        Arc<MockStoragePort>,
-        Arc<MockRepositoryRepository>,
-        Arc<MockPolicyProjectionRepository>,
-    ) {
-        build_use_case(formats.into_iter().map(str::to_string).collect())
+        build_use_case()
     }
 
     #[allow(clippy::type_complexity)]
-    fn build_use_case(
-        provenance_capable_formats: Vec<String>,
-    ) -> (
+    fn build_use_case() -> (
         SeedImportUseCase,
         Arc<MockArtifactRepository>,
         Arc<MockArtifactLifecycle>,
@@ -536,29 +511,30 @@ mod tests {
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 
-        let ingest = Arc::new(
-            IngestUseCase::new(
-                storage.clone(),
-                lifecycle.clone(),
-                artifacts.clone(),
-                repos.clone(),
-                crate::event_store_publisher::wrap_for_test(events.clone()),
-                curation_rules,
-                group_use_case,
-                true,
-                HashMap::new(),
-                0,
-                content_references,
-                policies.clone(),
-                jobs,
-            )
-            .with_provenance_capable_formats(provenance_capable_formats),
-        );
+        let ingest = Arc::new(IngestUseCase::new(
+            storage.clone(),
+            lifecycle.clone(),
+            artifacts.clone(),
+            repos.clone(),
+            crate::event_store_publisher::wrap_for_test(events.clone()),
+            curation_rules,
+            group_use_case,
+            true,
+            HashMap::new(),
+            0,
+            content_references,
+            policies.clone(),
+            jobs,
+        ));
 
         let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
         handlers.insert(
             "pypi".to_string(),
             Arc::new(StubFormatHandler::new("pypi").with_max_bytes(10 * 1024 * 1024)),
+        );
+        handlers.insert(
+            "oci".to_string(),
+            Arc::new(StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024)),
         );
 
         let uc = SeedImportUseCase::new(
@@ -574,6 +550,15 @@ mod tests {
     fn pypi_repository() -> Repository {
         let mut repo = sample_repository();
         repo.format = RepositoryFormat::Pypi;
+        repo
+    }
+
+    /// The Tier-1 provenance-capable format
+    /// (`hort_app::provenance::TIER1_PROVENANCE_CAPABLE_FORMATS`), used by
+    /// the positive-path provenance-enqueue-gate tests below.
+    fn oci_repository() -> Repository {
+        let mut repo = sample_repository();
+        repo.format = RepositoryFormat::Oci;
         repo
     }
 
@@ -1043,13 +1028,12 @@ mod tests {
     }
 
     /// Acceptance: provenance enqueued iff `mode != Off` AND the format is
-    /// in `provenance_capable_formats`. Positive case: `Required` +
-    /// `"pypi"` registered as capable.
+    /// in `provenance_capable_formats`. Positive case: `Required` + `"oci"`
+    /// (the Tier-1 capable format).
     #[tokio::test]
     async fn seed_import_provenance_enqueued_when_required_and_format_capable() {
-        let (uc, _artifacts, lifecycle, storage, repos, policies) =
-            make_use_case_with_provenance_formats(["pypi"]);
-        let repo = pypi_repository();
+        let (uc, _artifacts, lifecycle, storage, repos, policies) = make_use_case();
+        let repo = oci_repository();
         let repo_id = repo.id;
         repos.insert(repo);
         // scan_backends:[] isolates this test to the provenance gate only
@@ -1059,7 +1043,7 @@ mod tests {
 
         let item = SeedImportItem {
             repository_id: repo_id,
-            format: RepositoryFormat::Pypi,
+            format: RepositoryFormat::Oci,
             name: "provenance-pkg".into(),
             version: "1.0.0".into(),
             content_hash: hash,
@@ -1084,9 +1068,8 @@ mod tests {
     /// when the format is capable.
     #[tokio::test]
     async fn seed_import_provenance_not_enqueued_when_mode_off() {
-        let (uc, _artifacts, lifecycle, storage, repos, policies) =
-            make_use_case_with_provenance_formats(["pypi"]);
-        let repo = pypi_repository();
+        let (uc, _artifacts, lifecycle, storage, repos, policies) = make_use_case();
+        let repo = oci_repository();
         let repo_id = repo.id;
         repos.insert(repo);
         policies.insert(policy_with(vec![], ProvenanceMode::Off));
@@ -1094,7 +1077,7 @@ mod tests {
 
         let item = SeedImportItem {
             repository_id: repo_id,
-            format: RepositoryFormat::Pypi,
+            format: RepositoryFormat::Oci,
             name: "off-mode-pkg".into(),
             version: "1.0.0".into(),
             content_hash: hash,
@@ -1112,9 +1095,8 @@ mod tests {
     }
 
     /// Negative: `Required` mode does NOT enqueue provenance for a format
-    /// that is not in `provenance_capable_formats` (the default
-    /// `make_use_case` — empty set — mirrors "no registered verifier acts
-    /// on this format").
+    /// that is not in `provenance_capable_formats` — pypi carries no
+    /// registered verifier, unlike the Tier-1 `"oci"` format.
     #[tokio::test]
     async fn seed_import_provenance_not_enqueued_when_format_not_capable() {
         let (uc, _artifacts, lifecycle, storage, repos, policies) = make_use_case();

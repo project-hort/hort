@@ -11,11 +11,27 @@ use sqlx::migrate::{Migrate, Migrator};
 use sqlx::PgPool;
 
 use hort_config::pg_identity::{parse_pg_application_name, parse_version_core};
+use hort_config::schema_compat::{
+    register_from_rows, schema_rollback_floor, SchemaCompatRegister, SchemaCompatibility,
+};
 
 /// Compile-time-embedded migration set. Used by both `run` (the
 /// `migrate` subcommand) and `assert_current` (the runtime's
 /// schema-version check at boot).
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+
+/// This binary's own version — the "how old am I" side of the schema
+/// compatibility register comparison, and the runtime fleet fence's
+/// "current" side. Both read the same workspace-inherited
+/// `CARGO_PKG_VERSION` that `hort_config::pg_identity` stamps into
+/// `application_name`, so the two answers cannot drift.
+pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The versions [`MIGRATOR`] carries — the "embedded" side of
+/// [`SchemaCompatibility::evaluate`].
+fn embedded_migration_versions() -> BTreeSet<i64> {
+    MIGRATOR.iter().map(|m| m.version).collect()
+}
 
 /// Run every pending migration against `pool`, then re-assert the
 /// `events` table role-hardening invariant (ADR 0009).
@@ -23,6 +39,38 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 /// Returns on the first failure — there is no rollback or retry at the
 /// binary layer. A deployment orchestrator (systemd, Kubernetes) is the
 /// retry surface.
+///
+/// **Why this gate exists at all on a rollback.** `hort-server.service`
+/// and `hort-worker.service` require `hort-migrate.service`, and the
+/// chart runs the same subcommand as a `pre-upgrade` hook, so *every*
+/// start re-runs this with the installed binary — including a start of
+/// the previous release. `SchemaCompatibility` decides whether that is
+/// legitimate; see its docs for why a newer schema is a supported state,
+/// and for the register rows that decide *how much* newer it may be.
+///
+/// The verdict drives one knob only, `Migrator::set_ignore_missing`,
+/// which suppresses exactly one error (`MigrateError::VersionMissing`)
+/// and is therefore enabled only under a `Supported` verdict. It is far
+/// weaker than the predicate on its own: it tolerates *any*
+/// applied-but-not-embedded version, a mid-sequence gap included, so
+/// enabling it unconditionally would discard the divergence check.
+/// Checksum validation of the shared prefix is untouched by it
+/// (`MigrateError::VersionMismatch` still fires), as is the dirty-state
+/// check.
+///
+/// **Why the register write lives here.** Every migration this binary
+/// embeds gets a `schema_compat_register` row carrying the oldest binary
+/// version it tolerates, read out of `migrations/CONTRACTIONS.toml` — the
+/// manifest this binary embeds precisely because it also embeds that
+/// migration. `ON CONFLICT DO NOTHING` makes this write double as a
+/// backfill: it covers both what this call just applied and whatever an
+/// older binary — one that predates the register, or one that crashed
+/// between applying a migration and recording it — already applied before
+/// this run. A future binary that does *not* embed the migration cannot
+/// derive that answer from anything it ships, so the write has to happen
+/// on the way past, under the DDL role, as part of the same operation
+/// that applies it. The serve path only ever reads these rows
+/// (see [`assert_current`], ADR 0009).
 ///
 /// **Why the post-migrate hardening step.** `004_events.sql`
 /// revokes UPDATE/DELETE/TRUNCATE on `events` from `hort_app_role` so
@@ -41,10 +89,74 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 /// `events_immutable` trigger itself: belt-and-braces, two
 /// independent mechanisms enforce the same audit invariant.
 pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
-    MIGRATOR
-        .run(pool)
-        .await
-        .context("applying schema migrations")?;
+    let applied = applied_migration_versions(pool).await?;
+    let mut register = read_schema_compat_register(pool).await?;
+    let compatibility = SchemaCompatibility::evaluate(
+        &applied,
+        &embedded_migration_versions(),
+        &register,
+        BINARY_VERSION,
+    );
+
+    // The versions this invocation applies — used below only to report the
+    // post-migrate applied set; the register write is scoped separately, to
+    // every migration this binary embeds (see `record_schema_compat`).
+    let applied_now: BTreeSet<i64> = match compatibility {
+        SchemaCompatibility::Divergent(divergence) => {
+            anyhow::bail!("refusing to migrate: {}", divergence.refusal());
+        }
+        SchemaCompatibility::Intolerable(bound) => {
+            anyhow::bail!("refusing to migrate: {}", bound.refusal());
+        }
+        SchemaCompatibility::Supported { newer_applied } => {
+            if !newer_applied.is_empty() {
+                tracing::warn!(
+                    newer_applied = ?newer_applied,
+                    "the database is migrated past this binary's embedded set; applying nothing \
+                     and verifying the shared prefix only"
+                );
+            }
+            // Deliberately not short-circuited: with every embedded
+            // migration already applied, `run` applies nothing and reduces
+            // to checksum verification of the shared prefix, which is a
+            // property worth keeping.
+            //
+            // `Migrator` is neither `Clone` nor interior-mutable and
+            // `set_ignore_missing` takes `&mut self`, so the tolerance
+            // cannot be toggled on the `MIGRATOR` static. Re-expanding the
+            // macro here yields an owned migrator over the same embedded
+            // directory, carrying every macro-derived setting (table name,
+            // schemas, per-migration transaction mode) by construction
+            // rather than reconstructing them field by field from
+            // semver-exempt struct internals.
+            let mut migrator: Migrator = sqlx::migrate!("../../migrations");
+            migrator.set_ignore_missing(true);
+            migrator
+                .run(pool)
+                .await
+                .context("applying schema migrations")?;
+            // Nothing was applied this run — under `Supported` every
+            // embedded migration is already applied. The register write
+            // below still backfills a row for each of them when an older
+            // binary applied them before the register existed.
+            BTreeSet::new()
+        }
+        SchemaCompatibility::Pending { pending, .. } => {
+            MIGRATOR
+                .run(pool)
+                .await
+                .context("applying schema migrations")?;
+            pending.into_iter().collect()
+        }
+    };
+
+    register.extend(record_schema_compat(pool, &embedded_migration_versions()).await?);
+    let applied_after: BTreeSet<i64> = applied.union(&applied_now).copied().collect();
+    tracing::info!(
+        tolerates_binaries_from = %schema_rollback_floor(&applied_after, &register),
+        "schema compatibility register up to date"
+    );
+
     harden_events_role(pool)
         .await
         .context("re-asserting events role hardening")?;
@@ -95,6 +207,100 @@ pub async fn harden_events_role(pool: &PgPool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Classify a `schema_compat_register` read failure.
+///
+/// `None` means "treat the register as empty and carry on": the table
+/// does not exist, so this database was last migrated by a binary from
+/// before the register shipped. That is not an error — every applied
+/// migration the reading binary does not embed is then unregistered, and
+/// [`SchemaCompatibility`]'s fail-closed rule refuses on exactly that.
+/// Turning a missing table into a hard error instead would refuse boots
+/// the strict gate already handles correctly.
+///
+/// `Some` is a genuine read failure. `42501` gets the same
+/// operator-actionable grant message shape as the `_sqlx_migrations`
+/// read, because it has the same cause: the runtime role's least-privilege
+/// grant set missed a table.
+fn map_register_read_db_err(e: sqlx::Error) -> Option<anyhow::Error> {
+    match e {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01") => None,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("42501") => {
+            Some(anyhow::anyhow!(
+                "permission denied reading schema_compat_register — grant SELECT on \
+             schema_compat_register to the runtime role (see \
+             docs/architecture/how-to/deploy/postgres-roles.md)"
+            ))
+        }
+        other => Some(other.into()),
+    }
+}
+
+/// Read the schema compatibility register: the oldest binary version each
+/// applied migration tolerates, as recorded by the binary that applied it.
+///
+/// `SELECT` only, on both the migrate and the serve path — this must never
+/// become a `CREATE TABLE IF NOT EXISTS` (ADR 0009). A missing table is an
+/// empty register; see [`map_register_read_db_err`].
+async fn read_schema_compat_register(pool: &PgPool) -> anyhow::Result<SchemaCompatRegister> {
+    match sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT version, min_binary_version FROM schema_compat_register",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => Ok(register_from_rows(rows)),
+        Err(e) => match map_register_read_db_err(e) {
+            Some(err) => Err(err),
+            None => Ok(SchemaCompatRegister::new()),
+        },
+    }
+}
+
+/// Record one register row per migration `embedded` names — every migration
+/// this binary embeds, not only whatever this run applied — and return the
+/// rows written so the caller can report the resulting rollback floor
+/// without a second read.
+///
+/// A migration named by `migrations/CONTRACTIONS.toml` records that
+/// entry's `reference_removed_in`; every other migration removed nothing
+/// and records `NULL`.
+///
+/// `ON CONFLICT DO NOTHING` rather than an upsert: an applied migration is
+/// frozen (ADR 0022), so its contraction status can never change and an
+/// existing row is already the right answer. That is what makes it safe to
+/// pass the whole embedded set on every call rather than just what this run
+/// applied: a row already written by the release that shipped the migration
+/// is never overwritten, so this both records a fresh migration and
+/// backfills a migration an older, pre-register binary already applied. It
+/// also makes a re-run after a partial failure safe.
+async fn record_schema_compat(
+    pool: &PgPool,
+    embedded: &BTreeSet<i64>,
+) -> anyhow::Result<SchemaCompatRegister> {
+    if embedded.is_empty() {
+        return Ok(SchemaCompatRegister::new());
+    }
+    let minimums = crate::contractions::contraction_minimum_binary_versions();
+    let versions: Vec<i64> = embedded.iter().copied().collect();
+    let recorded: Vec<Option<String>> = versions
+        .iter()
+        .map(|version| minimums.get(version).cloned())
+        .collect();
+
+    sqlx::query(
+        "INSERT INTO schema_compat_register (version, min_binary_version) \
+         SELECT * FROM UNNEST($1::bigint[], $2::text[]) \
+         ON CONFLICT (version) DO NOTHING",
+    )
+    .bind(&versions)
+    .bind(&recorded)
+    .execute(pool)
+    .await
+    .context("recording schema compatibility register rows")?;
+
+    Ok(register_from_rows(versions.into_iter().zip(recorded)))
+}
+
 /// Map a `_sqlx_migrations` read failure onto an operator-actionable
 /// `anyhow::Error`.
 ///
@@ -126,45 +332,78 @@ fn map_assert_current_db_err(e: sqlx::Error) -> anyhow::Error {
     }
 }
 
-/// Verify the schema version matches what the binary expects, without
-/// applying any migrations.
+/// Verify the schema this binary is about to serve against is one it
+/// supports, without applying any migrations.
 ///
 /// This is the runtime entrypoint — `cli::serve` calls it instead of
 /// `run` so the runtime DSN can be true least-privilege (DML only,
 /// no DDL on `public`). The serve path therefore never issues
 /// `CREATE TABLE IF NOT EXISTS _sqlx_migrations`, which `sqlx::migrate!`
 /// always does on first call even when nothing is pending. See ADR 0009.
+///
+/// The supported/pending/divergent question is answered by
+/// [`SchemaCompatibility`], the same predicate `run` uses — answering it
+/// differently in the two places is what would make a binary rollback
+/// impossible, since one gate passing while the other refuses leaves the
+/// binary unable to serve either way.
+///
+/// Reading the whole applied set rather than `MAX(version)` is still a
+/// plain `SELECT`; this must never become a `CREATE TABLE IF NOT EXISTS`.
+/// The same holds for the `schema_compat_register` read that follows it:
+/// the register is written on the migrate path only, and a database whose
+/// last migrate predates the register simply has no such table — an empty
+/// register, which the predicate fails closed on.
 pub async fn assert_current(pool: &PgPool) -> anyhow::Result<()> {
-    let expected: i64 = MIGRATOR
-        .iter()
-        .map(|m| m.version)
-        .max()
-        .expect("migration set is non-empty at compile time");
-
     // SELECT only — does NOT create the bookkeeping table.
-    // Failure modes:
-    //   - table missing       → 42P01 undefined_table       (no migrate Job ran)
-    //   - SELECT denied       → 42501 insufficient_privilege (grant missing)
-    //   - applied < expected  → bail with operator-actionable message
-    //   - applied > expected  → bail (binary older than schema; rolling-upgrade misordering)
-    let row: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-        .fetch_one(pool)
+    // Read failure modes:
+    //   - table missing → 42P01 undefined_table        (no migrate Job ran)
+    //   - SELECT denied → 42501 insufficient_privilege (grant missing)
+    let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
+        .fetch_all(pool)
         .await
         .map_err(map_assert_current_db_err)?;
-    let applied = row.unwrap_or(0);
+    let applied: BTreeSet<i64> = versions.into_iter().collect();
+    let embedded = embedded_migration_versions();
+    let register = read_schema_compat_register(pool).await?;
 
-    if applied != expected {
-        anyhow::bail!(
-            "schema version mismatch: applied={applied}, binary expects={expected}. \
-             Run `hort-server migrate` to advance, or roll the binary back to match the schema."
-        );
+    let compatibility =
+        SchemaCompatibility::evaluate(&applied, &embedded, &register, BINARY_VERSION);
+    // `boot_refusal` is `None` for exactly one verdict — the bootable one —
+    // so this is the whole refusal path.
+    if let Some(refusal) = compatibility.boot_refusal() {
+        anyhow::bail!("{refusal}");
     }
 
-    tracing::info!(
-        applied_version = applied,
-        expected_version = expected,
-        "schema version OK"
-    );
+    let applied_version = applied.iter().next_back().copied().unwrap_or(0);
+    let expected_version = embedded.iter().next_back().copied().unwrap_or(0);
+    // "How far back does this schema tolerate a binary" — the question a
+    // rollback decision turns on, answered on the surface that already
+    // reports the applied and expected schema versions.
+    let tolerates_binaries_from = schema_rollback_floor(&applied, &register);
+    match compatibility {
+        SchemaCompatibility::Supported { newer_applied } if !newer_applied.is_empty() => {
+            // Warn, not info: an operator running a rolled-back binary
+            // against a migrated schema needs to see that state without
+            // going looking for it.
+            tracing::warn!(
+                applied_version,
+                expected_version,
+                newer_applied = ?newer_applied,
+                tolerates_binaries_from = %tolerates_binaries_from,
+                "serving against a schema newer than this binary's embedded migration set; \
+                 supported by the expand/contract discipline (ADR 0030), but the fleet is not \
+                 on the schema's own release"
+            );
+        }
+        _ => {
+            tracing::info!(
+                applied_version,
+                expected_version,
+                tolerates_binaries_from = %tolerates_binaries_from,
+                "schema version OK"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -192,12 +431,13 @@ pub struct FleetFenceOutcome {
     pub offenders: Vec<String>,
 }
 
-/// Every migration version in [`MIGRATOR`] that is not yet recorded in the
-/// `_sqlx_migrations` table. Creates the bookkeeping table if it does not
-/// exist yet (a fresh database has every migration pending) — this runs
-/// under the `migrate` subcommand's admin DSN, which already has DDL
-/// rights to do so.
-pub async fn pending_migration_versions(pool: &PgPool) -> anyhow::Result<BTreeSet<i64>> {
+/// Every migration version recorded in the `_sqlx_migrations` table.
+/// Creates the bookkeeping table if it does not exist yet (a fresh
+/// database has recorded nothing) — this runs under the `migrate`
+/// subcommand's admin DSN, which already has DDL rights to do so. The
+/// serve path must not call this: it reads the same set with a bare
+/// `SELECT` in `assert_current` instead (ADR 0009).
+async fn applied_migration_versions(pool: &PgPool) -> anyhow::Result<BTreeSet<i64>> {
     let mut conn = pool
         .acquire()
         .await
@@ -205,16 +445,21 @@ pub async fn pending_migration_versions(pool: &PgPool) -> anyhow::Result<BTreeSe
     conn.ensure_migrations_table(MIGRATOR.table_name.as_ref())
         .await
         .context("ensuring the sqlx migrations bookkeeping table exists")?;
-    let applied: BTreeSet<i64> = conn
+    Ok(conn
         .list_applied_migrations(MIGRATOR.table_name.as_ref())
         .await
         .context("listing applied migrations")?
         .into_iter()
         .map(|m| m.version)
-        .collect();
-    Ok(MIGRATOR
-        .iter()
-        .map(|m| m.version)
+        .collect())
+}
+
+/// Every migration version in [`MIGRATOR`] that is not yet recorded in the
+/// `_sqlx_migrations` table.
+pub async fn pending_migration_versions(pool: &PgPool) -> anyhow::Result<BTreeSet<i64>> {
+    let applied = applied_migration_versions(pool).await?;
+    Ok(embedded_migration_versions()
+        .into_iter()
         .filter(|v| !applied.contains(v))
         .collect())
 }
@@ -436,6 +681,49 @@ mod tests {
             !msg.contains("_sqlx_migrations"),
             "non-Database error must pass through, not synthesise a message; got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // `map_register_read_db_err` — the register read's failure
+    // classification. `42P01` is deliberately NOT an error: a database
+    // whose last migrate predates the register has no such table, and
+    // the predicate's fail-closed rule covers the rollback that case
+    // implies.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn register_read_treats_a_missing_table_as_an_empty_register() {
+        assert!(
+            map_register_read_db_err(db_err("42P01")).is_none(),
+            "a missing schema_compat_register must not be a boot failure"
+        );
+    }
+
+    #[test]
+    fn register_read_maps_42501_to_a_grant_select_message() {
+        let mapped = map_register_read_db_err(db_err("42501")).expect("42501 must be an error");
+        let msg = format!("{mapped}");
+        assert_eq!(
+            msg,
+            "permission denied reading schema_compat_register — grant SELECT on \
+             schema_compat_register to the runtime role (see \
+             docs/architecture/how-to/deploy/postgres-roles.md)"
+        );
+    }
+
+    #[test]
+    fn register_read_passes_other_db_codes_through() {
+        let mapped = map_register_read_db_err(db_err("08006")).expect("08006 must be an error");
+        let msg = format!("{mapped}");
+        assert!(msg.contains("SQLSTATE 08006"), "{msg}");
+        assert!(!msg.contains("schema_compat_register"), "{msg}");
+    }
+
+    #[test]
+    fn register_read_passes_non_database_errors_through() {
+        let mapped =
+            map_register_read_db_err(sqlx::Error::RowNotFound).expect("must stay an error");
+        assert!(!format!("{mapped}").contains("schema_compat_register"));
     }
 
     // -----------------------------------------------------------------

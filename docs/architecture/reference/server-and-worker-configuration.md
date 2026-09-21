@@ -54,7 +54,7 @@ and `args: ["serve"]` (k8s) are therefore correct and identical.
 | `enqueue-quarantine-release-sweep` | Enqueue one `quarantine-release-sweep` job and exit; the always-on worker dispatches it to `QuarantineReleaseSweepHandler`. The default `executionPath: dsn-direct` CronJob. | `MinimalConfig` |
 | `seed-import` | Parse an operator-supplied TSV describing a dependency cutover set and enqueue one `seed-import` job; the worker bulk-registers each item with a backdated `quarantine_window_start` (the *time* gate only — scan gate unchanged). One-shot, operator-invoked. | `MinimalConfig` |
 | `enqueue-prefetch-tick` | Enqueue one `prefetch-tick` job and exit; the worker dispatches `PrefetchTickHandler` over every scheduled-eligible repo + tracked package. | `MinimalConfig` |
-| `enqueue-prefetch-row-retention-sweep` | Enqueue one `prefetch-row-retention-sweep` job and exit; the worker deletes terminal `kind LIKE 'prefetch%'` rows older than a configurable horizon (default 7 days). | `MinimalConfig` |
+| `enqueue-prefetch-row-retention-sweep` | Enqueue one `prefetch-row-retention-sweep` job and exit; the worker deletes terminal `kind LIKE 'prefetch%'` and `kind = 'oci-index-child-ingest'` rows older than a configurable horizon (default 7 days). | `MinimalConfig` |
 | `enqueue-wheel-metadata-backfill` | Enqueue one `wheel-metadata-backfill` job and exit; the worker retrofits PEP 658 `wheel_metadata` ContentReferences for pre-existing PyPI wheels. | `MinimalConfig` |
 | `validate-config [--strict]` | Offline gitops-config validation (CI pre-merge gate); see [§ `validate-config`](#validate-config). | _none_ — DSN-free; reads its own env directly |
 | `license [--full]` | Print hort's license identifier (and, with `--full`, the complete license texts) to stdout and exit. | _none_ — synchronous, no config, no DSN |
@@ -621,7 +621,7 @@ neither set the error surfaces the name `"DATABASE_URL"`.
 | `HORT_SCANNER_TRIVY_ENABLED` | bool | `true` | No | **Load-bearing.** When `false`, the worker does NOT register the Trivy backend even if its `--version` probe would pass — the flag is the enabling gate; the probe is a secondary health check that only runs on flag-enabled backends. Set from `worker.scanner.trivy.enabled`. |
 | `HORT_SCANNER_OSV_ENABLED` | bool | `true` | No | **Load-bearing**, same contract as `HORT_SCANNER_TRIVY_ENABLED`. Set from `worker.scanner.osv.enabled`. Disabling **both** backends is a hard boot error (a scanner worker with no backends has nothing to scan). |
 | `HORT_SCANNER_TRIVY_BIN` | path | `trivy` | No | Trivy binary path/name. |
-| `HORT_SCANNER_TRIVY_DB_DIR` | path | _unset → Trivy default cache_ | No | Trivy `--cache-dir`; omitted when unset. |
+| `HORT_SCANNER_TRIVY_DB_DIR` | path | _unset → Trivy default cache_ | No | Trivy `--cache-dir`; omitted when unset. Must be **writable**: besides the vulnerability DB, Trivy downloads `trivy-java-db` on demand when it meets a JAR whose embedded `pom.properties` / `MANIFEST.MF` do not identify it. A read-only cache turns that case into a scan failure. See [the scanning pipeline](../explanation/scanning-pipeline.md). |
 | `HORT_SCANNER_OSV_BIN` | path | `osv-scanner` | No | osv-scanner binary path/name. |
 | `HORT_ADVISORY_OSV_API_URL` | URL | `https://api.osv.dev/v1/querybatch` | No | OSV per-component `querybatch` endpoint. |
 | `HORT_ADVISORY_OSV_BULK_URL` | URL | `https://osv-vulnerabilities.storage.googleapis.com` | No | Base URL for per-ecosystem OSV bulk archives (advisory-watch tick). |

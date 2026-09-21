@@ -150,7 +150,11 @@ pull-through uses, so prefetch and serve-site cannot diverge:
   many files (sdist + wheels) with per-file checksums, so the leaf fans
   out over the per-version JSON manifest's `urls[]` array, one verified
   ingest per distribution.
-- **Other formats** (OCI, Maven, generic) inherit no resolution method
+- **Maven** — no resolution method at all: the repository layout IS the
+  URL, so the leaf composes the GAV path directly (POM always, jar when
+  present) and verifies each file against its strongest upstream
+  checksum sidecar.
+- **Other formats** (OCI, generic) inherit no resolution method
   and short-circuit — they have no compose-style prefetch URL.
 
 Individual URL failures are non-fatal — the leaf completes with
@@ -235,7 +239,11 @@ failed driver leaves a terminal row; the dedup index (below) excludes
 terminal states, so the next pull of any dependent re-derives the
 missing subtree from the artifacts projection. Terminal `prefetch%`
 rows are garbage-collected by the `prefetch-row-retention-sweep` task
-(`crates/hort-app/src/task_handlers/prefetch_row_retention_sweep.rs`).
+(`crates/hort-app/src/task_handlers/prefetch_row_retention_sweep.rs`),
+which also covers terminal `oci-index-child-ingest` rows — the OCI
+eager index-child ingest is the same class of high-churn, best-effort
+pull-through work, and its jobs row is likewise not the layer that makes
+the work idempotent.
 
 ## Archive-aware dependency extraction
 
@@ -272,6 +280,65 @@ cap's worth of decompressed bytes is unreachable — fine in practice,
 because real npm and cargo archives place their manifest as an early
 entry, while zip's central directory lets the wheel path seek straight
 to `METADATA`.
+
+## Maven: the POM's own bytes, and where that stops
+
+Maven has no archive to open for this — the `.pom` file **is** the
+manifest, stored as its own group member, so `extract_dependency_specs`
+(`crates/hort-formats/src/maven/pom.rs`, `parse_pom_dependencies`) reads
+it directly rather than reaching into a container. What it resolves:
+
+- `<dependencies>` entries whose effective scope is `compile` or
+  `runtime` (an absent `<scope>` is Maven's own `compile` default) —
+  the same runtime-declaration class boundary ADR 0053 D5 draws for
+  every format.
+- Versions written literally, or through a property this POM's own
+  `<properties>` declares, or through the model built-ins computable
+  from the POM alone (`${project.version}`, `${project.groupId}`, and
+  their `pom.`-prefixed spellings).
+- Versions supplied by this POM's **own** `<dependencyManagement>`
+  block — local bytes, not a parent and not a BOM import.
+
+**What it cannot reach, stated plainly: parent POMs, and imported
+BOMs.** `extract_dependency_specs` is a pure function over one
+artifact's own bytes — it holds no port, no HTTP client, no fetcher —
+so a POM's parent chain and any BOM it pulls in through
+`<dependencyManagement>`'s `<import>` scope are structurally
+unreachable from here, and that is exactly where a Spring Boot or
+Quarkus tree keeps most of its versions. **A project that keeps its
+versions in a parent or a BOM will see a high skip count and a
+correspondingly cold tree** — the reason is architectural, not a bug in
+this cut: reaching beyond a single POM needs a change to the
+`VersionDiscovery` (ADR 0005) contract itself, not more effort spent
+against the current one.
+
+Everything this reader cannot resolve is a **counted skip, never an
+`Err`** — a POM whose every version lives in its parent is a *valid*
+POM and yields `Ok(vec![])` with every dependency skipped, so the
+cascade partially warms the tree instead of aborting the walk.
+`PomSkipReason` (`crates/hort-formats/src/maven/pom.rs`) names five
+reasons, and an operator must read them as **two different classes**:
+
+- **Deliberate class boundary — expected, not a coverage gap:**
+  `scope_excluded` (`provided` / `test` / `system` / `import` scope,
+  declined on purpose per ADR 0053 D4/D5). A high count here is
+  normal and simply explains why the warmed set is smaller than the
+  full dependency list in the POM.
+- **Reader limits — the tree really was only partly reached:**
+  `version_from_parent_or_bom` (the dominant reason on a managed
+  tree — the version lives in a parent or an imported BOM),
+  `unresolved_property` (a `${...}` placeholder this POM's own
+  properties/built-ins could not resolve), `unsupported_range` (a
+  Maven version range; per ADR 0053 D2 a range upstream cannot
+  satisfy is skipped, never guessed at), and `incomplete_coordinate`
+  (no `<groupId>` or `<artifactId>` to enqueue).
+
+Presenting these five as one "skipped" number defeats the signal in
+both directions: a healthy cascade (mostly `scope_excluded`) reads as
+broken, and a half-blind one (mostly the four reader-limit reasons)
+reads as fine. See
+[the metrics catalog](../../metrics-catalog.md#maven-pom-dependency-extraction-skip-accounting)
+for how the reasons are surfaced and how to read them.
 
 ## Three layers of dedup
 
@@ -390,3 +457,6 @@ best-effort, and starvable.
   bytes land.
 - [Event sourcing](event-sourcing.md) — the lifecycle events a
   prefetched artifact emits like any other ingest.
+- [Metrics catalog](../../metrics-catalog.md#prefetch-amplification) —
+  the `deps_upstream_unsatisfiable` / `deps_routing_dead_end` split and
+  the Maven `PomSkipReason` accounting.

@@ -4,18 +4,26 @@
 //! by serialising the supplied [`Sbom`] into a CycloneDX 1.5 JSON
 //! document, shelling out to
 //! `osv-scanner scan source --format json --sbom <path>`,
-//! parsing the JSON output, and returning `Vec<Finding>`.
+//! parsing the JSON output, and returning the lowered findings.
 //!
 //! Unlike the Trivy adapter, this scanner does **not** consume the
 //! artifact's content bytes. osv-scanner derives every match from the
-//! SBOM's PURLs; the underlying `content_hash` is unused (the
-//! parameter is kept for trait conformance and for future caching keys).
+//! SBOM's PURLs, so nothing on the
+//! [`ScanTarget`](hort_domain::ports::scanner::ScanTarget) — not the
+//! content hash, not the artifact kind — is read: there is no payload for
+//! this backend to materialise. The parameter is kept for trait
+//! conformance and for future caching keys.
 //!
-//! Behaviour when `sbom: None`: the adapter logs `info!` and returns
-//! `Ok(vec![])`. osv-scanner needs an SBOM input — there is no
-//! payload-based fallback. The orchestrator chains scanners
-//! sequentially; an empty result here is the documented "skip" signal,
-//! not an error.
+//! Behaviour when `sbom: None`: the adapter returns
+//! `NothingAnalysable(NotApplicable)` — the explicit absence of a
+//! verdict, never a clean one. osv-scanner needs an SBOM input and has
+//! no payload-based fallback, so with no SBOM there is nothing this
+//! backend examined; an empty finding list would claim otherwise and
+//! would hand an unexamined artifact the release authority of a scan
+//! (ADR 0007). `NotApplicable` rather than a gating arm because a
+//! missing SBOM is a property of the artifact — the handler declares
+//! these bytes to carry no dependency information — so there is nothing
+//! for a hold to wait on.
 //!
 //! Module layout:
 //! - [`severity`] — score / label → `SeverityThreshold` (pure)
@@ -39,9 +47,11 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER};
+use hort_domain::ports::scanner::{
+    NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort, SCAN_REPORT_TOO_LARGE_MARKER,
+};
 use hort_domain::ports::BoxFuture;
-use hort_domain::types::{ContentHash, Finding, Sbom};
+use hort_domain::types::{Finding, Sbom};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -196,6 +206,39 @@ impl Default for OsvScannerConfig {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Capability map
+// ---------------------------------------------------------------------------
+
+/// The repository formats this backend can produce a verdict for: those
+/// whose compiled-in format handler exposes an SBOM the orchestrator can
+/// hand over.
+///
+/// This backend reads nothing but the SBOM, so its coverage is exactly
+/// the set of formats that *have* one. `oci` is absent and that absence
+/// is the point: an OCI blob has no SBOM source, so pairing `osv` with
+/// an OCI repository analyses nothing — while looking, in a policy, like
+/// a second scan authority.
+///
+/// Derived from the handlers' own declarations, and — per the map's
+/// rule that a cell is "yes" only with a known-vulnerable-fixture test
+/// behind it — evidenced per format in `tests/sbom_evidence.rs`:
+///
+/// | format  | SBOM source | evidence test |
+/// |---------|-------------|---------------|
+/// | `npm`   | packument metadata → `FormatHandler::extract_sbom` | `a_known_vulnerable_npm_sbom_yields_a_finding` |
+/// | `pypi`  | per-release JSON `requires_dist` → `FormatHandler::extract_sbom` | `a_known_vulnerable_pypi_sbom_yields_a_finding` |
+/// | `cargo` | the `.crate`'s `Cargo.lock` → `PayloadSbom` | `a_known_vulnerable_cargo_sbom_yields_a_finding` |
+/// | `maven` | the POM's `<dependencies>` → `PayloadSbom` | `a_known_vulnerable_maven_sbom_yields_a_finding` |
+///
+/// The set is static here because a scanner adapter depends on
+/// `hort-domain` alone and cannot ask `hort-formats`. The worker's
+/// parity guard closes that gap: it asks every registered handler
+/// whether it is SBOM-capable and asserts this answer matches, so a
+/// handler gaining or losing an SBOM source without this const moving
+/// fails the test gate.
+const SBOM_CAPABLE_FORMATS: &[&str] = &["npm", "pypi", "cargo", "maven"];
 
 // ---------------------------------------------------------------------------
 // Adapter
@@ -402,18 +445,49 @@ impl ScannerPort for OsvScannerAdapter {
         "osv"
     }
 
+    /// OSV's half of the scanner capability map: the formats whose
+    /// compiled-in handler exposes an SBOM the orchestrator can hand
+    /// over. [`SBOM_CAPABLE_FORMATS`] holds the set and the reasoning.
+    fn applies_to(&self, format: &str) -> bool {
+        SBOM_CAPABLE_FORMATS.contains(&format)
+    }
+
+    /// OSV-scanner adjudicates the **SBOM**, not the payload, so the
+    /// materialisation facts on [`ScanTarget`] (the kind, the coords, the
+    /// content hash) are not consulted: there is nothing for this backend
+    /// to put on disk. Its input is whatever the format handler extracted.
+    ///
+    /// No SBOM means no verdict, never a clean one — see the module docs.
     fn scan<'a>(
         &'a self,
-        _content_hash: &'a ContentHash,
+        _target: &'a ScanTarget<'a>,
         sbom: Option<&'a Sbom>,
-    ) -> BoxFuture<'a, DomainResult<Vec<Finding>>> {
+    ) -> BoxFuture<'a, DomainResult<ScanAnalysis>> {
         Box::pin(async move {
             let Some(sbom) = sbom else {
-                tracing::info!(
+                // A missing SBOM is a fact about the *artifact*, not an
+                // unassessed surface: the handler declares these bytes
+                // (an OCI blob, a checksum sidecar, a `-sources.jar`) to
+                // carry no dependency information, so there is nothing
+                // for a hold to wait on — the same arm Trivy uses for a
+                // kind it has no materialisation for. `debug!` because
+                // this is the steady state for every such artifact, not
+                // an operator action.
+                //
+                // What it must never be is `clean()`. An empty finding
+                // list is a *verdict* and carries release authority, so
+                // returning one here would make this backend a false
+                // scan authority for every SBOM-less artifact — and on a
+                // policy where the other backend abstains, that false
+                // authority is the only thing standing between an
+                // unexamined artifact and release.
+                tracing::debug!(
                     scanner = "osv",
-                    "osv adapter: scan skipped — no SBOM provided"
+                    "osv adapter: no SBOM for this artifact — nothing to assess"
                 );
-                return Ok(Vec::new());
+                return Ok(ScanAnalysis::NothingAnalysable(
+                    NotAnalysable::NotApplicable,
+                ));
             };
 
             // 1. Materialise SBOM into a TempDir. RAII drop on
@@ -437,7 +511,7 @@ impl ScannerPort for OsvScannerAdapter {
             );
 
             // 4. ws drops here — TempDir cleanup runs.
-            Ok(findings)
+            Ok(ScanAnalysis::Analysed(findings))
         })
     }
 
@@ -476,6 +550,17 @@ mod tests {
     use hort_domain::ports::scanner::SCAN_REPORT_TOO_LARGE_MARKER;
     use std::io::Cursor;
 
+    /// Serializes every write-then-exec fixture in this test binary. An
+    /// executable's write descriptor stays open (and inherited across a
+    /// fork) until whichever process holds it execs or closes it — so a
+    /// second thread that forks a child while our script is still open for
+    /// writing can keep that descriptor alive in the child even after we
+    /// close our own handle, and our own later exec of the same path fails
+    /// with `ETXTBSY`. Held from script creation through the `run_scan`
+    /// call that execs it, so no other thread in this process can fork
+    /// while a script is open for writing.
+    static SCRIPT_WRITE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn cfg() -> OsvScannerConfig {
         OsvScannerConfig {
             osv_scanner_bin: PathBuf::from("/usr/local/bin/osv-scanner"),
@@ -489,10 +574,35 @@ mod tests {
         OsvScannerAdapter::new(cfg())
     }
 
-    fn sample_hash() -> ContentHash {
+    fn sample_hash() -> hort_domain::types::ContentHash {
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             .parse()
             .unwrap()
+    }
+
+    fn sample_coords() -> hort_domain::types::ArtifactCoords {
+        hort_domain::types::ArtifactCoords {
+            name: "lodash".to_string(),
+            name_as_published: "lodash".to_string(),
+            version: Some("4.17.21".to_string()),
+            path: "lodash/-/lodash-4.17.21.tgz".to_string(),
+            format: hort_domain::entities::repository::RepositoryFormat::Npm,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// A scan target this backend ignores every payload fact of — it
+    /// scans the SBOM. Present so the port's shape is exercised.
+    fn sample_target<'a>(
+        hash: &'a hort_domain::types::ContentHash,
+        coords: &'a hort_domain::types::ArtifactCoords,
+    ) -> ScanTarget<'a> {
+        ScanTarget {
+            content_hash: hash,
+            format: "npm",
+            coords,
+            kind: hort_domain::types::ArtifactKind::NpmTarball,
+        }
     }
 
     // ----- argv shape (no real binary needed) ------------------------------
@@ -615,6 +725,7 @@ mod tests {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
+        let _guard = SCRIPT_WRITE_GUARD.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let script = dir.path().join("fake-osv.sh");
         {
@@ -662,19 +773,47 @@ mod tests {
     // ----- scan(None) early-return path ------------------------------------
 
     #[tokio::test]
-    async fn scan_with_none_sbom_returns_empty_findings_without_invoking_cli() {
+    async fn scan_with_none_sbom_abstains_without_invoking_cli() {
         // The configured binary path is bogus — if `scan` actually
         // tried to run osv-scanner, this would surface as
-        // DomainError::Invariant("not found"). Reaching `Ok(vec![])`
-        // proves the early-return path skipped the CLI entirely.
+        // DomainError::Invariant("not found"). Reaching `Ok(_)` proves
+        // the early-return path skipped the CLI entirely.
         let c = OsvScannerConfig {
             osv_scanner_bin: PathBuf::from("/no/such/osv-scanner/exists/here"),
             ..OsvScannerConfig::default()
         };
         let a = OsvScannerAdapter::new(c);
         let h = sample_hash();
-        let r = a.scan(&h, None).await.expect("none-sbom returns Ok");
-        assert!(r.is_empty(), "scan(None) must produce no findings");
+        let coords = sample_coords();
+        let r = a
+            .scan(&sample_target(&h, &coords), None)
+            .await
+            .expect("none-sbom returns Ok");
+        // With no SBOM this backend examined nothing, so it has no
+        // verdict to give. A clean verdict here would carry release
+        // authority for an artifact nothing looked at.
+        assert_eq!(
+            r,
+            ScanAnalysis::NothingAnalysable(NotAnalysable::NotApplicable),
+            "scan(None) must be the absence of a verdict, not a clean one"
+        );
+        assert_ne!(r, ScanAnalysis::clean());
+    }
+
+    // ----- capability map --------------------------------------------------
+
+    /// The formats whose handlers expose an SBOM, and only those. `oci`
+    /// is the cell this map exists to close: an OCI blob has no SBOM
+    /// source, so this backend can never adjudicate one.
+    #[test]
+    fn applies_to_is_exactly_the_sbom_capable_formats() {
+        let a = OsvScannerAdapter::new(cfg());
+        for format in ["npm", "pypi", "cargo", "maven"] {
+            assert!(a.applies_to(format), "{format} has an SBOM source");
+        }
+        for format in ["oci", "gradle", "generic", "", "NPM"] {
+            assert!(!a.applies_to(format), "{format} has no SBOM source");
+        }
     }
 
     // ----- runtime smoke (no real binary needed) ---------------------------
@@ -706,11 +845,12 @@ mod tests {
         };
         let a = OsvScannerAdapter::new(c);
         let h = sample_hash();
+        let coords = sample_coords();
         let sbom = Sbom {
             subject: None,
             components: vec![],
         };
-        let r = a.scan(&h, Some(&sbom)).await;
+        let r = a.scan(&sample_target(&h, &coords), Some(&sbom)).await;
         assert!(matches!(r, Err(DomainError::Invariant(_))));
     }
 

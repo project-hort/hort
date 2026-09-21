@@ -46,15 +46,32 @@ SCRAPE SOURCE — operator-supplied, no guessing, fail-closed when empty
   `scrapeFrom` at apply time, so the listener can never be turned on without
   declaring exactly who may scrape it.
 
-ESCAPE HATCH PARITY
+ESCAPE HATCH PARITY, AND THE ONE COMBINATION THAT IS REJECTED
   Gated on `.Values.networkPolicy.enabled` (the same toggle as the
-  app-pod + Job-scoped policies). `networkPolicy.enabled: false` drops THIS
-  policy too — but then the server policy's deny-all is also gone, so the
-  operator owns the worker port's reachability via their own L3/L4 / mesh
-  controls. Enabling the metrics listener under `networkPolicy.enabled:
-  false` is therefore the operator's explicit choice to govern exposure
-  elsewhere.
+  app-pod + Job-scoped policies). `networkPolicy.enabled: false` is a
+  documented escape hatch for the app-pod/Job-scoped policies (an operator
+  governing exposure via their own L3/L4 / mesh controls instead), and it
+  drops THIS policy too — that combination is fine when
+  `worker.metrics.enabled` is false, since there is no listener to protect.
+  It is also fine whenever `worker.enabled` is false: with no worker pod
+  there is no `/metrics` listener and nothing for a NetworkPolicy to
+  protect, no matter how `worker.metrics.enabled` is left set — so a
+  disabled worker can carry `worker.metrics.enabled: true` and
+  `networkPolicy.enabled: false` together and still render cleanly.
+  It is NOT fine when a worker actually exists (`worker.enabled: true`)
+  combined with `worker.metrics.enabled: true`: the listener turns on,
+  THIS policy does not render (its gate below requires
+  `networkPolicy.enabled`), and the server policy's deny-all is also gone —
+  an unauthenticated scrape port with no NetworkPolicy at all. That degrades
+  the "ONE structural action" pairing above to nothing, and it is the one
+  combination of the three flags nothing else rejects, so it fails the
+  render below, unconditionally (outside this file's normal render gate,
+  which this exact combination would otherwise skip entirely). Every other
+  combination of the three flags stays renderable.
 */}}
+{{- if and .Values.worker.enabled .Values.worker.metrics.enabled (not .Values.networkPolicy.enabled) -}}
+{{- fail "worker.metrics.enabled=true with networkPolicy.enabled=false would expose the worker's unauthenticated /metrics listener with no NetworkPolicy protecting it at all -- enabling the listener and rendering its NetworkPolicy are meant to be ONE structural action, and this combination silently collapses that pairing to nothing. Set networkPolicy.enabled: true (the default) or leave worker.metrics.enabled: false." -}}
+{{- end -}}
 {{- if and .Values.worker.enabled .Values.worker.metrics.enabled .Values.networkPolicy.enabled -}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

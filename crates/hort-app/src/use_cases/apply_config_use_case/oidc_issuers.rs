@@ -287,6 +287,8 @@ mod tests {
             h.oidc_issuers.clone(),
             h.service_accounts.clone(),
             h.users.clone(),
+            // See `build_harness_with_lint_config` — same default posture.
+            Arc::new(["npm".to_string()].into_iter().collect()),
         )
         // Permissive linter (see `build_harness`) —
         // the OIDC warm-up tests apply only `oidc_issuers` envelopes,

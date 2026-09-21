@@ -2,7 +2,7 @@ use bytes::Bytes;
 
 use crate::error::{DomainError, DomainResult};
 use crate::types::checksum::UpstreamPublishedChecksum;
-use crate::types::{ArtifactCoords, PayloadAccess, Sbom};
+use crate::types::{ArtifactCoords, ArtifactKind, PayloadAccess, Sbom};
 
 /// How a format handler wants ingest to persist its payload metadata.
 ///
@@ -75,9 +75,11 @@ pub trait VersionDiscovery: Send + Sync {
     ///
     /// **Phase-1 scope cap.** Reference implementations exist for
     /// `npm` (packument `versions{}` keys), `cargo` (sparse-index
-    /// NDJSON `vers` field per line), and `pypi` (PEP 503 HTML anchor
-    /// list parsed via the filename → version extractor). A format that
-    /// does not implement `VersionDiscovery` at all (maven, oci, helm,
+    /// NDJSON `vers` field per line), `pypi` (PEP 503 HTML anchor
+    /// list parsed via the filename → version extractor), and `maven`
+    /// (A-level `maven-metadata.xml` `<versioning><versions>` list).
+    /// A format that
+    /// does not implement `VersionDiscovery` at all (oci, helm,
     /// rpm, debian, generic, …) never reaches this method — the
     /// scheduled tick reads `version_discovery() == None` as "format has
     /// no Phase-1 upstream-version discovery" and silently skips it.
@@ -142,8 +144,12 @@ pub trait VersionDiscovery: Send + Sync {
     ///   top-level `<dir>/Cargo.toml` inside it.
     /// - **pypi** — the wheel (zip) / sdist (gzip-tar); `Requires-Dist` lives
     ///   in `*.dist-info/METADATA` inside the wheel.
+    /// - **maven** — the `.pom` itself. The one participating format whose
+    ///   declared manifest is NOT inside a container: the POM is stored as
+    ///   its own group member, so there is no archive to open.
     ///
-    /// Each implementing handler is **archive-aware**: it locates its declared
+    /// Each implementing handler whose artifact IS a container is
+    /// **archive-aware**: it locates its declared
     /// runtime manifest inside the artifact (via the audited
     /// `hort-formats::archive_bounds` extractor) and parses it. (An earlier
     /// contract — "a just-ingested artifact's pre-selected manifest body" —
@@ -164,7 +170,8 @@ pub trait VersionDiscovery: Send + Sync {
     ///
     /// The `range` field stays opaque (a [`String`] in the format's
     /// native range syntax — `"^1.2"` for npm, `">=2,<3"` for PyPI,
-    /// `"2.x"` for cargo, `"[1.0,2.0)"` for Maven). Parsing the range
+    /// `"2.x"` for cargo, `"31.1-jre"` for Maven, whose bare version is a
+    /// soft requirement satisfied only by itself). Parsing the range
     /// is the per-format
     /// [`resolve_range_max`](Self::resolve_range_max) implementation's
     /// concern, not the caller's; different formats have different
@@ -176,7 +183,7 @@ pub trait VersionDiscovery: Send + Sync {
     /// stored artifact via the per-format `hort-formats` archive helpers.
     ///
     /// A format without a machine-readable runtime-dep concept
-    /// (oci, generic, raw uploads, helm, Maven) simply does not implement
+    /// (oci, generic, raw uploads, helm) simply does not implement
     /// `VersionDiscovery`; a participating format with nothing to declare
     /// returns `Ok(Vec::new())`, which the cascade reads as "no
     /// transitive deps to enqueue". Returning
@@ -185,6 +192,14 @@ pub trait VersionDiscovery: Send + Sync {
     /// a missing declared manifest entry, an unparseable manifest, or an
     /// `archive_bounds` guard trip; a well-formed artifact whose manifest
     /// declares zero runtime deps must return `Ok(vec![])`, not `Err`.
+    ///
+    /// **"Well-formed but unresolvable" is `Ok`, not `Err`.** A manifest a
+    /// handler parses successfully but cannot fully interpret — a Maven POM
+    /// whose versions are all held by its parent, an sdist whose PKG-INFO
+    /// carries no `Requires-Dist` — is valid input, and returning `Err`
+    /// there aborts the cascade for the whole artifact instead of partially
+    /// warming it. Handlers count what they could not resolve (see
+    /// `hort-formats::maven::pom::PomSkipReason`) rather than failing.
     fn extract_dependency_specs(
         &self,
         content: &mut dyn std::io::Read,
@@ -726,16 +741,46 @@ pub trait FormatHandler: Send + Sync {
     /// realisation note (issue #58).
     ///
     /// **Why the default is `None` and not a required method:** every
-    /// non-participating format (OCI, Maven, Helm, and any future Tier-C)
+    /// non-participating format (OCI, Helm, and any future Tier-C)
     /// would otherwise need a boilerplate `None` override. The default is
     /// safe here precisely because it is *one* method whose meaning is "I
     /// do not participate" — unlike the eight per-method defaults this
     /// accessor replaced, each of which used to silently fake a behaviour.
     ///
-    /// npm, cargo, and pypi implement [`VersionDiscovery`] and return
-    /// `Some(self)`. Every other format inherits this default.
+    /// npm, cargo, pypi, and maven implement [`VersionDiscovery`] and
+    /// return `Some(self)`. Every other format inherits this default.
+    /// `hort-formats/tests/version_discovery_participation.rs` pins the
+    /// participating set against an exhaustive `RepositoryFormat` match,
+    /// so a change here cannot drift from the declared classification.
     fn version_discovery(&self) -> Option<&dyn VersionDiscovery> {
         None
+    }
+
+    /// What this artifact's stored bytes **are**, so a content scanner
+    /// can materialise them the way its analyzers expect.
+    ///
+    /// A scanner like Trivy selects analyzers by file name, extension and
+    /// directory layout and does not open archives in filesystem mode, so
+    /// an adapter handed only a content hash has no way to write the
+    /// bytes down under a name any analyzer will look at. The knowledge
+    /// of what the bytes are belongs to the format, so it is answered
+    /// here and travels to the adapter on
+    /// [`ScanTarget`](crate::ports::scanner::ScanTarget).
+    ///
+    /// Answer from what the handler already knows about its own layout —
+    /// a Maven path's extension, an OCI row's path prefix, the one
+    /// payload shape npm and cargo publish. This is a classification of
+    /// the row, not an inspection of the payload: no I/O, and the
+    /// `Artifact` is the only input.
+    ///
+    /// Default [`ArtifactKind::Other`] — the honest answer for a format
+    /// whose payload is opaque. It does **not** mean "scan it
+    /// generically": there is no generic materialisation, so a scanner
+    /// handed `Other` reports that it had nothing to analyse rather than
+    /// an empty (clean-looking) finding list.
+    fn scan_kind(&self, artifact: &crate::entities::artifact::Artifact) -> ArtifactKind {
+        let _ = artifact;
+        ArtifactKind::Other
     }
 
     /// Extract a deterministic SBOM from the ingested payload.
@@ -982,6 +1027,61 @@ mod tests {
         assert_eq!(DefaultsOnlyHandler.metadata_expected_max_bytes(), 64 * 1024);
     }
 
+    /// Build an artifact row good enough to classify. Only `path` and
+    /// `content_type` carry any signal for `scan_kind`; the rest exists
+    /// to satisfy the struct.
+    fn scan_kind_artifact(path: &str) -> crate::entities::artifact::Artifact {
+        use crate::entities::artifact::{Artifact, QuarantineStatus};
+        Artifact {
+            id: uuid::Uuid::nil(),
+            repository_id: uuid::Uuid::nil(),
+            name: "x".into(),
+            name_as_published: "x".into(),
+            version: Some("1.0.0".into()),
+            path: path.into(),
+            size_bytes: 1,
+            sha256_checksum: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+            sha1_checksum: None,
+            md5_checksum: None,
+            content_type: "application/octet-stream".into(),
+            quarantine_status: QuarantineStatus::None,
+            rejection_reason: None,
+            quarantine_window_start: None,
+            quarantine_deadline: None,
+            provenance_hold_indefinite: false,
+            deleted_at: None,
+            upstream_published_at: None,
+            uploaded_by: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A handler that does not classify its payload inherits `Other` —
+    /// "no materialisation makes these bytes analysable" — and never the
+    /// optimistic guess that would let an unexamined artifact look clean.
+    #[test]
+    fn default_scan_kind_is_other() {
+        assert_eq!(
+            DefaultsOnlyHandler.scan_kind(&scan_kind_artifact("whatever/1.0.0/thing.jar")),
+            ArtifactKind::Other
+        );
+    }
+
+    /// The default ignores every field of the row: it is a declaration of
+    /// non-participation, not a heuristic that happens to look at paths.
+    #[test]
+    fn default_scan_kind_ignores_the_artifact_row() {
+        let jar = scan_kind_artifact("g/a/1.0/a-1.0.jar");
+        let pom = scan_kind_artifact("g/a/1.0/a-1.0.pom");
+        assert_eq!(
+            DefaultsOnlyHandler.scan_kind(&jar),
+            DefaultsOnlyHandler.scan_kind(&pom)
+        );
+    }
+
     #[test]
     fn default_build_artifact_logical_path_returns_validation_error() {
         // A format without a logical-path projection
@@ -1067,6 +1167,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             upstream_published_at: None,
             uploaded_by: None,
             created_at: chrono::Utc::now(),

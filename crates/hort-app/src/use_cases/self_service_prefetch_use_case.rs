@@ -152,9 +152,7 @@ use crate::metrics::{
 };
 use crate::ports::upstream_metadata::UpstreamMetadataPort;
 use crate::rbac::RbacEvaluator;
-use crate::use_cases::index_serve_filter::{
-    CargoSemverOrdering, NpmSemverOrdering, Pep440Ordering, VersionOrdering,
-};
+use crate::use_cases::index_serve_filter::{ordering_for_format, VersionOrdering};
 use crate::use_cases::virtual_resolution::VirtualResolutionUseCase;
 
 // Exact wording propagated verbatim to the client via
@@ -419,12 +417,17 @@ impl SelfServicePrefetchUseCase {
         };
 
         // Per-format ordering for the "pick latest" path (version = None
-        // resolves to the newest upstream-advertised version). The
-        // `+ Sync` bound is load-bearing — the per-item async loop
+        // resolves to the newest upstream-advertised version), resolved
+        // through the workspace's one canonical format-to-ordering
+        // mapping — the same one the scheduled prefetch tick uses, so
+        // the two prefetch surfaces cannot disagree about how a format
+        // sorts its versions.
+        //
+        // The `+ Sync` bound is load-bearing — the per-item async loop
         // holds the ref across `.await` points, which requires the
         // resulting future to be `Send` (and for that, every borrow
         // held across an await must be `Sync`).
-        let ordering: Option<&(dyn VersionOrdering + Sync)> =
+        let ordering: Option<&(dyn VersionOrdering + Send + Sync)> =
             ordering_for_format(&repository.format);
 
         // -------- Per-item iteration ----------------------------------
@@ -480,7 +483,7 @@ impl SelfServicePrefetchUseCase {
         is_virtual: bool,
         members: &[Repository],
         resolved_target: &Option<(Uuid, RepositoryUpstreamMapping)>,
-        ordering: Option<&(dyn VersionOrdering + Sync)>,
+        ordering: Option<&(dyn VersionOrdering + Send + Sync)>,
         item: PrefetchRequestItem,
         outcome: &mut PrefetchOutcome,
     ) {
@@ -516,16 +519,16 @@ impl SelfServicePrefetchUseCase {
                     .await
                 {
                     Ok(versions) => {
-                        // `ordering` is `None` only for a format
-                        // `ordering_for_format` does not recognise —
+                        // `ordering` is `None` only for a format the
+                        // canonical mapping does not recognise —
                         // structurally, that is exactly the set of
                         // formats whose `list_versions` call above
-                        // already fails with `UnsupportedFormat` (see
-                        // `ordering_for_format`'s doc), so a successful
-                        // `Ok(versions)` here is provably paired with
-                        // `Some(ordering)` today. Fail closed rather
-                        // than mis-order or panic if that invariant
-                        // is ever violated by a future format.
+                        // already fails with `UnsupportedFormat`, so a
+                        // successful `Ok(versions)` here is provably
+                        // paired with `Some(ordering)`. Fail closed
+                        // rather than mis-order or panic if that
+                        // invariant is ever violated by a future
+                        // format.
                         let Some(ordering) = ordering else {
                             tracing::warn!(
                                 repository = %repository.key,
@@ -997,59 +1000,6 @@ impl SelfServicePrefetchUseCase {
         }
 
         Ok(job)
-    }
-}
-
-/// Per-format ordering selector. The three formats in scope
-/// (npm / pypi / cargo) each have an existing `VersionOrdering`
-/// implementation in `index_serve_filter`. Every other format returns
-/// `None` — they cannot reach the per-item version-resolution path
-/// because the OCI rejection (gate 3) short-circuits the only
-/// currently-supported non-npm/pypi/cargo format, and other formats
-/// return `UpstreamFetchError::UnsupportedFormat` from the upstream port
-/// so the ordering is never actually consulted (`process_item`'s
-/// `Ok(versions)` arm fails closed on `None` rather than trusting that
-/// invariant blindly).
-///
-/// **No wildcard default (issue #58).** This used to fall through to
-/// `NpmSemverOrdering` for any unrecognised format — a silent-mis-order
-/// footgun the ADR 0005 register's *Maven Phase-2 prefetch* row flagged:
-/// a future format that starts returning real upstream versions from
-/// `list_versions` without also being added here would get silently
-/// ordered as npm-semver, with no test to catch it. `None` makes that
-/// same future mistake fail closed (an `Internal` per-item error) instead
-/// of silently wrong. See ADR 0005's `VersionDiscovery` realisation note.
-fn ordering_for_format(format: &RepositoryFormat) -> Option<&'static (dyn VersionOrdering + Sync)> {
-    // Pin static singletons so the returned `&dyn VersionOrdering` is
-    // `'static` — the use-case method holds the ref across `.await`
-    // points without dragging the use-case lifetime.
-    static NPM: NpmSemverOrdering = NpmSemverOrdering;
-    static PEP440: Pep440Ordering = Pep440Ordering;
-    // CargoSemverOrdering is a `pub type` alias for NpmSemverOrdering;
-    // we reuse the NPM singleton (identical behavior — see the alias
-    // doc in `index_serve_filter.rs:419`).
-    static CARGO: CargoSemverOrdering = NpmSemverOrdering;
-    match format {
-        RepositoryFormat::Npm => Some(&NPM),
-        RepositoryFormat::Pypi => Some(&PEP440),
-        RepositoryFormat::Cargo => Some(&CARGO),
-        // Every other format either was rejected at gate 3 (OCI) or
-        // returns `UnsupportedFormat` from the upstream port (so the
-        // planner sees `version = Some(_)` and bypasses the ordering
-        // selection altogether).
-        //
-        // Maven is unreachable here TODAY: `hort-formats-upstream`
-        // rejects Maven `list_versions` with
-        // `UpstreamFetchError::UnsupportedFormat`, so the self-service
-        // planner never consults this ordering for a Maven repo. A
-        // `MavenVersionOrdering` exists (`index_serve_filter`) but is
-        // consumed only by the Maven serve/builder path.
-        // **Coupling (design §4(d)):** enabling Maven prefetch (Phase-2)
-        // MUST add the Maven arm HERE *and* to
-        // `prefetch_tick::ordering_for_format` *and* to the
-        // `hort-formats-upstream` dispatch + `MavenFormatHandler`'s
-        // `VersionDiscovery` participation — together.
-        _ => None,
     }
 }
 
@@ -2880,23 +2830,23 @@ mod tests {
         );
     }
 
-    /// Issue #58: the `ordering_for_format` wildcard footgun's replacement
-    /// fail-closed path. Production never actually reaches this branch
-    /// (`hort-formats-upstream`'s dispatch already rejects Maven's
-    /// `list_versions` with `UnsupportedFormat` — see
-    /// `ordering_for_format`'s own doc), so this test deliberately seeds
-    /// the `MockUpstreamMetadataPort` to return `Ok(_)` for a Maven
-    /// package — a shape the real port would never produce — purely to
-    /// drive `process_item`'s `let Some(ordering) = ordering else { ... }`
-    /// fail-closed arm and prove it surfaces `Internal` (not a silent
-    /// npm-semver mis-order, and not a panic) rather than being
-    /// unreachable-and-untested.
+    /// The fail-closed path for a format that resolves no
+    /// `VersionOrdering`. Production never actually reaches this branch
+    /// — a format with no ordering is a format the upstream dispatch
+    /// already rejects with `UnsupportedFormat`, so `Ok(versions)` and
+    /// `None` ordering cannot co-occur — so this test deliberately
+    /// seeds the `MockUpstreamMetadataPort` to return `Ok(_)` for a
+    /// RubyGems package (a shape the real port would never produce)
+    /// purely to drive `process_item`'s
+    /// `let Some(ordering) = ordering else { ... }` arm and prove it
+    /// surfaces `Internal` — not a silent mis-order under some other
+    /// format's comparator, and not a panic.
     #[test]
     fn list_versions_success_with_no_ordering_surfaces_internal_not_panic() {
         let snap = capture(|| {
             Box::pin(async {
                 let mut repo = sample_repository();
-                repo.format = RepositoryFormat::Maven;
+                repo.format = RepositoryFormat::Rubygems;
                 repo.is_public = false;
                 let repo_id = repo.id;
                 let key = repo.key.clone();
@@ -2906,10 +2856,10 @@ mod tests {
                 let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
                 mappings.upsert(mapping(repo_id)).await.unwrap();
                 let upstream = Arc::new(MockUpstreamMetadataPort::new());
-                // Deliberately unrealistic: real Maven `list_versions`
+                // Deliberately unrealistic: real RubyGems `list_versions`
                 // never succeeds (UnsupportedFormat) — seeded here only
                 // to reach the defensive fail-closed arm under test.
-                upstream.insert_versions("maven", "p", Ok(vec!["1.0".to_string()]));
+                upstream.insert_versions("rubygems", "p", Ok(vec!["1.0".to_string()]));
                 let jobs = Arc::new(MockJobsRepository::new());
                 let rbac = Arc::new(ArcSwap::from_pointee(evaluator_with_read_and_prefetch(
                     "dev", repo_id,
@@ -2941,40 +2891,12 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // Per-format ordering helper coverage
-    // ============================================================
-
-    #[test]
-    fn ordering_for_format_covers_each_supported_format() {
-        // Smoke check that the helper returns `Some(comparator)` for each
-        // in-scope format (npm / pypi / cargo). The implementations
-        // themselves are tested in `index_serve_filter` — here we just
-        // verify dispatch.
-        assert!(ordering_for_format(&RepositoryFormat::Npm).is_some());
-        assert!(ordering_for_format(&RepositoryFormat::Pypi).is_some());
-        assert!(ordering_for_format(&RepositoryFormat::Cargo).is_some());
-        // Sanity check: each returns ordering consistent with semver
-        // `1.0.0 < 2.0.0`.
-        assert_eq!(
-            ordering_for_format(&RepositoryFormat::Npm)
-                .expect("npm")
-                .compare("1.0.0", "2.0.0"),
-            std::cmp::Ordering::Less
-        );
-    }
-
-    /// Issue #58: the former `_ => &NpmSemverOrdering` wildcard silently
-    /// mis-ordered any unrecognised format as npm-semver. `None` is the
-    /// fail-closed replacement — every format outside the in-scope three
-    /// returns `None`, not a fallback comparator.
-    #[test]
-    fn ordering_for_format_returns_none_for_non_participating_formats() {
-        assert!(ordering_for_format(&RepositoryFormat::Maven).is_none());
-        assert!(ordering_for_format(&RepositoryFormat::Oci).is_none());
-        assert!(ordering_for_format(&RepositoryFormat::Helm).is_none());
-        assert!(ordering_for_format(&RepositoryFormat::Generic).is_none());
-    }
+    // The format-to-ordering mapping is pinned where it lives
+    // (`index_serve_filter`), including the fact that a format outside
+    // the `VersionDiscovery` set resolves `None` rather than a fallback
+    // comparator. This use case only consumes it; a second copy of
+    // those assertions here is the duplication that let the two
+    // prefetch surfaces drift apart in the first place.
 
     // ============================================================
     // upstream_fetch_to_item_error coverage

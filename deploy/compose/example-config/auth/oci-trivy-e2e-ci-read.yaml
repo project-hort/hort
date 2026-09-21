@@ -1,0 +1,21 @@
+# PermissionGrant: serviceAccount oci-trivy-e2e-ci -> read oci-trivy-e2e.
+#
+# The push itself needs only the sibling write grant, but under the
+# native-tokens overlay the scenario mints ONE `/v2`-scoped token for the
+# whole run and skopeo's copy issues reads (pre-flight blob existence, the
+# manifest read-back) on it. A write-only scope would 403 those before the
+# quarantine gate ever ran, which is not what the scenario is testing.
+# Resolves at apply to the SA's backing user (GrantSubject::User).
+#
+# The repository is public, so this grant adds no visibility a reader did
+# not already have; it exists so the minted token carries a pull scope.
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: oci-trivy-e2e-ci-read
+spec:
+  subject:
+    kind: serviceAccount
+    name: oci-trivy-e2e-ci
+  permission: read
+  repository: oci-trivy-e2e

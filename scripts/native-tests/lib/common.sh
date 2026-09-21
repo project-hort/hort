@@ -145,17 +145,42 @@ bounded_poll() {
   done
 }
 
-# metrics_scrape_diag <url> — one-shot GET of a metrics endpoint, echoes
-# "HTTP <code> (curl exit <n>)" for FAIL-message diagnostics. `-w
-# '%{http_code}'` without `-f` so a non-2xx still yields a real status
-# instead of curl swallowing the body and reporting only exit 22; a
-# transport-level failure (no response at all) surfaces as HTTP <none>
-# with the actual curl exit code. Never itself fails the caller.
+# metrics_scrape_diag <url> [line_prefix] — one-shot GET of a metrics
+# endpoint, echoes "HTTP <code> (curl exit <n>)" for FAIL-message
+# diagnostics. `-w '%{http_code}'` without `-f` so a non-2xx still yields a
+# real status instead of curl swallowing the body and reporting only exit
+# 22; a transport-level failure (no response at all) surfaces as HTTP
+# <none> with the actual curl exit code. Never itself fails the caller.
+#
+# <line_prefix>, when given, appends the body's byte/line counts plus every
+# line starting with <line_prefix> (capped at 40, so a runaway body cannot
+# bury the log), or an explicit "no <line_prefix>* lines in body" when none
+# match. Lets a FAIL distinguish, without a re-run, the three cases a bare
+# HTTP status cannot tell apart: the metric is absent, the metric is
+# present under a different label than the one being polled for, or the
+# body was truncated.
 metrics_scrape_diag() {
-  local url="$1" code rc
-  code=$(curl -s "${METRICS_AUTH_HEADER[@]}" -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)
+  local url="$1" prefix="${2:-}" code rc body_file diag
+  body_file="$(mktemp)"
+  code=$(curl -s "${METRICS_AUTH_HEADER[@]}" -o "$body_file" -w '%{http_code}' --max-time 5 "$url" 2>/dev/null)
   rc=$?
-  printf 'HTTP %s (curl exit %d)' "${code:-<none>}" "$rc"
+  diag=$(printf 'HTTP %s (curl exit %d)' "${code:-<none>}" "$rc")
+  if [ -n "$prefix" ]; then
+    local bytes lines matched total_matched shown
+    bytes=$(wc -c <"$body_file" | tr -d '[:space:]')
+    lines=$(wc -l <"$body_file" | tr -d '[:space:]')
+    matched=$(grep -E "^${prefix}" "$body_file" 2>/dev/null || true)
+    if [ -n "$matched" ]; then
+      total_matched=$(printf '%s\n' "$matched" | wc -l | tr -d '[:space:]')
+      shown=$(printf '%s\n' "$matched" | head -n 40)
+      diag="${diag}, body ${bytes}B/${lines} lines, ${total_matched} ${prefix}* line(s) (showing up to 40):
+${shown}"
+    else
+      diag="${diag}, body ${bytes}B/${lines} lines, no ${prefix}* lines in body"
+    fi
+  fi
+  rm -f "$body_file"
+  printf '%s' "$diag"
 }
 
 # metrics_scrape_preflight <label> — posture-aware gate for scenarios that

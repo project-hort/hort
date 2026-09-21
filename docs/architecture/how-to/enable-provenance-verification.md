@@ -191,7 +191,7 @@ fail-closed — the proxy stays available on upstream flakiness).
 > emits with `--new-bundle-format`. An image signed **only** with **legacy
 > cosign `simplesigning`** (the pre-`--new-bundle-format`, annotation-based
 > `.sig`) is **not** verified: it yields `no_attestation` (allowed under
-> `verify_if_present`; rejected `Unsigned` under `required`). This is a
+> `verify_if_present`; held indefinitely under `required`). This is a
 > real, named limitation — reconstructing a v0.3 bundle from the legacy
 > `.sig` annotations is explicitly out of scope. A `verified` verdict
 > requires the upstream to publish a
@@ -241,14 +241,15 @@ spec:
 ```
 
 `required` is meaningful **on a proxy too**: the worker verifies the
-upstream signature when present and emits `ProvenanceRejected{Unsigned}`
-(terminal) when the upstream genuinely ships no Sigstore v0.3 bundle —
-which is exactly what `required` asks for. There is **no** apply-time
-"reject `required` on a proxy" guard: now that the fetch capability ships,
-the mode is correct on a proxy, not a footgun. An
-image carrying only a legacy `simplesigning` signature is **not** verified
-(see the limitation above) and is therefore rejected `Unsigned` under
-`required`.
+upstream signature when present, and **holds** the artifact when the
+upstream genuinely ships no Sigstore v0.3 bundle — which is exactly what
+`required` asks for. A held artifact is as unpullable as a rejected one
+(503, layer bytes withheld), but the hold stays correctable if the
+upstream later publishes a signature. There is **no** apply-time "reject
+`required` on a proxy" guard: now that the fetch capability ships, the
+mode is correct on a proxy, not a footgun. An image carrying only a
+legacy `simplesigning` signature is **not** verified (see the limitation
+above) and is therefore held under `required`.
 
 Apply-time validation **rejects** a policy that would be impossible to
 satisfy:
@@ -346,15 +347,16 @@ quarantine window and re-verifies when the signature arrives (issue #13).
 > `sha256-<hex>.sig` tag mode is **not** linked to its subject on the
 > hosted push path — a signature pushed that way carries no `subject`, is
 > never linked into local carriage, and stays **invisible to the
-> verifier**, so the image is never cleared and rejects `Unsigned` at
-> window expiry. The `oci-1-1` referrers mode is the supported carriage; the
+> verifier**, so the image is never cleared and stays held — no amount of
+> waiting changes it. The `oci-1-1` referrers mode is the supported carriage; the
 > legacy tag scheme is honored only on the upstream-proxy fetch path. See
 > [ADR 0039 §9](../../adr/0039-keyed-provenance-verification.md).
 
 ### What you will observe while the image is held
 
-For an unsigned `required` image **within** its `quarantineDuration`
-window:
+For an unsigned `required` image — **within its `quarantineDuration`
+window or past it**; the window is an exposure budget, never a signing
+deadline:
 
 - A **pull** (anonymous or read-only manifest `GET`, and any layer blob)
   returns **503** — the image is not yet consumable.
@@ -370,43 +372,75 @@ window:
   `--registry-referrers-mode=oci-1-1`), hort **re-verifies** the subject image;
   a valid signature emits `ProvenanceVerified` and the image **clears** and
   releases (once the scan/time gate is also satisfied).
-- If the image is **still unsigned at window expiry**, hort makes the
-  terminal decision and rejects it `Unsigned` (`ProvenanceRejected`).
+- If the image is **still unsigned at window expiry**, nothing happens to
+  it: it stays held, indefinitely. A missing signature is a statement
+  about a point in time — the very next second can falsify it — so it
+  never produces a terminal state (ADR 0039's 2026-09-12 amendment,
+  D1/D4). A signature that lands a day later still clears and releases
+  the image. The one visible difference past expiry is that the `503`
+  stops carrying `Retry-After`: the hold is now waiting on an external
+  event, not on the clock, and advertising a retry schedule it does not
+  have would put well-behaved clients in an unbounded retry loop (D5).
+- The exits from a hold are therefore: a signature (directly, or via the
+  subject cascade for constituents), or an operator decision — an admin
+  release, a curator waiver, or deleting the artifact. Retention is not
+  one of them: `quarantined` and `rejected` are both GC-protected as
+  evidence.
 
 A **bad** signature is not held — a forged, wrong-key, or
 digest-mismatched signature is rejected **immediately**, even mid-window (a
-missing signature is time-dependent; a wrong one is already wrong).
+missing signature is time-dependent; a wrong one is already wrong). A
+**positive disproof** like that is the only thing that terminally rejects
+on the provenance axis.
 
-> **Only *subjects* are ever terminally unsigned.** cosign signs the
-> manifest or index digest, so a manifest and an index are **subjects** —
-> rows that could have carried a signature, and for which "still unsigned
-> at window expiry" is a real, terminal verdict. An image's **config and
-> layer blobs** are **constituents**: their content is already covered by
-> the signature over the manifest that names them, and they carry no
-> attestation of their own — ever. A constituent is therefore **never**
-> rejected `Unsigned` on its own. It is **held** (observable as
-> `hort_provenance_verify_total{result="held_pending_subject"}`) until its
-> subject clears it: automatically, when the subject's signature is
-> verified, or when a constituent that arrives *after* its subject was
-> verified self-clears at its own ingest. This is why a
-> **`quarantineDuration` shorter than your push takes** is safe:
-> it shortens only the *subject's* observation window — your signing
-> budget — and never turns a correctly signed image's layers into
-> unrecoverable rejections, whatever order your client pushed them in.
+> **Upgrading from a build that predates the 2026-09-12 amendment?** That
+> build *did* terminally reject an unsigned `required` artifact, and left
+> it `rejected` with no `ArtifactRejected` behind the status —
+> unreachable by re-evaluate, waive, release or a re-push. Those
+> artifacts need the one-shot repair in
+> [Recovering stranded artifacts](recover-stranded-artifacts.md) §5,
+> which is dry-run by default.
+
+> **Subjects and constituents wait for different things.** cosign signs
+> the manifest or index digest, so a manifest and an index are
+> **subjects** — rows that could carry a signature of their own, and whose
+> hold is observable as
+> `hort_provenance_verify_total{result="held_pending_signature"}`. An
+> image's **config and layer blobs** are **constituents**: their content
+> is already covered by the signature over the manifest that names them,
+> and they carry no attestation of their own — ever. A constituent is
+> **held** under the distinct
+> `hort_provenance_verify_total{result="held_pending_subject"}` label
+> until its subject clears it: automatically, when the subject's signature
+> is verified, or when a constituent that arrives *after* its subject was
+> verified self-clears at its own ingest. Nothing is waiting for the blob
+> itself to be signed, so reporting it as `held_pending_signature` would
+> send you to check your signer for no reason. Neither row's hold ends on
+> a timer, which is why a **`quarantineDuration` shorter than your push
+> takes** is safe: it shortens only the *exposure* window and can never
+> turn a correctly signed image — or its layers — into an unrecoverable
+> rejection, whatever order your client pushed them in.
 >
 > A constituent whose subject never arrives (a blob pushed without its
-> manifest) stays held indefinitely and ages out through retention. That
-> is deliberate: held bytes serve nothing, and any "orphan timer" would
-> just be a second observation window with the same race. If you need such
-> a row gone sooner, delete it — do not shorten the window expecting a
-> rejection.
+> manifest) stays held indefinitely. That is deliberate: held bytes serve
+> nothing, and any "orphan timer" would just be a second observation
+> window with the same race. If you need such a row gone, delete it — do
+> not shorten the window expecting a rejection, and do not expect
+> retention to reclaim it (`quarantined` rows are GC-protected as
+> evidence).
 
-> **The "images waiting to be signed" signal.** The
+> **The "images waiting to be signed" signals.** The
 > `hort_provenance_verify_total{result="held_pending_signature"}` counter
-> increments each time an unsigned `required` image is held mid-window.
-> A sustained non-zero rate with no matching `verified` follow-through means
-> images are being pushed but not signed — a broken or misconfigured signer
-> (e.g. the legacy tag mode). See `docs/metrics-catalog.md`.
+> increments each time an unsigned `required` image is held. A sustained
+> non-zero rate with no matching `verified` follow-through means images
+> are being pushed but not signed — a broken or misconfigured signer
+> (e.g. the legacy tag mode).
+>
+> Because the hold is indefinite, that counter — which counts verify
+> *events* — is not the whole picture: it cannot tell you whether the held
+> set is churning or stuck. For the standing population, use the
+> projection surface instead of a metric: today the admin curation queue,
+> and, once it exists, retention's overview. See `docs/metrics-catalog.md`.
 
 For the design rationale — provenance as an AND-precondition on the timer
 release arm, the fail-closed hold, and the granted-write hold-read
@@ -430,7 +464,8 @@ exemption — see
   - `hort_provenance_reject_total{backend="cosign", reason}` — the
     per-reason breakdown of rejections.
   These are emitted by the **worker** and are scrapeable from the worker's
-  `/metrics` listener — see *Worker metrics* below.
+  `/metrics` listener — see *Worker metrics* below. The standing held
+  population itself is not a metric — see the admin curation queue.
 - Per-job verdict: the `provenance-verify` job records a compact
   `result_summary` on its job row, one of
   `{"result": "verified"}`,
@@ -522,4 +557,4 @@ Why this is structured as one knob, not two:
 | Proxy image always `no_attestation` despite an upstream signature | The upstream signed only with **legacy `simplesigning`** (no `--new-bundle-format`) — not verified in Tier 1 | Re-sign upstream with a v0.3 Sigstore bundle (`cosign sign --new-bundle-format`); the legacy `.sig` is not reconstructed. |
 | No `hort_provenance_*` series in Prometheus | The worker `/metrics` listener is disabled (default) | Set `worker.metrics.enabled: true` + a `worker.metrics.scrapeFrom` Prometheus selector — the chart sets the bind, exposes the port, and co-renders the scrape NetworkPolicy (*Worker metrics* above). |
 | `cosign verify $HORT/image` 503s right after push (older builds) | Signature was quarantined — fixed: pushed Sigstore-bundle signatures land status `None` now | Upgrade to a build with the pure-bundle signature-manifest exemption; no quarantine wait for pure-signature pushes. |
-| `required` image never clears despite a `cosign sign` — rejects `Unsigned` at window expiry | Signed with the legacy `sha256-<hex>.sig` tag mode — not subject-linked on the hosted push path, so invisible to the verifier | Re-sign with `cosign sign --registry-referrers-mode=oci-1-1 <ref>@<digest>` (subject-based referrers) within the `quarantineDuration` window (*The push-then-sign CI flow* above). |
+| `required` image never clears despite a `cosign sign` — stays held (503) indefinitely | Signed with the legacy `sha256-<hex>.sig` tag mode — not subject-linked on the hosted push path, so invisible to the verifier | Re-sign with `cosign sign --registry-referrers-mode=oci-1-1 <ref>@<digest>` (subject-based referrers). The window is not a deadline: a correct re-sign clears the image whenever it lands (*The push-then-sign CI flow* above). |

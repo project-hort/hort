@@ -20,7 +20,7 @@
 //!   `upsert_self` happens on the heartbeat loop's first tick, NOT here,
 //!   so the row's existence and the loop's liveness are inseparable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -81,14 +81,18 @@ use hort_app::task_dispatcher::TaskDispatcher;
 use hort_app::task_handlers::eventstore_checkpoint::BackfillBaselineConfig;
 use hort_app::task_handlers::{
     AdvisoryWatchTickHandler, CronRescanTickHandler, EventStoreArchiveHandler,
-    EventstoreCheckpointHandler, NoopTaskHandler, OciMembershipEdgeBackfillHandler,
-    PrefetchDependenciesHandler, PrefetchIngestHandler, PrefetchRowRetentionSweepHandler,
-    PrefetchTickHandler, ProvenanceVerifyHandler, QuarantineReleaseSweepHandler,
-    ReplaySeenPruneHandler, RetentionEvaluateHandler, RetentionPurgeHandler,
-    ScanRowRetentionSweepHandler, ScanTaskHandler, ScannerRegistryPruneHandler, SeedImportHandler,
-    ServiceAccountRotationHandler, StagingSweepHandler, WheelMetadataBackfillHandler,
+    EventstoreCheckpointHandler, NoopTaskHandler, OciIndexChildIngestHandler,
+    OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler, PrefetchIngestHandler,
+    PrefetchRowRetentionSweepHandler, PrefetchTickHandler, ProvenanceVerifyHandler,
+    QuarantineReleaseSweepHandler, ReplaySeenPruneHandler, RetentionEvaluateHandler,
+    RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
+    ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
+    StagingSweepHandler, WheelMetadataBackfillHandler,
 };
 use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
+use hort_config::schema_compat::{
+    register_from_rows, schema_rollback_floor, SchemaCompatRegister, SchemaCompatibility,
+};
 // IngestUseCase + ArtifactGroupUseCase are the dep subtree the worker
 // side needs to construct the SeedImportUseCase the handler wraps.
 // Mirrors the shape and ordering of
@@ -183,6 +187,28 @@ pub struct BuildOutput {
     /// caller calls `dispatcher.run(cancel_token)` in a spawned task
     /// to start the generalised poll loop.
     pub dispatcher: TaskDispatcher,
+}
+
+/// The compiled-in format-handler registry, keyed by handler key.
+///
+/// Until the WASM module loader lands this is the canonical list, and
+/// it is the same one `hort-server` wires. Extracted from
+/// [`build_app_context`] so the scanner-capability parity guard can ask
+/// the *actual* registry which keys exist and what each handler
+/// declares — a second list maintained alongside this one would be free
+/// to drift, and a guard that drifts with the thing it guards proves
+/// nothing.
+///
+/// Constructing it opens nothing: every handler is a unit struct.
+#[must_use]
+pub fn compiled_in_format_handlers() -> HashMap<String, Arc<dyn FormatHandler>> {
+    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+    handlers.insert("pypi".into(), Arc::new(PyPiFormatHandler));
+    handlers.insert("cargo".into(), Arc::new(CargoFormatHandler));
+    handlers.insert("npm".into(), Arc::new(NpmFormatHandler));
+    handlers.insert("oci".into(), Arc::new(OciFormatHandler));
+    handlers.insert("maven".into(), Arc::new(MavenFormatHandler));
+    handlers
 }
 
 /// Build the full worker context. Steps mirror `hort-server`'s
@@ -460,24 +486,19 @@ pub async fn build_app_context(
     //    the orchestration call site preserves single-instance semantics
     //    for the scan path while handing a second handle to seed-import.
     //
-    //    `maven` participates here too: it has no `VersionDiscovery`
-    //    (no ordering, no upstream-metadata fan-out), so the auto-trigger
-    //    tick and the transitive-dependency cascade both fall through
-    //    their `handler.version_discovery()` guard and no-op for Maven
-    //    repos exactly as they already do for a registered handler with
-    //    no `VersionDiscovery` impl — a case both handlers have dedicated
-    //    coverage for. The leaf-ingest `PrefetchIngestHandler` below is
-    //    the consumer that actually needs the registration: without it,
-    //    the self-service prefetch endpoint's `prefetch` leaf-ingest rows
-    //    for a Maven repo short-circuit as "no FormatHandler registered"
-    //    before ever reaching the Maven pull-through arm.
+    //    `maven` declares `VersionDiscovery`, so the transitive-dependency
+    //    cascade reads a stored POM's own compile- and runtime-scope
+    //    `<dependencies>` and warms them, and the scheduled
+    //    `prefetch-tick` walks a Maven repo like any other participant —
+    //    it resolves `MavenVersionOrdering` through the canonical
+    //    `index_serve_filter::ordering_for_format` mapping.
+    //    The leaf-ingest `PrefetchIngestHandler` below is
+    //    the consumer that needs the registration unconditionally: without
+    //    it, the self-service prefetch endpoint's `prefetch` leaf-ingest
+    //    rows for a Maven repo short-circuit as "no FormatHandler
+    //    registered" before ever reaching the Maven pull-through arm.
     // -----------------------------------------------------------------
-    let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
-    handlers.insert("pypi".into(), Arc::new(PyPiFormatHandler));
-    handlers.insert("cargo".into(), Arc::new(CargoFormatHandler));
-    handlers.insert("npm".into(), Arc::new(NpmFormatHandler));
-    handlers.insert("oci".into(), Arc::new(OciFormatHandler));
-    handlers.insert("maven".into(), Arc::new(MavenFormatHandler));
+    let handlers = compiled_in_format_handlers();
 
     // -----------------------------------------------------------------
     // 8. QuarantineUseCase — the consumer of the orchestrator's
@@ -771,7 +792,8 @@ pub async fn build_app_context(
     //          single-flights the prefetch-vs-client-pull race.
     //
     //          `PrefetchRowRetentionSweepHandler` — periodically
-    //          deletes terminal `prefetch%` rows older than a
+    //          deletes terminal `prefetch%` and
+    //          `oci-index-child-ingest` rows older than a
     //          configurable horizon (default 7d). Enqueued by the
     //          `enqueue-prefetch-row-retention-sweep` hort-server
     //          subcommand.
@@ -1031,6 +1053,13 @@ pub async fn build_app_context(
         )),
         1,
     );
+
+    // The eager index-child ingest handler is registered further down, at
+    // the point where the live `UpstreamResolver` exists — it resolves each
+    // child through the same resolver the rest of the worker uses. Its
+    // dependency on `ingest_use_case` is carried there by this clone, taken
+    // before `SeedImportUseCase` below consumes the original.
+    let ingest_use_case_for_index_child = ingest_use_case.clone();
 
     let seed_import_use_case = Arc::new(SeedImportUseCase::new(
         ingest_use_case,
@@ -1418,6 +1447,12 @@ pub async fn build_app_context(
     // `HORT_UPSTREAM_RESOLVER_REFRESH_SECS` (default 60s, floor 5s) →
     // `reload`. With a primed resolver the proxy referrer-fetch arm fires
     // for proxy-scoped repos; hosted-repo provenance is unaffected.
+    //
+    // This ONE instance serves every worker consumer that needs it — the
+    // provenance orchestrator below and the eager index-child ingest handler
+    // registered just after it. A second instance would carry a second
+    // refresh clock, so the two could disagree about which upstream serves a
+    // name for up to a refresh interval.
     let caching_resolver = Arc::new(hort_adapters_upstream_http::CachingResolver::new());
     // Boot-prime from the same mapping repo the prefetch path uses. A
     // prime failure is logged but does NOT abort boot — an operator with
@@ -1478,6 +1513,75 @@ pub async fn build_app_context(
             }
         });
     }
+    // -----------------------------------------------------------------
+    // Register the OciIndexChildIngestHandler (kind
+    // `oci-index-child-ingest`). Registered HERE, after the boot-primed +
+    // background-refreshed `CachingResolver` above, so the handler resolves a
+    // child through the SAME resolver instance the rest of the worker uses
+    // rather than a second one with its own refresh clock. Its other
+    // dependency — `ingest_use_case`, for `ingest_verified` — is carried down
+    // from the leaf-prefetch block as `ingest_use_case_for_index_child`.
+    //
+    // Resolution is by the row's CLIENT-FACING requested name, which is what
+    // makes an eager child ingest fetch through exactly the mapping a lazy
+    // client pull of that child would use: the longest matching prefix, on a
+    // multi-upstream proxy whose mappings may all be prefix-scoped.
+    //
+    // One claimed row = one child manifest an OCI image index declared.
+    // The handler performs, up front, the verified upstream pull a later
+    // lazy client GET would have performed, so a multi-arch image's index
+    // quarantine window and its children's windows run concurrently
+    // instead of back to back. It shortens no window — the anchor still
+    // comes from `first_seen_for_checksum` (ADR 0054).
+    //
+    // Its own `HttpUpstreamProxy`, NOT a clone of the prefetch or
+    // provenance instance: `format_label` is the metric label fired on
+    // every outbound fetch, and cloning one subsystem's proxy into another
+    // mis-attributes its `hort_upstream_fetch_*` series (see
+    // docs/metrics-catalog.md — the worker's subsystem-labelled instances).
+    //
+    // Concurrency = 1 — single-active per worker replica, matching every
+    // other handler in this file. The per-row dedupe key already
+    // single-flights a given (repository, child digest), so raising
+    // concurrency buys parallelism only across distinct children, at the
+    // cost of N concurrent upstream fetches from one replica.
+    // -----------------------------------------------------------------
+    let upstream_proxy_for_index_child: Arc<dyn UpstreamProxy> = {
+        let cfg = hort_adapters_upstream_http::HttpUpstreamProxyConfig {
+            extra_trust_anchors: extra_ca.cloned(),
+            // Same upstream User-Agent as hort-server and the worker's other
+            // outbound legs (HORT_UPSTREAM_USER_AGENT or the built-in
+            // default), so a custom value applies uniformly.
+            user_agent: hort_adapters_upstream_http::user_agent_from_env(),
+            ..hort_adapters_upstream_http::HttpUpstreamProxyConfig::new("oci_index_child_ingest")
+        };
+        Arc::new(hort_adapters_upstream_http::HttpUpstreamProxy::new(
+            cfg,
+            secret_port.clone(),
+        )?)
+    };
+    let oci_handler_for_index_child: Arc<dyn FormatHandler> = handlers
+        .get("oci")
+        .expect(
+            "hort-worker composition: `oci` FormatHandler must be registered for \
+             OciIndexChildIngestHandler (it re-derives the ingested child's OCI \
+             membership edges)",
+        )
+        .clone();
+    dispatcher.register(
+        Arc::new(OciIndexChildIngestHandler::new(
+            repositories.clone(),
+            artifacts.clone(),
+            upstream_proxy_for_index_child,
+            caching_resolver.clone(),
+            content_references.clone(),
+            jobs.clone(),
+            oci_handler_for_index_child,
+            ingest_use_case_for_index_child,
+        )),
+        1, // single-active — see rationale above
+    );
+
     let upstream_resolver_for_provenance: Arc<dyn UpstreamResolver> = caching_resolver;
     register_provenance_verify(
         &mut dispatcher,
@@ -2195,18 +2299,31 @@ fn read_backfill_baseline() -> Option<BackfillBaselineConfig> {
 
 /// Schema-version assertion. Mirrors `hort-server::migrate::assert_current`
 /// shape exactly (does NOT create the bookkeeping table — the runtime
-/// `hort_app_role` does not have `CREATE TABLE` privilege). Copied rather
-/// than depended-on so the worker does not pull in `hort-server`.
-async fn assert_schema_current(pool: &PgPool) -> anyhow::Result<()> {
+/// `hort_app_role` does not have `CREATE TABLE` privilege). The migration
+/// set is embedded here rather than depended on so the worker does not
+/// pull in `hort-server`; the *rule* about which (binary, schema) pairs
+/// may boot is not duplicated — both binaries ask
+/// [`hort_config::schema_compat::SchemaCompatibility`], so a rolled-back
+/// worker and a rolled-back server accept exactly the same schemas.
+///
+/// The schema compatibility register is read here for the same reason:
+/// the *rule* the register feeds lives in `hort_config::schema_compat`,
+/// so a rolled-back worker refuses exactly the schemas a rolled-back
+/// server refuses. Only the `SELECT` is mirrored, and it stays a
+/// `SELECT` — the worker holds the runtime DSN and issues no DDL, so it
+/// never writes a register row (ADR 0009).
+///
+/// Public so the boot gate can be driven directly from an integration
+/// test against a throwaway database, the way the server's counterpart
+/// is; `build_app_context` needs far more of the environment than the
+/// gate itself does.
+pub async fn assert_schema_current(pool: &PgPool) -> anyhow::Result<()> {
     static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
-    let expected: i64 = MIGRATOR
-        .iter()
-        .map(|m| m.version)
-        .max()
-        .expect("migration set is non-empty at compile time");
+    let embedded: BTreeSet<i64> = MIGRATOR.iter().map(|m| m.version).collect();
 
-    let row: Option<i64> = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-        .fetch_one(pool)
+    // SELECT only — the runtime DSN is least-privilege (ADR 0009).
+    let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
+        .fetch_all(pool)
         .await
         .map_err(|e| match e {
             sqlx::Error::Database(db) if db.code().as_deref() == Some("42P01") => {
@@ -2221,21 +2338,81 @@ async fn assert_schema_current(pool: &PgPool) -> anyhow::Result<()> {
             ),
             other => other.into(),
         })?;
-    let applied = row.unwrap_or(0);
+    let applied: BTreeSet<i64> = versions.into_iter().collect();
+    let register = read_schema_compat_register(pool).await?;
 
-    if applied != expected {
-        anyhow::bail!(
-            "schema version mismatch: applied={applied}, binary expects={expected}. \
-             Run `hort-server migrate` to advance, or roll the binary back to match the schema."
-        );
+    let compatibility = SchemaCompatibility::evaluate(
+        &applied,
+        &embedded,
+        &register,
+        // Same workspace-inherited version the `pg_stat_activity`
+        // identity stamps, and the same one `hort-server` compares.
+        env!("CARGO_PKG_VERSION"),
+    );
+    // `boot_refusal` is `None` for exactly one verdict — the bootable one.
+    if let Some(refusal) = compatibility.boot_refusal() {
+        anyhow::bail!("{refusal}");
     }
 
-    tracing::info!(
-        applied_version = applied,
-        expected_version = expected,
-        "schema version OK"
-    );
+    let applied_version = applied.iter().next_back().copied().unwrap_or(0);
+    let expected_version = embedded.iter().next_back().copied().unwrap_or(0);
+    // "How far back does this schema tolerate a binary" — reported on the
+    // surface that already carries the applied and expected versions.
+    let tolerates_binaries_from = schema_rollback_floor(&applied, &register);
+    match compatibility {
+        SchemaCompatibility::Supported { newer_applied } if !newer_applied.is_empty() => {
+            // Warn, not info: an operator running a rolled-back binary
+            // against a migrated schema needs to see that state without
+            // going looking for it.
+            tracing::warn!(
+                applied_version,
+                expected_version,
+                newer_applied = ?newer_applied,
+                tolerates_binaries_from = %tolerates_binaries_from,
+                "serving against a schema newer than this binary's embedded migration set; \
+                 supported by the expand/contract discipline (ADR 0030), but the fleet is not \
+                 on the schema's own release"
+            );
+        }
+        _ => {
+            tracing::info!(
+                applied_version,
+                expected_version,
+                tolerates_binaries_from = %tolerates_binaries_from,
+                "schema version OK"
+            );
+        }
+    }
     Ok(())
+}
+
+/// Read the schema compatibility register — the oldest binary version
+/// each applied migration tolerates.
+///
+/// `SELECT` only (ADR 0009). A missing table means this database was last
+/// migrated by a binary from before the register shipped: that yields an
+/// empty register, on which every applied migration the worker does not
+/// embed is unregistered and `SchemaCompatibility`'s fail-closed rule
+/// refuses. Treating the missing table as a hard error instead would
+/// refuse boots the structural gate already handles correctly.
+async fn read_schema_compat_register(pool: &PgPool) -> anyhow::Result<SchemaCompatRegister> {
+    match sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT version, min_binary_version FROM schema_compat_register",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => Ok(register_from_rows(rows)),
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42P01") => {
+            Ok(SchemaCompatRegister::new())
+        }
+        Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("42501") => Err(anyhow!(
+            "permission denied reading schema_compat_register — grant SELECT on \
+             schema_compat_register to the runtime role (see \
+             docs/architecture/how-to/deploy/postgres-roles.md)"
+        )),
+        Err(other) => Err(other.into()),
+    }
 }
 
 #[cfg(test)]
@@ -2247,8 +2424,9 @@ mod tests {
 
     use super::*;
     use hort_domain::error::{DomainError, DomainResult};
+    use hort_domain::ports::scanner::{ScanAnalysis, ScanTarget};
     use hort_domain::ports::BoxFuture;
-    use hort_domain::types::{ContentHash, Finding, Sbom};
+    use hort_domain::types::Sbom;
 
     #[test]
     fn split_pem_public_keys_splits_multiple_blocks_for_rotation_overlap() {
@@ -2300,12 +2478,18 @@ BBBB
         fn name(&self) -> &str {
             &self.name
         }
+        fn applies_to(&self, _format: &str) -> bool {
+            // The health-check tests below never dispatch, so the
+            // capability answer is irrelevant to them. The parity guard
+            // uses the real adapters, not this mock.
+            true
+        }
         fn scan<'a>(
             &'a self,
-            _content_hash: &'a ContentHash,
+            _target: &'a ScanTarget<'a>,
             _sbom: Option<&'a Sbom>,
-        ) -> BoxFuture<'a, DomainResult<Vec<Finding>>> {
-            Box::pin(async { Ok(Vec::new()) })
+        ) -> BoxFuture<'a, DomainResult<ScanAnalysis>> {
+            Box::pin(async { Ok(ScanAnalysis::clean()) })
         }
         fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
             let healthy = self.healthy;

@@ -201,7 +201,8 @@ pub trait ArtifactLifecyclePort: Send + Sync {
     }
 
     /// Atomically append a **provenance-verdict** transition
-    /// (`ProvenanceVerified` / `ProvenanceRejected`) and persist ONLY the
+    /// (`ProvenanceVerified`, or `ProvenanceRejected` + its
+    /// `ArtifactRejected` companion) and persist ONLY the
     /// `quarantine_status` column — never the artifact's full row.
     ///
     /// `commit_transition` persists the caller's full in-memory `Artifact`
@@ -343,6 +344,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -454,6 +456,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -548,6 +551,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -635,6 +639,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,
@@ -736,6 +741,7 @@ mod tests {
             rejection_reason: None,
             quarantine_window_start: None,
             quarantine_deadline: None,
+            provenance_hold_indefinite: false,
             deleted_at: None,
             upstream_published_at: None,
             uploaded_by: None,

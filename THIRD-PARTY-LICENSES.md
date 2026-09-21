@@ -53,7 +53,7 @@ the result instead.
 | untrusted | 0.9.0 | ISC | https://github.com/briansmith/untrusted |
 | simple_asn1 | 0.6.4 | ISC | https://github.com/acw/simple_asn1 |
 | ring | 0.17.14 | ISC | https://github.com/briansmith/ring |
-| rustls-webpki | 0.103.13 | ISC | https://github.com/rustls/webpki |
+| rustls-webpki | 0.103.15 | ISC | https://github.com/rustls/webpki |
 | aws-lc-rs | 1.18.1 | ISC | https://github.com/aws/aws-lc-rs |
 | aws-lc-sys | 0.45.0 | ISC | https://github.com/aws/aws-lc-rs |
 | serde_yaml_ng | 0.10.0 | MIT | https://github.com/acatton/serde-yaml-ng |
@@ -95,7 +95,7 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.26.0 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.26.1 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -142,7 +142,7 @@ the result instead.
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
 | rustls-native-certs | 0.8.4 | MIT | https://github.com/rustls/rustls-native-certs |
-| rustls | 0.23.43 | MIT | https://github.com/rustls/rustls |
+| rustls | 0.23.45 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
@@ -155,7 +155,7 @@ the result instead.
 | scopeguard | 1.2.0 | MIT | https://github.com/bluss/scopeguard |
 | cipher | 0.4.4 | MIT | https://github.com/RustCrypto/traits |
 | cipher | 0.5.2 | MIT | https://github.com/RustCrypto/traits |
-| reqwest | 0.13.4 | MIT | https://github.com/seanmonstar/reqwest |
+| reqwest | 0.13.5 | MIT | https://github.com/seanmonstar/reqwest |
 | md-5 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
 | sha1 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
 | sha2 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
@@ -233,7 +233,7 @@ the result instead.
 | crypto_secretbox | 0.1.1 | MIT | https://github.com/RustCrypto/nacl-compat/tree/master/crypto_secretbox |
 | http-body | 1.0.1 | MIT | https://github.com/hyperium/http-body |
 | http-body-util | 0.1.3 | MIT | https://github.com/hyperium/http-body |
-| chacha20 | 0.10.0 | MIT | https://github.com/RustCrypto/stream-ciphers |
+| chacha20 | 0.10.2 | MIT | https://github.com/RustCrypto/stream-ciphers |
 | zeroize_derive | 1.5.0 | MIT | https://github.com/RustCrypto/utils |
 | salsa20 | 0.11.0 | MIT | https://github.com/RustCrypto/stream-ciphers |
 | iana-time-zone | 0.1.65 | MIT | https://github.com/strawlab/iana-time-zone |
@@ -290,23 +290,23 @@ the result instead.
 | system-configuration | 0.7.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | primefield | 0.14.0 | MIT | https://github.com/RustCrypto/elliptic-curves |
 | ctutils | 0.4.2 | MIT | https://github.com/RustCrypto/utils |
-| wnaf | 0.14.0 | MIT | https://github.com/RustCrypto/elliptic-curves |
+| wnaf | 0.14.1 | MIT | https://github.com/RustCrypto/elliptic-curves |
 | annotate-snippets | 0.12.16 | MIT | https://github.com/rust-lang/annotate-snippets-rs |
 | anstream | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-parse | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.6 | MIT | https://github.com/clap-rs/clap |
-| clap_builder | 4.6.6 | MIT | https://github.com/clap-rs/clap |
-| clap_complete | 4.6.9 | MIT | https://github.com/clap-rs/clap |
-| clap_derive | 4.6.4 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.7 | MIT | https://github.com/clap-rs/clap |
+| clap_builder | 4.6.7 | MIT | https://github.com/clap-rs/clap |
+| clap_complete | 4.6.11 | MIT | https://github.com/clap-rs/clap |
+| clap_derive | 4.6.7 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
 | serde_spanned | 1.1.1 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.1.5+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.1.6+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_datetime | 1.1.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_parser | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_writer | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
@@ -319,7 +319,7 @@ the result instead.
 | tar | 0.4.46 | MIT | https://github.com/composefs/tar-rs |
 | arrayvec | 0.7.6 | MIT | https://github.com/bluss/arrayvec |
 | synstructure | 0.13.2 | MIT | https://github.com/mystor/synstructure |
-| ipnet | 2.12.1 | MIT | https://github.com/krisprice/ipnet |
+| ipnet | 2.12.2 | MIT | https://github.com/krisprice/ipnet |
 | rand | 0.10.2 | MIT | https://github.com/rust-random/rand |
 | rand | 0.8.6 | MIT | https://github.com/rust-random/rand |
 | rand | 0.9.4 | MIT | https://github.com/rust-random/rand |
@@ -366,7 +366,7 @@ the result instead.
 | objc2-encode | 4.1.0 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
-| object_store | 0.14.1 | MIT | https://github.com/apache/arrow-rs-object-store |
+| object_store | 0.14.2 | MIT | https://github.com/apache/arrow-rs-object-store |
 | sqlx-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
 | sqlx-macros-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
 | sqlx-macros | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
@@ -480,7 +480,7 @@ the result instead.
 | security-framework-sys | 2.17.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | security-framework | 3.7.0 | MIT | https://github.com/kornelski/rust-security-framework |
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
-| jsonwebtoken | 11.0.0 | MIT | https://github.com/Keats/jsonwebtoken |
+| jsonwebtoken | 11.1.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.45.0 | MIT | https://github.com/aws/aws-lc-rs |
 | webbrowser | 1.2.4 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
@@ -4351,7 +4351,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ```
 
-### rustls-webpki 0.103.13 — ISC
+### rustls-webpki 0.103.15 — ISC
 
 Repository: https://github.com/rustls/webpki
 
@@ -5675,7 +5675,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.26.0 — MIT
+### uuid 1.26.1 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -7182,7 +7182,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls 0.23.43 — MIT
+### rustls 0.23.45 — MIT
 
 Repository: https://github.com/rustls/rustls
 
@@ -7600,7 +7600,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### reqwest 0.13.4 — MIT
+### reqwest 0.13.5 — MIT
 
 Repository: https://github.com/seanmonstar/reqwest
 
@@ -10144,7 +10144,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### chacha20 0.10.0 — MIT
+### chacha20 0.10.2 — MIT
 
 Repository: https://github.com/RustCrypto/stream-ciphers
 
@@ -11986,7 +11986,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### wnaf 0.14.0 — MIT
+### wnaf 0.14.1 — MIT
 
 Repository: https://github.com/RustCrypto/elliptic-curves
 
@@ -12182,7 +12182,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.6 — MIT
+### clap 4.6.7 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -12209,7 +12209,7 @@ SOFTWARE.
 
 ```
 
-### clap_builder 4.6.6 — MIT
+### clap_builder 4.6.7 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -12236,7 +12236,7 @@ SOFTWARE.
 
 ```
 
-### clap_complete 4.6.9 — MIT
+### clap_complete 4.6.11 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -12263,7 +12263,7 @@ SOFTWARE.
 
 ```
 
-### clap_derive 4.6.4 — MIT
+### clap_derive 4.6.7 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -12425,7 +12425,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.1.5+spec-1.1.0 — MIT
+### toml 1.1.6+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -12788,7 +12788,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
-### ipnet 2.12.1 — MIT
+### ipnet 2.12.2 — MIT
 
 Repository: https://github.com/krisprice/ipnet
 
@@ -14103,7 +14103,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### object_store 0.14.1 — MIT
+### object_store 0.14.2 — MIT
 
 Repository: https://github.com/apache/arrow-rs-object-store
 
@@ -17398,7 +17398,7 @@ SOFTWARE.
 
 ```
 
-### jsonwebtoken 11.0.0 — MIT
+### jsonwebtoken 11.1.0 — MIT
 
 Repository: https://github.com/Keats/jsonwebtoken
 

@@ -5,8 +5,10 @@ Periodically invokes `hort-server enqueue-prefetch-row-retention-sweep`,
 which inserts ONE `kind='prefetch-row-retention-sweep'` row into
 `public.jobs` using the runtime DSN. The always-on worker (`hort-worker`)
 picks the row up and dispatches to `PrefetchRowRetentionSweepHandler`,
-which deletes terminal `kind LIKE 'prefetch%'` rows older than a
-configurable horizon (default 7 days).
+which deletes terminal `kind LIKE 'prefetch%'` and
+`kind = 'oci-index-child-ingest'` rows older than a configurable horizon
+(default 7 days) — the pull-through ingest cascade's rows, none of which
+hold durable state.
 
 Design rationale: a default-enabled CronJob going through the `hort-cli`
 HTTP admin-task path would drag the whole `svc-token-bootstrap` Job chain
@@ -20,12 +22,15 @@ So this CronJob:
   - Uses `hort-server.runtimeEnv` (DSN + log/metric tunables only —
     same env block the migrate Job uses, MinimalConfig discipline).
   - Has NO `valueFrom.secretKeyRef` for any svc-token.
-  - Is gated by `prefetchRowRetentionSweep.enabled` (default **false** —
-    the cascade is opt-in per-repo via
-    `prefetch_policy.triggers.contains(TransitiveDeps)`; if no repo opts
-    in the `jobs` table accumulates nothing and the sweep has nothing to
-    delete. An operator enabling the cascade should also enable this
-    sweep so `jobs` does not grow unbounded).
+  - Is gated by `prefetchRowRetentionSweep.enabled` (default **true** —
+    an OCI proxy repository mints `oci-index-child-ingest` rows with no
+    opt-in at all, one terminal row per declared child manifest on every
+    image-index pull-through, from day one; without the sweep they are
+    retained permanently. The transitive prefetch cascade's own
+    `prefetch%` rows are opt-in per-repo via
+    `prefetch_policy.triggers.contains(TransitiveDeps)`, so a deployment
+    using neither feature runs one idle CronJob whose DELETE matches
+    nothing).
   - Does NOT depend on `scheduledTasks.adminTasksEnabled` — that toggle
     gates the svc-token chain this template deliberately avoids.
 
