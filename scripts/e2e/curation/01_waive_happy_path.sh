@@ -130,6 +130,7 @@ fi
 AUTH="$(json_get "$EVENT_ROW" '.data.released_by' 2>/dev/null || echo "")"
 RELEASED_BY="$(json_get "$EVENT_ROW" '.data.released_by_user_id' 2>/dev/null || echo "")"
 
+# Bounded: EVENT_ROW is a single events-table row's JSON payload.
 if [ "$AUTH" = "Curator" ] || \
    printf '%s' "$EVENT_ROW" | grep -q '"released_by":"Curator"'; then
     assert_pass "ArtifactReleased.released_by = Curator (curator-waiver attribution)"

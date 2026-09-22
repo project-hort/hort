@@ -196,6 +196,7 @@ the qualified \"tamper-evident\" wording (honesty caveat)."
         stripped="$(printf '%s' "${numbered}" \
             | sed -E "s/${negator_re}//Ig" \
             | sed -E "s/${mandate_phrase_re}//Ig")"
+        # Bounded: stripped is a single already-extracted source line.
         if printf '%s' "${stripped}" | grep -Eiq "${forbidden_token_re}"; then
             bad_lines+="${numbered}"$'\n'
         fi

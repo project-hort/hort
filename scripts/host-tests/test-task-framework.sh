@@ -366,7 +366,13 @@ fi
 log ""
 log "--> [5/5] /metrics scrape: hort_admin_tasks_* metric names wired"
 
-METRICS_BODY="$(curl -fsSL --max-time 10 "$METRICS_URL" || true)"
+# Capture once into a file and grep the file, never the pipe: `curl | grep
+# -q` under `set -o pipefail` misreports "no match" when the match lands
+# before curl has finished writing a body bigger than the pipe buffer
+# (grep -q exits at its first match, curl takes SIGPIPE, pipefail promotes
+# that exit to the pipeline status).
+METRICS_BODY_FILE="$(mktemp)"
+curl -fsSL --max-time 10 "$METRICS_URL" >"$METRICS_BODY_FILE" 2>/dev/null || true
 
 declare -a METRIC_NAMES=(
     "hort_admin_tasks_enqueued_total"
@@ -376,7 +382,7 @@ declare -a METRIC_NAMES=(
 )
 
 for NAME in "${METRIC_NAMES[@]}"; do
-    if printf '%s\n' "$METRICS_BODY" | grep -q "$NAME"; then
+    if grep -q "$NAME" "$METRICS_BODY_FILE"; then
         assert_pass "/metrics contains $NAME"
     else
         assert_fail \
@@ -387,8 +393,8 @@ done
 
 # Specifically verify that hort_admin_tasks_enqueued_total{result="ok"} fired
 # from our POST call (at least one series with kind + result labels).
-ENQUEUED_OK="$(printf '%s\n' "$METRICS_BODY" \
-    | grep -c 'hort_admin_tasks_enqueued_total{.*result="ok"' || true)"
+ENQUEUED_OK="$(grep -c 'hort_admin_tasks_enqueued_total{.*result="ok"' "$METRICS_BODY_FILE" || true)"
+rm -f "$METRICS_BODY_FILE"
 if [ "${ENQUEUED_OK:-0}" -ge 1 ] 2>/dev/null; then
     assert_pass "hort_admin_tasks_enqueued_total{result=\"ok\"} series present (count=$ENQUEUED_OK)"
 else

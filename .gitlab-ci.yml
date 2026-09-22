@@ -1417,6 +1417,22 @@ quality:g1-attestation-gate:
   script:
     - bash scripts/check-g1-attestation-gate.sh
 
+# Rejects an unannotated pipe into `grep -q`/`grep -Eq` under scripts/: that
+# shape misreports "no match" under `set -o pipefail` once the match lands
+# before a producer bigger than the pipe buffer has finished writing (see
+# scripts/check-pipe-grep-q.sh's header). Pure bash, no external grep/sed
+# pipeline of its own, sub-second, runs on every pipeline (no rules /
+# no needs:) — same weight class as the pin-sync + g1 gates above.
+quality:pipe-grep-q-guard:
+  stage: quality
+  image: alpine:3.24
+  needs: []
+  <<: *rules-code-changed
+  before_script:
+    - apk add --no-cache bash findutils
+  script:
+    - bash scripts/check-pipe-grep-q.sh
+
 # Chart-template render test. Mirrors .github/workflows/ci.yml's
 # chart-template-tests job so the canonical GitLab pipeline gates chart
 # regressions too (the harness previously ran only on the GitHub mirror
@@ -1459,6 +1475,21 @@ quality:fail2ban-regex-test:
     - apt-get install -y -qq --no-install-recommends fail2ban
   script:
     - bash scripts/test-fail2ban-regex.sh
+
+# capture_match regression test. Mirrors quality:fail2ban-regex-test: plain
+# bash, lightweight image, needs: [], runs on every pipeline (no rules).
+# Pins the >64 KiB-body / match-on-line-1 trap that motivated
+# scripts/native-tests/lib/common.sh's capture_match helper directly
+# against the helper — no compose, no DB, no live stack.
+quality:capture-match-test:
+  stage: quality
+  image: alpine:3.24
+  needs: []
+  <<: *rules-code-changed
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - bash scripts/test-capture-match.sh
 
 # Publish-time registry index check. Same shape as the two jobs above:
 # plain bash, lightweight image, no network. The check decides whether a

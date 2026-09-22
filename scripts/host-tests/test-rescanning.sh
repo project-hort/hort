@@ -184,8 +184,20 @@ phase_1_helm_template_smoke() {
         return 1
     fi
 
+    # Capture once into a file and grep the file, never the pipe, for every
+    # `-q` check below: a multi-resource chart render can exceed the pipe
+    # buffer, and `printf | grep -q` under `set -o pipefail` misreports "no
+    # match" when the match lands before printf has finished writing (grep
+    # -q exits at its first match, printf takes SIGPIPE, pipefail promotes
+    # that exit to the pipeline status). Removed via a RETURN trap so every
+    # exit path from this function cleans it up.
+    local manifest_file
+    manifest_file="$(mktemp)"
+    trap 'rm -f "$manifest_file"' RETURN
+    printf '%s\n' "$manifest" >"$manifest_file"
+
     # Assertion 1.1 — at least one CronJob manifest rendered.
-    if printf '%s\n' "$manifest" | grep -q '^kind: CronJob$'; then
+    if grep -q '^kind: CronJob$' "$manifest_file"; then
         assert_pass "helm template produced at least one CronJob manifest"
     else
         assert_fail \
@@ -194,7 +206,7 @@ phase_1_helm_template_smoke() {
     fi
 
     # Assertion 1.2 — cron-rescan-tick CronJob present.
-    if printf '%s\n' "$manifest" | grep -q "hort-server.io/job: cron-rescan-tick"; then
+    if grep -q "hort-server.io/job: cron-rescan-tick" "$manifest_file"; then
         assert_pass "cron-rescan-tick CronJob rendered"
     else
         assert_fail \
@@ -203,7 +215,7 @@ phase_1_helm_template_smoke() {
     fi
 
     # Assertion 1.3 — advisory-watch-tick CronJob present.
-    if printf '%s\n' "$manifest" | grep -q "hort-server.io/job: advisory-watch-tick"; then
+    if grep -q "hort-server.io/job: advisory-watch-tick" "$manifest_file"; then
         assert_pass "advisory-watch-tick CronJob rendered"
     else
         assert_fail \
@@ -218,6 +230,7 @@ phase_1_helm_template_smoke() {
     local rescan_invoke_line
     rescan_invoke_line="$(printf '%s\n' "$manifest" \
         | grep -E 'hort-cli admin task invoke cron-rescan-tick' || true)"
+    # Bounded: rescan_invoke_line is a single already-extracted line.
     if [ -n "$rescan_invoke_line" ] \
        && printf '%s\n' "$rescan_invoke_line" | grep -q -- '--idempotency-key'; then
         assert_pass "cron-rescan-tick command invokes hort-cli with --idempotency-key"
@@ -232,6 +245,7 @@ phase_1_helm_template_smoke() {
     local advisory_invoke_line
     advisory_invoke_line="$(printf '%s\n' "$manifest" \
         | grep -E 'hort-cli admin task invoke advisory-watch-tick' || true)"
+    # Bounded: advisory_invoke_line is a single already-extracted line.
     if [ -n "$advisory_invoke_line" ] \
        && printf '%s\n' "$advisory_invoke_line" | grep -q -- '--idempotency-key'; then
         assert_pass "advisory-watch-tick command invokes hort-cli with --idempotency-key"
@@ -244,8 +258,7 @@ phase_1_helm_template_smoke() {
     # Assertion 1.6 — both CronJob containers reference the
     # bootstrap Secret (svc-token-bootstrap-job.yaml) for HORT_TOKEN.
     # This is the chart-level token bootstrap the design requires.
-    if printf '%s\n' "$manifest" \
-            | grep -q "name: release-name-hort-server-svc-token"; then
+    if grep -q "name: release-name-hort-server-svc-token" "$manifest_file"; then
         assert_pass "CronJob containers reference the chart-managed svc-token Secret"
     else
         assert_fail \
@@ -654,6 +667,7 @@ phase_2_runtime_smoke() {
         psql -U registry -d artifact_registry -c \
         "UPDATE artifacts SET last_scan_at = NOW() - INTERVAL '2 hours' WHERE id = '${artifact_id}';" 2>&1 \
         || true)"
+    # Bounded: a single `psql -c` UPDATE's own status line.
     if printf '%s\n' "$update_out" | grep -q "UPDATE 1"; then
         assert_pass "psql UPDATE backdated last_scan_at by 2h (artifact eligible for rescan)"
     else

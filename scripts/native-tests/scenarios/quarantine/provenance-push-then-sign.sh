@@ -346,6 +346,7 @@ else
          "got HTTP ${ANON_GET_CODE} (a private repo must deny an anonymous read with 401 + a challenge before the hold check, ADR 0045)"
 fi
 if [ "$NATIVE_TOKENS" = "1" ]; then
+    # Bounded: ANON_HDRS is one HTTP response's header block.
     if printf '%s' "$ANON_HDRS" | tr -d '\r' | grep -qiE '^WWW-Authenticate:.*Bearer'; then
         pass "anonymous denial advertises a Bearer challenge (native-token mode, ADR 0045 D1)"
     else
@@ -414,6 +415,8 @@ if [ -x "$REF_SIGNER" ]; then
     # grep below; only the actual `cosign sign` invocation must be checked.
     REF_VAULT_BLOCK="$(awk '/vault-key\)/{f=1} f && $1 !~ /^#/{print} /;;/{if(f)exit}' "$REF_SIGNER")"
     REF_OK=1
+    # Bounded: REF_VAULT_BLOCK is one shell case-branch body extracted by
+    # the awk above, a handful of lines.
     for flag in '--registry-referrers-mode=oci-1-1' '--use-signing-config=false' \
                 '--tlog-upload=false' '--key /tmp/cosign.key'; do
         printf '%s' "$REF_VAULT_BLOCK" | grep -qF -- "$flag" || REF_OK=0
@@ -458,6 +461,8 @@ if [ "$SIGN_RC" -eq 0 ]; then
     pass "cosign sign (keyed, oci referrers) succeeded — the write-authorized manifest HEAD-and-GET hold-read exemption served the subject to the signer"
 else
     log "[cosign output]"; printf '%s\n' "$SIGN_OUT" | sed 's/^/    /'
+    # Bounded: SIGN_OUT is cosign's own progress/status output for a single
+    # sign call, a handful of lines.
     if printf '%s' "$SIGN_OUT" | grep -Eqi 'GET .*/manifests/.*503|503 .*manifests'; then
         fail "cosign sign hold-read exemption regressed" \
              "cosign got a 503 on a manifest GET during signing -> the write-authorized manifest hold-read exemption (ADR 0039 §10) is not serving the held subject to the signer; the exemption regressed to HEAD-only"

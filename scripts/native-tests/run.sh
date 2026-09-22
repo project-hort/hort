@@ -98,6 +98,8 @@ discover() {
 
 selected() {  # filter discover() by --group/--scenario (--scenario takes `name` OR `group/name`)
   discover | while IFS=$'\t' read -r group name path reqs; do
+    # Bounded: SEL_GROUPS/SEL_SCEN are --group/--scenario CLI args, a
+    # handful of short names at most.
     if [ "${#SEL_GROUPS[@]}" -gt 0 ]; then printf '%s\n' "${SEL_GROUPS[@]}" | grep -qxF "$group" || continue; fi
     if [ "${#SEL_SCEN[@]}" -gt 0 ]; then
       printf '%s\n' "${SEL_SCEN[@]}" | grep -qxF -e "$name" -e "$group/$name" || continue
@@ -225,6 +227,8 @@ PROFILE_ARGS=(); [ "$NEED_WORKER" = 1 ] && PROFILE_ARGS=(--profile worker)
 SCALE_ARGS=(); [ "$NEED_WORKER" = 1 ] && SCALE_ARGS=(--scale "hort-worker=${HORT_E2E_WORKER_REPLICAS:-4}")
 
 # The worker has no HTTP health/port, so readiness = compose reports it running.
+# Bounded: `compose ps --services` lists this compose file's own services,
+# a handful of names.
 wait_running() { local svc="$1" t="${2:-180}"; local d=$(( $(now)+t )); until docker compose "${CA[@]}" "${PROFILE_ARGS[@]}" ps --status running --services 2>/dev/null | grep -qx "$svc"; do [ "$(now)" -ge "$d" ] && return 1; sleep 2; done; }
 
 STARTED=0

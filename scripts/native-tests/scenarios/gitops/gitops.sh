@@ -47,7 +47,7 @@ if metrics_scrape_preflight "gitops boot-apply metrics"; then
     log ""
     log '--> hort_gitops_apply_total{result="ok"} fired during boot'
     if bounded_poll "gitops apply_total(result=ok)" 15 \
-        "curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_apply_total\{[^}]*result=\"ok\"[^}]*\} +[1-9]'"; then
+        "capture_match '^hort_gitops_apply_total\{[^}]*result=\"ok\"[^}]*\} +[1-9]' curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\""; then
         pass 'hort_gitops_apply_total{result=ok} >= 1'
     else
         fail 'hort_gitops_apply_total{result=ok} >= 1' \
@@ -55,7 +55,7 @@ if metrics_scrape_preflight "gitops boot-apply metrics"; then
     fi
 
     if bounded_poll "gitops objects_total emitted" 15 \
-        "curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_gitops_objects_total\{'"; then
+        "capture_match '^hort_gitops_objects_total\{' curl -sSf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\""; then
         pass "hort_gitops_objects_total emitted at least once"
     else
         fail "hort_gitops_objects_total emitted" \
