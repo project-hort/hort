@@ -60,3 +60,14 @@ env:
   DATABASE_URL: "postgres://dev:test@sbx-hort-pg:5432/hort"
 # staging: enable in Plan 4 (verifier)
 # models: tune per spec §7.5 when limits demand it
+#
+# The cockpit runs one fresh CLI process per directive (task mode), so a
+# directive picks its own runtime with `Class:` + optional `Provider:` headers
+# instead of the session-mode `Model:` line. No `defaults.provider` on purpose:
+# the default stays Claude and the single directive decides when a ticket goes
+# to Codex. Verifier and designer stay in session mode — the verifier keeps its
+# test history across runs, which the handover protocol names as the case the
+# persistent loop exists for.
+workers:
+  modes:
+    cockpit: task
