@@ -480,6 +480,7 @@ fi
 # `ExclusionRemoved`'s domain shape; jsonb_path_query matches whatever
 # the value is at any depth.
 removed_reason="$(psql_one "SELECT event_data->>'reason' FROM events WHERE event_type = 'ExclusionRemoved' AND event_data->>'cve_id' = '${EXCLUSION_CVE_ID}' ORDER BY global_position DESC LIMIT 1;")"
+# Bounded: removed_reason is a single JSONB scalar column value.
 if [ "$removed_reason" = "removedbygitopsapply" ] || [ "$removed_reason" = "removedbygitops" ] || \
    echo "$removed_reason" | grep -qi "removedbygitopsapply"; then
     assert_pass "ExclusionRemoved.reason == 'removed by gitops apply'"
@@ -489,6 +490,7 @@ elif [ -z "$removed_reason" ]; then
     # full event_data blob so the assertion can't silently pass on
     # an empty payload.
     blob="$(psql_one "SELECT event_data::text FROM events WHERE event_type = 'ExclusionRemoved' AND event_data->>'cve_id' = '${EXCLUSION_CVE_ID}' ORDER BY global_position DESC LIMIT 1;")"
+    # Bounded: blob is a single event row's JSONB payload as text.
     if echo "$blob" | grep -qi 'removedbygitopsapply'; then
         assert_pass "ExclusionRemoved event payload contains 'removed by gitops apply'"
     else
@@ -907,6 +909,7 @@ EOF
     # row we just persisted under metadata.name = 'block-retro-1'.
     RETRO_RULE_ID="$(psql_one "SELECT id FROM curation_rules WHERE name = 'block-retro-1';")"
     REJECT_REASON_BLOB="$(psql_one "SELECT event_data::text FROM events WHERE event_type = 'ArtifactRejected' AND stream_id = '${PREV_ARTIFACT_ID}' ORDER BY global_position DESC LIMIT 1;")"
+    # Bounded: REJECT_REASON_BLOB is a single event row's JSONB payload as text.
     if echo "$REJECT_REASON_BLOB" | grep -q "CurationRetroactive" \
        && echo "$REJECT_REASON_BLOB" | grep -q "$RETRO_RULE_ID"; then
         assert_pass "ArtifactRejected.rejected_by carries CurationRetroactive { rule_id = $RETRO_RULE_ID }"

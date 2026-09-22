@@ -334,6 +334,8 @@ while IFS='|' read -r fixture pattern label; do
     fi
 
     # rendered_ok holds the stderr+stdout from the failed render.
+    # Bounded: an install-blocked `helm template` render fails fast and
+    # emits a short validation error, not a full chart render.
     if printf '%s\n' "${rendered_ok}" | grep -qE "${pattern}"; then
         echo "PASS: ${fixture} → ${label} (failed with expected pattern)"
         checked_fixtures+=("${fixture}")

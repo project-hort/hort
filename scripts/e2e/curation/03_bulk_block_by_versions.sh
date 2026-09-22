@@ -177,7 +177,8 @@ MIXED_OUT="$(run_hort_cli "$ADMIN_TOKEN" -- curation block versions \
 }
 assert_pass "mixed-nonexistent block call succeeded"
 
-# Assert not_found_versions contains the nonexistent version
+# Bounded: hort-cli's own curation-command summary JSON for a 2-version
+# request, not an unbounded scrape/log.
 if printf '%s' "$MIXED_OUT" | grep -q "$NONEXIST_VER"; then
     assert_pass "outcome.not_found_versions contains the bogus version"
 else

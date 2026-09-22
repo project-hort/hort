@@ -84,6 +84,7 @@ cleanup() {
         fi
     else
         if command -v kind >/dev/null 2>&1; then
+            # Bounded: this host's own kind cluster list, a handful of names.
             if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
                 echo "Deleting kind cluster ${CLUSTER_NAME}..."
                 kind delete cluster --name "${CLUSTER_NAME}" >/dev/null 2>&1 || true
@@ -194,6 +195,7 @@ export KUBECONFIG="${KIND_KUBECONFIG}"
 
 echo "==> Creating kind cluster ${CLUSTER_NAME}..."
 echo "    KUBECONFIG=${KIND_KUBECONFIG} (throwaway — operator's ~/.kube/config untouched)"
+# Bounded: this host's own kind cluster list, a handful of names.
 if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
     echo "Cluster ${CLUSTER_NAME} already exists — deleting first for a clean run."
     kind delete cluster --name "${CLUSTER_NAME}" >/dev/null
@@ -801,6 +803,7 @@ assert_label_regex() {
     local got
     got="$(kubectl get secret -n "${TARGET_NAMESPACE}" "${SECRET_NAME}" \
         -o jsonpath="{.metadata.labels.${label_key}}" 2>/dev/null || true)"
+    # Bounded: a single k8s label value (spec-limited to 63 chars).
     if ! echo "${got}" | grep -qE "${regex}"; then
         echo "FAIL: Secret label '${label_key//\\/}' = '${got}', does not match regex '${regex}'."
         exit 1
@@ -819,6 +822,7 @@ assert_annotation_regex() {
     local got
     got="$(kubectl get secret -n "${TARGET_NAMESPACE}" "${SECRET_NAME}" \
         -o jsonpath="{.metadata.annotations.${annot_key}}" 2>/dev/null || true)"
+    # Bounded: a single k8s annotation value — here, one RFC 3339 timestamp.
     if ! echo "${got}" | grep -qE "${regex}"; then
         echo "FAIL: Secret annotation '${annot_key//\\/}' = '${got}', does not match regex '${regex}'."
         exit 1

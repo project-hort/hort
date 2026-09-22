@@ -415,6 +415,8 @@ if [ "$SIGN_RC" -eq 0 ]; then
     pass "cosign sign (keyed, oci referrers) succeeded against the proxy-pulled subject"
 else
     log "[cosign output]"; printf '%s\n' "$SIGN_OUT" | sed 's/^/    /'
+    # Bounded: SIGN_OUT is cosign's own progress/status output for a single
+    # sign call, a handful of lines.
     if printf '%s' "$SIGN_OUT" | grep -Eqi 'GET .*/manifests/.*503|503 .*manifests'; then
         fail "cosign sign hold-read exemption on a proxy-pulled subject" \
              "cosign got a 503 on a manifest GET during signing -> the write-authorized manifest hold-read exemption (ADR 0039 §10) is not serving the held, proxy-pulled subject to the signer"

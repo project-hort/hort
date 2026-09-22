@@ -499,6 +499,7 @@ if [ "$(metric_count no_sa_match)" -ge 1 ]; then
     assert_pass "metric-federated_jwt-no_sa_match"
 else
     NEG_DESC="$(printf '%s' "${NEG_BODY}" | jq -r '.error_description // empty' 2>/dev/null || true)"
+    # Bounded: NEG_DESC is a single JSON error_description string.
     if printf '%s' "${NEG_DESC}" | grep -qi "no ServiceAccount matches"; then
         assert_pass "metric-federated_jwt-no_sa_match"
     else
