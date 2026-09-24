@@ -126,6 +126,19 @@ pub struct RetentionCandidate {
     /// always stale (fail-safe: it never expires). `None` → the
     /// default 24 h.
     pub resolved_rescan_interval_hours: Option<i64>,
+    /// The `KeepLastN` input: this artifact's 1-based rank among its
+    /// live `(repository, name)` siblings (newest first by
+    /// `created_at`, ties broken by artifact id) plus the sibling
+    /// total. Resolved by the caller in the same enumeration query
+    /// that produced the candidate; `None` when no ranking could be
+    /// resolved, which the pure evaluator fails safe. Mirrors
+    /// `RetentionCandidateRow::keep_rank` exactly.
+    pub keep_rank: Option<(u32, u32)>,
+    /// `true` iff a mutable ref in this artifact's own repository
+    /// currently resolves to it. A tag target survives `KeepLastN`
+    /// regardless of rank. Mirrors `RetentionCandidateRow::tag_targeted`
+    /// exactly.
+    pub tag_targeted: bool,
 }
 
 /// Outcome summary of one `evaluate_policies` pass — the
@@ -387,13 +400,15 @@ impl RetentionUseCase {
         let inputs = EvaluationInputs {
             now,
             created_at: artifact.created_at,
-            // `UnusedFor` / `KeepLastN` inputs are not in B3's bounded
-            // scope (no download-timeseries / sibling-rank port); the
-            // pure evaluator fails them safe (never expire) when these
-            // are absent. Security-driven + age predicates — B3's
-            // focus — do not need them.
+            // The `UnusedFor` anchor still has no source (no
+            // download-timeseries reader); the pure evaluator fails
+            // that predicate safe (never expire) while it is absent.
+            // The `KeepLastN` inputs below come from the candidate
+            // enumeration query, which resolves them in the same
+            // statement.
             last_downloaded_at: None,
-            keep_rank: None,
+            keep_rank: candidate.keep_rank,
+            tag_targeted: candidate.tag_targeted,
             findings: &findings,
             first_detected_at,
             latest_scan_at,

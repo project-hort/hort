@@ -365,6 +365,8 @@ async fn refuses_to_run_when_reconcile_not_converged() {
         MockPurgeGc::new().with_pending(vec![PendingPurge {
             artifact_id,
             quarantine_status: QuarantineStatus::None,
+            tag_targeted: false,
+            expired_only_by_keep_last_n: false,
         }]),
         MockStorage::new(),
         MockReconcileGate::not_converged(),
@@ -400,6 +402,8 @@ async fn zero_refcount_deletes_blob_then_retires_with_terminal_event() {
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::None,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]),
         MockStorage::new().with_present(content_hash.clone()),
@@ -430,6 +434,8 @@ async fn shared_blob_is_kept_but_artifact_is_retired() {
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::Released,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 3)]),
         MockStorage::new(),
@@ -455,6 +461,8 @@ async fn all_hashes_land_in_one_terminal_batch() {
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::None,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(
                 artifact_id,
@@ -487,6 +495,8 @@ async fn second_hash_failure_withholds_entire_terminal_transition_then_retries()
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::None,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(
                 artifact_id,
@@ -532,6 +542,8 @@ async fn completed_primary_does_not_hide_outstanding_oci_child() {
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::None,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(artifact_id, vec![primary, work(child.clone(), 0)]),
         MockStorage::new().with_present(child.clone()),
@@ -552,6 +564,8 @@ async fn absent_storage_is_an_idempotent_success() {
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::None,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 0)]),
         MockStorage::new(),
@@ -576,6 +590,8 @@ async fn protected_artifacts_are_never_prepared() {
             MockPurgeGc::new().with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: status,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }]),
             MockStorage::new(),
             MockReconcileGate::converged(),
@@ -609,10 +625,14 @@ async fn prepare_failure_is_per_artifact_and_sweep_continues() {
                 PendingPurge {
                     artifact_id: bad,
                     quarantine_status: QuarantineStatus::None,
+                    tag_targeted: false,
+                    expired_only_by_keep_last_n: false,
                 },
                 PendingPurge {
                     artifact_id: good,
                     quarantine_status: QuarantineStatus::None,
+                    tag_targeted: false,
+                    expired_only_by_keep_last_n: false,
                 },
             ])
             .with_refs(good, vec![work(content_hash.clone(), 0)])
@@ -636,6 +656,8 @@ async fn empty_worklist_is_a_noop() {
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::None,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(artifact_id, Vec::new()),
         MockStorage::new(),
@@ -657,6 +679,8 @@ async fn checkpoint_failure_withholds_terminal_transition_and_retries() {
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::None,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
             .fail_mark_once_for(content_hash),
@@ -684,6 +708,8 @@ async fn terminal_transition_failure_retries_without_repeating_storage() {
             .with_pending(vec![PendingPurge {
                 artifact_id,
                 quarantine_status: QuarantineStatus::None,
+                tag_targeted: false,
+                expired_only_by_keep_last_n: false,
             }])
             .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
             .fail_complete_once(),
@@ -753,14 +779,20 @@ mod metrics_emission_tests {
                                 PendingPurge {
                                     artifact_id: success,
                                     quarantine_status: QuarantineStatus::None,
+                                    tag_targeted: false,
+                                    expired_only_by_keep_last_n: false,
                                 },
                                 PendingPurge {
                                     artifact_id: kept,
                                     quarantine_status: QuarantineStatus::None,
+                                    tag_targeted: false,
+                                    expired_only_by_keep_last_n: false,
                                 },
                                 PendingPurge {
                                     artifact_id: failed,
                                     quarantine_status: QuarantineStatus::None,
+                                    tag_targeted: false,
+                                    expired_only_by_keep_last_n: false,
                                 },
                             ])
                             .with_refs(success, vec![work(success_hash.clone(), 0)])
@@ -781,4 +813,88 @@ mod metrics_emission_tests {
         assert_eq!(counter(&snapshot, "blob_kept"), Some(1));
         assert_eq!(counter(&snapshot, "storage_error"), Some(1));
     }
+}
+
+// ===========================================================================
+// KeepLastN tag exemption, re-asked at purge time
+// ===========================================================================
+
+fn pending(artifact_id: Uuid, tag_targeted: bool, keep_last_n_only: bool) -> PendingPurge {
+    PendingPurge {
+        artifact_id,
+        quarantine_status: QuarantineStatus::Released,
+        tag_targeted,
+        expired_only_by_keep_last_n: keep_last_n_only,
+    }
+}
+
+/// Walk the interval the two cron sweeps leave open: the artifact was
+/// expired by `KeepLastN` at 03:00 with no ref on it, a tag was set at
+/// 03:30, and the purge runs at 04:00. Nothing re-runs the predicate,
+/// so the purge itself has to re-ask — the steady-state fixtures below
+/// pass without this and that is exactly why it is its own test.
+#[tokio::test]
+async fn a_tag_set_between_expiry_and_purge_saves_the_artifact() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            // The ref set during the interval is visible to the sweep
+            // that reads the work set, not to the expiry that predates it.
+            .with_pending(vec![pending(artifact_id, true, true)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(8000)).await.unwrap();
+
+    assert_eq!(summary.artifacts_visited, 1);
+    assert_eq!(summary.skipped_tag_exempt, 1);
+    assert_eq!(summary.blobs_deleted, 0);
+    assert_eq!(summary.purged_events, 0);
+    // Nothing destructive ran, and the decision is retained: the
+    // artifact is purged on a later sweep once the tag moves.
+    assert_eq!(h.gc.purge_call_count(), 0);
+    assert!(h.storage.delete_attempts().is_empty());
+    assert!(!h.gc.is_retired(artifact_id));
+}
+
+#[tokio::test]
+async fn an_untagged_keep_last_n_expiry_is_purged_normally() {
+    let artifact_id = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![pending(artifact_id, false, true)])
+            .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 0)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(8000)).await.unwrap();
+
+    assert_eq!(summary.skipped_tag_exempt, 0);
+    assert_eq!(summary.blobs_deleted, 1);
+    assert!(h.gc.is_retired(artifact_id));
+}
+
+#[tokio::test]
+async fn a_tagged_artifact_expired_by_another_predicate_is_still_purged() {
+    // The exemption belongs to KeepLastN alone. An age- or
+    // security-driven decision stands: the artifact is purged even
+    // while a ref points at it.
+    let artifact_id = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![pending(artifact_id, true, false)])
+            .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 0)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(8000)).await.unwrap();
+
+    assert_eq!(summary.skipped_tag_exempt, 0);
+    assert_eq!(summary.blobs_deleted, 1);
+    assert!(h.gc.is_retired(artifact_id));
 }

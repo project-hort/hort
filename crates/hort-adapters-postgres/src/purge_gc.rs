@@ -17,6 +17,42 @@
 //! defence-in-depth, but the adapter never hands a protected artifact
 //! to the destructive path in the first place.
 //!
+//! ## The two tag-exemption facts
+//!
+//! The query also reports, per row, the two facts the `KeepLastN` tag
+//! exemption needs at purge time. They are reported rather than
+//! filtered: the *decision* lives in the use case, where it lands in
+//! the sweep summary instead of disappearing into a `WHERE` clause.
+//!
+//! - `tag_targeted` — a mutable ref **in the artifact's own
+//!   repository** currently resolves to it: `target_kind = 'hash'`
+//!   against `checksum_sha256` (the OCI tag) or
+//!   `target_kind = 'version'` against `(namespace, version)` (the npm
+//!   dist-tag shape). The repository scope matters because CAS shares
+//!   content hashes across repositories; the version arm matters
+//!   because a hash-only reading protects nothing outside OCI; the
+//!   `namespace` conjunct matters because otherwise one package's
+//!   `latest` would exempt every same-versioned package beside it.
+//!   This is re-read here, not inherited from the evaluation sweep:
+//!   the two sweeps are an hour apart and a tag set in between arrives
+//!   after the `ArtifactExpired` is already on the stream.
+//! - `expired_only_by_keep_last_n` — no pending `ArtifactExpired` on
+//!   the stream carries a readable non-`KeepLastN` reason.
+//!   `ExpirationReason` is an externally-tagged enum, so the stored
+//!   payload of a count-based expiry is `{"KeepLastN": {…}}` under
+//!   `event_data->'data'->'reason'`. The exemption belongs to
+//!   `KeepLastN` alone — an age- or security-driven decision is not
+//!   countermanded by a tag.
+//!
+//!   The `jsonb_typeof(…) = 'object'` guard is the fail-safe
+//!   direction: only a payload that positively reads as *some other*
+//!   reason clears the exemption. An absent or non-object reason
+//!   leaves the flag set, which at worst withholds a destructive step
+//!   on an artifact a tag currently names — visible in the sweep
+//!   summary and released as soon as the tag moves. The opposite
+//!   default would let an unreadable payload delete content a live
+//!   tag resolves to, and deletion does not come back.
+//!
 //! # `purge_artifact_refs` — durable preparation in one transaction
 //!
 //! 1. `SELECT … FROM artifacts WHERE id = $1 FOR UPDATE` — lock the
@@ -109,6 +145,8 @@ impl PgPurgeGcPort {
 struct PendingRow {
     artifact_id: Uuid,
     quarantine_status: Option<String>,
+    tag_targeted: bool,
+    expired_only_by_keep_last_n: bool,
 }
 
 /// One `(target_content_hash, kind)` row removed by the step-2
@@ -271,10 +309,20 @@ impl PurgeGcPort for PgPurgeGcPort {
             // excluded here (GC-protected invariant) — the destructive
             // path is never even offered an evidence artifact; the use
             // case re-asserts the same filter defence-in-depth.
-            let rows: Vec<PendingRow> = sqlx::query_as(
+            let sql = format!(
                 r#"
                 SELECT a.id                AS artifact_id,
-                       a.quarantine_status AS quarantine_status
+                       a.quarantine_status AS quarantine_status,
+                       {tag_targeted}      AS tag_targeted,
+                       NOT EXISTS (
+                         SELECT 1 FROM events e
+                          WHERE e.stream_id  = 'artifact-' || a.id::text
+                            AND e.event_type = 'ArtifactExpired'
+                            AND jsonb_typeof(e.event_data->'data'->'reason')
+                                  = 'object'
+                            AND NOT (e.event_data->'data'->'reason'
+                                       ? 'KeepLastN')
+                       )                   AS expired_only_by_keep_last_n
                   FROM artifacts a
                  WHERE EXISTS (
                          SELECT 1 FROM events e
@@ -290,17 +338,21 @@ impl PurgeGcPort for PgPurgeGcPort {
                         OR a.quarantine_status <> ALL($1::text[]))
                  ORDER BY a.id
                 "#,
-            )
-            .bind(crate::gc_protected_quarantine_status_names())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "purge_gc", "list_pending"))?;
+                tag_targeted = crate::ARTIFACT_IS_TAG_TARGETED_SQL,
+            );
+            let rows: Vec<PendingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(crate::gc_protected_quarantine_status_names())
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "purge_gc", "list_pending"))?;
 
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 out.push(PendingPurge {
                     artifact_id: row.artifact_id,
                     quarantine_status: map_status(row.quarantine_status.as_deref())?,
+                    tag_targeted: row.tag_targeted,
+                    expired_only_by_keep_last_n: row.expired_only_by_keep_last_n,
                 });
             }
             Ok(out)
@@ -903,6 +955,87 @@ mod tests {
         .execute(pool)
         .await
         .expect("append event");
+    }
+
+    /// Append an artifact-stream event carrying a real payload —
+    /// `{"type": …, "data": {"reason": <reason>}}`, the shape
+    /// `serialize_event_data` writes for an externally-tagged
+    /// `ExpirationReason`.
+    async fn append_expired_with_reason(
+        pool: &PgPool,
+        artifact: Uuid,
+        stream_position: i64,
+        reason: serde_json::Value,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO events (
+                   stream_id, stream_category, stream_position, event_type,
+                   event_data, correlation_id, actor_type,
+                   prev_event_hash, event_hash
+               ) VALUES (
+                   'artifact-' || $1::text, 'artifact', $2, 'ArtifactExpired',
+                   jsonb_build_object(
+                       'type', 'ArtifactExpired',
+                       'data', jsonb_build_object('reason', $3::jsonb)
+                   ),
+                   gen_random_uuid(), 'system',
+                   '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea,
+                   '\x1111111111111111111111111111111111111111111111111111111111111111'::bytea
+               )"#,
+        )
+        .bind(artifact)
+        .bind(stream_position)
+        .bind(reason)
+        .execute(pool)
+        .await
+        .expect("append ArtifactExpired");
+    }
+
+    fn keep_last_n_reason() -> serde_json::Value {
+        serde_json::json!({ "KeepLastN": { "keep": 3, "total": 10, "rank": 4 } })
+    }
+
+    fn age_exceeded_reason() -> serde_json::Value {
+        serde_json::json!({
+            "AgeExceeded": { "published_at": "2024-01-01T00:00:00Z", "ttl_secs": 60 }
+        })
+    }
+
+    async fn seed_mutable_ref(
+        pool: &PgPool,
+        repo: Uuid,
+        namespace: &str,
+        ref_name: &str,
+        kind: &str,
+        hash: Option<&str>,
+        version: Option<&str>,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO mutable_refs (
+                   repository_id, namespace, ref_name, target_kind,
+                   target_hash, target_version
+               ) VALUES ($1, $2, $3, $4, $5, $6)"#,
+        )
+        .bind(repo)
+        .bind(namespace)
+        .bind(ref_name)
+        .bind(kind)
+        .bind(hash)
+        .bind(version)
+        .execute(pool)
+        .await
+        .expect("seed mutable ref");
+    }
+
+    async fn pending_for(pool: &PgPool, artifact: Uuid) -> PendingPurge {
+        adapter(pool)
+            .await
+            .list_pending_purge()
+            .await
+            .expect("list pending")
+            .into_iter()
+            .find(|p| p.artifact_id == artifact)
+            .unwrap_or_else(|| panic!("{artifact} is not pending purge"))
     }
 
     async fn cr_rows_for(pool: &PgPool, source: Uuid) -> Vec<(String, String)> {
@@ -2068,5 +2201,200 @@ mod tests {
         let adapter = adapter(&pool).await;
         let refs = adapter.purge_artifact_refs(Uuid::new_v4()).await.unwrap();
         assert!(refs.is_empty(), "no artifact row → nothing to purge");
+    }
+
+    // -- tag exemption, re-asked at purge time ---------------------------
+
+    /// Walk the interval the two cron sweeps leave open. At 03:00 the
+    /// evaluator expired an untagged artifact under `KeepLastN`; at
+    /// 03:30 an operator tagged it; the purge runs at 04:00 and nothing
+    /// re-ran the predicate. The work-set read is what has to notice.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_tag_set_after_expiry_flips_the_pending_row() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "interval", HASH_A, Some("released")).await;
+        append_expired_with_reason(&pool, art, 0, keep_last_n_reason()).await;
+
+        // 03:00 — expired, nothing points at it.
+        let before = pending_for(&pool, art).await;
+        assert!(!before.tag_targeted);
+        assert!(before.expired_only_by_keep_last_n);
+
+        // 03:30 — an operator tags it.
+        seed_mutable_ref(
+            &pool,
+            repo,
+            "interval",
+            "latest",
+            "hash",
+            Some(HASH_A),
+            None,
+        )
+        .await;
+
+        // 04:00 — the purge sweep re-reads the work set.
+        let after = pending_for(&pool, art).await;
+        assert!(
+            after.tag_targeted,
+            "the ref set after the expiry must be visible to the purge"
+        );
+        assert!(after.expired_only_by_keep_last_n);
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The version target kind — the npm dist-tag shape. A hash-only
+    /// reading reports `false` here.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn pending_tag_targeted_covers_the_version_target_kind() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "dist-tagged", HASH_A, Some("released")).await;
+        append_expired_with_reason(&pool, art, 0, keep_last_n_reason()).await;
+        // `seed_artifact` stores version '1.0.0' under name = namespace.
+        seed_mutable_ref(
+            &pool,
+            repo,
+            "dist-tagged",
+            "latest",
+            "version",
+            None,
+            Some("1.0.0"),
+        )
+        .await;
+
+        assert!(pending_for(&pool, art).await.tag_targeted);
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Identical content tagged in a *different* repository must not
+    /// exempt this one — CAS shares hashes across repositories.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn pending_tag_targeted_is_repository_scoped() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let elsewhere = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "shared", HASH_A, Some("released")).await;
+        append_expired_with_reason(&pool, art, 0, keep_last_n_reason()).await;
+        // Same bytes, same name, same version — tagged next door.
+        seed_mutable_ref(
+            &pool,
+            elsewhere,
+            "shared",
+            "latest",
+            "hash",
+            Some(HASH_A),
+            None,
+        )
+        .await;
+        seed_mutable_ref(
+            &pool,
+            elsewhere,
+            "shared",
+            "dist",
+            "version",
+            None,
+            Some("1.0.0"),
+        )
+        .await;
+
+        assert!(!pending_for(&pool, art).await.tag_targeted);
+
+        cleanup(&pool, repo).await;
+        cleanup(&pool, elsewhere).await;
+    }
+
+    /// A non-`KeepLastN` expiry clears the flag: an age- or
+    /// security-driven decision is not countermanded by a tag.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_age_expiry_is_not_keep_last_n_only() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let aged = seed_artifact(&pool, repo, "aged", HASH_A, Some("released")).await;
+        append_expired_with_reason(&pool, aged, 0, age_exceeded_reason()).await;
+        // Both reasons on one stream: the age decision still stands.
+        let both = seed_artifact(&pool, repo, "both", HASH_B, Some("released")).await;
+        append_expired_with_reason(&pool, both, 0, keep_last_n_reason()).await;
+        append_expired_with_reason(&pool, both, 1, age_exceeded_reason()).await;
+
+        assert!(!pending_for(&pool, aged).await.expired_only_by_keep_last_n);
+        assert!(!pending_for(&pool, both).await.expired_only_by_keep_last_n);
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// End-to-end through the real use case: the tagged artifact keeps
+    /// its blob and its row; an identical untagged one is purged.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn purge_sweep_skips_the_tagged_artifact_and_purges_its_sibling() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let tagged = seed_artifact(&pool, repo, "keeper", HASH_A, Some("released")).await;
+        let doomed = seed_artifact(&pool, repo, "goner", HASH_B, Some("released")).await;
+        for art in [tagged, doomed] {
+            sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+                .bind(art)
+                .execute(&pool)
+                .await
+                .unwrap();
+            append_expired_with_reason(&pool, art, 0, keep_last_n_reason()).await;
+        }
+        insert_cr(&pool, repo, tagged, "primary_content", HASH_A).await;
+        insert_cr(&pool, repo, doomed, "primary_content", HASH_B).await;
+        seed_mutable_ref(&pool, repo, "keeper", "latest", "hash", Some(HASH_A), None).await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let uc = PurgeUseCase::new(
+            Arc::new(adapter(&pool).await),
+            storage,
+            Arc::new(ConvergedGate),
+        );
+
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert_eq!(summary.skipped_tag_exempt, 1);
+        // The tagged artifact was never even prepared: its reference
+        // edge is intact and its row is still live.
+        assert_eq!(cr_rows_for(&pool, tagged).await.len(), 1);
+        assert!(cr_rows_for(&pool, doomed).await.is_empty());
+        let tagged_deleted_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(tagged)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(tagged_deleted_at.is_none(), "the tag target stays live");
+        let doomed_deleted_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(doomed)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            doomed_deleted_at.is_some(),
+            "the untagged sibling is purged"
+        );
+
+        cleanup(&pool, repo).await;
     }
 }

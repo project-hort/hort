@@ -41,6 +41,60 @@
 //! with no resolved scan policy yields `None` (→ the default 24 h)
 //! rather than being dropped — age-based retention applies even
 //! without a scan policy.
+//!
+//! ## `keep_rank` — the `KeepLastN` input
+//!
+//! This artifact's 1-based rank among its siblings plus the sibling
+//! total, resolved in the **same** enumeration statement (a window
+//! function — no second port, no extra round-trip, no second data
+//! source).
+//!
+//! **Sibling group.** `(repository_id, artifact name)`.
+//!
+//! **Ordering (contract, not an implementation detail).** Newest first
+//! by `created_at`, ties broken by artifact id descending. Which `n`
+//! versions survive `KeepLastN(n)` is decided entirely by this
+//! ordering, and the tiebreak is what makes it reproducible: two
+//! artifacts stored in the same instant must not be free to swap ranks
+//! between two sweeps and expire alternately.
+//!
+//! **Live set.** The rank is computed over the artifacts that are live
+//! by the same definition this reader's own enumeration uses —
+//! `deleted_at IS NULL`. A retired artifact must occupy no rank slot:
+//! it would otherwise shield itself and push one extra live artifact
+//! over the edge. GC-protected siblings (`quarantined` / `rejected` /
+//! `scan_indeterminate`) are *not* enumerable as candidates but they
+//! **do** occupy rank slots — they are live bytes on disk, and
+//! "keep the last n" means n live artifacts.
+//!
+//! **Pagination.** The rank is a property of the whole sibling group,
+//! never of the page. An implementation that lets the keyset cursor
+//! reach the window partition computes a rank relative to the current
+//! page and expires the wrong artifacts; the sibling group can be far
+//! larger than one page.
+//!
+//! ## `tag_targeted` — the tag exemption
+//!
+//! A tag target survives `KeepLastN` regardless of rank, and nothing
+//! in a rank knows about tags. The flag answers "does a mutable ref in
+//! **this** repository resolve to this artifact?" and it has three
+//! ways to look right and be wrong:
+//!
+//! - **Repository-scoped.** Content hashes are shared across
+//!   repositories by construction — that is what CAS is. A
+//!   hash-global lookup would exempt an untagged artifact because
+//!   identical bytes happen to be tagged in another repository, and
+//!   under a name-pattern-scoped policy it would protect nothing when
+//!   the tag lives in a repository the policy does not cover.
+//! - **Both target kinds.** `target_kind = 'hash'` is the OCI tag
+//!   (a pointer at a content hash); `target_kind = 'version'` is how
+//!   an npm dist-tag or any other non-OCI mutable pointer resolves.
+//!   A hash-only exemption silently protects nothing outside OCI.
+//! - **Evaluation is not the last word.** Evaluation and purge are
+//!   separate sweeps, so a tag added between them finds the artifact
+//!   already carrying `ArtifactExpired`. The window is closed on the
+//!   purge side — see
+//!   [`PendingPurge::tag_targeted`](super::purge_gc::PendingPurge::tag_targeted).
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -77,6 +131,21 @@ pub struct RetentionCandidateRow {
     /// default 24 h. Mirrors `RetentionCandidate
     /// .resolved_rescan_interval_hours` semantics exactly.
     pub resolved_rescan_interval_hours: Option<i64>,
+    /// The `KeepLastN` input: this artifact's 1-based rank among its
+    /// live siblings (newest = 1) and the size of that sibling group.
+    /// `None` when no ranking could be resolved — the pure evaluator
+    /// then fails `KeepLastN` safe and never expires the artifact.
+    ///
+    /// See the module docs for the ordering contract, the sibling-group
+    /// definition, and why the rank cannot be computed per page.
+    pub keep_rank: Option<(u32, u32)>,
+    /// `true` iff a mutable ref **in this artifact's own repository**
+    /// currently resolves to this artifact — an OCI tag
+    /// (`target_kind = 'hash'`) pointing at its content hash, or a
+    /// version pointer (`target_kind = 'version'`, the npm dist-tag
+    /// shape) naming its `(name, version)`. See the module docs for
+    /// why both kinds and the repository scope are load-bearing.
+    pub tag_targeted: bool,
 }
 
 /// Outbound port for the retention candidate-enumeration query.
