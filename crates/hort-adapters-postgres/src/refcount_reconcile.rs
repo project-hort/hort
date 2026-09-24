@@ -160,6 +160,7 @@ impl RefcountReconcilePort for PgRefcountReconcile {
                         AND cr.source_artifact_id = a.id
                         AND cr.kind               = 'primary_content'
                  WHERE a.repository_id = $1
+                   AND a.deleted_at IS NULL
                    AND (a.quarantine_status IS NULL
                         OR a.quarantine_status <> ALL($2::text[]))
                    AND (cr.target_content_hash IS NULL
@@ -205,6 +206,7 @@ impl RefcountReconcilePort for PgRefcountReconcile {
                         AND cr.source_artifact_id = a.id
                         AND cr.kind               = 'metadata_blob'
                  WHERE a.repository_id = $1
+                   AND a.deleted_at IS NULL
                    AND am.metadata_blob IS NOT NULL
                    AND (a.quarantine_status IS NULL
                         OR a.quarantine_status <> ALL($2::text[]))
@@ -859,6 +861,38 @@ mod tests {
             drift.repairs.is_empty(),
             "a quarantined artifact yields no primary_content create and no delete"
         );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Retired rows are historical projections, not live refcount
+    /// sources. Reconcile must not recreate either single-target edge.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn retired_artifact_is_not_reconciled() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let artifact = seed_artifact(&pool, repo, "retired", HASH_A, Some("released")).await;
+        seed_metadata_blob(&pool, artifact, HASH_B).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifacts SET deleted_at = now() WHERE id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let drift = PgRefcountReconcile::new(pool.clone())
+            .scan_repo_drift(repo)
+            .await
+            .unwrap();
+        assert!(drift.repairs.is_empty());
+        assert!(cr_rows_for(&pool, artifact).await.is_empty());
 
         cleanup(&pool, repo).await;
     }

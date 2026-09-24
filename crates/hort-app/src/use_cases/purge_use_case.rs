@@ -9,7 +9,8 @@
 //! stage two: for every `ArtifactExpired` with no following
 //! [`ArtifactPurged`](hort_domain::events::ArtifactPurged) it runs the GC
 //! algorithm (decrement `content_references`, delete the CAS blob iff
-//! the cross-`kind` refcount hit `0`, append `ArtifactPurged`). It is
+//! the cross-`kind` refcount hit `0`, then append all `ArtifactPurged`
+//! events and retire the projection atomically). It is
 //! NOT a scheduler — that is the `RetentionPurgeHandler`
 //! `TaskHandler`; this is the pure orchestration the handler calls.
 //!
@@ -48,15 +49,16 @@
 //!
 //! For each pending `ArtifactExpired`:
 //! 1. Lock the artifact row `FOR UPDATE`.
-//! 2. `DELETE FROM content_references WHERE source_artifact_id = X AND
-//!    kind IN ('primary_content','metadata_blob') RETURNING
-//!    target_content_hash, kind`.
-//! 3. For each returned hash `H`: `SELECT count(*) FROM
-//!    content_references WHERE target_content_hash = H` (covers **every**
-//!    kind incl. `oci_subject` — a live OCI manifest keeps the blob).
-//!    `count = 0` ⇒ `StoragePort::delete(H)`; emit
-//!    `ArtifactPurged{ content_hash: H, refs_remaining: count }`.
-//! 4. Commit.
+//! 2. Delete every `content_references` source edge for the artifact,
+//!    returning each distinct target hash.
+//! 3. Persist each returned hash and its post-delete count in the purge
+//!    worklist, in the same transaction as the edge deletion.
+//! 4. For each hash `H`, use its cross-kind remaining count (including
+//!    `oci_subject` and every other kind). `count = 0` means
+//!    `StoragePort::delete(H)`; emit no event yet. Checkpoint the
+//!    successful storage decision.
+//! 5. Once every hash is checkpointed, append one `ArtifactPurged` per
+//!    hash and set `artifacts.deleted_at` in one adapter transaction.
 //!
 //! Walks **both** `artifact.sha256_checksum` (`primary_content`) AND
 //! `artifact_metadata.metadata_blob` (`metadata_blob`).
@@ -64,17 +66,14 @@
 //! ## Two-stage idempotency
 //!
 //! The durable `ArtifactExpired` event is the work item; `ArtifactPurged`
-//! terminates it. The adapter's [`PurgeGcPort::purge_artifact_refs`] is
-//! **idempotent**: the deleted-blob hash is recoverable from the
-//! authoritative `artifacts.checksum_sha256` /
-//! `artifact_metadata.metadata_blob` columns, not only from the
-//! (deleted) `content_references` rows. A transient `StoragePort::delete`
-//! failure ⇒ **no** `ArtifactPurged` emitted, the content_references
-//! deletion rolled back with the failed transaction, the
-//! `ArtifactExpired` decision intact ⇒ the next sweep re-reads it and
-//! retries. Re-running `StoragePort::delete` on an already-absent blob
-//! is a clean no-op (`delete` is success-on-missing);
-//! `ArtifactPurged` is idempotent on replay.
+//! terminates it. The adapter's worklist is written atomically with the
+//! reference deletion, so every hash remains discoverable after its
+//! source edge is gone. A transient `StoragePort::delete` failure emits
+//! no terminal event and leaves the artifact live; the next sweep reads
+//! the same worklist and retries. Re-running `StoragePort::delete` on an
+//! already-absent blob is a clean no-op (`delete` is
+//! success-on-missing). The terminal event batch and retirement happen
+//! only after every hash is complete.
 //!
 //! ## Evidence is never purged (defence-in-depth)
 //!
@@ -93,13 +92,12 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::events::{retention_scheduler_actor, ArtifactPurged, DomainEvent, StreamId};
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::purge_gc::{PendingPurge, PurgeGcPort, PurgedRef};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::ContentHash;
 
 use crate::error::{AppError, AppResult};
-use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{emit_retention_purged, RetentionPurgedResult};
 
 /// Reports whether the refcount-reconcile sweep
@@ -139,7 +137,8 @@ pub struct PurgeSummary {
     pub purged_events: u64,
     /// Artifacts skipped by the evidence-protection re-assertion.
     pub skipped_protected: u64,
-    /// Per-artifact failures (port read / storage delete / append).
+    /// Per-artifact failures (prepare / storage / checkpoint / terminal
+    /// transition).
     /// The `ArtifactExpired` decision is retained; next sweep retries.
     pub errors: u64,
 }
@@ -151,7 +150,6 @@ pub struct PurgeSummary {
 pub struct PurgeUseCase {
     gc: Arc<dyn PurgeGcPort>,
     storage: Arc<dyn StoragePort>,
-    events: Arc<EventStorePublisher>,
     reconcile_gate: Arc<dyn RefcountReconcileGate>,
 }
 
@@ -163,13 +161,11 @@ impl PurgeUseCase {
     pub fn new(
         gc: Arc<dyn PurgeGcPort>,
         storage: Arc<dyn StoragePort>,
-        events: Arc<EventStorePublisher>,
         reconcile_gate: Arc<dyn RefcountReconcileGate>,
     ) -> Self {
         Self {
             gc,
             storage,
-            events,
             reconcile_gate,
         }
     }
@@ -264,7 +260,7 @@ impl PurgeUseCase {
             QuarantineStatus::None | QuarantineStatus::Released => {}
         }
 
-        // -- GC steps 1-3 (committed, idempotent transaction) ------------
+        // -- durable worklist preparation (committed, idempotent) --------
         let purged_refs = match self.gc.purge_artifact_refs(item.artifact_id).await {
             Ok(r) => r,
             Err(e) => {
@@ -279,23 +275,86 @@ impl PurgeUseCase {
             }
         };
 
-        for pr in purged_refs {
-            self.finish_one_ref(now, item.artifact_id, pr, summary)
-                .await;
+        if purged_refs.is_empty() {
+            return;
+        }
+
+        for pr in &purged_refs {
+            if pr.completed {
+                continue;
+            }
+            if !self
+                .finish_one_ref(now, item.artifact_id, pr, summary)
+                .await
+            {
+                return;
+            }
+        }
+
+        let events = purged_refs
+            .iter()
+            .map(|pr| {
+                EventToAppend::new(DomainEvent::ArtifactPurged(ArtifactPurged {
+                    artifact_id: item.artifact_id,
+                    content_hash: pr.content_hash.clone(),
+                    refs_remaining: pr.refs_remaining,
+                    purged_at: now,
+                }))
+            })
+            .collect();
+        let event_count = purged_refs.len() as u64;
+        let batch = AppendEvents {
+            stream_id: StreamId::artifact(item.artifact_id),
+            expected_version: ExpectedVersion::Any,
+            events,
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: retention_scheduler_actor(),
+        };
+
+        match self
+            .gc
+            .complete_artifact_purge(item.artifact_id, now, batch)
+            .await
+        {
+            Ok(()) => {
+                summary.purged_events += event_count;
+                for pr in &purged_refs {
+                    if pr.refs_remaining == 0 {
+                        emit_retention_purged(RetentionPurgedResult::Success);
+                    } else {
+                        emit_retention_purged(RetentionPurgedResult::BlobKept);
+                    }
+                }
+                tracing::info!(
+                    artifact_id = %item.artifact_id,
+                    purged_events = event_count,
+                    "artifact purge completed and projection retired"
+                );
+            }
+            Err(e) => {
+                summary.errors += 1;
+                tracing::error!(
+                    artifact_id = %item.artifact_id,
+                    error = %e,
+                    "atomic ArtifactPurged append and projection retirement failed — \
+                     worklist retained, retried on next sweep"
+                );
+            }
         }
     }
 
-    /// Decide + execute the storage delete for one hash, then append
-    /// the terminal `ArtifactPurged`. Two-stage idempotency: a
-    /// transient `StoragePort::delete` failure emits **no**
-    /// `ArtifactPurged` (the decision survives, next sweep retries).
+    /// Execute the storage decision for one hash, then checkpoint it.
+    /// A transient `StoragePort::delete` failure leaves the checkpoint
+    /// outstanding and emits no terminal event, so the next sweep
+    /// retries from the durable worklist.
     async fn finish_one_ref(
         &self,
         now: DateTime<Utc>,
         artifact_id: Uuid,
-        pr: PurgedRef,
+        pr: &PurgedRef,
         summary: &mut PurgeSummary,
-    ) {
+    ) -> bool {
         let hash_short = truncate_hash(&pr.content_hash);
 
         if pr.refs_remaining == 0 {
@@ -328,32 +387,23 @@ impl PurgeUseCase {
                          emitted), retried on next sweep (two-stage \
                          idempotency)"
                     );
-                    return;
+                    return false;
                 }
             }
-            summary.blobs_deleted += 1;
-        } else {
-            // A live reference keeps the blob; only this ref is gone.
-            summary.blobs_kept += 1;
         }
 
         match self
-            .append_purged(artifact_id, pr.content_hash.clone(), pr.refs_remaining, now)
+            .gc
+            .mark_purge_ref_complete(artifact_id, &pr.content_hash, now)
             .await
         {
             Ok(()) => {
-                summary.purged_events += 1;
                 if pr.refs_remaining == 0 {
-                    emit_retention_purged(RetentionPurgedResult::Success);
+                    summary.blobs_deleted += 1;
                 } else {
-                    emit_retention_purged(RetentionPurgedResult::BlobKept);
+                    summary.blobs_kept += 1;
                 }
-                tracing::info!(
-                    %artifact_id,
-                    content_hash = %hash_short,
-                    refs_remaining = pr.refs_remaining,
-                    "artifact purged"
-                );
+                true
             }
             Err(e) => {
                 summary.errors += 1;
@@ -361,48 +411,12 @@ impl PurgeUseCase {
                     %artifact_id,
                     content_hash = %hash_short,
                     error = %e,
-                    "ArtifactPurged append failed after storage step — \
-                     ArtifactExpired retained, retried on next sweep \
-                     (purge_artifact_refs + storage delete are idempotent)"
+                    "purge worklist checkpoint failed after storage step — \
+                     terminal transition withheld, retried on next sweep"
                 );
+                false
             }
         }
-    }
-
-    /// Append the terminal `ArtifactPurged` to the artifact stream.
-    /// `ExpectedVersion::Any` — the purge races nothing on the stream
-    /// for this decision (the pending set already proves no
-    /// `ArtifactPurged` followed the `ArtifactExpired`; a concurrent
-    /// ingest appending in between is harmless and cannot duplicate the
-    /// terminal). Same convention as `RetentionUseCase`'s
-    /// `append_expired`. Actor is [`retention_scheduler_actor`] (not
-    /// `system_actor()`) so the destructive `ArtifactPurged`
-    /// audit is attributable to the retention subsystem.
-    async fn append_purged(
-        &self,
-        artifact_id: Uuid,
-        content_hash: ContentHash,
-        refs_remaining: u32,
-        now: DateTime<Utc>,
-    ) -> AppResult<()> {
-        let event = ArtifactPurged {
-            artifact_id,
-            content_hash,
-            refs_remaining,
-            purged_at: now,
-        };
-        event.validate().map_err(AppError::Domain)?;
-        let batch = AppendEvents {
-            stream_id: StreamId::artifact(artifact_id),
-            expected_version: ExpectedVersion::Any,
-            events: vec![EventToAppend::new(DomainEvent::ArtifactPurged(event))],
-            correlation_id: Uuid::new_v4(),
-            causation_id: None,
-            // Destructive purge audit → RetentionScheduler.
-            actor: retention_scheduler_actor(),
-        };
-        self.events.append(batch).await.map_err(AppError::Domain)?;
-        Ok(())
     }
 }
 

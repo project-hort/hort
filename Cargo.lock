@@ -2545,6 +2545,7 @@ name = "hort-adapters-postgres"
 version = "0.14.1-dev"
 dependencies = [
  "chrono",
+ "hort-adapters-storage",
  "hort-app",
  "hort-domain",
  "metrics",
@@ -2553,6 +2554,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
