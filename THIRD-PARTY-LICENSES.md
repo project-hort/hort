@@ -336,7 +336,7 @@ the result instead.
 | crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.18.4 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.18.5 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -446,9 +446,9 @@ the result instead.
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
 | syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror-impl | 2.0.20 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror-impl | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror | 2.0.20 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
 | typed-path | 0.12.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | unicode-ident | 1.0.24 | MIT | https://github.com/dtolnay/unicode-ident |
 | unsafe-libyaml | 0.2.11 | MIT | https://github.com/dtolnay/unsafe-libyaml |
@@ -13254,7 +13254,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.18.4 — MIT
+### lru 0.18.5 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
@@ -16416,7 +16416,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror-impl 2.0.20 — MIT
+### thiserror-impl 2.0.21 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 
@@ -16478,7 +16478,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror 2.0.20 — MIT
+### thiserror 2.0.21 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 
