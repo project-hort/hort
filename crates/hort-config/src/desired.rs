@@ -420,6 +420,7 @@ impl DesiredState {
         push_init14_reference_errors(self, &declared_repos, &mut errors);
         push_per_policy_exclusion_duplicates(&self.exclusions, &mut errors);
         push_scan_policy_scope_duplicates(&self.scan_policies, &mut errors);
+        push_retention_policy_scope_reference_errors(self, &declared_repos, &mut errors);
         push_upstream_mapping_reference_errors(self, &declared_repos, &mut errors);
         push_upstream_mapping_identity_duplicates(&self.upstream_mappings, &mut errors);
         push_upstream_mapping_format_compatibility_errors(self, &mut errors);
@@ -1155,6 +1156,44 @@ fn push_upstream_mapping_identity_duplicates(
     }
 }
 
+/// Cross-doc reference check for a `RetentionPolicy`'s repository
+/// scope.
+///
+/// `scope: { Repos: [<metadata.name>, …] }` names repositories the
+/// apply pipeline resolves to UUIDs through `repo_id_by_name`, which is
+/// built from `DesiredState.repositories`. A name absent from that map
+/// has no id to resolve to, and the resolution site treats a miss as an
+/// invariant violation rather than papering over it — so an undeclared
+/// name has to be rejected here, before any write. Mirrors the
+/// `ScanPolicy` scope rule and the `UpstreamMapping.spec.repository`
+/// rule: one `DanglingReference` per offending value, naming it.
+///
+/// A scope that does not deserialize is skipped: the per-spec validator
+/// already reported it, and reporting the same envelope twice for one
+/// defect helps nobody.
+fn push_retention_policy_scope_reference_errors(
+    state: &DesiredState,
+    declared_repos: &std::collections::HashSet<&str>,
+    errors: &mut Vec<ValidationError>,
+) {
+    for env in &state.retention_policies {
+        let Ok(scope) = crate::retention_policy::scope_from_value(&env.spec.scope) else {
+            continue;
+        };
+        for name in scope.repository_names() {
+            if !declared_repos.contains(name.as_str()) {
+                errors.push(ValidationError::DanglingReference {
+                    referrer_kind: Kind::RetentionPolicy,
+                    referrer_name: env.metadata.name.clone(),
+                    field: "spec.scope.Repos",
+                    target_kind: Kind::ArtifactRepository,
+                    missing_name: name.clone(),
+                });
+            }
+        }
+    }
+}
+
 /// Scope-uniqueness check for `ScanPolicy`.
 ///
 /// A `ScanPolicy`'s scope (`Global` or `Repository(<name>)`) is the key
@@ -1765,6 +1804,149 @@ spec:
                 ..
             }
         )));
+    }
+
+    // -- RetentionPolicy scope reference rule -------------------------------
+
+    fn rp_yaml(name: &str, scope_yaml: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: RetentionPolicy
+metadata:
+  name: {name}
+spec:
+  predicate:
+    AgeExceeds: 2592000
+  scope: {scope_yaml}
+"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn validate_accepts_retention_scope_naming_a_repository_declared_in_the_same_bundle() {
+        // The ordering guarantee this pins: a retention policy may name a
+        // repository declared in the SAME desired state. Nothing has to
+        // pre-exist in the database.
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (
+                p("rp.yaml"),
+                rp_yaml("retain-npm", "{ Repos: [npm-internal] }"),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        state.validate().expect("declared repository resolves");
+    }
+
+    #[test]
+    fn validate_rejects_retention_scope_naming_an_undeclared_repository() {
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (
+                p("rp.yaml"),
+                rp_yaml("retain-ghost", "{ Repos: [npm-internal, ghost-repo] }"),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        let dangling: Vec<&ValidationError> = err
+            .0
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ValidationError::DanglingReference {
+                        referrer_kind: Kind::RetentionPolicy,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(
+            dangling.len(),
+            1,
+            "only the undeclared name is an error, got: {:?}",
+            err.0
+        );
+        let rendered = dangling[0].to_string();
+        assert!(
+            rendered.contains("ghost-repo"),
+            "the message must name the offending value: {rendered}"
+        );
+        assert!(
+            rendered.contains("retain-ghost"),
+            "the message must name the referrer: {rendered}"
+        );
+    }
+
+    /// The retired UUID form is not grandfathered: a tree that still
+    /// writes repository ids now fails the declared-repository rule,
+    /// because the id is read as a name and no repository is named that.
+    #[test]
+    fn validate_rejects_a_retention_scope_still_written_as_uuids() {
+        let files = vec![
+            (p("repo.yaml"), repo_yaml("npm-internal", "hosted", None)),
+            (
+                p("rp.yaml"),
+                rp_yaml(
+                    "retain-legacy",
+                    "{ Repos: ['67e55044-10b1-426f-9247-bb680e5fe0c8'] }",
+                ),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        assert!(
+            err.0.iter().any(|e| e
+                .to_string()
+                .contains("67e55044-10b1-426f-9247-bb680e5fe0c8")),
+            "got: {:?}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn validate_ignores_name_free_retention_scopes() {
+        let files = vec![
+            (p("a.yaml"), rp_yaml("retain-all", "AllRepos")),
+            (
+                p("b.yaml"),
+                rp_yaml("retain-proxied", "{ IngestSource: Proxied }"),
+            ),
+        ];
+        let state = DesiredState::parse_files(files).unwrap();
+        state
+            .validate()
+            .expect("no repository reference to resolve");
+    }
+
+    /// A scope that does not deserialize is the per-spec validator's
+    /// error to report; the reference check must not pile a second,
+    /// misleading error onto the same envelope.
+    #[test]
+    fn validate_reports_an_unparsable_retention_scope_once() {
+        let files = vec![(p("rp.yaml"), rp_yaml("retain-bogus", "{ NotAScope: [] }"))];
+        let state = DesiredState::parse_files(files).unwrap();
+        let err = state.validate().unwrap_err();
+        assert!(
+            err.0.iter().any(|e| e
+                .to_string()
+                .contains("spec.scope is not a valid retention scope")),
+            "got: {:?}",
+            err.0
+        );
+        assert!(
+            !err.0.iter().any(|e| matches!(
+                e,
+                ValidationError::DanglingReference {
+                    referrer_kind: Kind::RetentionPolicy,
+                    ..
+                }
+            )),
+            "an unparsable scope must not also produce a dangling reference: {:?}",
+            err.0
+        );
     }
 
     // -- ScanPolicy scope-uniqueness rules ----------------------------------

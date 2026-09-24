@@ -438,22 +438,26 @@ pub struct ApplyConfigUseCase {
     /// `upstream_allowlist` opt-in/opt-out shape). There is no
     /// env-var and no global `warn` switch.
     lint_config: crate::lint::LintConfig,
-    /// The event-sourced
-    /// retention-policy apply slot. `None` when the retention
-    /// projection port + use case are not wired (test
-    /// harnesses, and any composition that does not opt in); the
-    /// production composition root (`hort-server`/`hort-worker`) installs
-    /// it via [`Self::with_retention`]. When `None`,
-    /// `apply_retention_policies` is a logged no-op (a `RetentionPolicy`
-    /// YAML present with the slot unwired is operator-visible, not a
-    /// silent drop). Builder-shaped exactly like
-    /// `with_federated_jwt_validator` / `with_lint_config` so the
-    /// constructor signature (9 call sites) stays unchanged.
+    /// The event-sourced retention-policy apply slot.
     ///
-    /// Open item — retention-apply slot unwired:
-    /// `with_retention()` stays builder-optional until the
-    /// consumer ships. Sweep this slot's `Option` shape when
-    /// artifact retention goes live.
+    /// A **required** [`Self::new`] parameter — `Option`-typed but not
+    /// omittable. The distinction is the point: the slot stayed
+    /// builder-optional while retention had no consumer, and the
+    /// production composition root was written without ever calling the
+    /// builder, so every `RetentionPolicy` envelope an operator authored
+    /// was parsed, validated, warned about and dropped. A required
+    /// argument forces every composition point to state its answer;
+    /// omission is a compile error rather than an inherited `None`.
+    /// Mirrors [`Self::version_discovery_capable_formats`], which is
+    /// required for the same reason.
+    ///
+    /// `None` stays expressible — a composition with no retention
+    /// projection (test harnesses) is legitimate. When `None`,
+    /// `apply_retention_policies` is a **loud** no-op: a `RetentionPolicy`
+    /// YAML present with the slot unwired warns, never silently drops.
+    /// [`Self::with_retention`] overrides the initial value after
+    /// construction (call-site ergonomics only — it does not make the
+    /// slot optional).
     retention: Option<RetentionApply>,
     /// The deployment's **effective global storage backend**.
     ///
@@ -625,6 +629,7 @@ impl ApplyConfigUseCase {
         service_accounts: Arc<dyn ServiceAccountRepository>,
         users: Arc<dyn UserRepository>,
         version_discovery_capable_formats: Arc<HashSet<String>>,
+        retention: Option<RetentionApply>,
     ) -> Self {
         Self {
             repositories,
@@ -643,11 +648,11 @@ impl ApplyConfigUseCase {
             service_accounts,
             users,
             federated_jwt_validator: None,
-            // Retention apply opt-in (None until the
-            // composition root calls `with_retention`). A
-            // `RetentionPolicy` YAML with this unwired is a logged
-            // no-op, never a silent drop.
-            retention: None,
+            // Supplied by the caller, not defaulted: a composition
+            // point that has no retention projection must say `None`
+            // out loud. `None` keeps `apply_retention_policies` a
+            // warned no-op, never a silent drop.
+            retention,
             // Secure-by-default linter posture (ADR 0015). The
             // production path constructs through `new` only, so the
             // linter rejects single-claim / wildcard-non-admin /
@@ -774,15 +779,17 @@ impl ApplyConfigUseCase {
         self
     }
 
-    /// Install the event-sourced retention-policy apply
-    /// dependencies (projection reader + `RetentionPolicyUseCase`).
+    /// Override the event-sourced retention-policy apply dependencies
+    /// (projection reader + `RetentionPolicyUseCase`) installed as a
+    /// required [`Self::new`] argument.
     ///
-    /// Composition root calls this after [`Self::new`]; without it,
-    /// `apply_retention_policies` is a logged no-op. Builder-shaped
-    /// like `with_federated_jwt_validator` so the constructor stays
-    /// unchanged (the 9 `ApplyConfigUseCase::new` call sites are not
-    /// touched — only the production composition root chains
-    /// `.with_retention(...)`).
+    /// Builder-style purely for call-site ergonomics (a caller holding
+    /// an already-constructed use case does not have to re-supply every
+    /// other constructor argument); it does **not** make the slot
+    /// optional — [`Self::new`] already requires an explicit value.
+    /// Same shape, and same rationale, as
+    /// [`Self::with_version_discovery_capable_formats`].
+    #[must_use]
     pub fn with_retention(mut self, retention: RetentionApply) -> Self {
         self.retention = Some(retention);
         self
@@ -1283,7 +1290,8 @@ impl ApplyConfigUseCase {
             .await?;
         // Event-sourced retention policies, same shape
         // as ScanPolicy (gitops-authored via RetentionPolicyUseCase).
-        self.apply_retention_policies(&desired, &mut report).await?;
+        self.apply_retention_policies(&desired, &repo_id_by_name, &mut report)
+            .await?;
 
         // ----- Stage 3: depends on stage 2 -----
         // Exclusion (refs ScanPolicy projection), UpstreamMapping (refs
@@ -1730,6 +1738,29 @@ fn resolve_scope(scope: &ScopeSpec, repo_id_by_name: &HashMap<String, Uuid>) -> 
             PolicyScope::Repository(id)
         }
     }
+}
+
+/// Resolve a `RetentionPolicy`'s operator-authored scope into the
+/// domain form, mirroring [`resolve_scope`].
+///
+/// Panics on a repository name absent from `repo_id_by_name`, for the
+/// same reason `resolve_scope` does: the cross-spec validator in
+/// `hort-config` has already proved every named repository is declared,
+/// and the apply pipeline fills the map from `DesiredState` before
+/// dispatching policy applies. A softer fallback here would mean the
+/// linter's guarantee is no longer load-bearing, and the two resolution
+/// paths would drift.
+fn resolve_retention_scope(
+    scope: &hort_config::retention_policy::RetentionScopeSpec,
+    repo_id_by_name: &HashMap<String, Uuid>,
+) -> hort_domain::retention::RetentionScope {
+    scope.resolve(repo_id_by_name).unwrap_or_else(|missing| {
+        panic!(
+            "INVARIANT: RetentionPolicy references repository name '{missing}' that is not in \
+             repo_id_by_name — pipeline must populate the map from DesiredState before \
+             dispatching retention-policy applies"
+        )
+    })
 }
 
 fn humantime_secs(s: &str) -> i64 {
@@ -2697,6 +2728,11 @@ mod tests {
             // don't care about this rule keep passing unmodified. Tests
             // that DO care override via `with_version_discovery_capable_formats`.
             Arc::new(["npm".to_string()].into_iter().collect()),
+            // No retention projection in this harness. Explicit,
+            // not inherited: the slot is a required argument so a
+            // composition that skips retention says so, and the
+            // apply warns on every envelope it then drops.
+            None,
         )
         // The caller supplies the `LintConfig`.
         // `build_harness` passes `permissive_for_tests()` (the
@@ -2776,6 +2812,11 @@ mod tests {
             users.clone(),
             // See `build_harness_with_lint_config` — same default posture.
             Arc::new(["npm".to_string()].into_iter().collect()),
+            // No retention projection in this harness. Explicit,
+            // not inherited: the slot is a required argument so a
+            // composition that skips retention says so, and the
+            // apply warns on every envelope it then drops.
+            None,
         )
         // Permissive linter (see `build_harness`).
         .with_lint_config(crate::lint::LintConfig::permissive_for_tests());
@@ -5344,6 +5385,11 @@ mod tests {
             h.service_accounts.clone(),
             h.users.clone(),
             Arc::new(["npm".to_string()].into_iter().collect()),
+            // No retention projection in this harness. Explicit,
+            // not inherited: the slot is a required argument so a
+            // composition that skips retention says so, and the
+            // apply warns on every envelope it then drops.
+            None,
         );
         let without_mapping = DesiredState {
             repositories: vec![repo_env("oci-mirror", "proxy")],

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **A `RetentionPolicy` scope names repositories, and a declared retention
+  policy now actually applies** (#282). The `repos` scope carried repository
+  **UUIDs** at the gitops surface — a form that contradicts every other
+  reference in that tree and stops meaning anything the moment an instance is
+  rebuilt against a fresh database, so the one scope a first cleanup needs could
+  not be authored at all. It now carries `metadata.name` values, mirroring
+  `ScanPolicy`: the apply resolves each name to an id exactly once, through the
+  same map and under the same ordering guarantee, and a name that is not
+  declared in the same desired state is rejected before anything is written,
+  with the offending value named. The UUID form is gone rather than kept
+  alongside — a tree still writing ids fails the declared-repository rule.
+
+  The half that made all of this moot is also closed: the retention apply slot
+  was never wired into the composition root, so every `RetentionPolicy` envelope
+  was parsed, validated, logged as skipped, and dropped. It is now wired, and
+  the slot is a required argument rather than an opt-in builder — the failure
+  was omission by inheritance, so omission is now a compile error. A composition
+  that genuinely has no projection still says so explicitly and still warns on
+  every envelope it skips.
+
+  **Operator action:** write `scope: { Repos: [<metadata.name>, …] }`. Nothing
+  in a shipped configuration changes, because no retention policy could take
+  effect before this.
+
 ### Fixed
 
 - **A completed purge left the artifact broken instead of reclaiming space**

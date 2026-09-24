@@ -12,21 +12,34 @@
 //! This module implements the *machine* envelope: a `ScanPolicySpec`-shaped
 //! YAML whose `predicate` / `scope` are the JSON serde forms of
 //! [`PolicyPredicate`](hort_domain::retention::PolicyPredicate) /
-//! [`RetentionScope`](hort_domain::retention::RetentionScope) (both are
-//! `Serialize + Deserialize` in `hort-domain`). The apply pipeline is
+//! [`RetentionScopeSpec`]. The apply pipeline is
 //! the only way to configure retention policies in v1 (every policy
 //! aggregate is gitops-authored — there is no imperative HTTP API,
-//! exactly like `ScanPolicy`). `RetentionScope::Repos` carries
-//! repository **UUIDs** in this machine envelope; resolving repo
-//! `metadata.name` → id is a planned DSL follow-on not yet implemented.
+//! exactly like `ScanPolicy`).
+//!
+//! The one place this envelope's `scope` deliberately diverges from the
+//! domain enum is [`RetentionScopeSpec::Repos`], which carries
+//! repository **`metadata.name`s** — the domain's
+//! `RetentionScope::Repos(Vec<Uuid>)` is the *resolved* form. That is
+//! the same operator-names / domain-ids split `ScanPolicy` uses
+//! (`ScopeSpec` → `PolicyScope`): the cross-spec validator in
+//! [`crate::desired`] requires every named repository to be declared in
+//! the same desired state, and the apply pipeline resolves each name to
+//! its id exactly once, before any event is emitted. A repository UUID
+//! is never a valid value here.
 //!
 //! The apply-time `IngestSource(Direct)` warning lands in
 //! `ApplyConfigUseCase`, NOT here — this layer is pure schema.
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use hort_domain::retention::{PolicyPredicate, RetentionScope};
+use hort_domain::entities::repository::RepositoryFormat;
+use hort_domain::error::DomainResult;
+use hort_domain::events::IngestSource;
+use hort_domain::retention::{PolicyPredicate, RetentionScope, MAX_REPOS_IN_SCOPE};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::envelope::{Envelope, Kind};
 use crate::error::{ParseError, ValidationError};
@@ -42,12 +55,118 @@ pub fn predicate_from_value(v: &serde_json::Value) -> Result<PolicyPredicate, se
     serde_json::from_value(v.clone())
 }
 
-/// As [`predicate_from_value`] for the
-/// [`RetentionScope`](hort_domain::retention::RetentionScope). `pub` so
-/// the `hort-app` apply pipeline (`apply_retention_policies`) can resolve
-/// the machine-envelope `Value` into the domain enum.
-pub fn scope_from_value(v: &serde_json::Value) -> Result<RetentionScope, serde_json::Error> {
+/// As [`predicate_from_value`] for [`RetentionScopeSpec`]. `pub` so
+/// the `hort-app` apply pipeline (`apply_retention_policies`) can
+/// resolve the machine-envelope `Value` into the operator-surface enum,
+/// and from there into the domain
+/// [`RetentionScope`](hort_domain::retention::RetentionScope).
+pub fn scope_from_value(v: &serde_json::Value) -> Result<RetentionScopeSpec, serde_json::Error> {
     serde_json::from_value(v.clone())
+}
+
+/// Operator-surface form of
+/// [`RetentionScope`](hort_domain::retention::RetentionScope).
+///
+/// Variant-for-variant identical to the domain enum — same names, same
+/// JSON shape — except [`Self::Repos`], which carries repository
+/// `metadata.name`s where the domain carries `Uuid`s. Names are what an
+/// operator can actually write: every other reference in the gitops
+/// tree is by name, and an id is worthless the moment the instance is
+/// rebuilt from a fresh database. Resolution happens exactly once, in
+/// the apply pipeline, through the same `repo_id_by_name` map the
+/// `ScanPolicy` scope resolves through.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RetentionScopeSpec {
+    /// Every repository in the deployment.
+    AllRepos,
+    /// An explicit list of repository `metadata.name`s. Each must
+    /// resolve to an `ArtifactRepository` declared in the same desired
+    /// state (cross-spec rule in [`crate::desired`]).
+    Repos(Vec<String>),
+    /// Every repository of a given package format.
+    Format(RepositoryFormat),
+    /// Artifacts whose package name matches a glob.
+    PackageNamePattern(String),
+    /// Restrict to artifacts whose `ArtifactIngested.source` matches.
+    IngestSource(IngestSource),
+}
+
+impl RetentionScopeSpec {
+    /// The repository names this scope references — empty for every
+    /// variant but [`Self::Repos`]. The cross-spec dangling-reference
+    /// check in [`crate::desired`] walks this; mirrors
+    /// [`crate::scope::ScopeSpec::repository_name`].
+    pub fn repository_names(&self) -> &[String] {
+        match self {
+            Self::Repos(names) => names,
+            Self::AllRepos
+            | Self::Format(_)
+            | Self::PackageNamePattern(_)
+            | Self::IngestSource(_) => &[],
+        }
+    }
+
+    /// Validate the scope's structural bounds *pre-resolution*, so a
+    /// malformed envelope is rejected before any write rather than
+    /// surfacing as a mid-apply domain error.
+    ///
+    /// Every name-free variant delegates to its domain twin, which owns
+    /// the bound. Only [`Self::Repos`] is checked here, because its
+    /// operator form is a name list the domain never sees; it shares the
+    /// domain's [`MAX_REPOS_IN_SCOPE`] so a spec that passes here can
+    /// never resolve into a domain scope that fails there (name → id
+    /// resolution is 1:1).
+    pub fn validate(&self) -> DomainResult<()> {
+        match self {
+            Self::Repos(names) => {
+                if names.is_empty() {
+                    return Err(hort_domain::error::DomainError::Validation(
+                        "RetentionScope::Repos must name at least one repository".into(),
+                    ));
+                }
+                if names.len() > MAX_REPOS_IN_SCOPE {
+                    return Err(hort_domain::error::DomainError::Validation(format!(
+                        "RetentionScope::Repos exceeds the maximum of {MAX_REPOS_IN_SCOPE} \
+                         repositories (got {})",
+                        names.len()
+                    )));
+                }
+                Ok(())
+            }
+            Self::PackageNamePattern(p) => RetentionScope::PackageNamePattern(p.clone()).validate(),
+            Self::AllRepos => RetentionScope::AllRepos.validate(),
+            Self::Format(f) => RetentionScope::Format(f.clone()).validate(),
+            Self::IngestSource(s) => RetentionScope::IngestSource(*s).validate(),
+        }
+    }
+
+    /// Resolve into the domain
+    /// [`RetentionScope`](hort_domain::retention::RetentionScope).
+    ///
+    /// `Err` carries the first repository name absent from
+    /// `repo_id_by_name`. The apply pipeline treats that as an invariant
+    /// violation — the cross-spec validator already proved every name is
+    /// declared — exactly as the `ScanPolicy` scope resolution does; the
+    /// `Result` exists only so the panic message lives at the apply
+    /// site, next to the ordering guarantee it depends on.
+    pub fn resolve(
+        &self,
+        repo_id_by_name: &HashMap<String, Uuid>,
+    ) -> Result<RetentionScope, String> {
+        Ok(match self {
+            Self::AllRepos => RetentionScope::AllRepos,
+            Self::Repos(names) => {
+                let mut ids = Vec::with_capacity(names.len());
+                for name in names {
+                    ids.push(*repo_id_by_name.get(name).ok_or_else(|| name.clone())?);
+                }
+                RetentionScope::Repos(ids)
+            }
+            Self::Format(f) => RetentionScope::Format(f.clone()),
+            Self::PackageNamePattern(p) => RetentionScope::PackageNamePattern(p.clone()),
+            Self::IngestSource(s) => RetentionScope::IngestSource(*s),
+        })
+    }
 }
 
 /// Shape of a `kind: RetentionPolicy` YAML body.
@@ -77,11 +196,12 @@ pub struct RetentionPolicySpec {
     /// going via JSON preserves the JSON form and surfaces a malformed
     /// value as a typed validation error naming the policy.
     pub predicate: serde_json::Value,
-    /// Which artifacts the policy applies to —
-    /// [`RetentionScope`](hort_domain::retention::RetentionScope) in its
-    /// JSON shape (e.g. `scope: AllRepos`, `scope: {Repos: ["<uuid>"]}`,
+    /// Which artifacts the policy applies to — [`RetentionScopeSpec`]
+    /// in its JSON shape (e.g. `scope: AllRepos`,
+    /// `scope: {Repos: [npm-public, pypi-mirror]}`,
     /// `scope: {IngestSource: Proxied}`). Same `Value`-then-resolve
-    /// rationale as `predicate`.
+    /// rationale as `predicate`. The `Repos` list holds repository
+    /// `metadata.name`s, never ids.
     pub scope: serde_json::Value,
 }
 
@@ -109,9 +229,12 @@ pub fn parse_retention_policy(
 ///   [`PolicyPredicate::validate`](hort_domain::retention::PolicyPredicate::validate)
 ///   (composite depth/width, non-zero TTLs, CVSS range, `KeepLastN`
 ///   non-zero)
-/// - `scope` passes B1's
-///   [`RetentionScope::validate`](hort_domain::retention::RetentionScope::validate)
-///   (non-empty / bounded `Repos`, bounded `PackageNamePattern`)
+/// - `scope` passes [`RetentionScopeSpec::validate`] (non-empty /
+///   bounded `Repos`, bounded `PackageNamePattern`)
+///
+/// The cross-spec rule — every `Repos` entry names a declared
+/// `ArtifactRepository` — lives in [`crate::desired`], the only layer
+/// that can see the other envelopes.
 ///
 /// The *security-predicate-does-not-exclude-direct-uploads* `info!` warning
 /// is **not** a validation reject — it fires at apply time in
@@ -193,7 +316,7 @@ mod tests {
         let pred = predicate_from_value(&env.spec.predicate).expect("predicate resolves");
         assert_eq!(pred, PolicyPredicate::AgeExceeds(2_592_000));
         let scope = scope_from_value(&env.spec.scope).expect("scope resolves");
-        assert_eq!(scope, RetentionScope::AllRepos);
+        assert_eq!(scope, RetentionScopeSpec::AllRepos);
         assert!(validate_retention_policy(&env).is_empty());
     }
 
@@ -215,7 +338,12 @@ mod tests {
         let pred = predicate_from_value(&env.spec.predicate).expect("predicate resolves");
         assert!(pred.is_security_driven());
         let scope = scope_from_value(&env.spec.scope).expect("scope resolves");
-        assert!(scope.excludes_direct_uploads());
+        assert_eq!(
+            scope
+                .resolve(&HashMap::new())
+                .expect("name-free scope resolves"),
+            RetentionScope::IngestSource(IngestSource::Proxied)
+        );
         assert!(validate_retention_policy(&env).is_empty());
     }
 
@@ -234,6 +362,171 @@ mod tests {
                 .any(|e| e.to_string().contains("spec.predicate is invalid")),
             "expected a predicate validation error, got {errs:?}"
         );
+    }
+
+    // -- RetentionScopeSpec: the operator surface carries names ---------
+
+    #[test]
+    fn parse_repos_scope_carries_names_not_uuids() {
+        let body = "
+  predicate:
+    AgeExceeds: 2592000
+  scope:
+    Repos: [npm-public, pypi-mirror]
+";
+        let env = parse_retention_policy(&p(), yaml("retain-named", body).as_bytes()).unwrap();
+        let scope = scope_from_value(&env.spec.scope).expect("scope resolves");
+        assert_eq!(
+            scope,
+            RetentionScopeSpec::Repos(vec!["npm-public".into(), "pypi-mirror".into()])
+        );
+        assert!(validate_retention_policy(&env).is_empty());
+    }
+
+    /// A UUID in the YAML is not a UUID to this layer — it is just an
+    /// unlucky repository *name*. Nothing downstream ever parses a
+    /// `Repos` entry as an id, so a tree that still carries the retired
+    /// UUID form fails the cross-spec declared-repository rule rather
+    /// than applying against a stale id.
+    #[test]
+    fn a_uuid_in_the_repos_list_is_read_as_a_name() {
+        let body = "
+  predicate:
+    AgeExceeds: 60
+  scope:
+    Repos: ['67e55044-10b1-426f-9247-bb680e5fe0c8']
+";
+        let env = parse_retention_policy(&p(), yaml("legacy-uuid", body).as_bytes()).unwrap();
+        let scope = scope_from_value(&env.spec.scope).expect("scope resolves");
+        assert_eq!(
+            scope,
+            RetentionScopeSpec::Repos(vec!["67e55044-10b1-426f-9247-bb680e5fe0c8".into()])
+        );
+    }
+
+    #[test]
+    fn repository_names_is_empty_for_every_name_free_variant() {
+        assert!(RetentionScopeSpec::AllRepos.repository_names().is_empty());
+        assert!(RetentionScopeSpec::Format(RepositoryFormat::Npm)
+            .repository_names()
+            .is_empty());
+        assert!(RetentionScopeSpec::PackageNamePattern("x-*".into())
+            .repository_names()
+            .is_empty());
+        assert!(RetentionScopeSpec::IngestSource(IngestSource::Proxied)
+            .repository_names()
+            .is_empty());
+        assert_eq!(
+            RetentionScopeSpec::Repos(vec!["a".into(), "b".into()]).repository_names(),
+            ["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn spec_validate_bounds_the_name_list() {
+        RetentionScopeSpec::Repos(vec!["a".into()])
+            .validate()
+            .unwrap();
+        RetentionScopeSpec::Repos(vec!["a".into(); MAX_REPOS_IN_SCOPE])
+            .validate()
+            .unwrap();
+
+        let empty = RetentionScopeSpec::Repos(Vec::new())
+            .validate()
+            .unwrap_err();
+        assert!(
+            empty.to_string().contains("at least one repository"),
+            "got {empty}"
+        );
+        let over = RetentionScopeSpec::Repos(vec!["a".into(); MAX_REPOS_IN_SCOPE + 1])
+            .validate()
+            .unwrap_err();
+        assert!(over.to_string().contains("maximum"), "got {over}");
+    }
+
+    #[test]
+    fn spec_validate_delegates_the_name_free_variants_to_the_domain() {
+        RetentionScopeSpec::AllRepos.validate().unwrap();
+        RetentionScopeSpec::Format(RepositoryFormat::Cargo)
+            .validate()
+            .unwrap();
+        RetentionScopeSpec::IngestSource(IngestSource::Direct)
+            .validate()
+            .unwrap();
+        RetentionScopeSpec::PackageNamePattern("org.example.*".into())
+            .validate()
+            .unwrap();
+        let err = RetentionScopeSpec::PackageNamePattern(String::new())
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "got {err}");
+    }
+
+    #[test]
+    fn resolve_maps_names_to_ids_preserving_order() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let map: HashMap<String, Uuid> = [
+            ("npm-public".to_string(), a),
+            ("pypi-mirror".to_string(), b),
+        ]
+        .into_iter()
+        .collect();
+        let resolved = RetentionScopeSpec::Repos(vec!["pypi-mirror".into(), "npm-public".into()])
+            .resolve(&map)
+            .expect("both names are declared");
+        assert_eq!(resolved, RetentionScope::Repos(vec![b, a]));
+    }
+
+    #[test]
+    fn resolve_reports_the_first_undeclared_name() {
+        let map: HashMap<String, Uuid> = [("npm-public".to_string(), Uuid::from_u128(1))]
+            .into_iter()
+            .collect();
+        let missing = RetentionScopeSpec::Repos(vec!["npm-public".into(), "ghost".into()])
+            .resolve(&map)
+            .unwrap_err();
+        assert_eq!(missing, "ghost");
+    }
+
+    #[test]
+    fn resolve_passes_every_name_free_variant_through_unchanged() {
+        let empty = HashMap::new();
+        assert_eq!(
+            RetentionScopeSpec::AllRepos.resolve(&empty).unwrap(),
+            RetentionScope::AllRepos
+        );
+        assert_eq!(
+            RetentionScopeSpec::Format(RepositoryFormat::Oci)
+                .resolve(&empty)
+                .unwrap(),
+            RetentionScope::Format(RepositoryFormat::Oci)
+        );
+        assert_eq!(
+            RetentionScopeSpec::PackageNamePattern("a/*".into())
+                .resolve(&empty)
+                .unwrap(),
+            RetentionScope::PackageNamePattern("a/*".into())
+        );
+        assert_eq!(
+            RetentionScopeSpec::IngestSource(IngestSource::Direct)
+                .resolve(&empty)
+                .unwrap(),
+            RetentionScope::IngestSource(IngestSource::Direct)
+        );
+    }
+
+    #[test]
+    fn spec_scope_clone_debug_eq_cover() {
+        let a = RetentionScopeSpec::Repos(vec!["npm-public".into()]);
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_ne!(a, RetentionScopeSpec::AllRepos);
+        assert!(format!("{a:?}").contains("npm-public"));
+        // The JSON machine envelope round-trips both directions.
+        let json = serde_json::to_value(&a).unwrap();
+        let back: RetentionScopeSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(a, back);
     }
 
     #[test]

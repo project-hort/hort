@@ -334,7 +334,9 @@ rewrote `kind: PermissionGrant` to a sum-typed claim/user subject
 that emits `PermissionGrantApplied` / `PermissionGrantRevoked` on the
 `Authorization` event stream — so what was a CRUD kind is now
 event-sourced, and the current surface is four extant kinds:
-`PermissionGrant`, `CurationRule`, `ScanPolicy`, `Exclusion`. The
+`PermissionGrant`, `CurationRule`, `ScanPolicy`, `Exclusion`. This
+section also documents `RetentionPolicy` and the `UpstreamMapping`
+knobs, which are policy-shaped but not part of the RBAC surface. The
 RBAC model is documented in
 [`operate/claim-based-rbac.md`](./operate/claim-based-rbac.md) and
 [ADR 0012](../../adr/0012-claim-based-rbac-claimless-static-tokens.md).
@@ -776,6 +778,74 @@ spec:
 parent `ScanPolicy` must exist in the same `$HORT_CONFIG_DIR` (or as a
 prior projection) — the cross-spec validator rejects orphan
 exclusions before any DB write.
+
+### `kind: RetentionPolicy`
+
+Event-sourced kind, gitops-authored only — there is no imperative HTTP
+API. The apply pipeline diffs each envelope against the current
+`retention_policy_projections` row and emits
+`RetentionPolicyChanged(Created | Updated | Archived)`.
+
+`spec.predicate` and `spec.scope` are written in the **JSON-shaped
+externally-tagged form** (`{AgeExceeds: 2592000}`), not YAML's
+`!AgeExceeds` tag form.
+
+```yaml
+apiVersion: project-hort.de/v1
+kind: RetentionPolicy
+metadata:
+  name: retain-90d-npm-and-pypi
+spec:
+  predicate:
+    AgeExceeds: 7776000                 # seconds
+  scope:
+    Repos: [npm-internal, pypi-internal]  # ArtifactRepository metadata.name
+```
+
+**`scope` names repositories; it never carries ids.** Each `Repos`
+entry is an `ArtifactRepository.metadata.name`, resolved to a UUID by
+the apply pipeline exactly once, through the same map the `ScanPolicy`
+scope resolves through. That means:
+
+- Every named repository must be declared in the same
+  `$HORT_CONFIG_DIR` — including one declared in the *same* apply, since
+  resolution happens after the repository rows are written. A name that
+  resolves to nothing is a pre-write rejection naming the offending
+  value, not a half-applied bundle.
+- A repository UUID is not a supported value. It is read as a name,
+  matches no repository, and is rejected. A UUID in gitops YAML is
+  worthless the moment the instance is rebuilt against a fresh database,
+  which is why the surface takes names.
+
+The other scopes carry no repository reference:
+
+```yaml
+  scope: AllRepos                       # every repository
+  scope: { Format: Npm }                # every repository of a format
+  scope: { PackageNamePattern: "xz-*" } # `*`-only glob on the artifact name
+  scope: { IngestSource: Proxied }      # pull-through artifacts only
+```
+
+**What apply emits:**
+- New name: one `RetentionPolicyChanged(Created)`; one row inserted into
+  `retention_policy_projections`. Counters:
+  `hort_gitops_events_emitted_total{kind=retention_policy,event_type=RetentionPolicyCreated}`.
+- Predicate or scope edit: one `RetentionPolicyChanged(Updated)`.
+- YAML removed: one `RetentionPolicyChanged(Archived)`; the row is
+  marked archived, not deleted. Archive is terminal — re-declaring an
+  archived name mints a **fresh** policy, it does not reactivate the old
+  one, and the archived stream stays as audit history.
+
+**Idempotency:** reapply with no YAML change emits zero events.
+
+**Direct-upload advisory.** A security-driven predicate
+(`HasFixAvailable`, `HasFindingAboveSeverity`, …) under a scope that does
+not exclude `IngestSource(Direct)` logs an apply-time `info!`. It is
+advisory, not a reject — the policy applies. The point is that a
+directly-uploaded artifact may be the only build of that version
+anywhere, while a proxied one is restorable by re-pull. If the intent is
+"clean up vulnerable *mirrored* packages", say
+`scope: { IngestSource: Proxied }` and the advisory goes away.
 
 ### `kind: UpstreamMapping` — `spec.upstreamNamePrefix`
 
