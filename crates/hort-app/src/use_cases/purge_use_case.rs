@@ -137,6 +137,10 @@ pub struct PurgeSummary {
     pub purged_events: u64,
     /// Artifacts skipped by the evidence-protection re-assertion.
     pub skipped_protected: u64,
+    /// Artifacts skipped because a mutable ref in their own repository
+    /// resolves to them and every pending expiry decision was
+    /// `KeepLastN` — the tag exemption, re-asked at purge time.
+    pub skipped_tag_exempt: u64,
     /// Per-artifact failures (prepare / storage / checkpoint / terminal
     /// transition).
     /// The `ArtifactExpired` decision is retained; next sweep retries.
@@ -227,6 +231,7 @@ impl PurgeUseCase {
             blobs_kept = summary.blobs_kept,
             purged_events = summary.purged_events,
             skipped_protected = summary.skipped_protected,
+            skipped_tag_exempt = summary.skipped_tag_exempt,
             errors = summary.errors,
             "storage-GC purge sweep complete"
         );
@@ -258,6 +263,33 @@ impl PurgeUseCase {
                 return;
             }
             QuarantineStatus::None | QuarantineStatus::Released => {}
+        }
+
+        // -- tag exemption, re-asked immediately before deleting ---------
+        // The evaluator already refuses to expire a tag target under
+        // `KeepLastN`, but it decided an hour ago: evaluation and purge
+        // are separate sweeps, and a tag set in between arrives after
+        // the `ArtifactExpired` is already on the stream, where nothing
+        // re-runs the predicate. Re-reading the fact here is what makes
+        // the *interval* correct and not merely the steady state — the
+        // last reader before the destructive step is the one that
+        // decides.
+        //
+        // Scoped to `KeepLastN`, exactly as the exemption is: an age-
+        // or security-driven policy is the operator's explicit
+        // instruction to remove the content, and a tag does not
+        // countermand it. An artifact some other policy also expired is
+        // therefore purged even while tagged.
+        if item.tag_targeted && item.expired_only_by_keep_last_n {
+            summary.skipped_tag_exempt += 1;
+            tracing::info!(
+                artifact_id = %item.artifact_id,
+                "a mutable ref in this artifact's repository resolves to it \
+                 and every pending expiry was KeepLastN — tag exemption \
+                 re-asserted at purge time, NOT purged. The ArtifactExpired \
+                 is retained; the artifact is purged once the tag moves."
+            );
+            return;
         }
 
         // -- durable worklist preparation (committed, idempotent) --------

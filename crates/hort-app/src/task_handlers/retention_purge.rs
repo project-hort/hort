@@ -54,6 +54,7 @@ impl TaskHandler for RetentionPurgeHandler {
                         blobs_kept = s.blobs_kept,
                         purged_events = s.purged_events,
                         skipped_protected = s.skipped_protected,
+                        skipped_tag_exempt = s.skipped_tag_exempt,
                         errors = s.errors,
                         "retention-purge sweep complete"
                     );
@@ -64,6 +65,7 @@ impl TaskHandler for RetentionPurgeHandler {
                             "blobs_kept": s.blobs_kept,
                             "purged_events": s.purged_events,
                             "skipped_protected": s.skipped_protected,
+                            "skipped_tag_exempt": s.skipped_tag_exempt,
                             "errors": s.errors,
                         }),
                     })

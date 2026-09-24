@@ -246,6 +246,8 @@ fn candidate(status: QuarantineStatus, created_at: DateTime<Utc>) -> RetentionCa
         artifact: a,
         format: hort_domain::entities::repository::RepositoryFormat::Generic,
         resolved_rescan_interval_hours: Some(24),
+        keep_rank: None,
+        tag_targeted: false,
     }
 }
 
@@ -1469,6 +1471,44 @@ mod metrics {
         );
     }
 
+    /// `hort_retention_expired_total{reason="keep_last_n"}` is live
+    /// now that the sibling ranking reaches the evaluator.
+    #[test]
+    fn keep_last_n_reason_label_fires() {
+        let pid = Uuid::new_v4();
+        let snap = run(move || {
+            Box::pin(async move {
+                let store = Arc::new(MockEventStore::new());
+                let uc = RetentionUseCase::new(
+                    wrap_for_test(store.clone()),
+                    Arc::new(MockRetentionScanReader::new()),
+                );
+                let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    id: pid,
+                    name: "keep-last".into(),
+                    predicate: PolicyPredicate::KeepLastN(3),
+                    scope: RetentionScope::AllRepos,
+                    created_at: ts(0),
+                }])
+                .unwrap();
+                let c = ranked_candidate(Some((4, 10)), false);
+                seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+                uc.evaluate_policies(ts(1_000_000), &[p], &[c])
+                    .await
+                    .unwrap();
+            })
+        });
+        let pid_s = pid.to_string();
+        assert_eq!(
+            counter(
+                &snap,
+                "hort_retention_expired_total",
+                &[("policy_id", pid_s.as_str()), ("reason", "keep_last_n")],
+            ),
+            Some(1)
+        );
+    }
+
     #[test]
     fn no_match_and_skipped_quarantined_labels_fire() {
         let pid_nm = Uuid::new_v4();
@@ -1741,4 +1781,115 @@ mod metrics {
             "security-driven expiry must carry reason=\"security_finding\""
         );
     }
+}
+
+// ===========================================================================
+// KeepLastN — sibling rank and the tag exemption
+// ===========================================================================
+
+/// A candidate carrying a resolved sibling ranking (and optionally a
+/// live mutable ref resolving to it).
+fn ranked_candidate(keep_rank: Option<(u32, u32)>, tag_targeted: bool) -> RetentionCandidate {
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.keep_rank = keep_rank;
+    c.tag_targeted = tag_targeted;
+    c
+}
+
+#[tokio::test]
+async fn keep_last_n_expires_a_candidate_outside_the_keep_window() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::KeepLastN(3), RetentionScope::AllRepos);
+    // 4th-newest of 10 siblings — one past the keep window.
+    let c = ranked_candidate(Some((4, 10)), false);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 1);
+    let batches = store.appended_batches();
+    assert_eq!(batches.len(), 1);
+    match &batches[0].events[0].event {
+        DomainEvent::ArtifactExpired(e) => assert_eq!(
+            e.reason,
+            ExpirationReason::KeepLastN {
+                keep: 3,
+                total: 10,
+                rank: 4
+            }
+        ),
+        other => panic!("expected ArtifactExpired, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn keep_last_n_leaves_a_candidate_inside_the_keep_window() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::KeepLastN(3), RetentionScope::AllRepos);
+    let c = ranked_candidate(Some((3, 10)), false);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 0);
+    assert!(store.appended_batches().is_empty());
+}
+
+#[tokio::test]
+async fn keep_last_n_without_a_resolved_rank_fails_safe() {
+    // The reader could not resolve a ranking: the predicate must not
+    // match, whatever the keep count.
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::KeepLastN(1), RetentionScope::AllRepos);
+    let c = ranked_candidate(None, false);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 0);
+    assert!(store.appended_batches().is_empty());
+}
+
+#[tokio::test]
+async fn keep_last_n_does_not_expire_a_tag_target_however_low_its_rank() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::KeepLastN(3), RetentionScope::AllRepos);
+    // Oldest of 10 — far outside the window, but a live ref names it.
+    let c = ranked_candidate(Some((10, 10)), true);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 0, "a tag target survives KeepLastN");
+    assert!(store.appended_batches().is_empty());
+}
+
+#[tokio::test]
+async fn tag_target_still_expires_under_an_age_policy() {
+    // The exemption is scoped to KeepLastN: an age policy is the
+    // operator's explicit instruction and a tag does not countermand it.
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(1), RetentionScope::AllRepos);
+    let c = ranked_candidate(Some((10, 10)), true);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 1);
+    assert_eq!(store.appended_batches().len(), 1);
 }

@@ -35,6 +35,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`KeepLastN` never matched anything** (#287). The evaluator was handed no
+  sibling ranking, and its fail-safe — correctly — refuses to expire an artifact
+  whose position among its siblings is unknown, so a count-based retention policy
+  was inert however it was written. The rank and the sibling total are now
+  resolved in the candidate query itself, by a window function over
+  `(repository, name)` computed across the **whole** sibling group rather than
+  the current keyset page: a rank that shifted with the page boundary would have
+  expired the wrong versions. Which N survive is now a documented part of the
+  contract — newest first by creation time, ties broken by artifact id — so two
+  artifacts created in the same instant cannot swap places between runs. Retired
+  rows occupy no rank slot.
+
+  **An artifact a tag points at does not expire under `KeepLastN`, however low
+  its rank** — otherwise the first count-based policy would delete the image a
+  pinned deployment is running. The exemption resolves per repository, because
+  content hashes are shared across repositories by construction and a global
+  lookup would protect the wrong artifacts in both directions; it covers both
+  mutable-pointer forms, the content-hash target an OCI tag resolves to and the
+  version target an npm dist-tag resolves to; and it is re-checked immediately
+  before the purge deletes, because evaluation and purge are separate scheduled
+  sweeps and a tag set in between would otherwise find the artifact already
+  expired and unasked. A skipped artifact is reported in the sweep summary
+  rather than disappearing from the work set.
+
 - **A completed purge left the artifact broken instead of reclaiming space**
   (#286). The purge deleted an artifact's content references, deleted the blob
   once nothing else referenced it, and recorded `ArtifactPurged` — but never

@@ -145,6 +145,8 @@ impl TaskHandler for RetentionEvaluateHandler {
                         artifact: r.artifact,
                         format: r.format,
                         resolved_rescan_interval_hours: r.resolved_rescan_interval_hours,
+                        keep_rank: r.keep_rank,
+                        tag_targeted: r.tag_targeted,
                     })
                     .collect();
 
@@ -501,11 +503,15 @@ mod tests {
                 artifact: art(Uuid::new_v4()),
                 format: hort_domain::entities::repository::RepositoryFormat::Generic,
                 resolved_rescan_interval_hours: Some(24),
+                keep_rank: Some((4, 10)),
+                tag_targeted: false,
             },
             RetentionCandidateRow {
                 artifact: art(Uuid::new_v4()),
                 format: hort_domain::entities::repository::RepositoryFormat::Generic,
                 resolved_rescan_interval_hours: None,
+                keep_rank: None,
+                tag_targeted: true,
             },
         ];
         let h = RetentionEvaluateHandler::new(

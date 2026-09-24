@@ -3952,12 +3952,13 @@ emit nothing):
 `hort_domain::retention::ExpirationReason::metric_label` string (the
 domain owns the label vocabulary so emitter and catalog cannot drift):
 `age_exceeded` / `unused_ttl` / `keep_last_n` / `manual` /
-`security_finding`. The B3 evaluator currently emits `age_exceeded`
-and `security_finding` (its in-scope predicates); `unused_ttl` /
-`keep_last_n` / `manual` are reserved for the same metric and emitted
-once the `UnusedFor` / `KeepLastN` / manual-expiry input ports are
-wired (named follow-on; the reason vocabulary is locked now so the
-catalog does not churn later).
+`security_finding`. The evaluator currently emits `age_exceeded`,
+`keep_last_n`, and `security_finding` — `keep_last_n` went live with
+the sibling ranking the candidate-enumeration query now resolves.
+`unused_ttl` / `manual` are reserved for the same metric and emitted
+once the `UnusedFor` / manual-expiry inputs are wired (named
+follow-on; the reason vocabulary is locked now so the catalog does not
+churn later).
 
 Source: `hort_app::metrics::{emit_retention_evaluation,
 emit_retention_expired, RetentionEvaluationResult}`;
@@ -4116,9 +4117,9 @@ label-assertion coverage is complete:
 `hort_retention_evaluations_total` — all six `result` arms
 (`retention_use_case` `tests::metrics`);
 `hort_retention_expired_total` — `age_exceeded`
-+ `security_finding` (`unused_ttl` / `keep_last_n` /
-`manual` are reserved, emitted once their input ports are wired —
-named follow-on, vocabulary locked now);
++ `keep_last_n` + `security_finding` (`unused_ttl` / `manual` are
+reserved, emitted once their inputs are wired — named follow-on,
+vocabulary locked now);
 `hort_retention_purged_total` (`purge_use_case` `tests`, all 3
 values); `hort_event_store_streams_archived_total`
 (`eventstore_retention_use_case` `tests`, all 3 values);

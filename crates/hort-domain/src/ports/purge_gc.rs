@@ -70,6 +70,31 @@ pub struct PendingPurge {
     /// release-gate invariant (the adapter already excludes the protected
     /// states; this is the conservative second check).
     pub quarantine_status: QuarantineStatus,
+    /// `true` iff a mutable ref **in this artifact's own repository**
+    /// currently resolves to this artifact (an OCI tag on its content
+    /// hash, or a version pointer naming its `(name, version)` — the
+    /// npm dist-tag shape). Read at sweep time, not at expiry time:
+    /// that is the entire point of carrying it.
+    ///
+    /// ## Why the purge re-asks
+    ///
+    /// Evaluation and purge are separate sweeps, an hour apart by
+    /// default. A tag added in between finds the artifact already
+    /// carrying its `ArtifactExpired`, and nothing re-runs the
+    /// predicate — so the steady state is correct and the interval is
+    /// not. Re-reading the fact here closes that window: the last
+    /// reader before the destructive step is the one that decides.
+    pub tag_targeted: bool,
+    /// `true` iff **every** pending `ArtifactExpired` on this
+    /// artifact's stream carries a `KeepLastN` reason.
+    ///
+    /// The tag exemption belongs to `KeepLastN` alone: an age- or
+    /// security-driven policy is the operator's explicit instruction
+    /// to remove old or vulnerable content, and a tag does not
+    /// countermand it. So an artifact that some *other* policy also
+    /// expired is purged even while tagged — the `KeepLastN` decision
+    /// is simply not the one keeping it in the work set.
+    pub expired_only_by_keep_last_n: bool,
 }
 
 /// One refcount decision the adapter's transactional decrement step
@@ -101,6 +126,12 @@ pub trait PurgeGcPort: Send + Sync {
     /// MUST exclude `quarantine_status ∈ {quarantined, rejected,
     /// scan_indeterminate}`; the use case re-asserts this regardless
     /// (defence-in-depth).
+    ///
+    /// Tag-targeted artifacts are **not** excluded here — the
+    /// adapter reports the two facts ([`PendingPurge::tag_targeted`]
+    /// and [`PendingPurge::expired_only_by_keep_last_n`]) and the use
+    /// case owns the decision, so the skip is observable in the sweep
+    /// summary instead of vanishing into a `WHERE` clause.
     fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>>;
 
     /// Prepare the durable worklist in **one committed, idempotent
@@ -292,10 +323,14 @@ mod tests {
         let pp = PendingPurge {
             artifact_id: a,
             quarantine_status: QuarantineStatus::Released,
+            tag_targeted: true,
+            expired_only_by_keep_last_n: true,
         };
         assert_eq!(pp.clone(), pp);
         assert_eq!(pp.artifact_id, a);
         assert_eq!(pp.quarantine_status, QuarantineStatus::Released);
+        assert!(pp.tag_targeted);
+        assert!(pp.expired_only_by_keep_last_n);
 
         let pr = PurgedRef {
             content_hash: hash(HASH_A),
