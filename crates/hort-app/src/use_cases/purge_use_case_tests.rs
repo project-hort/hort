@@ -1,24 +1,9 @@
 //! `PurgeUseCase::process_expired` unit tests.
 //!
-//! `hort-app` is the 100%-coverage tier (mock every port). Every branch
-//! is pinned here:
-//! - **reconcile-not-converged start-gate** → the sweep refuses to run
-//!   (`AppError::Domain`), touches no port, emits no event.
-//! - **refcount==0** → CAS blob deleted + `ArtifactPurged{refs_remaining=0}`.
-//! - **refcount>0** → blob retained + `ArtifactPurged{refs_remaining=N}`.
-//! - **metadata_blob walked alongside primary_content** (two
-//!   `PurgedRef`s, one decision each).
-//! - **two-stage idempotency**: a transient `StoragePort::delete`
-//!   failure does NOT lose the `ArtifactExpired` (no `ArtifactPurged`
-//!   appended), the sweep continues, the next sweep retries.
-//! - **idempotent re-purge** on an already-absent blob is a clean
-//!   no-op success (`delete` NotFound == gone).
-//! - **evidence protection**: a quarantined/rejected/indeterminate pending
-//!   artifact is skipped, never purged (defence-in-depth re-assertion).
-//! - a `DebuggingRecorder` assertion that
-//!   `hort_retention_purged_total{result=…}` fires with the documented
-//!   `result` label values.
+//! `hort-app` is the 100%-coverage tier, so the mocks expose every
+//! prepare, storage, checkpoint, and terminal-transition failure seam.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -27,18 +12,18 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::events::{ArtifactPurged, DomainEvent};
+use hort_domain::events::{retention_scheduler_actor, ArtifactPurged, DomainEvent};
+use hort_domain::ports::event_store::AppendEvents;
 use hort_domain::ports::purge_gc::{PendingPurge, PurgeGcPort, PurgedRef};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ByteRange, ContentHash};
 
-use crate::event_store_publisher::wrap_for_test;
 use crate::use_cases::purge_use_case::{PurgeUseCase, RefcountReconcileGate};
-use crate::use_cases::test_support::MockEventStore;
 
 const HASH_PRIMARY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HASH_META: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+const HASH_CHILD: &str = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
 
 fn hash(s: &str) -> ContentHash {
     s.parse().unwrap()
@@ -48,40 +33,44 @@ fn ts(secs: i64) -> DateTime<Utc> {
     DateTime::from_timestamp(secs, 0).unwrap()
 }
 
-// ---------------------------------------------------------------------------
-// MockReconcileGate
-// ---------------------------------------------------------------------------
-
-struct MockReconcileGate {
-    converged: bool,
+fn work(content_hash: ContentHash, refs_remaining: u32) -> PurgedRef {
+    PurgedRef {
+        content_hash,
+        refs_remaining,
+        completed: false,
+    }
 }
+
+struct MockReconcileGate(bool);
+
 impl MockReconcileGate {
     fn converged() -> Arc<Self> {
-        Arc::new(Self { converged: true })
+        Arc::new(Self(true))
     }
+
     fn not_converged() -> Arc<Self> {
-        Arc::new(Self { converged: false })
-    }
-}
-impl RefcountReconcileGate for MockReconcileGate {
-    fn is_converged(&self) -> bool {
-        self.converged
+        Arc::new(Self(false))
     }
 }
 
-// ---------------------------------------------------------------------------
-// MockPurgeGc
-// ---------------------------------------------------------------------------
+impl RefcountReconcileGate for MockReconcileGate {
+    fn is_converged(&self) -> bool {
+        self.0
+    }
+}
 
 #[derive(Default)]
 struct MockPurgeGc {
     pending: Mutex<Vec<PendingPurge>>,
-    /// `artifact_id -> PurgedRef list` the transactional step returns.
-    refs: Mutex<std::collections::HashMap<Uuid, Vec<PurgedRef>>>,
+    refs: Mutex<HashMap<Uuid, Vec<PurgedRef>>>,
     list_err: AtomicBool,
-    purge_err_for: Mutex<Vec<Uuid>>,
-    /// Every `purge_artifact_refs` call, in order (idempotency proof).
+    purge_err_for: Mutex<HashSet<Uuid>>,
+    mark_fail_once_for: Mutex<HashSet<ContentHash>>,
+    complete_fail_once: AtomicBool,
     purge_calls: Mutex<Vec<Uuid>>,
+    complete_calls: AtomicUsize,
+    completed_batches: Mutex<Vec<AppendEvents>>,
+    retired: Mutex<HashSet<Uuid>>,
     list_calls: AtomicUsize,
 }
 
@@ -89,43 +78,80 @@ impl MockPurgeGc {
     fn new() -> Self {
         Self::default()
     }
-    fn with_pending(self, p: Vec<PendingPurge>) -> Self {
-        *self.pending.lock().unwrap() = p;
+
+    fn with_pending(self, pending: Vec<PendingPurge>) -> Self {
+        *self.pending.lock().unwrap() = pending;
         self
     }
+
     fn with_refs(self, artifact_id: Uuid, refs: Vec<PurgedRef>) -> Self {
         self.refs.lock().unwrap().insert(artifact_id, refs);
         self
     }
+
     fn with_list_err(self) -> Self {
         self.list_err.store(true, Ordering::SeqCst);
         self
     }
-    fn fail_purge_for(self, id: Uuid) -> Self {
-        self.purge_err_for.lock().unwrap().push(id);
+
+    fn fail_purge_for(self, artifact_id: Uuid) -> Self {
+        self.purge_err_for.lock().unwrap().insert(artifact_id);
         self
     }
+
+    fn fail_mark_once_for(self, content_hash: ContentHash) -> Self {
+        self.mark_fail_once_for.lock().unwrap().insert(content_hash);
+        self
+    }
+
+    fn fail_complete_once(self) -> Self {
+        self.complete_fail_once.store(true, Ordering::SeqCst);
+        self
+    }
+
     fn purge_call_count(&self) -> usize {
         self.purge_calls.lock().unwrap().len()
     }
+
     fn list_call_count(&self) -> usize {
         self.list_calls.load(Ordering::SeqCst)
+    }
+
+    fn complete_call_count(&self) -> usize {
+        self.complete_calls.load(Ordering::SeqCst)
+    }
+
+    fn is_retired(&self, artifact_id: Uuid) -> bool {
+        self.retired.lock().unwrap().contains(&artifact_id)
+    }
+
+    fn completed_batches(&self) -> Vec<AppendEvents> {
+        self.completed_batches.lock().unwrap().clone()
     }
 }
 
 impl PurgeGcPort for MockPurgeGc {
     fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
-        let err = self.list_err.load(Ordering::SeqCst);
-        let p = self.pending.lock().unwrap().clone();
+        let fail = self.list_err.load(Ordering::SeqCst);
+        let retired = self.retired.lock().unwrap().clone();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|item| !retired.contains(&item.artifact_id))
+            .cloned()
+            .collect();
         Box::pin(async move {
-            if err {
+            if fail {
                 Err(DomainError::Invariant("pending list failed".into()))
             } else {
-                Ok(p)
+                Ok(pending)
             }
         })
     }
+
     fn purge_artifact_refs(
         &self,
         artifact_id: Uuid,
@@ -141,95 +167,154 @@ impl PurgeGcPort for MockPurgeGc {
             .unwrap_or_default();
         Box::pin(async move {
             if fail {
-                Err(DomainError::Invariant(
-                    "purge_artifact_refs tx failed".into(),
-                ))
+                Err(DomainError::Invariant("prepare failed".into()))
             } else {
                 Ok(refs)
             }
         })
     }
-}
 
-// ---------------------------------------------------------------------------
-// MockStorage — dedicated (the shared MockStoragePort lacks a transient
-// non-NotFound delete-failure injection; a destructive item needs to
-// distinguish "absent (NotFound, idempotent ok)" from "transient
-// failure (must retry)"). Self-contained so test_support stays untouched.
-// ---------------------------------------------------------------------------
+    fn mark_purge_ref_complete(
+        &self,
+        artifact_id: Uuid,
+        content_hash: &ContentHash,
+        _completed_at: DateTime<Utc>,
+    ) -> BoxFuture<'_, DomainResult<()>> {
+        let fail = self.mark_fail_once_for.lock().unwrap().remove(content_hash);
+        if !fail {
+            let mut refs = self.refs.lock().unwrap();
+            if let Some(item) = refs.get_mut(&artifact_id).and_then(|items| {
+                items
+                    .iter_mut()
+                    .find(|item| item.content_hash == *content_hash)
+            }) {
+                item.completed = true;
+            }
+        }
+        Box::pin(async move {
+            if fail {
+                Err(DomainError::Invariant("checkpoint failed".into()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn complete_artifact_purge(
+        &self,
+        artifact_id: Uuid,
+        _retired_at: DateTime<Utc>,
+        events: AppendEvents,
+    ) -> BoxFuture<'_, DomainResult<()>> {
+        self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        let fail = self.complete_fail_once.swap(false, Ordering::SeqCst);
+        if !fail {
+            assert!(self
+                .refs
+                .lock()
+                .unwrap()
+                .get(&artifact_id)
+                .is_some_and(|refs| refs.iter().all(|item| item.completed)));
+            self.completed_batches.lock().unwrap().push(events);
+            self.retired.lock().unwrap().insert(artifact_id);
+        }
+        Box::pin(async move {
+            if fail {
+                Err(DomainError::Invariant("terminal transition failed".into()))
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
 
 #[derive(Default)]
 struct MockStorage {
     present: Mutex<Vec<ContentHash>>,
-    /// Hashes whose `delete` returns a transient (non-NotFound) error.
-    transient_fail: Mutex<Vec<ContentHash>>,
-    deleted: Mutex<Vec<ContentHash>>,
+    transient_fail_once: Mutex<HashSet<ContentHash>>,
+    delete_attempts: Mutex<Vec<ContentHash>>,
 }
+
 impl MockStorage {
     fn new() -> Self {
         Self::default()
     }
-    fn with_present(self, h: ContentHash) -> Self {
-        self.present.lock().unwrap().push(h);
+
+    fn with_present(self, content_hash: ContentHash) -> Self {
+        self.present.lock().unwrap().push(content_hash);
         self
     }
-    fn fail_delete_transient(self, h: ContentHash) -> Self {
-        self.transient_fail.lock().unwrap().push(h);
+
+    fn fail_delete_once(self, content_hash: ContentHash) -> Self {
+        self.transient_fail_once
+            .lock()
+            .unwrap()
+            .insert(content_hash);
         self
     }
-    fn deleted_hashes(&self) -> Vec<ContentHash> {
-        self.deleted.lock().unwrap().clone()
+
+    fn delete_attempts(&self) -> Vec<ContentHash> {
+        self.delete_attempts.lock().unwrap().clone()
     }
 }
+
 impl StoragePort for MockStorage {
     fn put(
         &self,
-        _s: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        _stream: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
     ) -> BoxFuture<'_, DomainResult<hort_domain::ports::storage::PutResult>> {
         Box::pin(async { unreachable!("purge never puts") })
     }
+
     fn get(
         &self,
-        _h: &ContentHash,
+        _content_hash: &ContentHash,
     ) -> BoxFuture<'_, DomainResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
         Box::pin(async { unreachable!("purge never gets") })
     }
+
     fn get_range(
         &self,
-        _h: &ContentHash,
-        _r: ByteRange,
+        _content_hash: &ContentHash,
+        _range: ByteRange,
     ) -> BoxFuture<'_, DomainResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
         Box::pin(async { unreachable!("purge never range-gets") })
     }
-    fn exists(&self, h: &ContentHash) -> BoxFuture<'_, DomainResult<bool>> {
-        let present = self.present.lock().unwrap().contains(h);
+
+    fn exists(&self, content_hash: &ContentHash) -> BoxFuture<'_, DomainResult<bool>> {
+        let present = self.present.lock().unwrap().contains(content_hash);
         Box::pin(async move { Ok(present) })
     }
-    fn delete(&self, h: &ContentHash) -> BoxFuture<'_, DomainResult<()>> {
-        self.deleted.lock().unwrap().push(h.clone());
-        let transient = self.transient_fail.lock().unwrap().contains(h);
-        let present = {
-            let mut p = self.present.lock().unwrap();
-            if let Some(i) = p.iter().position(|x| x == h) {
-                p.remove(i);
-                true
-            } else {
-                false
-            }
+
+    fn delete(&self, content_hash: &ContentHash) -> BoxFuture<'_, DomainResult<()>> {
+        self.delete_attempts
+            .lock()
+            .unwrap()
+            .push(content_hash.clone());
+        let fail = self
+            .transient_fail_once
+            .lock()
+            .unwrap()
+            .remove(content_hash);
+        let present = if fail {
+            false
+        } else {
+            let mut present = self.present.lock().unwrap();
+            present
+                .iter()
+                .position(|item| item == content_hash)
+                .map(|index| present.remove(index))
+                .is_some()
         };
-        let id = h.to_string();
+        let id = content_hash.to_string();
         Box::pin(async move {
-            if transient {
-                // Transient backend error (e.g. S3 5xx) — NOT NotFound.
+            if fail {
                 Err(DomainError::Invariant(format!(
                     "transient delete failure: {id}"
                 )))
             } else if present {
                 Ok(())
             } else {
-                // Already absent — adapter surfaces NotFound (allowed by
-                // the StoragePort contract; the use case treats it as
-                // the success-on-missing path).
                 Err(DomainError::NotFound {
                     entity: "content",
                     id,
@@ -237,8 +322,9 @@ impl StoragePort for MockStorage {
             }
         })
     }
-    fn size_of(&self, h: &ContentHash) -> BoxFuture<'_, DomainResult<u64>> {
-        let id = h.to_string();
+
+    fn size_of(&self, content_hash: &ContentHash) -> BoxFuture<'_, DomainResult<u64>> {
+        let id = content_hash.to_string();
         Box::pin(async move {
             Err(DomainError::NotFound {
                 entity: "content",
@@ -248,411 +334,275 @@ impl StoragePort for MockStorage {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Harness
-// ---------------------------------------------------------------------------
-
 struct Harness {
     uc: PurgeUseCase,
     gc: Arc<MockPurgeGc>,
     storage: Arc<MockStorage>,
-    store: Arc<MockEventStore>,
 }
 
 fn build(gc: MockPurgeGc, storage: MockStorage, gate: Arc<MockReconcileGate>) -> Harness {
     let gc = Arc::new(gc);
     let storage = Arc::new(storage);
-    let store = Arc::new(MockEventStore::new());
-    let publisher = wrap_for_test(store.clone());
-    let uc = PurgeUseCase::new(gc.clone(), storage.clone(), publisher, gate);
-    Harness {
-        uc,
-        gc,
-        storage,
-        store,
-    }
+    let uc = PurgeUseCase::new(gc.clone(), storage.clone(), gate);
+    Harness { uc, gc, storage }
 }
 
-fn purged_events(store: &MockEventStore) -> Vec<ArtifactPurged> {
-    store
-        .appended_batches()
+fn purged_events(gc: &MockPurgeGc) -> Vec<ArtifactPurged> {
+    gc.completed_batches()
         .into_iter()
-        .flat_map(|b| b.events)
-        .filter_map(|e| match e.event {
-            DomainEvent::ArtifactPurged(p) => Some(p),
+        .flat_map(|batch| batch.events)
+        .filter_map(|event| match event.event {
+            DomainEvent::ArtifactPurged(event) => Some(event),
             _ => None,
         })
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// reconcile-converged start-gate
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn refuses_to_run_when_reconcile_not_converged() {
-    let aid = Uuid::new_v4();
+    let artifact_id = Uuid::new_v4();
     let h = build(
         MockPurgeGc::new().with_pending(vec![PendingPurge {
-            artifact_id: aid,
+            artifact_id,
             quarantine_status: QuarantineStatus::None,
         }]),
         MockStorage::new(),
         MockReconcileGate::not_converged(),
     );
 
-    let err = h.uc.process_expired(ts(1000)).await.unwrap_err();
-    assert!(matches!(err, crate::error::AppError::Domain(_)));
-    assert!(err.to_string().contains("has not converged"), "got: {err}");
-
-    // The gate fires BEFORE any port is touched and BEFORE any event.
-    assert_eq!(h.gc.list_call_count(), 0, "must not even list pending");
+    let error = h.uc.process_expired(ts(1000)).await.unwrap_err();
+    assert!(error.to_string().contains("has not converged"));
+    assert_eq!(h.gc.list_call_count(), 0);
     assert_eq!(h.gc.purge_call_count(), 0);
-    assert!(h.storage.deleted_hashes().is_empty());
-    assert!(purged_events(&h.store).is_empty());
+    assert!(h.storage.delete_attempts().is_empty());
 }
 
 #[tokio::test]
-async fn runs_when_b35_converged_empty_pending_is_noop() {
+async fn converged_empty_pending_is_noop() {
     let h = build(
         MockPurgeGc::new(),
         MockStorage::new(),
         MockReconcileGate::converged(),
     );
-    let s = h.uc.process_expired(ts(1000)).await.unwrap();
-    assert_eq!(s.artifacts_visited, 0);
-    assert_eq!(s.purged_events, 0);
+    assert_eq!(
+        h.uc.process_expired(ts(1000)).await.unwrap(),
+        Default::default()
+    );
     assert_eq!(h.gc.list_call_count(), 1);
-    assert!(purged_events(&h.store).is_empty());
 }
 
-// ---------------------------------------------------------------------------
-// refcount == 0  → blob deleted + ArtifactPurged{refs_remaining=0}
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn refcount0_deletes_blob_and_emits_purged() {
-    let aid = Uuid::new_v4();
-    let ph = hash(HASH_PRIMARY);
+async fn zero_refcount_deletes_blob_then_retires_with_terminal_event() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
     let h = build(
         MockPurgeGc::new()
             .with_pending(vec![PendingPurge {
-                artifact_id: aid,
+                artifact_id,
                 quarantine_status: QuarantineStatus::None,
             }])
-            .with_refs(
-                aid,
-                vec![PurgedRef {
-                    content_hash: ph.clone(),
-                    refs_remaining: 0,
-                }],
-            ),
-        MockStorage::new().with_present(ph.clone()),
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]),
+        MockStorage::new().with_present(content_hash.clone()),
         MockReconcileGate::converged(),
     );
 
-    let s = h.uc.process_expired(ts(2000)).await.unwrap();
-    assert_eq!(s.artifacts_visited, 1);
-    assert_eq!(s.blobs_deleted, 1);
-    assert_eq!(s.blobs_kept, 0);
-    assert_eq!(s.purged_events, 1);
-    assert_eq!(s.errors, 0);
-
-    assert_eq!(h.storage.deleted_hashes(), vec![ph.clone()]);
-    let evs = purged_events(&h.store);
-    assert_eq!(evs.len(), 1);
-    assert_eq!(evs[0].artifact_id, aid);
-    assert_eq!(evs[0].content_hash, ph);
-    assert_eq!(evs[0].refs_remaining, 0);
-    assert_eq!(evs[0].purged_at, ts(2000));
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(summary.purged_events, 1);
+    assert_eq!(summary.errors, 0);
+    assert!(h.gc.is_retired(artifact_id));
+    let batches = h.gc.completed_batches();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].events.len(), 1);
+    assert_eq!(batches[0].actor, retention_scheduler_actor());
+    let events = purged_events(&h.gc);
+    assert_eq!(events[0].artifact_id, artifact_id);
+    assert_eq!(events[0].content_hash, content_hash);
+    assert_eq!(events[0].refs_remaining, 0);
+    assert_eq!(events[0].purged_at, ts(2000));
 }
 
-// ---------------------------------------------------------------------------
-// refcount > 0  → blob retained + ArtifactPurged{refs_remaining=N}
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn refcount_gt0_retains_blob_and_records_refs_remaining() {
-    let aid = Uuid::new_v4();
-    let ph = hash(HASH_PRIMARY);
+async fn shared_blob_is_kept_but_artifact_is_retired() {
+    let artifact_id = Uuid::new_v4();
     let h = build(
         MockPurgeGc::new()
             .with_pending(vec![PendingPurge {
-                artifact_id: aid,
+                artifact_id,
                 quarantine_status: QuarantineStatus::Released,
             }])
-            .with_refs(
-                aid,
-                vec![PurgedRef {
-                    content_hash: ph.clone(),
-                    refs_remaining: 3,
-                }],
-            ),
-        // Blob present but MUST NOT be deleted (a live ref remains).
-        MockStorage::new().with_present(ph.clone()),
-        MockReconcileGate::converged(),
-    );
-
-    let s = h.uc.process_expired(ts(3000)).await.unwrap();
-    assert_eq!(s.blobs_deleted, 0);
-    assert_eq!(s.blobs_kept, 1);
-    assert_eq!(s.purged_events, 1);
-    assert!(
-        h.storage.deleted_hashes().is_empty(),
-        "a blob with refs_remaining>0 must NEVER be deleted"
-    );
-    let evs = purged_events(&h.store);
-    assert_eq!(evs.len(), 1);
-    assert_eq!(evs[0].refs_remaining, 3);
-}
-
-// ---------------------------------------------------------------------------
-// metadata_blob walked alongside primary_content
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn walks_primary_and_metadata_blob_together() {
-    let aid = Uuid::new_v4();
-    let ph = hash(HASH_PRIMARY);
-    let mh = hash(HASH_META);
-    let h = build(
-        MockPurgeGc::new()
-            .with_pending(vec![PendingPurge {
-                artifact_id: aid,
-                quarantine_status: QuarantineStatus::None,
-            }])
-            .with_refs(
-                aid,
-                vec![
-                    PurgedRef {
-                        content_hash: ph.clone(),
-                        refs_remaining: 0,
-                    },
-                    // metadata blob still referenced by another artifact.
-                    PurgedRef {
-                        content_hash: mh.clone(),
-                        refs_remaining: 1,
-                    },
-                ],
-            ),
-        MockStorage::new()
-            .with_present(ph.clone())
-            .with_present(mh.clone()),
-        MockReconcileGate::converged(),
-    );
-
-    let s = h.uc.process_expired(ts(4000)).await.unwrap();
-    assert_eq!(s.blobs_deleted, 1, "primary content (refcount 0) deleted");
-    assert_eq!(s.blobs_kept, 1, "metadata blob (refcount 1) retained");
-    assert_eq!(s.purged_events, 2);
-    // Only the primary-content blob was deleted; metadata blob retained.
-    assert_eq!(h.storage.deleted_hashes(), vec![ph.clone()]);
-    let evs = purged_events(&h.store);
-    assert_eq!(evs.len(), 2);
-    let by_hash: std::collections::HashMap<_, _> = evs
-        .iter()
-        .map(|e| (e.content_hash.clone(), e.refs_remaining))
-        .collect();
-    assert_eq!(by_hash.get(&ph), Some(&0));
-    assert_eq!(by_hash.get(&mh), Some(&1));
-}
-
-// ---------------------------------------------------------------------------
-// Two-stage idempotency: transient StoragePort::delete failure does NOT
-// lose the ArtifactExpired decision; sweep continues; next sweep retries.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn transient_storage_delete_failure_does_not_emit_purged_and_continues() {
-    let bad = Uuid::new_v4();
-    let good = Uuid::new_v4();
-    let bad_h = hash(HASH_PRIMARY);
-    let good_h = hash(HASH_META);
-    let h = build(
-        MockPurgeGc::new()
-            .with_pending(vec![
-                PendingPurge {
-                    artifact_id: bad,
-                    quarantine_status: QuarantineStatus::None,
-                },
-                PendingPurge {
-                    artifact_id: good,
-                    quarantine_status: QuarantineStatus::None,
-                },
-            ])
-            .with_refs(
-                bad,
-                vec![PurgedRef {
-                    content_hash: bad_h.clone(),
-                    refs_remaining: 0,
-                }],
-            )
-            .with_refs(
-                good,
-                vec![PurgedRef {
-                    content_hash: good_h.clone(),
-                    refs_remaining: 0,
-                }],
-            ),
-        MockStorage::new()
-            .with_present(bad_h.clone())
-            .with_present(good_h.clone())
-            .fail_delete_transient(bad_h.clone()),
-        MockReconcileGate::converged(),
-    );
-
-    let s = h.uc.process_expired(ts(5000)).await.unwrap();
-
-    // The bad artifact failed transiently → 1 error, NO ArtifactPurged
-    // for it. The good artifact still processed (sweep continued).
-    assert_eq!(s.errors, 1);
-    assert_eq!(s.blobs_deleted, 1, "only the good blob deleted");
-    assert_eq!(
-        s.purged_events, 1,
-        "only the good artifact's ArtifactPurged"
-    );
-
-    let evs = purged_events(&h.store);
-    assert_eq!(evs.len(), 1);
-    assert_eq!(
-        evs[0].artifact_id, good,
-        "the failed artifact got NO purge event"
-    );
-
-    // The ArtifactExpired decision is NOT lost: there is simply no
-    // ArtifactPurged for `bad`, so a NEXT sweep would re-list it as
-    // pending and retry — proven by re-running with the transient
-    // fault cleared.
-    let h2 = build(
-        MockPurgeGc::new()
-            .with_pending(vec![PendingPurge {
-                artifact_id: bad,
-                quarantine_status: QuarantineStatus::None,
-            }])
-            .with_refs(
-                bad,
-                vec![PurgedRef {
-                    content_hash: bad_h.clone(),
-                    refs_remaining: 0,
-                }],
-            ),
-        MockStorage::new().with_present(bad_h.clone()),
-        MockReconcileGate::converged(),
-    );
-    let s2 = h2.uc.process_expired(ts(6000)).await.unwrap();
-    assert_eq!(s2.errors, 0);
-    assert_eq!(s2.blobs_deleted, 1);
-    assert_eq!(s2.purged_events, 1);
-    assert_eq!(purged_events(&h2.store)[0].artifact_id, bad);
-}
-
-// ---------------------------------------------------------------------------
-// Idempotent re-purge on an already-absent blob is a clean no-op
-// success (delete NotFound == already gone).
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn re_purge_on_already_absent_storage_is_clean_success() {
-    let aid = Uuid::new_v4();
-    let ph = hash(HASH_PRIMARY);
-    let h = build(
-        MockPurgeGc::new()
-            .with_pending(vec![PendingPurge {
-                artifact_id: aid,
-                quarantine_status: QuarantineStatus::None,
-            }])
-            .with_refs(
-                aid,
-                vec![PurgedRef {
-                    content_hash: ph.clone(),
-                    refs_remaining: 0,
-                }],
-            ),
-        // Blob NOT present → delete returns NotFound → must be treated
-        // as success-on-missing, NOT a transient error.
+            .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 3)]),
         MockStorage::new(),
         MockReconcileGate::converged(),
     );
 
-    let s = h.uc.process_expired(ts(7000)).await.unwrap();
-    assert_eq!(s.errors, 0, "NotFound on delete is NOT an error (inv 4)");
-    assert_eq!(s.blobs_deleted, 1);
-    assert_eq!(
-        s.purged_events, 1,
-        "ArtifactPurged still emitted (idempotent)"
-    );
-    let evs = purged_events(&h.store);
-    assert_eq!(evs.len(), 1);
-    assert_eq!(evs[0].refs_remaining, 0);
+    let summary = h.uc.process_expired(ts(3000)).await.unwrap();
+    assert_eq!(summary.blobs_deleted, 0);
+    assert_eq!(summary.blobs_kept, 1);
+    assert_eq!(summary.purged_events, 1);
+    assert!(h.storage.delete_attempts().is_empty());
+    assert!(h.gc.is_retired(artifact_id));
+    assert_eq!(purged_events(&h.gc)[0].refs_remaining, 3);
 }
 
-// ---------------------------------------------------------------------------
-// Evidence protection — quarantined / rejected / indeterminate never purged
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn all_hashes_land_in_one_terminal_batch() {
+    let artifact_id = Uuid::new_v4();
+    let primary = hash(HASH_PRIMARY);
+    let metadata = hash(HASH_META);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![PendingPurge {
+                artifact_id,
+                quarantine_status: QuarantineStatus::None,
+            }])
+            .with_refs(
+                artifact_id,
+                vec![work(primary.clone(), 0), work(metadata.clone(), 1)],
+            ),
+        MockStorage::new().with_present(primary),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(4000)).await.unwrap();
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(summary.blobs_kept, 1);
+    assert_eq!(summary.purged_events, 2);
+    assert_eq!(h.gc.completed_batches()[0].events.len(), 2);
+    let by_hash: HashMap<_, _> = purged_events(&h.gc)
+        .into_iter()
+        .map(|event| (event.content_hash, event.refs_remaining))
+        .collect();
+    assert_eq!(by_hash.get(&hash(HASH_PRIMARY)), Some(&0));
+    assert_eq!(by_hash.get(&metadata), Some(&1));
+}
 
 #[tokio::test]
-async fn invariant1_protected_artifacts_are_never_purged() {
+async fn second_hash_failure_withholds_entire_terminal_transition_then_retries() {
+    let artifact_id = Uuid::new_v4();
+    let first = hash(HASH_PRIMARY);
+    let second = hash(HASH_CHILD);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![PendingPurge {
+                artifact_id,
+                quarantine_status: QuarantineStatus::None,
+            }])
+            .with_refs(
+                artifact_id,
+                vec![work(first.clone(), 0), work(second.clone(), 0)],
+            ),
+        MockStorage::new()
+            .with_present(first.clone())
+            .with_present(second.clone())
+            .fail_delete_once(second.clone()),
+        MockReconcileGate::converged(),
+    );
+
+    let first_run = h.uc.process_expired(ts(5000)).await.unwrap();
+    assert_eq!(first_run.errors, 1);
+    assert_eq!(first_run.purged_events, 0);
+    assert_eq!(h.gc.complete_call_count(), 0);
+    assert!(!h.gc.is_retired(artifact_id));
+    assert!(purged_events(&h.gc).is_empty());
+
+    let retry = h.uc.process_expired(ts(6000)).await.unwrap();
+    assert_eq!(retry.errors, 0);
+    assert_eq!(retry.purged_events, 2);
+    assert!(h.gc.is_retired(artifact_id));
+    assert_eq!(purged_events(&h.gc).len(), 2);
+    assert_eq!(
+        h.storage.delete_attempts(),
+        vec![first, second.clone(), second],
+        "the checkpointed first hash is not re-deleted on retry"
+    );
+}
+
+#[tokio::test]
+async fn completed_primary_does_not_hide_outstanding_oci_child() {
+    let artifact_id = Uuid::new_v4();
+    let primary = PurgedRef {
+        content_hash: hash(HASH_PRIMARY),
+        refs_remaining: 0,
+        completed: true,
+    };
+    let child = hash(HASH_CHILD);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![PendingPurge {
+                artifact_id,
+                quarantine_status: QuarantineStatus::None,
+            }])
+            .with_refs(artifact_id, vec![primary, work(child.clone(), 0)]),
+        MockStorage::new().with_present(child.clone()),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(6100)).await.unwrap();
+    assert_eq!(summary.purged_events, 2);
+    assert_eq!(h.storage.delete_attempts(), vec![child]);
+    assert!(h.gc.is_retired(artifact_id));
+}
+
+#[tokio::test]
+async fn absent_storage_is_an_idempotent_success() {
+    let artifact_id = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![PendingPurge {
+                artifact_id,
+                quarantine_status: QuarantineStatus::None,
+            }])
+            .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 0)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(7000)).await.unwrap();
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(summary.purged_events, 1);
+}
+
+#[tokio::test]
+async fn protected_artifacts_are_never_prepared() {
     for status in [
         QuarantineStatus::Quarantined,
         QuarantineStatus::Rejected,
         QuarantineStatus::ScanIndeterminate,
     ] {
-        let aid = Uuid::new_v4();
-        let ph = hash(HASH_PRIMARY);
+        let artifact_id = Uuid::new_v4();
         let h = build(
-            MockPurgeGc::new()
-                .with_pending(vec![PendingPurge {
-                    artifact_id: aid,
-                    quarantine_status: status,
-                }])
-                .with_refs(
-                    aid,
-                    vec![PurgedRef {
-                        content_hash: ph.clone(),
-                        refs_remaining: 0,
-                    }],
-                ),
-            MockStorage::new().with_present(ph.clone()),
+            MockPurgeGc::new().with_pending(vec![PendingPurge {
+                artifact_id,
+                quarantine_status: status,
+            }]),
+            MockStorage::new(),
             MockReconcileGate::converged(),
         );
 
-        let s = h.uc.process_expired(ts(8000)).await.unwrap();
-        assert_eq!(s.skipped_protected, 1, "status {status} must be skipped");
-        assert_eq!(s.blobs_deleted, 0);
-        assert_eq!(s.purged_events, 0);
-        assert_eq!(
-            h.gc.purge_call_count(),
-            0,
-            "must not even call purge_artifact_refs for protected {status}"
-        );
-        assert!(
-            h.storage.deleted_hashes().is_empty(),
-            "evidence blob for {status} must NEVER be deleted"
-        );
-        assert!(purged_events(&h.store).is_empty());
+        let summary = h.uc.process_expired(ts(8000)).await.unwrap();
+        assert_eq!(summary.skipped_protected, 1);
+        assert_eq!(h.gc.purge_call_count(), 0);
+        assert!(!h.gc.is_retired(artifact_id));
     }
 }
 
-// ---------------------------------------------------------------------------
-// Error paths: list failure aborts; per-artifact tx failure continues.
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
-async fn list_pending_failure_aborts_the_sweep() {
+async fn list_failure_aborts_the_sweep() {
     let h = build(
         MockPurgeGc::new().with_list_err(),
         MockStorage::new(),
         MockReconcileGate::converged(),
     );
-    let err = h.uc.process_expired(ts(9000)).await.unwrap_err();
-    assert!(matches!(err, crate::error::AppError::Domain(_)));
+    assert!(h.uc.process_expired(ts(9000)).await.is_err());
 }
 
 #[tokio::test]
-async fn purge_tx_failure_is_per_artifact_and_sweep_continues() {
+async fn prepare_failure_is_per_artifact_and_sweep_continues() {
     let bad = Uuid::new_v4();
     let good = Uuid::new_v4();
-    let gh = hash(HASH_META);
+    let content_hash = hash(HASH_META);
     let h = build(
         MockPurgeGc::new()
             .with_pending(vec![
@@ -665,110 +615,97 @@ async fn purge_tx_failure_is_per_artifact_and_sweep_continues() {
                     quarantine_status: QuarantineStatus::None,
                 },
             ])
-            .with_refs(
-                good,
-                vec![PurgedRef {
-                    content_hash: gh.clone(),
-                    refs_remaining: 0,
-                }],
-            )
+            .with_refs(good, vec![work(content_hash.clone(), 0)])
             .fail_purge_for(bad),
-        MockStorage::new().with_present(gh.clone()),
+        MockStorage::new().with_present(content_hash),
         MockReconcileGate::converged(),
     );
 
-    let s = h.uc.process_expired(ts(9100)).await.unwrap();
-    assert_eq!(s.artifacts_visited, 2);
-    assert_eq!(s.errors, 1, "the bad tx is one error");
-    assert_eq!(s.purged_events, 1, "the good artifact still completed");
-    assert_eq!(purged_events(&h.store)[0].artifact_id, good);
+    let summary = h.uc.process_expired(ts(9100)).await.unwrap();
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.purged_events, 1);
+    assert!(!h.gc.is_retired(bad));
+    assert!(h.gc.is_retired(good));
 }
 
 #[tokio::test]
-async fn append_purged_failure_is_recorded_and_decision_retained() {
-    // MockEventStore::append always Ok; to exercise the append-error
-    // arm we use a publisher whose inner store fails append. Reuse a
-    // tiny failing store rather than touching test_support.
-    struct FailAppend;
-    impl hort_domain::ports::event_store::EventStore for FailAppend {
-        fn append(
-            &self,
-            _b: hort_domain::ports::event_store::AppendEvents,
-        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::AppendResult>> {
-            Box::pin(async { Err(DomainError::Invariant("append boom".into())) })
-        }
-        fn read_stream(
-            &self,
-            _s: &hort_domain::events::StreamId,
-            _f: hort_domain::ports::event_store::ReadFrom,
-            _m: u64,
-        ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::events::PersistedEvent>>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn read_category(
-            &self,
-            _c: hort_domain::events::StreamCategory,
-            _f: hort_domain::ports::event_store::SubscribeFrom,
-            _m: u64,
-        ) -> BoxFuture<'_, DomainResult<Vec<hort_domain::events::PersistedEvent>>> {
-            Box::pin(async { Ok(vec![]) })
-        }
-        fn delete_stream(
-            &self,
-            _s: hort_domain::events::StreamId,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn archive_stream(
-            &self,
-            _s: hort_domain::events::StreamId,
-            _t: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    let aid = Uuid::new_v4();
-    let ph = hash(HASH_PRIMARY);
-    let gc = Arc::new(
+async fn empty_worklist_is_a_noop() {
+    let artifact_id = Uuid::new_v4();
+    let h = build(
         MockPurgeGc::new()
             .with_pending(vec![PendingPurge {
-                artifact_id: aid,
+                artifact_id,
                 quarantine_status: QuarantineStatus::None,
             }])
-            .with_refs(
-                aid,
-                vec![PurgedRef {
-                    content_hash: ph.clone(),
-                    refs_remaining: 0,
-                }],
-            ),
-    );
-    let storage = Arc::new(MockStorage::new().with_present(ph.clone()));
-    let publisher = wrap_for_test(Arc::new(FailAppend));
-    let uc = PurgeUseCase::new(
-        gc.clone(),
-        storage.clone(),
-        publisher,
+            .with_refs(artifact_id, Vec::new()),
+        MockStorage::new(),
         MockReconcileGate::converged(),
     );
 
-    let s = uc.process_expired(ts(9200)).await.unwrap();
-    // Storage delete happened (idempotent); append failed → error
-    // recorded, no purged_events, sweep returns Ok.
-    assert_eq!(s.blobs_deleted, 1);
-    assert_eq!(s.purged_events, 0);
-    assert_eq!(s.errors, 1);
+    let summary = h.uc.process_expired(ts(9150)).await.unwrap();
+    assert_eq!(summary.artifacts_visited, 1);
+    assert_eq!(summary.purged_events, 0);
+    assert_eq!(h.gc.complete_call_count(), 0);
 }
 
-// ---------------------------------------------------------------------------
-// Metric: hort_retention_purged_total fires with the documented labels.
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn checkpoint_failure_withholds_terminal_transition_and_retries() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![PendingPurge {
+                artifact_id,
+                quarantine_status: QuarantineStatus::None,
+            }])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .fail_mark_once_for(content_hash),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let first = h.uc.process_expired(ts(9200)).await.unwrap();
+    assert_eq!(first.errors, 1);
+    assert_eq!(first.purged_events, 0);
+    assert!(!h.gc.is_retired(artifact_id));
+
+    let retry = h.uc.process_expired(ts(9300)).await.unwrap();
+    assert_eq!(retry.errors, 0);
+    assert_eq!(retry.purged_events, 1);
+    assert!(h.gc.is_retired(artifact_id));
+}
+
+#[tokio::test]
+async fn terminal_transition_failure_retries_without_repeating_storage() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![PendingPurge {
+                artifact_id,
+                quarantine_status: QuarantineStatus::None,
+            }])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .fail_complete_once(),
+        MockStorage::new().with_present(content_hash.clone()),
+        MockReconcileGate::converged(),
+    );
+
+    let first = h.uc.process_expired(ts(9400)).await.unwrap();
+    assert_eq!(first.errors, 1);
+    assert_eq!(first.purged_events, 0);
+    assert!(!h.gc.is_retired(artifact_id));
+
+    let retry = h.uc.process_expired(ts(9500)).await.unwrap();
+    assert_eq!(retry.errors, 0);
+    assert_eq!(retry.purged_events, 1);
+    assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
+    assert!(h.gc.is_retired(artifact_id));
+}
 
 mod metrics_emission_tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use std::collections::HashMap;
 
     type SnapEntry = (
         metrics_util::CompositeKey,
@@ -777,110 +714,71 @@ mod metrics_emission_tests {
         DebugValue,
     );
 
-    fn capture<F>(f: F) -> Vec<SnapEntry>
-    where
-        F: FnOnce() -> futures::future::BoxFuture<'static, ()> + Send + 'static,
-    {
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            rt.block_on(f());
-        });
-        snapshotter.snapshot().into_vec()
-    }
-
-    fn counter(snap: &[SnapEntry], name: &str, result: &str) -> Option<u64> {
-        for (key, _, _, value) in snap {
-            if key.key().name() != name {
-                continue;
+    fn counter(snapshot: &[SnapEntry], result: &str) -> Option<u64> {
+        snapshot.iter().find_map(|(key, _, _, value)| {
+            let labels: HashMap<&str, &str> = key
+                .key()
+                .labels()
+                .map(|label| (label.key(), label.value()))
+                .collect();
+            if key.key().name() == "hort_retention_purged_total"
+                && labels.get("result") == Some(&result)
+            {
+                if let DebugValue::Counter(value) = value {
+                    return Some(*value);
+                }
             }
-            let labels: HashMap<&str, &str> =
-                key.key().labels().map(|l| (l.key(), l.value())).collect();
-            if labels.get("result") != Some(&result) {
-                continue;
-            }
-            if let DebugValue::Counter(v) = value {
-                return Some(*v);
-            }
-        }
-        None
+            None
+        })
     }
 
     #[test]
-    fn purged_total_fires_success_blob_kept_and_storage_error() {
-        let snap = capture(|| {
-            Box::pin(async {
-                let success_id = Uuid::new_v4();
-                let kept_id = Uuid::new_v4();
-                let err_id = Uuid::new_v4();
-                let sh = hash(HASH_PRIMARY);
-                let kh = hash(HASH_META);
-                // a third valid distinct hash for the storage-error case
-                let eh = hash("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-
-                let h = build(
-                    MockPurgeGc::new()
-                        .with_pending(vec![
-                            PendingPurge {
-                                artifact_id: success_id,
-                                quarantine_status: QuarantineStatus::None,
-                            },
-                            PendingPurge {
-                                artifact_id: kept_id,
-                                quarantine_status: QuarantineStatus::None,
-                            },
-                            PendingPurge {
-                                artifact_id: err_id,
-                                quarantine_status: QuarantineStatus::None,
-                            },
-                        ])
-                        .with_refs(
-                            success_id,
-                            vec![PurgedRef {
-                                content_hash: sh.clone(),
-                                refs_remaining: 0,
-                            }],
-                        )
-                        .with_refs(
-                            kept_id,
-                            vec![PurgedRef {
-                                content_hash: kh.clone(),
-                                refs_remaining: 2,
-                            }],
-                        )
-                        .with_refs(
-                            err_id,
-                            vec![PurgedRef {
-                                content_hash: eh.clone(),
-                                refs_remaining: 0,
-                            }],
-                        ),
-                    MockStorage::new()
-                        .with_present(sh.clone())
-                        .with_present(kh.clone())
-                        .with_present(eh.clone())
-                        .fail_delete_transient(eh.clone()),
-                    MockReconcileGate::converged(),
-                );
-                let _ = h.uc.process_expired(ts(1)).await.unwrap();
-            })
+    fn purged_total_records_terminal_results_and_storage_error() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let success = Uuid::new_v4();
+                    let kept = Uuid::new_v4();
+                    let failed = Uuid::new_v4();
+                    let success_hash = hash(HASH_PRIMARY);
+                    let failed_hash = hash(HASH_CHILD);
+                    let h = build(
+                        MockPurgeGc::new()
+                            .with_pending(vec![
+                                PendingPurge {
+                                    artifact_id: success,
+                                    quarantine_status: QuarantineStatus::None,
+                                },
+                                PendingPurge {
+                                    artifact_id: kept,
+                                    quarantine_status: QuarantineStatus::None,
+                                },
+                                PendingPurge {
+                                    artifact_id: failed,
+                                    quarantine_status: QuarantineStatus::None,
+                                },
+                            ])
+                            .with_refs(success, vec![work(success_hash.clone(), 0)])
+                            .with_refs(kept, vec![work(hash(HASH_META), 2)])
+                            .with_refs(failed, vec![work(failed_hash.clone(), 0)]),
+                        MockStorage::new()
+                            .with_present(success_hash)
+                            .with_present(failed_hash.clone())
+                            .fail_delete_once(failed_hash),
+                        MockReconcileGate::converged(),
+                    );
+                    h.uc.process_expired(ts(1)).await.unwrap();
+                });
         });
 
-        assert_eq!(
-            counter(&snap, "hort_retention_purged_total", "success"),
-            Some(1)
-        );
-        assert_eq!(
-            counter(&snap, "hort_retention_purged_total", "blob_kept"),
-            Some(1)
-        );
-        assert_eq!(
-            counter(&snap, "hort_retention_purged_total", "storage_error"),
-            Some(1)
-        );
+        let snapshot = snapshotter.snapshot().into_vec();
+        assert_eq!(counter(&snapshot, "success"), Some(1));
+        assert_eq!(counter(&snapshot, "blob_kept"), Some(1));
+        assert_eq!(counter(&snapshot, "storage_error"), Some(1));
     }
 }

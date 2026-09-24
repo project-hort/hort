@@ -7,12 +7,6 @@
 //! enforces — see the port module docs
 //! (`hort-domain/src/ports/purge_gc.rs`) for the posture this consumes).
 //!
-//! Purely additive: a brand-new adapter for a brand-new (additive)
-//! port. No existing adapter or port signature is touched. The
-//! existing [`crate::pg_content_reference_repo::PgContentReferenceRepo`]
-//! and [`crate::refcount_reconcile::PgRefcountReconcile`] are left
-//! exactly as shipped.
-//!
 //! # `list_pending_purge`
 //!
 //! Every artifact whose stream (`stream_id = 'artifact-' || a.id`) has
@@ -23,7 +17,7 @@
 //! defence-in-depth, but the adapter never hands a protected artifact
 //! to the destructive path in the first place.
 //!
-//! # `purge_artifact_refs` — three steps in one committed tx
+//! # `purge_artifact_refs` — durable preparation in one transaction
 //!
 //! 1. `SELECT … FROM artifacts WHERE id = $1 FOR UPDATE` — lock the
 //!    artifact row so a concurrent ingest/promote cannot race the
@@ -32,13 +26,11 @@
 //! 2. `DELETE FROM content_references WHERE source_artifact_id = $1
 //!    RETURNING target_content_hash` — remove **every** kind of this
 //!    artifact's own source-edges: the `primary_content` /
-//!    `metadata_blob` refcount rows AND (#49) any `oci_index_member` /
+//!    `metadata_blob` refcount rows and any `oci_index_member` /
 //!    `oci_subject` / `oci_config` / `oci_layer` membership edges this
-//!    artifact carries as a source (e.g. an image index's children, or
-//!    a manifest's config/layer blobs). Purge tombstones the `artifacts`
-//!    row rather than hard-deleting it, so the FK's `ON DELETE CASCADE`
-//!    never fires for a purge — this DELETE is the only sweep that
-//!    reaches a purged manifest's membership edges. Mirrors
+//!    artifact carries as a source. The retained audit row means the
+//!    FK's `ON DELETE CASCADE` never fires for a purge, so this explicit
+//!    DELETE is the only sweep that reaches those membership edges. Mirrors
 //!    `pg_content_reference_repo::delete_by_source`'s all-kinds
 //!    behavior (the manifest-DELETE path), now applied to purge too.
 //! 3. For each distinct returned hash `H`:
@@ -48,20 +40,16 @@
 //!    `oci_layer` too: a live OCI manifest/index still pointing at `H`
 //!    keeps the blob alive even when the artifact whose primary content
 //!    matches `H` is purged).
+//! 4. Insert every `(artifact, hash, refs_remaining)` decision into
+//!    `artifact_purge_worklist` before committing. Retries read this
+//!    table rather than trying to reconstruct targets from deleted
+//!    edges, so every OCI target remains actionable.
 //!
-//! **Idempotent retry.** If a prior partial run already committed the
-//! `DELETE` (storage delete / `ArtifactPurged` append then failed and
-//! the sweep retries), step 2 returns zero rows. `primary_content` and
-//! `metadata_blob` are recovered from the authoritative columns —
-//! `artifacts.checksum_sha256` (locked in step 1) and
-//! `artifact_metadata.metadata_blob` — and the now-stable cross-`kind`
-//! count is recomputed for those. **The `oci_*` membership targets are
-//! NOT recovered on retry** (#49, accepted bounded gap — see the code
-//! comment at the recovery branch): there is no authoritative column to
-//! reconstruct them from, and by the time the retry runs, their
-//! refcounts are already correctly decremented from the prior attempt's
-//! committed DELETE — only this retry call's own `PurgedRef` output
-//! (decision emission) omits them, not the underlying data.
+//! After storage decisions have been checkpointed per worklist row,
+//! `complete_artifact_purge` appends the whole per-hash terminal event
+//! batch and writes `artifacts.deleted_at` in one transaction. The
+//! projection and stream therefore cannot expose different terminal
+//! states.
 //!
 //! `metadata_blob` is stored as `character(64)` (blank-padded) on
 //! `artifact_metadata`; it is trimmed at the boundary before parsing,
@@ -70,28 +58,47 @@
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use chrono::{DateTime, Utc};
 use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::events::{DomainEvent, StreamId};
+use hort_domain::ports::event_store::AppendEvents;
 use hort_domain::ports::purge_gc::{PendingPurge, PurgeGcPort, PurgedRef};
 use hort_domain::types::ContentHash;
 
+use crate::event_store::PgEventStore;
 use crate::{map_sqlx_error, BoxFuture};
 
 /// PostgreSQL implementation of [`PurgeGcPort`].
 ///
-/// Thin wrapper over a `PgPool`; no per-instance state beyond the
-/// pool. Construction is cheap (no I/O).
 pub struct PgPurgeGcPort {
     pool: PgPool,
+    event_store: Arc<PgEventStore>,
+    #[cfg(test)]
+    interrupt_after_append: AtomicBool,
 }
 
 impl PgPurgeGcPort {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, event_store: Arc<PgEventStore>) -> Self {
+        Self {
+            pool,
+            event_store,
+            #[cfg(test)]
+            interrupt_after_append: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(test)]
+    fn interrupt_next_terminal_transition(&self) {
+        self.interrupt_after_append.store(true, Ordering::SeqCst);
     }
 }
 
@@ -110,6 +117,13 @@ struct PendingRow {
 #[derive(Debug, FromRow)]
 struct DeletedRefRow {
     target_content_hash: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct WorklistRow {
+    content_hash: String,
+    refs_remaining: i64,
+    completed_at: Option<DateTime<Utc>>,
 }
 
 /// Map the persisted `artifacts.quarantine_status` text to the domain
@@ -161,6 +175,89 @@ impl PgPurgeGcPort {
         .await
         .map_err(|e| map_sqlx_error(&e, "purge_gc", "count_refs"))?;
         Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+    }
+
+    async fn load_worklist(
+        tx: &mut Transaction<'_, Postgres>,
+        artifact_id: Uuid,
+    ) -> DomainResult<Vec<WorklistRow>> {
+        sqlx::query_as(
+            r#"
+            SELECT content_hash, refs_remaining, completed_at
+              FROM artifact_purge_worklist
+             WHERE artifact_id = $1
+             ORDER BY content_hash
+            "#,
+        )
+        .bind(artifact_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|e| map_sqlx_error(&e, "purge_gc", "load_worklist"))
+    }
+
+    fn map_worklist(rows: Vec<WorklistRow>) -> DomainResult<Vec<PurgedRef>> {
+        rows.into_iter()
+            .map(|row| {
+                Ok(PurgedRef {
+                    content_hash: parse_hash(&row.content_hash, "artifact_purge_worklist")?,
+                    refs_remaining: u32::try_from(row.refs_remaining).map_err(|_| {
+                        DomainError::Invariant(format!(
+                            "purge_gc: invalid refs_remaining {} in worklist",
+                            row.refs_remaining
+                        ))
+                    })?,
+                    completed: row.completed_at.is_some(),
+                })
+            })
+            .collect()
+    }
+
+    fn validate_terminal_batch(
+        artifact_id: Uuid,
+        retired_at: DateTime<Utc>,
+        worklist: &[WorklistRow],
+        batch: &AppendEvents,
+    ) -> DomainResult<()> {
+        if batch.stream_id != StreamId::artifact(artifact_id) {
+            return Err(DomainError::Invariant(
+                "purge_gc: terminal batch targets the wrong artifact stream".into(),
+            ));
+        }
+
+        let expected: BTreeMap<_, _> = worklist
+            .iter()
+            .map(|row| (row.content_hash.trim().to_owned(), row.refs_remaining))
+            .collect();
+        let mut actual = BTreeMap::new();
+        for event in &batch.events {
+            let DomainEvent::ArtifactPurged(event) = &event.event else {
+                return Err(DomainError::Invariant(
+                    "purge_gc: terminal batch contains a non-ArtifactPurged event".into(),
+                ));
+            };
+            if event.artifact_id != artifact_id || event.purged_at != retired_at {
+                return Err(DomainError::Invariant(
+                    "purge_gc: terminal event does not match its artifact transition".into(),
+                ));
+            }
+            if actual
+                .insert(
+                    event.content_hash.as_ref().to_owned(),
+                    i64::from(event.refs_remaining),
+                )
+                .is_some()
+            {
+                return Err(DomainError::Invariant(
+                    "purge_gc: terminal batch contains a duplicate content hash".into(),
+                ));
+            }
+        }
+        if actual != expected {
+            return Err(DomainError::Invariant(
+                "purge_gc: terminal events do not exactly match the purge worklist".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -219,14 +316,20 @@ impl PurgeGcPort for PgPurgeGcPort {
                 DomainError::Invariant(format!("purge_gc purge_artifact_refs begin: {e}"))
             })?;
 
-            // -- Step 1: lock the artifact row FOR UPDATE -------------
-            //
-            // Also yields the authoritative `checksum_sha256` for the
-            // idempotent-retry recovery path. A missing row means the
-            // artifact was hard-deleted out from under the pending
-            // `ArtifactExpired` (FK `ON DELETE CASCADE` already swept
-            // its content_references); the purge is then a no-op —
-            // there is nothing left to decrement.
+            let existing = Self::load_worklist(&mut tx, artifact_id).await?;
+            if !existing.is_empty() {
+                tx.commit().await.map_err(|e| {
+                    DomainError::Invariant(format!("purge_gc worklist-read commit: {e}"))
+                })?;
+                return Self::map_worklist(existing);
+            }
+
+            // Locking serializes first-time preparation. Once a
+            // worklist exists, it is the authoritative target set and
+            // no deleted edge needs to be reconstructed. The initial
+            // worklist read happens before this artifact lock so a
+            // normal retry cannot invert the final transition's
+            // worklist -> events -> artifact lock order.
             let locked: Option<(String,)> =
                 sqlx::query_as("SELECT checksum_sha256 FROM artifacts WHERE id = $1 FOR UPDATE")
                     .bind(artifact_id)
@@ -240,21 +343,19 @@ impl PurgeGcPort for PgPurgeGcPort {
                 return Ok(Vec::new());
             };
 
-            // -- Step 2: DELETE this artifact's own refs --------------
-            //
-            // ALL kinds (#49) — no `kind IN (...)` filter. Mirrors
-            // `pg_content_reference_repo::delete_by_source`'s all-kinds
-            // sweep. Purge tombstones the `artifacts` row (`ArtifactPurged`)
-            // rather than hard-`DELETE`ing it, so the `content_references`
-            // FK's `ON DELETE CASCADE` never fires for a purge — this
-            // DELETE is the only thing that removes a purged manifest's
-            // `oci_index_member` / `oci_subject` / `oci_config` /
-            // `oci_layer` **source**-edges (in addition to its own
-            // `primary_content` / `metadata_blob` refcount rows). Without
-            // sweeping every kind here, a purged manifest's membership
-            // edges dangled forever (no cascade, no other sweep reaches
-            // them), permanently over-retaining every target they pointed
-            // at — the #49 leak.
+            // Another first-time preparer may have committed while this
+            // transaction waited for the artifact lock.
+            let existing = Self::load_worklist(&mut tx, artifact_id).await?;
+            if !existing.is_empty() {
+                tx.commit().await.map_err(|e| {
+                    DomainError::Invariant(format!("purge_gc worklist-read commit: {e}"))
+                })?;
+                return Self::map_worklist(existing);
+            }
+
+            // Remove every source-edge kind. A purge retains its
+            // artifact row for audit, so no FK cascade can perform
+            // this sweep later.
             let deleted: Vec<DeletedRefRow> = sqlx::query_as(
                 r#"
                 DELETE FROM content_references
@@ -267,17 +368,11 @@ impl PurgeGcPort for PgPurgeGcPort {
             .await
             .map_err(|e| map_sqlx_error(&e, "purge_gc", "delete_refs"))?;
 
-            // Distinct target hashes this artifact referenced, across
-            // EVERY kind — the `oci_*` membership targets (child
-            // manifests / config / layer blobs) ride the same `hashes`
-            // set as `primary_content` / `metadata_blob` from here on,
-            // so step 3 recomputes their cross-`kind` remaining count
-            // exactly like any other target. On the happy path these
-            // come from the DELETE … RETURNING above; on an idempotent
-            // retry (a prior run already committed the DELETE) the set
-            // is empty and is recovered from the authoritative
-            // `artifacts.checksum_sha256` + `artifact_metadata.metadata_blob`
-            // columns.
+            // Distinct targets across every reference kind are captured
+            // before this transaction commits. The fallback supports a
+            // projection that was already missing its single-target
+            // rows before durable worklists existed; retries of this
+            // implementation always take the worklist branch above.
             let mut hashes: BTreeMap<String, ContentHash> = BTreeMap::new();
             for row in &deleted {
                 let h = parse_hash(
@@ -287,33 +382,6 @@ impl PurgeGcPort for PgPurgeGcPort {
                 hashes.insert(h.as_ref().to_owned(), h);
             }
             if hashes.is_empty() {
-                // Idempotent-retry recovery: the rows were already
-                // deleted by a prior partial run. Recover from the
-                // authoritative columns so the retry still produces
-                // the decisions needed to finish the purge.
-                //
-                // **Accepted bounded gap (#49):** this recovery ONLY
-                // reconstructs `primary_content` (from
-                // `artifacts.checksum_sha256`) and `metadata_blob` (from
-                // `artifact_metadata.metadata_blob`) — there is no
-                // authoritative column anywhere that records what
-                // `oci_index_member` / `oci_subject` / `oci_config` /
-                // `oci_layer` **targets** this artifact's now-deleted
-                // membership edges used to point at, so those targets are
-                // NOT re-added to `hashes` on a retry. This does not
-                // reintroduce the #49 leak: by the time this branch runs,
-                // the DELETE in step 2 already committed on the prior
-                // attempt, so every `oci_*` target's refcount is already
-                // correctly decremented in the database — the gap is
-                // purely that THIS retry's `PurgedRef` output (and thus
-                // the use case's GC-eligibility decision emission for
-                // that call) skips those already-corrected targets. A
-                // later, unrelated purge/reconcile pass still sees their
-                // true (already-decremented) count. Deliberately not
-                // fixed by adding a column/table for this bounded,
-                // rare-partial-failure gap (directive #49 — do not expand
-                // the schema for it); revisit only if evidence shows the
-                // retry path is common enough to matter.
                 let primary = parse_hash(&checksum_sha256, "artifacts.checksum_sha256")?;
                 hashes.insert(primary.as_ref().to_owned(), primary);
 
@@ -333,21 +401,141 @@ impl PurgeGcPort for PgPurgeGcPort {
                 }
             }
 
-            // -- Step 3: cross-`kind` remaining count per hash --------
-            let mut out = Vec::with_capacity(hashes.len());
+            // Persist the post-delete decision for every hash before
+            // the deleted edges become invisible to later attempts.
             for hash in hashes.into_values() {
                 let refs_remaining = Self::remaining_refs(&mut tx, &hash).await?;
-                out.push(PurgedRef {
-                    content_hash: hash,
-                    refs_remaining,
-                });
+                sqlx::query(
+                    r#"
+                    INSERT INTO artifact_purge_worklist (
+                        artifact_id, content_hash, refs_remaining
+                    ) VALUES ($1, $2, $3)
+                    "#,
+                )
+                .bind(artifact_id)
+                .bind(hash.as_ref())
+                .bind(i64::from(refs_remaining))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "purge_gc", "insert_worklist"))?;
             }
 
-            // -- Step 4: commit ---------------------------------------
+            let worklist = Self::load_worklist(&mut tx, artifact_id).await?;
             tx.commit().await.map_err(|e| {
                 DomainError::Invariant(format!("purge_gc purge_artifact_refs commit: {e}"))
             })?;
-            Ok(out)
+            Self::map_worklist(worklist)
+        })
+    }
+
+    fn mark_purge_ref_complete(
+        &self,
+        artifact_id: Uuid,
+        content_hash: &ContentHash,
+        completed_at: DateTime<Utc>,
+    ) -> BoxFuture<'_, DomainResult<()>> {
+        let content_hash = content_hash.clone();
+        Box::pin(async move {
+            let result = sqlx::query(
+                "UPDATE artifact_purge_worklist \
+                 SET completed_at = COALESCE(completed_at, $3) \
+                 WHERE artifact_id = $1 AND content_hash = $2",
+            )
+            .bind(artifact_id)
+            .bind(content_hash.as_ref())
+            .bind(completed_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "purge_gc", "complete_worklist_ref"))?;
+            if result.rows_affected() != 1 {
+                return Err(DomainError::Invariant(format!(
+                    "purge_gc: no worklist row for artifact {artifact_id} hash {content_hash}"
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn complete_artifact_purge(
+        &self,
+        artifact_id: Uuid,
+        retired_at: DateTime<Utc>,
+        events: AppendEvents,
+    ) -> BoxFuture<'_, DomainResult<()>> {
+        Box::pin(async move {
+            let mut uow = self.event_store.begin_unit_of_work().await?;
+            let worklist: Vec<WorklistRow> = sqlx::query_as(
+                r#"
+                SELECT content_hash, refs_remaining, completed_at
+                  FROM artifact_purge_worklist
+                 WHERE artifact_id = $1
+                 ORDER BY content_hash
+                   FOR UPDATE
+                "#,
+            )
+            .bind(artifact_id)
+            .fetch_all(uow.conn())
+            .await
+            .map_err(|e| map_sqlx_error(&e, "purge_gc", "lock_worklist"))?;
+
+            if worklist.is_empty() {
+                return Err(DomainError::Invariant(format!(
+                    "purge_gc: artifact {artifact_id} has no purge worklist"
+                )));
+            }
+            if worklist.iter().any(|row| row.completed_at.is_none()) {
+                return Err(DomainError::Invariant(format!(
+                    "purge_gc: artifact {artifact_id} still has incomplete storage work"
+                )));
+            }
+            Self::validate_terminal_batch(artifact_id, retired_at, &worklist, &events)?;
+
+            self.event_store.append_in_tx(&mut uow, events).await?;
+
+            #[cfg(test)]
+            if self.interrupt_after_append.swap(false, Ordering::SeqCst) {
+                return Err(DomainError::Invariant(
+                    "purge_gc: injected interruption after terminal append".into(),
+                ));
+            }
+
+            // Idempotent in the state, not in the writer: the row must
+            // end up retired, whoever retired it. A user-facing delete
+            // can land between the expiry decision and this sweep (the
+            // pending-purge set has no `deleted_at` predicate), and an
+            // unconditional `deleted_at IS NULL` guard would then fail
+            // this transition on every retry, leaving an artifact whose
+            // blobs are gone, whose row lives, and whose stream carries
+            // no terminal event. `COALESCE` keeps the *earlier*
+            // timestamp: the moment the artifact left service is the
+            // audit fact, and overwriting it with the purge time would
+            // erase it. Matching on `id` alone still affects zero rows —
+            // and so still yields `NotFound` — when the row is genuinely
+            // absent.
+            let updated = sqlx::query(
+                "UPDATE artifacts SET deleted_at = COALESCE(deleted_at, $2), updated_at = $2 \
+                 WHERE id = $1",
+            )
+            .bind(artifact_id)
+            .bind(retired_at)
+            .execute(uow.conn())
+            .await
+            .map_err(|e| map_sqlx_error(&e, "purge_gc", "retire_artifact"))?;
+            if updated.rows_affected() != 1 {
+                return Err(DomainError::NotFound {
+                    entity: "Artifact",
+                    id: artifact_id.to_string(),
+                });
+            }
+
+            sqlx::query("DELETE FROM artifact_purge_worklist WHERE artifact_id = $1")
+                .bind(artifact_id)
+                .execute(uow.conn())
+                .await
+                .map_err(|e| map_sqlx_error(&e, "purge_gc", "clear_worklist"))?;
+
+            uow.commit().await?;
+            Ok(())
         })
     }
 }
@@ -359,11 +547,88 @@ impl PurgeGcPort for PgPurgeGcPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use hort_app::use_cases::purge_use_case::{PurgeUseCase, RefcountReconcileGate};
+    use hort_domain::ports::artifact_repository::ArtifactRepository;
+    use hort_domain::ports::refcount_reconcile::RefcountReconcilePort;
+    use hort_domain::ports::storage::StoragePort;
+    use hort_domain::types::ByteRange;
     use serial_test::serial;
+    use tokio::io::AsyncReadExt;
 
     const HASH_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const HASH_B: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
     const HASH_C: &str = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+
+    struct ConvergedGate;
+
+    impl RefcountReconcileGate for ConvergedGate {
+        fn is_converged(&self) -> bool {
+            true
+        }
+    }
+
+    struct FailDeleteOnceStorage {
+        inner: hort_adapters_storage::FilesystemStorage,
+        fail_once: Mutex<HashSet<ContentHash>>,
+    }
+
+    impl FailDeleteOnceStorage {
+        fn new(inner: hort_adapters_storage::FilesystemStorage, hash: ContentHash) -> Self {
+            Self {
+                inner,
+                fail_once: Mutex::new(HashSet::from([hash])),
+            }
+        }
+    }
+
+    impl StoragePort for FailDeleteOnceStorage {
+        fn put(
+            &self,
+            stream: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::storage::PutResult>> {
+            self.inner.put(stream)
+        }
+
+        fn get(
+            &self,
+            hash: &ContentHash,
+        ) -> BoxFuture<'_, DomainResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+            self.inner.get(hash)
+        }
+
+        fn get_range(
+            &self,
+            hash: &ContentHash,
+            range: ByteRange,
+        ) -> BoxFuture<'_, DomainResult<Box<dyn tokio::io::AsyncRead + Send + Unpin>>> {
+            self.inner.get_range(hash, range)
+        }
+
+        fn exists(&self, hash: &ContentHash) -> BoxFuture<'_, DomainResult<bool>> {
+            self.inner.exists(hash)
+        }
+
+        fn delete(&self, hash: &ContentHash) -> BoxFuture<'_, DomainResult<()>> {
+            let fail = self.fail_once.lock().unwrap().remove(hash);
+            if fail {
+                let hash = hash.to_string();
+                Box::pin(async move {
+                    Err(DomainError::Invariant(format!(
+                        "injected storage delete failure for {hash}"
+                    )))
+                })
+            } else {
+                self.inner.delete(hash)
+            }
+        }
+
+        fn size_of(&self, hash: &ContentHash) -> BoxFuture<'_, DomainResult<u64>> {
+            self.inner.size_of(hash)
+        }
+    }
 
     // -- pure unit -----------------------------------------------------
 
@@ -371,13 +636,6 @@ mod tests {
     fn adapter_implements_port() {
         fn _assert_port<T: PurgeGcPort>() {}
         _assert_port::<PgPurgeGcPort>();
-    }
-
-    #[tokio::test]
-    async fn pg_purge_gc_new_does_not_panic() {
-        let pool = PgPool::connect_lazy("postgres://localhost/nonexistent")
-            .expect("connect_lazy validates only the URL, not connectivity");
-        let _ = PgPurgeGcPort::new(pool);
     }
 
     #[test]
@@ -445,6 +703,98 @@ mod tests {
         let pool = crate::test_support::isolated_db_from(&url).await?;
         crate::test_support::migrate_or_panic(&pool).await;
         Some(pool)
+    }
+
+    async fn adapter(pool: &PgPool) -> PgPurgeGcPort {
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        PgPurgeGcPort::new(pool.clone(), event_store)
+    }
+
+    fn terminal_batch(
+        artifact_id: Uuid,
+        refs: &[PurgedRef],
+        retired_at: DateTime<Utc>,
+    ) -> AppendEvents {
+        AppendEvents {
+            stream_id: StreamId::artifact(artifact_id),
+            expected_version: hort_domain::ports::event_store::ExpectedVersion::Any,
+            events: refs
+                .iter()
+                .map(|purged_ref| {
+                    hort_domain::ports::event_store::EventToAppend::new(
+                        DomainEvent::ArtifactPurged(hort_domain::events::ArtifactPurged {
+                            artifact_id,
+                            content_hash: purged_ref.content_hash.clone(),
+                            refs_remaining: purged_ref.refs_remaining,
+                            purged_at: retired_at,
+                        }),
+                    )
+                })
+                .collect(),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: hort_domain::events::retention_scheduler_actor(),
+        }
+    }
+
+    #[test]
+    fn worklist_mapping_and_terminal_batch_validation_are_fail_closed() {
+        let artifact_id = Uuid::new_v4();
+        let retired_at = DateTime::from_timestamp(1_000, 0).unwrap();
+        let rows = vec![WorklistRow {
+            content_hash: HASH_A.into(),
+            refs_remaining: 0,
+            completed_at: Some(retired_at),
+        }];
+        let refs = PgPurgeGcPort::map_worklist(rows.clone()).unwrap();
+        assert!(refs[0].completed);
+        let valid = terminal_batch(artifact_id, &refs, retired_at);
+        PgPurgeGcPort::validate_terminal_batch(artifact_id, retired_at, &rows, &valid).unwrap();
+
+        let wrong_stream = terminal_batch(Uuid::new_v4(), &refs, retired_at);
+        assert!(PgPurgeGcPort::validate_terminal_batch(
+            artifact_id,
+            retired_at,
+            &rows,
+            &wrong_stream
+        )
+        .is_err());
+
+        let wrong_time = terminal_batch(
+            artifact_id,
+            &refs,
+            retired_at + chrono::Duration::seconds(1),
+        );
+        assert!(PgPurgeGcPort::validate_terminal_batch(
+            artifact_id,
+            retired_at,
+            &rows,
+            &wrong_time
+        )
+        .is_err());
+
+        let duplicate_refs = vec![refs[0].clone(), refs[0].clone()];
+        let duplicates = terminal_batch(artifact_id, &duplicate_refs, retired_at);
+        assert!(PgPurgeGcPort::validate_terminal_batch(
+            artifact_id,
+            retired_at,
+            &rows,
+            &duplicates
+        )
+        .is_err());
+
+        let missing = terminal_batch(artifact_id, &[], retired_at);
+        assert!(
+            PgPurgeGcPort::validate_terminal_batch(artifact_id, retired_at, &rows, &missing)
+                .is_err()
+        );
+
+        let invalid_count = vec![WorklistRow {
+            content_hash: HASH_A.into(),
+            refs_remaining: -1,
+            completed_at: None,
+        }];
+        assert!(PgPurgeGcPort::map_worklist(invalid_count).is_err());
     }
 
     async fn seed_repo(pool: &PgPool) -> Uuid {
@@ -612,7 +962,7 @@ mod tests {
         append_event(&pool, purged, "ArtifactExpired", 0).await;
         append_event(&pool, purged, "ArtifactPurged", 1).await;
 
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
         let pending = adapter.list_pending_purge().await.unwrap();
         let ids: Vec<Uuid> = pending.iter().map(|p| p.artifact_id).collect();
 
@@ -662,7 +1012,7 @@ mod tests {
         insert_cr(&pool, repo, art, "metadata_blob", HASH_B).await;
         append_event(&pool, art, "ArtifactExpired", 0).await;
 
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
         let mut refs = adapter.purge_artifact_refs(art).await.unwrap();
         refs.sort_by(|a, b| a.content_hash.as_ref().cmp(b.content_hash.as_ref()));
 
@@ -701,7 +1051,7 @@ mod tests {
         insert_cr(&pool, repo, art, "primary_content", HASH_A).await;
         append_event(&pool, art, "ArtifactExpired", 0).await;
 
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
         let refs = adapter.purge_artifact_refs(art).await.unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].content_hash.as_ref(), HASH_A);
@@ -734,7 +1084,7 @@ mod tests {
         insert_cr(&pool, repo, other, "oci_subject", HASH_A).await;
         append_event(&pool, purged, "ArtifactExpired", 0).await;
 
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
         let refs = adapter.purge_artifact_refs(purged).await.unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].content_hash.as_ref(), HASH_A);
@@ -774,7 +1124,7 @@ mod tests {
         insert_cr(&pool, repo, art, "metadata_blob", HASH_B).await;
         append_event(&pool, art, "ArtifactExpired", 0).await;
 
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
 
         // First invocation deletes the rows and returns both decisions.
         let first = adapter.purge_artifact_refs(art).await.unwrap();
@@ -852,7 +1202,7 @@ mod tests {
         );
         append_event(&pool, child_a, "ArtifactExpired", 0).await;
 
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
 
         // -- Phase 1: index is live → purging child_a keeps its blob ----
         let refs = adapter.purge_artifact_refs(child_a).await.unwrap();
@@ -874,16 +1224,19 @@ mod tests {
             "the index's oci_index_member edges survive the child purge"
         );
 
-        // -- Phase 2: index no longer references the child → child freed -
-        // The index's own DELETE / purge sweeps every `source = index`
-        // row (both members). With no remaining reference to HASH_A, a
-        // re-purge of child_a reports the blob GC-eligible.
+        // -- Phase 2: index no longer references the hash → freed ------
+        // A prepared artifact's refcount decision is intentionally
+        // stable in its worklist. A fresh referent for the same CAS hash
+        // observes the new state after the index edges are removed.
         sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
             .bind(index)
             .execute(&pool)
             .await
             .unwrap();
-        let refs_after = adapter.purge_artifact_refs(child_a).await.unwrap();
+        let later_child =
+            seed_artifact(&pool, repo, "child-a-later", HASH_A, Some("released")).await;
+        insert_cr(&pool, repo, later_child, "primary_content", HASH_A).await;
+        let refs_after = adapter.purge_artifact_refs(later_child).await.unwrap();
         assert_eq!(refs_after.len(), 1);
         assert_eq!(refs_after[0].content_hash.as_ref(), HASH_A);
         assert_eq!(
@@ -942,7 +1295,7 @@ mod tests {
         append_event(&pool, config, "ArtifactExpired", 0).await;
         append_event(&pool, layer, "ArtifactExpired", 0).await;
 
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
 
         // -- Phase 1: manifest is live → purging config/layer keeps them -
         let config_refs = adapter.purge_artifact_refs(config).await.unwrap();
@@ -972,23 +1325,28 @@ mod tests {
             "the manifest's oci_config/oci_layer edges survive the blob purge"
         );
 
-        // -- Phase 2: manifest DELETE (delete_by_source) → blobs freed ---
-        // Manifest DELETE sweeps every `source = manifest` row (both
-        // kinds), same as an index DELETE. With no remaining reference,
-        // a re-purge of the config/layer blobs reports them GC-eligible.
+        // -- Phase 2: manifest edges removed → fresh referents are free -
+        // Prepared decisions remain stable in their worklists, so use
+        // fresh artifact rows for the same hashes to observe the later
+        // refcount after both membership edges are gone.
         sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
             .bind(manifest)
             .execute(&pool)
             .await
             .unwrap();
-        let config_refs_after = adapter.purge_artifact_refs(config).await.unwrap();
+        let later_config =
+            seed_artifact(&pool, repo, "config-later", HASH_A, Some("released")).await;
+        let later_layer = seed_artifact(&pool, repo, "layer-later", HASH_C, Some("released")).await;
+        insert_cr(&pool, repo, later_config, "primary_content", HASH_A).await;
+        insert_cr(&pool, repo, later_layer, "primary_content", HASH_C).await;
+        let config_refs_after = adapter.purge_artifact_refs(later_config).await.unwrap();
         assert_eq!(config_refs_after.len(), 1);
         assert_eq!(config_refs_after[0].content_hash.as_ref(), HASH_A);
         assert_eq!(
             config_refs_after[0].refs_remaining, 0,
             "once the manifest is deleted, its config blob is GC-eligible"
         );
-        let layer_refs_after = adapter.purge_artifact_refs(layer).await.unwrap();
+        let layer_refs_after = adapter.purge_artifact_refs(later_layer).await.unwrap();
         assert_eq!(layer_refs_after.len(), 1);
         assert_eq!(layer_refs_after[0].content_hash.as_ref(), HASH_C);
         assert_eq!(
@@ -1025,7 +1383,7 @@ mod tests {
             return;
         };
         let repo = seed_repo(&pool).await;
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
 
         // (kind, target_hash, manifest_1_own_hash, manifest_2_own_hash) —
         // one independent triple per oci_* kind.
@@ -1138,6 +1496,567 @@ mod tests {
         cleanup(&pool, repo).await;
     }
 
+    /// The worklist, not the deleted edge set, drives every retry. An
+    /// OCI child target therefore survives preparation and remains
+    /// outstanding after another hash has completed.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn retry_preserves_outstanding_oci_child_hash() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let artifact = seed_artifact(&pool, repo, "oci-retry", HASH_A, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, artifact, "primary_content", HASH_A).await;
+        insert_cr(&pool, repo, artifact, "oci_layer", HASH_C).await;
+        append_event(&pool, artifact, "ArtifactExpired", 0).await;
+
+        let adapter = adapter(&pool).await;
+        let prepared = adapter.purge_artifact_refs(artifact).await.unwrap();
+        assert_eq!(prepared.len(), 2);
+        assert!(cr_rows_for(&pool, artifact).await.is_empty());
+
+        adapter
+            .mark_purge_ref_complete(artifact, &HASH_A.parse().unwrap(), Utc::now())
+            .await
+            .unwrap();
+        let retry = adapter.purge_artifact_refs(artifact).await.unwrap();
+        let primary = retry
+            .iter()
+            .find(|item| item.content_hash.as_ref() == HASH_A)
+            .unwrap();
+        let child = retry
+            .iter()
+            .find(|item| item.content_hash.as_ref() == HASH_C)
+            .unwrap();
+        assert!(primary.completed);
+        assert!(!child.completed);
+        assert_eq!(child.refs_remaining, 0);
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// A failed OCI-child delete withholds the whole artifact-level
+    /// transition. The next sweep reads the child from the persisted
+    /// worklist, deletes it, and commits both terminal events together.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn oci_child_delete_failure_retries_and_completes_entire_artifact() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let filesystem = hort_adapters_storage::FilesystemStorage::new(temp.path().to_path_buf());
+        let primary_put = filesystem
+            .put(Box::new(std::io::Cursor::new(b"foo".to_vec())))
+            .await
+            .unwrap();
+        let child_put = filesystem
+            .put(Box::new(std::io::Cursor::new(Vec::new())))
+            .await
+            .unwrap();
+        assert_eq!(primary_put.hash.as_ref(), HASH_C);
+        assert_eq!(child_put.hash.as_ref(), HASH_A);
+
+        let repo = seed_repo(&pool).await;
+        let artifact = seed_artifact(&pool, repo, "oci-failure", HASH_C, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, artifact, "primary_content", HASH_C).await;
+        insert_cr(&pool, repo, artifact, "oci_layer", HASH_A).await;
+        append_event(&pool, artifact, "ArtifactExpired", 0).await;
+
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
+        let gc = Arc::new(PgPurgeGcPort::new(pool.clone(), event_store));
+        let storage = Arc::new(FailDeleteOnceStorage::new(
+            filesystem,
+            child_put.hash.clone(),
+        ));
+        let use_case = PurgeUseCase::new(gc, storage.clone(), Arc::new(ConvergedGate));
+
+        let first = use_case.process_expired(Utc::now()).await.unwrap();
+        assert_eq!(first.errors, 1);
+        assert_eq!(first.purged_events, 0);
+        let deleted_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(artifact)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(deleted_at.is_none());
+        let first_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(StreamId::artifact(artifact).to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first_events, 0);
+
+        let retry = use_case.process_expired(Utc::now()).await.unwrap();
+        assert_eq!(retry.errors, 0);
+        assert_eq!(retry.purged_events, 2);
+        assert!(!storage.exists(&primary_put.hash).await.unwrap());
+        assert!(!storage.exists(&child_put.hash).await.unwrap());
+        let deleted_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(artifact)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(deleted_at.is_some());
+        let terminal_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(StreamId::artifact(artifact).to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(terminal_events, 2);
+
+        cleanup(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn incomplete_or_unknown_work_cannot_reach_terminal_transition() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let artifact = seed_artifact(&pool, repo, "incomplete", HASH_A, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, artifact, "primary_content", HASH_A).await;
+        append_event(&pool, artifact, "ArtifactExpired", 0).await;
+
+        let adapter = adapter(&pool).await;
+        let refs = adapter.purge_artifact_refs(artifact).await.unwrap();
+        let retired_at = Utc::now();
+        let error = adapter
+            .complete_artifact_purge(
+                artifact,
+                retired_at,
+                terminal_batch(artifact, &refs, retired_at),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("incomplete storage work"));
+        let unknown: ContentHash = HASH_C.parse().unwrap();
+        assert!(adapter
+            .mark_purge_ref_complete(artifact, &unknown, retired_at)
+            .await
+            .is_err());
+
+        let deleted_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(artifact)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(deleted_at.is_none());
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Terminal events and projection retirement are one commit. The
+    /// injected interruption happens after the append was staged and
+    /// proves that dropping the transaction exposes neither half.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn interrupted_terminal_transition_exposes_neither_event_nor_retirement() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let artifact = seed_artifact(&pool, repo, "atomic", HASH_A, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, artifact, "primary_content", HASH_A).await;
+        append_event(&pool, artifact, "ArtifactExpired", 0).await;
+
+        let adapter = adapter(&pool).await;
+        let refs = adapter.purge_artifact_refs(artifact).await.unwrap();
+        adapter
+            .mark_purge_ref_complete(artifact, &refs[0].content_hash, Utc::now())
+            .await
+            .unwrap();
+        let retired_at = Utc::now();
+        adapter.interrupt_next_terminal_transition();
+        let error = adapter
+            .complete_artifact_purge(
+                artifact,
+                retired_at,
+                terminal_batch(artifact, &refs, retired_at),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected interruption"));
+
+        let deleted_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(artifact)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let purged_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(StreamId::artifact(artifact).to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(deleted_at.is_none());
+        assert_eq!(purged_events, 0);
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Even when another referent keeps the bytes, the expired artifact
+    /// retires, its terminal event keeps retention attribution, and a
+    /// reconcile pass does not recreate the removed source edge.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn shared_blob_purge_retires_projection_and_reconcile_leaves_it_retired() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let expired = seed_artifact(&pool, repo, "expired-shared", HASH_A, Some("released")).await;
+        let live = seed_artifact(&pool, repo, "live-shared", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id IN ($1, $2)")
+            .bind(expired)
+            .bind(live)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, expired, "primary_content", HASH_A).await;
+        insert_cr(&pool, repo, live, "oci_subject", HASH_A).await;
+        append_event(&pool, expired, "ArtifactExpired", 0).await;
+
+        let adapter = adapter(&pool).await;
+        let refs = adapter.purge_artifact_refs(expired).await.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].refs_remaining, 1);
+        adapter
+            .mark_purge_ref_complete(expired, &refs[0].content_hash, Utc::now())
+            .await
+            .unwrap();
+        let retired_at = Utc::now();
+        adapter
+            .complete_artifact_purge(
+                expired,
+                retired_at,
+                terminal_batch(expired, &refs, retired_at),
+            )
+            .await
+            .unwrap();
+
+        let artifact_repo = crate::artifact_repo::PgArtifactRepository::new(
+            pool.clone(),
+            adapter.event_store.clone(),
+        );
+        assert!(matches!(
+            artifact_repo.find_by_id(expired).await,
+            Err(DomainError::NotFound { .. })
+        ));
+        let historical: crate::mappers::ArtifactRow = sqlx::query_as(
+            r#"
+            SELECT id, repository_id, name, name_as_published, version, path,
+                   size_bytes, checksum_sha256, checksum_sha1, checksum_md5,
+                   content_type, storage_key, quarantine_status,
+                   quarantine_window_start, upstream_published_at, uploaded_by,
+                   created_at, updated_at, deleted_at
+              FROM artifacts WHERE id = $1
+            "#,
+        )
+        .bind(expired)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let historical = hort_domain::entities::artifact::Artifact::try_from(historical).unwrap();
+        assert!(!historical.is_downloadable());
+
+        let actor_type: String = sqlx::query_scalar(
+            "SELECT actor_type FROM events \
+             WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(StreamId::artifact(expired).to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(actor_type, "retention_scheduler");
+        let deleted_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE stream_id = $1 AND event_type = 'ArtifactDeleted'",
+        )
+        .bind(StreamId::artifact(expired).to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(deleted_events, 0);
+
+        let drift = crate::refcount_reconcile::PgRefcountReconcile::new(pool.clone())
+            .scan_repo_drift(repo)
+            .await
+            .unwrap();
+        assert!(drift.repairs.iter().all(|repair| match repair {
+            hort_domain::ports::refcount_reconcile::RefcountRepair::CreatePrimaryContent {
+                source_artifact_id,
+                ..
+            }
+            | hort_domain::ports::refcount_reconcile::RefcountRepair::RepairPrimaryContent {
+                source_artifact_id,
+                ..
+            }
+            | hort_domain::ports::refcount_reconcile::RefcountRepair::UpsertMetadataBlob {
+                source_artifact_id,
+                ..
+            }
+            | hort_domain::ports::refcount_reconcile::RefcountRepair::DeleteRejectedSourceRows {
+                source_artifact_id,
+                ..
+            } => *source_artifact_id != expired,
+        }));
+        assert_eq!(
+            cr_rows_for(&pool, live).await,
+            vec![("oci_subject".into(), HASH_A.into())]
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// A user-facing delete can land between the expiry decision and the
+    /// purge sweep — the pending-purge set filters on the two events and
+    /// the quarantine status only, so the artifact is still enumerated
+    /// and its storage work still runs. The terminal transition must
+    /// then succeed over the already-retired row: a guard demanding
+    /// `deleted_at IS NULL` would fail identically on every retry,
+    /// stranding an artifact whose blobs are gone, whose row lives, and
+    /// whose stream carries no terminal event. The delete's timestamp
+    /// survives the purge — it records when the artifact left service.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn purge_completes_over_a_row_already_retired_by_the_delete_path() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "hand-deleted", HASH_A, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, art, "primary_content", HASH_A).await;
+        append_event(&pool, art, "ArtifactExpired", 0).await;
+
+        let adapter = adapter(&pool).await;
+
+        // The operator deletes the artifact through the normal verb,
+        // after it expired and before the sweep runs.
+        let artifact_repo = crate::artifact_repo::PgArtifactRepository::new(
+            pool.clone(),
+            adapter.event_store.clone(),
+        );
+        artifact_repo
+            .delete(
+                art,
+                hort_domain::events::Actor::Api(hort_domain::events::ApiActor {
+                    user_id: Uuid::new_v4(),
+                }),
+            )
+            .await
+            .unwrap();
+        let user_deleted_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(art)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        // Still pending: the delete verb retires the projection, it does
+        // not remove the bytes.
+        assert!(adapter
+            .list_pending_purge()
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.artifact_id == art));
+
+        let refs = adapter.purge_artifact_refs(art).await.unwrap();
+        assert_eq!(refs.len(), 1);
+        adapter
+            .mark_purge_ref_complete(art, &refs[0].content_hash, Utc::now())
+            .await
+            .unwrap();
+        let retired_at = user_deleted_at + chrono::Duration::seconds(60);
+        adapter
+            .complete_artifact_purge(art, retired_at, terminal_batch(art, &refs, retired_at))
+            .await
+            .unwrap();
+
+        let purged_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(StreamId::artifact(art).to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(purged_events, 1, "the terminal event is appended");
+        let outstanding: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_purge_worklist WHERE artifact_id = $1",
+        )
+        .bind(art)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outstanding, 0, "the worklist is cleared");
+        assert!(
+            !adapter
+                .list_pending_purge()
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.artifact_id == art),
+            "the artifact leaves the pending set instead of stalling forever"
+        );
+
+        let deleted_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(art)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            deleted_at, user_deleted_at,
+            "the earlier retirement timestamp is the audit fact and is kept"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Retiring the old row frees the live path key. Re-pushing the
+    /// same bytes performs a fresh CAS write, creates a new row, and
+    /// makes those bytes readable again.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn purge_then_repush_same_path_writes_and_fetches_bytes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let storage = hort_adapters_storage::FilesystemStorage::new(temp.path().to_path_buf());
+        let bytes = b"hello world".to_vec();
+        let first_put = storage
+            .put(Box::new(std::io::Cursor::new(bytes.clone())))
+            .await
+            .unwrap();
+        assert_eq!(first_put.hash.as_ref(), HASH_B);
+
+        let repo = seed_repo(&pool).await;
+        let old = seed_artifact(&pool, repo, "repush", HASH_B, Some("released")).await;
+        let path: String = sqlx::query_scalar("SELECT path FROM artifacts WHERE id = $1")
+            .bind(old)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, old, "primary_content", HASH_B).await;
+        append_event(&pool, old, "ArtifactExpired", 0).await;
+
+        let adapter = adapter(&pool).await;
+        let refs = adapter.purge_artifact_refs(old).await.unwrap();
+        storage.delete(&refs[0].content_hash).await.unwrap();
+        adapter
+            .mark_purge_ref_complete(old, &refs[0].content_hash, Utc::now())
+            .await
+            .unwrap();
+        let retired_at = Utc::now();
+        adapter
+            .complete_artifact_purge(old, retired_at, terminal_batch(old, &refs, retired_at))
+            .await
+            .unwrap();
+        assert!(!storage.exists(&refs[0].content_hash).await.unwrap());
+        let artifact_repo = crate::artifact_repo::PgArtifactRepository::new(
+            pool.clone(),
+            adapter.event_store.clone(),
+        );
+        assert!(artifact_repo
+            .find_by_path(repo, &path)
+            .await
+            .unwrap()
+            .is_none());
+
+        let second_put = storage
+            .put(Box::new(std::io::Cursor::new(bytes.clone())))
+            .await
+            .unwrap();
+        assert_eq!(second_put.hash, refs[0].content_hash);
+        let fresh = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, name_as_published, version, path,
+                size_bytes, checksum_sha256, content_type, storage_key,
+                quarantine_status
+            ) VALUES (
+                $1, $2, 'repush', 'repush', '1.0.0', $3,
+                $4, $5, 'application/octet-stream', $3, 'released'
+            )
+            "#,
+        )
+        .bind(fresh)
+        .bind(repo)
+        .bind(&path)
+        .bind(i64::try_from(bytes.len()).unwrap())
+        .bind(second_put.hash.as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let live = artifact_repo
+            .find_by_path(repo, &path)
+            .await
+            .unwrap()
+            .expect("re-pushed path is live");
+        assert_eq!(live.id, fresh);
+        assert_ne!(fresh, old);
+        let rows_at_path: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE repository_id = $1 AND path = $2",
+        )
+        .bind(repo)
+        .bind(&path)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows_at_path, 2);
+        let mut reader = storage.get(&second_put.hash).await.unwrap();
+        let mut fetched = Vec::new();
+        reader.read_to_end(&mut fetched).await.unwrap();
+        assert_eq!(fetched, bytes);
+
+        cleanup(&pool, repo).await;
+    }
+
     /// A hard-deleted artifact row (FK cascade already swept its refs)
     /// is a clean no-op — nothing left to decrement.
     #[tokio::test]
@@ -1146,7 +2065,7 @@ mod tests {
         let Some(pool) = maybe_pool().await else {
             return;
         };
-        let adapter = PgPurgeGcPort::new(pool.clone());
+        let adapter = adapter(&pool).await;
         let refs = adapter.purge_artifact_refs(Uuid::new_v4()).await.unwrap();
         assert!(refs.is_empty(), "no artifact row → nothing to purge");
     }

@@ -1328,13 +1328,9 @@ pub async fn build_app_context(
         );
 
         // -- RetentionPurgeHandler (reconcile gate injected) ----------
-        let purge_gc: Arc<dyn PurgeGcPort> = Arc::new(PgPurgeGcPort::new(pool.clone()));
-        let purge_uc = Arc::new(PurgeUseCase::new(
-            purge_gc,
-            storage.clone(),
-            event_publisher.clone(),
-            reconcile_gate,
-        ));
+        let purge_gc: Arc<dyn PurgeGcPort> =
+            Arc::new(PgPurgeGcPort::new(pool.clone(), pg_event_store.clone()));
+        let purge_uc = Arc::new(PurgeUseCase::new(purge_gc, storage.clone(), reconcile_gate));
         dispatcher.register(Arc::new(RetentionPurgeHandler::new(purge_uc)), 1);
 
         // -- EventStoreArchiveHandler (hort_retention_role pool) ---------

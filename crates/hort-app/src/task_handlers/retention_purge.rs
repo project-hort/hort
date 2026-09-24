@@ -99,12 +99,13 @@ mod tests {
     use chrono::{DateTime, Utc};
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
+    use hort_domain::ports::event_store::AppendEvents;
     use hort_domain::ports::purge_gc::{PendingPurge, PurgeGcPort, PurgedRef};
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use uuid::Uuid;
 
     use crate::use_cases::purge_use_case::RefcountReconcileGate;
-    use crate::use_cases::test_support::{MockEventStore, MockStoragePort};
+    use crate::use_cases::test_support::MockStoragePort;
 
     struct Gate(bool);
     impl RefcountReconcileGate for Gate {
@@ -124,6 +125,22 @@ mod tests {
         fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn mark_purge_ref_complete(
+            &self,
+            _artifact_id: Uuid,
+            _content_hash: &hort_domain::types::ContentHash,
+            _completed_at: DateTime<Utc>,
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn complete_artifact_purge(
+            &self,
+            _artifact_id: Uuid,
+            _retired_at: DateTime<Utc>,
+            _events: AppendEvents,
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     fn purge_uc(gate: bool) -> Arc<PurgeUseCase> {
@@ -132,7 +149,6 @@ mod tests {
                 pending: Mutex::new(Vec::new()),
             }),
             Arc::new(MockStoragePort::new()),
-            crate::event_store_publisher::wrap_for_test(Arc::new(MockEventStore::new())),
             Arc::new(Gate(gate)),
         ))
     }
@@ -210,11 +226,26 @@ mod tests {
             fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
                 Box::pin(async { Ok(Vec::new()) })
             }
+            fn mark_purge_ref_complete(
+                &self,
+                _artifact_id: Uuid,
+                _content_hash: &hort_domain::types::ContentHash,
+                _completed_at: DateTime<Utc>,
+            ) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn complete_artifact_purge(
+                &self,
+                _artifact_id: Uuid,
+                _retired_at: DateTime<Utc>,
+                _events: AppendEvents,
+            ) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
         }
         let uc = Arc::new(PurgeUseCase::new(
             Arc::new(FailGc),
             Arc::new(MockStoragePort::new()),
-            crate::event_store_publisher::wrap_for_test(Arc::new(MockEventStore::new())),
             Arc::new(Gate(true)),
         ));
         let h = RetentionPurgeHandler::new(uc);

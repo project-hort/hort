@@ -2,7 +2,10 @@
 //! (`PurgeUseCase::process_expired`) uses: read
 //! the pending-purge work set and, in one committed idempotent
 //! transaction, decrement the `content_references` projection and
-//! report the post-delete cross-`kind` remaining count per CAS hash.
+//! persist and report the post-delete cross-`kind` remaining count per
+//! CAS hash. Storage completion is checkpointed per hash; only after
+//! every checkpoint exists may the adapter atomically append all
+//! terminal events and retire the artifact projection.
 //!
 //! # Why this exists
 //!
@@ -13,31 +16,29 @@
 //! `ArtifactExpired` with no following
 //! [`ArtifactPurged`](crate::events::ArtifactPurged) it runs the
 //! decrement-and-GC algorithm (decrement `content_references`, delete the
-//! CAS blob iff the cross-`kind` refcount hit `0`, append `ArtifactPurged`).
+//! CAS blob iff the cross-`kind` refcount hit `0`, append every
+//! `ArtifactPurged`, and retire the projection).
 //! The `hort-app` `PurgeUseCase` is pure orchestration over this port plus
 //! the existing [`StoragePort`](super::storage::StoragePort) and the event
 //! store; the SQL (lock + `DELETE … RETURNING` + cross-`kind` count) lives
 //! in the Postgres adapter.
 //!
-//! # Why a *new, separate* additive port (not extra methods on
+//! # Why a separate port (not methods on
 //! [`ContentReferenceIndex`](super::content_reference_index::ContentReferenceIndex))
 //!
 //! Identical reasoning to the
 //! [`RefcountReconcilePort`](super::refcount_reconcile::RefcountReconcilePort)
-//! split. The scope contract forbids changing any existing port/trait
-//! signature; `ContentReferenceIndex` already ships with `insert` /
-//! `find_by_target` / `delete_by_source` plus several impls and mocks.
-//! Adding the transactional GC-walk surface to *that* trait would
-//! mutate an existing port signature. So the GC-walk surface is a
-//! **distinct, purely-additive** trait — zero existing impls touched.
-//! It reuses the shipped [`ContentHash`](crate::types::ContentHash)
-//! type so nothing is redefined.
+//! split. `ContentReferenceIndex` owns ordinary reference CRUD; the
+//! purge worklist and atomic terminal transition are a different
+//! transactional responsibility. Keeping them on this dedicated port
+//! prevents purge-specific state from leaking into general reference
+//! operations.
 //!
 //! # Why the port returns refcount *decisions* (data), not a "purge" verb
 //!
-//! Keeping the transactional decrement and the storage delete /
-//! `ArtifactPurged` append as separate concerns that exchange typed
-//! decision data lets the `hort-app` `PurgeUseCase` stay pure
+//! Keeping the transactional decrement, storage delete, and terminal
+//! transition as separate concerns that exchange typed decision data
+//! lets the `hort-app` `PurgeUseCase` stay pure
 //! orchestration (100% mock-testable — the release-gate re-assertion, the
 //! two-stage idempotency split, the `info!`/`warn!`/`error!` policy, the
 //! summary) while the SQL (row lock, set-based `DELETE … RETURNING`,
@@ -47,8 +48,11 @@
 
 use uuid::Uuid;
 
+use chrono::{DateTime, Utc};
+
 use crate::entities::artifact::QuarantineStatus;
 use crate::error::DomainResult;
+use crate::ports::event_store::AppendEvents;
 use crate::types::ContentHash;
 
 use super::BoxFuture;
@@ -73,23 +77,24 @@ pub struct PendingPurge {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PurgedRef {
     /// The CAS content hash whose `content_references` row(s) for this
-    /// artifact were removed. Recoverable from
-    /// `artifacts.checksum_sha256` / `artifact_metadata.metadata_blob`
-    /// even on an idempotent retry where the projection rows were
-    /// already gone.
+    /// artifact were removed. The purge worklist preserves it after
+    /// those source edges are gone.
     pub content_hash: ContentHash,
     /// Cross-`kind` `content_references` count for `content_hash`
     /// **after** this artifact's references were removed.
     /// `0` ⇒ the blob is GC-eligible and must be deleted; `> 0` ⇒ a
     /// live reference keeps the blob and only this ref is gone.
     pub refs_remaining: u32,
+    /// Whether the corresponding storage decision has completed. A
+    /// retry skips completed hashes but retains them so the final
+    /// transaction can append one terminal event per hash.
+    pub completed: bool,
 }
 
-/// Read + transactional-decrement outbound port for the storage-GC walk.
-/// Purely additive — introduces no change to any existing port. The
-/// Postgres adapter implements the SQL (lock + `DELETE … RETURNING` +
-/// cross-`kind` count) in one committed, idempotent transaction; unit
-/// tests use an in-memory mock.
+/// Read + transactional-transition outbound port for the storage-GC
+/// walk. The Postgres adapter owns the worklist, reference deletion,
+/// completion checkpoints, and atomic event/projection transition;
+/// unit tests use an in-memory mock.
 pub trait PurgeGcPort: Send + Sync {
     /// Every artifact with an `ArtifactExpired` event and **no**
     /// following `ArtifactPurged` — the pending-purge work set.
@@ -98,23 +103,44 @@ pub trait PurgeGcPort: Send + Sync {
     /// (defence-in-depth).
     fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>>;
 
-    /// Steps 1–3 in **one committed, idempotent transaction**:
-    /// lock the artifact row `FOR UPDATE`, `DELETE` the
-    /// `primary_content` + `metadata_blob` `content_references` rows,
-    /// and return one [`PurgedRef`] per distinct hash with the
-    /// post-delete cross-`kind` remaining count.
+    /// Prepare the durable worklist in **one committed, idempotent
+    /// transaction**: lock the artifact row, delete every source edge,
+    /// compute each distinct target's cross-kind remaining count, and
+    /// persist those decisions before returning them.
     ///
-    /// **Idempotent**: if a prior partial run already deleted the
-    /// rows, the adapter recovers the hash(es) from the authoritative
-    /// `artifacts.checksum_sha256` / `artifact_metadata.metadata_blob`
-    /// columns and recomputes the (now stable) remaining count, so a
-    /// retry still yields the decisions needed to finish the purge.
-    /// The storage delete + `ArtifactPurged` append happen **after**
-    /// this returns (different ports); on their failure the next sweep
-    /// re-invokes this and the recoverable-hash property keeps the
-    /// retry correct (two-stage idempotency).
+    /// **Idempotent**: once present, the worklist is authoritative and
+    /// returned unchanged on retry. This preserves OCI membership
+    /// targets that no artifact column can reconstruct after deletion.
     fn purge_artifact_refs(&self, artifact_id: Uuid)
         -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>>;
+
+    /// Checkpoint one hash after its storage decision succeeds. The
+    /// operation is idempotent so a delete-success/checkpoint-failure
+    /// crash safely retries a success-on-missing delete.
+    fn mark_purge_ref_complete(
+        &self,
+        artifact_id: Uuid,
+        content_hash: &ContentHash,
+        completed_at: DateTime<Utc>,
+    ) -> BoxFuture<'_, DomainResult<()>>;
+
+    /// Append every per-hash `ArtifactPurged` event and set
+    /// `artifacts.deleted_at` in one transaction. The adapter refuses
+    /// the transition while any worklist row is incomplete. `events`
+    /// is assembled by the application layer so attribution and event
+    /// vocabulary remain orchestration policy, not adapter policy.
+    ///
+    /// The retirement is idempotent in the *state*: the transition
+    /// succeeds whenever the row ends up retired — including when the
+    /// user-facing delete path retired it first, which keeps its
+    /// earlier timestamp — and reports `NotFound` only when the row is
+    /// genuinely absent.
+    fn complete_artifact_purge(
+        &self,
+        artifact_id: Uuid,
+        retired_at: DateTime<Utc>,
+        events: AppendEvents,
+    ) -> BoxFuture<'_, DomainResult<()>>;
 }
 
 #[cfg(test)]
@@ -147,6 +173,22 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
+        fn mark_purge_ref_complete(
+            &self,
+            _artifact_id: Uuid,
+            _content_hash: &ContentHash,
+            _completed_at: DateTime<Utc>,
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn complete_artifact_purge(
+            &self,
+            _artifact_id: Uuid,
+            _retired_at: DateTime<Utc>,
+            _events: AppendEvents,
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     #[tokio::test]
@@ -154,6 +196,23 @@ mod tests {
         let p = EmptyPort;
         assert!(p.list_pending_purge().await.unwrap().is_empty());
         assert!(p.purge_artifact_refs(Uuid::nil()).await.unwrap().is_empty());
+        p.mark_purge_ref_complete(Uuid::nil(), &hash(HASH_A), Utc::now())
+            .await
+            .unwrap();
+        p.complete_artifact_purge(
+            Uuid::nil(),
+            Utc::now(),
+            AppendEvents {
+                stream_id: crate::events::StreamId::artifact(Uuid::nil()),
+                expected_version: crate::ports::event_store::ExpectedVersion::Any,
+                events: Vec::new(),
+                correlation_id: Uuid::nil(),
+                causation_id: None,
+                actor: crate::events::system_actor(),
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// `DomainError` round-trips through every return signature — the
@@ -173,6 +232,22 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
                 Box::pin(async { Err(DomainError::Invariant("purge tx failed".into())) })
             }
+            fn mark_purge_ref_complete(
+                &self,
+                _artifact_id: Uuid,
+                _content_hash: &ContentHash,
+                _completed_at: DateTime<Utc>,
+            ) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Err(DomainError::Invariant("checkpoint failed".into())) })
+            }
+            fn complete_artifact_purge(
+                &self,
+                _artifact_id: Uuid,
+                _retired_at: DateTime<Utc>,
+                _events: AppendEvents,
+            ) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Err(DomainError::Invariant("completion failed".into())) })
+            }
         }
         let p = ErrPort;
         assert!(matches!(
@@ -181,6 +256,29 @@ mod tests {
         ));
         assert!(matches!(
             p.purge_artifact_refs(Uuid::nil()).await.unwrap_err(),
+            DomainError::Invariant(_)
+        ));
+        assert!(matches!(
+            p.mark_purge_ref_complete(Uuid::nil(), &hash(HASH_A), Utc::now())
+                .await
+                .unwrap_err(),
+            DomainError::Invariant(_)
+        ));
+        assert!(matches!(
+            p.complete_artifact_purge(
+                Uuid::nil(),
+                Utc::now(),
+                AppendEvents {
+                    stream_id: crate::events::StreamId::artifact(Uuid::nil()),
+                    expected_version: crate::ports::event_store::ExpectedVersion::Any,
+                    events: Vec::new(),
+                    correlation_id: Uuid::nil(),
+                    causation_id: None,
+                    actor: crate::events::system_actor(),
+                },
+            )
+            .await
+            .unwrap_err(),
             DomainError::Invariant(_)
         ));
     }
@@ -202,9 +300,11 @@ mod tests {
         let pr = PurgedRef {
             content_hash: hash(HASH_A),
             refs_remaining: 0,
+            completed: false,
         };
         assert_eq!(pr.clone(), pr);
         assert_eq!(pr.content_hash.as_ref(), HASH_A);
         assert_eq!(pr.refs_remaining, 0);
+        assert!(!pr.completed);
     }
 }

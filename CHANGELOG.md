@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A completed purge left the artifact broken instead of reclaiming space**
+  (#286). The purge deleted an artifact's content references, deleted the blob
+  once nothing else referenced it, and recorded `ArtifactPurged` — but never
+  retired the row. With the blob gone the artifact kept answering `HEAD` with
+  200 from a row whose bytes no longer existed, `GET` failed on the storage
+  read, and re-pushing the same content could not heal it: the ingest dedup
+  keys on path and checksum and returns before writing. Purge now retires the
+  projection in the same transaction that writes the terminal events, whether
+  or not the blob survived for another referent, and the refcount reconcile no
+  longer recreates references for retired rows. The retirement is idempotent in
+  the state rather than in the writer, so an artifact a person deleted between
+  its expiry and the purge still completes and keeps its original deletion
+  timestamp. Completion is now per artifact rather than per hash — a failure on
+  one of several hashes no longer records the artifact as purged while part of
+  its content survives — which needs durable state, so a new table records each
+  target and its post-delete refcount in the same transaction that removes the
+  edges. Without it a retry could not rediscover an OCI manifest's child
+  targets at all.
+
 - **Retention could never have enumerated a single artifact** (#284). Three
   faults in one query, all of which had to fall before any retention policy
   could do anything at all. The candidate reader selected
