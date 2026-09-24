@@ -26,17 +26,20 @@ impl ApplyConfigUseCase {
     /// runtime retention evaluator deliberately does NOT block; this
     /// is the single home of that warning.
     ///
-    /// No-op (logged) when the retention apply slot is unwired
-    /// (`with_retention` not called) — a `RetentionPolicy` YAML present
-    /// with the slot unwired is operator-visible, never a silent drop.
+    /// **Scope resolution.** The envelope's `scope` carries repository
+    /// `metadata.name`s; the domain scope carries ids. Resolution runs
+    /// here, exactly once, through the same `repo_id_by_name` map the
+    /// `ScanPolicy` scope resolves through — built from `DesiredState`
+    /// after the repository rows land, so a repository declared in the
+    /// *same* apply is resolvable. Never at evaluation time.
     ///
-    /// Open item — retention-apply slot unwired:
-    /// `with_retention()` stays builder-optional until the
-    /// consumer ships. Sweep this slot's `Option` shape when
-    /// artifact retention goes live.
+    /// No-op (logged at `warn`) when the composition supplied `None`
+    /// for the retention slot — a `RetentionPolicy` YAML present with
+    /// the slot unwired is operator-visible, never a silent drop.
     pub(super) async fn apply_retention_policies(
         &self,
         desired: &DesiredState,
+        repo_id_by_name: &HashMap<String, Uuid>,
         report: &mut ApplyReport,
     ) -> AppResult<()> {
         let Some(retention) = self.retention.as_ref() else {
@@ -44,9 +47,9 @@ impl ApplyConfigUseCase {
                 tracing::warn!(
                     count = desired.retention_policies.len(),
                     "RetentionPolicy envelopes present but the retention apply \
-                     slot is unwired (ApplyConfigUseCase::with_retention not \
-                     called) — skipping; these policies will NOT be applied \
-                     until the composition root wires retention"
+                     slot is unwired (ApplyConfigUseCase was constructed with \
+                     retention: None) — skipping; these policies will NOT be \
+                     applied until the composition root wires retention"
                 );
             }
             return Ok(());
@@ -75,12 +78,19 @@ impl ApplyConfigUseCase {
                     "RetentionPolicy '{name}': predicate resolve: {e}"
                 )))
             })?;
-            let scope =
-                hort_config::retention_policy::scope_from_value(&env.spec.scope).map_err(|e| {
+            let scope_spec = hort_config::retention_policy::scope_from_value(&env.spec.scope)
+                .map_err(|e| {
                     AppError::Domain(DomainError::Validation(format!(
                         "RetentionPolicy '{name}': scope resolve: {e}"
                     )))
                 })?;
+            // Names → ids, once, here. `repo_id_by_name` is populated
+            // from DesiredState after the repository rows are written,
+            // so a policy may scope a repository declared in the same
+            // apply; an undeclared name was already rejected by the
+            // cross-spec validator, which is why the resolver panics
+            // rather than degrading.
+            let scope = resolve_retention_scope(&scope_spec, repo_id_by_name);
 
             // A security-driven predicate must exclude
             // direct uploads, or the operator is told (advisory, NOT
@@ -210,8 +220,10 @@ mod tests {
         use tracing_subscriber::Registry;
         use uuid::Uuid;
 
-        use crate::use_cases::apply_config_use_case::tests::{build_harness, env_oidc};
-        use crate::use_cases::apply_config_use_case::{ApplyConfigUseCase, RetentionApply};
+        use crate::use_cases::apply_config_use_case::tests::{build_harness, env_oidc, repo_env};
+        use crate::use_cases::apply_config_use_case::{
+            resolve_retention_scope, ApplyConfigUseCase, RetentionApply,
+        };
         use crate::use_cases::retention_policy_use_case::RetentionPolicyUseCase;
 
         // -- tracing capture (the established repository_access pattern) --
@@ -523,12 +535,32 @@ mod tests {
             );
         }
 
-        /// Unwired retention slot: a `RetentionPolicy` envelope present
-        /// but `with_retention` not called → logged no-op, NOT a silent
-        /// drop and NOT an apply failure.
-        #[tokio::test]
-        async fn unwired_slot_is_logged_noop_not_failure() {
-            // build_harness() does NOT call with_retention.
+        /// Unwired retention slot (the composition passed `retention:
+        /// None`): a `RetentionPolicy` envelope present → **warned**
+        /// no-op, NOT a silent drop and NOT an apply failure.
+        ///
+        /// This is the loudness half of the required-argument trade-off.
+        /// `None` stays expressible, so the warning is the only thing
+        /// standing between an operator-authored policy and silence —
+        /// pin it at `warn` level, naming the envelope count and telling
+        /// the operator the policies were skipped.
+        #[test]
+        fn unwired_slot_warns_loudly_and_is_not_a_failure() {
+            install_global();
+            let _g = TRACING_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let layer = CapLayer::default();
+            let captured = layer.records.clone();
+            let _sub = tracing::subscriber::set_default(Registry::default().with(layer));
+            tracing::callsite::rebuild_interest_cache();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+
+            // build_harness() constructs with `retention: None`.
             let h = build_harness();
             let mut d = DesiredState::default();
             d.retention_policies.push(rp_env(
@@ -536,11 +568,135 @@ mod tests {
                 serde_json::json!({ "AgeExceeds": 60 }),
                 serde_json::json!("AllRepos"),
             ));
-            let r =
-                h.uc.apply(d, env_oidc())
-                    .await
-                    .expect("apply must NOT fail when retention slot is unwired");
+            let r = rt
+                .block_on(h.uc.apply(d, env_oidc()))
+                .expect("apply must NOT fail when the retention slot is unwired");
             assert_eq!(r.created, 0, "unwired slot creates nothing");
+
+            let recs = captured.lock().unwrap();
+            assert!(
+                recs.iter().any(|(lvl, msg)| *lvl == tracing::Level::WARN
+                    && msg.contains("retention apply")
+                    && msg.contains("will NOT be")),
+                "an unwired slot must warn, not drop silently; captured: {recs:?}"
+            );
+        }
+
+        /// The acceptance case: an envelope whose scope names
+        /// repositories is accepted, resolved, and the **projection
+        /// carries the UUIDs**. Both repositories are declared in the
+        /// SAME apply — the ordering guarantee (repository rows written,
+        /// then `repo_id_by_name` collected, then policies applied) is
+        /// what makes that resolvable.
+        #[tokio::test]
+        async fn repos_scope_resolves_names_declared_in_the_same_apply_to_ids() {
+            use hort_domain::ports::repository_repository::RepositoryRepository;
+
+            let proj = Arc::new(MockProj::default());
+            let h = build_harness();
+            let repos = h.repos.clone();
+            let events = crate::event_store_publisher::wrap_for_test(Arc::new(MockEvents));
+            let rp_uc = Arc::new(RetentionPolicyUseCase::new(events, proj.clone()));
+            let uc =
+                h.uc.with_retention(RetentionApply::new(proj.clone(), rp_uc));
+
+            let mut d = DesiredState::default();
+            d.repositories.push(repo_env("npm-internal", "hosted"));
+            d.repositories.push(repo_env("pypi-internal", "hosted"));
+            d.retention_policies.push(rp_env(
+                "retain-named",
+                serde_json::json!({ "AgeExceeds": 2_592_000 }),
+                serde_json::json!({ "Repos": ["pypi-internal", "npm-internal"] }),
+            ));
+            let r = uc.apply(d, env_oidc()).await.expect("apply");
+            assert_eq!(r.created, 3, "two repositories plus the policy");
+
+            let npm = repos
+                .find_by_key("npm-internal")
+                .await
+                .expect("repo row")
+                .id;
+            let pypi = repos
+                .find_by_key("pypi-internal")
+                .await
+                .expect("repo row")
+                .id;
+
+            let rows = proj.rows.lock().unwrap();
+            let row = rows
+                .values()
+                .find(|r| r.name == "retain-named")
+                .expect("the policy reached the projection");
+            assert_eq!(
+                row.scope,
+                hort_domain::retention::RetentionScope::Repos(vec![pypi, npm]),
+                "the projection must carry resolved ids, in the authored order"
+            );
+        }
+
+        /// Re-applying an unchanged named scope is a no-op: resolution
+        /// is deterministic, so the projection comparison sees the same
+        /// ids and emits nothing.
+        #[tokio::test]
+        async fn unchanged_named_scope_reapplies_as_a_no_op() {
+            let proj = Arc::new(MockProj::default());
+            let h = build_harness();
+            let events = crate::event_store_publisher::wrap_for_test(Arc::new(MockEvents));
+            let rp_uc = Arc::new(RetentionPolicyUseCase::new(events, proj.clone()));
+            let uc =
+                h.uc.with_retention(RetentionApply::new(proj.clone(), rp_uc));
+
+            let desired = || {
+                let mut d = DesiredState::default();
+                d.repositories.push(repo_env("npm-internal", "hosted"));
+                d.retention_policies.push(rp_env(
+                    "retain-named",
+                    serde_json::json!({ "AgeExceeds": 2_592_000 }),
+                    serde_json::json!({ "Repos": ["npm-internal"] }),
+                ));
+                d
+            };
+            let first = uc.apply(desired(), env_oidc()).await.expect("create");
+            assert_eq!(first.created, 2, "the repository plus the policy");
+            let r = uc.apply(desired(), env_oidc()).await.expect("re-apply");
+            assert_eq!(
+                (r.created, r.updated, r.deleted),
+                (0, 0, 0),
+                "a resolved named scope is stable across applies"
+            );
+            assert_eq!(proj.active_count(), 1);
+        }
+
+        /// `resolve_retention_scope` panics on a name the map does not
+        /// carry, mirroring the `ScanPolicy` resolver. The cross-spec
+        /// validator is what guarantees the name is there; degrading to
+        /// a fallback here would make that guarantee decorative and let
+        /// the two resolution paths drift.
+        #[test]
+        #[should_panic(expected = "INVARIANT: RetentionPolicy references repository name 'ghost'")]
+        fn resolver_panics_on_a_name_the_validator_should_have_rejected() {
+            let spec =
+                hort_config::retention_policy::RetentionScopeSpec::Repos(vec!["ghost".to_string()]);
+            let _ = resolve_retention_scope(&spec, &HashMap::new());
+        }
+
+        /// The name-free scopes resolve without consulting the map at
+        /// all — an empty map is not a failure for them.
+        #[test]
+        fn resolver_passes_name_free_scopes_through() {
+            use hort_config::retention_policy::RetentionScopeSpec;
+            use hort_domain::retention::RetentionScope;
+            assert_eq!(
+                resolve_retention_scope(&RetentionScopeSpec::AllRepos, &HashMap::new()),
+                RetentionScope::AllRepos
+            );
+            assert_eq!(
+                resolve_retention_scope(
+                    &RetentionScopeSpec::PackageNamePattern("xz-*".into()),
+                    &HashMap::new()
+                ),
+                RetentionScope::PackageNamePattern("xz-*".into())
+            );
         }
 
         /// The actor threaded into the retention lifecycle append is

@@ -59,4 +59,4 @@ pub use evaluate::{
 pub use policy::{RetentionPolicy, RetentionPolicyEvent};
 pub use predicate::{BooleanOp, PolicyPredicate};
 pub use reason::ExpirationReason;
-pub use scope::RetentionScope;
+pub use scope::{RetentionScope, MAX_REPOS_IN_SCOPE};
