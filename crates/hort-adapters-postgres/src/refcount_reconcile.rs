@@ -161,13 +161,13 @@ impl RefcountReconcilePort for PgRefcountReconcile {
                         AND cr.kind               = 'primary_content'
                  WHERE a.repository_id = $1
                    AND (a.quarantine_status IS NULL
-                        OR a.quarantine_status NOT IN
-                           ('quarantined','rejected','scan_indeterminate'))
+                        OR a.quarantine_status <> ALL($2::text[]))
                    AND (cr.target_content_hash IS NULL
                         OR cr.target_content_hash <> a.checksum_sha256)
                 "#,
             )
             .bind(repo_id)
+            .bind(crate::gc_protected_quarantine_status_names())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", "scan_primary"))?;
@@ -207,13 +207,13 @@ impl RefcountReconcilePort for PgRefcountReconcile {
                  WHERE a.repository_id = $1
                    AND am.metadata_blob IS NOT NULL
                    AND (a.quarantine_status IS NULL
-                        OR a.quarantine_status NOT IN
-                           ('quarantined','rejected','scan_indeterminate'))
+                        OR a.quarantine_status <> ALL($2::text[]))
                    AND (cr.target_content_hash IS NULL
                         OR cr.target_content_hash <> trim(am.metadata_blob))
                 "#,
             )
             .bind(repo_id)
+            .bind(crate::gc_protected_quarantine_status_names())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", "scan_metadata"))?;

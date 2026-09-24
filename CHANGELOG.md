@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Retention could never have enumerated a single artifact** (#284). Three
+  faults in one query, all of which had to fall before any retention policy
+  could do anything at all. The candidate reader selected
+  `repositories.format` without casting the PostgreSQL enum to text, so
+  decoding failed on the first row of every non-empty page — the sweep
+  returned a retryable error and expired nothing. Its status filter was
+  written as `quarantine_status NOT IN (…)`, which is *unknown* rather than
+  *true* for the SQL `NULL` that an artifact without a quarantine status is
+  stored as, so a quarter of a typical inventory was invisible to every
+  policy. And it had no `deleted_at` predicate, so it offered soft-deleted
+  rows as candidates. None of this was reachable before: the sweep
+  short-circuits when no retention policy exists, and the only test over the
+  reader enumerated an empty table. The eligible and GC-protected status sets
+  now come from one definition shared by the candidate reader, the
+  pending-purge reader, the refcount reconcile and the purge-path mapper,
+  which is what kept them from drifting apart again.
+
 ## [0.14.0] - 2026-09-20
 
 ### Added
