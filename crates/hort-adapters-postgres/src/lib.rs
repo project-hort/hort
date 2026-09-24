@@ -19,6 +19,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::error::DomainError;
 
 pub mod advisory_sync_state;
@@ -100,6 +101,29 @@ pub mod user_repo;
 /// Boxed future alias for dyn-compatible async trait methods.
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Persisted quarantine statuses that must never be offered to garbage
+/// collection or refcount repair paths.
+const GC_PROTECTED_QUARANTINE_STATUSES: [(&str, QuarantineStatus); 3] = [
+    ("quarantined", QuarantineStatus::Quarantined),
+    ("rejected", QuarantineStatus::Rejected),
+    ("scan_indeterminate", QuarantineStatus::ScanIndeterminate),
+];
+
+/// Names for binding the shared GC-protected set as a PostgreSQL text array.
+pub(crate) fn gc_protected_quarantine_status_names() -> Vec<&'static str> {
+    GC_PROTECTED_QUARANTINE_STATUSES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// Map a persisted status when it belongs to the shared GC-protected set.
+pub(crate) fn gc_protected_quarantine_status(raw: &str) -> Option<QuarantineStatus> {
+    GC_PROTECTED_QUARANTINE_STATUSES
+        .iter()
+        .find_map(|(name, status)| (*name == raw).then_some(*status))
+}
+
 /// Map sqlx errors to domain errors.
 ///
 /// Order matters. The contention arm sits ahead of the catch-all because a
@@ -148,6 +172,27 @@ pub(crate) fn escape_like_pattern(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_protected_status_definition_supplies_names_and_domain_values() {
+        assert_eq!(
+            gc_protected_quarantine_status_names(),
+            ["quarantined", "rejected", "scan_indeterminate"]
+        );
+        assert_eq!(
+            gc_protected_quarantine_status("quarantined"),
+            Some(QuarantineStatus::Quarantined)
+        );
+        assert_eq!(
+            gc_protected_quarantine_status("rejected"),
+            Some(QuarantineStatus::Rejected)
+        );
+        assert_eq!(
+            gc_protected_quarantine_status("scan_indeterminate"),
+            Some(QuarantineStatus::ScanIndeterminate)
+        );
+        assert_eq!(gc_protected_quarantine_status("released"), None);
+    }
 
     #[test]
     fn escape_like_plain_text() {

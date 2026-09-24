@@ -117,7 +117,7 @@ struct DeletedRefRow {
 /// any value the use case re-checks must round-trip; an unknown value
 /// is a data-integrity error rather than a silent mis-classification of
 /// a destructive decision.
-fn map_status(raw: Option<&str>) -> DomainResult<QuarantineStatus> {
+pub(crate) fn map_status(raw: Option<&str>) -> DomainResult<QuarantineStatus> {
     match raw {
         // `unscanned` / `clean` / `flagged` are non-terminal scan
         // states the schema allows but the artifact aggregate models
@@ -127,13 +127,12 @@ fn map_status(raw: Option<&str>) -> DomainResult<QuarantineStatus> {
         None | Some("unscanned") | Some("clean") | Some("flagged") | Some("none") => {
             Ok(QuarantineStatus::None)
         }
-        Some("quarantined") => Ok(QuarantineStatus::Quarantined),
         Some("released") => Ok(QuarantineStatus::Released),
-        Some("rejected") => Ok(QuarantineStatus::Rejected),
-        Some("scan_indeterminate") => Ok(QuarantineStatus::ScanIndeterminate),
-        Some(other) => Err(DomainError::Invariant(format!(
-            "purge_gc: unknown quarantine_status {other:?} on a pending-purge artifact"
-        ))),
+        Some(other) => crate::gc_protected_quarantine_status(other).ok_or_else(|| {
+            DomainError::Invariant(format!(
+                "purge_gc: unknown quarantine_status {other:?} on a pending-purge artifact"
+            ))
+        }),
     }
 }
 
@@ -191,11 +190,11 @@ impl PurgeGcPort for PgPurgeGcPort {
                             AND e.event_type = 'ArtifactPurged'
                        )
                    AND (a.quarantine_status IS NULL
-                        OR a.quarantine_status NOT IN
-                           ('quarantined','rejected','scan_indeterminate'))
+                        OR a.quarantine_status <> ALL($1::text[]))
                  ORDER BY a.id
                 "#,
             )
+            .bind(crate::gc_protected_quarantine_status_names())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| map_sqlx_error(&e, "purge_gc", "list_pending"))?;
@@ -384,6 +383,7 @@ mod tests {
     #[test]
     fn map_status_maps_known_values_and_collapses_scan_states() {
         assert_eq!(map_status(None).unwrap(), QuarantineStatus::None);
+        assert_eq!(map_status(Some("none")).unwrap(), QuarantineStatus::None);
         assert_eq!(
             map_status(Some("unscanned")).unwrap(),
             QuarantineStatus::None
