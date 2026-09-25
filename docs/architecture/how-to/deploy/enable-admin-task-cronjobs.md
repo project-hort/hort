@@ -214,6 +214,12 @@ is a hard architectural line, not a configuration gap:
   "retention-purge" requires the "task:destructive" claim in addition to
   Permission::AdminTaskInvoke`.
 
+The one exception is `retention-evaluate` with `{"mode":"dry_run"}`, which
+records nothing and therefore needs only `Permission::AdminTaskInvoke`. The
+claim gate follows the invocation's mode, and the mode defaults to `execute`
+when the request body omits it — so every invocation shown below, and the
+shipped CronJob, still needs the claim.
+
 To run a destructive task, use a **fresh IdP-backed admin CliSession** by
 hand, from an operator workstation — never a static token:
 

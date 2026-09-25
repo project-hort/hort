@@ -10,7 +10,7 @@
 //! POST   /                           → invoke::<NoopParams>         (noop)
 //! POST   /cron-rescan-tick           → invoke::<CronRescanTickRawParams>
 //! POST   /advisory-watch-tick        → invoke::<AdvisoryWatchTickRawParams>
-//! POST   /retention-evaluate         → invoke::<RetentionEvaluateRawParams>
+//! POST   /retention-evaluate         → invoke::<RetentionEvaluateParams>
 //! POST   /retention-purge            → invoke::<RetentionPurgeRawParams>
 //! POST   /eventstore-archive         → invoke::<EventstoreArchiveRawParams>
 //! POST   /staging-sweep              → invoke::<StagingSweepParams>
@@ -46,9 +46,9 @@ use handlers::invoke::invoke;
 use handlers::list::list_tasks;
 use params::{
     AdvisoryWatchTickRawParams, CronRescanTickRawParams, EventstoreArchiveRawParams,
-    EventstoreCheckpointRawParams, NoopParams, ReplaySeenPruneRawParams,
-    RetentionEvaluateRawParams, RetentionPurgeRawParams, ScannerRegistryPruneRawParams,
-    ServiceAccountRotationRawParams, StagingSweepParams,
+    EventstoreCheckpointRawParams, NoopParams, ReplaySeenPruneRawParams, RetentionEvaluateParams,
+    RetentionPurgeRawParams, ScannerRegistryPruneRawParams, ServiceAccountRotationRawParams,
+    StagingSweepParams,
 };
 
 pub mod dto;
@@ -73,7 +73,7 @@ pub fn router() -> Router<Arc<AppContext>> {
         )
         .route(
             "/retention-evaluate",
-            post(invoke::<RetentionEvaluateRawParams>),
+            post(invoke::<RetentionEvaluateParams>),
         )
         .route("/retention-purge", post(invoke::<RetentionPurgeRawParams>))
         .route(

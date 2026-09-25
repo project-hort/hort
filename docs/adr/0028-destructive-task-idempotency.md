@@ -41,8 +41,10 @@ For every kind in `DESTRUCTIVE_TASK_KINDS`, the server derives a per-UTC-day
 idempotency key itself and the database enforces its uniqueness durably:
 
 - **Server-derived, always.** The invoke handler computes
-  `cron:<kind>:<YYYY-MM-DD>` for every destructive kind
-  (`crates/hort-http-admin-tasks/src/handlers/invoke.rs:214-223`), regardless
+  `cron:<kind>:<YYYY-MM-DD>` for `retention-purge` and
+  `eventstore-archive`, and
+  `cron:retention-evaluate:<mode>:<YYYY-MM-DD>` for both retention modes
+  (`crates/hort-http-admin-tasks/src/handlers/invoke.rs:229-242`), regardless
   of any operator-supplied `Idempotency-Key` header. There is no branch where
   a destructive kind reaches `enqueue` with no key — the invariant
   "destructive ⇒ key present" is structural, not operator discipline.
@@ -78,7 +80,11 @@ idempotency key itself and the database enforces its uniqueness durably:
   against domain-bypass writes.
 
 The ephemeral `idem-task:` fast-path remains in the handler as a cheap
-additional layer for header-bearing calls; the DB index is the durable one.
+additional layer for header-bearing calls. Its cached value records the job,
+kind, and complete typed params, and only an exact match is a hit; the former
+16-byte raw UUID representation is an unverified miss. The CLI includes the
+retention mode in its window-derived header key. The DB index is the durable
+layer.
 This ADR records the layer that **promotes ADR 0020's per-UTC-day key from
 best-effort-ephemeral to durable-DB** — the other ADR 0020 layers (CronJob
 `concurrencyPolicy: Forbid`, worker per-kind semaphore, sequential seal await,
@@ -90,6 +96,8 @@ block per ADR 0020.
 - The per-UTC-day single-flight layer survives ephemeral-store flush/failover
   and CronJob-controller restarts — the dedup decision lives in the same
   database transaction domain as the job row itself.
+- Retention preview and execution are independent same-day jobs at both
+  idempotency layers. A preview cannot suppress a later execution.
 - Ad-hoc CLI invocations of destructive kinds get the layer with no
   operator-supplied key; nothing depends on the `--idempotency-key-window`
   flag being present.
@@ -136,7 +144,7 @@ block per ADR 0020.
 - `crates/hort-domain/src/types/idempotency_key.rs` (newtype);
   `crates/hort-domain/src/ports/jobs_repository.rs:440` (`enqueue_task` +
   `EnqueueOutcome`); `crates/hort-app/src/use_cases/task_use_case.rs:259`
-  (`enqueue`); `crates/hort-http-admin-tasks/src/handlers/invoke.rs:214-223`
+  (`enqueue`); `crates/hort-http-admin-tasks/src/handlers/invoke.rs:229-242`
   (server-side derivation); `crates/hort-adapters-postgres/src/jobs_repository.rs`
   (`ON CONFLICT` CTE); `migrations/009_scan_jobs_and_findings.sql:260-264,356-358`
   (column, CHECKs, partial unique index);

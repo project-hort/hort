@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A retention policy can be previewed before it takes anything** (#283).
+  `retention-evaluate` gains a dry-run mode that draws the same candidates
+  through the same reader and the same predicates, appends no `ArtifactExpired`,
+  advances no projection field, and writes its finding into its own job's
+  `result_summary`. It is the same code path with one branch, not a second
+  evaluator, so the preview cannot drift from the action it predicts. The mode
+  defaults to execute, so a deployment that sends no mode behaves exactly as
+  before.
+
+  The report gives rows per policy and repository, distinct content hashes —
+  rows are not bytes — a capped sample so the selection can be checked rather
+  than a total believed, and the bytes that would actually be freed. That figure
+  is **simulated, never estimated**: a blob falls only when its reference count
+  reaches zero across the whole candidate set, so the simulation reproduces the
+  purge's edge set term by term, including the OCI membership edges, and
+  excludes any target a surviving artifact still references. Where the candidate
+  set exceeds the simulation's bounds, or a size lookup fails, the figure is
+  reported as **omitted** with a reason — against 142 GB, a plausible wrong
+  number is worse than none.
+
+  Preview and execution are independent jobs at **both** idempotency layers: the
+  server-derived per-day key carries the mode, and the ephemeral
+  `Idempotency-Key` cache now records what its entry was issued for, so the same
+  header sent for a preview and an execution no longer returns the preview's
+  job. `hort-cli`'s window-derived key carries the mode too — it is the normal
+  path, and without it the shipped CronJob and an operator's preview would
+  collide by construction. A preview needs no destructive claim; an execution
+  still does, checked both at the HTTP boundary and inside the use case.
+
 ### Changed
 
 - **A `RetentionPolicy` scope names repositories, and a declared retention

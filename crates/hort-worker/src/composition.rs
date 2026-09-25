@@ -1239,6 +1239,7 @@ pub async fn build_app_context(
         use hort_adapters_postgres::refcount_reconcile::PgRefcountReconcile;
         use hort_adapters_postgres::retention_candidate_reader::PgRetentionCandidateReader;
         use hort_adapters_postgres::retention_policy_projection_repo::PgRetentionPolicyProjectionRepository;
+        use hort_adapters_postgres::retention_preview::PgRetentionPreview;
         use hort_adapters_postgres::retention_scan_reader::PgRetentionScanReader;
         use hort_adapters_postgres::terminal_stream_reader::PgTerminalStreamReader;
         use hort_app::use_cases::eventstore_retention_use_case::{
@@ -1249,6 +1250,7 @@ pub async fn build_app_context(
         use hort_domain::ports::purge_gc::PurgeGcPort;
         use hort_domain::ports::retention_candidate_reader::RetentionCandidateReader;
         use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
+        use hort_domain::ports::retention_preview::RetentionPreview;
         use hort_domain::ports::retention_scan_reader::RetentionScanReader;
         use hort_domain::ports::terminal_stream_reader::TerminalStreamReader;
 
@@ -1314,6 +1316,8 @@ pub async fn build_app_context(
             Arc::new(PgRetentionCandidateReader::new(pool.clone()));
         let retention_scan_reader: Arc<dyn RetentionScanReader> =
             Arc::new(PgRetentionScanReader::new(pool.clone()));
+        let retention_preview: Arc<dyn RetentionPreview> =
+            Arc::new(PgRetentionPreview::new(pool.clone()));
         let retention_uc = Arc::new(RetentionUseCase::new(
             event_publisher.clone(),
             retention_scan_reader,
@@ -1323,6 +1327,8 @@ pub async fn build_app_context(
                 retention_policy_projections,
                 retention_candidates,
                 retention_uc,
+                retention_preview,
+                storage.clone(),
             )),
             1,
         );

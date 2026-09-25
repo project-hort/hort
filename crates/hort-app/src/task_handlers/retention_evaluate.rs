@@ -3,7 +3,7 @@
 //! The `kind = "retention-evaluate"` TaskHandler. Triggered by the
 //! k8s CronJob (or operator host cron) hitting
 //! `POST /api/v1/admin/tasks/retention-evaluate` (the route +
-//! raw-params live in
+//! typed params live in
 //! `hort-http-admin-tasks`; this module only registers the handler
 //! with the worker). Default schedule `0 3 * * *`. Thin orchestration, modelled
 //! 1:1 on [`CronRescanTickHandler`](super::cron_rescan_tick):
@@ -19,14 +19,21 @@
 //! 4. Per batch, map `RetentionCandidateRow → RetentionUseCase::
 //!    RetentionCandidate` (a trivial field copy — the type stays in
 //!    `hort-app`) and call
-//!    `RetentionUseCase::evaluate_policies(now, &policies,
-//!    &candidates)`, accumulating the per-batch [`EvaluateSummary`].
-//! 5. Return [`TaskOutcome::Completed`] with the projected JSON.
+//!    `RetentionUseCase::evaluate_policies_in_mode(now, &policies,
+//!    &candidates, mode)`, accumulating the per-batch [`EvaluateSummary`]
+//!    and matched rows.
+//! 5. For a dry run, simulate the purge refcount decision and build a
+//!    bounded operator sample; for execution, append expiry events at the
+//!    same use-case boundary used before modes existed.
+//! 6. Return [`TaskOutcome::Completed`] with the projected JSON.
 //!
-//! The handler appends nothing directly — `evaluate_policies` owns the
-//! `ArtifactExpired` append. No new metrics are introduced; the handler
-//! returns `result_summary` JSON only.
+//! The handler appends nothing directly — `evaluate_policies_in_mode` owns
+//! the `ArtifactExpired` append in execute mode and suppresses that append
+//! in dry-run mode. No new metrics are introduced; the handler returns
+//! `result_summary` JSON only.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -35,10 +42,15 @@ use serde_json::json;
 use hort_domain::error::DomainResult;
 use hort_domain::ports::retention_candidate_reader::RetentionCandidateReader;
 use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
+use hort_domain::ports::retention_preview::{RetentionContentSimulation, RetentionPreview};
+use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
+use hort_domain::retention::RetentionEvaluationMode;
 
-use crate::use_cases::retention_use_case::{EvaluateSummary, RetentionCandidate, RetentionUseCase};
+use crate::use_cases::retention_use_case::{
+    EvaluateSummary, EvaluationMatch, EvaluationReport, RetentionCandidate, RetentionUseCase,
+};
 
 /// Per-batch keyset page size. Mirrors `CronRescanTickHandler`'s
 /// `BATCH_SIZE` (a single tick fetches in 1000-row pages). The daily
@@ -53,11 +65,22 @@ const BATCH_SIZE: u32 = 1000;
 /// because retention has no in-flight-job dedup to bound re-visits).
 const MAX_BATCHES_PER_TICK: usize = 64;
 
+/// The curation queue's listing cap is the operator-facing precedent for a
+/// bounded sanity-check sample.
+const MAX_SAMPLE_SIZE: usize = 500;
+
+/// Exact byte accounting is intentionally bounded. Above either limit the
+/// result says `omitted`; it never extrapolates from a partial set.
+const MAX_SIMULATION_ARTIFACTS: usize = 10_000;
+const MAX_SIMULATION_TARGETS: u32 = 10_000;
+
 /// [`TaskHandler`] for the periodic retention-evaluate sweep.
 pub struct RetentionEvaluateHandler {
     policies: Arc<dyn RetentionPolicyProjectionRepository>,
     candidates: Arc<dyn RetentionCandidateReader>,
     retention: Arc<RetentionUseCase>,
+    preview: Arc<dyn RetentionPreview>,
+    storage: Arc<dyn StoragePort>,
 }
 
 impl RetentionEvaluateHandler {
@@ -65,11 +88,15 @@ impl RetentionEvaluateHandler {
         policies: Arc<dyn RetentionPolicyProjectionRepository>,
         candidates: Arc<dyn RetentionCandidateReader>,
         retention: Arc<RetentionUseCase>,
+        preview: Arc<dyn RetentionPreview>,
+        storage: Arc<dyn StoragePort>,
     ) -> Self {
         Self {
             policies,
             candidates,
             retention,
+            preview,
+            storage,
         }
     }
 }
@@ -82,11 +109,19 @@ impl TaskHandler for RetentionEvaluateHandler {
     #[tracing::instrument(skip(self))]
     fn run<'a>(
         &'a self,
-        _params: &'a serde_json::Value,
+        params: &'a serde_json::Value,
         _ctx: TaskContext,
     ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
         Box::pin(async move {
             let now = Utc::now();
+            let mode_raw = params
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("execute");
+            let mode = match RetentionEvaluationMode::from_str(mode_raw) {
+                Ok(mode) => mode,
+                Err(message) => return Ok(TaskOutcome::fail(message, false)),
+            };
 
             let policies = match self.policies.list_active().await {
                 Ok(p) => p,
@@ -101,19 +136,34 @@ impl TaskHandler for RetentionEvaluateHandler {
                 return Ok(TaskOutcome::Completed {
                     result_summary: json!({
                         "policies": 0,
+                        "mode": mode.as_str(),
+                        "coverage": "complete",
                         "evaluated": 0,
                         "expired": 0,
                         "already_expired": 0,
                         "skipped_protected": 0,
                         "skipped_stale_scan": 0,
                         "errors": 0,
+                        "preview": if mode == RetentionEvaluationMode::DryRun {
+                            Some(json!({
+                                "rows": 0,
+                                "distinct_contents": 0,
+                                "freed_bytes": { "status": "exact", "bytes": 0 },
+                                "groups": [],
+                                "sample": [],
+                            }))
+                        } else {
+                            None
+                        },
                     }),
                 });
             }
 
             let mut total = EvaluateSummary::default();
+            let mut matches = Vec::new();
             let mut cursor: Option<uuid::Uuid> = None;
-            for _ in 0..MAX_BATCHES_PER_TICK {
+            let mut coverage_complete = true;
+            for batch_index in 0..MAX_BATCHES_PER_TICK {
                 let rows = match self
                     .candidates
                     .list_candidates(BATCH_SIZE, cursor, now)
@@ -152,10 +202,10 @@ impl TaskHandler for RetentionEvaluateHandler {
 
                 match self
                     .retention
-                    .evaluate_policies(now, &policies, &candidates)
+                    .evaluate_policies_in_mode(now, &policies, &candidates, mode)
                     .await
                 {
-                    Ok(s) => accumulate(&mut total, &s),
+                    Ok(report) => accumulate(&mut total, &mut matches, report),
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -171,6 +221,9 @@ impl TaskHandler for RetentionEvaluateHandler {
                 if short_page {
                     break;
                 }
+                if batch_index + 1 == MAX_BATCHES_PER_TICK {
+                    coverage_complete = false;
+                }
             }
 
             tracing::info!(
@@ -184,8 +237,16 @@ impl TaskHandler for RetentionEvaluateHandler {
                 "retention-evaluate sweep complete"
             );
 
+            let preview = if mode == RetentionEvaluationMode::DryRun {
+                Some(self.build_preview(now, &matches).await)
+            } else {
+                None
+            };
+
             Ok(TaskOutcome::Completed {
                 result_summary: json!({
+                    "mode": mode.as_str(),
+                    "coverage": if coverage_complete { "complete" } else { "partial" },
                     "policies": policies.len(),
                     "evaluated": total.evaluated,
                     "expired": total.expired,
@@ -193,19 +254,135 @@ impl TaskHandler for RetentionEvaluateHandler {
                     "skipped_protected": total.skipped_protected,
                     "skipped_stale_scan": total.skipped_stale_scan,
                     "errors": total.errors,
+                    "preview": preview,
                 }),
             })
         })
     }
 }
 
-fn accumulate(total: &mut EvaluateSummary, batch: &EvaluateSummary) {
-    total.evaluated += batch.evaluated;
-    total.expired += batch.expired;
-    total.already_expired += batch.already_expired;
-    total.skipped_protected += batch.skipped_protected;
-    total.skipped_stale_scan += batch.skipped_stale_scan;
-    total.errors += batch.errors;
+impl RetentionEvaluateHandler {
+    async fn build_preview(
+        &self,
+        now: chrono::DateTime<Utc>,
+        matches: &[EvaluationMatch],
+    ) -> serde_json::Value {
+        #[derive(Default)]
+        struct Group {
+            policy_name: String,
+            rows: u64,
+            checksums: BTreeSet<String>,
+        }
+
+        let mut groups: BTreeMap<(uuid::Uuid, uuid::Uuid), Group> = BTreeMap::new();
+        let mut distinct_contents = BTreeSet::new();
+        let mut artifact_ids = BTreeSet::new();
+        let mut sample = Vec::new();
+
+        for hit in matches {
+            let group = groups
+                .entry((hit.policy_id, hit.repository_id))
+                .or_default();
+            group.policy_name.clone_from(&hit.policy_name);
+            group.rows += 1;
+            group.checksums.insert(hit.checksum_sha256.clone());
+            distinct_contents.insert(hit.checksum_sha256.clone());
+            artifact_ids.insert(hit.artifact_id);
+            if sample.len() < MAX_SAMPLE_SIZE {
+                sample.push(json!({
+                    "artifact_id": hit.artifact_id,
+                    "policy_id": hit.policy_id,
+                    "repository_id": hit.repository_id,
+                    "name": hit.name,
+                    "version": hit.version,
+                    "age_seconds": now.signed_duration_since(hit.created_at).num_seconds().max(0),
+                }));
+            }
+        }
+
+        let group_rows: Vec<_> = groups
+            .into_iter()
+            .map(|((policy_id, repository_id), group)| {
+                json!({
+                    "policy_id": policy_id,
+                    "policy_name": group.policy_name,
+                    "repository_id": repository_id,
+                    "rows": group.rows,
+                    "distinct_contents": group.checksums.len(),
+                })
+            })
+            .collect();
+
+        let artifact_ids: Vec<_> = artifact_ids.into_iter().collect();
+        let freed_bytes = match self
+            .preview
+            .reclaimable_content(
+                &artifact_ids,
+                MAX_SIMULATION_ARTIFACTS,
+                MAX_SIMULATION_TARGETS,
+            )
+            .await
+        {
+            Ok(RetentionContentSimulation::Exact(hashes)) => {
+                let mut total = 0_u64;
+                let mut omitted_reason = None;
+                for hash in hashes {
+                    match self.storage.size_of(&hash).await {
+                        Ok(size) => match total.checked_add(size) {
+                            Some(next) => total = next,
+                            None => {
+                                omitted_reason = Some("byte total overflowed u64");
+                                break;
+                            }
+                        },
+                        Err(error) => {
+                            tracing::warn!(error = %error, "retention dry-run storage size lookup failed");
+                            omitted_reason = Some("a reclaimable target size was unavailable");
+                            break;
+                        }
+                    }
+                }
+                match omitted_reason {
+                    Some(reason) => json!({ "status": "omitted", "reason": reason }),
+                    None => json!({ "status": "exact", "bytes": total }),
+                }
+            }
+            Ok(RetentionContentSimulation::Omitted) => json!({
+                "status": "omitted",
+                "reason": "simulation cardinality exceeded its exact-accounting bound",
+            }),
+            Err(error) => {
+                tracing::warn!(error = %error, "retention dry-run refcount simulation failed");
+                json!({
+                    "status": "omitted",
+                    "reason": "refcount simulation was unavailable",
+                })
+            }
+        };
+
+        json!({
+            "rows": matches.len(),
+            "distinct_contents": distinct_contents.len(),
+            "freed_bytes": freed_bytes,
+            "groups": group_rows,
+            "sample": sample,
+            "sample_limit": MAX_SAMPLE_SIZE,
+        })
+    }
+}
+
+fn accumulate(
+    total: &mut EvaluateSummary,
+    matches: &mut Vec<EvaluationMatch>,
+    batch: EvaluationReport,
+) {
+    total.evaluated += batch.summary.evaluated;
+    total.expired += batch.summary.expired;
+    total.already_expired += batch.summary.already_expired;
+    total.skipped_protected += batch.summary.skipped_protected;
+    total.skipped_stale_scan += batch.summary.skipped_stale_scan;
+    total.errors += batch.summary.errors;
+    matches.extend(batch.matches);
 }
 
 #[cfg(test)]
@@ -222,9 +399,13 @@ mod tests {
         AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
     };
     use hort_domain::ports::retention_candidate_reader::RetentionCandidateRow;
+    use hort_domain::ports::retention_preview::RetentionContentSimulation;
     use hort_domain::ports::retention_scan_reader::RetentionScanReader;
+    use hort_domain::ports::storage::PutResult;
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use hort_domain::retention::RetentionPolicy;
+    use hort_domain::types::{ByteRange, ContentHash};
+    use tokio::io::AsyncRead;
     use uuid::Uuid;
 
     fn art(id: Uuid) -> Artifact {
@@ -430,6 +611,73 @@ mod tests {
         ))
     }
 
+    struct InertPreview;
+    impl RetentionPreview for InertPreview {
+        fn reclaimable_content<'a>(
+            &'a self,
+            _artifact_ids: &'a [Uuid],
+            _max_artifacts: usize,
+            _max_targets: u32,
+        ) -> BoxFuture<'a, DomainResult<RetentionContentSimulation>> {
+            Box::pin(async { Ok(RetentionContentSimulation::Exact(Vec::new())) })
+        }
+    }
+
+    #[derive(Default)]
+    struct InertStorage {
+        sizes: std::collections::HashMap<ContentHash, u64>,
+        fail_size: bool,
+    }
+    impl StoragePort for InertStorage {
+        fn put(
+            &self,
+            _stream: Box<dyn AsyncRead + Send + Unpin>,
+        ) -> BoxFuture<'_, DomainResult<PutResult>> {
+            Box::pin(async { Err(DomainError::Invariant("unused put".into())) })
+        }
+
+        fn get(
+            &self,
+            _hash: &ContentHash,
+        ) -> BoxFuture<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
+            Box::pin(async { Err(DomainError::Invariant("unused get".into())) })
+        }
+
+        fn get_range(
+            &self,
+            _hash: &ContentHash,
+            _range: ByteRange,
+        ) -> BoxFuture<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
+            Box::pin(async { Err(DomainError::Invariant("unused get_range".into())) })
+        }
+
+        fn exists(&self, _hash: &ContentHash) -> BoxFuture<'_, DomainResult<bool>> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn size_of(&self, hash: &ContentHash) -> BoxFuture<'_, DomainResult<u64>> {
+            let result = if self.fail_size {
+                Err(DomainError::Invariant("size unavailable".into()))
+            } else {
+                Ok(self.sizes.get(hash).copied().unwrap_or(0))
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    fn handler(
+        policies: Arc<dyn RetentionPolicyProjectionRepository>,
+        candidates: Arc<dyn RetentionCandidateReader>,
+    ) -> RetentionEvaluateHandler {
+        RetentionEvaluateHandler::new(
+            policies,
+            candidates,
+            retention_uc(),
+            Arc::new(InertPreview),
+            Arc::new(InertStorage::default()),
+        )
+    }
+
     fn ctx() -> TaskContext {
         use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
         TaskContext {
@@ -470,27 +718,64 @@ mod tests {
         .unwrap()
     }
 
+    fn archived_age_policy() -> RetentionPolicy {
+        let id = Uuid::new_v4();
+        RetentionPolicy::project(&[
+            hort_domain::retention::RetentionPolicyEvent::Created {
+                id,
+                name: "archived".into(),
+                predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(1),
+                scope: hort_domain::retention::RetentionScope::AllRepos,
+                created_at: DateTime::<Utc>::UNIX_EPOCH,
+            },
+            hort_domain::retention::RetentionPolicyEvent::Archived {
+                id,
+                by: Uuid::nil(),
+                archived_at: DateTime::<Utc>::UNIX_EPOCH,
+            },
+        ])
+        .unwrap()
+    }
+
     #[test]
     fn kind_is_retention_evaluate() {
-        let h = RetentionEvaluateHandler::new(
+        let h = handler(
             Arc::new(MockPolicies::new(vec![])),
             Arc::new(MockCandidates::new(vec![])),
-            retention_uc(),
         );
         assert_eq!(h.kind(), "retention-evaluate");
     }
 
     #[tokio::test]
     async fn empty_policies_is_completed_noop() {
-        let h = RetentionEvaluateHandler::new(
+        let h = handler(
             Arc::new(MockPolicies::new(vec![])),
             Arc::new(MockCandidates::new(vec![vec![]])),
-            retention_uc(),
         );
         match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["policies"], 0);
                 assert_eq!(result_summary["evaluated"], 0);
+                assert_eq!(result_summary["mode"], "execute");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_policies_dry_run_returns_an_exact_empty_preview() {
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![])),
+            Arc::new(MockCandidates::new(vec![vec![]])),
+        );
+        match h.run(&json!({ "mode": "dry_run" }), ctx()).await.unwrap() {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["mode"], "dry_run");
+                assert_eq!(result_summary["preview"]["rows"], 0);
+                assert_eq!(result_summary["preview"]["distinct_contents"], 0);
+                assert_eq!(result_summary["preview"]["freed_bytes"]["bytes"], 0);
+                assert_eq!(result_summary["preview"]["groups"], json!([]));
+                assert_eq!(result_summary["preview"]["sample"], json!([]));
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -514,10 +799,9 @@ mod tests {
                 tag_targeted: true,
             },
         ];
-        let h = RetentionEvaluateHandler::new(
+        let h = handler(
             Arc::new(MockPolicies::new(vec![age_policy()])),
             Arc::new(MockCandidates::new(vec![rows])),
-            retention_uc(),
         );
         match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {
             TaskOutcome::Completed { result_summary } => {
@@ -532,10 +816,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_active_error_fails_with_retry() {
-        let h = RetentionEvaluateHandler::new(
+        let h = handler(
             Arc::new(MockPolicies::failing()),
             Arc::new(MockCandidates::new(vec![])),
-            retention_uc(),
         );
         match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {
             TaskOutcome::Failed { retry, reason } => {
@@ -548,10 +831,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_candidates_error_fails_with_retry() {
-        let h = RetentionEvaluateHandler::new(
+        let h = handler(
             Arc::new(MockPolicies::new(vec![age_policy()])),
             Arc::new(MockCandidates::failing()),
-            retention_uc(),
         );
         match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {
             TaskOutcome::Failed { retry, reason } => {
@@ -559,6 +841,241 @@ mod tests {
                 assert!(reason.contains("list_candidates"));
             }
             other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_mode_fails_without_retry() {
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            Arc::new(MockCandidates::new(vec![])),
+        );
+        match h
+            .run(&json!({ "mode": "preview" }), ctx())
+            .await
+            .expect("outcome")
+        {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(!retry);
+                assert!(reason.contains("execute, dry_run"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    fn evaluation_match(
+        artifact_id: Uuid,
+        policy_id: Uuid,
+        repository_id: Uuid,
+        checksum: &str,
+    ) -> EvaluationMatch {
+        EvaluationMatch {
+            policy_id,
+            policy_name: "cleanup".into(),
+            artifact_id,
+            repository_id,
+            name: "pkg".into(),
+            version: Some("1.0.0".into()),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            checksum_sha256: checksum.into(),
+        }
+    }
+
+    struct FixedPreview(RetentionContentSimulation);
+    impl RetentionPreview for FixedPreview {
+        fn reclaimable_content<'a>(
+            &'a self,
+            _artifact_ids: &'a [Uuid],
+            _max_artifacts: usize,
+            _max_targets: u32,
+        ) -> BoxFuture<'a, DomainResult<RetentionContentSimulation>> {
+            let value = self.0.clone();
+            Box::pin(async move { Ok(value) })
+        }
+    }
+
+    struct FailingPreview;
+    impl RetentionPreview for FailingPreview {
+        fn reclaimable_content<'a>(
+            &'a self,
+            _artifact_ids: &'a [Uuid],
+            _max_artifacts: usize,
+            _max_targets: u32,
+        ) -> BoxFuture<'a, DomainResult<RetentionContentSimulation>> {
+            Box::pin(async { Err(DomainError::Invariant("simulation unavailable".into())) })
+        }
+    }
+
+    fn preview_handler(
+        preview: Arc<dyn RetentionPreview>,
+        storage: Arc<dyn StoragePort>,
+    ) -> RetentionEvaluateHandler {
+        RetentionEvaluateHandler::new(
+            Arc::new(MockPolicies::new(vec![])),
+            Arc::new(MockCandidates::new(vec![])),
+            retention_uc(),
+            preview,
+            storage,
+        )
+    }
+
+    #[tokio::test]
+    async fn preview_reports_literal_bytes_and_caps_sample() {
+        const HASH_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+        const HASH_B: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+        let hash_a: ContentHash = HASH_A.parse().unwrap();
+        let hash_b: ContentHash = HASH_B.parse().unwrap();
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert(hash_a.clone(), 11);
+        sizes.insert(hash_b.clone(), 29);
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![
+                hash_a, hash_b,
+            ]))),
+            Arc::new(InertStorage {
+                sizes,
+                fail_size: false,
+            }),
+        );
+        let policy_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let matches: Vec<_> = (0..501)
+            .map(|_| evaluation_match(Uuid::new_v4(), policy_id, repository_id, HASH_A))
+            .collect();
+
+        let preview = h.build_preview(Utc::now(), &matches).await;
+        assert_eq!(preview["rows"], 501);
+        assert_eq!(preview["distinct_contents"], 1);
+        assert_eq!(preview["groups"][0]["rows"], 501);
+        assert_eq!(preview["groups"][0]["distinct_contents"], 1);
+        assert_eq!(preview["sample"].as_array().unwrap().len(), 500);
+        assert_eq!(preview["sample_limit"], 500);
+        assert_eq!(preview["freed_bytes"]["status"], "exact");
+        assert_eq!(preview["freed_bytes"]["bytes"], 40);
+    }
+
+    #[tokio::test]
+    async fn preview_explicitly_omits_bytes_for_bounds_or_port_failure() {
+        let bounded = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Omitted)),
+            Arc::new(InertStorage::default()),
+        );
+        let omitted = bounded.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        assert!(omitted["freed_bytes"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("cardinality"));
+
+        let failed = preview_handler(Arc::new(FailingPreview), Arc::new(InertStorage::default()));
+        let omitted = failed.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        assert!(omitted["freed_bytes"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("unavailable"));
+    }
+
+    #[tokio::test]
+    async fn preview_omits_bytes_when_storage_size_is_unavailable() {
+        let hash: ContentHash = "1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![hash]))),
+            Arc::new(InertStorage {
+                sizes: Default::default(),
+                fail_size: true,
+            }),
+        );
+        let omitted = h.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        assert!(omitted["freed_bytes"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("size"));
+    }
+
+    #[tokio::test]
+    async fn preview_omits_bytes_when_exact_total_overflows() {
+        let first: ContentHash = "1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        let second: ContentHash =
+            "4444444444444444444444444444444444444444444444444444444444444444"
+                .parse()
+                .unwrap();
+        let mut sizes = std::collections::HashMap::new();
+        sizes.insert(first.clone(), u64::MAX);
+        sizes.insert(second.clone(), 1);
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![
+                first, second,
+            ]))),
+            Arc::new(InertStorage {
+                sizes,
+                fail_size: false,
+            }),
+        );
+
+        let omitted = h.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        assert!(omitted["freed_bytes"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("overflowed"));
+    }
+
+    #[tokio::test]
+    async fn inert_storage_non_size_methods_are_explicit_test_failures() {
+        let storage = InertStorage::default();
+        let hash: ContentHash = "1111111111111111111111111111111111111111111111111111111111111111"
+            .parse()
+            .unwrap();
+        assert!(storage.put(Box::new(tokio::io::empty())).await.is_err());
+        assert!(storage.get(&hash).await.is_err());
+        assert!(storage
+            .get_range(&hash, ByteRange::Inclusive { start: 0, end: 0 })
+            .await
+            .is_err());
+        assert!(!storage.exists(&hash).await.unwrap());
+    }
+
+    struct FullPageCandidates {
+        row: RetentionCandidateRow,
+    }
+
+    impl RetentionCandidateReader for FullPageCandidates {
+        fn list_candidates<'a>(
+            &'a self,
+            batch_size: u32,
+            _after: Option<Uuid>,
+            _now: DateTime<Utc>,
+        ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
+            let rows = vec![self.row.clone(); batch_size as usize];
+            Box::pin(async move { Ok(rows) })
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_ceiling_is_reported_as_partial_coverage() {
+        let row = RetentionCandidateRow {
+            artifact: art(Uuid::new_v4()),
+            format: hort_domain::entities::repository::RepositoryFormat::Generic,
+            resolved_rescan_interval_hours: None,
+            keep_rank: None,
+            tag_targeted: false,
+        };
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![archived_age_policy()])),
+            Arc::new(FullPageCandidates { row }),
+        );
+        match h.run(&json!({ "mode": "dry_run" }), ctx()).await.unwrap() {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["coverage"], "partial");
+                assert_eq!(result_summary["preview"]["rows"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
         }
     }
 }

@@ -125,7 +125,8 @@ fn ordinary_principal() -> CallerPrincipal {
 /// For every kind in `DESTRUCTIVE_TASK_KINDS`, fire `POST /api/v1/admin/tasks/<kind>`
 /// against the real handler and assert the mocked `enqueue_task` received
 /// `Some(server-derived-key)` with the per-UTC-day shape
-/// `cron:<kind>:<YYYY-MM-DD>`.
+/// `cron:<kind>:<YYYY-MM-DD>`, except retention evaluation, whose typed
+/// mode is an explicit key segment.
 ///
 /// Closed-set semantics: adding a fourth destructive kind to
 /// `DESTRUCTIVE_TASK_KINDS` without routing the new kind through the
@@ -171,16 +172,20 @@ async fn destructive_kinds_carry_db_idempotency() {
         );
 
         let after = Utc::now().format("%Y-%m-%d").to_string();
+        let expected = |day: &str| {
+            if *kind == "retention-evaluate" {
+                format!("cron:{kind}:execute:{day}")
+            } else {
+                format!("cron:{kind}:{day}")
+            }
+        };
         let acceptable_keys: Vec<String> = if before == after {
-            vec![format!("cron:{kind}:{before}")]
+            vec![expected(&before)]
         } else {
             // Midnight UTC rollover landed inside the test — accept
             // both same-day shapes. Vanishingly rare; the explicit
             // handling makes the guard non-flaky.
-            vec![
-                format!("cron:{kind}:{before}"),
-                format!("cron:{kind}:{after}"),
-            ]
+            vec![expected(&before), expected(&after)]
         };
 
         // The mock captured exactly one enqueue with idempotency_key=Some(_).
@@ -209,12 +214,49 @@ async fn destructive_kinds_carry_db_idempotency() {
         assert!(
             acceptable_keys.iter().any(|k| k == key.as_str()),
             "destructive kind {kind:?}: key shape mismatch. Expected one of {acceptable_keys:?}, \
-             got {key_str:?}. The shape `cron:<kind>:<YYYY-MM-DD>` is required \
+             got {key_str:?}. The server-derived per-day shape is required \
              to be distinct from the client's `<window>:<kind>` shape so the \
              Redis and DB layers cannot collide on a key.",
             key_str = key.as_str(),
         );
     }
+}
+
+#[tokio::test]
+async fn retention_preview_and_execute_have_distinct_durable_keys() {
+    let (ctx, mocks) = new_ctx();
+    let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
+    let uc = task_use_case_permit_destructive(&mocks, events);
+    let ctx = with_task_use_case(&ctx, uc);
+    let router = build_test_router(ctx);
+
+    let mut preview = Request::post("/api/v1/admin/tasks/retention-evaluate")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"mode":"dry_run"}"#))
+        .expect("request");
+    auth_test::inject_principal(&mut preview, ordinary_principal());
+    assert_eq!(
+        router.clone().oneshot(preview).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+
+    let mut execute = Request::post("/api/v1/admin/tasks/retention-evaluate")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"mode":"execute"}"#))
+        .expect("request");
+    auth_test::inject_principal(&mut execute, destructive_principal());
+    assert_eq!(
+        router.oneshot(execute).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+
+    let keys = mocks.jobs.enqueue_idem_keys();
+    assert_eq!(keys.len(), 2);
+    let preview_key = keys[0].as_ref().expect("preview key").as_str();
+    let execute_key = keys[1].as_ref().expect("execute key").as_str();
+    assert_ne!(preview_key, execute_key);
+    assert!(preview_key.contains(":dry_run:"));
+    assert!(execute_key.contains(":execute:"));
 }
 
 // ---------------------------------------------------------------------------
