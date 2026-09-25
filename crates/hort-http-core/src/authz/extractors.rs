@@ -27,12 +27,14 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::Response;
 
+use hort_app::rbac::AuthzDecision;
+use hort_domain::entities::api_token::TokenKind;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
 
-use crate::authz::{emit_authz_decision, emit_repo_not_found};
+use crate::authz::{emit_authz_decision, emit_authz_denial, emit_repo_not_found};
 use crate::context::{AppContext, AuthContext};
 use crate::middleware::auth::AuthenticatedPrincipal;
 
@@ -279,35 +281,55 @@ impl FromRequestParts<Arc<AppContext>> for CurateOrAdminPrincipal {
     ) -> Result<Self, Self::Rejection> {
         let principal = extract_principal(parts, state).map_err(|b| *b)?;
         // Privilege precedence — Curate first, Admin as the wider
-        // fall-back. `authorize_silent` does NOT emit the per-attempt
+        // fall-back. `evaluate_rbac` does NOT emit the per-attempt
         // metric tick on miss (otherwise an admin-only caller would
         // double-count: one `curate=deny` then one `curate=allow`).
         // The final decision is emitted at the bottom of this body
         // via the explicit `emit_authz_decision` call.
-        let allowed_via_curate =
+        let curate_decision =
             evaluate_rbac(state, &principal, Permission::Curate, None).map_err(|b| *b)?;
-        let allowed = if allowed_via_curate {
-            true
+        // `None` = the Admin fall-back was never consulted because Curate
+        // already allowed. Keeping it an `Option` rather than evaluating
+        // Admin unconditionally preserves the short-circuit: an allowed
+        // curator costs one grant scan, not two.
+        let admin_decision = if curate_decision.is_allowed() {
+            None
         } else {
-            evaluate_rbac(state, &principal, Permission::Admin, None).map_err(|b| *b)?
+            Some(evaluate_rbac(state, &principal, Permission::Admin, None).map_err(|b| *b)?)
         };
+        let allowed =
+            curate_decision.is_allowed() || admin_decision.is_some_and(AuthzDecision::is_allowed);
         if allowed {
             emit_authz_decision(PERMISSION_CURATE, RESULT_ALLOW);
             tracing::debug!(
                 user_id = %principal.user_id,
                 permission = PERMISSION_CURATE,
-                via_curate = allowed_via_curate,
+                via_curate = curate_decision.is_allowed(),
                 "curator-or-admin authorization allowed"
             );
             Ok(Self(principal))
         } else {
             emit_authz_decision(PERMISSION_CURATE, RESULT_DENY);
+            // No `hort_authz_denials_total` tick here, deliberately. This
+            // gate produces TWO decisions and one deny, and they can fail
+            // for different reasons — Curate on the grants leg while Admin
+            // fails on the cap, say. Any single `reason` label would be a
+            // fiction, and an `unknown` value would put a meaningless
+            // series member exactly where the answer is hardest to read.
+            // Both decisions go on the log line instead, which reports
+            // more than a merged reason could: they are `Copy` enums
+            // rendered via `Debug`, so this allocates nothing, and
+            // `deny_hint` keeps its principal-shape reading (no single
+            // decision to hand it). `admin_decision` is always `Some` on
+            // this path — Curate denied, so the fall-back ran.
             tracing::info!(
                 user_id = %principal.user_id,
                 permission = PERMISSION_CURATE,
                 claims = ?principal.claims,
                 token_kind = ?principal.token_kind,
-                hint = deny_hint(&principal),
+                curate_decision = ?curate_decision,
+                admin_decision = ?admin_decision,
+                hint = deny_hint(&principal, None),
                 "curator-or-admin authorization denied"
             );
             Err(*forbidden_response())
@@ -598,79 +620,208 @@ async fn extract_repo_key(
     }
 }
 
-/// Operator-facing diagnostic appended to every deny log line.
+/// The principal-shape classes [`deny_hint`] discriminates, computed once
+/// and then crossed with the denied leg.
 ///
-/// The bare `"authorization denied"` line carries who and what but no
-/// signal pointing at the GitOps surface that would fix the deny. This
-/// helper discriminates the three commonest misconfiguration shapes so
-/// the first time an operator sees a 403 they can grep the log for the
-/// CRD that needs declaring:
+/// This is the whole of the pre-existing hint ladder, lifted out of the
+/// string selection so each shape test appears exactly once. It answers a
+/// different question from [`AuthzDecision`] and the two compose: the
+/// decision says **which leg** denied; the shape says the **likely
+/// remediation within that leg**. Neither subsumes the other — a cap
+/// reject on a CliSession token and a cap reject on a ServiceAccount token
+/// are the same leg with entirely different fixes.
 ///
-/// 1. Empty `claims` — the IdP group claim or `kind: ClaimMapping`
-///    binding is the culprit. PermissionGrants are irrelevant until a
-///    claim resolves.
-/// 2. Claims present, no `token_cap` — the deny is purely an RBAC-grant
-///    miss. A `kind: PermissionGrant` declaring this (claims,
-///    permission, repository) tuple resolves it.
-/// 3. Claims present, `token_cap` set — the deny could be either the
-///    RBAC-grant miss above OR the token's cap narrowing the
-///    intersection (the two-leg AND). Operator needs to check
-///    both the token's scope/repo set and the grant table.
-///
-/// The cap-aware CliSession branch is keyed off the
-/// typed `principal.token_kind == Some(TokenKind::CliSession)` carrier;
-/// its four behaviours (empty / cli_session-no-admin-cap /
-/// cli_session-with-admin-cap / cli_session-no-cap) are pinned by the
-/// tests below.
-///
-/// The hint is purely a static string for the log — never load-bearing
-/// for the deny decision (which is `RbacEvaluator::authorize`'s
-/// concern). Returns `&'static str` so adding it to the tracing call
-/// has zero allocation overhead on the deny hot path.
-fn deny_hint(principal: &CallerPrincipal) -> &'static str {
-    use hort_domain::entities::api_token::TokenKind;
-    // ServiceAccount-kind tokens carry `claims == []` by
-    // construction (ADR 0012: SAs never consume
-    // claim_mappings). Routing them through the generic "verify
-    // ClaimMapping" branch actively misleads the operator. Branch on
-    // the typed `token_kind` carrier first so SAs land on a hint that
-    // names the right remediation surfaces (the explicit
-    // `serviceAccount`-subject PermissionGrant and the grants-snapshot
-    // cap on the issued token).
+/// Order of classification is load-bearing and matches the ladder it
+/// replaces: `ServiceAccount` is tested before `NoClaims` because SAs
+/// carry `claims == []` by construction (ADR 0012 — SAs never consume
+/// ClaimMappings), so the claim-resolution hint would actively mislead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrincipalShape {
+    /// `TokenKind::ServiceAccount`. Remediation surfaces are the explicit
+    /// `serviceAccount`-subject PermissionGrant and the effective-grants
+    /// snapshot taken into the token's cap at issuance — never
+    /// ClaimMappings.
+    ServiceAccount,
+    /// No claims resolved, and not a CliSession (which legitimately
+    /// carries none). Claim resolution sits upstream of every grant, so
+    /// nothing in the grant table can matter yet.
+    NoClaims,
+    /// A `hort-cli auth login` session whose cap was minted without
+    /// `--admin` — the commonest admin-from-CLI deny shape.
+    CliSessionWithoutAdminCap,
+    /// Claims resolved and a cap is present, with nothing more specific to
+    /// point at.
+    ClaimsWithCap,
+    /// Claims resolved and no cap present: the grant table is the only
+    /// surface in play.
+    ClaimsWithoutCap,
+}
+
+/// Classify a denied principal's shape. Pure; no I/O, no state.
+fn principal_shape(principal: &CallerPrincipal) -> PrincipalShape {
     if principal.token_kind == Some(TokenKind::ServiceAccount) {
-        "principal is a ServiceAccount token (SAs never consume \
-         ClaimMappings). Verify (a) a `kind: PermissionGrant` with `subject: serviceAccount` \
-         covers this repository + permission and the gitops apply succeeded; (b) the apply \
-         log shows the consolidated `permission_grant audit events committed` line — the \
-         resolved `GrantSubject::User(backing_user_id)` grant lands there; and (c) the \
-         token's cap (the SA's effective grants snapshotted at issuance) covers the \
-         requested permission — a grant added after issuance enters the cap on the next \
-         exchange or rotation."
+        PrincipalShape::ServiceAccount
     } else if principal.claims.is_empty() && principal.token_kind != Some(TokenKind::CliSession) {
-        "principal has no claims — verify the IdP group claim and `kind: ClaimMapping` bindings"
+        PrincipalShape::NoClaims
     } else if principal.token_kind == Some(TokenKind::CliSession)
         && principal
             .token_cap
             .as_ref()
             .is_some_and(|c| !c.permissions.contains(&Permission::Admin))
     {
-        // Most common admin-from-CLI deny shape. The
-        // cli_session principal's cap was minted without admin (no
-        // `--admin` at login). The hint points at the most likely
-        // remediation; if the deny was actually about a per-repo
-        // grant gap, the operator finds out after re-login fails.
-        // Pure tracing — never load-bearing on the deny decision.
-        "principal authenticated via `hort-cli auth login` (no --admin); the session token's \
-         cap does not include admin. Re-login with `hort-cli auth login --admin` to mint a \
-         1h admin-capable session, subject to the server's HORT_TOKEN_ALLOW_ADMIN gate."
+        PrincipalShape::CliSessionWithoutAdminCap
     } else if principal.token_cap.is_some() {
-        "principal has claim(s); deny may be from token-cap narrowing OR a missing \
-         `kind: PermissionGrant` — check both the token's allowed scopes/repos and that a \
-         matching grant exists"
+        PrincipalShape::ClaimsWithCap
     } else {
-        "principal has claim(s) but no `kind: PermissionGrant` matches this (permission, \
-         repository) — declare a PermissionGrant; see \
-         docs/architecture/how-to/declare-gitops-config.md"
+        PrincipalShape::ClaimsWithoutCap
+    }
+}
+
+/// Operator-facing diagnostic appended to every deny log line.
+///
+/// The bare `"authorization denied"` line carries who and what but no
+/// signal pointing at the surface that would fix the deny, so this names
+/// one — the gitops object to declare, the token to re-mint, the claim
+/// binding to check.
+///
+/// # Two inputs, two different questions
+///
+/// - `decision` — WHICH leg of the two-leg AND denied
+///   ([`RbacEvaluator::authorize_explained`](hort_app::rbac::RbacEvaluator::authorize_explained)).
+///   A measured fact, not an inference. `DeniedCap` exonerates the grant
+///   table outright; `DeniedGrants` exonerates the token's cap.
+/// - the principal's shape ([`PrincipalShape`]) — the likely remediation
+///   *within* that leg. Still the only thing that separates "the IdP group
+///   claim never resolved" from "the grant is missing", both of which are
+///   grants-leg denials.
+///
+/// The shape alone used to carry the whole burden, which is why the
+/// claims-present-with-a-cap case could only offer a checklist ("check
+/// both the token's scopes and the grant table"): with a bare `bool` from
+/// the evaluator there was nothing else to say. That checklist arm and the
+/// ServiceAccount arm's three-way (a)/(b)/(c) version are now answered by
+/// the decision, and appear only where the decision genuinely is "both".
+///
+/// `decision = None` means *no single reason exists* — the composite
+/// curate-or-admin gate evaluates two permissions and denies on the pair,
+/// so neither decision describes that deny on its own. That case falls
+/// back to the shape ladder alone, which is what every deny log carried
+/// before the leg became observable. `Some(AuthzDecision::Allowed)` is
+/// unreachable from a deny path and is treated the same way.
+///
+/// # Constraints
+///
+/// The hint is **advisory** — purely a log string, never load-bearing for
+/// the deny decision (which is the evaluator's concern). It returns
+/// `&'static str`, so adding it to the tracing call allocates nothing on
+/// the deny path; every arm below is a static literal for that reason.
+///
+/// The `match` is exhaustive over both taxonomies with no catch-all arm
+/// covering an unhandled `AuthzDecision` or `PrincipalShape`, so adding a
+/// variant to either is a compile error here rather than a hint that
+/// silently stops discriminating.
+fn deny_hint(principal: &CallerPrincipal, decision: Option<AuthzDecision>) -> &'static str {
+    match (decision, principal_shape(principal)) {
+        // ---- the cap leg denied; the grant table is exonerated --------
+        (Some(AuthzDecision::DeniedCap), PrincipalShape::CliSessionWithoutAdminCap) => {
+            "the identity holds this permission but the presented session token's cap does \
+             not — `hort-cli auth login` minted it without --admin. Re-login with \
+             `hort-cli auth login --admin` to mint a 1h admin-capable session, subject to the \
+             server's HORT_TOKEN_ALLOW_ADMIN gate. No PermissionGrant change is needed."
+        }
+        (Some(AuthzDecision::DeniedCap), PrincipalShape::ServiceAccount) => {
+            "principal is a ServiceAccount token whose identity DOES hold this permission — \
+             the presented token's cap is what excluded it. The cap is a snapshot of the \
+             backing user's effective grants taken at issuance, so a grant added afterwards \
+             only enters the cap on the next exchange or rotation: re-exchange or rotate the \
+             token. The PermissionGrant table is not the fault."
+        }
+        (Some(AuthzDecision::DeniedCap), _) => {
+            "the identity holds this permission; the presented token's cap excluded this \
+             (permission, repository). Check the token's declared permissions and its \
+             repository set — a cap scoped to other repositories denies this one even when \
+             the grant is entirely correct. The PermissionGrant table is not the fault."
+        }
+        // ---- the grants leg denied; the token's cap is exonerated -----
+        (Some(AuthzDecision::DeniedGrants), PrincipalShape::NoClaims) => {
+            "principal has no claims — verify the IdP group claim and `kind: ClaimMapping` \
+             bindings. The presented token's cap allows this; only the grants leg denied, and \
+             no PermissionGrant can match until a claim resolves."
+        }
+        (Some(AuthzDecision::DeniedGrants), PrincipalShape::ServiceAccount) => {
+            "principal is a ServiceAccount token (SAs never consume ClaimMappings) and the \
+             grants leg is what denied — the presented token's cap allows this, so the cap is \
+             not the fault. Verify (a) a `kind: PermissionGrant` with `subject: \
+             serviceAccount` covers this repository + permission and the gitops apply \
+             succeeded; and (b) the apply log shows the consolidated `permission_grant audit \
+             events committed` line — the resolved `GrantSubject::User(backing_user_id)` \
+             grant lands there."
+        }
+        (Some(AuthzDecision::DeniedGrants), _) => {
+            "no `kind: PermissionGrant` matches this (permission, repository) — declare a \
+             PermissionGrant; see docs/architecture/how-to/declare-gitops-config.md. The \
+             presented token's cap allows this; only the grants leg denied."
+        }
+        // ---- both legs denied: fixing one leaves the deny in place ----
+        (Some(AuthzDecision::DeniedBoth), PrincipalShape::NoClaims) => {
+            "BOTH legs denied, so fixing one leaves the deny in place: principal has no \
+             claims AND the presented token's cap excludes this (permission, repository). \
+             Verify the IdP group claim and `kind: ClaimMapping` bindings first (no \
+             PermissionGrant can match until a claim resolves), then the token's declared \
+             permissions and repository set."
+        }
+        (Some(AuthzDecision::DeniedBoth), PrincipalShape::ServiceAccount) => {
+            "principal is a ServiceAccount token (SAs never consume ClaimMappings) and BOTH \
+             legs denied, so fixing one leaves the deny in place. Verify (a) a `kind: \
+             PermissionGrant` with `subject: serviceAccount` covers this repository + \
+             permission and the gitops apply succeeded; (b) the apply log shows the \
+             consolidated `permission_grant audit events committed` line — the resolved \
+             `GrantSubject::User(backing_user_id)` grant lands there; and (c) the token's cap \
+             (the SA's effective grants snapshotted at issuance) covers the requested \
+             permission — a grant added after issuance enters the cap on the next exchange \
+             or rotation."
+        }
+        (Some(AuthzDecision::DeniedBoth), _) => {
+            "BOTH legs denied, so fixing one leaves the deny in place: declare a matching \
+             `kind: PermissionGrant` (see docs/architecture/how-to/declare-gitops-config.md) \
+             AND widen or re-mint the presented token's cap to cover this (permission, \
+             repository)."
+        }
+        // ---- no single reason to report: the shape ladder alone -------
+        (None | Some(AuthzDecision::Allowed), PrincipalShape::ServiceAccount) => {
+            "principal is a ServiceAccount token (SAs never consume \
+             ClaimMappings). Verify (a) a `kind: PermissionGrant` with `subject: serviceAccount` \
+             covers this repository + permission and the gitops apply succeeded; (b) the apply \
+             log shows the consolidated `permission_grant audit events committed` line — the \
+             resolved `GrantSubject::User(backing_user_id)` grant lands there; and (c) the \
+             token's cap (the SA's effective grants snapshotted at issuance) covers the \
+             requested permission — a grant added after issuance enters the cap on the next \
+             exchange or rotation."
+        }
+        (None | Some(AuthzDecision::Allowed), PrincipalShape::NoClaims) => {
+            "principal has no claims — verify the IdP group claim and `kind: ClaimMapping` bindings"
+        }
+        (None | Some(AuthzDecision::Allowed), PrincipalShape::CliSessionWithoutAdminCap) => {
+            // Most common admin-from-CLI deny shape. The
+            // cli_session principal's cap was minted without admin (no
+            // `--admin` at login). The hint points at the most likely
+            // remediation; if the deny was actually about a per-repo
+            // grant gap, the operator finds out after re-login fails.
+            // Pure tracing — never load-bearing on the deny decision.
+            "principal authenticated via `hort-cli auth login` (no --admin); the session token's \
+             cap does not include admin. Re-login with `hort-cli auth login --admin` to mint a \
+             1h admin-capable session, subject to the server's HORT_TOKEN_ALLOW_ADMIN gate."
+        }
+        (None | Some(AuthzDecision::Allowed), PrincipalShape::ClaimsWithCap) => {
+            "principal has claim(s); deny may be from token-cap narrowing OR a missing \
+             `kind: PermissionGrant` — check both the token's allowed scopes/repos and that a \
+             matching grant exists"
+        }
+        (None | Some(AuthzDecision::Allowed), PrincipalShape::ClaimsWithoutCap) => {
+            "principal has claim(s) but no `kind: PermissionGrant` matches this (permission, \
+             repository) — declare a PermissionGrant; see \
+             docs/architecture/how-to/declare-gitops-config.md"
+        }
     }
 }
 
@@ -682,38 +833,39 @@ fn deny_hint(principal: &CallerPrincipal) -> &'static str {
 /// emitting exactly one decision per request via
 /// [`emit_authz_decision`].
 ///
-/// `Ok(true)` means "RBAC allows"; `Ok(false)` means "RBAC denies"
-/// (the caller decides whether to retry under a different
-/// permission or surface a 403). `Err(_)` is the same router-wiring
+/// Returns the full [`AuthzDecision`] rather than a bare `bool` so the
+/// composite gate can report BOTH per-permission decisions on its single
+/// deny line — a merged reason there would be a fiction, since the two
+/// legs can fail for different reasons. `Err(_)` is the same router-wiring
 /// 500 the shared [`authorize`] surfaces when [`AuthContext::Disabled`]
-/// — note the inversion: under Disabled this returns `Ok(true)` (the
-/// curate-or-admin extractor mirrors `authorize`'s "Disabled = allow"
-/// posture).
+/// — note the inversion: under Disabled this returns
+/// `Ok(AuthzDecision::Allowed)` (the curate-or-admin extractor mirrors
+/// `authorize`'s "Disabled = allow" posture).
 fn evaluate_rbac(
     state: &Arc<AppContext>,
     principal: &CallerPrincipal,
     permission: Permission,
     repository_id: Option<uuid::Uuid>,
-) -> Result<bool, RejectResponse> {
+) -> Result<AuthzDecision, RejectResponse> {
     let rbac_handle = match &state.auth {
         AuthContext::Disabled => {
             // Mirrors `authorize`'s Disabled branch — extractors
             // grant unconditionally under Disabled. We still need to
             // emit a single allow tick at the call site, so we return
-            // `Ok(true)` here and let the caller decide whether to
-            // emit (the caller short-circuits on the first `true`).
+            // `Allowed` here and let the caller decide whether to
+            // emit (the caller short-circuits on the first allow).
             tracing::info!(
                 user_id = %principal.user_id,
                 permission = ?permission,
                 repository_id = ?repository_id,
                 "authorization granted (auth disabled)"
             );
-            return Ok(true);
+            return Ok(AuthzDecision::Allowed);
         }
         AuthContext::Enabled { rbac, .. } | AuthContext::BearerOnly { rbac, .. } => rbac.clone(),
     };
     let rbac = rbac_handle.load();
-    Ok(rbac.authorize(principal, permission, repository_id))
+    Ok(rbac.authorize_explained(principal, permission, repository_id))
 }
 
 /// Run the RBAC predicate, emit the allow/deny metric + trace, and shape
@@ -750,7 +902,12 @@ fn authorize(
     // holds the snapshot alive for the duration of this call even if
     // the refresh task swaps underneath.
     let rbac = rbac_handle.load();
-    if rbac.authorize(principal, permission, repository_id) {
+    // `authorize_explained` is the same evaluation `authorize` performs —
+    // one call, one verdict — with the denied leg preserved instead of
+    // collapsed into `false`. There is one decision per request here, so
+    // this is the path that can report a reason.
+    let decision = rbac.authorize_explained(principal, permission, repository_id);
+    if decision.is_allowed() {
         emit_authz_decision(permission_label, RESULT_ALLOW);
         tracing::debug!(
             user_id = %principal.user_id,
@@ -761,6 +918,13 @@ fn authorize(
         Ok(())
     } else {
         emit_authz_decision(permission_label, RESULT_DENY);
+        // Deny-only sibling series. `denial_reason()` is `Some` for every
+        // decision that is not `Allowed`, which this branch has already
+        // excluded; the `if let` keeps the audit log below unconditional
+        // rather than tying it to the metric.
+        if let Some(reason) = decision.denial_reason() {
+            emit_authz_denial(permission_label, reason);
+        }
         tracing::info!(
             user_id = %principal.user_id,
             permission = permission_label,
@@ -774,7 +938,12 @@ fn authorize(
             // / routine logs, not the security-relevant deny record.
             claims = ?principal.claims,
             token_kind = ?principal.token_kind,
-            hint = deny_hint(principal),
+            // Which leg denied, as the variant name. The metric's
+            // lowercase `reason` label carries the same distinction under
+            // the spellings `docs/metrics-catalog.md` documents, so a
+            // dashboard spike pivots onto these log lines.
+            denial_reason = ?decision,
+            hint = deny_hint(principal, Some(decision)),
             "authorization denied"
         );
         Err(forbidden_response())
@@ -1045,7 +1214,7 @@ mod tests {
     /// the kind is the typed `token_kind`, never a claim string.
     fn cli_session_principal() -> CallerPrincipal {
         CallerPrincipal {
-            token_kind: Some(hort_domain::entities::api_token::TokenKind::CliSession),
+            token_kind: Some(TokenKind::CliSession),
             ..principal(&[])
         }
     }
@@ -1057,7 +1226,7 @@ mod tests {
     /// ClaimMapping).
     fn service_account_principal() -> CallerPrincipal {
         CallerPrincipal {
-            token_kind: Some(hort_domain::entities::api_token::TokenKind::ServiceAccount),
+            token_kind: Some(TokenKind::ServiceAccount),
             ..principal(&[])
         }
     }
@@ -2234,10 +2403,15 @@ mod tests {
     // ================================================================
     // deny_hint — operator-facing diagnostic on the deny log
     //
-    // The helper is pure (no I/O, no state) so the three branches get
+    // The helper is pure (no I/O, no state) so the branches get
     // unit tests directly. A separate `#[traced_test]` further down
     // pins the wiring from `authorize`'s deny path into the actual log
     // record, so a future refactor cannot quietly drop the field.
+    //
+    // The cases below pass `decision = None` — the no-single-reason
+    // shape the composite curate-or-admin gate uses, and the ladder
+    // every deny log carried before the denied leg became observable.
+    // The reason-aware arms have their own section further down.
     // ================================================================
 
     #[test]
@@ -2245,7 +2419,7 @@ mod tests {
         // Empty `claims`, and not a
         // CliSession principal (those route to the cap-aware branch).
         let p = principal(&[]);
-        let hint = deny_hint(&p);
+        let hint = deny_hint(&p, None);
         assert!(hint.contains("ClaimMapping"), "hint: {hint}");
         assert!(hint.contains("group claim"), "hint: {hint}");
     }
@@ -2253,7 +2427,7 @@ mod tests {
     #[test]
     fn deny_hint_role_no_token_cap_points_at_permission_grant() {
         let p = principal(&["developer"]);
-        let hint = deny_hint(&p);
+        let hint = deny_hint(&p, None);
         assert!(hint.contains("PermissionGrant"), "hint: {hint}");
         assert!(
             hint.contains("declare-gitops-config.md"),
@@ -2270,7 +2444,7 @@ mod tests {
             permissions: vec![Permission::Read],
             repository_ids: None,
         });
-        let hint = deny_hint(&p);
+        let hint = deny_hint(&p, None);
         assert!(hint.contains("token-cap"), "hint: {hint}");
         assert!(hint.contains("PermissionGrant"), "hint: {hint}");
     }
@@ -2301,7 +2475,7 @@ mod tests {
     fn deny_hint_cli_session_without_admin_cap_points_at_admin_relogin() {
         let mut p = cli_session_principal();
         p.token_cap = Some(cap_with(vec![Permission::Read, Permission::Write]));
-        let hint = deny_hint(&p);
+        let hint = deny_hint(&p, None);
         assert!(
             hint.contains("hort-cli auth login --admin"),
             "expected --admin remediation hint: {hint}"
@@ -2324,7 +2498,7 @@ mod tests {
             Permission::Read,
             Permission::Write,
         ]));
-        let hint = deny_hint(&p);
+        let hint = deny_hint(&p, None);
         assert!(
             !hint.contains("hort-cli auth login --admin"),
             "cli_session WITH admin cap must not get --admin hint: {hint}"
@@ -2340,7 +2514,7 @@ mod tests {
         // generic token-cap branch.
         let mut p = principal(&["developer"]);
         p.token_cap = Some(cap_with(vec![Permission::Read]));
-        let hint = deny_hint(&p);
+        let hint = deny_hint(&p, None);
         assert!(
             !hint.contains("hort-cli auth login --admin"),
             "non-CliSession principal (token_kind != CliSession) must not get --admin hint: {hint}"
@@ -2360,7 +2534,7 @@ mod tests {
     #[test]
     fn deny_hint_service_account_branch_does_not_point_at_claim_mapping() {
         let p = service_account_principal();
-        let hint = deny_hint(&p);
+        let hint = deny_hint(&p, None);
         assert!(
             !hint.contains("verify the IdP group claim"),
             "SA deny hint must not steer at IdP group / ClaimMapping bindings \
@@ -2388,7 +2562,7 @@ mod tests {
         // guard excludes it) — it falls through to the grant-miss hint.
         let p = cli_session_principal();
         // token_cap defaults to None via principal()
-        let hint = deny_hint(&p);
+        let hint = deny_hint(&p, None);
         assert!(
             !hint.contains("hort-cli auth login --admin"),
             "CliSession without cap must not get --admin hint: {hint}"
@@ -2396,18 +2570,58 @@ mod tests {
         assert!(hint.contains("PermissionGrant"), "hint: {hint}");
     }
 
-    /// Pin the deny-log wiring: a cli_session principal
-    /// without admin cap denied on an admin operation must surface the
-    /// `--admin` hint in the audit log line. Mirrors the existing
+    /// Pin the deny-log wiring: a cli_session principal whose IDENTITY is
+    /// admin but whose session cap was minted without `--admin` must
+    /// surface the `--admin` hint in the audit log line. Mirrors the
+    /// existing
     /// `deny_log_carries_permission_grant_hint_for_role_principal_without_grant`
     /// test pattern.
+    ///
+    /// The `admin` claim is what makes this the shape the hint is for: the
+    /// grants leg passes on the admin short-circuit and only the cap
+    /// denies, so re-login with `--admin` is a remedy that can actually
+    /// succeed. A principal with no admin authority at all gets the
+    /// both-legs hint instead — see
+    /// `deny_log_does_not_offer_admin_relogin_when_the_identity_is_not_admin`.
     #[tracing_test::traced_test]
     #[test]
     fn deny_log_carries_admin_relogin_hint_for_cli_session_principal_without_admin_cap() {
         use hort_domain::entities::rbac::Permission;
         run_async(async {
             let repos = Arc::new(MockRepositoryRepository::new());
-            // Empty evaluator: every authorize() returns false → deny.
+            // Empty evaluator: the admin claim short-circuits the grants
+            // leg, so the cap is the only leg that can deny.
+            let ctx = ctx_with_repos(repos, enabled_auth(RbacEvaluator::new(Vec::new())));
+            let router = admin_router(ctx);
+            let mut p = cli_session_principal();
+            p.claims = vec!["admin".into()];
+            p.token_cap = Some(hort_domain::entities::api_token::TokenCap {
+                permissions: vec![Permission::Read, Permission::Write, Permission::Delete],
+                repository_ids: None,
+            });
+            let req = request_with_principal("/admin/thing", Some(p));
+            router.oneshot(req).await.unwrap()
+        });
+        assert!(logs_contain("hort-cli auth login --admin"));
+        assert!(
+            logs_contain("DeniedCap"),
+            "the cap is the only leg that can deny an admin-claim principal here"
+        );
+    }
+
+    /// The counterpart, and a behaviour change worth pinning: a CliSession
+    /// principal holding NO admin authority (empty evaluator, no admin
+    /// claim) fails BOTH legs, and must not be told to re-login with
+    /// `--admin` — that mint would be refused by the issuance admin gate,
+    /// sending the operator round the loop for nothing. The shape ladder
+    /// alone could not tell this case from the one above; the measured
+    /// leg can.
+    #[tracing_test::traced_test]
+    #[test]
+    fn deny_log_does_not_offer_admin_relogin_when_the_identity_is_not_admin() {
+        use hort_domain::entities::rbac::Permission;
+        run_async(async {
+            let repos = Arc::new(MockRepositoryRepository::new());
             let ctx = ctx_with_repos(repos, enabled_auth(RbacEvaluator::new(Vec::new())));
             let router = admin_router(ctx);
             let mut p = cli_session_principal();
@@ -2418,7 +2632,16 @@ mod tests {
             let req = request_with_principal("/admin/thing", Some(p));
             router.oneshot(req).await.unwrap()
         });
-        assert!(logs_contain("hort-cli auth login --admin"));
+        assert!(logs_contain("DeniedBoth"), "both legs deny this principal");
+        assert!(
+            !logs_contain("hort-cli auth login --admin"),
+            "a principal with no admin authority must not be sent to re-login \
+             with --admin — the mint would be refused"
+        );
+        assert!(
+            logs_contain("PermissionGrant"),
+            "the grant surface must still be named"
+        );
     }
 
     /// Pins the deny-path tracing wiring: the role-bearing principal
@@ -2442,6 +2665,480 @@ mod tests {
         assert!(
             logs_contain("PermissionGrant"),
             "operator-facing PermissionGrant hint missing from deny log"
+        );
+    }
+
+    // ================================================================
+    // deny_hint — the reason-aware arms
+    //
+    // A measured denied leg replaces two guesses: the "check both the
+    // token's scopes and the grant table" hedge, and the ServiceAccount
+    // arm's three-way (a)/(b)/(c) checklist. Both survive, but only
+    // where the decision genuinely is `DeniedBoth`.
+    //
+    // Each case asserts two things: the surface the hint names, and the
+    // surface it exonerates. The second half is the point — an operator
+    // reading a cap reject must be told the grant table is fine, or
+    // they will check it anyway.
+    // ================================================================
+
+    #[test]
+    fn deny_hint_cap_reject_names_the_token_and_exonerates_the_grant_table() {
+        let mut p = principal(&["developer"]);
+        p.token_cap = Some(cap_with(vec![Permission::Write]));
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedCap));
+        assert!(
+            hint.contains("the presented token's cap excluded"),
+            "cap reject must name the cap: {hint}"
+        );
+        assert!(
+            hint.contains("PermissionGrant table is not the fault"),
+            "cap reject must exonerate the grant table: {hint}"
+        );
+    }
+
+    /// The `hort-cli auth login` (no `--admin`) shape, now measured
+    /// rather than inferred from the principal's shape alone: the cap
+    /// really is what denied, so the re-login remediation is certain and
+    /// the hint can say no grant change is needed.
+    #[test]
+    fn deny_hint_cap_reject_for_cli_session_without_admin_cap_points_at_relogin() {
+        let mut p = cli_session_principal();
+        p.token_cap = Some(cap_with(vec![Permission::Read, Permission::Write]));
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedCap));
+        assert!(
+            hint.contains("hort-cli auth login --admin"),
+            "expected --admin remediation: {hint}"
+        );
+        assert!(
+            hint.contains("HORT_TOKEN_ALLOW_ADMIN"),
+            "expected HORT_TOKEN_ALLOW_ADMIN reference: {hint}"
+        );
+        assert!(
+            hint.contains("No PermissionGrant change is needed"),
+            "a measured cap reject must exonerate the grant table: {hint}"
+        );
+    }
+
+    /// The SA cap-reject arm is the stale-snapshot case: the identity
+    /// holds the permission, the cap was taken before the grant existed.
+    /// The (a)/(b) grant-surface checklist items are noise here.
+    #[test]
+    fn deny_hint_cap_reject_for_service_account_points_at_the_cap_snapshot() {
+        let mut p = service_account_principal();
+        p.token_cap = Some(cap_with(vec![Permission::Read]));
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedCap));
+        assert!(
+            hint.contains("exchange or rotation"),
+            "SA cap reject must point at re-exchange / rotation: {hint}"
+        );
+        assert!(
+            hint.contains("PermissionGrant table is not the fault"),
+            "SA cap reject must exonerate the grant table: {hint}"
+        );
+        assert!(
+            !hint.contains("(a)"),
+            "a measured cap reject must not offer the (a)/(b)/(c) checklist: {hint}"
+        );
+    }
+
+    #[test]
+    fn deny_hint_grants_deny_names_the_grant_and_exonerates_the_cap() {
+        let mut p = principal(&["developer"]);
+        p.token_cap = Some(cap_with(vec![Permission::Write]));
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedGrants));
+        assert!(hint.contains("PermissionGrant"), "hint: {hint}");
+        assert!(
+            hint.contains("declare-gitops-config.md"),
+            "hint should link the gitops how-to: {hint}"
+        );
+        assert!(
+            hint.contains("cap allows this"),
+            "a grants-leg deny must exonerate the token's cap: {hint}"
+        );
+    }
+
+    #[test]
+    fn deny_hint_grants_deny_for_empty_claims_still_points_at_claim_mapping() {
+        let p = principal(&[]);
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedGrants));
+        assert!(hint.contains("ClaimMapping"), "hint: {hint}");
+        assert!(hint.contains("group claim"), "hint: {hint}");
+        assert!(
+            hint.contains("cap allows this"),
+            "a grants-leg deny must exonerate the token's cap: {hint}"
+        );
+    }
+
+    /// The (c) cap item drops off the SA checklist once the cap is
+    /// measured to have allowed the request; (a) and (b) remain because
+    /// the decision cannot tell an unapplied grant from an absent one.
+    #[test]
+    fn deny_hint_grants_deny_for_service_account_drops_the_cap_checklist_item() {
+        let p = service_account_principal();
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedGrants));
+        assert!(
+            hint.contains("(a)") && hint.contains("(b)"),
+            "the grant-surface checklist items must survive: {hint}"
+        );
+        assert!(
+            !hint.contains("(c)"),
+            "the cap checklist item must drop once the cap is known to allow: {hint}"
+        );
+        assert!(
+            hint.contains("cap is not the fault"),
+            "hint should say the cap allowed it: {hint}"
+        );
+    }
+
+    #[test]
+    fn deny_hint_both_legs_says_fixing_one_leaves_the_deny() {
+        let mut p = principal(&["developer"]);
+        p.token_cap = Some(cap_with(vec![Permission::Read]));
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedBoth));
+        assert!(
+            hint.contains("BOTH legs denied") && hint.contains("fixing one leaves the deny"),
+            "a both-legs deny must say so explicitly: {hint}"
+        );
+        assert!(hint.contains("PermissionGrant"), "hint: {hint}");
+        assert!(hint.contains("token's cap"), "hint: {hint}");
+    }
+
+    #[test]
+    fn deny_hint_both_legs_for_empty_claims_names_both_surfaces() {
+        let mut p = principal(&[]);
+        p.token_cap = Some(cap_with(vec![Permission::Read]));
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedBoth));
+        assert!(hint.contains("ClaimMapping"), "hint: {hint}");
+        assert!(
+            hint.contains("token's declared permissions"),
+            "hint: {hint}"
+        );
+        assert!(hint.contains("BOTH legs denied"), "hint: {hint}");
+    }
+
+    /// `DeniedBoth` is the one case where the SA three-way checklist is
+    /// the honest answer rather than a hedge — and it now says so.
+    #[test]
+    fn deny_hint_both_legs_for_service_account_keeps_the_full_checklist() {
+        let mut p = service_account_principal();
+        p.token_cap = Some(cap_with(vec![Permission::Read]));
+        let hint = deny_hint(&p, Some(AuthzDecision::DeniedBoth));
+        assert!(
+            hint.contains("(a)") && hint.contains("(b)") && hint.contains("(c)"),
+            "a measured both-legs deny keeps the full checklist: {hint}"
+        );
+        assert!(
+            hint.contains("BOTH legs denied"),
+            "the checklist must be labelled as a measured both, not a guess: {hint}"
+        );
+    }
+
+    /// The hedge the item exists to remove: with a known single leg the
+    /// hint must never tell the operator to check both surfaces.
+    #[test]
+    fn deny_hint_with_a_known_single_leg_never_offers_the_check_both_hedge() {
+        let mut p = principal(&["developer"]);
+        p.token_cap = Some(cap_with(vec![Permission::Read]));
+        for decision in [AuthzDecision::DeniedCap, AuthzDecision::DeniedGrants] {
+            let hint = deny_hint(&p, Some(decision));
+            assert!(
+                !hint.contains("check both"),
+                "{decision:?} must not offer the check-both hedge: {hint}"
+            );
+            assert!(
+                !hint.contains("deny may be from"),
+                "{decision:?} must not hedge about the source of the deny: {hint}"
+            );
+        }
+    }
+
+    /// `Allowed` cannot reach a deny log, but the argument type admits it;
+    /// it must behave exactly like the no-single-reason case rather than
+    /// inventing a fifth hint.
+    #[test]
+    fn deny_hint_allowed_decision_falls_back_to_the_principal_shape_ladder() {
+        let mut p = principal(&["developer"]);
+        p.token_cap = Some(cap_with(vec![Permission::Read]));
+        assert_eq!(
+            deny_hint(&p, Some(AuthzDecision::Allowed)),
+            deny_hint(&p, None)
+        );
+    }
+
+    // ================================================================
+    // hort_authz_denials_total — the deny-only sibling counter
+    //
+    // Emitted from the general `authorize` path only, where exactly one
+    // decision exists. The composite curate-or-admin gate has two and
+    // emits none — asserted below.
+    // ================================================================
+
+    /// A single-claim `GrantSubject::Claims` grant. `repo = None` is a
+    /// global grant (matches every repository id, including `None`).
+    fn claims_grant(claim: &str, repo: Option<Uuid>, permission: Permission) -> PermissionGrant {
+        PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::Claims(vec![claim.into()]),
+            repository_id: repo,
+            permission,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        }
+    }
+
+    /// An RBAC evaluator granting `Write` on EVERY repository to the
+    /// `developer` claim. Used by the cap-reject cases: the grants leg
+    /// must pass so the cap is the only thing that can deny.
+    fn rbac_with_global_write_grant() -> RbacEvaluator {
+        RbacEvaluator::new(vec![claims_grant("developer", None, Permission::Write)])
+    }
+
+    /// Drive a write request against the `seeded_repo()` fixture as `p`
+    /// through the `WriteRepoAccess` extractor, returning the metric
+    /// snapshot and the response status. `rbac_for` receives the seeded
+    /// repository's id so a per-repo grant can be built against it.
+    fn write_attempt(
+        rbac_for: impl FnOnce(Uuid) -> RbacEvaluator,
+        p: CallerPrincipal,
+    ) -> (Vec<MetricEntry>, StatusCode) {
+        let (snap, status) = capture(|| {
+            run_async(async {
+                let (spy, repo) = seeded_repo();
+                let ctx = ctx_with_repos(spy, enabled_auth(rbac_for(repo.id)));
+                let router = write_router(ctx);
+                let req = request_with_principal("/my-repo/upload", Some(p));
+                router.oneshot(req).await.unwrap().status()
+            })
+        });
+        (snap.into_vec(), status)
+    }
+
+    fn denial_counter(entries: &[MetricEntry], permission: &str, reason: &str) -> Option<u64> {
+        match find(
+            entries,
+            MetricKind::Counter,
+            "hort_authz_denials_total",
+            &[("permission", permission), ("reason", reason)],
+        ) {
+            Some(DebugValue::Counter(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// The shape that produced the same wrong diagnosis twice: a correct,
+    /// applied, global grant, and a presented token whose cap is scoped to
+    /// a different repository. The response stays a deny — the caller sees
+    /// no new distinction — but the reason is now on the counter.
+    #[test]
+    fn write_denied_by_cap_scope_emits_reason_cap() {
+        let other_repo_id = Uuid::new_v4();
+        let mut p = principal(&["developer"]);
+        p.token_cap = Some(hort_domain::entities::api_token::TokenCap {
+            permissions: vec![Permission::Write],
+            repository_ids: Some(vec![other_repo_id]),
+        });
+        let (entries, status) = write_attempt(|_| rbac_with_global_write_grant(), p);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            denial_counter(&entries, "write", "cap"),
+            Some(1),
+            "a cap-scoped-elsewhere deny must tick reason=cap"
+        );
+        assert_eq!(
+            denial_counter(&entries, "write", "grants"),
+            None,
+            "the grant is correct — nothing may tick reason=grants"
+        );
+        // The pre-existing decision counter is untouched by this change.
+        let v = find(
+            &entries,
+            MetricKind::Counter,
+            "hort_authz_decisions_total",
+            &[("permission", "write"), ("result", "deny")],
+        )
+        .expect("write/deny decision counter absent");
+        assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+    }
+
+    #[test]
+    fn write_denied_by_missing_grant_emits_reason_grants() {
+        let mut p = principal(&["developer"]);
+        // Cap permits Write everywhere; the evaluator holds no grants.
+        p.token_cap = Some(cap_with(vec![Permission::Write]));
+        let (entries, status) = write_attempt(|_| RbacEvaluator::new(Vec::new()), p);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(denial_counter(&entries, "write", "grants"), Some(1));
+        assert_eq!(denial_counter(&entries, "write", "cap"), None);
+    }
+
+    #[test]
+    fn write_denied_by_both_legs_emits_reason_both() {
+        let mut p = principal(&["developer"]);
+        p.token_cap = Some(cap_with(vec![Permission::Read]));
+        let (entries, status) = write_attempt(|_| RbacEvaluator::new(Vec::new()), p);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(denial_counter(&entries, "write", "both"), Some(1));
+        assert_eq!(denial_counter(&entries, "write", "grants"), None);
+        assert_eq!(denial_counter(&entries, "write", "cap"), None);
+    }
+
+    /// A principal with no cap at all can never tick `reason=cap`: the cap
+    /// leg is vacuously true, so the grants leg is the only one that can
+    /// deny.
+    #[test]
+    fn write_denied_without_a_cap_emits_reason_grants() {
+        let (entries, status) =
+            write_attempt(|_| RbacEvaluator::new(Vec::new()), principal(&["reader"]));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(denial_counter(&entries, "write", "grants"), Some(1));
+        assert_eq!(denial_counter(&entries, "write", "cap"), None);
+        assert_eq!(denial_counter(&entries, "write", "both"), None);
+    }
+
+    /// An allow must not tick the deny-only series at all.
+    #[test]
+    fn allowed_write_emits_no_denial_counter() {
+        let (entries, status) = write_attempt(
+            |_| rbac_with_global_write_grant(),
+            principal(&["developer"]),
+        );
+        assert_eq!(status, StatusCode::OK);
+        for reason in ["grants", "cap", "both"] {
+            assert_eq!(
+                denial_counter(&entries, "write", reason),
+                None,
+                "an allow must not tick reason={reason}"
+            );
+        }
+    }
+
+    /// Pin the deny-log wiring end to end: a correct, applied, global
+    /// grant against a token cap scoped to a different repository must
+    /// name the cap in the record an operator greps, and must not hand
+    /// them the check-both checklist.
+    #[tracing_test::traced_test]
+    #[test]
+    fn deny_log_names_the_cap_for_a_cap_scoped_elsewhere() {
+        let mut p = principal(&["developer"]);
+        p.token_cap = Some(hort_domain::entities::api_token::TokenCap {
+            permissions: vec![Permission::Write],
+            repository_ids: Some(vec![Uuid::new_v4()]),
+        });
+        let (_entries, status) = write_attempt(|_| rbac_with_global_write_grant(), p);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            logs_contain("authorization denied"),
+            "deny log line missing"
+        );
+        assert!(
+            logs_contain("DeniedCap"),
+            "deny log must carry the denied leg as a structured field"
+        );
+        assert!(
+            logs_contain("PermissionGrant table is not the fault"),
+            "deny log must exonerate the grant table on a cap reject"
+        );
+        assert!(
+            !logs_contain("check both"),
+            "a measured cap reject must not offer the check-both hedge"
+        );
+    }
+
+    // ================================================================
+    // CurateOrAdminPrincipal — the composite gate
+    //
+    // Two decisions, one deny. It reports BOTH decisions on the log line
+    // and emits no `hort_authz_denials_total` tick, because no single
+    // reason describes the deny.
+    // ================================================================
+
+    fn curate_router(ctx: Arc<AppContext>) -> Router {
+        async fn handler(_extractor: CurateOrAdminPrincipal) -> StatusCode {
+            StatusCode::OK
+        }
+        Router::new()
+            .route("/curation/thing", get(handler))
+            .with_state(ctx)
+    }
+
+    fn curate_attempt(rbac: RbacEvaluator, p: CallerPrincipal) -> (Vec<MetricEntry>, StatusCode) {
+        let (snap, status) = capture(|| {
+            run_async(async {
+                let repos = Arc::new(MockRepositoryRepository::new());
+                let ctx = ctx_with_repos(repos, enabled_auth(rbac));
+                let router = curate_router(ctx);
+                let req = request_with_principal("/curation/thing", Some(p));
+                router.oneshot(req).await.unwrap().status()
+            })
+        });
+        (snap.into_vec(), status)
+    }
+
+    #[test]
+    fn curate_or_admin_deny_emits_no_denial_counter() {
+        let (entries, status) =
+            curate_attempt(RbacEvaluator::new(Vec::new()), principal(&["reader"]));
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        for reason in ["grants", "cap", "both"] {
+            assert_eq!(
+                denial_counter(&entries, "curate", reason),
+                None,
+                "the composite gate has no single reason — reason={reason} must be absent"
+            );
+        }
+        // The decision counter is unchanged: one deny on the curate label.
+        let v = find(
+            &entries,
+            MetricKind::Counter,
+            "hort_authz_decisions_total",
+            &[("permission", "curate"), ("result", "deny")],
+        )
+        .expect("curate/deny decision counter absent");
+        assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+    }
+
+    #[test]
+    fn curate_or_admin_allows_a_curate_claim_holder() {
+        let rbac = RbacEvaluator::new(vec![claims_grant("curate", None, Permission::Curate)]);
+        let (entries, status) = curate_attempt(rbac, principal(&["curate"]));
+        assert_eq!(status, StatusCode::OK);
+        let v = find(
+            &entries,
+            MetricKind::Counter,
+            "hort_authz_decisions_total",
+            &[("permission", "curate"), ("result", "allow")],
+        )
+        .expect("curate/allow decision counter absent");
+        assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
+    }
+
+    /// Both per-permission decisions land on the composite gate's single
+    /// deny line. Here the legs fail differently — Curate on the grants
+    /// leg, Admin on both, because the cap carries neither permission —
+    /// which is exactly why a merged reason would be a fiction.
+    #[tracing_test::traced_test]
+    #[test]
+    fn curate_or_admin_deny_log_carries_both_decisions() {
+        let rbac = RbacEvaluator::new(vec![claims_grant("curate", None, Permission::Curate)]);
+        let mut p = principal(&["curate"]);
+        // Cap omits Curate → the Curate leg denies on the cap while the
+        // Admin leg denies on the grants (no admin claim) AND the cap.
+        p.token_cap = Some(cap_with(vec![Permission::Read]));
+        let (_entries, status) = curate_attempt(rbac, p);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(
+            logs_contain("curator-or-admin authorization denied"),
+            "composite deny log line missing"
+        );
+        assert!(
+            logs_contain("curate_decision") && logs_contain("admin_decision"),
+            "the composite deny must report both per-permission decisions"
+        );
+        assert!(
+            logs_contain("DeniedCap") && logs_contain("DeniedBoth"),
+            "the two legs failed differently and both verdicts must appear"
         );
     }
 
