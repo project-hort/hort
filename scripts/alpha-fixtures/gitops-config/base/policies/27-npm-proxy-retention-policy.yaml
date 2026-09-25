@@ -1,0 +1,45 @@
+apiVersion: project-hort.de/v1
+kind: RetentionPolicy
+metadata:
+  name: alpha-npm-proxy-retention
+spec:
+  # `predicate` and `scope` are the domain enums in their **JSON**
+  # externally-tagged shape, written as YAML maps — `{AgeExceeds: 86400}`,
+  # `{Repos: [npm-proxy]}`. They are NOT `serde_yaml` tag forms
+  # (`!AgeExceeds 86400`): the wire layer holds both fields as
+  # `serde_json::Value` and resolves them through `serde_json`, so a tag
+  # form does not deserialize at all. See
+  # `crates/hort-config/src/retention_policy.rs`.
+  #
+  # `AgeExceeds` is anchored on `Artifact.created_at` — when hort ingested
+  # the artifact, not when upstream published it. One day is chosen
+  # against both bounds of that anchor:
+  #
+  #   * Long enough that an alpha walk cannot match the content it just
+  #     ingested: a walk lasts minutes, so a match is evidence about
+  #     artifacts that predate the walk — the only population a real
+  #     cleanup is ever about. A span shorter than a walk would report a
+  #     match on an instance that holds nothing but what the walk put
+  #     there.
+  #   * Short enough that anything cached on an earlier day already
+  #     matches. A span reaching weeks back leaves the policy inert on a
+  #     young instance: it would demonstrate that a policy arrives and
+  #     nothing about whether it selects anything.
+  predicate:
+    AgeExceeds: 86400
+  # One repository, named by its `metadata.name` — never a UUID. A name is
+  # what survives rebuilding the instance from a fresh database, and the
+  # cross-spec validator requires the name to be a declared
+  # `ArtifactRepository` in this same tree, so a typo fails at parse
+  # rather than at the first sweep.
+  #
+  # A proxy repository, and exactly one: every artifact here is a
+  # pull-through cache entry that upstream still holds, so an expiry costs
+  # one re-fetch of byte-identical content (same payload, same content
+  # hash). The hosted repositories in this tree hold the only copy of what
+  # was published into them. `AllRepos`, `{Format: npm}` and
+  # `{IngestSource: Proxied}` all reach further than one re-fetchable
+  # cache while exercising the name-resolution path this scope exists for
+  # strictly less.
+  scope:
+    Repos: [npm-proxy]
