@@ -9,18 +9,20 @@
 //! ## Why
 //!
 //! The DB-backed test suites historically connected to ONE shared
-//! database and each ran `sqlx::migrate!().run()` against it. Under
-//! `cargo test --tests` cargo runs many test binaries in parallel, so
-//! they raced and corrupted each other's schema/data (concurrent
-//! migrate, `DROP TABLE … CASCADE` collateral, before/after deltas on
-//! global streams, …). [`isolated_db_from`] gives every caller its own
+//! database and each ran `sqlx::migrate!().run()` against it. Cargo
+//! runs the test binaries one after another, but libtest runs the tests
+//! *within* a binary on many threads at once, and each binary in turn
+//! inherited every earlier binary's leftovers — so they raced and
+//! corrupted each other's schema/data (concurrent migrate,
+//! `DROP TABLE … CASCADE` collateral, before/after deltas on global
+//! streams, …). [`isolated_db_from`] gives every caller its own
 //! freshly-created database, so cross-test/cross-binary interference is
 //! structurally impossible. The caller still runs its own
 //! `sqlx::migrate!().run()` on the returned pool (kept at the call site
 //! so the embedded-migration set stays crate-local; the workspace
 //! `build.rs` files make that embed track `migrations`).
 //!
-//! ## Cleanup — bounded, not unbounded (issue #37)
+//! ## Cleanup — a once-per-process sweep (issue #37)
 //!
 //! A throwaway database is still not dropped at the end of its own
 //! test (there is no teardown hook — [`isolated_db_from`] hands back a
@@ -49,11 +51,62 @@
 //!   proceeds to create its own database. Cleanup must never be the
 //!   reason a test fails.
 //!
-//! This bounds accumulation to roughly one run's worth. It does not
-//! *prevent* a leak — a drop-on-teardown guard would, at the cost of a
-//! guard type threaded through 22 test files and a database drop issued
-//! from a synchronous `Drop`. Deliberately not done; revisit only if
-//! the between-sweep accumulation ever bites.
+//! ## What the sweep does NOT bound
+//!
+//! It does **not** bound accumulation to roughly one run's worth. That
+//! claim used to stand here and measurement contradicts it: on a
+//! sandbox cluster reset to zero the same morning, four
+//! `cargo test --workspace` runs left **1,251 databases / 11 GB**
+//! standing. One run against a purged cluster creates **429** of them.
+//! [`STALE_AFTER_SECS`] is the reason nothing comes back. At
+//! one hour it exceeds the interval between consecutive runs during
+//! active development, so a run reclaims neither its own databases nor,
+//! usually, its predecessor's, and the population climbs monotonically.
+//!
+//! Nor is the sweep cheap at that scale, and its cost falls on the run
+//! it belongs to rather than on the sibling it is trying not to
+//! disturb. Every `DROP DATABASE` makes the backend request an
+//! immediate, waited-on checkpoint — visible as `IPC/CheckpointStart`
+//! then `IPC/CheckpointDone` in `pg_stat_activity.wait_event` — so a
+//! sweep is a serial queue of forced checkpoints, one per candidate,
+//! issued from inside the first DB-backed test of the process, which
+//! holds the crate-wide `#[serial(hort_pg_db)]` key for the whole of
+//! it. Measured: 60–80 ms per drop against an otherwise idle server, so
+//! 1,251 candidates became a 77-second stall that pushed three
+//! unrelated tests past libtest's 60-second slow-test threshold; and
+//! **unbounded** whenever another process is writing — a single
+//! `DROP DATABASE` was observed waiting 136 seconds for its checkpoint
+//! while a second process ran migration sets, and 73 seconds on
+//! `Lock/object` when two test processes swept the same candidate list
+//! at once (each `DROP DATABASE` takes an exclusive lock on the database
+//! object, so concurrent sweeps serialise against each other). The
+//! candidate count is therefore not just a disk-space number: it is a
+//! stall the whole DB-backed suite serialises behind, which is why
+//! [`sweep_stale_databases`] reports it.
+//!
+//! It also does not *prevent* a leak — a drop-on-teardown guard would,
+//! at the cost of a guard type threaded through the 59 test files that
+//! call [`isolated_db_from`] and a database drop issued from a
+//! synchronous `Drop`. Deliberately not done.
+//!
+//! ## Pool sizing is deliberately left at sqlx's defaults
+//!
+//! A `PoolTimedOut` from a DB-backed test invites capping
+//! `max_connections` on these pools. Measurement refutes that reading
+//! twice over, so the defaults stay. Sampling `pg_stat_activity` once a
+//! second through a whole `cargo test --workspace` (1,072 samples)
+//! peaked at **11 concurrent client backends against 97 usable**
+//! (`max_connections` 100 less 3 reserved — and one of the 11 was the
+//! sampler itself), sat at 2 for 69% of them, and never had more than 3
+//! test databases connected at once: sqlx pools are lazy
+//! (`min_connections = 0`) and cargo runs test binaries one at a time,
+//! so they never approach the server's limit. And a second
+//! process's full acquisition path — connect, `CREATE DATABASE`, build
+//! the pool, `acquire`, run the whole migration set — showed no
+//! degradation at all across a 242-second sweep of 600 databases: every
+//! one of its 90 `acquire` calls returned in under a millisecond. A
+//! timeout here is not a connection budget that is full, so a smaller
+//! pool would change nothing.
 
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
@@ -96,22 +149,39 @@ async fn sweep_stale_databases(admin: &mut PgConnection) {
                      ELSE true END)"
     );
 
+    let started = std::time::Instant::now();
     let Ok(rows) = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
         .fetch_all(&mut *admin)
         .await
     else {
         return;
     };
+    let candidates = rows.len();
+    let mut dropped = 0usize;
     for name in rows {
         // DROP DATABASE cannot run in a transaction; a concurrent
         // connection arriving between the query and here makes this
         // fail, which is exactly the outcome we want — skip it.
-        let _ = admin
+        if admin
             .execute(sqlx::AssertSqlSafe(format!(
                 "DROP DATABASE IF EXISTS \"{name}\""
             )))
-            .await;
+            .await
+            .is_ok()
+        {
+            dropped += 1;
+        }
     }
+    // The cost of this sweep, reported where a human can see it. Without
+    // it the sweep is silent in both directions: nobody notices the
+    // candidate list growing into the thousands, and nobody connects a
+    // slow, DDL-saturated server to the burst of drops that caused it.
+    tracing::debug!(
+        candidates,
+        dropped,
+        elapsed_ms = started.elapsed().as_millis(),
+        "swept stale test databases"
+    );
 }
 
 fn now_unix_secs() -> u64 {
@@ -264,8 +334,9 @@ fn classify_migrate_failure(err: &sqlx::migrate::MigrateError) -> String {
             "connection acquisition timed out before migrations ran — this is \
              contention for a connection, not a broken migration. Check for another \
              `cargo test` run or a sibling DB-backed test target hitting the same \
-             Postgres server concurrently, and whether the server's connection limit \
-             is too low. Underlying error: {err}"
+             Postgres server concurrently. Pool sizing is not the thing to change: \
+             measured peak usage is ~10 concurrent backends against ~97 usable. \
+             Underlying error: {err}"
         )
     } else {
         format!("migrations failed to run cleanly against the test DB: {err}")
