@@ -37,6 +37,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
+use futures::StreamExt;
 use serde_json::json;
 
 use hort_domain::error::DomainResult;
@@ -49,6 +50,7 @@ use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
 use hort_domain::retention::RetentionEvaluationMode;
+use hort_domain::types::ContentHash;
 
 use crate::use_cases::retention_use_case::{
     EvaluateSummary, EvaluationMatch, EvaluationReport, RetentionCandidate, RetentionUseCase,
@@ -106,11 +108,14 @@ const MAX_SIMULATION_ARTIFACTS: usize = 100_000;
 ///   of an artifact, and a flat-format artifact carries 2 targets while an
 ///   OCI-shaped one carries up to 9;
 /// - every returned target then costs **one `StoragePort::size_of` round trip**
-///   in [`RetentionEvaluateHandler::build_preview`], issued sequentially. On a
-///   filesystem backend that is a `stat`, measured at 8.4 us; on an
-///   object-store backend it is an HTTP `HEAD`, so this loop — not the SQL —
-///   is what puts an upper limit on how large a preview may usefully be, and
-///   it is why this ceiling is 10^5 rather than 10^6.
+///   in [`RetentionEvaluateHandler::build_preview`]. On a filesystem backend
+///   that is a `stat`, measured at 8.4 us; on an object-store backend it is an
+///   HTTP `HEAD`, so this fan-out — not the SQL — is what puts an upper limit
+///   on how large a preview may usefully be, and it is why this ceiling is
+///   10^5 rather than 10^6. The round trips are issued
+///   [`SIZE_PROBE_CONCURRENCY`] at a time, which divides that cost without
+///   removing it: the fan-out is still the dominant term at every target
+///   count this bound admits.
 ///
 /// The value covers the sweep's per-tick structural maximum at the ordinary
 /// flat-format fanout (64 000 candidates x 2 edges), which is what makes a
@@ -119,6 +124,59 @@ const MAX_SIMULATION_ARTIFACTS: usize = 100_000;
 /// An OCI-dominated sweep can still exceed it; the omission then says so, with
 /// the bound and the observed count, so the operator can narrow the scope.
 const MAX_SIMULATION_TARGETS: u32 = 128_000;
+
+/// Width of the byte simulation's [`StoragePort::size_of`] fan-out.
+///
+/// The probe loop, not the SQL walk, is what bounds how large a preview may
+/// usefully be: on an object-store backend every target costs one HTTP `HEAD`.
+/// Issued one at a time, a preview at the [`MAX_SIMULATION_TARGETS`] ceiling
+/// costs `128_000 x latency` — over half an hour against a store answering in
+/// 15 ms. That cost is what holds that ceiling down, and with it the size of
+/// repository whose preview can carry a figure at all rather than `omitted`.
+///
+/// **Why a width has to exist here at all.** The object-store adapter builds
+/// its HTTP client from `object_store::ClientOptions::new()` with only
+/// `allow_http` and the extra-CA anchors applied, so every connection knob is
+/// at its default: `http1_only = true` (no multiplexing — one in-flight
+/// request is one TCP connection), `pool_max_idle_per_host` unset and
+/// therefore `reqwest`'s `usize::MAX`, `pool_idle_timeout` unset and
+/// therefore 90 s. The client never pushes back. A wider fan-out does not
+/// queue against a smaller pool; it opens more sockets, and then holds them
+/// idle against the store for 90 s after the sweep has finished. This
+/// constant is the only ceiling in the path, and its unit is sockets.
+///
+/// **Measured**, release build, best of five over 20 000 targets, against a
+/// filesystem CAS and an S3-compatible object store on the same host:
+///
+/// | backend                    | sequential | at this width | plateau |
+/// |----------------------------|-----------:|--------------:|--------:|
+/// | filesystem (`stat`)        |     5.5 us |        1.3 us |  c >= 8 |
+/// | object store (HTTP `HEAD`) |    93.3 us |       51.3 us |  c >= 8 |
+///
+/// Neither plateau there is a property of the fan-out: that host's object
+/// store answers in 93 us, so nothing waits and there is no latency to hide —
+/// both numbers are its own CPU wall. Re-measured against the same store with
+/// 10 ms of added per-probe latency, which is the regime a real S3 sits in,
+/// scaling is linear well past this width (48.9x at 64, 98.2x at 128) and
+/// flattens around 192 — exactly that host's ~17 000 probe/s ceiling
+/// multiplied by the 10 ms latency.
+///
+/// **Derived** by applying that same `rate ceiling x latency` relation to the
+/// worker's own budget rather than the measuring host's. One object-store
+/// probe costs 46-49 us of client CPU across the plateau (measured), and the
+/// shipped worker is guaranteed 200 millicores
+/// (`deploy/helm/hort-server/values.yaml`, `worker.resources.requests.cpu`),
+/// so it sustains roughly 4 000-4 400 probes/s. A width above
+/// `rate x latency` cannot be fed from that guaranteed share and turns into
+/// sockets rather than throughput, which places the useful width somewhere
+/// between about 40 (a 10 ms store) and about 130 (a 30 ms one). This value
+/// sits inside that range and deliberately low in it: the width's costs are
+/// paid on every run — sockets held 90 s past the sweep, and on the
+/// filesystem backend one `spawn_blocking` slot per in-flight probe out of a
+/// process-wide pool of 512 shared with every other `tokio::fs` caller in the
+/// worker — whereas the upper half of the range buys throughput only against
+/// the slowest stores.
+const SIZE_PROBE_CONCURRENCY: usize = 64;
 
 /// [`TaskHandler`] for the periodic retention-evaluate sweep.
 pub struct RetentionEvaluateHandler {
@@ -375,27 +433,9 @@ impl RetentionEvaluateHandler {
             .await
         {
             Ok(RetentionContentSimulation::Exact(hashes)) => {
-                let mut total = 0_u64;
-                let mut omitted_reason = None;
-                for hash in hashes {
-                    match self.storage.size_of(&hash).await {
-                        Ok(size) => match total.checked_add(size) {
-                            Some(next) => total = next,
-                            None => {
-                                omitted_reason = Some("byte total overflowed u64");
-                                break;
-                            }
-                        },
-                        Err(error) => {
-                            tracing::warn!(error = %error, "retention dry-run storage size lookup failed");
-                            omitted_reason = Some("a reclaimable target size was unavailable");
-                            break;
-                        }
-                    }
-                }
-                match omitted_reason {
-                    Some(reason) => json!({ "status": "omitted", "reason": reason }),
-                    None => json!({ "status": "exact", "bytes": total }),
+                match sum_target_sizes(self.storage.as_ref(), hashes).await {
+                    Ok(bytes) => json!({ "status": "exact", "bytes": bytes }),
+                    Err(reason) => json!({ "status": "omitted", "reason": reason }),
                 }
             }
             Ok(RetentionContentSimulation::Omitted(exceeded)) => json!({
@@ -420,6 +460,57 @@ impl RetentionEvaluateHandler {
             "sample_limit": MAX_SAMPLE_SIZE,
         })
     }
+}
+
+/// Sum the stored size of every reclaimable target, or say why no sum may be
+/// reported. Fans the probes out [`SIZE_PROBE_CONCURRENCY`] at a time.
+///
+/// # Why the two failure reasons are ranked rather than raced
+///
+/// Concurrently, "the first error" is a property of the scheduler, not of the
+/// input: which of several failing probes lands first varies run to run, and
+/// so would the sentence the operator reads. Both failures are ranked instead,
+/// so the verdict is a function of the target set and the storage's answers
+/// alone and reproduces across runs:
+///
+/// 1. **A failed probe outranks everything.** It is not a preference: a failed
+///    probe means the set of measured targets is incomplete, and no claim
+///    about the total — including the claim that it overflowed — can be
+///    founded on addends that were never observed. The fan-out is abandoned
+///    the moment one probe fails, which also keeps a doomed preview from
+///    paying for the remaining round trips.
+/// 2. **Overflow is decided only over a complete set.** The accumulator is
+///    widened to `u128`, which cannot overflow for any input this path admits
+///    (at most [`MAX_SIMULATION_TARGETS`] addends below `2^64`, so below
+///    `2^81`), and the narrowing to `u64` happens once, at the end. Order
+///    therefore cannot change the answer: addition commutes, and the
+///    intermediate sums no longer have a ceiling to trip over. `saturating_add`
+///    keeps the impossible case impossible rather than a debug-build panic; a
+///    saturated total still fails the narrowing and is reported as an
+///    overflow.
+///
+/// A partial sum is never returned: the only `Ok` is a total over every
+/// target, narrowed without loss.
+async fn sum_target_sizes(
+    storage: &dyn StoragePort,
+    hashes: Vec<ContentHash>,
+) -> Result<u64, &'static str> {
+    let mut probes = futures::stream::iter(hashes)
+        .map(|hash| async move { storage.size_of(&hash).await })
+        .buffer_unordered(SIZE_PROBE_CONCURRENCY);
+
+    let mut total: u128 = 0;
+    while let Some(outcome) = probes.next().await {
+        match outcome {
+            Ok(size) => total = total.saturating_add(u128::from(size)),
+            Err(error) => {
+                tracing::warn!(error = %error, "retention dry-run storage size lookup failed");
+                return Err("a reclaimable target size was unavailable");
+            }
+        }
+    }
+
+    u64::try_from(total).map_err(|_| "byte total overflowed u64")
 }
 
 /// Phrase a bound rejection so the operator can act on it: which ceiling, what
@@ -455,6 +546,7 @@ fn accumulate(
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use chrono::{DateTime, Utc};
@@ -695,6 +787,51 @@ mod tests {
     struct InertStorage {
         sizes: std::collections::HashMap<ContentHash, u64>,
         fail_size: bool,
+        /// When set, only this target's probe fails and every other one
+        /// answers from `sizes`. Lets one run carry both a failing probe and
+        /// a sum that would overflow, which is what pins which verdict wins.
+        fail_only: Option<ContentHash>,
+        /// How many `yield_now` points each probe passes before answering.
+        /// Zero — the default — resolves on the first poll, which is what
+        /// every test that is not about the fan-out wants. A non-zero value
+        /// holds every probe open long enough for the buffer to fill, so
+        /// `peak_in_flight` observes the real width rather than 1.
+        yields: usize,
+        in_flight: AtomicUsize,
+        peak_in_flight: AtomicUsize,
+    }
+    impl InertStorage {
+        fn failing() -> Self {
+            Self {
+                fail_size: true,
+                ..Default::default()
+            }
+        }
+        fn with_sizes(sizes: std::collections::HashMap<ContentHash, u64>) -> Self {
+            Self {
+                sizes,
+                ..Default::default()
+            }
+        }
+        fn failing_only(
+            hash: ContentHash,
+            sizes: std::collections::HashMap<ContentHash, u64>,
+        ) -> Self {
+            Self {
+                sizes,
+                fail_only: Some(hash),
+                ..Default::default()
+            }
+        }
+        fn observing_concurrency() -> Self {
+            Self {
+                yields: 2,
+                ..Default::default()
+            }
+        }
+        fn peak_in_flight(&self) -> usize {
+            self.peak_in_flight.load(Ordering::SeqCst)
+        }
     }
     impl StoragePort for InertStorage {
         fn put(
@@ -724,12 +861,19 @@ mod tests {
         }
 
         fn size_of(&self, hash: &ContentHash) -> BoxFuture<'_, DomainResult<u64>> {
-            let result = if self.fail_size {
-                Err(DomainError::Invariant("size unavailable".into()))
-            } else {
-                Ok(self.sizes.get(hash).copied().unwrap_or(0))
-            };
-            Box::pin(async move { result })
+            let hash = hash.clone();
+            Box::pin(async move {
+                let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+                for _ in 0..self.yields {
+                    tokio::task::yield_now().await;
+                }
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                if self.fail_size || self.fail_only.as_ref() == Some(&hash) {
+                    return Err(DomainError::Invariant("size unavailable".into()));
+                }
+                Ok(self.sizes.get(&hash).copied().unwrap_or(0))
+            })
         }
     }
 
@@ -1031,10 +1175,7 @@ mod tests {
             Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![
                 hash_a, hash_b,
             ]))),
-            Arc::new(InertStorage {
-                sizes,
-                fail_size: false,
-            }),
+            Arc::new(InertStorage::with_sizes(sizes)),
         );
         let policy_id = Uuid::new_v4();
         let repository_id = Uuid::new_v4();
@@ -1231,10 +1372,7 @@ mod tests {
             .unwrap();
         let h = preview_handler(
             Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![hash]))),
-            Arc::new(InertStorage {
-                sizes: Default::default(),
-                fail_size: true,
-            }),
+            Arc::new(InertStorage::failing()),
         );
         let omitted = h.build_preview(Utc::now(), &[]).await;
         assert_eq!(omitted["freed_bytes"]["status"], "omitted");
@@ -1260,10 +1398,7 @@ mod tests {
             Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![
                 first, second,
             ]))),
-            Arc::new(InertStorage {
-                sizes,
-                fail_size: false,
-            }),
+            Arc::new(InertStorage::with_sizes(sizes)),
         );
 
         let omitted = h.build_preview(Utc::now(), &[]).await;
@@ -1272,6 +1407,146 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("overflowed"));
+    }
+
+    /// Distinct, well-formed content hashes for fan-out tests. The value is
+    /// irrelevant; only that each target is its own key into the mock's size
+    /// table.
+    fn hash_n(n: usize) -> ContentHash {
+        format!("{n:064x}")
+            .parse()
+            .expect("64 lowercase hex characters is a content hash")
+    }
+
+    /// The fan-out is the change: a probe loop that issues one `size_of` at a
+    /// time is what made the largest repositories unreportable. Both halves
+    /// matter and neither is implied by the other — that probes overlap at
+    /// all, and that the overlap never exceeds the documented width, because
+    /// on an object-store backend that width is the number of sockets opened
+    /// against the store.
+    #[tokio::test]
+    async fn size_probes_overlap_and_never_exceed_the_documented_width() {
+        let targets: Vec<ContentHash> = (0..SIZE_PROBE_CONCURRENCY * 3).map(hash_n).collect();
+        let storage = Arc::new(InertStorage::observing_concurrency());
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
+            storage.clone(),
+        );
+
+        let preview = h.build_preview(Utc::now(), &[]).await;
+        assert_eq!(preview["freed_bytes"]["status"], "exact");
+        assert_eq!(
+            storage.peak_in_flight(),
+            SIZE_PROBE_CONCURRENCY,
+            "the probes must overlap, and exactly as widely as the constant says: a peak of 1 \
+             means the fan-out was lost, a peak above the width means the cap is not applied"
+        );
+    }
+
+    /// The property with no acceptable failure mode: whatever a failing probe
+    /// does to the verdict, it must never leave a figure behind. The failing
+    /// target is the last of 128 here and every other one answers, so a
+    /// short-circuit that kept its accumulator would be holding a large,
+    /// plausible, wrong number at the moment it gave up.
+    #[tokio::test]
+    async fn a_failed_probe_omits_the_figure_instead_of_reporting_what_it_did_measure() {
+        let targets: Vec<ContentHash> = (0..SIZE_PROBE_CONCURRENCY * 2).map(hash_n).collect();
+        let sizes = targets
+            .iter()
+            .map(|t| (t.clone(), 1_000_u64))
+            .collect::<std::collections::HashMap<_, _>>();
+        let doomed = targets.last().expect("non-empty target set").clone();
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
+            Arc::new(InertStorage::failing_only(doomed, sizes)),
+        );
+
+        let omitted = h.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        assert!(
+            omitted["freed_bytes"]["bytes"].is_null(),
+            "a partial sum must never be emitted, as `exact` or otherwise: {omitted}"
+        );
+        assert!(omitted["freed_bytes"]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("size"));
+    }
+
+    /// Overflow is decided once, over the complete target set, and by a
+    /// narrowing that cannot be skipped. Each target here is under a 64th of
+    /// `u64::MAX`, so neither a single probe nor a buffer-sized batch of them
+    /// overflows — only the whole set does. Widening the accumulator makes
+    /// every intermediate sum representable, which removes the per-addition
+    /// `checked_add` that used to be the guard; this pins that the one check
+    /// left still refuses the figure.
+    #[tokio::test]
+    async fn overflow_is_decided_over_the_whole_target_set_not_a_prefix() {
+        let targets: Vec<ContentHash> = (0..SIZE_PROBE_CONCURRENCY * 2).map(hash_n).collect();
+        let per_target = u64::MAX / SIZE_PROBE_CONCURRENCY as u64;
+        let sizes = targets
+            .iter()
+            .map(|t| (t.clone(), per_target))
+            .collect::<std::collections::HashMap<_, _>>();
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
+            Arc::new(InertStorage::with_sizes(sizes)),
+        );
+
+        let omitted = h.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        assert!(omitted["freed_bytes"]["reason"]
+            .as_str()
+            .expect("reason")
+            .contains("overflowed"));
+    }
+
+    /// Concurrently there is no "first" error, so the two failure reasons are
+    /// ranked rather than raced. A failed probe wins: with one target
+    /// unmeasured, "the total overflowed" would be a claim about addends that
+    /// were never observed. The run here makes both conditions true at once —
+    /// the two measured targets alone overflow `u64`, and a third probe fails
+    /// — so only the ranking decides the sentence the operator reads.
+    #[tokio::test]
+    async fn a_failed_probe_outranks_an_overflowing_total() {
+        let measured = [hash_n(1), hash_n(2)];
+        let doomed = hash_n(3);
+        let sizes = measured
+            .iter()
+            .map(|t| (t.clone(), u64::MAX))
+            .collect::<std::collections::HashMap<_, _>>();
+        let targets = vec![measured[0].clone(), measured[1].clone(), doomed.clone()];
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
+            Arc::new(InertStorage::failing_only(doomed, sizes)),
+        );
+
+        let omitted = h.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        let reason = omitted["freed_bytes"]["reason"].as_str().expect("reason");
+        assert!(
+            reason.contains("unavailable"),
+            "an unmeasured target outranks an overflow verdict it would have to invent: {reason}"
+        );
+        assert!(!reason.contains("overflowed"), "{reason}");
+    }
+
+    /// The width's justification is a range rather than a point: a fan-out
+    /// wider than `sustainable probe rate x store latency` converts into open
+    /// sockets instead of throughput, and for the shipped worker that rate is
+    /// roughly 4 000-4 400 probes/s, which places the range between a 10 ms
+    /// store and a 30 ms one. Pin the ends so a later "make it faster" edit
+    /// has to re-derive the number instead of rounding it up to a power of two
+    /// that the client's unbounded connection pool will happily honour.
+    #[test]
+    fn the_probe_width_stays_inside_the_range_its_measurement_established() {
+        const WIDTH_FED_AT_10MS: usize = 40;
+        const WIDTH_FED_AT_30MS: usize = 130;
+        assert!(
+            (WIDTH_FED_AT_10MS..=WIDTH_FED_AT_30MS).contains(&SIZE_PROBE_CONCURRENCY),
+            "{SIZE_PROBE_CONCURRENCY} is outside the measured range \
+             {WIDTH_FED_AT_10MS}..={WIDTH_FED_AT_30MS}"
+        );
     }
 
     #[tokio::test]
