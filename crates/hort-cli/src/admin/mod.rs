@@ -15,6 +15,7 @@
 pub mod quarantine;
 pub mod rbac;
 pub mod rescan;
+pub mod retention;
 pub mod task_get;
 pub mod task_invoke;
 pub mod task_list;
@@ -84,6 +85,21 @@ pub enum AdminCommand {
     /// (`GET /admin/workers`). Stale/dead workers stay in the listing
     /// (`LIVE=NO`) rather than vanishing.
     Workers(workers::WorkersArgs),
+
+    /// Retention: see what a cleanup would take, then execute it.
+    ///
+    /// `retention preview` runs the evaluator's dry run and renders the
+    /// proposal — artifact rows, distinct stored contents, the measured
+    /// bytes a purge would reclaim (or an explicit statement that hort
+    /// did not measure them), and a capped sample. `retention apply`
+    /// re-runs that preview immediately before executing, shows the
+    /// difference against a preview you name, and takes the
+    /// confirmation.
+    ///
+    /// Both go through `POST /admin/tasks/retention-evaluate`; the
+    /// preview needs no destructive authority, the execution needs the
+    /// `task:destructive` claim a fresh admin session carries.
+    Retention(retention::RetentionArgs),
 }
 
 /// `admin task` arguments.
@@ -139,7 +155,40 @@ pub async fn run(
         AdminCommand::Workers(workers_args) => {
             run_workers(workers_args, output, cli_server, cli_token).await
         }
+        AdminCommand::Retention(retention_args) => {
+            run_retention(retention_args, output, cli_server, cli_token).await
+        }
     }
+}
+
+/// Dispatch for `admin retention`.
+///
+/// Mirrors `run_workers` — loads config, builds the HTTP client, hands
+/// off to the `retention` module's per-subcommand dispatcher. Unlike its
+/// siblings it propagates the subcommand's own `ExitCode`: a wait that
+/// timed out without seeing a result, and a confirmation the operator
+/// declined, are distinct outcomes a script must be able to tell apart
+/// from success.
+async fn run_retention(
+    args: retention::RetentionArgs,
+    output: OutputFormat,
+    cli_server: Option<String>,
+    cli_token: Option<String>,
+) -> anyhow::Result<std::process::ExitCode> {
+    use crate::client::AkClient;
+    use crate::config::load_effective_config;
+
+    let cfg = match load_effective_config(cli_server, cli_token) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("hort-cli: config error: {e}");
+            eprintln!("Hint: run `hort-cli auth login` to set up credentials.");
+            return Ok(std::process::ExitCode::from(2));
+        }
+    };
+
+    let client = AkClient::new(&cfg)?;
+    retention::run(client, args, output).await
 }
 
 async fn run_task(

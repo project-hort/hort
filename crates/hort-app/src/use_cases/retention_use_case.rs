@@ -116,10 +116,17 @@ pub struct RetentionCandidate {
     /// The artifact's repository [`RepositoryFormat`] — the
     /// `RetentionScope::Format` input. Resolved by the caller from the
     /// joined `repositories.format` column (the `RetentionCandidateRow`
-    /// port DTO carries it; B6's handler copies it across). `Artifact`
+    /// port DTO carries it; the handler copies it across). `Artifact`
     /// has no `format` field, so the scope gate needs it carried
     /// alongside.
     pub format: RepositoryFormat,
+    /// The artifact's repository key (`repositories.key`) — the
+    /// identifier an operator writes into a policy's `metadata.name`.
+    /// Copied from `RetentionCandidateRow::repository_key`, which the
+    /// candidate query already resolves on its existing
+    /// `JOIN repositories`. It exists so a match can be reported by a
+    /// name the operator can act on rather than by a UUID.
+    pub repository_key: String,
     /// The resolved `rescan_interval_hours` for the artifact's
     /// repository. `0` is meaningful (rescanning disabled) — it still
     /// yields a `2 × 0 = 0`-second freshness window, i.e. a
@@ -169,6 +176,10 @@ pub struct EvaluationMatch {
     pub policy_name: String,
     pub artifact_id: Uuid,
     pub repository_id: Uuid,
+    /// The repository's operator-facing key. Travels **beside**
+    /// `repository_id`, never instead of it: the id is what a machine
+    /// consumer joins on, the key is what a human types into a policy.
+    pub repository_key: String,
     pub name: String,
     pub version: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -277,6 +288,7 @@ impl RetentionUseCase {
                             policy_name: policy.name.clone(),
                             artifact_id: candidate.artifact.id,
                             repository_id: candidate.artifact.repository_id,
+                            repository_key: candidate.repository_key.clone(),
                             name: candidate.artifact.name.clone(),
                             version: candidate.artifact.version.clone(),
                             created_at: candidate.artifact.created_at,

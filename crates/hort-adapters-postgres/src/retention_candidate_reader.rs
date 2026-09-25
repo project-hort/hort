@@ -21,7 +21,9 @@
 //! a.repository_id` to select `r.format::text` (aliased `repo_format`) — the
 //! required enum-to-text cast lets sqlx decode the per-artifact
 //! [`RepositoryFormat`] the `RetentionScope::Format`
-//! gate needs (`Artifact` itself has no `format` field). This is an
+//! gate needs (`Artifact` itself has no `format` field) — and
+//! `r.key` (aliased `repo_key`), the operator-facing repository
+//! identifier the retention preview names a repository by. This is an
 //! INNER join: every artifact's `repository_id` is a FK into
 //! `repositories`, so it never drops a row. Still a **single query**:
 //! no extra round-trip, no N+1, no scope SQL pre-filter (scope
@@ -133,6 +135,15 @@ fn decode_candidate(row: &PgRow) -> DomainResult<RetentionCandidateRow> {
         DomainError::Invariant(format!("retention_candidate repo_format decode: {e}"))
     })?;
     let format: RepositoryFormat = repo_format_raw.parse().unwrap_or(RepositoryFormat::Generic);
+    // `repositories.key` — `NOT NULL UNIQUE` in the schema, so the decode
+    // is infallible in practice; a failure here means the join column was
+    // dropped from the SELECT and the preview would silently fall back to
+    // naming repositories by UUID, which is precisely what carrying the
+    // key exists to prevent. Fail the row loudly instead.
+    let repository_key: String = row.try_get("repo_key").map_err(|e| {
+        tracing::warn!(error = %e, "retention_candidate repo key decode failed");
+        DomainError::Invariant(format!("retention_candidate repo_key decode: {e}"))
+    })?;
     let resolved_rescan_interval_hours: Option<i32> =
         row.try_get("resolved_rescan_interval_hours").map_err(|e| {
             tracing::warn!(error = %e, "retention_candidate rescan-interval decode failed");
@@ -173,6 +184,7 @@ fn decode_candidate(row: &PgRow) -> DomainResult<RetentionCandidateRow> {
     Ok(RetentionCandidateRow {
         artifact,
         format,
+        repository_key,
         resolved_rescan_interval_hours: resolved_rescan_interval_hours.map(i64::from),
         keep_rank,
         tag_targeted,
@@ -249,6 +261,7 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                        a.uploaded_by,
                        a.created_at, a.updated_at, a.deleted_at,
                        r.format::text AS repo_format,
+                       r.key AS repo_key,
                        p.rescan_interval_hours AS resolved_rescan_interval_hours,
                        rk.keep_rank AS keep_rank,
                        rk.sibling_total AS sibling_total,
@@ -308,6 +321,12 @@ mod tests {
     }
 
     async fn seed_repo(pool: &PgPool) -> Uuid {
+        seed_repo_keyed(pool).await.0
+    }
+
+    /// Same seed, but hands back the `repositories.key` the row was
+    /// created with so a test can assert what the reader reports.
+    async fn seed_repo_keyed(pool: &PgPool) -> (Uuid, String) {
         let id = Uuid::new_v4();
         let key = format!("it-retention-candidate-{}", id.simple());
         sqlx::query(
@@ -329,7 +348,7 @@ mod tests {
         .execute(pool)
         .await
         .expect("seed repo");
-        id
+        (id, key)
     }
 
     async fn seed_artifact(
@@ -479,6 +498,35 @@ mod tests {
             .into_iter()
             .map(|candidate| candidate.artifact.id)
             .collect()
+    }
+
+    /// The reader resolves `repositories.key` on the join it already
+    /// makes for `format`, so a retention preview can name a repository
+    /// by the identifier an operator writes into a policy instead of by
+    /// its UUID. Two repositories must come back with their own keys —
+    /// a join that lost its correlation would still pass a one-repo
+    /// assertion.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn candidates_carry_their_repositorys_key() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let (repo_a, key_a) = seed_repo_keyed(&pool).await;
+        let (repo_b, key_b) = seed_repo_keyed(&pool).await;
+        assert_ne!(key_a, key_b, "the fixture must seed two distinct keys");
+        let in_a = seed_artifact(&pool, repo_a, Some("released"), false).await;
+        let in_b = seed_artifact(&pool, repo_b, Some("released"), false).await;
+
+        let rows = candidates_by_id(&pool, 1000).await;
+
+        let a = rows.get(&in_a).expect("artifact in repo A is a candidate");
+        let b = rows.get(&in_b).expect("artifact in repo B is a candidate");
+        assert_eq!(a.repository_key, key_a);
+        assert_eq!(b.repository_key, key_b);
+        // The id stays beside the key — machine consumers join on it.
+        assert_eq!(a.artifact.repository_id, repo_a);
+        assert_eq!(b.artifact.repository_id, repo_b);
     }
 
     /// Empty-table query compiles + runs (also exercises the keyset
