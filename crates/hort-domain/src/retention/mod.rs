@@ -48,6 +48,7 @@
 //! is the adapter layer's job.
 
 mod evaluate;
+mod mode;
 mod policy;
 mod predicate;
 mod reason;
@@ -56,6 +57,7 @@ mod scope;
 pub use evaluate::{
     evaluate, matches_bool, severity_at_or_above, EvaluationInputs, EvaluationOutcome,
 };
+pub use mode::RetentionEvaluationMode;
 pub use policy::{RetentionPolicy, RetentionPolicyEvent};
 pub use predicate::{BooleanOp, PolicyPredicate};
 pub use reason::ExpirationReason;

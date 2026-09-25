@@ -26,12 +26,13 @@ use hort_domain::events::{
     ArtifactBecameVulnerable, DomainEvent, IngestSource, PersistedEvent, ScanAssessment,
     ScanCompleted, SeveritySummary, StreamId,
 };
+use hort_domain::ports::event_store::{EventStore, ReadFrom};
 use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
 use hort_domain::ports::BoxFuture;
 use hort_domain::retention::{
-    BooleanOp, ExpirationReason, PolicyPredicate, RetentionPolicy, RetentionPolicyEvent,
-    RetentionScope,
+    BooleanOp, ExpirationReason, PolicyPredicate, RetentionEvaluationMode, RetentionPolicy,
+    RetentionPolicyEvent, RetentionScope,
 };
 use hort_domain::types::Finding;
 
@@ -320,6 +321,56 @@ fn seed_fresh_scanned_stream(
     }
     store.set_stream(&stream_id, events);
     stream_id
+}
+
+#[tokio::test]
+async fn dry_run_and_execute_select_identical_candidates_but_only_execute_appends() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let old = candidate(QuarantineStatus::Released, ts(0));
+    let old_id = old.artifact.id;
+    let young = candidate(QuarantineStatus::Released, ts(950));
+    let old_stream = seed_stream(&store, &old, IngestSource::Proxied, vec![]);
+    seed_stream(&store, &young, IngestSource::Proxied, vec![]);
+    let before = store
+        .read_stream(&old_stream, ReadFrom::Start, 200)
+        .await
+        .unwrap();
+
+    let preview = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            std::slice::from_ref(&p),
+            &[old.clone(), young.clone()],
+            RetentionEvaluationMode::DryRun,
+        )
+        .await
+        .unwrap();
+    let after = store
+        .read_stream(&old_stream, ReadFrom::Start, 200)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    assert!(store.appended_batches().is_empty());
+
+    let execution = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            &[old, young],
+            RetentionEvaluationMode::Execute,
+        )
+        .await
+        .unwrap();
+    let preview_ids: Vec<_> = preview.matches.iter().map(|hit| hit.artifact_id).collect();
+    let execution_ids: Vec<_> = execution
+        .matches
+        .iter()
+        .map(|hit| hit.artifact_id)
+        .collect();
+    assert_eq!(preview_ids, execution_ids);
+    assert_eq!(preview_ids, vec![old_id]);
+    assert_eq!(store.appended_batches().len(), 1);
 }
 
 // ===========================================================================

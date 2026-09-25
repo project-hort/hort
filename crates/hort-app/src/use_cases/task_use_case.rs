@@ -44,6 +44,7 @@
 //! transaction support to the event-store port can replace this with a true
 //! atomic two-phase write.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -61,6 +62,7 @@ use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, E
 use hort_domain::ports::jobs_repository::{
     EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
 };
+use hort_domain::retention::RetentionEvaluationMode;
 use hort_domain::types::IdempotencyKey;
 
 use crate::error::{AppError, AppResult};
@@ -96,15 +98,16 @@ impl TaskUseCase {
         Self { jobs, events, rbac }
     }
 
-    /// Authorize `actor` to invoke task `kind`, **before** any param
-    /// parsing, idempotency probe, or port I/O.
+    /// Authorize `actor` to invoke task `kind`, **before** semantic param
+    /// validation, idempotency probe, or port I/O.
     ///
     /// Two-factor, fail-safe-by-AND:
     ///
     /// 1. The existing coarse gate — `Permission::AdminTaskInvoke` via
     ///    [`RbacEvaluator::authorize`] (unchanged for every kind).
-    /// 2. **For destructive kinds only** ([`task_kind_is_destructive`] —
-    ///    `retention-purge` / `eventstore-archive` / `retention-evaluate`):
+    /// 2. **For destructive invocations only**: every
+    ///    `retention-purge` / `eventstore-archive`, plus
+    ///    `retention-evaluate` in execute mode (including the default):
     ///    the caller's resolved `principal.claims` must additionally
     ///    satisfy the [`DESTRUCTIVE_TASK_CLAIM`] requirement, evaluated
     ///    through the **same** `RbacEvaluator` claim subset-match the
@@ -124,7 +127,12 @@ impl TaskUseCase {
     /// [`Self::enqueue`] (defense-in-depth — a direct use-case caller is
     /// still gated).
     #[tracing::instrument(skip(self))]
-    pub fn authorize_kind(&self, actor: &CallerPrincipal, kind: &str) -> AppResult<()> {
+    pub fn authorize_kind(
+        &self,
+        actor: &CallerPrincipal,
+        kind: &str,
+        params: &serde_json::Value,
+    ) -> AppResult<()> {
         let rbac = self.rbac.load();
 
         // Factor 1 — the unchanged coarse `AdminTaskInvoke` gate.
@@ -139,12 +147,13 @@ impl TaskUseCase {
             ))));
         }
 
-        // Factor 2 — destructive kinds need the extra claim. Reuse the
+        // Factor 2 — destructive invocations need the extra claim. Reuse the
         // RbacEvaluator claim subset-match (incl. the synthetic-`admin`
         // short-circuit) by checking a synthetic single-claim requirement
         // against the same evaluator semantics, rather than re-deriving
         // the subset test here.
-        if task_kind_is_destructive(kind)
+        let requires_destructive_claim = Self::requires_destructive_claim(kind, params)?;
+        if requires_destructive_claim
             && !rbac.claims_satisfy(actor, std::slice::from_ref(&DESTRUCTIVE_TASK_CLAIM))
         {
             tracing::info!(
@@ -160,7 +169,7 @@ impl TaskUseCase {
             ))));
         }
 
-        if task_kind_is_destructive(kind) {
+        if requires_destructive_claim {
             tracing::info!(
                 actor_user_id = %actor.user_id,
                 kind,
@@ -170,6 +179,23 @@ impl TaskUseCase {
         }
 
         Ok(())
+    }
+
+    fn requires_destructive_claim(kind: &str, params: &serde_json::Value) -> AppResult<bool> {
+        if !task_kind_is_destructive(kind) {
+            return Ok(false);
+        }
+        if kind != "retention-evaluate" {
+            return Ok(true);
+        }
+
+        let mode_raw = params
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("execute");
+        RetentionEvaluationMode::from_str(mode_raw)
+            .map(RetentionEvaluationMode::is_destructive)
+            .map_err(|message| AppError::Domain(DomainError::Validation(message.to_owned())))
     }
 
     /// Route the audit `TaskInvoked` for task `kind` to the correct
@@ -217,8 +243,8 @@ impl TaskUseCase {
     ///
     /// Steps:
     /// 1. Validate `kind` is in the v1 allowlist.
-    /// 2. Per-kind authz via [`Self::authorize_kind`] (coarse
-    ///    `AdminTaskInvoke` AND, for destructive kinds, the
+    /// 2. Per-invocation authz via [`Self::authorize_kind`] (coarse
+    ///    `AdminTaskInvoke` AND, for destructive invocations, the
     ///    `task:destructive` claim).
     /// 3. Insert a `jobs` row with `status='pending'` via `JobsRepository::enqueue_task`.
     /// 4. Append `TaskInvoked` on the kind-routed audit stream
@@ -287,7 +313,7 @@ impl TaskUseCase {
         //    first, before param-validate / idempotency probe; calling it
         //    again here keeps a direct use-case caller independently
         //    gated). Shared logic — no parallel evaluator.
-        self.authorize_kind(actor, kind)?;
+        self.authorize_kind(actor, kind, params)?;
 
         // 3. Insert jobs row. `trigger_source = "manual"` mirrors
         //    `TriggerSource::Manual` — the admin-task POST is operator-
@@ -1124,7 +1150,9 @@ mod tests {
             crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
         let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
         let actor = caller_with_task_admin_role();
-        assert!(use_case.authorize_kind(&actor, "noop").is_ok());
+        assert!(use_case
+            .authorize_kind(&actor, "noop", &serde_json::json!({}))
+            .is_ok());
     }
 
     /// `authorize_kind`: a caller WITHOUT `AdminTaskInvoke` is denied an
@@ -1137,7 +1165,7 @@ mod tests {
         let use_case = TaskUseCase::new(jobs, events, rbac_deny_all());
         let actor = caller_no_roles();
         assert!(matches!(
-            use_case.authorize_kind(&actor, "noop"),
+            use_case.authorize_kind(&actor, "noop", &serde_json::json!({})),
             Err(AppError::Domain(DomainError::Forbidden(_)))
         ));
     }
@@ -1156,7 +1184,7 @@ mod tests {
             "eventstore-archive",
             "retention-evaluate",
         ] {
-            let r = use_case.authorize_kind(&actor, kind);
+            let r = use_case.authorize_kind(&actor, kind, &serde_json::json!({}));
             assert!(
                 matches!(r, Err(AppError::Domain(DomainError::Forbidden(_)))),
                 "destructive kind {kind:?} must be Forbidden without the claim; got {r:?}"
@@ -1179,7 +1207,9 @@ mod tests {
             "retention-evaluate",
         ] {
             assert!(
-                use_case.authorize_kind(&actor, kind).is_ok(),
+                use_case
+                    .authorize_kind(&actor, kind, &serde_json::json!({}))
+                    .is_ok(),
                 "destructive kind {kind:?} must be allowed with the claim"
             );
         }
@@ -1198,8 +1228,55 @@ mod tests {
         let mut actor = caller_no_roles();
         actor.claims = vec!["task:destructive".into()];
         assert!(matches!(
-            use_case.authorize_kind(&actor, "retention-purge"),
+            use_case.authorize_kind(&actor, "retention-purge", &serde_json::json!({}),),
             Err(AppError::Domain(DomainError::Forbidden(_)))
+        ));
+    }
+
+    #[test]
+    fn authorize_kind_retention_dry_run_needs_no_destructive_claim() {
+        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
+        let events: Arc<EventStorePublisher> =
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
+        let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
+        let actor = caller_with_task_admin_role();
+
+        assert!(use_case
+            .authorize_kind(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "dry_run" }),
+            )
+            .is_ok());
+        assert!(matches!(
+            use_case.authorize_kind(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "execute" }),
+            ),
+            Err(AppError::Domain(DomainError::Forbidden(_)))
+        ));
+    }
+
+    #[test]
+    fn authorize_kind_retention_mode_defaults_to_execute_and_rejects_unknown() {
+        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
+        let events: Arc<EventStorePublisher> =
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
+        let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
+        let actor = caller_with_task_admin_role();
+
+        assert!(matches!(
+            use_case.authorize_kind(&actor, "retention-evaluate", &serde_json::json!({})),
+            Err(AppError::Domain(DomainError::Forbidden(_)))
+        ));
+        assert!(matches!(
+            use_case.authorize_kind(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "unknown" }),
+            ),
+            Err(AppError::Domain(DomainError::Validation(_)))
         ));
     }
 
@@ -1220,6 +1297,53 @@ mod tests {
             matches!(result, Err(AppError::Domain(DomainError::Forbidden(_)))),
             "direct enqueue of destructive kind must stay gated; got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_retention_mode_enforces_defense_in_depth() {
+        let preview_job_id = Uuid::new_v4();
+        let preview_jobs = Arc::new(RecordingJobsRepository::new(preview_job_id));
+        let preview_events = Arc::new(RecordingEventStore::new());
+        let preview_use_case = TaskUseCase::new(
+            Arc::clone(&preview_jobs) as _,
+            crate::event_store_publisher::wrap_for_test(Arc::clone(&preview_events)),
+            rbac_with_task_invoke(),
+        );
+        let actor = caller_with_task_admin_role();
+        let result = preview_use_case
+            .enqueue(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "dry_run" }),
+                None,
+            )
+            .await;
+        assert_eq!(
+            result.expect("dry-run enqueue should need no destructive claim"),
+            EnqueueOutcome::Enqueued {
+                job_id: preview_job_id
+            }
+        );
+        assert_eq!(preview_jobs.enqueue_calls().len(), 1);
+        assert_eq!(preview_events.append_calls().len(), 1);
+
+        let denied_use_case = TaskUseCase::new(
+            Arc::new(PanicJobsRepository),
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore)),
+            rbac_with_task_invoke(),
+        );
+        let denied = denied_use_case
+            .enqueue(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "execute" }),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            denied,
+            Err(AppError::Domain(DomainError::Forbidden(_)))
+        ));
     }
 
     /// Defense-in-depth: a direct `enqueue` of a destructive kind WITH

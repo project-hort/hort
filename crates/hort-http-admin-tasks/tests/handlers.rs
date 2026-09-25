@@ -82,6 +82,12 @@ fn task_admin_principal() -> CallerPrincipal {
     }
 }
 
+fn destructive_task_admin_principal() -> CallerPrincipal {
+    let mut principal = task_admin_principal();
+    principal.claims.push("task:destructive".into());
+    principal
+}
+
 /// Build a `TaskUseCase` that grants `Permission::AdminTaskInvoke` to any
 /// caller whose resolved claims contain `task-admin` (flat
 /// `GrantSubject::Claims` grant set, no role row — see ADR 0012).
@@ -259,7 +265,7 @@ async fn invoke_idempotency_key_cache_hit_returns_200() {
     let uc = task_use_case_with_permit(&mocks, events);
     let ctx = with_task_use_case(&ctx, uc);
 
-    // Pre-seed a UUID into the durable ephemeral store under the idem-task key.
+    // Pre-seed the invocation-bound record under the idem-task key.
     let existing_job_id = Uuid::new_v4();
     let idem_key = "my-idempotency-key-001";
     let store_key = format!("idem-task:{idem_key}");
@@ -267,7 +273,14 @@ async fn invoke_idempotency_key_cache_hit_returns_200() {
         .ephemeral_durable
         .put(
             &store_key,
-            Bytes::copy_from_slice(existing_job_id.as_bytes()),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "task_job_id": existing_job_id,
+                    "kind": "noop",
+                    "params": { "label": null },
+                }))
+                .unwrap(),
+            ),
             Duration::from_secs(300),
         )
         .await
@@ -336,9 +349,53 @@ async fn invoke_idempotency_key_fresh_returns_202_and_stores_key() {
     let store_key = format!("idem-task:{idem_key}");
     let cached = ephemeral_durable.get(&store_key).await.expect("get failed");
     let cached_bytes = cached.expect("expected cached entry");
-    assert_eq!(cached_bytes.len(), 16, "UUID is 16 bytes");
-    let cached_id = Uuid::from_bytes(cached_bytes[..16].try_into().unwrap());
+    let cached_record: serde_json::Value =
+        serde_json::from_slice(&cached_bytes).expect("cached invocation record");
+    let cached_id = cached_record["task_job_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
     assert_eq!(cached_id, returned_id);
+}
+
+#[tokio::test]
+async fn legacy_raw_uuid_cache_entry_is_an_unverified_miss() {
+    let (ctx, mocks) = new_ctx();
+    let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
+    let uc = task_use_case_with_permit(&mocks, events);
+    let ctx = with_task_use_case(&ctx, uc);
+    let legacy_job_id = Uuid::new_v4();
+    let idem_key = "legacy-raw-uuid";
+    // Hoisted out of the `put` argument on purpose: the keyspace gate only
+    // resolves a prefix statically when the key literal is bound in the same
+    // function as the call.
+    let store_key = format!("idem-task:{idem_key}");
+    mocks
+        .ephemeral_durable
+        .put(
+            &store_key,
+            Bytes::copy_from_slice(legacy_job_id.as_bytes()),
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    let router = build_test_router(ctx);
+    let mut req = Request::post("/api/v1/admin/tasks/noop")
+        .header("content-type", "application/json")
+        .header("Idempotency-Key", idem_key)
+        .body(Body::from("{}"))
+        .unwrap();
+    auth_test::inject_principal(&mut req, task_admin_principal());
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_ne!(
+        body["task_job_id"].as_str().unwrap(),
+        legacy_job_id.to_string()
+    );
+    assert_eq!(mocks.jobs.enqueue_calls().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -970,4 +1027,69 @@ async fn invoke_destructive_kind_without_destructive_claim_returns_403() {
         mocks.jobs.enqueue_calls().is_empty(),
         "destructive enqueue must not run without the claim"
     );
+}
+
+#[tokio::test]
+async fn retention_dry_run_is_authorized_without_destructive_claim_but_execute_is_not() {
+    let (ctx, mocks) = new_ctx();
+    let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
+    let uc = task_use_case_with_permit(&mocks, events);
+    let ctx = with_task_use_case(&ctx, uc);
+    let router = build_test_router(ctx);
+
+    let mut dry_run = Request::post("/api/v1/admin/tasks/retention-evaluate")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"mode":"dry_run"}"#))
+        .unwrap();
+    auth_test::inject_principal(&mut dry_run, task_admin_principal());
+    assert_eq!(
+        router.clone().oneshot(dry_run).await.unwrap().status(),
+        StatusCode::ACCEPTED
+    );
+
+    let mut execute = Request::post("/api/v1/admin/tasks/retention-evaluate")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"mode":"execute"}"#))
+        .unwrap();
+    auth_test::inject_principal(&mut execute, task_admin_principal());
+    assert_eq!(
+        router.oneshot(execute).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn identical_header_does_not_fold_retention_dry_run_into_execute() {
+    let (ctx, mocks) = new_ctx();
+    let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
+    let uc = task_use_case_with_permit(&mocks, events);
+    let ctx = with_task_use_case(&ctx, uc);
+    let router = build_test_router(ctx);
+    let idem_key = "2026-09-25:retention-evaluate";
+
+    let mut dry_run = Request::post("/api/v1/admin/tasks/retention-evaluate")
+        .header("content-type", "application/json")
+        .header("Idempotency-Key", idem_key)
+        .body(Body::from(r#"{"mode":"dry_run"}"#))
+        .unwrap();
+    auth_test::inject_principal(&mut dry_run, task_admin_principal());
+    let dry_response = router.clone().oneshot(dry_run).await.unwrap();
+    assert_eq!(dry_response.status(), StatusCode::ACCEPTED);
+    let dry_id = body_json(dry_response).await["task_job_id"].clone();
+
+    let mut execute = Request::post("/api/v1/admin/tasks/retention-evaluate")
+        .header("content-type", "application/json")
+        .header("Idempotency-Key", idem_key)
+        .body(Body::from(r#"{"mode":"execute"}"#))
+        .unwrap();
+    auth_test::inject_principal(&mut execute, destructive_task_admin_principal());
+    let execute_response = router.oneshot(execute).await.unwrap();
+    assert_eq!(execute_response.status(), StatusCode::ACCEPTED);
+    let execute_id = body_json(execute_response).await["task_job_id"].clone();
+
+    assert_ne!(dry_id, execute_id);
+    assert_eq!(mocks.jobs.enqueue_calls().len(), 2);
+    let keys = mocks.jobs.enqueue_idem_keys();
+    assert!(keys[0].as_ref().unwrap().as_str().contains(":dry_run:"));
+    assert!(keys[1].as_ref().unwrap().as_str().contains(":execute:"));
 }

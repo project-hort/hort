@@ -130,7 +130,12 @@ pub async fn run_with_output(
     let computed_key: Option<String> =
         match (args.idempotency_key.as_deref(), args.idempotency_key_window) {
             (Some(k), _) => Some(k.to_owned()),
-            (None, Some(window)) => Some(format_window_key(window, Utc::now(), &args.kind)),
+            (None, Some(window)) => Some(format_window_key(
+                window,
+                Utc::now(),
+                &args.kind,
+                invocation_mode(&args.kind, &body),
+            )),
             (None, None) => None,
         };
 
@@ -170,7 +175,12 @@ pub async fn run_with_output(
 /// `hort-cli` so the chart's distroless runtime image can invoke the CLI
 /// without a shell wrapper. Takes the clock as a parameter so the unit
 /// tests can pin a fixed instant.
-fn format_window_key(window: IdempotencyKeyWindow, now: DateTime<Utc>, kind: &str) -> String {
+fn format_window_key(
+    window: IdempotencyKeyWindow,
+    now: DateTime<Utc>,
+    kind: &str,
+    mode: &str,
+) -> String {
     let prefix = match window {
         IdempotencyKeyWindow::Minute => format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}",
@@ -191,7 +201,21 @@ fn format_window_key(window: IdempotencyKeyWindow, now: DateTime<Utc>, kind: &st
             format!("{:04}-{:02}-{:02}", now.year(), now.month(), now.day())
         }
     };
-    format!("{prefix}:{kind}")
+    if kind == "retention-evaluate" {
+        format!("{prefix}:{kind}:{mode}")
+    } else {
+        format!("{prefix}:{kind}")
+    }
+}
+
+fn invocation_mode<'a>(kind: &str, body: &'a serde_json::Value) -> &'a str {
+    if kind == "retention-evaluate" {
+        body.get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("execute")
+    } else {
+        "execute"
+    }
 }
 
 /// Percent-encode a single URL path segment using
@@ -283,19 +307,67 @@ mod tests {
             IdempotencyKeyWindow::Minute,
             fixed_instant(),
             "service-account-rotation",
+            "execute",
         );
         assert_eq!(key, "2026-05-14T11:25:service-account-rotation");
     }
 
     #[test]
     fn format_window_key_hour_drops_minute() {
-        let key = format_window_key(IdempotencyKeyWindow::Hour, fixed_instant(), "noop");
+        let key = format_window_key(
+            IdempotencyKeyWindow::Hour,
+            fixed_instant(),
+            "noop",
+            "execute",
+        );
         assert_eq!(key, "2026-05-14T11:noop");
     }
 
     #[test]
     fn format_window_key_day_drops_time() {
-        let key = format_window_key(IdempotencyKeyWindow::Day, fixed_instant(), "staging-sweep");
+        let key = format_window_key(
+            IdempotencyKeyWindow::Day,
+            fixed_instant(),
+            "staging-sweep",
+            "execute",
+        );
         assert_eq!(key, "2026-05-14:staging-sweep");
+    }
+
+    #[test]
+    fn retention_window_key_carries_mode() {
+        let execute = format_window_key(
+            IdempotencyKeyWindow::Day,
+            fixed_instant(),
+            "retention-evaluate",
+            "execute",
+        );
+        let dry_run = format_window_key(
+            IdempotencyKeyWindow::Day,
+            fixed_instant(),
+            "retention-evaluate",
+            "dry_run",
+        );
+        assert_eq!(execute, "2026-05-14:retention-evaluate:execute");
+        assert_eq!(dry_run, "2026-05-14:retention-evaluate:dry_run");
+    }
+
+    #[test]
+    fn invocation_mode_defaults_to_execute_and_reads_retention_mode() {
+        assert_eq!(
+            invocation_mode("retention-evaluate", &serde_json::json!({})),
+            "execute"
+        );
+        assert_eq!(
+            invocation_mode(
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "dry_run" }),
+            ),
+            "dry_run"
+        );
+        assert_eq!(
+            invocation_mode("retention-purge", &serde_json::json!({ "mode": "dry_run" })),
+            "execute"
+        );
     }
 }

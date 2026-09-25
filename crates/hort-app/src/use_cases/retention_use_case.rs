@@ -81,7 +81,8 @@ use hort_domain::ports::event_store::{
 };
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
 use hort_domain::retention::{
-    evaluate, EvaluationInputs, EvaluationOutcome, ExpirationReason, RetentionPolicy,
+    evaluate, EvaluationInputs, EvaluationOutcome, ExpirationReason, RetentionEvaluationMode,
+    RetentionPolicy,
 };
 use hort_domain::types::Finding;
 
@@ -161,6 +162,26 @@ pub struct EvaluateSummary {
     pub errors: u64,
 }
 
+/// One predicate hit produced by the shared evaluator path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationMatch {
+    pub policy_id: Uuid,
+    pub policy_name: String,
+    pub artifact_id: Uuid,
+    pub repository_id: Uuid,
+    pub name: String,
+    pub version: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub checksum_sha256: String,
+}
+
+/// Detailed result used by the task handler to build an operator preview.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvaluationReport {
+    pub summary: EvaluateSummary,
+    pub matches: Vec<EvaluationMatch>,
+}
+
 /// The retention evaluator. Pure orchestration over the
 /// [`RetentionScanReader`] port + the existing event store; the
 /// match decision itself is the pure
@@ -206,7 +227,27 @@ impl RetentionUseCase {
         policies: &[RetentionPolicy],
         candidates: &[RetentionCandidate],
     ) -> AppResult<EvaluateSummary> {
-        let mut summary = EvaluateSummary::default();
+        Ok(self
+            .evaluate_policies_in_mode(now, policies, candidates, RetentionEvaluationMode::Execute)
+            .await?
+            .summary)
+    }
+
+    /// Evaluate through the same selection and predicate path in execute or
+    /// dry-run mode. Dry-run differs only at the event-append boundary.
+    #[tracing::instrument(skip(self, policies, candidates), fields(
+        policy_count = policies.len(),
+        candidate_count = candidates.len(),
+        mode = mode.as_str(),
+    ))]
+    pub async fn evaluate_policies_in_mode(
+        &self,
+        now: DateTime<Utc>,
+        policies: &[RetentionPolicy],
+        candidates: &[RetentionCandidate],
+        mode: RetentionEvaluationMode,
+    ) -> AppResult<EvaluationReport> {
+        let mut report = EvaluationReport::default();
 
         for policy in policies {
             if policy.archived {
@@ -222,28 +263,38 @@ impl RetentionUseCase {
             let mut expired_count: u32 = 0;
 
             for candidate in candidates {
-                summary.evaluated += 1;
+                report.summary.evaluated += 1;
                 match self
-                    .evaluate_one(now, policy, &policy_id_label, candidate)
+                    .evaluate_one(now, policy, &policy_id_label, candidate, mode)
                     .await
                 {
                     EvalStep::Matched => {
-                        summary.expired += 1;
+                        report.summary.expired += 1;
                         matched_count += 1;
                         expired_count += 1;
+                        report.matches.push(EvaluationMatch {
+                            policy_id: policy.id,
+                            policy_name: policy.name.clone(),
+                            artifact_id: candidate.artifact.id,
+                            repository_id: candidate.artifact.repository_id,
+                            name: candidate.artifact.name.clone(),
+                            version: candidate.artifact.version.clone(),
+                            created_at: candidate.artifact.created_at,
+                            checksum_sha256: candidate.artifact.sha256_checksum.to_string(),
+                        });
                     }
                     EvalStep::NoMatch => {
                         matched_count += 0;
                     }
                     EvalStep::AlreadyExpired => {
-                        summary.already_expired += 1;
+                        report.summary.already_expired += 1;
                         // An already-expired artifact still counts as a
                         // policy match for the per-policy audit summary.
                         matched_count += 1;
                     }
-                    EvalStep::SkippedProtected => summary.skipped_protected += 1,
-                    EvalStep::SkippedStaleScan => summary.skipped_stale_scan += 1,
-                    EvalStep::Errored => summary.errors += 1,
+                    EvalStep::SkippedProtected => report.summary.skipped_protected += 1,
+                    EvalStep::SkippedStaleScan => report.summary.skipped_stale_scan += 1,
+                    EvalStep::Errored => report.summary.errors += 1,
                 }
             }
 
@@ -257,7 +308,7 @@ impl RetentionUseCase {
             );
         }
 
-        Ok(summary)
+        Ok(report)
     }
 
     /// Evaluate one policy against one candidate. Isolated so a port
@@ -269,6 +320,7 @@ impl RetentionUseCase {
         policy: &RetentionPolicy,
         policy_id_label: &str,
         candidate: &RetentionCandidate,
+        mode: RetentionEvaluationMode,
     ) -> EvalStep {
         let artifact = &candidate.artifact;
 
@@ -424,8 +476,8 @@ impl RetentionUseCase {
                 EvalStep::NoMatch
             }
             EvaluationOutcome::Matched(reason) => {
-                match self
-                    .append_expired(
+                let append_result = if mode == RetentionEvaluationMode::Execute {
+                    self.append_expired(
                         &stream_id,
                         artifact,
                         policy,
@@ -434,20 +486,32 @@ impl RetentionUseCase {
                         stream.len() as u64,
                     )
                     .await
-                {
+                } else {
+                    Ok(())
+                };
+                match append_result {
                     Ok(()) => {
                         emit_retention_evaluation(
                             policy_id_label,
                             RetentionEvaluationResult::Matched,
                         );
-                        emit_retention_expired(policy_id_label, reason.metric_label());
-                        tracing::info!(
-                            policy_id = %policy.id,
-                            policy_name = %policy.name,
-                            artifact_id = %artifact.id,
-                            reason = reason.metric_label(),
-                            "artifact expired by retention policy"
-                        );
+                        if mode == RetentionEvaluationMode::Execute {
+                            emit_retention_expired(policy_id_label, reason.metric_label());
+                            tracing::info!(
+                                policy_id = %policy.id,
+                                policy_name = %policy.name,
+                                artifact_id = %artifact.id,
+                                reason = reason.metric_label(),
+                                "artifact expired by retention policy"
+                            );
+                        } else {
+                            tracing::debug!(
+                                policy_id = %policy.id,
+                                policy_name = %policy.name,
+                                artifact_id = %artifact.id,
+                                "artifact matched retention policy during dry run"
+                            );
+                        }
                         EvalStep::Matched
                     }
                     Err(e) => self.errored(policy_id_label, policy, artifact, "append_expired", e),

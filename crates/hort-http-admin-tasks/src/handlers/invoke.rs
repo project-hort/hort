@@ -11,10 +11,11 @@
 //! 2. Deserialise the request body into `P`.
 //! 3. Call `params.validate()` → 422 on failure.
 //! 4. Check the `Idempotency-Key` header. If present and already cached
-//!    in `ctx.ephemeral_durable` → respond 200 with the cached `task_job_id`.
+//!    for the same kind and params in `ctx.ephemeral_durable` → respond 200
+//!    with the cached `task_job_id`.
 //! 5. Call `ctx.task_use_case.enqueue(principal, P::KIND, params_value)`.
-//! 6. Store `idem-task:<key>` → `task_job_id` in `ephemeral_durable`
-//!    with a 300 s TTL.
+//! 6. Store `idem-task:<key>` → `{task_job_id, kind, params}` in
+//!    `ephemeral_durable` with a 300 s TTL.
 //! 7. Return 202 on the fresh path, 200 on the cache-hit path.
 //!
 //! # Metrics
@@ -96,6 +97,13 @@ pub struct InvokeResponse {
     pub task_job_id: Uuid,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedInvocation {
+    task_job_id: Uuid,
+    kind: String,
+    params: serde_json::Value,
+}
+
 /// Generic handler invoked for each task kind.
 ///
 /// Mounted once per `kind` at route registration; the `P` type parameter
@@ -117,11 +125,16 @@ pub async fn invoke<P: TaskParams>(
     AuthenticatedCaller(principal): AuthenticatedCaller,
     Json(params): Json<P>,
 ) -> Result<(StatusCode, Json<InvokeResponse>), ApiError> {
+    let params_value = serde_json::to_value(&params).map_err(|e| {
+        ApiError(AppError::Domain(DomainError::Invariant(format!(
+            "params serialization failed: {e}"
+        ))))
+    })?;
+
     // Step 1 — per-kind authz FIRST.
     //
-    // The RBAC check (coarse `Permission::AdminTaskInvoke` AND, for the
-    // destructive kinds `retention-purge`/`eventstore-archive`/
-    // `retention-evaluate`, the `task:destructive` claim) runs **before**
+    // The RBAC check (coarse `Permission::AdminTaskInvoke` AND, for a
+    // destructive invocation, the `task:destructive` claim) runs **before**
     // param-validation and before the attacker-controlled
     // `Idempotency-Key` ephemeral-store probe. This prevents an
     // unauthenticated/under-privileged caller from probing param-validation
@@ -130,9 +143,15 @@ pub async fn invoke<P: TaskParams>(
     // direct use-case caller stays gated); sharing the method enforces it
     // first at the HTTP boundary too. An unknown `kind` never reaches here
     // — the route is not mounted (404 at the router).
-    if let Err(err) = ctx.task_use_case.authorize_kind(&principal, P::KIND) {
+    if let Err(err) = ctx
+        .task_use_case
+        .authorize_kind(&principal, P::KIND, &params_value)
+    {
         if matches!(err, AppError::Domain(DomainError::Forbidden(_))) {
             counter!(METRIC_ENQUEUED, "kind" => P::KIND, "result" => RESULT_RBAC_DENIED)
+                .increment(1);
+        } else if matches!(err, AppError::Domain(DomainError::Validation(_))) {
+            counter!(METRIC_ENQUEUED, "kind" => P::KIND, "result" => RESULT_VALIDATION_ERROR)
                 .increment(1);
         }
         return Err(ApiError(err));
@@ -169,25 +188,21 @@ pub async fn invoke<P: TaskParams>(
         })?;
 
         if let Some(bytes) = cached {
-            // Cache hit — return the previously-issued task_job_id.
+            // A legacy raw UUID or a record for another kind/param set is
+            // an unverified miss. Only an exact invocation record is a hit.
             // Emit result="ok": the operator's intent (enqueue this task) was
             // already satisfied by the prior request; the cache-hit is a
             // de-duplication courtesy, not a distinct failure mode.
-            if bytes.len() == 16 {
-                let id_bytes: [u8; 16] = bytes[..16].try_into().unwrap_or([0u8; 16]);
-                let task_job_id = Uuid::from_bytes(id_bytes);
-                counter!(METRIC_ENQUEUED, "kind" => P::KIND, "result" => RESULT_OK).increment(1);
-                return Ok((StatusCode::OK, Json(InvokeResponse { task_job_id })));
+            if let Ok(record) = serde_json::from_slice::<CachedInvocation>(&bytes) {
+                if record.kind == P::KIND && record.params == params_value {
+                    let task_job_id = record.task_job_id;
+                    counter!(METRIC_ENQUEUED, "kind" => P::KIND, "result" => RESULT_OK)
+                        .increment(1);
+                    return Ok((StatusCode::OK, Json(InvokeResponse { task_job_id })));
+                }
             }
         }
     }
-
-    // Step 4 — serialize params to JSON Value for the use case.
-    let params_value = serde_json::to_value(&params).map_err(|e| {
-        ApiError(AppError::Domain(DomainError::Invariant(format!(
-            "params serialization failed: {e}"
-        ))))
-    })?;
 
     // Step 4b — derive the DB-layer idempotency key for destructive
     // kinds (see ADR 0028 / `how-to/using-hort-cli-with-admin-ops.md`
@@ -214,10 +229,16 @@ pub async fn invoke<P: TaskParams>(
     let db_idempotency_key: Option<IdempotencyKey> =
         if hort_domain::events::task_kind_is_destructive(P::KIND) {
             let utc_today = chrono::Utc::now().format("%Y-%m-%d");
-            Some(IdempotencyKey::try_from(format!(
-                "cron:{}:{utc_today}",
-                P::KIND
-            ))?)
+            let derived = if P::KIND == "retention-evaluate" {
+                let mode = params_value
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("execute");
+                format!("cron:{}:{mode}:{utc_today}", P::KIND)
+            } else {
+                format!("cron:{}:{utc_today}", P::KIND)
+            };
+            Some(IdempotencyKey::try_from(derived)?)
         } else {
             None
         };
@@ -283,7 +304,17 @@ pub async fn invoke<P: TaskParams>(
     // Step 6 — store the idempotency mapping in ephemeral_durable.
     if let Some(key) = idem_key {
         let store_key = format!("{IDEM_TASK_PREFIX}{key}");
-        let id_bytes = Bytes::copy_from_slice(task_job_id.as_bytes());
+        let record = CachedInvocation {
+            task_job_id,
+            kind: P::KIND.to_owned(),
+            params: params_value,
+        };
+        let record_bytes = serde_json::to_vec(&record).map_err(|e| {
+            ApiError(AppError::Domain(DomainError::Invariant(format!(
+                "idempotency record serialization failed: {e}"
+            ))))
+        })?;
+        let id_bytes = Bytes::from(record_bytes);
         // Best-effort — a cache write failure does NOT abort the response.
         // The task was already enqueued successfully; the idempotency
         // window is a convenience, not a correctness invariant.
