@@ -119,6 +119,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`KeepLastN(n)` could leave n artifacts and no downloadable one** (#292).
+  The retention candidate reader ranked siblings over every live row of the
+  `(repository, name)` group, while the candidate page itself excluded the
+  GC-protected statuses. A quarantined, rejected or scan-indeterminate sibling
+  could therefore never expire *and* still held a rank slot — the two halves of
+  one query disagreeing about what a sibling is.
+
+  That does not merely narrow the keep window, it can empty it. `KeepLastN(3)`
+  over five siblings whose three newest went into quarantine together — one
+  scan hit on a fresh build burst does exactly that — gave ranks 1–3 to the
+  quarantined rows and expired both released siblings at ranks 4 and 5. What
+  survived was three artifacts, none downloadable and none collectable, for an
+  operator who had asked to keep the last three.
+
+  The rank now counts **usable** siblings: `ranked` carries the identical
+  predicate the page does, bound from the same protected-status set, so
+  `KeepLastN(n)` means n artifacts a client can actually fetch. The accepted
+  counter-cost is that a group holds n plus its protected siblings rather than
+  n rows — a population `KeepLastN` could not have collected in any case.
+  Releasing a protected sibling re-enters it in the rank and can push an older
+  released sibling out of the window; that is the rule working, since release
+  is what makes an artifact usable. A soft-deleted sibling still occupies no
+  slot, and the tag exemption is unchanged.
+
 - **A retention preview took the destructive single-flight key, so previewing
   first is what made the confirmation lie** (#291). `retention-evaluate` is a
   destructive *kind*, and the server derived its durable per-UTC-day

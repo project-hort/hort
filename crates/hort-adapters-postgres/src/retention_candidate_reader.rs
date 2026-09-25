@@ -1,4 +1,8 @@
-//! PostgreSQL adapter for [`RetentionCandidateReader`] (ADR 0020).
+//! PostgreSQL adapter for [`RetentionCandidateReader`].
+//!
+//! The protected-status filter below is Invariant 1 (ADR 0007): an
+//! artifact held as evidence is never enumerated as a retention
+//! candidate. That is the constraint this adapter exists to honour.
 //!
 //! Enumerates non-protected artifacts and resolves each one's
 //! repo-scoped rescan interval (freshness-window input)
@@ -36,7 +40,7 @@
 //! (the daily cron drains any backlog, identical posture to
 //! cron-rescan's single-shot cap).
 //!
-//! # `keep_rank` / `sibling_total` — and why the page is a CTE
+//! # `keep_rank` / `usable_sibling_total` — and why the page is a CTE
 //!
 //! The `KeepLastN` input is resolved in this same statement by a
 //! window function over `(repository_id, name)`, ordered newest-first
@@ -46,28 +50,59 @@
 //! A window function is evaluated **after** `WHERE` and **before**
 //! `LIMIT`, so writing `ROW_NUMBER() OVER (…)` straight into the
 //! paginated query would rank each artifact within the slice of its
-//! sibling group that survived the keyset cursor and the
-//! protected-status filter — a rank that shifts with the page
-//! boundary and with quarantine state, expiring the wrong artifacts.
-//! A sibling group can be several times the 1000-row page, so this is
-//! the common case, not a corner.
+//! sibling group that survived the keyset cursor — a rank that shifts
+//! with the page boundary, expiring the wrong artifacts. A sibling
+//! group can be several times the 1000-row page, so this is the
+//! common case, not a corner.
 //!
 //! The query therefore picks the page first (`page`, materialised so
 //! the `ORDER BY … LIMIT` is evaluated exactly once), collects the
-//! distinct `(repository_id, name)` groups it touched, and ranks over
-//! **every live row** of those groups (`ranked`) before joining the
-//! rank back onto the page. Consequences, all intended:
+//! distinct `(repository_id, name)` groups it touched, and ranks the
+//! **usable** rows of those groups (`ranked`) before joining the rank
+//! back onto the page. Ranking is bounded by the groups the page
+//! actually touched rather than by the whole table.
 //!
-//! - The live set is `deleted_at IS NULL` — the same definition this
-//!   adapter's own enumeration uses. A retired sibling occupies no
-//!   rank slot, so it cannot shield itself and push an extra live
-//!   artifact over the edge.
-//! - GC-protected siblings (`quarantined` / `rejected` /
-//!   `scan_indeterminate`) are absent from `page` but present in
-//!   `ranked`: they are live bytes on disk, and "keep the last n"
-//!   counts live artifacts.
-//! - Ranking is bounded by the groups the page actually touched
-//!   rather than by the whole table.
+//! ## `KeepLastN(n)` counts n *usable* siblings, not n live rows
+//!
+//! `ranked` carries the identical row predicate `page` does — the same
+//! `deleted_at IS NULL` and the same
+//! `(quarantine_status IS NULL OR quarantine_status <> ALL($4::text[]))`
+//! bound from `gc_protected_quarantine_status_names` (`lib.rs`), whose
+//! `IS NULL` arm is what keeps `QuarantineStatus::None` (persisted as
+//! SQL `NULL`) and the legacy `unscanned` / `clean` / `flagged`
+//! spellings in the rank. One predicate, bound once, read by both
+//! CTEs: a second spelling of the protected set here is how the page
+//! and the rank drift apart.
+//!
+//! Ranking over every live row instead — counting rows rather than
+//! usable artifacts — lets the usable window reach **zero**.
+//! `KeepLastN(3)` over five siblings whose three newest went into
+//! quarantine together (one scan hit on a fresh build burst does
+//! exactly that) hands ranks 1–3 to the quarantined rows and expires
+//! the two released siblings at ranks 4 and 5. Three artifacts
+//! survive, none of them downloadable
+//! ([`Artifact::is_downloadable`] is true only for
+//! `QuarantineStatus::None | Released`) and none of them collectable
+//! either — the same protected set is filtered out of the purge path
+//! (`purge_gc`). The operator who asked to keep the last three would
+//! have none.
+//!
+//! The cost of measuring usability is real and accepted: a group then
+//! holds n **plus** its protected siblings rather than n rows.
+//! `KeepLastN` could never have collected those rows in any case —
+//! they are excluded from the purge path whatever their rank — so the
+//! excess is bounded by a population this knob does not govern.
+//!
+//! Two consequences follow, both intended:
+//!
+//! - **Releasing a sibling re-enters it in the rank**, which can push
+//!   an older released sibling out of the keep window and expire it.
+//!   That is the rule working rather than a race: release is exactly
+//!   what makes an artifact usable, and a usable artifact counts.
+//! - **A soft-deleted sibling still occupies no rank slot**
+//!   (`deleted_at IS NULL`, unchanged). A retired artifact holding a
+//!   slot would shield itself and push one extra usable artifact over
+//!   the edge.
 //!
 //! # `tag_targeted` — the `KeepLastN` tag exemption
 //!
@@ -160,9 +195,11 @@ fn decode_candidate(row: &PgRow) -> DomainResult<RetentionCandidateRow> {
         tracing::warn!(error = %e, "retention_candidate keep_rank decode failed");
         DomainError::Invariant(format!("retention_candidate keep_rank decode: {e}"))
     })?;
-    let total_raw: i64 = row.try_get("sibling_total").map_err(|e| {
-        tracing::warn!(error = %e, "retention_candidate sibling_total decode failed");
-        DomainError::Invariant(format!("retention_candidate sibling_total decode: {e}"))
+    let total_raw: i64 = row.try_get("usable_sibling_total").map_err(|e| {
+        tracing::warn!(error = %e, "retention_candidate usable_sibling_total decode failed");
+        DomainError::Invariant(format!(
+            "retention_candidate usable_sibling_total decode: {e}"
+        ))
     })?;
     let keep_rank = match (u32::try_from(rank_raw), u32::try_from(total_raw)) {
         (Ok(rank), Ok(total)) => Some((rank, total)),
@@ -245,12 +282,14 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                            ) AS keep_rank,
                            COUNT(*) OVER (
                                PARTITION BY s.repository_id, s.name
-                           ) AS sibling_total
+                           ) AS usable_sibling_total
                     FROM artifacts s
                     JOIN sibling_groups g
                       ON g.repository_id = s.repository_id
                      AND g.name = s.name
-                    WHERE s.deleted_at IS NULL
+                    WHERE (s.quarantine_status IS NULL
+                           OR s.quarantine_status <> ALL($4::text[]))
+                      AND s.deleted_at IS NULL
                 )
                 SELECT a.id, a.repository_id, a.name, a.name_as_published,
                        a.version, a.path, a.size_bytes,
@@ -264,7 +303,7 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                        r.key AS repo_key,
                        p.rescan_interval_hours AS resolved_rescan_interval_hours,
                        rk.keep_rank AS keep_rank,
-                       rk.sibling_total AS sibling_total,
+                       rk.usable_sibling_total AS usable_sibling_total,
                        {tag_targeted} AS tag_targeted
                 FROM page pg
                 JOIN artifacts a ON a.id = pg.id
@@ -818,28 +857,40 @@ mod tests {
         assert_eq!(rank_of(&rows, live_old), (2, 2));
     }
 
-    /// A GC-protected sibling is not enumerable as a candidate but it
-    /// is live content on disk, so it still occupies a rank slot —
-    /// "keep the last n" counts live artifacts.
+    /// A GC-protected sibling is not enumerable as a candidate and it
+    /// occupies no rank slot either — "keep the last n" counts the n
+    /// artifacts an operator can actually download. All three
+    /// protected statuses are pinned: they share one predicate, and a
+    /// reading that lost one of them would still pass a
+    /// `quarantined`-only assertion.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    async fn keep_rank_counts_gc_protected_siblings() {
+    async fn keep_rank_skips_gc_protected_siblings() {
         let Some(pool) = maybe_pool().await else {
             return;
         };
         let repo = seed_repo(&pool).await;
         let base = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let quarantined = seed_sibling(
-            &pool,
-            repo,
-            "pkg",
-            "2.0.0",
-            base + chrono::Duration::seconds(100),
-            &fixture_hash(9),
-            Some("quarantined"),
-            false,
-        )
-        .await;
+        let mut protected = Vec::new();
+        for (offset, status) in [
+            (300i64, "quarantined"),
+            (200, "rejected"),
+            (100, "scan_indeterminate"),
+        ] {
+            protected.push(
+                seed_sibling(
+                    &pool,
+                    repo,
+                    "pkg",
+                    &format!("2.0.{offset}"),
+                    base + chrono::Duration::seconds(offset),
+                    &fixture_hash(u8::try_from(offset / 100).unwrap() + 8),
+                    Some(status),
+                    false,
+                )
+                .await,
+            );
+        }
         let released = seed_sibling(
             &pool,
             repo,
@@ -854,14 +905,185 @@ mod tests {
 
         let rows = candidates_by_id(&pool, 1000).await;
 
-        assert!(
-            !rows.contains_key(&quarantined),
-            "a protected artifact is not a candidate"
-        );
+        for id in &protected {
+            assert!(
+                !rows.contains_key(id),
+                "a protected artifact is not a candidate"
+            );
+        }
         assert_eq!(
             rank_of(&rows, released),
-            (2, 2),
-            "the protected sibling still holds rank 1"
+            (1, 1),
+            "the three protected siblings hold no rank slot, newer though they are"
+        );
+    }
+
+    /// The reason the rank counts usable siblings: counting rows lets
+    /// the usable window reach zero. `KeepLastN(3)` over five siblings
+    /// whose three newest were quarantined together — one scan hit on
+    /// a fresh build burst — must still leave the operator the two
+    /// artifacts they can download. Asserted through the real
+    /// evaluator, not just the rank.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn keep_last_n_keeps_usable_siblings_when_the_newest_are_quarantined() {
+        use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let base = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        // Oldest first: two released, then the three that a single
+        // scan run put into quarantine together.
+        let mut released = Vec::new();
+        for i in 0..2i64 {
+            released.push(
+                seed_sibling(
+                    &pool,
+                    repo,
+                    "pkg",
+                    &format!("1.0.{i}"),
+                    base + chrono::Duration::seconds(i),
+                    &fixture_hash(u8::try_from(i).unwrap() + 1),
+                    Some("released"),
+                    false,
+                )
+                .await,
+            );
+        }
+        for i in 0..3i64 {
+            seed_sibling(
+                &pool,
+                repo,
+                "pkg",
+                &format!("2.0.{i}"),
+                base + chrono::Duration::seconds(100 + i),
+                &fixture_hash(u8::try_from(i).unwrap() + 4),
+                Some("quarantined"),
+                false,
+            )
+            .await;
+        }
+
+        let rows = candidates_by_id(&pool, 1000).await;
+
+        assert_eq!(rows.len(), 2, "only the released siblings are candidates");
+        assert_eq!(rank_of(&rows, released[1]), (1, 2));
+        assert_eq!(rank_of(&rows, released[0]), (2, 2));
+
+        let predicate = PolicyPredicate::KeepLastN(3);
+        let now = Utc::now();
+        for id in &released {
+            let row = &rows[id];
+            assert!(
+                !matches_bool(
+                    &predicate,
+                    &EvaluationInputs {
+                        now,
+                        created_at: row.artifact.created_at,
+                        last_downloaded_at: None,
+                        keep_rank: row.keep_rank,
+                        tag_targeted: row.tag_targeted,
+                        findings: &[],
+                        first_detected_at: row.artifact.created_at,
+                        latest_scan_at: row.artifact.created_at,
+                    },
+                ),
+                "KeepLastN(3) must not expire a downloadable sibling to keep three \
+                 quarantined ones"
+            );
+        }
+    }
+
+    /// The other side of the same rule: releasing a protected sibling
+    /// re-enters it in the rank and can push an older released sibling
+    /// out of the window. That is the rule working — release is what
+    /// makes an artifact usable, and a usable artifact counts.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn releasing_a_quarantined_sibling_pushes_the_oldest_released_one_out() {
+        use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let base = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let older = seed_sibling(
+            &pool,
+            repo,
+            "pkg",
+            "1.0.0",
+            base,
+            &fixture_hash(1),
+            Some("released"),
+            false,
+        )
+        .await;
+        let newer = seed_sibling(
+            &pool,
+            repo,
+            "pkg",
+            "1.0.1",
+            base + chrono::Duration::seconds(10),
+            &fixture_hash(2),
+            Some("released"),
+            false,
+        )
+        .await;
+        let held = seed_sibling(
+            &pool,
+            repo,
+            "pkg",
+            "2.0.0",
+            base + chrono::Duration::seconds(20),
+            &fixture_hash(3),
+            Some("quarantined"),
+            false,
+        )
+        .await;
+
+        let predicate = PolicyPredicate::KeepLastN(2);
+        let now = Utc::now();
+        let expires = |rows: &HashMap<Uuid, RetentionCandidateRow>, id: Uuid| {
+            let row = &rows[&id];
+            matches_bool(
+                &predicate,
+                &EvaluationInputs {
+                    now,
+                    created_at: row.artifact.created_at,
+                    last_downloaded_at: None,
+                    keep_rank: row.keep_rank,
+                    tag_targeted: row.tag_targeted,
+                    findings: &[],
+                    first_detected_at: row.artifact.created_at,
+                    latest_scan_at: row.artifact.created_at,
+                },
+            )
+        };
+
+        let before = candidates_by_id(&pool, 1000).await;
+        assert_eq!(rank_of(&before, newer), (1, 2));
+        assert_eq!(rank_of(&before, older), (2, 2));
+        assert!(
+            !expires(&before, older),
+            "rank 2 of 2 is inside KeepLastN(2)"
+        );
+
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'released' WHERE id = $1")
+            .bind(held)
+            .execute(&pool)
+            .await
+            .expect("release the held sibling");
+
+        let after = candidates_by_id(&pool, 1000).await;
+        assert_eq!(rank_of(&after, held), (1, 3));
+        assert_eq!(rank_of(&after, newer), (2, 3));
+        assert_eq!(rank_of(&after, older), (3, 3));
+        assert!(
+            expires(&after, older),
+            "the released sibling took a rank slot, so the oldest falls outside the window"
         );
     }
 
@@ -869,6 +1091,11 @@ mod tests {
     /// A window function evaluated inside the keyset-filtered query
     /// would rank each artifact within the page slice instead; this
     /// pins the two runs to the identical ranking.
+    ///
+    /// Protected siblings are interleaved through the group on
+    /// purpose: the usable-sibling predicate is what a future change
+    /// would be tempted to move onto the page-joined rows, and that is
+    /// exactly the move that makes the rank page-dependent again.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn keep_rank_is_stable_across_page_boundaries() {
@@ -877,8 +1104,20 @@ mod tests {
         };
         let repo = seed_repo(&pool).await;
         let base = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let group = 7usize;
-        for i in 0..group {
+        // Ten siblings, every third one GC-protected → seven usable.
+        let statuses = [
+            "released",
+            "released",
+            "quarantined",
+            "released",
+            "released",
+            "rejected",
+            "released",
+            "released",
+            "scan_indeterminate",
+            "released",
+        ];
+        for (i, status) in statuses.iter().enumerate() {
             seed_sibling(
                 &pool,
                 repo,
@@ -886,32 +1125,34 @@ mod tests {
                 &format!("1.0.{i}"),
                 base + chrono::Duration::seconds(i as i64),
                 &fixture_hash(u8::try_from(i).unwrap()),
-                Some("released"),
+                Some(status),
                 false,
             )
             .await;
         }
+        let usable = statuses.iter().filter(|s| **s == "released").count();
 
         let unpaginated = candidates_by_id(&pool, 1000).await;
         // A batch far smaller than the sibling group, so every page
         // boundary falls inside it.
         let paginated = candidates_by_id(&pool, 2).await;
 
-        assert_eq!(unpaginated.len(), group);
-        assert_eq!(paginated.len(), group);
+        assert_eq!(unpaginated.len(), usable);
+        assert_eq!(paginated.len(), usable);
         for (id, row) in &unpaginated {
             assert_eq!(
                 paginated[id].keep_rank, row.keep_rank,
                 "rank of {id} shifted with the page boundary"
             );
         }
-        // And the ranking itself is the complete 1..=7 sequence.
+        // And the ranking itself is the complete 1..=7 sequence over
+        // the usable siblings — no gaps where a protected one sat.
         let mut ranks: Vec<u32> = paginated
             .values()
             .map(|r| r.keep_rank.expect("ranked").0)
             .collect();
         ranks.sort_unstable();
-        assert_eq!(ranks, (1..=group as u32).collect::<Vec<_>>());
+        assert_eq!(ranks, (1..=usable as u32).collect::<Vec<_>>());
     }
 
     // -- tag_targeted ---------------------------------------------------
