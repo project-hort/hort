@@ -18,6 +18,24 @@
       "enabled": false
     },
     {
+      "description": "Hold quick-xml below 0.42: 0.42 makes text decoding infallible, which breaks the Maven readers' fallible-decode invariant (decode_text in crates/hort-formats/src/maven/xml.rs returns None on invalid UTF-8 so an unneeded element cannot abort the reader); and while object_store still requires quick-xml ^0.41, a bump splits the graph across both versions. Unpark when object_store's own quick-xml requirement reaches 0.42.",
+      "matchPackageNames": ["quick-xml"],
+      "matchUpdateTypes": ["minor", "major"],
+      "enabled": false
+    },
+    {
+      "description": "Hold x509-cert and const-oid at the majors the sigstore crate compiles against. The type-unification coupling that forces this is documented at length on the dependency block of crates/hort-adapters-provenance-sigstore/Cargo.toml - read it there; it is deliberately not restated here. Unpark when a sigstore release itself moves to x509-cert 0.3 / der 0.8.",
+      "matchPackageNames": ["x509-cert", "const-oid"],
+      "matchUpdateTypes": ["minor", "major"],
+      "enabled": false
+    },
+    {
+      "description": "Hold cvss below 3.0: 3.0 removes or renames cvss::v3::Base - measured, not assumed (test:lint fails with 'cannot find type Base in module cvss::v3') - and both call sites, crates/hort-adapters-scanner-osv/src/severity.rs and crates/hort-adapters-advisory-osv/src/severity.rs, parse a CVSS v3 vector into the base score that drives severity classification, which is what the scan-policy gates act on. 2.2.0 carries no advisory, so the bump buys nothing functional while costing a port on the path that decides what gets quarantined. Unlike the other holds here this one waits on no upstream: unpark when the port is deliberately scheduled, or when an advisory against 2.2.0 forces it.",
+      "matchPackageNames": ["cvss"],
+      "matchUpdateTypes": ["minor", "major"],
+      "enabled": false
+    },
+    {
       "description": "Resolve crate versions through hort's crates-proxy sparse index instead of crates.io: the pull-through proxy that fires the on_dist_tag_move prefetch on each index read, warming the newest versions off the build's critical path. (cargo-virtual is the CI build source but aggregates crates-proxy, and its serve-path is still in progress, so crates-proxy is the reliable trigger point; warmed content lives here regardless.) Auth (hostRules matchHost hort.kdp.kloni.cloud, hostType crate, plus a hort read token) comes from the renovate-runner; this repo config carries only the routing. Note: crates-proxy uses indexMode include_pending, so not-yet-warmed upstream versions are visible — the read starts the quarantine clock early but does not guarantee a proposed version is released by the first build's fetch. Renovate's supplementary /api/v1/crates/ metadata probe 404s on hort (non-fatal noise, thinner changelog).",
       "matchDatasources": ["crate"],
       "registryUrls": ["sparse+https://hort.kdp.kloni.cloud/cargo/crates-proxy/"]
