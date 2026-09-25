@@ -870,9 +870,26 @@ the filesystem alpha, so the run reports `result=ok` rather than a
 coverage gap. To assert the anchored behaviour anyway, force it:
 `--fail-on-missing-checkpoint=true` then yields exit 3. The scrub reports
 zero `mismatches`/`missing`/`read_errors` (any non-zero is a real defect
-— capture and escalate). Retention sweep (`hort-cli admin task
-invoke retention-purge`) is informational unless a `kind: RetentionPolicy`
-is declared.
+— capture and escalate).
+
+**Retention (§13.b).** The fixture tree declares one `kind:
+RetentionPolicy` (`alpha-npm-proxy-retention`: `AgeExceeds: 86400` over
+`{Repos: [npm-proxy]}`), so the sweep has something to select. Read the
+proposal first — the dry run appends no events and deletes nothing, and
+needs only the svc-token's `admin_task_invoke` permission:
+
+```bash
+hort-cli admin retention preview
+```
+
+Its row count is `0` on a same-day walk (nothing in `npm-proxy` is a day
+old yet) and non-zero once the stack has held cached npm content across a
+day — that is the policy working, not a failure either way. Executing the
+proposal (`hort-cli admin retention apply`) additionally requires the
+`task:destructive` claim, which the `admin` claim satisfies (a full admin
+holds every claim requirement). So execution is **Track B only**, on the
+admin OIDC session from §5·B; the Track A svc-token carries no claims at
+all and is refused at the execute step by design.
 
 ---
 
