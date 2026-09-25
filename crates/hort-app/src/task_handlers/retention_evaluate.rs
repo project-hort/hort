@@ -42,7 +42,9 @@ use serde_json::json;
 use hort_domain::error::DomainResult;
 use hort_domain::ports::retention_candidate_reader::RetentionCandidateReader;
 use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
-use hort_domain::ports::retention_preview::{RetentionContentSimulation, RetentionPreview};
+use hort_domain::ports::retention_preview::{
+    RetentionContentSimulation, RetentionPreview, SimulationBoundExceeded,
+};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
@@ -69,10 +71,54 @@ const MAX_BATCHES_PER_TICK: usize = 64;
 /// bounded sanity-check sample.
 const MAX_SAMPLE_SIZE: usize = 500;
 
-/// Exact byte accounting is intentionally bounded. Above either limit the
-/// result says `omitted`; it never extrapolates from a partial set.
-const MAX_SIMULATION_ARTIFACTS: usize = 10_000;
-const MAX_SIMULATION_TARGETS: u32 = 10_000;
+/// Input ceiling on the byte simulation, checked before the walk touches the
+/// database.
+///
+/// Measured on Postgres 16 against corpora of 180 000 and 660 000
+/// `content_references` edges, the walk costs roughly **2 us per candidate
+/// artifact**: holding the reclaimable-target count at zero and raising the
+/// candidate set from 1 000 to 10 000 moves the statement from 35 ms to 51 ms.
+/// The same corpus costs ~7 us per *target*, so a run's cost is dominated by
+/// what its candidates point at, not by how many of them there are. There is
+/// no knee anywhere near the input sizes this sweep can produce, so the tight
+/// bound does not belong here; it belongs on the target side (see
+/// [`MAX_SIMULATION_TARGETS`]).
+///
+/// The value is therefore a backstop rather than an operational limit: it sits
+/// a margin above the sweep's own structural maximum
+/// (`MAX_BATCHES_PER_TICK * BATCH_SIZE` = 64 000 candidates examined per tick,
+/// and matches cannot exceed candidates), so a normal sweep never reaches it,
+/// while an oversized caller still cannot hand the database an unbounded
+/// `unnest` array. It is deliberately not written as arithmetic on those two
+/// constants: a ceiling that moves whenever the batch cap moves is not a
+/// ceiling.
+const MAX_SIMULATION_ARTIFACTS: usize = 100_000;
+
+/// Output ceiling on the byte simulation, checked against the walk's result.
+///
+/// This is the bound that does the work, because the target count is what both
+/// costs scale with:
+///
+/// - the walk itself costs roughly **7 us per target** — holding the candidate
+///   set at 10 000 and raising the reclaimable-target count from 0 to 80 000
+///   moves the statement from 51 ms to 635 ms on a 180 000-edge table, and
+///   from 342 ms to 956 ms on a 660 000-edge one. That is about 3.5x the cost
+///   of an artifact, and a flat-format artifact carries 2 targets while an
+///   OCI-shaped one carries up to 9;
+/// - every returned target then costs **one `StoragePort::size_of` round trip**
+///   in [`RetentionEvaluateHandler::build_preview`], issued sequentially. On a
+///   filesystem backend that is a `stat`, measured at 8.4 us; on an
+///   object-store backend it is an HTTP `HEAD`, so this loop — not the SQL —
+///   is what puts an upper limit on how large a preview may usefully be, and
+///   it is why this ceiling is 10^5 rather than 10^6.
+///
+/// The value covers the sweep's per-tick structural maximum at the ordinary
+/// flat-format fanout (64 000 candidates x 2 edges), which is what makes a
+/// preview over a repository the size of the largest real one — ~37 000
+/// artifacts, ~74 000 targets — report a measured figure instead of `omitted`.
+/// An OCI-dominated sweep can still exceed it; the omission then says so, with
+/// the bound and the observed count, so the operator can narrow the scope.
+const MAX_SIMULATION_TARGETS: u32 = 128_000;
 
 /// [`TaskHandler`] for the periodic retention-evaluate sweep.
 pub struct RetentionEvaluateHandler {
@@ -352,9 +398,9 @@ impl RetentionEvaluateHandler {
                     None => json!({ "status": "exact", "bytes": total }),
                 }
             }
-            Ok(RetentionContentSimulation::Omitted) => json!({
+            Ok(RetentionContentSimulation::Omitted(exceeded)) => json!({
                 "status": "omitted",
-                "reason": "simulation cardinality exceeded its exact-accounting bound",
+                "reason": bound_omission_reason(&exceeded),
             }),
             Err(error) => {
                 tracing::warn!(error = %error, "retention dry-run refcount simulation failed");
@@ -374,6 +420,21 @@ impl RetentionEvaluateHandler {
             "sample_limit": MAX_SAMPLE_SIZE,
         })
     }
+}
+
+/// Phrase a bound rejection so the operator can act on it: which ceiling, what
+/// it is set to, what this run presented to it, and the one lever that changes
+/// the answer. An omission that only says "a bound was exceeded" tells someone
+/// holding tens of thousands of artifacts nothing they can use.
+fn bound_omission_reason(exceeded: &SimulationBoundExceeded) -> String {
+    format!(
+        "exact byte accounting is bounded at {limit} {bound}; this run reached {observed}. \
+         Narrow the sweep's scope — fewer repositories, or a predicate that matches fewer \
+         artifacts — to bring it under the bound.",
+        limit = exceeded.limit,
+        bound = exceeded.bound.as_str(),
+        observed = exceeded.observed,
+    )
 }
 
 fn accumulate(
@@ -404,7 +465,9 @@ mod tests {
         AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
     };
     use hort_domain::ports::retention_candidate_reader::RetentionCandidateRow;
-    use hort_domain::ports::retention_preview::RetentionContentSimulation;
+    use hort_domain::ports::retention_preview::{
+        ObservedCardinality, RetentionContentSimulation, SimulationBound,
+    };
     use hort_domain::ports::retention_scan_reader::RetentionScanReader;
     use hort_domain::ports::storage::PutResult;
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
@@ -899,6 +962,24 @@ mod tests {
         }
     }
 
+    /// Records the bounds it was called with, so the constants the handler
+    /// documents can be asserted at the port boundary.
+    #[derive(Default)]
+    struct RecordingPreview {
+        seen: Mutex<Vec<(usize, u32)>>,
+    }
+    impl RetentionPreview for RecordingPreview {
+        fn reclaimable_content<'a>(
+            &'a self,
+            _artifact_ids: &'a [Uuid],
+            max_artifacts: usize,
+            max_targets: u32,
+        ) -> BoxFuture<'a, DomainResult<RetentionContentSimulation>> {
+            self.seen.lock().unwrap().push((max_artifacts, max_targets));
+            Box::pin(async { Ok(RetentionContentSimulation::Exact(Vec::new())) })
+        }
+    }
+
     struct FixedPreview(RetentionContentSimulation);
     impl RetentionPreview for FixedPreview {
         fn reclaimable_content<'a>(
@@ -1040,18 +1121,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_explicitly_omits_bytes_for_bounds_or_port_failure() {
-        let bounded = preview_handler(
-            Arc::new(FixedPreview(RetentionContentSimulation::Omitted)),
-            Arc::new(InertStorage::default()),
-        );
-        let omitted = bounded.build_preview(Utc::now(), &[]).await;
-        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
-        assert!(omitted["freed_bytes"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("cardinality"));
-
+    async fn preview_explicitly_omits_bytes_when_the_simulation_is_unavailable() {
         let failed = preview_handler(Arc::new(FailingPreview), Arc::new(InertStorage::default()));
         let omitted = failed.build_preview(Utc::now(), &[]).await;
         assert_eq!(omitted["freed_bytes"]["status"], "omitted");
@@ -1059,6 +1129,99 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unavailable"));
+    }
+
+    /// An omission that does not say which ceiling stopped it, what that
+    /// ceiling is, and how far over the run stood leaves the operator with no
+    /// way to tell whether a narrower scope brings the figure back.
+    #[tokio::test]
+    async fn an_input_bound_omission_names_the_bound_its_value_and_the_exact_count() {
+        let bounded = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Omitted(
+                SimulationBoundExceeded {
+                    bound: SimulationBound::Artifacts,
+                    limit: 100_000,
+                    observed: ObservedCardinality::Exact(120_000),
+                },
+            ))),
+            Arc::new(InertStorage::default()),
+        );
+        let omitted = bounded.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        let reason = omitted["freed_bytes"]["reason"].as_str().unwrap();
+        assert!(reason.contains("bounded at 100000 artifacts"), "{reason}");
+        assert!(reason.contains("reached 120000"), "{reason}");
+        assert!(reason.contains("Narrow the sweep's scope"), "{reason}");
+        assert!(
+            omitted["freed_bytes"]["bytes"].is_null(),
+            "an omission never carries a figure: {omitted}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_output_bound_omission_reports_a_lower_bound_not_an_invented_total() {
+        let bounded = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Omitted(
+                SimulationBoundExceeded {
+                    bound: SimulationBound::Targets,
+                    limit: 128_000,
+                    observed: ObservedCardinality::AtLeast(128_001),
+                },
+            ))),
+            Arc::new(InertStorage::default()),
+        );
+        let omitted = bounded.build_preview(Utc::now(), &[]).await;
+        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
+        let reason = omitted["freed_bytes"]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("bounded at 128000 reclaimable content targets"),
+            "{reason}"
+        );
+        assert!(reason.contains("reached at least 128001"), "{reason}");
+    }
+
+    /// The handler must hand the port the constants it documents; a preview
+    /// bounded by something other than the established figures would make
+    /// their justification fiction.
+    #[tokio::test]
+    async fn the_documented_bounds_are_the_ones_the_port_is_given() {
+        let recorder = Arc::new(RecordingPreview::default());
+        let handler = preview_handler(recorder.clone(), Arc::new(InertStorage::default()));
+        handler
+            .build_preview(
+                Utc::now(),
+                &[evaluation_match(
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    Uuid::new_v4(),
+                    "cc",
+                )],
+            )
+            .await;
+        assert_eq!(
+            *recorder.seen.lock().unwrap(),
+            vec![(MAX_SIMULATION_ARTIFACTS, MAX_SIMULATION_TARGETS)]
+        );
+    }
+
+    /// Both ceilings are measured values, and each one's justification is a
+    /// relation to the sweep's own structural maximum. Pin the relations so a
+    /// later edit cannot quietly drop a bound below the case it was chosen to
+    /// cover.
+    #[test]
+    fn the_bounds_keep_the_relations_their_measurement_established() {
+        let per_tick_max = MAX_BATCHES_PER_TICK * BATCH_SIZE as usize;
+        assert!(
+            MAX_SIMULATION_ARTIFACTS > per_tick_max,
+            "the input ceiling is a backstop above the sweep's own maximum, not a limit \
+             a normal sweep trips: {MAX_SIMULATION_ARTIFACTS} vs {per_tick_max}"
+        );
+        assert!(
+            MAX_SIMULATION_TARGETS as usize >= 2 * per_tick_max,
+            "the output ceiling covers the per-tick maximum at the flat-format fanout of \
+             two edges per artifact: {MAX_SIMULATION_TARGETS} vs {}",
+            2 * per_tick_max
+        );
     }
 
     #[tokio::test]

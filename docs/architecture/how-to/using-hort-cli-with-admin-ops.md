@@ -235,8 +235,12 @@ Three things about that output are deliberate:
   freed only when its last reference anywhere goes away.
 - **An unmeasured size says so.** When the evaluator's byte accounting
   exceeds its exact-accounting bound it reports `omitted`, and the CLI
-  prints `NOT MEASURED` with the reason. There is no estimate anywhere,
-  and never a `0` standing in for "we did not look".
+  prints `NOT MEASURED` with the reason. The reason names which of the two
+  bounds was hit (the candidate artifacts handed to the simulation, or the
+  reclaimable content targets it produced), what that bound is set to, and
+  what this run reached — so you can tell whether a narrower scope brings
+  the figure back. There is no estimate anywhere, and never a `0` standing
+  in for "we did not look".
 - **Partial coverage is in the header.** A sweep that stopped at its
   per-run batch cap undercounts everything below it, so it is stated
   above the numbers rather than after them.

@@ -88,6 +88,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The preview's byte figure was bounded by a guess, on the wrong axis, and
+  the query behind it had a 38× performance cliff** (#290). The simulation
+  refused to compute a size above 10 000 candidate artifacts or 10 000 target
+  blobs — round numbers, not measured ones — so a preview over a repository of
+  any real size reported the figure as omitted, and said only that a bound had
+  been exceeded.
+
+  Measured, the cost sits on the **target** side: about 7 µs of walk per target
+  against about 2 µs per candidate artifact. The bounds now reflect that — a
+  100 000-artifact backstop above the sweep's own structural maximum, and a
+  128 000-target operational ceiling — and both carry the measurement in their
+  doc comments. The omission now names the bound it hit, its value and the
+  observed count, so a narrower scope is a decision an operator can make rather
+  than guess at.
+
+  The measurement also turned up a latency cliff that would have surfaced only
+  in production: the survivor probe filtered with `NOT (… = ANY($1::uuid[]))`,
+  and PostgreSQL folds bound parameters into constants only while it is building
+  custom plans. From the sixth execution on a pooled connection — the steady
+  state for a worker that holds connections for days — the plan goes generic and
+  the array becomes a linear scan per row, measured at 64.2 s against 1.7 s for
+  identical input. The probe is now an anti-join against the candidate set,
+  producing a verified-identical result, with a structural guard pinning the
+  shape because only cost distinguishes the two forms.
+
+
 - **`KeepLastN` never matched anything** (#287). The evaluator was handed no
   sibling ranking, and its fail-safe — correctly — refuses to expire an artifact
   whose position among its siblings is unknown, so a count-based retention policy
