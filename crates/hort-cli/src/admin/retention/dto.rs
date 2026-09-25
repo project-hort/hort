@@ -26,6 +26,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A `freed_bytes.omitted.reason` in the shape the server actually sends
+/// (`bound_omission_reason` in the `retention-evaluate` task handler):
+/// which of the two simulation ceilings stopped the exact accounting,
+/// what that ceiling is set to, and what this run presented to it.
+///
+/// Test fixtures across this module share it so a reader cannot mistake a
+/// placeholder for the live contract. The CLI never matches on this text
+/// — it carries the server's words through verbatim — so the value here
+/// is illustrative, and the assertions below say so by checking shape
+/// rather than wording.
+#[cfg(test)]
+pub(crate) const OMITTED_BYTES_REASON: &str =
+    "exact byte accounting is bounded at 128000 reclaimable content targets; this run reached at least 128001. Narrow the sweep's scope — fewer repositories, or a predicate that matches fewer artifacts — to bring it under the bound.";
+
 /// Top-level `result_summary` of a `retention-evaluate` job.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RetentionRunSummary {
@@ -246,14 +260,15 @@ mod tests {
     fn omitted_bytes_never_become_a_number() {
         let omitted: FreedBytes = serde_json::from_value(serde_json::json!({
             "status": "omitted",
-            "reason": "simulation cardinality exceeded its exact-accounting bound"
+            "reason": OMITTED_BYTES_REASON
         }))
         .expect("parses");
         assert_eq!(omitted.measured(), None);
-        assert!(omitted
-            .omission_reason()
-            .expect("a reason")
-            .contains("cardinality"));
+        assert_eq!(
+            omitted.omission_reason().expect("a reason"),
+            OMITTED_BYTES_REASON,
+            "the server's reason is carried through verbatim, whatever it says",
+        );
     }
 
     #[test]

@@ -138,10 +138,9 @@ fn dedup_block(facts: &JobFacts) -> String {
     if !facts.deduplicated {
         return String::new();
     }
-    "\n  NOTE  The server did not run a new sweep for this request. Retention\n\
-     \x20       invocations are deduplicated per mode per UTC day, so what is shown\n\
-     \x20       below is an EARLIER sweep from today, replayed. It is not a fresh\n\
-     \x20       observation of the current state.\n"
+    "\n  NOTE  The server did not run a new sweep for this request — it answered\n\
+     \x20       with an EARLIER sweep from today, replayed. What is shown below is\n\
+     \x20       not a fresh observation of the current state.\n"
         .to_string()
 }
 
@@ -609,7 +608,7 @@ pub fn render_execution(facts: &JobFacts, summary: &RetentionRunSummary) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::retention::dto::PreviewSampleRow;
+    use crate::admin::retention::dto::{PreviewSampleRow, OMITTED_BYTES_REASON};
 
     fn group(policy: &str, repo_key: &str, rows: u64, distinct: u64) -> PreviewGroup {
         PreviewGroup {
@@ -679,11 +678,26 @@ mod tests {
     #[test]
     fn an_omitted_size_says_not_measured_with_the_reason() {
         let rendered = bytes_phrase(&FreedBytes::Omitted {
-            reason: "simulation cardinality exceeded its exact-accounting bound".into(),
+            reason: OMITTED_BYTES_REASON.into(),
         });
-        assert!(rendered.contains("NOT MEASURED"), "{rendered}");
-        assert!(rendered.contains("cardinality"), "{rendered}");
-        assert!(!rendered.contains('0'), "a zero must never appear here");
+        // The whole phrase is the banner plus the server's reason
+        // verbatim. Stated as an equality rather than as "contains no
+        // `0`": the server's reason legitimately carries the bound and
+        // the observed count, so digits inside it are the explanation,
+        // not a figure hort invented. What must never appear is a byte
+        // figure of our own, and there is no room for one here.
+        assert_eq!(
+            rendered,
+            format!("NOT MEASURED — {OMITTED_BYTES_REASON}"),
+            "the unmeasured phrase is the banner and the reason, nothing else",
+        );
+        let (banner, _reason) = rendered
+            .split_once(" — ")
+            .expect("banner, then the server's reason");
+        assert!(
+            !banner.contains(|c: char| c.is_ascii_digit()),
+            "no number may stand where the byte figure would be: {banner:?}",
+        );
     }
 
     #[test]
@@ -925,7 +939,7 @@ mod tests {
             10,
             8,
             FreedBytes::Omitted {
-                reason: "simulation cardinality exceeded its exact-accounting bound".into(),
+                reason: OMITTED_BYTES_REASON.into(),
             },
             "complete",
         );
@@ -933,7 +947,7 @@ mod tests {
         assert!(d.changed(), "the byte status moved");
         let rendered = render_delta(&d, "a", "b");
         assert!(rendered.contains("not measured"), "{rendered}");
-        assert!(rendered.contains("cardinality"), "{rendered}");
+        assert!(rendered.contains(OMITTED_BYTES_REASON), "{rendered}");
     }
 
     #[test]

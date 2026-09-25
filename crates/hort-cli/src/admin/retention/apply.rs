@@ -328,9 +328,9 @@ fn render_proposal(
             if b.facts.job_id == fresh.facts.job_id {
                 out.push_str(
                     "  NOTE  The server handed back the very preview you named rather than \
-                     running\n        a new one — retention invocations are deduplicated per \
-                     mode per UTC\n        day. The comparison below is therefore a job against \
-                     itself and proves\n        nothing about what has changed since.\n\n",
+                     running\n        a new one. The comparison below is therefore a job \
+                     against itself and\n        proves nothing about what has changed \
+                     since.\n\n",
                 );
             }
             out.push_str(&render::render_delta(
@@ -482,7 +482,7 @@ mod tests {
 
     use super::*;
     use crate::admin::retention::dto::{
-        FreedBytes, PreviewBody, PreviewGroup, RetentionRunSummary,
+        FreedBytes, PreviewBody, PreviewGroup, RetentionRunSummary, OMITTED_BYTES_REASON,
     };
     use crate::admin::retention::render::JobFacts;
 
@@ -574,7 +574,17 @@ mod tests {
         let fresh = sweep("same-1", 10);
         let delta = render::diff(&baseline.summary, &fresh.summary);
         let text = render_proposal(Some(&baseline), &fresh, Some(&delta), 0);
-        assert!(text.contains("proves\n        nothing"), "{text}");
+        // Collapse the wrap before matching: the note's wording is the
+        // property, its line breaks are not.
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("handed back the very preview you named"),
+            "{text}"
+        );
+        assert!(
+            flat.contains("proves nothing about what has changed since"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -596,7 +606,7 @@ mod tests {
         let baseline = sweep("base-1", 10);
         let mut fresh = sweep("fresh-1", 10);
         fresh.summary.preview.as_mut().expect("preview").freed_bytes = FreedBytes::Omitted {
-            reason: "simulation cardinality exceeded its exact-accounting bound".into(),
+            reason: OMITTED_BYTES_REASON.into(),
         };
         let doc = delta_json(&render::diff(&baseline.summary, &fresh.summary));
         assert_eq!(doc["changed"], true);

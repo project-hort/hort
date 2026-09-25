@@ -1089,7 +1089,16 @@ async fn identical_header_does_not_fold_retention_dry_run_into_execute() {
 
     assert_ne!(dry_id, execute_id);
     assert_eq!(mocks.jobs.enqueue_calls().len(), 2);
+
+    // The durable layer cannot fold them either, and for a different
+    // reason on each side: the dry run is not a destructive invocation so
+    // it claims no per-UTC-day key at all, and the execution's key names
+    // its mode. Neither can collide with the other.
     let keys = mocks.jobs.enqueue_idem_keys();
-    assert!(keys[0].as_ref().unwrap().as_str().contains(":dry_run:"));
+    assert!(
+        keys[0].is_none(),
+        "a dry run claims no durable key: {:?}",
+        keys[0],
+    );
     assert!(keys[1].as_ref().unwrap().as_str().contains(":execute:"));
 }

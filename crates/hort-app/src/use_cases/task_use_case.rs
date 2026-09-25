@@ -44,7 +44,6 @@
 //! transaction support to the event-store port can replace this with a true
 //! atomic two-phase write.
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
@@ -55,14 +54,13 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::error::DomainError;
 use hort_domain::events::{
-    task_kind_is_destructive, Actor, ApiActor, DomainEvent, StreamId, TaskInvoked,
-    ADMIN_INVOKABLE_TASK_KINDS, DESTRUCTIVE_TASK_CLAIM,
+    task_invocation_is_destructive, task_kind_is_destructive, Actor, ApiActor, DomainEvent,
+    StreamId, TaskInvoked, ADMIN_INVOKABLE_TASK_KINDS, DESTRUCTIVE_TASK_CLAIM,
 };
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
 };
-use hort_domain::retention::RetentionEvaluationMode;
 use hort_domain::types::IdempotencyKey;
 
 use crate::error::{AppError, AppResult};
@@ -119,6 +117,13 @@ impl TaskUseCase {
     /// Ordinary kinds keep **exactly** today's `AdminTaskInvoke`-only
     /// gate — zero behaviour change for `noop`/`scan`/etc.
     ///
+    /// Factor 2 reads [`task_invocation_is_destructive`], the domain's
+    /// single answer to "will this call destroy anything?". The invoke
+    /// handler's durable per-UTC-day idempotency key (ADR 0028) reads the
+    /// same function, so the authority an invocation needs and the
+    /// single-flight claim it takes cannot come apart. Re-deriving either
+    /// one locally is how they came apart before.
+    ///
     /// Denial is logged at `info!` (audit signal, NOT `err`) naming the
     /// missing authority and returns
     /// `AppError::Domain(DomainError::Forbidden(…))`. Called both at the
@@ -151,8 +156,9 @@ impl TaskUseCase {
         // RbacEvaluator claim subset-match (incl. the synthetic-`admin`
         // short-circuit) by checking a synthetic single-claim requirement
         // against the same evaluator semantics, rather than re-deriving
-        // the subset test here.
-        let requires_destructive_claim = Self::requires_destructive_claim(kind, params)?;
+        // the subset test here. The destructive/not answer is likewise the
+        // domain's, shared with the idempotency-key derivation.
+        let requires_destructive_claim = task_invocation_is_destructive(kind, params)?;
         if requires_destructive_claim
             && !rbac.claims_satisfy(actor, std::slice::from_ref(&DESTRUCTIVE_TASK_CLAIM))
         {
@@ -181,23 +187,6 @@ impl TaskUseCase {
         Ok(())
     }
 
-    fn requires_destructive_claim(kind: &str, params: &serde_json::Value) -> AppResult<bool> {
-        if !task_kind_is_destructive(kind) {
-            return Ok(false);
-        }
-        if kind != "retention-evaluate" {
-            return Ok(true);
-        }
-
-        let mode_raw = params
-            .get("mode")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("execute");
-        RetentionEvaluationMode::from_str(mode_raw)
-            .map(RetentionEvaluationMode::is_destructive)
-            .map_err(|message| AppError::Domain(DomainError::Validation(message.to_owned())))
-    }
-
     /// Route the audit `TaskInvoked` for task `kind` to the correct
     /// event stream.
     ///
@@ -222,6 +211,17 @@ impl TaskUseCase {
     /// classifier — it does **not** introduce a parallel destructive-kind
     /// list (a new classifier here would be the scope-creep regression
     /// `DESTRUCTIVE_TASK_KINDS`'s doc warns against).
+    ///
+    /// **Per kind, deliberately — not per invocation.** Unlike the
+    /// `task:destructive` claim gate and the durable idempotency key,
+    /// which both read
+    /// [`task_invocation_is_destructive`](hort_domain::events::task_invocation_is_destructive),
+    /// audit routing asks the coarser question on purpose: a
+    /// `retention-evaluate` dry run's `TaskInvoked` belongs on the
+    /// never-deleted stream with the executions it is deciding about, so
+    /// the two are readable as one trail and neither can be truncated by
+    /// the kind it audits. Narrowing this to the invocation would scatter
+    /// that trail across two streams for no gain.
     ///
     /// **Split emit-sites (intentional):**
     /// `TaskUseCase` only ever emits `TaskInvoked`; the `TaskFailed`

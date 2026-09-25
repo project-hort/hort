@@ -6,8 +6,12 @@
   `crates/hort-adapters-postgres/tests/idempotency_key.rs` (dedup, distinct-key,
   None-path, and schema-CHECK cases); the closed-set guard
   `crates/hort-http-admin-tasks/tests/destructive_kinds_carry_db_idempotency.rs`
-  (walks `DESTRUCTIVE_TASK_KINDS`, asserts every kind reaches `enqueue` with
-  `Some(key)`); the post-failure pin
+  (walks `DESTRUCTIVE_TASK_KINDS`, asserts the default invocation of every kind
+  reaches `enqueue` with `Some(key)` and that a retention dry run reaches it
+  with none); the operator-visible pin
+  `crates/hort-http-admin-tasks/tests/retention_dry_run_is_repeatable.rs`
+  (two previews are two `202`s, a second execution is still a `200` dedup hit,
+  and the claim gate and key derivation cannot disagree); the post-failure pin
   `crates/hort-server/tests/destructive_kind_idempotency_post_failure.rs`.
 - **Supersedes:** — (adds a layer to ADR 0020's single-flight stack; does not
   supersede it)
@@ -37,17 +41,34 @@ present only when the operator remembered to send it, so an ad-hoc
 
 ## Decision
 
-For every kind in `DESTRUCTIVE_TASK_KINDS`, the server derives a per-UTC-day
+For every **destructive invocation**, the server derives a per-UTC-day
 idempotency key itself and the database enforces its uniqueness durably:
 
 - **Server-derived, always.** The invoke handler computes
   `cron:<kind>:<YYYY-MM-DD>` for `retention-purge` and
-  `eventstore-archive`, and
-  `cron:retention-evaluate:<mode>:<YYYY-MM-DD>` for both retention modes
-  (`crates/hort-http-admin-tasks/src/handlers/invoke.rs:229-242`), regardless
+  `eventstore-archive`, and `cron:retention-evaluate:execute:<YYYY-MM-DD>`
+  for a retention execution
+  (`crates/hort-http-admin-tasks/src/handlers/invoke.rs`, Step 4b), regardless
   of any operator-supplied `Idempotency-Key` header. There is no branch where
-  a destructive kind reaches `enqueue` with no key — the invariant
+  a destructive invocation reaches `enqueue` with no key — the invariant
   "destructive ⇒ key present" is structural, not operator discipline.
+- **Per invocation, not per kind.** The gate is
+  `hort_domain::events::task_invocation_is_destructive(kind, params)` — the
+  same domain answer that decides whether the caller needs the
+  `DESTRUCTIVE_TASK_CLAIM` (`TaskUseCase::authorize_kind`), so the authority
+  an invocation needs and the single-flight claim it takes cannot come apart.
+  The coarser `task_kind_is_destructive(kind)` remains correct for audit
+  routing (`TaskUseCase::task_audit_stream`: a dry run's `TaskInvoked` still
+  belongs on the never-deleted destructive-kind stream) and is deliberately
+  not the predicate here. The practical difference is
+  `retention-evaluate` in `dry_run` mode: it appends nothing, takes **no**
+  durable key, and is therefore repeatable within a UTC day. Denying a repeat
+  of an observation buys nothing this decision is about — a restart cannot
+  make an observation destroy anything — and costs the one thing a preview
+  has to support, which is looking again. The mode segment stays in the
+  execute key even though no other mode now reaches that branch: it names the
+  dimension the key separates on, so a second kind gaining a mode cannot
+  silently collapse two invocations onto one key.
 - **Persisted and DB-enforced.** The key threads through
   `TaskUseCase::enqueue` (`crates/hort-app/src/use_cases/task_use_case.rs:259`)
   to `JobsRepository::enqueue_task`
@@ -65,13 +86,14 @@ idempotency key itself and the database enforces its uniqueness durably:
   (`crates/hort-domain/src/events/authorization_events.rs:546`,
   `#[serde(default)]` for replay safety) so dedup decisions are
   reconstructable from the audit stream.
-- **Strictly at most one enqueue per kind per UTC day, including after
-  failure.** The key is never cleared on terminal worker failure — the cron
-  schedule *is* the retry mechanism. Same-day recovery is an explicit, audited
+- **Strictly at most one destructive enqueue per key per UTC day, including
+  after failure.** The key is never cleared on terminal worker failure — the
+  cron schedule *is* the retry mechanism. Same-day recovery is an explicit, audited
   operator action (delete the failed `jobs` row). Pinned by
   `destructive_kind_idempotency_post_failure.rs`.
-- **Non-destructive kinds are untouched.** They pass `None`; the partial-index
-  predicate is inert and the insert always proceeds.
+- **Non-destructive invocations are untouched.** They pass `None`; the
+  partial-index predicate is inert and the insert always proceeds. That
+  covers every non-destructive kind and every retention dry run.
 - **Validated end-to-end.** The `IdempotencyKey` newtype
   (`crates/hort-domain/src/types/idempotency_key.rs`) validates charset and
   length (1..=256), matched 1:1 by the schema CHECKs
@@ -97,7 +119,11 @@ block per ADR 0020.
   and CronJob-controller restarts — the dedup decision lives in the same
   database transaction domain as the job row itself.
 - Retention preview and execution are independent same-day jobs at both
-  idempotency layers. A preview cannot suppress a later execution.
+  idempotency layers. A preview cannot suppress a later execution, and a
+  preview cannot suppress a later preview: `hort-cli admin retention apply
+  --from-preview <A>` re-measures immediately before executing and that fresh
+  sweep is genuinely fresh, so the delta it renders is the proposal against
+  the world as it now is rather than the proposal against itself.
 - Ad-hoc CLI invocations of destructive kinds get the layer with no
   operator-supplied key; nothing depends on the `--idempotency-key-window`
   flag being present.
@@ -112,8 +138,11 @@ block per ADR 0020.
   `Option<&IdempotencyKey>` decision; the compiler forces new enqueuers to
   consider idempotency.
 - Adding a kind to `DESTRUCTIVE_TASK_KINDS` automatically extends both the
-  server-side derivation (`task_kind_is_destructive`) and the closed-set guard
-  test — no second list to update.
+  server-side derivation (via `task_invocation_is_destructive`, which is built
+  on `task_kind_is_destructive`) and the closed-set guard test — no second list
+  to update. A kind that needs a *mode* dimension extends
+  `task_invocation_is_destructive`, and the claim gate and the key follow
+  together because both read it.
 
 ## Alternatives considered
 
@@ -132,8 +161,18 @@ block per ADR 0020.
   (non-destructive, `NULL`-key) enqueues completely untouched.
 - **Relocating the ephemeral fast-path into the use case.** Rejected: the
   handler is where the `Idempotency-Key` header arrives and where the
-  destructive-kind classification gates RBAC; moving the fast-path would add a
-  port nothing else needs. The two layers coexist at their natural boundaries.
+  destructive-invocation classification gates RBAC; moving the fast-path would
+  add a port nothing else needs. The two layers coexist at their natural
+  boundaries.
+- **Keeping the key per *kind* and letting the CLI report the dedup.** The
+  shipped CLI detects a deduplicated preview exactly (`200` versus `202` from
+  the server, not a clock comparison) and says so in the header, the delta
+  section, the JSON and the confirmation question. Rejected as the resting
+  state: it is an honest report of a wrong answer. The delta an operator is
+  being asked to authorise would still be empty by construction on every day
+  the intended preview-then-apply workflow is followed. The messaging stays —
+  a second *execution* in one day is still deduplicated by design, and saying
+  so is then exactly right.
 
 ## References
 
@@ -143,13 +182,17 @@ block per ADR 0020.
   `jobs` migration.
 - `crates/hort-domain/src/types/idempotency_key.rs` (newtype);
   `crates/hort-domain/src/ports/jobs_repository.rs:440` (`enqueue_task` +
-  `EnqueueOutcome`); `crates/hort-app/src/use_cases/task_use_case.rs:259`
-  (`enqueue`); `crates/hort-http-admin-tasks/src/handlers/invoke.rs:229-242`
-  (server-side derivation); `crates/hort-adapters-postgres/src/jobs_repository.rs`
+  `EnqueueOutcome`); `crates/hort-app/src/use_cases/task_use_case.rs`
+  (`enqueue`, `authorize_kind`);
+  `crates/hort-http-admin-tasks/src/handlers/invoke.rs` (Step 4b server-side
+  derivation); `crates/hort-adapters-postgres/src/jobs_repository.rs`
   (`ON CONFLICT` CTE); `migrations/009_scan_jobs_and_findings.sql:260-264,356-358`
   (column, CHECKs, partial unique index);
-  `crates/hort-domain/src/events/authorization_events.rs:475-480,509`
-  (`DESTRUCTIVE_TASK_KINDS`, `task_kind_is_destructive`).
+  `crates/hort-domain/src/events/authorization_events.rs`
+  (`DESTRUCTIVE_TASK_KINDS`, `task_kind_is_destructive`,
+  `task_invocation_is_destructive`, `retention_evaluate_mode`);
+  `crates/hort-domain/src/retention/mode.rs` (`RetentionEvaluationMode`).
 - Tests: `crates/hort-adapters-postgres/tests/idempotency_key.rs`;
   `crates/hort-http-admin-tasks/tests/destructive_kinds_carry_db_idempotency.rs`;
+  `crates/hort-http-admin-tasks/tests/retention_dry_run_is_repeatable.rs`;
   `crates/hort-server/tests/destructive_kind_idempotency_post_failure.rs`.

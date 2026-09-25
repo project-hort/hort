@@ -190,7 +190,9 @@ pub fn freed_bytes_json(freed: &FreedBytes) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::retention::dto::{PreviewBody, PreviewGroup, PreviewSampleRow};
+    use crate::admin::retention::dto::{
+        PreviewBody, PreviewGroup, PreviewSampleRow, OMITTED_BYTES_REASON,
+    };
 
     fn facts() -> JobFacts {
         JobFacts {
@@ -268,7 +270,7 @@ mod tests {
             "preview",
             &facts(),
             &summary(FreedBytes::Omitted {
-                reason: "simulation cardinality exceeded its exact-accounting bound".into(),
+                reason: OMITTED_BYTES_REASON.into(),
             }),
         );
         let freed = &doc["totals"]["freed_bytes"];
@@ -278,10 +280,11 @@ mod tests {
             freed["bytes"].is_null(),
             "an unmeasured run must expose no byte figure at all: {freed}"
         );
-        assert!(freed["reason"]
-            .as_str()
-            .expect("a reason")
-            .contains("cardinality"));
+        assert_eq!(
+            freed["reason"].as_str().expect("a reason"),
+            OMITTED_BYTES_REASON,
+            "the reason is the server's, carried through untouched",
+        );
     }
 
     #[test]

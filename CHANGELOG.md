@@ -88,6 +88,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A retention preview took the destructive single-flight key, so previewing
+  first is what made the confirmation lie** (#291). `retention-evaluate` is a
+  destructive *kind*, and the server derived its durable per-UTC-day
+  idempotency key for every invocation of one — including a dry run. The second
+  preview of a UTC day was therefore not a sweep at all: the server answered
+  `200 OK` with the first one's job.
+
+  That fires on the intended workflow, every time. `hort-cli admin retention
+  apply --from-preview A` re-measures immediately before executing so it can
+  show what moved since the proposal; that fresh preview was deduplicated back
+  to A, so the delta was A against A and always empty. The execution *was*
+  fresh, and expired what it found. The operator read "nothing changed since
+  you looked" and then authorised a sweep computed from different data.
+
+  The key is a single-flight claim on destroying something, so it is now
+  derived per **invocation** rather than per kind, from the same domain answer
+  that decides whether the caller needs the `task:destructive` claim — one
+  decision, two consumers, and a test that fails if they ever come apart. A dry
+  run takes no key and is repeatable; an execution keeps the key it has always
+  had, mode segment and all, so a second execution in one UTC day is still
+  deduplicated by design. Audit routing is unchanged: a dry run's `TaskInvoked`
+  still lands on the never-deleted destructive-kind stream.
+
 - **The preview's byte figure was bounded by a guess, on the wrong axis, and
   the query behind it had a 38× performance cliff** (#290). The simulation
   refused to compute a size above 10 000 candidate artifacts or 10 000 target

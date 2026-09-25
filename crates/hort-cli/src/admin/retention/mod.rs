@@ -201,12 +201,18 @@ pub enum SweepResult {
 /// Invoke `retention-evaluate` in `mode` and wait for the job.
 ///
 /// The response status is load-bearing and is carried into
-/// [`JobFacts::deduplicated`]: the server deduplicates a retention
-/// invocation per mode per UTC day, answering `200 OK` with the
-/// **existing** job rather than `202 Accepted` with a new one. A CLI
-/// that ignored the distinction would present an earlier sweep's numbers
-/// as a fresh observation of the current state — precisely the claim
-/// this command exists to make trustworthy.
+/// [`JobFacts::deduplicated`]: when the server treats a request as a
+/// repeat it answers `200 OK` with the **existing** job rather than
+/// `202 Accepted` with a new one. A CLI that ignored the distinction
+/// would present an earlier sweep's numbers as a fresh observation of
+/// the current state — precisely the claim this command exists to make
+/// trustworthy.
+///
+/// An execution is single-flighted per UTC day and so can be answered
+/// this way by design. A dry run destroys nothing, takes no such claim
+/// and is always a fresh sweep, so the branch stays wired for it rather
+/// than assumed away: the status the server sent is the authority here,
+/// never an assumption about which invocations it dedups.
 pub async fn run_sweep(client: &AkClient, mode: &str, opts: &SweepOptions) -> Result<SweepResult> {
     let path = format!("/api/v1/admin/tasks/{RETENTION_KIND}");
     let body = serde_json::json!({ "mode": mode });
