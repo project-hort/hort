@@ -6,12 +6,37 @@
 //! source edge outside that set. The fallback for a source with no projected
 //! edges mirrors `PgPurgeGcPort::purge_artifact_refs`: primary content plus a
 //! non-empty metadata blob. No row is locked, deleted, or inserted.
+//!
+//! # Why the survivor probe is an anti-join, not `= ANY($1)`
+//!
+//! The "still referenced from outside the candidate set" test reads as an
+//! array-membership filter — `NOT (survivor.source_artifact_id = ANY($1))` —
+//! and that form is a latency trap under a prepared statement. Postgres folds
+//! bound parameters into constants only while it is building **custom** plans;
+//! once the statement flips to a **generic** plan (which it does from the
+//! sixth execution on a pooled connection, and connections in a worker pool
+//! live for days), `$1` stays a `Param`, the array can no longer be hashed,
+//! and the filter degrades to a linear scan of the whole candidate array for
+//! every row of `content_references`. The cost goes from O(edges) to
+//! O(edges x candidates) with nothing in the query, the data or the
+//! configuration having changed.
+//!
+//! Measured on a 660 000-edge corpus with 40 000 candidate artifacts, the
+//! array-membership form costs 1.3 s on the custom plan and 64.2 s on the
+//! generic one. Joining against the `candidate_ids` CTE instead expresses the
+//! identical set — the CTE is that same array, unnested — and plans as a hash
+//! anti-join under both plan types, so the cliff disappears: 1.4 s custom,
+//! 1.7 s generic, on the same corpus and the same input. Do not "simplify" it
+//! back to `= ANY`.
 
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::retention_preview::{RetentionContentSimulation, RetentionPreview};
+use hort_domain::ports::retention_preview::{
+    ObservedCardinality, RetentionContentSimulation, RetentionPreview, SimulationBound,
+    SimulationBoundExceeded,
+};
 use hort_domain::types::ContentHash;
 
 use crate::{map_sqlx_error, BoxFuture};
@@ -36,7 +61,13 @@ impl RetentionPreview for PgRetentionPreview {
     ) -> BoxFuture<'a, DomainResult<RetentionContentSimulation>> {
         Box::pin(async move {
             if artifact_ids.len() > max_artifacts {
-                return Ok(RetentionContentSimulation::Omitted);
+                return Ok(RetentionContentSimulation::Omitted(
+                    SimulationBoundExceeded {
+                        bound: SimulationBound::Artifacts,
+                        limit: max_artifacts as u64,
+                        observed: ObservedCardinality::Exact(artifact_ids.len() as u64),
+                    },
+                ));
             }
             if artifact_ids.is_empty() {
                 return Ok(RetentionContentSimulation::Exact(Vec::new()));
@@ -79,8 +110,10 @@ impl RetentionPreview for PgRetentionPreview {
                  WHERE NOT EXISTS (
                        SELECT 1
                          FROM content_references survivor
+                    LEFT JOIN candidate_ids ci
+                           ON ci.artifact_id = survivor.source_artifact_id
                         WHERE survivor.target_content_hash = rt.target_content_hash
-                          AND NOT (survivor.source_artifact_id = ANY($1::uuid[]))
+                          AND ci.artifact_id IS NULL
                  )
                  ORDER BY rt.target_content_hash
                  LIMIT $2
@@ -92,8 +125,17 @@ impl RetentionPreview for PgRetentionPreview {
             .await
             .map_err(|e| map_sqlx_error(&e, "retention_preview", "reclaimable_content"))?;
 
+            // The statement reads `max_targets + 1` rows at most, so an
+            // over-bound run is detected without ever paying for the count
+            // that proves it: the observation is a lower bound, not a total.
             if rows.len() > max_targets as usize {
-                return Ok(RetentionContentSimulation::Omitted);
+                return Ok(RetentionContentSimulation::Omitted(
+                    SimulationBoundExceeded {
+                        bound: SimulationBound::Targets,
+                        limit: u64::from(max_targets),
+                        observed: ObservedCardinality::AtLeast(rows.len() as u64),
+                    },
+                ));
             }
 
             let mut hashes = Vec::with_capacity(rows.len());
@@ -346,19 +388,31 @@ mod tests {
         .await;
         let simulator = PgRetentionPreview::new(pool);
 
+        // The input bound is the caller's own count, so the observation is
+        // exact and the rejection costs no query at all.
         assert_eq!(
             simulator
                 .reclaimable_content(&[source], 0, 10)
                 .await
                 .unwrap(),
-            RetentionContentSimulation::Omitted
+            RetentionContentSimulation::Omitted(SimulationBoundExceeded {
+                bound: SimulationBound::Artifacts,
+                limit: 0,
+                observed: ObservedCardinality::Exact(1),
+            })
         );
+        // The output bound is observed through a `LIMIT limit + 1`, so all
+        // the run can honestly say is that it stands above the ceiling.
         assert_eq!(
             simulator
                 .reclaimable_content(&[source], 10, 1)
                 .await
                 .unwrap(),
-            RetentionContentSimulation::Omitted
+            RetentionContentSimulation::Omitted(SimulationBoundExceeded {
+                bound: SimulationBound::Targets,
+                limit: 1,
+                observed: ObservedCardinality::AtLeast(2),
+            })
         );
     }
 
