@@ -135,12 +135,15 @@ pub struct RetentionCandidate {
     /// default 24 h.
     pub resolved_rescan_interval_hours: Option<i64>,
     /// The `KeepLastN` input: this artifact's 1-based rank among its
-    /// live `(repository, name)` siblings (newest first by
-    /// `created_at`, ties broken by artifact id) plus the sibling
-    /// total. Resolved by the caller in the same enumeration query
-    /// that produced the candidate; `None` when no ranking could be
-    /// resolved, which the pure evaluator fails safe. Mirrors
-    /// `RetentionCandidateRow::keep_rank` exactly.
+    /// **usable** `(repository, name)` siblings (newest first by
+    /// `created_at`, ties broken by artifact id) plus the
+    /// usable-sibling total. Usable is the candidate set itself — a
+    /// soft-deleted or GC-protected sibling is counted by neither
+    /// number, so `KeepLastN(n)` leaves n artifacts an operator can
+    /// actually download. Resolved by the caller in the same
+    /// enumeration query that produced the candidate; `None` when no
+    /// ranking could be resolved, which the pure evaluator fails safe.
+    /// Mirrors `RetentionCandidateRow::keep_rank` exactly.
     pub keep_rank: Option<(u32, u32)>,
     /// `true` iff a mutable ref in this artifact's own repository
     /// currently resolves to it. A tag target survives `KeepLastN`

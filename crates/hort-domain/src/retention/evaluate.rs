@@ -47,9 +47,9 @@ pub struct EvaluationInputs<'a> {
     /// the `UnusedFor` anchor.
     pub last_downloaded_at: Option<DateTime<Utc>>,
     /// `KeepLastN` ranking: this artifact's 1-based position among its
-    /// sibling versions, newest = 1, and the sibling total. `None`
-    /// when the app layer could not resolve a ranking (then
-    /// `KeepLastN` cannot match — fail safe, never expire).
+    /// usable sibling versions, newest = 1, and the usable-sibling
+    /// total. `None` when the app layer could not resolve a ranking
+    /// (then `KeepLastN` cannot match — fail safe, never expire).
     ///
     /// ## Ranking contract (part of the retention contract, not an
     /// implementation detail)
@@ -60,11 +60,31 @@ pub struct EvaluationInputs<'a> {
     /// artifact id descending**. The tiebreak is what makes the
     /// decision reproducible — two artifacts stored in the same
     /// instant would otherwise be free to swap ranks between two runs
-    /// and expire alternately. The sibling group is
-    /// `(repository, artifact name)` and contains exactly the **live**
-    /// siblings (a retired artifact occupies no rank slot; if it did,
-    /// it would shield itself and push one extra live artifact over
-    /// the edge).
+    /// and expire alternately.
+    ///
+    /// ## Counted set (also contract): `n` means `n` *usable*
+    /// artifacts
+    ///
+    /// The sibling group is `(repository, artifact name)` and contains
+    /// exactly the **usable** siblings — the ones
+    /// [`Artifact::is_downloadable`](crate::entities::artifact::Artifact::is_downloadable)
+    /// admits. Neither a retired artifact nor a quarantined, rejected
+    /// or scan-indeterminate one occupies a rank slot:
+    ///
+    /// - A retired artifact holding a slot would shield itself and
+    ///   push one extra usable artifact over the edge.
+    /// - A quarantine-protected artifact holding a slot lets the
+    ///   usable window reach zero — `KeepLastN(3)` over five siblings
+    ///   whose three newest are quarantined together would keep only
+    ///   those three and expire both released ones, so the operator
+    ///   who asked for three usable artifacts would have none. The
+    ///   accepted counter-cost is that the group holds `n` plus its
+    ///   protected siblings rather than `n` rows.
+    ///
+    /// Releasing a protected sibling therefore re-enters it in the
+    /// rank and can push an older released sibling out of the window.
+    /// That is the rule working: release is what makes an artifact
+    /// usable, and a usable artifact counts.
     pub keep_rank: Option<(u32, u32)>,
     /// `true` iff a mutable ref (an OCI tag, an npm dist-tag, any
     /// other mutable pointer) **in this artifact's own repository**
