@@ -31,6 +31,15 @@ const BASELINE_JOB: &str = "33333333-3333-3333-3333-333333333333";
 const NPM_REPO_UUID: &str = "9f1d7c2e-4b3a-4f18-8c7d-0a5e6b4c3d21";
 const PYPI_REPO_UUID: &str = "7c0b5a44-2e19-4d6f-9a8b-1f2e3d4c5b6a";
 
+/// A `freed_bytes.omitted.reason` in the shape the server actually sends
+/// (`bound_omission_reason` in the `retention-evaluate` task handler):
+/// which simulation ceiling stopped the exact accounting, what it is set
+/// to, and what this run presented to it. The CLI never matches on this
+/// text — it passes the server's words through — so the value is
+/// illustrative and the assertions check shape, not wording.
+const OMITTED_BYTES_REASON: &str =
+    "exact byte accounting is bounded at 128000 reclaimable content targets; this run reached at least 128001. Narrow the sweep's scope — fewer repositories, or a predicate that matches fewer artifacts — to bring it under the bound.";
+
 fn test_client(server_url: &str) -> AkClient {
     let cfg = EffectiveConfig {
         server: url::Url::parse(server_url).expect("valid url"),
@@ -303,7 +312,7 @@ async fn preview_states_an_unmeasured_size_with_its_reason_and_never_a_zero() {
             "complete",
             &serde_json::json!({
                 "status": "omitted",
-                "reason": "simulation cardinality exceeded its exact-accounting bound"
+                "reason": OMITTED_BYTES_REASON
             }),
         )),
     )
@@ -325,8 +334,19 @@ async fn preview_states_an_unmeasured_size_with_its_reason_and_never_a_zero() {
         .find(|l| l.contains("storage freed"))
         .expect("the storage line exists");
     assert!(line.contains("NOT MEASURED"), "{line}");
-    assert!(line.contains("cardinality"), "{line}");
-    assert!(!line.contains('0'), "no zero on that line: {line}");
+    // The server's reason reaches the operator word for word, and nothing
+    // stands where the byte figure would be. Split at the banner rather
+    // than scanning the whole line for a `0`: the reason legitimately
+    // carries the bound and the observed count, and those digits are the
+    // explanation of why there is no figure, not a figure.
+    let (banner, reason) = line
+        .split_once(" — ")
+        .unwrap_or_else(|| panic!("banner, then the server's reason: {line}"));
+    assert_eq!(reason.trim_end(), OMITTED_BYTES_REASON, "{line}");
+    assert!(
+        !banner.contains(|c: char| c.is_ascii_digit()),
+        "no number may stand where the byte figure would be: {banner:?}"
+    );
 }
 
 #[tokio::test]

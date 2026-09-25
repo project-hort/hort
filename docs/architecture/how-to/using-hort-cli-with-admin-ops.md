@@ -263,13 +263,21 @@ the job outlived `--wait-timeout` (the job id is printed and nothing is
 reported about its outcome), `4` the operator declined and nothing was
 executed.
 
-Two operational notes:
+Three operational notes:
 
-- Retention invocations are **deduplicated per mode per UTC day**. A
-  second `preview` on the same day gets the first one's job back rather
-  than a new sweep; the CLI says so explicitly rather than presenting it
-  as a fresh observation. The same applies to a second `apply` execution
-  in one day.
+- **A `preview` is always a fresh sweep.** Run it as often as you like:
+  an observation destroys nothing, so it takes no single-flight claim and
+  is never deduplicated. That is what lets `apply --from-preview` compare
+  its pre-execution re-measure against the proposal you named rather than
+  against itself.
+- **An `apply` execution is deduplicated per UTC day.** The first
+  execution of a day owns the day; a second one gets that job back rather
+  than sweeping again, and the CLI says so explicitly rather than
+  presenting it as a fresh run. This is deliberate — the cron schedule is
+  the retry mechanism, and re-firing a destructive sweep inside the day is
+  what [ADR 0028](../../adr/0028-destructive-task-idempotency.md) exists
+  to prevent. Recovering inside the same day means deleting the earlier
+  `jobs` row, which is an explicit and audited operator action.
 - Expiry marks artifact records. Reclaiming the bytes is the separate
   purge stage.
 

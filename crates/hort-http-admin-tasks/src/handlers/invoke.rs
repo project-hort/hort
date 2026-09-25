@@ -205,8 +205,8 @@ pub async fn invoke<P: TaskParams>(
     }
 
     // Step 4b — derive the DB-layer idempotency key for destructive
-    // kinds (see ADR 0028 / `how-to/using-hort-cli-with-admin-ops.md`
-    // for the destructive-kind idempotency contract).
+    // **invocations** (see ADR 0028 / `how-to/using-hort-cli-with-admin-ops.md`
+    // for the destructive-invocation idempotency contract).
     //
     // Server-derived per-UTC-day key, distinct in shape from the
     // client-supplied `Idempotency-Key` header (`<window>:<kind>`,
@@ -215,26 +215,38 @@ pub async fn invoke<P: TaskParams>(
     // key. The Redis fast-path stays an additional cheap layer for
     // destructive kinds; the DB layer is the durable one.
     //
-    // Non-destructive kinds pass `None` — DB partial-unique check is
-    // inert, today's behaviour is preserved.
+    // The gate is `task_invocation_is_destructive` — the same domain
+    // answer Step 1's `task:destructive` claim check reads, deliberately
+    // NOT the per-kind `task_kind_is_destructive`. The key exists so a
+    // destructive sweep cannot re-fire; an observation has no such hazard
+    // and must stay repeatable, because "look again" is the one thing a
+    // preview has to support. Asking the per-kind question here would
+    // deduplicate the second dry run of a UTC day back to the first and
+    // report a stale observation as a fresh one. Anything that is not a
+    // destructive invocation passes `None`: the DB partial-unique check
+    // is inert and the insert always proceeds.
     //
-    // The `?` is structurally unreachable for the server-derived shape:
-    // every `DESTRUCTIVE_TASK_KINDS` literal is charset-clean and the
-    // UTC date pattern is `\d{4}-\d{2}-\d{2}` (well within
-    // `IdempotencyKey`'s charset and length bounds). The fallible
-    // ctor stays because adding a destructive kind that violates the
-    // charset (currently impossible — every existing literal is
-    // alphanumeric + hyphen) would surface as a clean 500 rather than
-    // a panic.
+    // Both `?`s below are structurally unreachable here. The mode was
+    // already parsed once by Step 1's authorization check and once more
+    // by Step 2's `params.validate()`, either of which rejects an
+    // unparseable one before this point; re-reading it is free and keeps
+    // the derivation honest about the invocation it is keying. And every
+    // `DESTRUCTIVE_TASK_KINDS` literal is charset-clean while the UTC date
+    // pattern is `\d{4}-\d{2}-\d{2}`, well within `IdempotencyKey`'s
+    // charset and length bounds — the fallible ctor stays so that adding a
+    // destructive kind that violates the charset would surface as a clean
+    // error rather than a panic.
+    //
+    // The mode segment stays in the key even though a dry run no longer
+    // reaches this branch: it costs nothing, it names the dimension the
+    // key separates on, and it means a second kind gaining a mode cannot
+    // silently collapse two invocations onto one key.
     let db_idempotency_key: Option<IdempotencyKey> =
-        if hort_domain::events::task_kind_is_destructive(P::KIND) {
+        if hort_domain::events::task_invocation_is_destructive(P::KIND, &params_value)? {
             let utc_today = chrono::Utc::now().format("%Y-%m-%d");
-            let derived = if P::KIND == "retention-evaluate" {
-                let mode = params_value
-                    .get("mode")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("execute");
-                format!("cron:{}:{mode}:{utc_today}", P::KIND)
+            let derived = if P::KIND == hort_domain::events::RETENTION_EVALUATE_TASK_KIND {
+                let mode = hort_domain::events::retention_evaluate_mode(&params_value)?;
+                format!("cron:{}:{}:{utc_today}", P::KIND, mode.as_str())
             } else {
                 format!("cron:{}:{utc_today}", P::KIND)
             };
