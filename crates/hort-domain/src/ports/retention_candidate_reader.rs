@@ -29,7 +29,8 @@
 //! (query-on-demand, no premature materialization). The reader still
 //! does no scope SQL pre-filter — it only joins `repositories` to
 //! supply the per-artifact `format` input `RetentionScope::matches`
-//! needs (a single query, no extra round-trip).
+//! needs, plus the `key` the operator-facing preview names the
+//! repository by (a single query, no extra round-trip).
 //!
 //! ## `resolved_rescan_interval_hours`
 //!
@@ -122,8 +123,19 @@ pub struct RetentionCandidateRow {
     /// joined `repositories.format` column (the existing
     /// `repositories.format text` → `RepositoryFormat` mapping; same
     /// query, no extra round-trip). `Artifact` itself has no `format`
-    /// field, so this is carried alongside it for B3's scope gate.
+    /// field, so this is carried alongside it for the scope gate.
     pub format: RepositoryFormat,
+    /// The artifact's repository **key** — `repositories.key`, the
+    /// unique operator-facing identifier a policy's `metadata.name`
+    /// resolves against (`RepositoryRepository::find_by_key`).
+    ///
+    /// Carried on the same `JOIN repositories` that already supplies
+    /// `format`, so it costs no extra round-trip and no N+1 lookup.
+    /// It exists so an operator-facing retention preview can name the
+    /// repository the operator would actually type; `repository_id` is
+    /// a UUID and nobody writes a UUID into a policy. Both travel
+    /// together — the id stays for machine consumers.
+    pub repository_key: String,
     /// The resolved `rescan_interval_hours` for the artifact's
     /// repository. `Some(0)` is meaningful (rescanning disabled — a
     /// security-driven predicate is then always-stale → fail-safe

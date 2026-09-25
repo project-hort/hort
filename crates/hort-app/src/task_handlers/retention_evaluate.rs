@@ -194,6 +194,7 @@ impl TaskHandler for RetentionEvaluateHandler {
                     .map(|r| RetentionCandidate {
                         artifact: r.artifact,
                         format: r.format,
+                        repository_key: r.repository_key,
                         resolved_rescan_interval_hours: r.resolved_rescan_interval_hours,
                         keep_rank: r.keep_rank,
                         tag_targeted: r.tag_targeted,
@@ -270,6 +271,7 @@ impl RetentionEvaluateHandler {
         #[derive(Default)]
         struct Group {
             policy_name: String,
+            repository_key: String,
             rows: u64,
             checksums: BTreeSet<String>,
         }
@@ -284,6 +286,7 @@ impl RetentionEvaluateHandler {
                 .entry((hit.policy_id, hit.repository_id))
                 .or_default();
             group.policy_name.clone_from(&hit.policy_name);
+            group.repository_key.clone_from(&hit.repository_key);
             group.rows += 1;
             group.checksums.insert(hit.checksum_sha256.clone());
             distinct_contents.insert(hit.checksum_sha256.clone());
@@ -293,6 +296,7 @@ impl RetentionEvaluateHandler {
                     "artifact_id": hit.artifact_id,
                     "policy_id": hit.policy_id,
                     "repository_id": hit.repository_id,
+                    "repository_key": hit.repository_key,
                     "name": hit.name,
                     "version": hit.version,
                     "age_seconds": now.signed_duration_since(hit.created_at).num_seconds().max(0),
@@ -307,6 +311,7 @@ impl RetentionEvaluateHandler {
                     "policy_id": policy_id,
                     "policy_name": group.policy_name,
                     "repository_id": repository_id,
+                    "repository_key": group.repository_key,
                     "rows": group.rows,
                     "distinct_contents": group.checksums.len(),
                 })
@@ -787,6 +792,7 @@ mod tests {
             RetentionCandidateRow {
                 artifact: art(Uuid::new_v4()),
                 format: hort_domain::entities::repository::RepositoryFormat::Generic,
+                repository_key: "npm-proxy".into(),
                 resolved_rescan_interval_hours: Some(24),
                 keep_rank: Some((4, 10)),
                 tag_targeted: false,
@@ -794,6 +800,7 @@ mod tests {
             RetentionCandidateRow {
                 artifact: art(Uuid::new_v4()),
                 format: hort_domain::entities::repository::RepositoryFormat::Generic,
+                repository_key: "npm-proxy".into(),
                 resolved_rescan_interval_hours: None,
                 keep_rank: None,
                 tag_targeted: true,
@@ -869,11 +876,22 @@ mod tests {
         repository_id: Uuid,
         checksum: &str,
     ) -> EvaluationMatch {
+        evaluation_match_in(artifact_id, policy_id, repository_id, "npm-proxy", checksum)
+    }
+
+    fn evaluation_match_in(
+        artifact_id: Uuid,
+        policy_id: Uuid,
+        repository_id: Uuid,
+        repository_key: &str,
+        checksum: &str,
+    ) -> EvaluationMatch {
         EvaluationMatch {
             policy_id,
             policy_name: "cleanup".into(),
             artifact_id,
             repository_id,
+            repository_key: repository_key.into(),
             name: "pkg".into(),
             version: Some("1.0.0".into()),
             created_at: DateTime::<Utc>::UNIX_EPOCH,
@@ -952,6 +970,73 @@ mod tests {
         assert_eq!(preview["sample_limit"], 500);
         assert_eq!(preview["freed_bytes"]["status"], "exact");
         assert_eq!(preview["freed_bytes"]["bytes"], 40);
+    }
+
+    /// The preview names repositories by the key an operator writes into
+    /// a policy, beside the id a machine consumer joins on — in both the
+    /// grouped rollup and the sample. Two repositories with distinct keys
+    /// must stay distinguishable without resolving a UUID.
+    #[tokio::test]
+    async fn preview_carries_the_repository_key_in_groups_and_sample() {
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![]))),
+            Arc::new(InertStorage::default()),
+        );
+        let policy_id = Uuid::new_v4();
+        let npm_repo = Uuid::new_v4();
+        let pypi_repo = Uuid::new_v4();
+        let matches = vec![
+            evaluation_match_in(
+                Uuid::new_v4(),
+                policy_id,
+                npm_repo,
+                "npm-proxy",
+                "1111111111111111111111111111111111111111111111111111111111111111",
+            ),
+            evaluation_match_in(
+                Uuid::new_v4(),
+                policy_id,
+                pypi_repo,
+                "pypi-proxy",
+                "4444444444444444444444444444444444444444444444444444444444444444",
+            ),
+        ];
+
+        let preview = h.build_preview(Utc::now(), &matches).await;
+
+        let groups = preview["groups"].as_array().expect("groups array");
+        assert_eq!(groups.len(), 2, "one group per (policy, repository)");
+        let keyed: BTreeMap<&str, &str> = groups
+            .iter()
+            .map(|g| {
+                (
+                    g["repository_id"].as_str().expect("repository_id"),
+                    g["repository_key"].as_str().expect("repository_key"),
+                )
+            })
+            .collect();
+        assert_eq!(keyed.get(npm_repo.to_string().as_str()), Some(&"npm-proxy"));
+        assert_eq!(
+            keyed.get(pypi_repo.to_string().as_str()),
+            Some(&"pypi-proxy")
+        );
+
+        let sample = preview["sample"].as_array().expect("sample array");
+        let sample_keys: BTreeSet<&str> = sample
+            .iter()
+            .map(|row| row["repository_key"].as_str().expect("repository_key"))
+            .collect();
+        assert_eq!(
+            sample_keys,
+            ["npm-proxy", "pypi-proxy"].into_iter().collect(),
+            "the sample names repositories by key too"
+        );
+        for row in sample {
+            assert!(
+                row["repository_id"].is_string(),
+                "the id stays beside the key for machine consumers"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1062,6 +1147,7 @@ mod tests {
         let row = RetentionCandidateRow {
             artifact: art(Uuid::new_v4()),
             format: hort_domain::entities::repository::RepositoryFormat::Generic,
+            repository_key: "npm-proxy".into(),
             resolved_rescan_interval_hours: None,
             keep_rank: None,
             tag_targeted: false,

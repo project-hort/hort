@@ -445,6 +445,7 @@ mod tests {
         let candidate = RetentionCandidate {
             artifact: row.artifact,
             format: row.format,
+            repository_key: row.repository_key,
             resolved_rescan_interval_hours: row.resolved_rescan_interval_hours,
             keep_rank: row.keep_rank,
             tag_targeted: row.tag_targeted,

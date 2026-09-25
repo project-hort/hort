@@ -25,7 +25,10 @@ hort-attribution = { workspace = true }
 reqwest    = { workspace = true, features = ["rustls", "json", "form"] }
 clap       = { workspace = true, features = ["derive", "env"] }
 clap_complete = { version = "=4.6.11", features = ["unstable-dynamic"] }
-tokio      = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# `time` backs the bounded job-wait poll loop in `admin retention`
+# (`tokio::time::sleep` between reads). A feature of a crate already in
+# the graph: no new dependency, no third-party attribution change.
+tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 toml       = { workspace = true }

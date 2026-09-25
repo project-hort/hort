@@ -246,6 +246,7 @@ fn candidate(status: QuarantineStatus, created_at: DateTime<Utc>) -> RetentionCa
     RetentionCandidate {
         artifact: a,
         format: hort_domain::entities::repository::RepositoryFormat::Generic,
+        repository_key: "npm-proxy".into(),
         resolved_rescan_interval_hours: Some(24),
         keep_rank: None,
         tag_targeted: false,
@@ -371,6 +372,32 @@ async fn dry_run_and_execute_select_identical_candidates_but_only_execute_append
     assert_eq!(preview_ids, execution_ids);
     assert_eq!(preview_ids, vec![old_id]);
     assert_eq!(store.appended_batches().len(), 1);
+}
+
+/// A match reports the repository by the key the operator writes into a
+/// policy, carried from the candidate the reader supplied — not resolved
+/// afterwards by a per-repository lookup. The UUID stays alongside it.
+#[tokio::test]
+async fn a_match_carries_the_candidates_repository_key_beside_its_id() {
+    let (uc, _store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.repository_key = "cargo-mirror".into();
+    seed_stream(&_store, &c, IngestSource::Proxied, vec![]);
+
+    let report = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            std::slice::from_ref(&c),
+            RetentionEvaluationMode::DryRun,
+        )
+        .await
+        .unwrap();
+
+    let hit = report.matches.first().expect("one match");
+    assert_eq!(hit.repository_key, "cargo-mirror");
+    assert_eq!(hit.repository_id, c.artifact.repository_id);
 }
 
 // ===========================================================================

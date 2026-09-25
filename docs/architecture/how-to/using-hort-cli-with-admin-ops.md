@@ -209,6 +209,66 @@ Both of the above endpoints are gated by the same `AdminPrincipal` check as
 rationale behind the admin-only scope, the in-memory apply-status
 semantics, and the secrets-exclusion mechanism.
 
+### Preview and execute a retention cleanup
+
+Retention deletes real content, so the CLI puts a readable proposal and a
+confirmation between the operator and the sweep. Two subcommands:
+
+```sh
+# What would retention take if it ran right now? Read-only.
+$ hort-cli admin retention preview
+
+# Execute it, after re-measuring and showing what moved since that preview.
+$ hort-cli admin retention apply --from-preview <task_job_id>
+```
+
+`preview` runs `retention-evaluate` in `dry_run` mode and renders the
+result: artifact rows, distinct stored contents, the bytes a purge would
+actually reclaim, a per-policy/per-repository rollup naming repositories
+by the key you write into a policy, and a capped sample.
+
+Three things about that output are deliberate:
+
+- **Rows are not bytes.** One stored blob can back many artifact rows, so
+  the row count and the byte figure will not agree. The output labels the
+  counts as counts and gives no per-group byte column, because a blob is
+  freed only when its last reference anywhere goes away.
+- **An unmeasured size says so.** When the evaluator's byte accounting
+  exceeds its exact-accounting bound it reports `omitted`, and the CLI
+  prints `NOT MEASURED` with the reason. There is no estimate anywhere,
+  and never a `0` standing in for "we did not look".
+- **Partial coverage is in the header.** A sweep that stopped at its
+  per-run batch cap undercounts everything below it, so it is stated
+  above the numbers rather than after them.
+
+`apply` always runs a **fresh** preview immediately before executing.
+With `--from-preview` it compares that fresh preview against the earlier
+one you name and renders the difference; if anything moved you are asked
+to acknowledge the change and then to authorise the run — two separate
+questions. `--yes` skips the questions and never the comparison. Without
+`--from-preview` there is nothing to compare against and no delta is
+invented: the fresh preview is presented on its own terms.
+
+Authority: `preview` needs only the ordinary admin-task permission;
+`apply`'s execute step additionally needs the `task:destructive` claim,
+which the `--admin` session above carries. Nothing here introduces a new
+permission, claim, or token lifetime.
+
+Exit codes worth scripting against: `0` ran and the result was read, `3`
+the job outlived `--wait-timeout` (the job id is printed and nothing is
+reported about its outcome), `4` the operator declined and nothing was
+executed.
+
+Two operational notes:
+
+- Retention invocations are **deduplicated per mode per UTC day**. A
+  second `preview` on the same day gets the first one's job back rather
+  than a new sweep; the CLI says so explicitly rather than presenting it
+  as a fresh observation. The same applies to a second `apply` execution
+  in one day.
+- Expiry marks artifact records. Reclaiming the bytes is the separate
+  purge stage.
+
 ### Re-login after expiry ("session expired")
 
 A 15 min admin session expires quickly. Once the token crosses `expires_at`,

@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`hort-cli admin retention preview` / `apply` — the surface a cleanup
+  actually happens on** (#289). `preview` runs the dry run, waits for it, and
+  renders it for a person: rows and distinct stored contents named as the
+  different quantities they are, the measured bytes that would be freed — or the
+  words `NOT MEASURED` and the server's reason, never a number the server did
+  not measure — a capped sample so the selection can be checked, and partial
+  coverage stated in the header rather than a footnote. Repositories are named
+  by the key an operator writes in a policy, not by UUID.
+
+  `apply` re-runs the preview immediately before executing and shows the
+  difference to the one it was pointed at, per figure and per group. When
+  anything moved, it asks twice: once to confirm the difference was read, once
+  to execute. Declining either exits without sending the execution. `--yes`
+  skips the questions and still prints the difference. Both commands work with a
+  fresh admin CLI session and need no new authority — a preview requires no
+  destructive claim at all, an execution still does. `--output json` carries the
+  same information, including the omission status and the coverage flag.
+
+  Both commands state plainly that expiry marks artifact records and does not
+  itself delete stored bytes; the separate purge reclaims a blob once its last
+  reference is gone.
+
 - **A retention policy can be previewed before it takes anything** (#283).
   `retention-evaluate` gains a dry-run mode that draws the same candidates
   through the same reader and the same predicates, appends no `ArtifactExpired`,
