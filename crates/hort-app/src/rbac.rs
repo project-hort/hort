@@ -54,6 +54,88 @@ pub struct EffectiveGrantSet {
 }
 
 // ---------------------------------------------------------------------------
+// AuthzDecision
+// ---------------------------------------------------------------------------
+
+/// The outcome of [`RbacEvaluator::authorize_explained`] — the verdict plus
+/// which leg of the two-leg AND produced it.
+///
+/// [`RbacEvaluator::authorize`] returns a bare `bool`, which makes two
+/// structurally different failures indistinguishable at every layer above
+/// it:
+///
+/// - **no grant** — the identity genuinely holds no such permission on the
+///   resource. Remediation is a `kind: PermissionGrant` (or the claim
+///   resolution upstream of it).
+/// - **cap reject** — the identity *does* hold the permission, but the
+///   presented token's [`TokenCap`] excludes the resource. Remediation is
+///   on the token: widen its declared permissions / repository set, or
+///   re-mint it. The grant table is not at fault.
+///
+/// The two have disjoint remediations, and the caller-visible response
+/// collapses both to the same status by anti-enumeration, so an operator
+/// handed only the merged signal has to rule out both surfaces by hand —
+/// a configuration that is entirely correct in gitops can stay
+/// unreachable with nothing saying why.
+///
+/// Preserving the distinction is free: both legs are already evaluated
+/// unconditionally (the cap leg must not be refactored out of the AND —
+/// ADR 0036), so this is a value [`RbacEvaluator::authorize`] already
+/// holds and discards on the way out.
+///
+/// This type **carries** the distinction; it does not report it. Emission
+/// stays at the handler layer per this module's contract (see the module
+/// docstring) — the evaluator is a decision function, not an observer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthzDecision {
+    /// Both legs passed.
+    Allowed,
+    /// The grants leg failed; the cap would have allowed it.
+    DeniedGrants,
+    /// The grants leg passed; the presented token's cap excluded it.
+    DeniedCap,
+    /// Both legs failed.
+    ///
+    /// A distinct fourth state rather than folded into
+    /// [`Self::DeniedGrants`]: reporting one of two faults sends the
+    /// operator round the diagnosis loop twice, fixing the named surface
+    /// only to meet the identical deny — the exact failure mode the
+    /// distinction exists to end.
+    DeniedBoth,
+}
+
+impl AuthzDecision {
+    /// `true` only for [`Self::Allowed`] — the `bool`
+    /// [`RbacEvaluator::authorize`] returns.
+    #[must_use]
+    pub fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+
+    /// Stable lowercase spelling of the denial reason; `None` for
+    /// [`Self::Allowed`], which has no reason.
+    ///
+    /// Mirrors [`Permission`]'s `Display` convention — the canonical
+    /// string spelling of a closed taxonomy lives next to the taxonomy, so
+    /// a handler labelling a metric or a log field with it cannot drift
+    /// from the variant set. The match is exhaustive, so a future variant
+    /// is a compile error here rather than a silently missing label.
+    ///
+    /// Returning `Option` is what keeps `Allowed` out of the deny-only
+    /// series: there is no spelling for "allowed" to leak in, and no
+    /// `unknown` sentinel for a caller to reach for.
+    #[must_use]
+    pub fn denial_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Allowed => None,
+            Self::DeniedGrants => Some("grants"),
+            Self::DeniedCap => Some("cap"),
+            Self::DeniedBoth => Some("both"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // RbacEvaluator
 // ---------------------------------------------------------------------------
 
@@ -186,6 +268,36 @@ impl RbacEvaluator {
         permission: Permission,
         repository_id: Option<Uuid>,
     ) -> bool {
+        self.authorize_explained(principal, permission, repository_id)
+            .is_allowed()
+    }
+
+    /// [`Self::authorize`] with the denied leg preserved.
+    ///
+    /// Same inputs, same two legs, same AND, same verdict — see
+    /// [`Self::authorize`] for the authorization model in full (admin
+    /// short-circuit, subject match, repository scoping). The only
+    /// difference is the return type: [`AuthzDecision`] names *which* leg
+    /// failed instead of collapsing both to `false`, because the two have
+    /// disjoint remediations and are otherwise indistinguishable to every
+    /// caller above this one.
+    ///
+    /// [`Self::authorize`] delegates here and calls
+    /// [`AuthzDecision::is_allowed`], so the `bool` and the decision
+    /// cannot disagree by construction — there is one evaluation, not two.
+    /// That is what lets every existing `authorize` call site keep its
+    /// signature and meaning, while the handful of sites that report a
+    /// denial to an operator opt into the richer return.
+    ///
+    /// Reporting is the caller's job: this module emits no tracing and no
+    /// metrics (see the module docstring).
+    #[must_use]
+    pub fn authorize_explained(
+        &self,
+        principal: &CallerPrincipal,
+        permission: Permission,
+        repository_id: Option<Uuid>,
+    ) -> AuthzDecision {
         // User-grants leg — admin short-circuit + subject-model grant
         // scan, unchanged for non-token callers.
         let user_leg = self.user_grants_authorize(principal, permission, repository_id);
@@ -196,7 +308,16 @@ impl RbacEvaluator {
         // disappears from the AND.
         let cap_leg =
             cap_allows_optional_repo(principal.token_cap.as_ref(), permission, repository_id);
-        user_leg && cap_leg
+        // The AND, spelled out per leg. `(true, true)` is the only
+        // allowing combination, so this is exactly `user_leg && cap_leg`
+        // with the losing leg kept instead of discarded — the two-leg
+        // structure is unchanged, only its return shape is.
+        match (user_leg, cap_leg) {
+            (true, true) => AuthzDecision::Allowed,
+            (false, true) => AuthzDecision::DeniedGrants,
+            (true, false) => AuthzDecision::DeniedCap,
+            (false, false) => AuthzDecision::DeniedBoth,
+        }
     }
 
     /// Grants-leg-only authorization — the quarantine hold-exemption
@@ -1607,6 +1728,244 @@ mod tests {
             &cap_rw,
             "cap field is fixed at issuance and must not have mutated"
         );
+    }
+
+    // ====================================================================
+    // authorize_explained — which leg denied.
+    //
+    // The four variants come from the two legs' cross product, so each
+    // test fixes one leg and flips the other. The final test in the
+    // section is the divergence guard: `authorize`'s `bool` and
+    // `authorize_explained`'s decision must agree for every input, which
+    // is what lets every existing `authorize` call site keep its
+    // signature while the deny-reporting sites read the decision.
+    // ====================================================================
+
+    #[test]
+    fn authz_decision_is_allowed_only_for_allowed() {
+        assert!(AuthzDecision::Allowed.is_allowed());
+        for denied in [
+            AuthzDecision::DeniedGrants,
+            AuthzDecision::DeniedCap,
+            AuthzDecision::DeniedBoth,
+        ] {
+            assert!(!denied.is_allowed(), "{denied:?} must not be an allow");
+        }
+    }
+
+    /// The reason spellings are the `hort_authz_denials_total` `reason`
+    /// label values and the deny-log field; the catalog documents the same
+    /// three. `Allowed` has no reason — that is what keeps an `unknown`
+    /// value out of the deny-only series.
+    #[test]
+    fn authz_decision_denial_reason_spells_each_denied_variant() {
+        assert_eq!(AuthzDecision::Allowed.denial_reason(), None);
+        assert_eq!(AuthzDecision::DeniedGrants.denial_reason(), Some("grants"));
+        assert_eq!(AuthzDecision::DeniedCap.denial_reason(), Some("cap"));
+        assert_eq!(AuthzDecision::DeniedBoth.denial_reason(), Some("both"));
+    }
+
+    #[test]
+    fn authorize_explained_allows_when_both_legs_pass() {
+        let repo_a = Uuid::new_v4();
+        let eval = dev_writes_repo_a(repo_a);
+        let p = principal_with_cap(
+            &["developer"],
+            cap(vec![Permission::Write], Some(vec![repo_a])),
+        );
+        assert_eq!(
+            eval.authorize_explained(&p, Permission::Write, Some(repo_a)),
+            AuthzDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn authorize_explained_reports_grants_when_only_the_grants_leg_fails() {
+        let repo_a = Uuid::new_v4();
+        // Cap permits Write on repo_a; the grant set is empty.
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal_with_cap(
+            &["developer"],
+            cap(vec![Permission::Write], Some(vec![repo_a])),
+        );
+        assert_eq!(
+            eval.authorize_explained(&p, Permission::Write, Some(repo_a)),
+            AuthzDecision::DeniedGrants
+        );
+    }
+
+    /// The shape that produced the same wrong diagnosis twice: the grant
+    /// is global and correct, and the presented token's cap is scoped to a
+    /// *different* repository. Before the decision existed this was
+    /// indistinguishable from having no grant at all.
+    #[test]
+    fn authorize_explained_reports_cap_when_the_cap_is_scoped_to_another_repository() {
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![claims_grant(&["developer"], None, Permission::Write)]);
+        let p = principal_with_cap(
+            &["developer"],
+            cap(vec![Permission::Write], Some(vec![repo_b])),
+        );
+        assert_eq!(
+            eval.authorize_explained(&p, Permission::Write, Some(repo_a)),
+            AuthzDecision::DeniedCap,
+            "global grant + cap scoped elsewhere is a cap reject, not a missing grant"
+        );
+    }
+
+    #[test]
+    fn authorize_explained_reports_cap_when_the_cap_omits_the_permission() {
+        let repo_a = Uuid::new_v4();
+        let eval = dev_writes_repo_a(repo_a);
+        let p = principal_with_cap(
+            &["developer"],
+            cap(vec![Permission::Read], Some(vec![repo_a])),
+        );
+        assert_eq!(
+            eval.authorize_explained(&p, Permission::Write, Some(repo_a)),
+            AuthzDecision::DeniedCap
+        );
+    }
+
+    #[test]
+    fn authorize_explained_reports_both_when_both_legs_fail() {
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        // No grant for `developer` on repo_a, and the cap covers repo_b.
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal_with_cap(
+            &["developer"],
+            cap(vec![Permission::Read], Some(vec![repo_b])),
+        );
+        assert_eq!(
+            eval.authorize_explained(&p, Permission::Write, Some(repo_a)),
+            AuthzDecision::DeniedBoth
+        );
+    }
+
+    /// `token_cap = None` (OIDC bearer / local session) makes the cap leg
+    /// vacuously true, so a cap can never be the reported reason — the
+    /// decision degrades to exactly the single-leg behaviour those callers
+    /// have always had.
+    #[test]
+    fn authorize_explained_without_a_cap_never_blames_the_cap() {
+        let repo_a = Uuid::new_v4();
+        let eval = dev_writes_repo_a(repo_a);
+        let granted = principal(&["developer"]);
+        let ungranted = principal(&["reader"]);
+        assert_eq!(
+            eval.authorize_explained(&granted, Permission::Write, Some(repo_a)),
+            AuthzDecision::Allowed
+        );
+        assert_eq!(
+            eval.authorize_explained(&ungranted, Permission::Write, Some(repo_a)),
+            AuthzDecision::DeniedGrants
+        );
+    }
+
+    /// The B1 fail-closed backstop (ADR 0036) lives inside the grants
+    /// leg, so an anomalous claims-admin Pat with no cap denies on the
+    /// *grants* leg — not the cap leg, which a `None` cap waves through.
+    /// Blaming the cap here would send the operator to re-mint a token
+    /// when the principal construction is what is wrong.
+    #[test]
+    fn authorize_explained_b1_backstop_denies_on_the_grants_leg() {
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal_kind_cap(&["admin"], Some(TokenKind::Pat), None);
+        assert_eq!(
+            eval.authorize_explained(&p, Permission::Write, Some(Uuid::new_v4())),
+            AuthzDecision::DeniedGrants
+        );
+    }
+
+    /// The divergence guard. `authorize` delegates to
+    /// `authorize_explained`, so the two cannot disagree by construction —
+    /// this pins that property against a future refactor that
+    /// reimplements either side, and asserts the matrix is wide enough to
+    /// actually reach all four variants.
+    #[test]
+    fn authorize_bool_agrees_with_authorize_explained_for_every_input() {
+        let repo_a = Uuid::new_v4();
+        let repo_b = Uuid::new_v4();
+        let uid = Uuid::new_v4();
+        let eval = RbacEvaluator::new(vec![
+            claims_grant(&["developer"], Some(repo_a), Permission::Write),
+            claims_grant(&["reader"], None, Permission::Read),
+            claims_grant(&["scraper"], None, Permission::ReadMetrics),
+            user_grant(uid, Some(repo_b), Permission::Delete),
+        ]);
+
+        let principals = vec![
+            principal(&[]),
+            principal(&["developer"]),
+            principal(&["reader"]),
+            principal(&["scraper"]),
+            principal(&["admin"]),
+            principal_with_id(uid, &[]),
+            principal_with_cap(&["developer"], cap(vec![Permission::Write], None)),
+            principal_with_cap(
+                &["developer"],
+                cap(vec![Permission::Write], Some(vec![repo_a])),
+            ),
+            principal_with_cap(
+                &["developer"],
+                cap(vec![Permission::Write], Some(vec![repo_b])),
+            ),
+            principal_with_cap(&["developer"], cap(vec![Permission::Read], None)),
+            principal_with_cap(&["admin"], cap(vec![Permission::Read], Some(vec![repo_b]))),
+            principal_with_cap(&["reader"], cap(Vec::new(), None)),
+            principal_kind_cap(&["admin"], Some(TokenKind::Pat), None),
+            principal_kind_cap(
+                &["admin"],
+                Some(TokenKind::ServiceAccount),
+                Some(cap(vec![Permission::Read], Some(vec![repo_a]))),
+            ),
+        ];
+        let permissions = [
+            Permission::Read,
+            Permission::Write,
+            Permission::Delete,
+            Permission::Admin,
+            Permission::AdminTaskInvoke,
+            Permission::Curate,
+            Permission::Prefetch,
+            Permission::ReadMetrics,
+        ];
+        let repositories = [None, Some(repo_a), Some(repo_b), Some(Uuid::new_v4())];
+
+        let mut seen: Vec<AuthzDecision> = Vec::new();
+        for p in &principals {
+            for perm in permissions {
+                for repo in repositories {
+                    let decision = eval.authorize_explained(p, perm, repo);
+                    assert_eq!(
+                        eval.authorize(p, perm, repo),
+                        decision.is_allowed(),
+                        "authorize() and authorize_explained() disagreed for \
+                         claims={:?} kind={:?} cap={:?} perm={perm:?} repo={repo:?}",
+                        p.claims,
+                        p.token_kind,
+                        p.token_cap,
+                    );
+                    if !seen.contains(&decision) {
+                        seen.push(decision);
+                    }
+                }
+            }
+        }
+        for expected in [
+            AuthzDecision::Allowed,
+            AuthzDecision::DeniedGrants,
+            AuthzDecision::DeniedCap,
+            AuthzDecision::DeniedBoth,
+        ] {
+            assert!(
+                seen.contains(&expected),
+                "matrix never produced {expected:?} — it does not cover the \
+                 variant it claims to agree on"
+            );
+        }
     }
 
     // -- claims_satisfy ----------------------------------------------------

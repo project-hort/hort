@@ -231,6 +231,7 @@ attached to the router in that mode.
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|-----------------|
 | `hort_authz_decisions_total` | counter | `result`, `permission` | — | `result` ∈ `allow`, `deny` / `permission` ∈ `read`, `write`, `delete`, `admin`, `curate`, `read_metrics` |
+| `hort_authz_denials_total` | counter | `permission`, `reason` | — | `permission` ∈ `read`, `write`, `delete`, `admin`, `read_metrics` (**no `curate`** — see below) / `reason` ∈ `grants`, `cap`, `both` |
 | `hort_http_404_repo_lookups_total` | counter | `format` | — | `format` ∈ known [`RepositoryFormat`](../crates/hort-domain/src/entities/repository.rs) values + sentinel `unknown` |
 
 Emission of `hort_authz_decisions_total` moved from per-handler helpers
@@ -262,6 +263,53 @@ call's inputs + decision:
   curator surface", not "which authority the evaluator consulted".
   An admin-only caller hitting `/api/v1/admin/curation/...` ticks
   `curate=allow`, NOT `admin=allow`.
+
+`hort_authz_denials_total` is the **deny-only sibling** of the decision
+counter, carrying WHICH leg of the two-leg authorization AND
+([ADR 0036](adr/0036-oci-auth-capability-token.md)) produced the deny. The two
+legs have disjoint remediations, and the caller-visible response collapses
+both to the same status by anti-enumeration, so without this the identical
+signal covers two unrelated faults:
+
+- `reason=grants` — the identity holds no such permission on the resource.
+  The presented token's cap would have allowed it. Remediation is a
+  `kind: PermissionGrant` (or the `kind: ClaimMapping` / IdP group claim
+  upstream of it).
+- `reason=cap` — the identity DOES hold the permission; the presented
+  token's cap excluded the resource. Remediation is on the token: widen its
+  declared permissions or its repository set, or re-mint it. The grant table
+  is not at fault. A correct, applied grant with a token cap scoped to a
+  different repository lands here, and used to be indistinguishable from
+  `grants`.
+- `reason=both` — both legs denied. A distinct third value rather than
+  folded into `grants`: reporting one of two faults sends the operator round
+  the diagnosis loop twice.
+
+The spellings come from `AuthzDecision::denial_reason` in
+`crates/hort-app/src/rbac.rs`, so the label set cannot drift from the
+variant set. The deny log line carries the same distinction as the
+`denial_reason` field (the variant name — `DeniedCap`, `DeniedGrants`,
+`DeniedBoth`), so a spike on this counter pivots onto the log records that
+explain it.
+
+**Emitted only where a single decision exists.** The composite
+`CurateOrAdminPrincipal` gate evaluates two permissions (`Curate`, then
+`Admin`) and denies on the pair; neither decision describes that deny on its
+own, so this series is **absent** at that site rather than carrying an
+`unknown` reason. Its deny log line reports both decisions as separate
+`curate_decision` / `admin_decision` fields instead. That gate is the only
+emitter of `permission="curate"`, so **no `curate` series exists on this
+counter at all** — a dashboard must not wait for one. Every other label
+value comes from the shared `authorize()` helper, which has exactly one
+decision per request.
+`hort_authz_decisions_total` remains the complete decision count —
+`sum(hort_authz_denials_total)` is therefore ≤
+`sum(hort_authz_decisions_total{result="deny"})`, and a dashboard must not
+treat the two as interchangeable.
+
+No `repository` label — the same cardinality-control decision
+`hort_authz_decisions_total` documents. Cardinality is bounded by
+permissions × three reasons on deny paths only.
 
 Some legacy call sites (`pypi.rs::upload` / `cargo.rs::publish` /
 `npm.rs::publish_*`) still emit via per-handler `emit_authz_metric`

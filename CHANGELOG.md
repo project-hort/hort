@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A denial records which leg denied it** (#239). `RbacEvaluator` gains
+  `authorize_explained`, returning `AuthzDecision` — `Allowed`,
+  `DeniedGrants`, `DeniedCap`, `DeniedBoth` — beside the unchanged `authorize`
+  predicate, which now delegates to it. Both legs of the cap-intersection AND
+  were already evaluated unconditionally, so which one failed was computed and
+  thrown away on every deny.
+
+  Two structurally different faults used to produce one indistinguishable
+  signal: an identity with no grant, and an identity that holds the permission
+  presenting a token whose cap excludes the repository. They have disjoint
+  remediations — declare a `PermissionGrant` versus widen or re-mint the token
+  — so a configuration correct in gitops could stay unreachable with nothing
+  saying why. The deny log now names the measured leg (`denial_reason`) and its
+  hint states which surface is at fault *and* which is exonerated, in place of
+  the "check both the token's scopes and the grant table" checklist it could
+  only offer while the evaluator returned a bare `bool`. A CLI session is told
+  to re-login with `--admin` only when the cap is genuinely what denied; an
+  identity holding no admin authority is no longer sent on a mint that would
+  be refused.
+
+  New counter `hort_authz_denials_total{permission, reason}` with
+  `reason ∈ {grants, cap, both}`, deny-only and with no `repository` label.
+  `hort_authz_decisions_total` is unchanged and remains the complete decision
+  count: the composite curate-or-admin gate evaluates two permissions and
+  denies on the pair, so it emits no `reason` rather than an invented
+  `unknown` one, and reports both decisions on its log line instead.
+
+  The caller-visible contract is untouched — a cap reject and a missing grant
+  still return the same status, since distinguishing them would disclose that
+  an identity's grants are broader than the presented token's cap.
+
 - **`hort-cli admin retention preview` / `apply` — the surface a cleanup
   actually happens on** (#289). `preview` runs the dry run, waits for it, and
   renders it for a person: rows and distinct stored contents named as the

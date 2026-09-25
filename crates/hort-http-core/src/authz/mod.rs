@@ -74,6 +74,41 @@ pub(crate) fn emit_authz_decision(permission: &'static str, result: &'static str
     .increment(1);
 }
 
+/// Catalog: `docs/metrics-catalog.md` — `hort_authz_denials_total`.
+///
+/// Deny-only sibling of [`emit_authz_decision`], carrying WHICH leg of the
+/// two-leg authorization AND produced the deny. `reason` comes from
+/// [`hort_app::rbac::AuthzDecision::denial_reason`] — `{grants, cap, both}`
+/// — so the label spelling cannot drift from the variant set.
+///
+/// **Why a sibling series and not a `reason` label on
+/// `hort_authz_decisions_total`.** That counter is also emitted from
+/// composite gates ([`CurateOrAdminPrincipal`]) which evaluate two
+/// permissions and deny on the pair: neither decision describes the deny on
+/// its own, so a `reason` label there would have to carry an `unknown`
+/// value — forcing a meaningless value into a catalogued series at exactly
+/// the sites where the answer is hardest to read. A separate series is
+/// simply absent at those sites instead, and `hort_authz_decisions_total`
+/// stays the complete decision count.
+///
+/// [`CurateOrAdminPrincipal`] is also the ONLY emitter of
+/// `permission="curate"`, so no `curate` series exists on this counter at
+/// all — every value it does carry comes from the shared `authorize` helper,
+/// which has exactly one decision per request.
+///
+/// Cardinality is bounded by permissions × three reasons, deny paths only,
+/// and carries **no** `repository` label — the same cardinality-control
+/// decision [`emit_authz_decision`] documents. Per-repo drill-down lives in
+/// the deny log's structured fields.
+pub(crate) fn emit_authz_denial(permission: &'static str, reason: &'static str) {
+    metrics::counter!(
+        "hort_authz_denials_total",
+        "permission" => permission,
+        "reason" => reason,
+    )
+    .increment(1);
+}
+
 /// Catalog: `docs/metrics-catalog.md` — `hort_http_404_repo_lookups_total`.
 ///
 /// `format` is the resolved [`hort_domain::entities::repository::RepositoryFormat`]'s
