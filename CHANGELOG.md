@@ -93,6 +93,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The retention dry-run's byte accounting probes storage concurrently**
+  (#293). The `freed_bytes` simulation issued one `StoragePort::size_of` per
+  reclaimable target, one at a time. On a filesystem CAS that is a `stat`
+  (5.5 µs, measured); on an object store it is an HTTP `HEAD`, so a preview at
+  the 128 000-target ceiling cost 128 000 serialised round trips — over half an
+  hour against a store answering in 15 ms, which is why the instances that most
+  need the figure were the ones reading `freed_bytes: omitted`. The probes now
+  fan out 64 at a time: 48.9× measured against an object store in the
+  latency-dominated regime a real S3 sits in, 4.3× against a filesystem CAS.
+
+  The width is a measured constant rather than a round one. The adapter's HTTP
+  client imposes no ceiling of its own — `object_store`'s `ClientOptions`
+  leaves `pool_max_idle_per_host` at `reqwest`'s `usize::MAX`, holds idle
+  connections for 90 s, and pins `http1_only`, so one in-flight probe is one
+  socket and a wider fan-out buys sockets rather than backpressure. The width
+  is therefore sized to what the shipped worker's guaranteed CPU share can keep
+  fed, with the measurement recorded beside the constant.
+
+  **Visible only on a failing preview:** when more than one thing goes wrong,
+  the reason is now ranked rather than raced — concurrently, "the first error"
+  is a property of the scheduler. A failed probe outranks an overflowing total,
+  because a sum missing an addend cannot be claimed to have overflowed. The
+  outcome is unchanged: `omitted` with a reason, never a partial sum dressed as
+  `exact`. `MAX_SIMULATION_TARGETS` is unchanged.
+
 - **A `RetentionPolicy` scope names repositories, and a declared retention
   policy now actually applies** (#282). The `repos` scope carried repository
   **UUIDs** at the gitops surface — a form that contradicts every other
