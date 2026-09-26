@@ -1413,7 +1413,11 @@ impl ArtifactExpired {
 /// The storage delete completed (or the blob was confirmed already
 /// absent). Lands on the **artifact** stream
 /// ([`StreamCategory::Artifact`](super::StreamCategory::Artifact))
-/// terminating an [`ArtifactExpired`] work item.
+/// terminating a byte-release work item — either an [`ArtifactExpired`]
+/// (a retention policy decided) or an [`ArtifactDeleted`] (a caller
+/// deleted the artifact). Both retire an artifact from service and both
+/// release its `content_references` source edges through the one
+/// storage-GC sweep.
 ///
 /// `refs_remaining` is the GC algorithm's post-decrement
 /// cross-`kind` refcount for `content_hash` (tied to
@@ -1481,14 +1485,28 @@ impl ArtifactPurged {
 /// # Soft delete, not row removal
 ///
 /// The projection row is retained with `artifacts.deleted_at` set; the
-/// CAS blob is untouched. Blob lifetime stays refcount-gated GC
-/// (`content_references` → the purge path), so deleting one repository's
-/// artifact can never remove bytes another artifact still references.
+/// CAS blob is untouched at this transition. Blob lifetime stays
+/// refcount-gated GC (`content_references` → the purge path), so deleting
+/// one repository's artifact can never remove bytes another artifact
+/// still references.
 /// The retained row keeps `checksum_sha256`, so an auditor can answer
 /// "what content did this path hold when it was deleted?" from the
 /// projection alone; this payload answers the same question from the
 /// event log alone, without resolving a projection row that a later
 /// purge may have removed.
+///
+/// # Also the byte-release work item
+///
+/// This event is what makes that refcount-gated GC actually fire. The
+/// storage-GC sweep enumerates every artifact stream carrying an
+/// `ArtifactExpired` **or** an `ArtifactDeleted` with no following
+/// [`ArtifactPurged`], and it is the sweep — not the delete — that
+/// removes the artifact's `content_references` source edges and deletes
+/// the blob at refcount zero. Without that, the source edge would stand
+/// forever, the refcount would never fall, and the bytes of a deleted
+/// artifact would have no release path at all. An `ArtifactPurged` may
+/// therefore follow an `ArtifactDeleted` on the same stream; it says
+/// nothing about the catalog, which this event already settled.
 ///
 /// # Why the payload denormalises `repository_id` / `path` /
 /// `content_hash`

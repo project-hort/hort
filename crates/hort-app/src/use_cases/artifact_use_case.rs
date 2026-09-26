@@ -336,9 +336,17 @@ impl ArtifactUseCase {
     ///
     /// The `artifacts` row is retained with `deleted_at` set and an
     /// `ArtifactDeleted` event is appended to the artifact's own stream,
-    /// atomically, attributed to `actor`. The CAS blob is untouched: blob
-    /// lifetime stays refcount-gated GC, because another artifact may
-    /// reference the same bytes.
+    /// atomically, attributed to `actor`.
+    ///
+    /// The CAS blob is untouched **by this call**: blob lifetime is
+    /// refcount-gated GC, because another artifact may reference the same
+    /// bytes. The `ArtifactDeleted` event is itself the byte-release work
+    /// item — `PurgeUseCase::process_expired` consumes it exactly as it
+    /// consumes an `ArtifactExpired`, removing this artifact's
+    /// `content_references` source edges and deleting the blob only once
+    /// the cross-`kind` refcount reaches zero. Because the event commits
+    /// in the same transaction as `deleted_at`, the retirement and the
+    /// work item authorising the byte release cannot come apart.
     ///
     /// `actor` is threaded from the authenticated request principal so the
     /// terminal transition is attributable. Deleting an absent or

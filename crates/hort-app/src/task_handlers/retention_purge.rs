@@ -5,7 +5,11 @@
 //! (the route lives in `hort-http-admin-tasks`).
 //! Default schedule `0 4 * * *`. Thin orchestration over
 //! [`PurgeUseCase::process_expired`] (the destructive storage-GC
-//! walk). The use case **refuses to run** until the
+//! walk). The name is narrower than the job: the sweep collects the
+//! bytes of *every* retired artifact, policy-expired and caller-deleted
+//! alike, which is why `user_deletes_visited` is in the summary — a
+//! deployment with no retention policy configured at all still has work
+//! here. The use case **refuses to run** until the
 //! [`RefcountReconcileGate`](crate::use_cases::purge_use_case::RefcountReconcileGate)
 //! reports the refcount reconcile has converged — a gate-false purge surfaces here as a
 //! retryable `TaskOutcome::fail` (fail-safe; the worker boot sweep
@@ -55,6 +59,7 @@ impl TaskHandler for RetentionPurgeHandler {
                         purged_events = s.purged_events,
                         skipped_protected = s.skipped_protected,
                         skipped_tag_exempt = s.skipped_tag_exempt,
+                        user_deletes_visited = s.user_deletes_visited,
                         errors = s.errors,
                         "retention-purge sweep complete"
                     );
@@ -66,6 +71,7 @@ impl TaskHandler for RetentionPurgeHandler {
                             "purged_events": s.purged_events,
                             "skipped_protected": s.skipped_protected,
                             "skipped_tag_exempt": s.skipped_tag_exempt,
+                            "user_deletes_visited": s.user_deletes_visited,
                             "errors": s.errors,
                         }),
                     })
@@ -180,6 +186,16 @@ mod tests {
         }
     }
 
+    fn purge_uc_with_pending(pending: Vec<PendingPurge>) -> Arc<PurgeUseCase> {
+        Arc::new(PurgeUseCase::new(
+            Arc::new(MockGc {
+                pending: Mutex::new(pending),
+            }),
+            Arc::new(MockStoragePort::new()),
+            Arc::new(Gate(true)),
+        ))
+    }
+
     #[test]
     fn kind_is_retention_purge() {
         assert_eq!(
@@ -195,7 +211,38 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["artifacts_visited"], 0);
                 assert_eq!(result_summary["blobs_deleted"], 0);
+                assert_eq!(result_summary["user_deletes_visited"], 0);
                 assert_eq!(result_summary["errors"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The summary separates delete-driven from expiry-driven work: the
+    /// sweep is the collector for both, so without the split an operator
+    /// watching a retention-free deployment could not attribute the
+    /// destructive work it does here.
+    #[tokio::test]
+    async fn summary_reports_delete_driven_work_separately() {
+        let deleted = PendingPurge {
+            artifact_id: Uuid::new_v4(),
+            quarantine_status: hort_domain::entities::artifact::QuarantineStatus::Released,
+            tag_targeted: false,
+            expired_only_by_keep_last_n: true,
+            user_deleted: true,
+        };
+        let expired = PendingPurge {
+            artifact_id: Uuid::new_v4(),
+            quarantine_status: hort_domain::entities::artifact::QuarantineStatus::Released,
+            tag_targeted: false,
+            expired_only_by_keep_last_n: false,
+            user_deleted: false,
+        };
+        let h = RetentionPurgeHandler::new(purge_uc_with_pending(vec![deleted, expired]));
+        match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["artifacts_visited"], 2);
+                assert_eq!(result_summary["user_deletes_visited"], 1);
             }
             other => panic!("expected Completed, got {other:?}"),
         }

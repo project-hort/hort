@@ -253,10 +253,20 @@ impl ArtifactRepository for PgArtifactRepository {
     /// reverse).
     ///
     /// The row survives with `deleted_at` set; the CAS blob is untouched
-    /// (blob lifetime is refcount-gated GC — another artifact may
+    /// here (blob lifetime is refcount-gated GC — another artifact may
     /// reference the same bytes). The `(repository_id, path)` unique index
     /// is predicated on `deleted_at IS NULL`, so the freed path admits a
     /// fresh ingest as a new artifact.
+    ///
+    /// The appended `ArtifactDeleted` is also the **byte-release work
+    /// item**: `purge_gc::list_pending_purge` enumerates it exactly as it
+    /// enumerates an `ArtifactExpired`, so the storage-GC sweep removes
+    /// this artifact's `content_references` source edges and collects the
+    /// blob once nothing else references it. Committing the event with
+    /// `deleted_at` in one transaction is what makes the work item as
+    /// durable as the retirement it authorises — a retired row whose
+    /// byte-release work item was lost would leave bytes no predicate can
+    /// ever reach.
     ///
     /// ## Idempotency
     ///

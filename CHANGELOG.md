@@ -144,6 +144,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A soft delete never released the content reference, so the bytes had no
+  release path at all** (#295). `ArtifactUseCase::delete` is an event-sourced
+  soft delete: the adapter appends `ArtifactDeleted` and sets
+  `artifacts.deleted_at` in one transaction, and its doc comment stated that
+  the CAS blob is left to refcount-gated GC "because another artifact may
+  reference the same bytes". The intent was right and the mechanism never
+  fired. The `content_references` source edge stood after the delete, so the
+  refcount never fell, so the refcount-gated collector never saw the blob — no
+  predicate reached those bytes, no policy selected them, and no configuration
+  changed it.
+
+  `ArtifactDeleted` is now a **byte-release work item** in its own right:
+  `purge_gc::list_pending_purge` enumerates every artifact stream carrying an
+  `ArtifactExpired` *or* an `ArtifactDeleted` with no following
+  `ArtifactPurged`, and the existing storage-GC sweep releases the source
+  edges, deletes the blob at cross-kind refcount zero, and appends the
+  terminal event — unchanged, crash-safe, and still the only destructive path.
+  The carrier is the event the delete already writes rather than a synthesised
+  `ArtifactExpired` (which would have to invent a `policy_id`, a `policy_name`
+  and an expiry reason for a decision no policy made) or a new work-item event
+  (which would duplicate, on the same stream at the same instant, a fact
+  `ArtifactDeleted` already records). It is also already durable in the same
+  transaction as `deleted_at`, so the work item cannot come apart from the
+  retirement that authorises it — no new transaction code was needed to get
+  the atomicity.
+
+  A delete does not inherit the `KeepLastN` tag exemption. That flag is
+  vacuously true for an artifact carrying no expiry decision at all, so a
+  tagged delete would otherwise have been skipped forever by a rule for a
+  policy that never ran, its bytes held by a mutable ref pointing at a row no
+  read path resolves. Invariant 1 is untouched: a quarantined, rejected or
+  scan-indeterminate artifact keeps its bytes as evidence even when a caller
+  deletes it — and unlike the retention path, which pre-filters those
+  statuses, the delete verb is deliberately orthogonal to the quarantine axis,
+  so the sweep's status filter is what holds there.
+
+  Byte release is asynchronous, bounded by the `retention-purge` sweep
+  interval (default `0 4 * * *`); the sweep summary gains
+  `user_deletes_visited` so a deployment with no retention policy configured
+  can still attribute the destructive work it does. On first run after
+  upgrading, the sweep collects the bytes of artifacts deleted before this
+  change — which is the point.
+
 - **`KeepLastN(n)` could leave n artifacts and no downloadable one** (#292).
   The retention candidate reader ranked siblings over every live row of the
   `(repository, name)` group, while the candidate page itself excluded the

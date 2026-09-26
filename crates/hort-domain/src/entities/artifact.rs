@@ -1542,9 +1542,12 @@ impl Artifact {
     /// artifact-lifecycle transition on the operator/registry-API axis.
     ///
     /// Deletion is a **soft delete**: the projection row survives with
-    /// `deleted_at` set and the CAS blob is untouched (blob lifetime is
-    /// refcount-gated GC, never a per-artifact delete — another
-    /// repository's artifact may reference the same bytes). What changes
+    /// `deleted_at` set and the CAS blob is untouched at this transition
+    /// (blob lifetime is refcount-gated GC, never a per-artifact delete —
+    /// another repository's artifact may reference the same bytes; the
+    /// emitted [`ArtifactDeleted`] is the work item the storage-GC sweep
+    /// consumes to release this artifact's references and collect the
+    /// blob once nothing else holds it). What changes
     /// is that the artifact leaves the live catalog: every live read
     /// filters `deleted_at IS NULL`, and the `(repository_id, path)`
     /// unique index is predicated on the same, so the freed path admits a

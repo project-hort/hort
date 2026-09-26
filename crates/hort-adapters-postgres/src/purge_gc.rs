@@ -9,17 +9,28 @@
 //!
 //! # `list_pending_purge`
 //!
-//! Every artifact whose stream (`stream_id = 'artifact-' || a.id`) has
-//! an `ArtifactExpired` event and **no** `ArtifactPurged` event — the
-//! pending purge work set. `quarantine_status ∈ {quarantined,
+//! Every artifact whose stream (`stream_id = 'artifact-' || a.id`)
+//! carries a **byte-release work item** — an `ArtifactExpired` (a
+//! retention policy decided) or an `ArtifactDeleted` (a caller deleted
+//! it through the registry API) — and **no** `ArtifactPurged` event:
+//! the pending purge work set. `quarantine_status ∈ {quarantined,
 //! rejected, scan_indeterminate}` is excluded (evidence is
 //! GC-protected); the use case re-asserts the same invariant
 //! defence-in-depth, but the adapter never hands a protected artifact
 //! to the destructive path in the first place.
 //!
-//! ## The two tag-exemption facts
+//! Both work items retire an artifact from service and both must
+//! release its `content_references` source edges; there is deliberately
+//! one destructive sweep rather than two, so the durable worklist and
+//! the atomic terminal transition below are earned once. A delete needs
+//! no expiry decision synthesised for it: `ArtifactDeleted` already
+//! commits in the same transaction as `artifacts.deleted_at`
+//! (`artifact_repo::delete`), which is exactly the durability the
+//! terminal transition depends on.
 //!
-//! The query also reports, per row, the two facts the `KeepLastN` tag
+//! ## The three reported facts
+//!
+//! The query also reports, per row, the facts the `KeepLastN` tag
 //! exemption needs at purge time. They are reported rather than
 //! filtered: the *decision* lives in the use case, where it lands in
 //! the sweep summary instead of disappearing into a `WHERE` clause.
@@ -52,6 +63,15 @@
 //!   summary and released as soon as the tag moves. The opposite
 //!   default would let an unreadable payload delete content a live
 //!   tag resolves to, and deletion does not come back.
+//! - `user_deleted` — an `ArtifactDeleted` is on the stream. A
+//!   delete-driven work item must not inherit the `KeepLastN` tag
+//!   exemption (a delete is the caller's explicit instruction, like an
+//!   age- or security-driven policy), and `expired_only_by_keep_last_n`
+//!   is vacuously true for an artifact with no expiry decision at all —
+//!   so the exemption needs this second fact to stay scoped to
+//!   `KeepLastN`. The two facts stay separate columns because the use
+//!   case composes them; collapsing them here would move the decision
+//!   into the `WHERE` clause the previous paragraph keeps it out of.
 //!
 //! # `purge_artifact_refs` — durable preparation in one transaction
 //!
@@ -138,15 +158,16 @@ impl PgPurgeGcPort {
     }
 }
 
-/// One pending-purge artifact: it has an `ArtifactExpired` event with
-/// no following `ArtifactPurged`, and is not in a GC-protected
-/// quarantine state.
+/// One pending-purge artifact: it carries a byte-release work item
+/// (`ArtifactExpired` or `ArtifactDeleted`) with no following
+/// `ArtifactPurged`, and is not in a GC-protected quarantine state.
 #[derive(Debug, FromRow)]
 struct PendingRow {
     artifact_id: Uuid,
     quarantine_status: Option<String>,
     tag_targeted: bool,
     expired_only_by_keep_last_n: bool,
+    user_deleted: bool,
 }
 
 /// One `(target_content_hash, kind)` row removed by the step-2
@@ -304,11 +325,15 @@ impl PurgeGcPort for PgPurgeGcPort {
         Box::pin(async move {
             // An artifact stream serializes as `artifact-<uuid>`
             // (`StreamId::Display`). The pending-purge set is every
-            // artifact whose stream has an `ArtifactExpired` and no
+            // artifact whose stream carries a byte-release work item —
+            // an `ArtifactExpired` or an `ArtifactDeleted` — and no
             // `ArtifactPurged`. Protected quarantine states are
             // excluded here (GC-protected invariant) — the destructive
             // path is never even offered an evidence artifact; the use
-            // case re-asserts the same filter defence-in-depth.
+            // case re-asserts the same filter defence-in-depth. A
+            // soft-deleted row is deliberately NOT excluded: `deleted_at`
+            // marks an artifact out of service, which is the condition
+            // for collecting its bytes, not against it.
             let sql = format!(
                 r#"
                 SELECT a.id                AS artifact_id,
@@ -322,12 +347,18 @@ impl PurgeGcPort for PgPurgeGcPort {
                                   = 'object'
                             AND NOT (e.event_data->'data'->'reason'
                                        ? 'KeepLastN')
-                       )                   AS expired_only_by_keep_last_n
+                       )                   AS expired_only_by_keep_last_n,
+                       EXISTS (
+                         SELECT 1 FROM events e
+                          WHERE e.stream_id  = 'artifact-' || a.id::text
+                            AND e.event_type = 'ArtifactDeleted'
+                       )                   AS user_deleted
                   FROM artifacts a
                  WHERE EXISTS (
                          SELECT 1 FROM events e
                           WHERE e.stream_id  = 'artifact-' || a.id::text
-                            AND e.event_type = 'ArtifactExpired'
+                            AND e.event_type IN ('ArtifactExpired',
+                                                 'ArtifactDeleted')
                        )
                    AND NOT EXISTS (
                          SELECT 1 FROM events e
@@ -353,6 +384,7 @@ impl PurgeGcPort for PgPurgeGcPort {
                     quarantine_status: map_status(row.quarantine_status.as_deref())?,
                     tag_targeted: row.tag_targeted,
                     expired_only_by_keep_last_n: row.expired_only_by_keep_last_n,
+                    user_deleted: row.user_deleted,
                 });
             }
             Ok(out)
@@ -2394,6 +2426,445 @@ mod tests {
             doomed_deleted_at.is_some(),
             "the untagged sibling is purged"
         );
+
+        cleanup(&pool, repo).await;
+    }
+
+    // =====================================================================
+    // The caller-facing delete as a byte-release work item
+    // =====================================================================
+
+    /// Shorthand for the caller-facing soft delete through the real
+    /// verb, returning the `deleted_at` it wrote.
+    async fn soft_delete(pool: &PgPool, adapter: &PgPurgeGcPort, art: Uuid) -> DateTime<Utc> {
+        let artifact_repo = crate::artifact_repo::PgArtifactRepository::new(
+            pool.clone(),
+            adapter.event_store.clone(),
+        );
+        artifact_repo
+            .delete(
+                art,
+                hort_domain::events::Actor::Api(hort_domain::events::ApiActor {
+                    user_id: Uuid::new_v4(),
+                }),
+            )
+            .await
+            .expect("soft delete");
+        sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+            .bind(art)
+            .fetch_one(pool)
+            .await
+            .expect("deleted_at")
+    }
+
+    /// An `ArtifactDeleted` is a byte-release work item in its own right:
+    /// the artifact enters the pending set with no expiry decision on its
+    /// stream at all, flagged so the `KeepLastN` tag exemption cannot
+    /// claim it. An already-purged delete leaves the set, and a
+    /// GC-protected status keeps evidence out of the destructive path
+    /// even when a caller deleted it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn pending_set_admits_a_caller_deleted_artifact_and_flags_it() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = Arc::new(adapter(&pool).await);
+
+        // Delete only — no ArtifactExpired anywhere on the stream.
+        let deleted = seed_artifact(&pool, repo, "deleted", HASH_A, Some("released")).await;
+        soft_delete(&pool, &adapter, deleted).await;
+
+        // Expiry only — the pre-existing work item, for contrast.
+        let expired = seed_artifact(&pool, repo, "expired", HASH_B, Some("released")).await;
+        append_expired_with_reason(&pool, expired, 0, age_exceeded_reason()).await;
+
+        // Deleted and already collected: the terminal event ends the item.
+        let done = seed_artifact(&pool, repo, "done", HASH_C, Some("released")).await;
+        soft_delete(&pool, &adapter, done).await;
+        append_event(&pool, done, "ArtifactPurged", 50).await;
+
+        // Evidence a caller deleted: the row retires, the bytes stay.
+        let rejected = seed_artifact(&pool, repo, "rejected", HASH_B, Some("rejected")).await;
+        soft_delete(&pool, &adapter, rejected).await;
+
+        let pending = adapter.list_pending_purge().await.unwrap();
+        let ids: Vec<Uuid> = pending.iter().map(|p| p.artifact_id).collect();
+        assert!(
+            ids.contains(&deleted),
+            "a caller-deleted artifact is pending byte release"
+        );
+        assert!(ids.contains(&expired), "an expiry is still pending");
+        assert!(
+            !ids.contains(&done),
+            "ArtifactPurged terminates a delete work item too"
+        );
+        assert!(
+            !ids.contains(&rejected),
+            "inv1: deleting evidence must not offer it to the destructive path"
+        );
+
+        let row = pending_for(&pool, deleted).await;
+        assert!(row.user_deleted);
+        assert!(
+            row.expired_only_by_keep_last_n,
+            "vacuously true with no expiry decision — which is exactly why \
+             the tag exemption needs user_deleted as a second fact"
+        );
+        assert!(!pending_for(&pool, expired).await.user_deleted);
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// End-to-end through the real delete verb and the real sweep: the
+    /// source edge is released, the refcount falls to zero, and the blob
+    /// is gone. The delete's own timestamp survives the purge — it is
+    /// when the artifact left service.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_soft_delete_releases_the_edge_and_collects_the_blob() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let put = storage
+            .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+            .await
+            .unwrap();
+        assert_eq!(put.hash.as_ref(), HASH_B);
+
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "byte-release", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, art, "primary_content", HASH_B).await;
+
+        let adapter = Arc::new(adapter(&pool).await);
+        let deleted_at = soft_delete(&pool, &adapter, art).await;
+        assert_eq!(
+            cr_rows_for(&pool, art).await.len(),
+            1,
+            "the delete itself leaves the edge to the sweep, which is the \
+             only step that records the target in a durable worklist"
+        );
+
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert_eq!(summary.user_deletes_visited, 1);
+        assert_eq!(summary.blobs_deleted, 1);
+        assert_eq!(summary.skipped_tag_exempt, 0);
+        assert_eq!(summary.errors, 0);
+        assert!(
+            cr_rows_for(&pool, art).await.is_empty(),
+            "the source edge is released, so the refcount falls"
+        );
+        assert!(
+            !storage.exists(&put.hash).await.unwrap(),
+            "the last reference is gone, so the bytes are collected"
+        );
+        let purged: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(StreamId::artifact(art).to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(purged, 1, "the terminal event closes the work item");
+        let after: DateTime<Utc> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(art)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, deleted_at,
+            "the delete's timestamp is the audit fact"
+        );
+        assert!(
+            !adapter
+                .list_pending_purge()
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.artifact_id == art),
+            "the work item does not come back"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// CAS bytes are shared: deleting one artifact over a content another
+    /// artifact still holds removes only that artifact's reference. ADR
+    /// 0054 — rows are not bytes.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_soft_delete_over_shared_bytes_leaves_the_blob_standing() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let put = storage
+            .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+            .await
+            .unwrap();
+
+        let repo = seed_repo(&pool).await;
+        let doomed = seed_artifact(&pool, repo, "doomed", HASH_B, Some("released")).await;
+        let keeper = seed_artifact(&pool, repo, "keeper", HASH_B, Some("released")).await;
+        for art in [doomed, keeper] {
+            sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+                .bind(art)
+                .execute(&pool)
+                .await
+                .unwrap();
+            insert_cr(&pool, repo, art, "primary_content", HASH_B).await;
+        }
+
+        let adapter = Arc::new(adapter(&pool).await);
+        soft_delete(&pool, &adapter, doomed).await;
+
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert_eq!(summary.blobs_kept, 1);
+        assert_eq!(summary.blobs_deleted, 0);
+        assert!(
+            storage.exists(&put.hash).await.unwrap(),
+            "another artifact still references these bytes"
+        );
+        assert!(cr_rows_for(&pool, doomed).await.is_empty());
+        assert_eq!(
+            cr_rows_for(&pool, keeper).await,
+            vec![("primary_content".into(), HASH_B.into())],
+            "the surviving artifact keeps its own edge"
+        );
+        let keeper_deleted_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                .bind(keeper)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(keeper_deleted_at.is_none(), "the sibling stays live");
+        let mut reader = storage.get(&put.hash).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"hello world");
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The shape the OCI manifest DELETE produces: the handler drops the
+    /// manifest's keepalive edges before the soft delete, so the sweep's
+    /// `DELETE … RETURNING` finds nothing and recovers the manifest's own
+    /// targets from `artifacts.checksum_sha256` +
+    /// `artifact_metadata.metadata_blob`. Its bytes must still be
+    /// collected — that is the path every user delete reaches today.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_delete_whose_edges_were_already_swept_still_releases_its_bytes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let manifest = storage
+            .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+            .await
+            .unwrap();
+        let meta = storage
+            .put(Box::new(std::io::Cursor::new(b"foo".to_vec())))
+            .await
+            .unwrap();
+        assert_eq!(meta.hash.as_ref(), HASH_C);
+
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "manifest", HASH_B, Some("released")).await;
+        seed_metadata_blob(&pool, art, HASH_C).await;
+        // The handler's pre-delete sweep: every kind, including the
+        // primary-content edge.
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let adapter = Arc::new(adapter(&pool).await);
+        soft_delete(&pool, &adapter, art).await;
+
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert_eq!(summary.user_deletes_visited, 1);
+        assert_eq!(summary.blobs_deleted, 2, "manifest bytes and metadata blob");
+        assert!(!storage.exists(&manifest.hash).await.unwrap());
+        assert!(!storage.exists(&meta.hash).await.unwrap());
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// A mutable ref left pointing at a deleted artifact's hash does not
+    /// hold its bytes. The `KeepLastN` tag exemption is scoped to that
+    /// predicate; a delete is the caller's explicit instruction, and the
+    /// row the ref names is one no read path resolves.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_tag_left_on_a_deleted_artifact_does_not_exempt_it() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let put = storage
+            .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+            .await
+            .unwrap();
+
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "tagged", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, art, "primary_content", HASH_B).await;
+        seed_mutable_ref(&pool, repo, "tagged", "latest", "hash", Some(HASH_B), None).await;
+
+        let adapter = Arc::new(adapter(&pool).await);
+        soft_delete(&pool, &adapter, art).await;
+        let row = pending_for(&pool, art).await;
+        assert!(row.tag_targeted, "the ref still resolves to the hash");
+        assert!(row.user_deleted);
+
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert_eq!(summary.skipped_tag_exempt, 0);
+        assert_eq!(summary.blobs_deleted, 1);
+        assert!(!storage.exists(&put.hash).await.unwrap());
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Recovery after a delete-driven collection. The trap this walks:
+    /// if any dedup or blob-existence lookup could still see the retired
+    /// row, a re-push would skip the CAS write and leave a row whose
+    /// bytes are gone — a permanent 404 that looks healthy in the
+    /// database. Both lookups the ingest path uses to short-circuit a
+    /// write (`find_by_path` for the path dedup, `find_by_checksum` for
+    /// the by-hash guard) filter `deleted_at IS NULL`, and the purge
+    /// always leaves `deleted_at` set, so the write always happens.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn delete_then_purge_then_repush_serves_the_bytes_again() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let bytes = b"hello world".to_vec();
+        let first = storage
+            .put(Box::new(std::io::Cursor::new(bytes.clone())))
+            .await
+            .unwrap();
+
+        let repo = seed_repo(&pool).await;
+        let old = seed_artifact(&pool, repo, "repush", HASH_B, Some("released")).await;
+        let path: String = sqlx::query_scalar("SELECT path FROM artifacts WHERE id = $1")
+            .bind(old)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, old, "primary_content", HASH_B).await;
+
+        let adapter = Arc::new(adapter(&pool).await);
+        soft_delete(&pool, &adapter, old).await;
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+        assert_eq!(
+            uc.process_expired(Utc::now())
+                .await
+                .expect("sweep runs")
+                .blobs_deleted,
+            1
+        );
+        assert!(!storage.exists(&first.hash).await.unwrap());
+
+        // Neither ingest short-circuit can see the retired row, so the
+        // re-push cannot skip the blob write.
+        let artifact_repo = crate::artifact_repo::PgArtifactRepository::new(
+            pool.clone(),
+            adapter.event_store.clone(),
+        );
+        assert!(artifact_repo
+            .find_by_path(repo, &path)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(artifact_repo
+            .find_by_checksum(&first.hash)
+            .await
+            .unwrap()
+            .is_none());
+
+        let second = storage
+            .put(Box::new(std::io::Cursor::new(bytes.clone())))
+            .await
+            .unwrap();
+        assert_eq!(second.hash, first.hash, "content addressing is stable");
+        let fresh = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO artifacts (
+                id, repository_id, name, name_as_published, version, path,
+                size_bytes, checksum_sha256, content_type, storage_key,
+                quarantine_status
+            ) VALUES (
+                $1, $2, 'repush', 'repush', '1.0.0', $3,
+                $4, $5, 'application/octet-stream', $3, 'released'
+            )
+            "#,
+        )
+        .bind(fresh)
+        .bind(repo)
+        .bind(&path)
+        .bind(i64::try_from(bytes.len()).unwrap())
+        .bind(second.hash.as_ref())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let live = artifact_repo
+            .find_by_path(repo, &path)
+            .await
+            .unwrap()
+            .expect("the re-pushed path is live again");
+        assert_eq!(live.id, fresh);
+        assert_ne!(fresh, old);
+        let mut reader = storage.get(&second.hash).await.unwrap();
+        let mut fetched = Vec::new();
+        reader.read_to_end(&mut fetched).await.unwrap();
+        assert_eq!(fetched, bytes, "the artifact serves its bytes again");
 
         cleanup(&pool, repo).await;
     }
