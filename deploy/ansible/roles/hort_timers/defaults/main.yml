@@ -44,6 +44,12 @@ hort_timers_tasks:
     on_calendar: "*-*-* 02:00:00"    # daily 02:00 (Helm: 0 2 * * *)
     enabled: true
     description: "Delete terminal prefetch job rows older than the retention horizon; also covers the eager OCI index-child ingest rows, which accrue on any OCI proxy repository with no opt-in at all."
+  - kind: jobs-row-retention-sweep
+    path: dsn-direct
+    exec_subcommand: enqueue-jobs-row-retention-sweep
+    on_calendar: "*-*-* 03:30:00"    # daily 03:30 (Helm: 30 3 * * *)
+    enabled: true
+    description: "Delete terminal job rows older than the retention horizon for every kind the two kind-specific sweeps do not reach; retains per kind the newest completed row and the newest terminal row, which the liveness gauges and the prefetch rotation cursor read."
   # ── enabled — admin-task (hort-cli; needs the cronjob-tasks token) ───────────
   - kind: scanner-registry-prune
     path: admin-task

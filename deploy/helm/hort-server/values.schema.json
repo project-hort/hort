@@ -995,6 +995,16 @@
             "schedule": {"type": "string", "minLength": 1}
           }
         },
+        "jobsRowRetentionSweep": {
+          "description": "executionPath: dsn-direct. General terminal-`jobs`-row retention-sweep CronJob — the horizon for every `jobs.kind` the two kind-specific sweeps do not reach. Inserts a `kind='jobs-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `JobsRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) rows where `kind NOT LIKE 'prefetch%' AND kind NOT IN ('scan', 'oci-index-child-ingest')` and `updated_at` is older than a configurable horizon (default 7 days), retaining per kind the newest `completed` row and the newest terminal row so the boot-time liveness gauges (`hort_staging_sweep_overdue`, `hort_event_chain_verify_overdue`) and the prefetch rotation cursor keep the rows they read. Default-enabled: the scheduled kinds (`staging-sweep` every five minutes, the daily cron tier) leave terminal rows from day one on any deployment. DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
         "wheelMetadataBackfill": {
           "description": "executionPath: dsn-direct. Periodic wheel-metadata-backfill CronJob. Inserts a `kind='wheel-metadata-backfill'` row every tick using the runtime DSN; the worker dispatches to `WheelMetadataBackfillHandler`, which walks PyPI wheel artifacts whose `content_references` row of kind `wheel_metadata` is absent, streams each wheel from CAS, invokes `FormatHandler::extract_wheel_metadata_bytes`, and on `Some(bytes)` persists the bytes to CAS + inserts the ContentReference row — retroactively enabling PEP 658 advertisement for pre-existing wheels. Default-disabled (one-shot retrofit for operators upgrading from an earlier release; a freshly-deployed operator's wheel inventory is empty and the tick is a no-op). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
           "type": "object",

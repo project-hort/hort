@@ -918,6 +918,98 @@ pub trait JobsRepository: Send + Sync {
             ))
         })
     }
+
+    /// Retention sweep for **every kind the two kind-specific sweeps
+    /// above do not reach** — delete terminal
+    /// (`status IN ('completed', 'failed')`) rows whose
+    /// `updated_at < now() - $horizon`, **except** the rows the
+    /// jobs-row-as-state readers depend on. Returns the number of rows
+    /// deleted.
+    ///
+    /// ```sql
+    /// WITH live AS (
+    ///     SELECT kind,
+    ///            max(completed_at) FILTER (WHERE status = 'completed')
+    ///              AS newest_completed_at,
+    ///            max(created_at) AS newest_created_at
+    ///       FROM public.jobs
+    ///      WHERE status IN ('completed', 'failed')
+    ///        AND kind NOT LIKE 'prefetch%'
+    ///        AND kind NOT IN ('scan', 'oci-index-child-ingest')
+    ///      GROUP BY kind
+    /// )
+    /// DELETE FROM public.jobs j
+    ///  USING live l
+    ///  WHERE l.kind = j.kind
+    ///    AND j.status IN ('completed', 'failed')
+    ///    AND j.updated_at < now() - $1::interval
+    ///    AND NOT (j.status = 'completed'
+    ///             AND j.completed_at IS NOT DISTINCT FROM l.newest_completed_at)
+    ///    AND j.created_at <> l.newest_created_at
+    /// ```
+    ///
+    /// **Why the kind exclusions.** `kind = 'scan'` and
+    /// `kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest'` already
+    /// have sweeps of their own, each with its own operator-tunable
+    /// horizon. A second sweep covering the same rows on a different
+    /// horizon would silently win whenever its horizon were the shorter
+    /// of the two, so an operator who widened the scan sweep to 30 days
+    /// would still see scan rows disappear at this sweep's 7. The
+    /// exclusions keep exactly one horizon in force per kind. They are
+    /// expressed as the complement of the two sibling predicates —
+    /// textually, not as a list of kinds — so a new `prefetch%` kind
+    /// inherits the cascade sweep without a matching edit here.
+    ///
+    /// **Why two rows per kind can survive the horizon.** "Keep the
+    /// newest terminal row" is not sufficient: the two liveness gauges
+    /// read [`Self::last_completed_at_by_kind`] and the prefetch rotation
+    /// reads [`Self::last_result_summary_by_kind`], and **both filter
+    /// `status = 'completed'`**. A kind whose newest terminal row is a
+    /// `failed` one (a sweep that ran, then started failing) would keep
+    /// that `failed` row and lose the older `completed` row underneath
+    /// it — so `last_completed_at_by_kind` would answer `None`, i.e.
+    /// "never ran", for a task that demonstrably ran. The two retained
+    /// rows are therefore:
+    ///
+    /// - the newest `completed` row per kind, matching
+    ///   `max(completed_at)` / `ORDER BY completed_at DESC LIMIT 1`
+    ///   exactly, so the row kept is the row those readers read;
+    /// - the newest terminal row per kind by `created_at`, matching the
+    ///   `ORDER BY created_at DESC LIMIT 1` shape a
+    ///   latest-job-decides-the-predicate reader uses (the artifact
+    ///   rescan-stranding probe is the live example of that shape).
+    ///
+    /// Equality rather than a ranking window is deliberate: on a
+    /// `completed_at` tie the readers pick arbitrarily between the tied
+    /// rows, so the sweep keeps all of them rather than guessing which
+    /// one the reader would land on. `IS NOT DISTINCT FROM` on
+    /// `completed_at` makes a `completed` row with a NULL `completed_at`
+    /// (only reachable by a writer that bypasses this port) retained
+    /// rather than deleted, which is also what `ORDER BY completed_at
+    /// DESC` would read first.
+    ///
+    /// `pending`/`running` rows are excluded for the same reason as in
+    /// the two sibling sweeps — they are claim-pending or in flight.
+    /// Note that this leaves a row abandoned in `running` by a crashed
+    /// worker untouched: an expired lease does not distinguish a dead
+    /// worker from a task that is simply slower than its lease, and no
+    /// lease-renewal exists to make that distinction. Reaping those is a
+    /// requeue problem, not a retention problem.
+    ///
+    /// **Default implementation:** returns
+    /// `Err(DomainError::Invariant("delete_terminal_other_kind_rows_older_than not implemented"))`
+    /// so existing test fixtures compile without modification.
+    fn delete_terminal_other_kind_rows_older_than<'a>(
+        &'a self,
+        horizon: Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        let _ = horizon;
+        Box::pin(async {
+            Err(DomainError::Invariant(
+                "delete_terminal_other_kind_rows_older_than not implemented".into(),
+            ))
+        })
+    }
 }
 
 /// One row to insert via
@@ -1589,6 +1681,24 @@ mod tests {
         assert!(
             matches!(err, DomainError::Invariant(_)),
             "expected Invariant for delete_terminal_scan_rows_older_than default impl, got {err:?}"
+        );
+    }
+
+    /// `delete_terminal_other_kind_rows_older_than` default impl
+    /// surfaces `Invariant` for the same reason as its two siblings — a
+    /// mock that returned `Ok(0)` would let a sweep handler report a
+    /// successful sweep against a repository that cannot sweep.
+    #[tokio::test]
+    async fn delete_terminal_other_kind_rows_older_than_default_impl_returns_invariant_error() {
+        let repo: Box<dyn JobsRepository> = Box::new(Bare);
+        let err = repo
+            .delete_terminal_other_kind_rows_older_than(Duration::from_secs(86_400 * 7))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DomainError::Invariant(_)),
+            "expected Invariant for delete_terminal_other_kind_rows_older_than default impl, \
+             got {err:?}"
         );
     }
 

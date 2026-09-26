@@ -74,6 +74,14 @@ pub mod prefetch_row_retention_sweep;
 // every successful and every permanently-failed scan otherwise leaves
 // a terminal row forever.
 pub mod scan_row_retention_sweep;
+// General `jobs`-row retention sweep (`jobs-row-retention-sweep`).
+// Periodically deletes terminal rows of every kind the two
+// kind-specific sweeps above do not reach, older than a configurable
+// horizon (default 7d), while retaining the per-kind rows the
+// jobs-row-as-state readers depend on (the newest `completed` row and
+// the newest terminal row). Without it 19 of the 25 allow-listed kinds
+// accumulated terminal rows forever.
+pub mod jobs_row_retention_sweep;
 // Scanner-worker registry housekeeping (kind
 // `scanner-registry-prune`). Deletes `scanner_registry` rows whose
 // `last_heartbeat` is older than the retention horizon so pod churn does
@@ -109,6 +117,7 @@ pub use eventstore_archive::EventStoreArchiveHandler;
 pub use eventstore_checkpoint::{
     CheckpointEmissionHook, CheckpointEmitterHookAdapter, EventstoreCheckpointHandler,
 };
+pub use jobs_row_retention_sweep::JobsRowRetentionSweepHandler;
 pub use noop::NoopTaskHandler;
 pub use oci_index_child_ingest::{OciIndexChildIngestHandler, OCI_INDEX_CHILD_INGEST_KIND};
 pub use oci_membership_edge_backfill::OciMembershipEdgeBackfillHandler;

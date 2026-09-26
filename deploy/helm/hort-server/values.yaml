@@ -1690,6 +1690,44 @@ scheduledTasks:
     # `autovacuum_vacuum_scale_factor` on `public.jobs`.
     schedule: "0 3 * * *"
 
+  # -- General jobs-row retention sweep --------------------
+  # Periodic jobs-row-retention-sweep CronJob — the horizon for every
+  # `jobs.kind` the two sweeps above do NOT reach. Inserts ONE
+  # `kind='jobs-row-retention-sweep'` row into `public.jobs` every tick
+  # using the RUNTIME DSN; the worker picks it up and runs
+  # `JobsRowRetentionSweepHandler`, which deletes terminal
+  # (`status IN ('completed', 'failed')`) rows where
+  # `kind NOT LIKE 'prefetch%' AND kind NOT IN ('scan',
+  # 'oci-index-child-ingest')` and `updated_at` is older than the horizon
+  # (default 7 days). Pairs with the per-table autovacuum tuning on
+  # `public.jobs` (migration 009: `autovacuum_vacuum_scale_factor = 0.02`).
+  #
+  # Retains, per kind, the newest `completed` row AND the newest terminal
+  # row: the boot-time liveness gauges (`hort_staging_sweep_overdue`,
+  # `hort_event_chain_verify_overdue`) read the newest `completed` row of
+  # their kind, so a horizon that collected it would report "never ran"
+  # for a task that demonstrably ran.
+  #
+  # The two kind-specific sweeps' kinds are excluded so exactly one
+  # horizon is in force per kind — otherwise widening
+  # `scanRowRetentionSweep`'s horizon would not stop this sweep deleting
+  # the same rows on its own, shorter one.
+  #
+  # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
+  # umbrella.
+  jobsRowRetentionSweep:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default true.** The scheduled kinds this sweep
+    # covers leave terminal rows on every deployment from day one —
+    # `staging-sweep` alone adds ~288 rows/day at its five-minute cadence
+    # — so there is no opt-in gate that would leave the table empty.
+    enabled: true
+    # Cron schedule. Default: daily at 03:30 UTC (offset from the
+    # scan-row sweep's 03:00 and the prefetch-row sweep's 02:00 so the
+    # three DSN-only CronJobs do not contend for the same minute). The
+    # 7-day horizon gives 6 days of headroom even after a missed run.
+    schedule: "30 3 * * *"
+
   # -- Wheel-metadata backfill -----------------------------
   # Periodic wheel-metadata-backfill CronJob. Inserts ONE
   # `kind='wheel-metadata-backfill'` row into `public.jobs` every tick
