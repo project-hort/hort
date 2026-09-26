@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+use hort_domain::retention::PolicyPredicate;
+
 use crate::claim_mapping::{parse_claim_mapping, ClaimMappingSpec};
 use crate::curation_rule::{parse_curation_rule, validate_curation_rule, CurationRuleSpec};
 use crate::diff::CurrentSnapshot;
@@ -1050,6 +1052,110 @@ pub fn validate_prefetch_triggers_require_version_discovery(
     errors
 }
 
+/// Apply-time linter rejecting a `RetentionPolicy` whose predicate uses
+/// [`PolicyPredicate::UnusedFor`](hort_domain::retention::PolicyPredicate::UnusedFor).
+///
+/// `UnusedFor` is not inert — it is *mislabelled*. No port supplies a
+/// last-download anchor, so `RetentionUseCase` builds every
+/// `EvaluationInputs` with `last_downloaded_at: None`, and the pure
+/// evaluator's `None` arm measures the interval from `created_at`.
+/// `UnusedFor(N)` therefore decides exactly what `AgeExceeds(N)` decides:
+/// an artifact pulled every hour expires the moment it is old enough.
+/// An operator writing `UnusedFor` is making a decision about *usage* and
+/// silently gets a decision about *age* — which on a hosted repository
+/// inverts the intent, since a year-old daily-pulled artifact is the last
+/// thing "unused" should reach and the first thing "old" does. Accepting
+/// a risk-significant field whose runtime meaning is not the one it
+/// names is a hard architectural block (ADR 0015, which treats the
+/// weaker accepted-but-inert case the same way).
+///
+/// **Retirement trigger.** This rejection is wrong the moment
+/// `UnusedFor` starts meaning what it says. That happens when
+/// `RetentionUseCase`'s `EvaluationInputs` construction stops passing the
+/// hard-coded `last_downloaded_at: None` and feeds a real last-download
+/// anchor from a port. Delete this function, its `LinterRule` row, its
+/// metric constant and its metrics-catalog entry **in that same commit** —
+/// a guard kept past the condition that justified it is worse than no
+/// guard, because the next reader has to re-derive whether it still
+/// applies.
+///
+/// **Fail-closed.** No escape hatch: the operator either says
+/// `AgeExceeds` (which is what the deployment would actually do) or drops
+/// the predicate until the usage signal exists.
+///
+/// The walk is recursive over the whole `Composite` tree — a nested
+/// `UnusedFor` evaluates exactly like a root one, so inspecting only the
+/// root would leave the hole open one `Composite` deep. One error per
+/// offending envelope, not per occurrence: the defect is the envelope's,
+/// and a composite naming `UnusedFor` three times is one thing to fix.
+///
+/// A predicate that does not deserialize is skipped: that error belongs
+/// to `validate_retention_policy`, and naming `UnusedFor` in a second
+/// error on an envelope whose predicate could not be read at all would be
+/// a guess. A predicate that *does* resolve but fails
+/// `PolicyPredicate::validate` — `UnusedFor(0)` — has two independent
+/// defects; apply aborts on the structural one first and this rule
+/// surfaces once that is fixed.
+///
+/// Pure function of `DesiredState`; runs alongside
+/// [`validate_prefetch_max_age_days_not_implemented`].
+pub fn validate_retention_unused_for_not_implemented(state: &DesiredState) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for env in &state.retention_policies {
+        let Ok(predicate) = crate::retention_policy::predicate_from_value(&env.spec.predicate)
+        else {
+            continue;
+        };
+        if !predicate_mentions_unused_for(&predicate) {
+            continue;
+        }
+        // `mentions` is true and the root is not itself `UnusedFor` ⇒ the
+        // occurrence is inside a `Composite`. Say so: an operator staring
+        // at a multi-level tree needs to know the reject is not about the
+        // outermost node.
+        let site = if matches!(predicate, PolicyPredicate::UnusedFor(_)) {
+            "`spec.predicate` is `UnusedFor`"
+        } else {
+            "`spec.predicate` nests `UnusedFor` inside a `Composite`"
+        };
+        errors.push(ValidationError::Invalid {
+            kind: Kind::RetentionPolicy,
+            name: env.metadata.name.clone(),
+            detail: format!(
+                "{site}, but no last-download signal is implemented: the evaluator is \
+                 handed no last-used timestamp and falls back to the artifact's creation \
+                 time, so `UnusedFor(N)` expires exactly what `AgeExceeds(N)` expires — \
+                 including an artifact downloaded today. Write `AgeExceeds` if age is what \
+                 was meant, or drop the predicate until the usage signal exists. \
+                 (retention policy: `{name}`)",
+                name = env.metadata.name,
+            ),
+        });
+    }
+    errors
+}
+
+/// `true` iff `pred` or any descendant of a `Composite` is
+/// `UnusedFor`. Mirrors the arm grouping of
+/// [`PolicyPredicate::is_security_driven`](hort_domain::retention::PolicyPredicate::is_security_driven),
+/// the in-tree recursive walk over this same tree, so the two read
+/// identically; the exhaustive match (no wildcard) makes a new predicate
+/// variant a compile error here rather than a silent `false`.
+fn predicate_mentions_unused_for(pred: &PolicyPredicate) -> bool {
+    match pred {
+        PolicyPredicate::UnusedFor(_) => true,
+        PolicyPredicate::Composite(_, children) => {
+            children.iter().any(predicate_mentions_unused_for)
+        }
+        PolicyPredicate::AgeExceeds(_)
+        | PolicyPredicate::KeepLastN(_)
+        | PolicyPredicate::HasFindingAboveSeverity(_)
+        | PolicyPredicate::HasFindingAboveCvss(_)
+        | PolicyPredicate::HasFixAvailable
+        | PolicyPredicate::HasFindingDetectedFor(_) => false,
+    }
+}
+
 /// Every `UpstreamMapping.spec.repository` must resolve to a declared
 /// `ArtifactRepository.metadata.name`. The apply pipeline needs the
 /// repository_id for the row insert; a dangling reference at
@@ -1947,6 +2053,166 @@ spec:
             "an unparsable scope must not also produce a dangling reference: {:?}",
             err.0
         );
+    }
+
+    // -- RetentionPolicy `UnusedFor` rejection ------------------------------
+
+    /// A `RetentionPolicy` envelope carrying an arbitrary predicate. The
+    /// scope is `AllRepos` so nothing but the predicate rule can fire.
+    fn rp_pred_yaml(name: &str, predicate_yaml: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: RetentionPolicy
+metadata:
+  name: {name}
+spec:
+  predicate: {predicate_yaml}
+  scope: AllRepos
+"
+        )
+        .into_bytes()
+    }
+
+    fn state_with_predicates(entries: &[(&str, &str)]) -> DesiredState {
+        let files: Vec<(PathBuf, Vec<u8>)> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (name, pred))| (p(&format!("rp{i}.yaml")), rp_pred_yaml(name, pred)))
+            .collect();
+        DesiredState::parse_files(files).unwrap()
+    }
+
+    #[test]
+    fn unused_for_at_the_root_is_rejected() {
+        let state = state_with_predicates(&[("reclaim-cold", "{ UnusedFor: 7776000 }")]);
+        let errors = validate_retention_unused_for_not_implemented(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        let rendered = errors[0].to_string();
+        assert!(
+            rendered.contains("reclaim-cold"),
+            "must name the envelope: {rendered}"
+        );
+        assert!(
+            rendered.contains("`spec.predicate` is `UnusedFor`"),
+            "must locate the predicate at the root: {rendered}"
+        );
+        assert!(
+            rendered.contains("AgeExceeds"),
+            "must name the alternative: {rendered}"
+        );
+        assert!(
+            rendered.contains("creation time"),
+            "must state the fallback that makes the label wrong: {rendered}"
+        );
+    }
+
+    /// The hole a root-only rule would leave: a `Composite` child
+    /// evaluates exactly like a root predicate.
+    #[test]
+    fn unused_for_nested_in_a_composite_is_rejected() {
+        let state = state_with_predicates(&[(
+            "reclaim-nested",
+            "{ Composite: [Or, [{ AgeExceeds: 2592000 }, { UnusedFor: 7776000 }]] }",
+        )]);
+        let errors = validate_retention_unused_for_not_implemented(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+        let rendered = errors[0].to_string();
+        assert!(
+            rendered.contains("nests `UnusedFor` inside a `Composite`"),
+            "a nested hit must say so, not read as a root predicate: {rendered}"
+        );
+    }
+
+    /// Two levels down — the walk recurses, it does not peek one deep.
+    #[test]
+    fn unused_for_nested_two_levels_deep_is_rejected() {
+        let state = state_with_predicates(&[(
+            "reclaim-deep",
+            "{ Composite: [And, [{ Composite: [Or, [{ UnusedFor: 60 }, HasFixAvailable]] }]] }",
+        )]);
+        let errors = validate_retention_unused_for_not_implemented(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+    }
+
+    /// One error per envelope, not per occurrence — the defect is the
+    /// envelope's and the operator fixes it once.
+    #[test]
+    fn several_unused_for_occurrences_in_one_envelope_report_once() {
+        let state = state_with_predicates(&[(
+            "reclaim-twice",
+            "{ Composite: [Or, [{ UnusedFor: 60 }, { UnusedFor: 120 }]] }",
+        )]);
+        let errors = validate_retention_unused_for_not_implemented(&state);
+        assert_eq!(errors.len(), 1, "got: {errors:?}");
+    }
+
+    #[test]
+    fn each_offending_envelope_gets_its_own_error() {
+        let state = state_with_predicates(&[
+            ("reclaim-a", "{ UnusedFor: 60 }"),
+            ("keep-b", "{ AgeExceeds: 60 }"),
+            ("reclaim-c", "{ UnusedFor: 120 }"),
+        ]);
+        let errors = validate_retention_unused_for_not_implemented(&state);
+        assert_eq!(errors.len(), 2, "got: {errors:?}");
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(rendered.iter().any(|e| e.contains("reclaim-a")));
+        assert!(rendered.iter().any(|e| e.contains("reclaim-c")));
+        assert!(
+            !rendered.iter().any(|e| e.contains("keep-b")),
+            "AgeExceeds is untouched: {rendered:?}"
+        );
+    }
+
+    /// `AgeExceeds` is the semantics `UnusedFor` accidentally delivers
+    /// today, so it is the one predicate the rule must never touch.
+    #[test]
+    fn age_exceeds_is_never_rejected() {
+        let state = state_with_predicates(&[("retain-90d", "{ AgeExceeds: 7776000 }")]);
+        assert!(validate_retention_unused_for_not_implemented(&state).is_empty());
+    }
+
+    /// Every other predicate shape, root and nested, stays accepted.
+    #[test]
+    fn every_other_predicate_is_untouched() {
+        let state = state_with_predicates(&[
+            ("p-age", "{ AgeExceeds: 60 }"),
+            ("p-keep", "{ KeepLastN: 5 }"),
+            ("p-sev", "{ HasFindingAboveSeverity: High }"),
+            ("p-cvss", "{ HasFindingAboveCvss: 7.5 }"),
+            ("p-fix", "HasFixAvailable"),
+            ("p-detected", "{ HasFindingDetectedFor: 604800 }"),
+            (
+                "p-composite",
+                "{ Composite: [And, [{ AgeExceeds: 60 }, HasFixAvailable, \
+                 { Composite: [Or, [{ KeepLastN: 3 }, { HasFindingDetectedFor: 60 }]] }]] }",
+            ),
+        ]);
+        let errors = validate_retention_unused_for_not_implemented(&state);
+        assert!(errors.is_empty(), "got: {errors:?}");
+    }
+
+    /// A predicate that does not deserialize is the per-spec validator's
+    /// error to report; this rule must not pile a second, misleading
+    /// error onto the same envelope.
+    #[test]
+    fn an_unparsable_predicate_is_not_double_reported() {
+        let state = state_with_predicates(&[("retain-bogus", "{ NotAPredicate: 1 }")]);
+        assert!(validate_retention_unused_for_not_implemented(&state).is_empty());
+        // …and the per-spec validator is the one that does report it.
+        let err = state.validate().unwrap_err();
+        assert!(
+            err.0.iter().any(|e| e
+                .to_string()
+                .contains("spec.predicate is not a valid retention predicate")),
+            "got: {:?}",
+            err.0
+        );
+    }
+
+    #[test]
+    fn a_state_with_no_retention_policies_reports_nothing() {
+        assert!(validate_retention_unused_for_not_implemented(&DesiredState::default()).is_empty());
     }
 
     // -- ScanPolicy scope-uniqueness rules ----------------------------------

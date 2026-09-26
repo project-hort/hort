@@ -149,6 +149,6 @@ relative to the storage backend root.
   and this tree's own walk publishes exactly one version of each hosted
   fixture package. `UnusedFor` has no last-use input wired at the
   evaluator yet (`last_downloaded_at` is passed as `None`), so it would
-  read as "old" rather than "unused" — declare it only once that input
-  exists.
+  read as "old" rather than "unused" — and the gitops apply linter now
+  rejects the predicate outright, so declaring it would fail the apply.
 - **Curation rules** (`kind: CurationRule`) — out of scope.

@@ -93,6 +93,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`UnusedFor` is refused at gitops apply while no usage signal exists**
+  (#299). A `RetentionPolicy` whose predicate uses `UnusedFor` — at the root
+  of `spec.predicate` or nested anywhere inside a `Composite` — is now
+  rejected by the apply-config linter and by the offline `hort-server
+  validate-config` gate, with an error naming the policy, the reason, and
+  `AgeExceeds` as the alternative.
+
+  The predicate was not inert, which would have been the milder ADR 0015
+  fault; it was mislabelled. No port supplies a last-download anchor, so the
+  retention evaluator is handed `last_downloaded_at: None` on every artifact
+  and its `None` arm measures the interval from the creation time —
+  `UnusedFor(N)` decided exactly what `AgeExceeds(N)` decides. An operator
+  writing `UnusedFor(90d)` was making a decision about usage and silently
+  getting one about age, which on a hosted repository inverts the intent: a
+  year-old artifact pulled daily is the last thing "unused" should reach and
+  the first thing "old" does.
+
+  New `hort_apply_config_linter_total` rule key
+  `retention_unused_for_not_implemented`, one increment per offending
+  envelope. The `UnusedFor` variant, `ExpirationReason::UnusedTtl` and the
+  evaluator arm are unchanged — the rejection is the operator surface only,
+  and it is retired in the same change that gives the evaluator a real
+  last-download anchor.
+
 - **The retention dry-run's byte accounting probes storage concurrently**
   (#293). The `freed_bytes` simulation issued one `StoragePort::size_of` per
   reclaimable target, one at a time. On a filesystem CAS that is a `stat`
