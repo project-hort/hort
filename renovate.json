@@ -12,7 +12,7 @@
   "github-actions": { "enabled": false },
   "packageRules": [
     {
-      "description": "RustCrypto digest 0.10->0.11 migration is mid-flight; hold sha2/hmac/md-5/sha1 until a coordinated bump. Mirrors the ignore in .github/dependabot.yml.",
+      "description": "Keep sha2/hmac/md-5/sha1 on one RustCrypto generation: hort's own code unifies all four through a single digest major at two compile-enforced sites, so one of them moving alone cannot build. crates/hort-http-maven/src/sidecar.rs boxes sha1::Sha1, md5::Md5 and sha2::Sha256/Sha512 behind one Box<dyn DynDigest>, and that trait is sha2's re-export of digest, so sha1 and md-5 must implement the very same one; crates/hort-notifier-webhook/src/lib.rs builds Hmac::<Sha256> for the webhook body signature, which pins hmac to sha2's digest major too. Measured, not assumed: Cargo.lock has sha2 0.11.0, md-5 0.11.0, sha1 0.11.0 and hmac 0.13.0 all on digest 0.11.3. This is structural, not the old mid-flight-migration hold - that migration landed and the coupling outlived it. The graph's second line, digest 0.10.7, is transitive-only (crc-fast under object_store, sqlx-core, and the sigstore/openidconnect stack are all still on the 0.10 generation) plus the sigstore adapter's own sha2 0.10 requirement, documented on the dependency block of crates/hort-adapters-provenance-sigstore/Cargo.toml; every other workspace manifest asks for the 0.11 set, so that line is not what this rule holds. Unpark when a move of all four to the next digest generation is deliberately scheduled as one coordinated change.",
       "matchPackageNames": ["sha2", "hmac", "md-5", "sha1"],
       "matchUpdateTypes": ["minor", "major"],
       "enabled": false
