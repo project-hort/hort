@@ -13,7 +13,7 @@
 //! retention split — it appends an
 //! [`ArtifactExpired`](crate::events::ArtifactExpired) to the artifact
 //! stream and deletes nothing. `PurgeUseCase` is stage two: for every
-//! `ArtifactExpired` with no following
+//! **byte-release work item** with no following
 //! [`ArtifactPurged`](crate::events::ArtifactPurged) it runs the
 //! decrement-and-GC algorithm (decrement `content_references`, delete the
 //! CAS blob iff the cross-`kind` refcount hit `0`, append every
@@ -22,6 +22,24 @@
 //! the existing [`StoragePort`](super::storage::StoragePort) and the event
 //! store; the SQL (lock + `DELETE … RETURNING` + cross-`kind` count) lives
 //! in the Postgres adapter.
+//!
+//! # Two work items, one collector
+//!
+//! A byte-release work item is an `ArtifactExpired` (a retention policy
+//! decided) **or** an [`ArtifactDeleted`](crate::events::ArtifactDeleted)
+//! (a caller deleted the artifact through the registry API). Both retire
+//! an artifact from service and both must release its
+//! `content_references` source edges so refcount-gated GC can reach the
+//! bytes; `ArtifactPurged` terminates either one.
+//!
+//! The delete path needs no separate collector and no synthetic
+//! retention vocabulary. `ArtifactDeleted` already commits in the same
+//! transaction as `artifacts.deleted_at` (`PgArtifactRepository::delete`),
+//! so the work item is durable exactly when the retirement is — the
+//! property the terminal-transition atomicity depends on — and reusing
+//! this one destructive path is what keeps the crash-safety invariants
+//! (durable worklist, per-hash checkpoint, atomic terminal batch) stated
+//! once rather than re-earned by a second sweep.
 //!
 //! # Why a separate port (not methods on
 //! [`ContentReferenceIndex`](super::content_reference_index::ContentReferenceIndex))
@@ -57,13 +75,15 @@ use crate::types::ContentHash;
 
 use super::BoxFuture;
 
-/// One artifact with a pending `ArtifactExpired` (no following
-/// `ArtifactPurged`) the GC walk must process. Carries the quarantine
-/// status so the use case can re-assert the release-gate invariant
-/// (defence-in-depth) before any destructive step.
+/// One artifact with a pending byte-release work item — an
+/// `ArtifactExpired` or an
+/// [`ArtifactDeleted`](crate::events::ArtifactDeleted) with no following
+/// `ArtifactPurged` — that the GC walk must process. Carries the
+/// quarantine status so the use case can re-assert the release-gate
+/// invariant (defence-in-depth) before any destructive step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPurge {
-    /// The artifact whose `ArtifactExpired` is pending purge. Also the
+    /// The artifact whose work item is pending purge. Also the
     /// `entity_id` of its artifact stream.
     pub artifact_id: Uuid,
     /// Status as projected at scan time — used only to re-assert the
@@ -94,7 +114,23 @@ pub struct PendingPurge {
     /// countermand it. So an artifact that some *other* policy also
     /// expired is purged even while tagged — the `KeepLastN` decision
     /// is simply not the one keeping it in the work set.
+    ///
+    /// Vacuously `true` for an artifact whose only work item is a
+    /// delete: there is no expiry decision to disqualify it. Read
+    /// [`Self::user_deleted`] alongside it — the fields state two
+    /// separate facts and the exemption decision composes them in the
+    /// use case, which is where the skip stays observable.
     pub expired_only_by_keep_last_n: bool,
+    /// `true` iff an [`ArtifactDeleted`](crate::events::ArtifactDeleted)
+    /// is on this artifact's stream — a caller deleted it through the
+    /// registry API, which is itself a byte-release work item.
+    ///
+    /// Reported because a deletion is not an expiry and must not
+    /// inherit the `KeepLastN` tag exemption: a delete is the caller's
+    /// explicit instruction to remove the artifact, exactly like an
+    /// age- or security-driven policy, and a mutable ref left pointing
+    /// at a row no read path can resolve does not countermand it.
+    pub user_deleted: bool,
 }
 
 /// One refcount decision the adapter's transactional decrement step
@@ -121,17 +157,20 @@ pub struct PurgedRef {
 /// completion checkpoints, and atomic event/projection transition;
 /// unit tests use an in-memory mock.
 pub trait PurgeGcPort: Send + Sync {
-    /// Every artifact with an `ArtifactExpired` event and **no**
-    /// following `ArtifactPurged` — the pending-purge work set.
+    /// Every artifact carrying a byte-release work item — an
+    /// `ArtifactExpired` **or** an
+    /// [`ArtifactDeleted`](crate::events::ArtifactDeleted) — with **no**
+    /// following `ArtifactPurged`: the pending-purge work set.
     /// MUST exclude `quarantine_status ∈ {quarantined, rejected,
     /// scan_indeterminate}`; the use case re-asserts this regardless
     /// (defence-in-depth).
     ///
     /// Tag-targeted artifacts are **not** excluded here — the
-    /// adapter reports the two facts ([`PendingPurge::tag_targeted`]
-    /// and [`PendingPurge::expired_only_by_keep_last_n`]) and the use
-    /// case owns the decision, so the skip is observable in the sweep
-    /// summary instead of vanishing into a `WHERE` clause.
+    /// adapter reports the facts ([`PendingPurge::tag_targeted`],
+    /// [`PendingPurge::expired_only_by_keep_last_n`] and
+    /// [`PendingPurge::user_deleted`]) and the use case owns the
+    /// decision, so the skip is observable in the sweep summary instead
+    /// of vanishing into a `WHERE` clause.
     fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>>;
 
     /// Prepare the durable worklist in **one committed, idempotent
@@ -325,12 +364,14 @@ mod tests {
             quarantine_status: QuarantineStatus::Released,
             tag_targeted: true,
             expired_only_by_keep_last_n: true,
+            user_deleted: true,
         };
         assert_eq!(pp.clone(), pp);
         assert_eq!(pp.artifact_id, a);
         assert_eq!(pp.quarantine_status, QuarantineStatus::Released);
         assert!(pp.tag_targeted);
         assert!(pp.expired_only_by_keep_last_n);
+        assert!(pp.user_deleted);
 
         let pr = PurgedRef {
             content_hash: hash(HASH_A),

@@ -990,7 +990,9 @@ async fn insert_subject_content_reference(
 /// group membership is an orthogonal, GC-invisible axis (the
 /// purge/refcount sweep never reads `artifact_group_members`). Manifest
 /// DELETE's `delete_by_source` removes every kind for the source, so these
-/// edges are cleaned up exactly like `oci_index_member`.
+/// edges are cleaned up exactly like `oci_index_member`; the manifest's
+/// own primary-content edge is then re-derived by the storage-GC sweep
+/// from `artifacts.checksum_sha256` when it collects the manifest bytes.
 async fn insert_blob_content_references(
     ctx: &AppContext,
     m: &ManifestPostIngest<'_>,
@@ -1418,10 +1420,12 @@ async fn delete_by_digest(
     // Artifact lifecycle delete. `ArtifactUseCase::delete` is an
     // event-sourced soft delete: the row survives with `deleted_at` set
     // and an `ArtifactDeleted` event lands on the artifact's stream,
-    // attributed to this caller. The CAS blob is NOT removed (GC
-    // concern; multiple artifacts may share CAS bytes) — the
-    // `content_references` cleanup above is what lets refcount GC
-    // reclaim it later if nothing else references it.
+    // attributed to this caller. The CAS blob is NOT removed here (GC
+    // concern; multiple artifacts may share CAS bytes). The cleanup
+    // above drops this manifest's keepalive edges so its config/layer
+    // blobs stop being held by it; the manifest's OWN bytes are released
+    // by the storage-GC sweep, for which the `ArtifactDeleted` appended
+    // here is the work item.
     if let Err(e) = ctx
         .artifact_use_case
         .delete(artifact.id, Actor::Api(actor))

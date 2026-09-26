@@ -41,6 +41,10 @@ Both events land on the **artifact** stream — wire-form id
 terminates that work item once storage has been reconciled. Source:
 `crates/hort-domain/src/events/artifact_events.rs`.
 
+`ArtifactPurged` also terminates an `ArtifactDeleted` (see
+[Deletion](#deletion) below): one storage-GC sweep releases the bytes of
+every retired artifact, whether a policy or a caller retired it.
+
 ### `ArtifactExpired`
 
 Emitted when a retention policy predicate matches an artifact and marks
@@ -60,7 +64,8 @@ is the pending-purge work item the GC walk consumes.
 ### `ArtifactPurged`
 
 Emitted when the storage delete completes, or the blob is confirmed
-already absent, terminating an `ArtifactExpired` work item. Re-emitting
+already absent, terminating a byte-release work item — an
+`ArtifactExpired` or an `ArtifactDeleted`. Re-emitting
 on an already-absent blob is **correct, not an error** (idempotent — §6
 invariant 4): re-applying to an already-purged artifact is a no-op that
 does not corrupt projected state.
@@ -74,7 +79,8 @@ does not corrupt projected state.
 
 **Consumer contract.** A consumer reconstructing retention state keys on
 `(artifact_id)` within the `artifact-{uuid}` stream: an `ArtifactExpired`
-is "pending purge" until a subsequent `ArtifactPurged` on the same
+— or an `ArtifactDeleted` — is "pending purge" until a subsequent
+`ArtifactPurged` on the same
 stream terminates it. Because `ArtifactPurged` is idempotent, a consumer
 that sees it more than once (replay, or a retried already-absent purge)
 must treat the second and later occurrences as no-ops. `refs_remaining`
@@ -95,13 +101,25 @@ envelope's `actor` / `stored_at`, not the payload. Source:
 `crates/hort-domain/src/events/artifact_events.rs`.
 
 Deletion is a **soft delete**: the `artifacts` projection row is retained
-with `deleted_at` set, and the CAS blob is untouched — blob lifetime stays
-refcount-gated GC, because another artifact may reference the same bytes.
+with `deleted_at` set, and the CAS blob is untouched *at this transition*
+— blob lifetime stays refcount-gated GC, because another artifact may
+reference the same bytes.
 A deleted artifact is excluded from every live read, and its path is
 released: the `(repository_id, path)` unique index is predicated on
 `deleted_at IS NULL`, so a later ingest at the same path mints a **new**
 artifact with a new id and its own stream rather than resurrecting this
 one.
+
+`ArtifactDeleted` is **also the byte-release work item** that makes that
+refcount-gated GC fire. The storage-GC sweep enumerates every artifact
+stream carrying an `ArtifactExpired` *or* an `ArtifactDeleted` with no
+following `ArtifactPurged`; the sweep — not the delete — removes the
+artifact's `content_references` source edges and deletes the blob once
+its cross-kind refcount reaches zero. The event is emitted in the same
+transaction as `deleted_at`, so the work item is exactly as durable as
+the retirement it authorises. A caller-deleted artifact whose bytes were
+also GC-eligible therefore acquires an `ArtifactPurged` on a later sweep;
+byte release is asynchronous by design, bounded by the sweep interval.
 
 Deletion is orthogonal to the quarantine axis. The event does not change
 `quarantine_status`, and there is no `Deleted` status value: a `Released`
@@ -122,6 +140,8 @@ are a separate axis — they decide the blob's fate, not the catalog's, and
 may still appear on the stream afterwards). A consumer projecting a live
 catalog removes the artifact on this event and must not reinstate it — a later
 artifact at the same `path` arrives under a *different* `artifact_id` and
-a different stream. It is not a purge signal: `content_hash` may still be
-referenced by other artifacts, and the blob's fate is decided separately
-by `ArtifactExpired` / `ArtifactPurged` above.
+a different stream. It is not itself a purge *confirmation*:
+`content_hash` may still be referenced by other artifacts, and whether
+the blob was actually removed is reported only by the `ArtifactPurged`
+that later terminates this work item (`refs_remaining = 0` ⇒ the bytes
+are gone).

@@ -367,6 +367,7 @@ async fn refuses_to_run_when_reconcile_not_converged() {
             quarantine_status: QuarantineStatus::None,
             tag_targeted: false,
             expired_only_by_keep_last_n: false,
+            user_deleted: false,
         }]),
         MockStorage::new(),
         MockReconcileGate::not_converged(),
@@ -404,6 +405,7 @@ async fn zero_refcount_deletes_blob_then_retires_with_terminal_event() {
                 quarantine_status: QuarantineStatus::None,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]),
         MockStorage::new().with_present(content_hash.clone()),
@@ -436,6 +438,7 @@ async fn shared_blob_is_kept_but_artifact_is_retired() {
                 quarantine_status: QuarantineStatus::Released,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 3)]),
         MockStorage::new(),
@@ -463,6 +466,7 @@ async fn all_hashes_land_in_one_terminal_batch() {
                 quarantine_status: QuarantineStatus::None,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(
                 artifact_id,
@@ -497,6 +501,7 @@ async fn second_hash_failure_withholds_entire_terminal_transition_then_retries()
                 quarantine_status: QuarantineStatus::None,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(
                 artifact_id,
@@ -544,6 +549,7 @@ async fn completed_primary_does_not_hide_outstanding_oci_child() {
                 quarantine_status: QuarantineStatus::None,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(artifact_id, vec![primary, work(child.clone(), 0)]),
         MockStorage::new().with_present(child.clone()),
@@ -566,6 +572,7 @@ async fn absent_storage_is_an_idempotent_success() {
                 quarantine_status: QuarantineStatus::None,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 0)]),
         MockStorage::new(),
@@ -592,6 +599,7 @@ async fn protected_artifacts_are_never_prepared() {
                 quarantine_status: status,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }]),
             MockStorage::new(),
             MockReconcileGate::converged(),
@@ -627,12 +635,14 @@ async fn prepare_failure_is_per_artifact_and_sweep_continues() {
                     quarantine_status: QuarantineStatus::None,
                     tag_targeted: false,
                     expired_only_by_keep_last_n: false,
+                    user_deleted: false,
                 },
                 PendingPurge {
                     artifact_id: good,
                     quarantine_status: QuarantineStatus::None,
                     tag_targeted: false,
                     expired_only_by_keep_last_n: false,
+                    user_deleted: false,
                 },
             ])
             .with_refs(good, vec![work(content_hash.clone(), 0)])
@@ -658,6 +668,7 @@ async fn empty_worklist_is_a_noop() {
                 quarantine_status: QuarantineStatus::None,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(artifact_id, Vec::new()),
         MockStorage::new(),
@@ -681,6 +692,7 @@ async fn checkpoint_failure_withholds_terminal_transition_and_retries() {
                 quarantine_status: QuarantineStatus::None,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
             .fail_mark_once_for(content_hash),
@@ -710,6 +722,7 @@ async fn terminal_transition_failure_retries_without_repeating_storage() {
                 quarantine_status: QuarantineStatus::None,
                 tag_targeted: false,
                 expired_only_by_keep_last_n: false,
+                user_deleted: false,
             }])
             .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
             .fail_complete_once(),
@@ -781,18 +794,21 @@ mod metrics_emission_tests {
                                     quarantine_status: QuarantineStatus::None,
                                     tag_targeted: false,
                                     expired_only_by_keep_last_n: false,
+                                    user_deleted: false,
                                 },
                                 PendingPurge {
                                     artifact_id: kept,
                                     quarantine_status: QuarantineStatus::None,
                                     tag_targeted: false,
                                     expired_only_by_keep_last_n: false,
+                                    user_deleted: false,
                                 },
                                 PendingPurge {
                                     artifact_id: failed,
                                     quarantine_status: QuarantineStatus::None,
                                     tag_targeted: false,
                                     expired_only_by_keep_last_n: false,
+                                    user_deleted: false,
                                 },
                             ])
                             .with_refs(success, vec![work(success_hash.clone(), 0)])
@@ -825,6 +841,20 @@ fn pending(artifact_id: Uuid, tag_targeted: bool, keep_last_n_only: bool) -> Pen
         quarantine_status: QuarantineStatus::Released,
         tag_targeted,
         expired_only_by_keep_last_n: keep_last_n_only,
+        user_deleted: false,
+    }
+}
+
+/// A caller-deleted artifact: `ArtifactDeleted` is its only work item,
+/// so there is no expiry decision and `expired_only_by_keep_last_n` is
+/// vacuously `true` — the shape the tag exemption has to survive.
+fn pending_user_deleted(artifact_id: Uuid, tag_targeted: bool) -> PendingPurge {
+    PendingPurge {
+        artifact_id,
+        quarantine_status: QuarantineStatus::Released,
+        tag_targeted,
+        expired_only_by_keep_last_n: true,
+        user_deleted: true,
     }
 }
 
@@ -897,4 +927,177 @@ async fn a_tagged_artifact_expired_by_another_predicate_is_still_purged() {
     assert_eq!(summary.skipped_tag_exempt, 0);
     assert_eq!(summary.blobs_deleted, 1);
     assert!(h.gc.is_retired(artifact_id));
+}
+
+// ===========================================================================
+// The caller-facing delete as a byte-release work item
+// ===========================================================================
+
+/// A delete carries no expiry decision, so nothing in the sweep may
+/// require one: the edges are released and the blob is collected exactly
+/// as for an expiry.
+#[tokio::test]
+async fn a_user_deleted_artifact_releases_its_refs_and_its_blob() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![pending_user_deleted(artifact_id, false)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(9000)).await.unwrap();
+
+    assert_eq!(summary.artifacts_visited, 1);
+    assert_eq!(summary.user_deletes_visited, 1);
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(summary.purged_events, 1);
+    assert_eq!(summary.skipped_tag_exempt, 0);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(h.gc.purge_call_count(), 1);
+    assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
+    assert!(h.gc.is_retired(artifact_id));
+    let purged = purged_events(&h.gc);
+    assert_eq!(purged.len(), 1);
+    assert_eq!(purged[0].refs_remaining, 0);
+    assert_eq!(purged[0].purged_at, ts(9000));
+}
+
+/// Bytes another artifact still references survive the delete: the
+/// reference is removed, the blob is kept, and `refs_remaining` records
+/// why.
+#[tokio::test]
+async fn a_user_delete_over_shared_bytes_keeps_the_blob() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![pending_user_deleted(artifact_id, false)])
+            .with_refs(artifact_id, vec![work(content_hash, 1)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(9000)).await.unwrap();
+
+    assert_eq!(summary.user_deletes_visited, 1);
+    assert_eq!(summary.blobs_kept, 1);
+    assert_eq!(summary.blobs_deleted, 0);
+    assert!(h.storage.delete_attempts().is_empty());
+    assert_eq!(purged_events(&h.gc)[0].refs_remaining, 1);
+}
+
+/// The `KeepLastN` tag exemption must not swallow a delete. The flag it
+/// reads is vacuously `true` for an artifact with no expiry decision, so
+/// a tagged delete would otherwise be skipped forever by a rule for a
+/// policy that never ran.
+#[tokio::test]
+async fn a_tagged_user_delete_is_not_tag_exempt() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![pending_user_deleted(artifact_id, true)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(9000)).await.unwrap();
+
+    assert_eq!(summary.skipped_tag_exempt, 0);
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
+    assert!(h.gc.is_retired(artifact_id));
+}
+
+/// A `KeepLastN` expiry a delete then joined is purged: the delete is the
+/// instruction that stands, exactly as an age-driven expiry would be.
+#[tokio::test]
+async fn a_tagged_keep_last_n_expiry_that_was_also_deleted_is_purged() {
+    let artifact_id = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![PendingPurge {
+                artifact_id,
+                quarantine_status: QuarantineStatus::Released,
+                tag_targeted: true,
+                expired_only_by_keep_last_n: true,
+                user_deleted: true,
+            }])
+            .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 0)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(9000)).await.unwrap();
+
+    assert_eq!(summary.skipped_tag_exempt, 0);
+    assert_eq!(summary.blobs_deleted, 1);
+    assert!(h.gc.is_retired(artifact_id));
+}
+
+/// Invariant 1 does not bend for a delete. An artifact is deletable
+/// whatever its quarantine status, so evidence really can arrive here
+/// carrying a delete work item — and it must still keep its bytes.
+#[tokio::test]
+async fn a_user_deleted_evidence_artifact_is_still_not_collected() {
+    for status in [
+        QuarantineStatus::Quarantined,
+        QuarantineStatus::Rejected,
+        QuarantineStatus::ScanIndeterminate,
+    ] {
+        let artifact_id = Uuid::new_v4();
+        let h = build(
+            MockPurgeGc::new()
+                .with_pending(vec![PendingPurge {
+                    artifact_id,
+                    quarantine_status: status,
+                    tag_targeted: false,
+                    expired_only_by_keep_last_n: true,
+                    user_deleted: true,
+                }])
+                .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 0)]),
+            MockStorage::new(),
+            MockReconcileGate::converged(),
+        );
+
+        let summary = h.uc.process_expired(ts(9000)).await.unwrap();
+
+        assert_eq!(summary.skipped_protected, 1, "{status} must be skipped");
+        assert_eq!(summary.user_deletes_visited, 1);
+        assert_eq!(summary.blobs_deleted, 0);
+        assert_eq!(h.gc.purge_call_count(), 0);
+        assert!(h.storage.delete_attempts().is_empty());
+        assert!(!h.gc.is_retired(artifact_id));
+    }
+}
+
+/// The two work-item classes are counted separately so an operator can
+/// attribute a sweep's destructive work — a deployment with no retention
+/// policy at all still collects here.
+#[tokio::test]
+async fn the_summary_separates_delete_driven_from_expiry_driven_work() {
+    let deleted = Uuid::new_v4();
+    let expired = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![
+                pending_user_deleted(deleted, false),
+                pending(expired, false, false),
+            ])
+            .with_refs(deleted, vec![work(hash(HASH_PRIMARY), 0)])
+            .with_refs(expired, vec![work(hash(HASH_META), 0)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(9000)).await.unwrap();
+
+    assert_eq!(summary.artifacts_visited, 2);
+    assert_eq!(summary.user_deletes_visited, 1);
+    assert_eq!(summary.blobs_deleted, 2);
+    assert_eq!(summary.purged_events, 2);
 }

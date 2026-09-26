@@ -121,7 +121,7 @@ hort_timers_tasks:
     idempotency_window: hour
     on_calendar: "*-*-* 04:00:00"
     enabled: false
-    description: "Retention purge — needs HORT_RETENTION_DATABASE_URL wired."
+    description: "Retention purge — needs HORT_RETENTION_DATABASE_URL wired. Also the only path that reclaims a deleted artifact's bytes."
   - kind: eventstore-archive
     path: admin-task
     idempotency_window: day

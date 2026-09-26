@@ -6,13 +6,38 @@
 //! `RetentionUseCase::evaluate_policies` is stage one — it
 //! appends an [`ArtifactExpired`](hort_domain::events::ArtifactExpired)
 //! to the artifact stream and deletes nothing. **This** use case is
-//! stage two: for every `ArtifactExpired` with no following
-//! [`ArtifactPurged`](hort_domain::events::ArtifactPurged) it runs the GC
-//! algorithm (decrement `content_references`, delete the CAS blob iff
-//! the cross-`kind` refcount hit `0`, then append all `ArtifactPurged`
-//! events and retire the projection atomically). It is
+//! stage two: for every pending **byte-release work item** with no
+//! following [`ArtifactPurged`](hort_domain::events::ArtifactPurged) it
+//! runs the GC algorithm (decrement `content_references`, delete the CAS
+//! blob iff the cross-`kind` refcount hit `0`, then append all
+//! `ArtifactPurged` events and retire the projection atomically). It is
 //! NOT a scheduler — that is the `RetentionPurgeHandler`
 //! `TaskHandler`; this is the pure orchestration the handler calls.
+//!
+//! # Two work items, one collector
+//!
+//! A byte-release work item is an `ArtifactExpired` **or** an
+//! [`ArtifactDeleted`](hort_domain::events::ArtifactDeleted). A delete
+//! retires an artifact from service exactly as an expiry does, and the
+//! bytes it leaves behind need the same release: its
+//! `content_references` source edges have to go so refcount-gated GC can
+//! reach the blob. Before the delete path was admitted here it could
+//! not: the edge stood forever, the refcount never fell, and no
+//! predicate, policy or configuration reached those bytes.
+//!
+//! `ArtifactDeleted` is the carrier rather than a synthesised
+//! `ArtifactExpired` (which would have to invent a `policy_id` /
+//! `policy_name` and an expiry reason for a decision no policy made) and
+//! rather than a new work-item event (which would duplicate, on the same
+//! stream at the same instant, a fact `ArtifactDeleted` already records).
+//! It is also already durable in the same transaction as
+//! `artifacts.deleted_at` (`PgArtifactRepository::delete`), so the work
+//! item cannot come apart from the retirement it authorises — the
+//! atomicity property the terminal transition below depends on, obtained
+//! without a line of new transaction code.
+//!
+//! A delete does **not** inherit the `KeepLastN` tag exemption: see
+//! [`PurgeUseCase::process_one`]'s tag-exemption block.
 //!
 //! # Reconcile-converged start-gate (binding constraint)
 //!
@@ -47,7 +72,7 @@
 //!
 //! # GC algorithm (faithful, crash-safe)
 //!
-//! For each pending `ArtifactExpired`:
+//! For each pending work item:
 //! 1. Lock the artifact row `FOR UPDATE`.
 //! 2. Delete every `content_references` source edge for the artifact,
 //!    returning each distinct target hash.
@@ -65,8 +90,8 @@
 //!
 //! ## Two-stage idempotency
 //!
-//! The durable `ArtifactExpired` event is the work item; `ArtifactPurged`
-//! terminates it. The adapter's worklist is written atomically with the
+//! The durable `ArtifactExpired` / `ArtifactDeleted` event is the work
+//! item; `ArtifactPurged` terminates it. The adapter's worklist is written atomically with the
 //! reference deletion, so every hash remains discoverable after its
 //! source edge is gone. A transient `StoragePort::delete` failure emits
 //! no terminal event and leaves the artifact live; the next sweep reads
@@ -84,6 +109,13 @@
 //! this use case asserts the invariant a second time and **skips +
 //! `warn!`s** rather than trusting the upstream filter (a destructive
 //! item is conservative by construction).
+//!
+//! This holds for the delete work item too, and there stage one does
+//! NOT pre-filter: an artifact is deletable whatever its quarantine
+//! status (`Artifact::delete` is orthogonal to the quarantine axis), so
+//! a rejected artifact really can acquire an `ArtifactDeleted`. The
+//! adapter's status filter and this re-assertion are what keep its
+//! evidence bytes: the row retires, the blob stays.
 
 use std::sync::Arc;
 
@@ -141,6 +173,12 @@ pub struct PurgeSummary {
     /// resolves to them and every pending expiry decision was
     /// `KeepLastN` — the tag exemption, re-asked at purge time.
     pub skipped_tag_exempt: u64,
+    /// Visited artifacts whose work item was a caller-facing delete
+    /// (`ArtifactDeleted`) rather than a policy expiry. Reported because
+    /// this sweep collects both and a deployment with no retention
+    /// policy configured at all still has blobs to reclaim here —
+    /// without the split, `blobs_deleted` moving would be unattributable.
+    pub user_deletes_visited: u64,
     /// Per-artifact failures (prepare / storage / checkpoint / terminal
     /// transition).
     /// The `ArtifactExpired` decision is retained; next sweep retries.
@@ -222,6 +260,9 @@ impl PurgeUseCase {
         let mut summary = PurgeSummary::default();
         for item in &pending {
             summary.artifacts_visited += 1;
+            if item.user_deleted {
+                summary.user_deletes_visited += 1;
+            }
             self.process_one(now, item, &mut summary).await;
         }
 
@@ -232,6 +273,7 @@ impl PurgeUseCase {
             purged_events = summary.purged_events,
             skipped_protected = summary.skipped_protected,
             skipped_tag_exempt = summary.skipped_tag_exempt,
+            user_deletes_visited = summary.user_deletes_visited,
             errors = summary.errors,
             "storage-GC purge sweep complete"
         );
@@ -280,14 +322,23 @@ impl PurgeUseCase {
         // instruction to remove the content, and a tag does not
         // countermand it. An artifact some other policy also expired is
         // therefore purged even while tagged.
-        if item.tag_targeted && item.expired_only_by_keep_last_n {
+        //
+        // A caller-facing delete is that same class of explicit
+        // instruction, and `expired_only_by_keep_last_n` is vacuously
+        // true for an artifact carrying no expiry decision at all — so
+        // without the `user_deleted` conjunct a tagged artifact's delete
+        // would be exempted by the rule for a policy that never ran, and
+        // its bytes would be held by a mutable ref pointing at a row no
+        // read path resolves.
+        if item.tag_targeted && item.expired_only_by_keep_last_n && !item.user_deleted {
             summary.skipped_tag_exempt += 1;
             tracing::info!(
                 artifact_id = %item.artifact_id,
-                "a mutable ref in this artifact's repository resolves to it \
-                 and every pending expiry was KeepLastN — tag exemption \
-                 re-asserted at purge time, NOT purged. The ArtifactExpired \
-                 is retained; the artifact is purged once the tag moves."
+                "a mutable ref in this artifact's repository resolves to it, \
+                 every pending expiry was KeepLastN and no delete was \
+                 requested — tag exemption re-asserted at purge time, NOT \
+                 purged. The ArtifactExpired is retained; the artifact is \
+                 purged once the tag moves."
             );
             return;
         }
