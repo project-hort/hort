@@ -1,0 +1,164 @@
+{{/*
+General terminal-`jobs`-row retention-sweep CronJob — the horizon for
+every `jobs.kind` the two kind-specific sweeps do NOT reach.
+
+Periodically invokes `hort-server enqueue-jobs-row-retention-sweep`,
+which inserts ONE `kind='jobs-row-retention-sweep'` row into
+`public.jobs` using the runtime DSN. The always-on worker (`hort-worker`)
+picks the row up and dispatches to `JobsRowRetentionSweepHandler`, which
+deletes terminal (`status IN ('completed', 'failed')`) rows where
+`kind NOT LIKE 'prefetch%' AND kind NOT IN ('scan',
+'oci-index-child-ingest')` and `updated_at` is older than a configurable
+horizon (default 7 days).
+
+What it retains, and why that is the point: per kind, the newest
+`completed` row AND the newest terminal row. The boot-time liveness
+gauges `hort_staging_sweep_overdue` and `hort_event_chain_verify_overdue`
+read the newest `completed` row of their kind
+(`JobsRepository::last_completed_at_by_kind`), and the prefetch rotation
+reads the newest `completed` row's `result_summary`. Both filter
+`status = 'completed'`, so keeping only the newest *terminal* row would
+let a `failed` newest row shadow the `completed` row underneath it and
+make a task that demonstrably ran report as never having run.
+
+Why the two sibling sweeps' kinds are excluded: each carries its own
+operator-tunable horizon, and a second sweep over the same rows silently
+wins whenever its horizon is the shorter of the two. The exclusions keep
+exactly one horizon in force per kind.
+
+Design rationale (delivery path): a default-enabled CronJob going through
+the `hort-cli` HTTP admin-task path would drag the whole
+`svc-token-bootstrap` Job chain + a standing `admin_task_invoke` token
+mount to default-on. The runtime DSN is least-privilege — it can
+`INSERT INTO public.jobs` and read the schema, full stop.
+
+So this CronJob:
+
+  - Uses `hort-server.runtimeEnv` (DSN + log/metric tunables only —
+    same env block the migrate Job uses, MinimalConfig discipline).
+  - Has NO `valueFrom.secretKeyRef` for any svc-token.
+  - Is gated by `jobsRowRetentionSweep.enabled` (default **true** — the
+    scheduled kinds this sweep covers leave terminal rows on every
+    deployment from day one; `staging-sweep` alone adds ~288 rows/day at
+    its five-minute cadence, so there is no opt-in gate that would
+    otherwise leave the table empty).
+  - Does NOT depend on `scheduledTasks.adminTasksEnabled` — that toggle
+    gates the svc-token chain this template deliberately avoids.
+
+Default schedule: daily at 03:30 UTC (offset from the scan-row sweep's
+03:00 and the prefetch-row sweep's 02:00 so the three DSN-only CronJobs
+do not contend for the same minute). The 7-day retention horizon means
+even a missed daily run leaves the operator with 6 days of headroom; the
+sweep is one DELETE per tick, so cron-tier drift is harmless. Operators
+tightening below daily should also tighten the schema's
+`autovacuum_vacuum_scale_factor` on `public.jobs` (migration 009 sets it
+to 0.02 — the lower the sweep cadence, the more aggressive autovacuum
+must be).
+
+Schedule-overlap protection: `concurrencyPolicy: Forbid` prevents the
+controller from spawning a second pod while the previous tick is still
+running. (The tick is just one INSERT; controller-restart double-fire is
+harmless — the worker drains both rows, and the DELETE is idempotent.)
+
+Hex-onion discipline: `enqueue-jobs-row-retention-sweep` is an inbound
+CLI adapter (parses MinimalConfig, builds the PgPool, calls
+`JobsRepository::enqueue_task`) — no application logic in the binary
+surface.
+*/}}
+{{- if .Values.scheduledTasks.jobsRowRetentionSweep.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "hort-server.fullname" . }}-jobs-row-retention-sweep
+  labels:
+    {{- include "hort-server.labels" . | nindent 4 }}
+    hort-server.io/job: jobs-row-retention-sweep
+spec:
+  schedule: {{ .Values.scheduledTasks.jobsRowRetentionSweep.schedule | quote }}
+  timeZone: {{ .Values.scheduledTasks.timeZone | quote }}
+  # `Forbid` is the cron-conventional choice for "this job is
+  # idempotent but must not overlap itself." The enqueue is one row
+  # insert, so a missed tick is fine — the next tick picks up the
+  # slack within the 7-day retention window.
+  concurrencyPolicy: Forbid
+  # Bound the history Kubernetes retains so a long-running deployment
+  # does not accumulate hundreds of completed Job objects.
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  # Surface a missed-deadline (the previous run still active when
+  # the schedule fires under `Forbid`) as a non-fatal event in the
+  # controller log rather than a CronJob failure. 600s window is
+  # generous for an INSERT-only pod.
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "hort-server.selectorLabels" . | nindent 12 }}
+            hort-server.io/job: jobs-row-retention-sweep
+        spec:
+          serviceAccountName: {{ include "hort-server.serviceAccountName" . }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          restartPolicy: OnFailure
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.affinity }}
+          affinity:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: enqueue-jobs-row-retention-sweep
+              image: {{ include "hort-server.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "enqueue-jobs-row-retention-sweep"
+              env:
+                # DB-only subcommand. The `hort-server.runtimeEnv` helper
+                # populates HORT_DATABASE_URL + log/metric tunables; we
+                # deliberately do NOT mount any svc-token secret here (see
+                # template docstring).
+                {{- include "hort-server.runtimeEnv" . | nindent 16 }}
+                {{- with .Values.extraEnv }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+              securityContext:
+                {{- toYaml .Values.containerSecurityContext | nindent 16 }}
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+                {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+                {{- /* Gate the mount on the auto-mount source
+                       (configMapName/secretName), NOT on `.path` alone:
+                       with `.path` set but no source the volume below
+                       never renders, leaving a dangling volumeMount that
+                       fails pod admission. */}}
+                {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 16 }}
+                {{- end }}
+                {{- with .Values.extraVolumeMounts }}
+                {{- toYaml . | nindent 16 }}
+                {{- end }}
+          volumes:
+            - name: tmp
+              emptyDir: {}
+            {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+            {{- include "hort-server.extraCaBundle.volume" . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraVolumes }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+{{- end }}

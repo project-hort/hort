@@ -81,11 +81,11 @@ use hort_app::task_dispatcher::TaskDispatcher;
 use hort_app::task_handlers::eventstore_checkpoint::BackfillBaselineConfig;
 use hort_app::task_handlers::{
     AdvisoryWatchTickHandler, CronRescanTickHandler, EventStoreArchiveHandler,
-    EventstoreCheckpointHandler, NoopTaskHandler, OciIndexChildIngestHandler,
-    OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler, PrefetchIngestHandler,
-    PrefetchRowRetentionSweepHandler, PrefetchTickHandler, ProvenanceVerifyHandler,
-    QuarantineReleaseSweepHandler, ReplaySeenPruneHandler, RetentionEvaluateHandler,
-    RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
+    EventstoreCheckpointHandler, JobsRowRetentionSweepHandler, NoopTaskHandler,
+    OciIndexChildIngestHandler, OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler,
+    PrefetchIngestHandler, PrefetchRowRetentionSweepHandler, PrefetchTickHandler,
+    ProvenanceVerifyHandler, QuarantineReleaseSweepHandler, ReplaySeenPruneHandler,
+    RetentionEvaluateHandler, RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
     ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
     StagingSweepHandler, WheelMetadataBackfillHandler,
 };
@@ -863,6 +863,15 @@ pub async fn build_app_context(
     // sibling row-retention sweep); single-active per worker replica,
     // same as every other sweep in this file.
     dispatcher.register(Arc::new(ScanRowRetentionSweepHandler::new(jobs.clone())), 1);
+
+    // General terminal-`jobs`-row retention sweep — the horizon for every
+    // kind the two sweeps above do not reach (`kind NOT LIKE 'prefetch%'
+    // AND kind NOT IN ('scan', 'oci-index-child-ingest')`). Retains per
+    // kind the newest `completed` row and the newest terminal row, so the
+    // boot-time liveness gauges and the prefetch rotation cursor keep the
+    // rows they read. Single-active per worker replica, same as every
+    // other sweep in this file.
+    dispatcher.register(Arc::new(JobsRowRetentionSweepHandler::new(jobs.clone())), 1);
 
     // -----------------------------------------------------------------
     // 12.e.tris Register the WheelMetadataBackfillHandler (kind

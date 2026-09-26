@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`public.jobs` gets a general horizon, and the newest state row per kind
+  survives it** (#297). New `jobs-row-retention-sweep` task kind (migration
+  `027`, default-enabled daily CronJob at 03:30 UTC,
+  `scheduledTasks.jobsRowRetentionSweep`) deleting terminal
+  (`status IN ('completed', 'failed')`) `jobs` rows older than a configurable
+  horizon (default 7 days) for every kind the two existing kind-specific
+  sweeps do not reach — `kind NOT LIKE 'prefetch%' AND kind NOT IN ('scan',
+  'oci-index-child-ingest')`. Nineteen of the twenty-five allow-listed kinds
+  had no horizon at all; the highest-churn of them, `staging-sweep`, adds
+  ~288 terminal rows a day at its five-minute cadence, and a production count
+  found ~83,000 unreclaimed terminal rows.
+
+  The sweep retains, per kind, **two** rows: the newest `completed` row and
+  the newest terminal row. Retaining only the newest terminal row is not
+  enough — both `last_completed_at_by_kind` (the boot-time
+  `hort_staging_sweep_overdue` and `hort_event_chain_verify_overdue` gauges)
+  and `last_result_summary_by_kind` (the `prefetch-tick` rotation cursor)
+  filter `status = 'completed'`, so a kind whose newest terminal row is a
+  failure would lose the `completed` row underneath it and report as having
+  never run. The kind exclusions keep exactly one horizon in force per kind:
+  a second sweep over the same rows would silently win whenever its horizon
+  were the shorter of the two. Non-terminal rows — including a row abandoned
+  in `running` by a crashed worker — are never deleted: an expired claim lease
+  does not distinguish a dead worker from a task slower than its lease, so
+  recovering those is a requeue rather than a retention concern.
+
 - **A denial records which leg denied it** (#239). `RbacEvaluator` gains
   `authorize_explained`, returning `AuthzDecision` — `Allowed`,
   `DeniedGrants`, `DeniedCap`, `DeniedBoth` — beside the unchanged `authorize`

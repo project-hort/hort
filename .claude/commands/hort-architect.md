@@ -589,6 +589,14 @@ The canonical triple:
 
 A new opt-in registers itself by adding a row above and a column for the matrix axis it introduces, then documenting the cell value for every existing column. The design-doc review for that initiative is the gate; an opt-in landing without the matrix row is a hard block in review.
 
+### Row-retention sweeps over `public.jobs` (review-only)
+
+These bullets are **review-only** — nothing enforces them structurally. They apply to any sweep that deletes `jobs` rows on a horizon (`delete_terminal_*_rows_older_than` and its relatives).
+
+- [ ] **Retaining "the newest terminal row per kind."** That phrasing is the trap, not the rule: the readers that treat a `jobs` row as state filter `status = 'completed'` (`last_completed_at_by_kind` feeds the boot liveness gauges; `last_result_summary_by_kind` feeds the `prefetch-tick` rotation cursor). A kind that ran successfully and then began failing has a *failed* newest terminal row, so retaining only that row deletes the last `completed` row underneath it and the reader answers `None` — "never ran" for a task that demonstrably ran, in exactly the outage the gauge exists to report. State the rule as **the sweep retains whatever row each `jobs`-as-state reader would read**, and enumerate those readers; today that means two rows per kind, the newest `completed` and the newest terminal.
+- [ ] **A second sweep reaching rows another sweep already owns.** Kind predicates must partition, so exactly one horizon is in force per kind — otherwise widening one sweep's horizon silently fails to protect the rows a shorter-horizon sibling also matches. Express a new sweep's scope as the textual complement of the existing predicates, not as a hand-maintained kind list that a future kind can fall out of.
+- [ ] **Deleting a non-terminal row to "clean up" an abandoned run.** An expired claim lease does not distinguish a dead worker from a task slower than its lease, and nothing renews a lease mid-task. Recovering an abandoned row is a **requeue** (`running` + expired lease → `pending`), which touches `attempts` and the retry budget; it does not belong behind a retention horizon.
+
 ### Patch-candidate surface (review-only)
 
 These bullets are **review-only** — none are enforced by compile-error or by the dep graph, so they are NOT mirrored to `CLAUDE.md` (the mirror convention covers structural-enforcement rules only). They live here so the reviewer catches them on patch-candidate-shaped PRs (`PatchCandidateUseCase`, `GET /admin/quarantine/patch-candidates`, `hort-cli admin quarantine`). Reference: `docs/architecture/how-to/quarantine-patch-release.md`.

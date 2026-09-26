@@ -6275,6 +6275,13 @@ pub struct MockJobsRepository {
     /// When `Some`, the scan-row retention sweep returns this row
     /// count instead of the default 0.
     scan_retention_deleted_count: Mutex<Option<u64>>,
+    /// Recorded calls to
+    /// `delete_terminal_other_kind_rows_older_than`. Each call appends
+    /// the `Duration` argument.
+    other_kind_retention_calls: Mutex<Vec<std::time::Duration>>,
+    /// When `Some`, the other-kind row retention sweep returns this row
+    /// count instead of the default 0.
+    other_kind_retention_deleted_count: Mutex<Option<u64>>,
     /// Seed map for `last_result_summary_by_kind`, keyed by `kind`. A
     /// cross-tick rotation test drives the handler repeatedly and calls
     /// [`Self::set_last_result_summary_by_kind`] between simulated
@@ -6328,6 +6335,8 @@ impl Default for MockJobsRepository {
             prefetch_retention_deleted_count: Mutex::new(None),
             scan_retention_calls: Mutex::new(Vec::new()),
             scan_retention_deleted_count: Mutex::new(None),
+            other_kind_retention_calls: Mutex::new(Vec::new()),
+            other_kind_retention_deleted_count: Mutex::new(None),
             last_result_summary_by_kind: Mutex::new(HashMap::new()),
         }
     }
@@ -6545,6 +6554,18 @@ impl MockJobsRepository {
     /// return the configured row count on the next call. Default is 0.
     pub fn set_scan_retention_deleted_count(&self, count: u64) {
         *self.scan_retention_deleted_count.lock().unwrap() = Some(count);
+    }
+
+    /// Recorded calls to `delete_terminal_other_kind_rows_older_than`.
+    /// Each call appends the horizon argument the sweep ran with.
+    pub fn other_kind_retention_calls(&self) -> Vec<std::time::Duration> {
+        self.other_kind_retention_calls.lock().unwrap().clone()
+    }
+
+    /// Make `delete_terminal_other_kind_rows_older_than`
+    /// return the configured row count on the next call. Default is 0.
+    pub fn set_other_kind_retention_deleted_count(&self, count: u64) {
+        *self.other_kind_retention_deleted_count.lock().unwrap() = Some(count);
     }
 
     /// Seed the value `last_result_summary_by_kind(kind)` returns.
@@ -6901,6 +6922,22 @@ impl JobsRepository for MockJobsRepository {
         self.scan_retention_calls.lock().unwrap().push(horizon);
         let count = self
             .scan_retention_deleted_count
+            .lock()
+            .unwrap()
+            .unwrap_or(0);
+        Box::pin(async move { Ok(count) })
+    }
+
+    fn delete_terminal_other_kind_rows_older_than<'a>(
+        &'a self,
+        horizon: std::time::Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        self.other_kind_retention_calls
+            .lock()
+            .unwrap()
+            .push(horizon);
+        let count = self
+            .other_kind_retention_deleted_count
             .lock()
             .unwrap()
             .unwrap_or(0);

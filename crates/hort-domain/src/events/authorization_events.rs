@@ -456,6 +456,27 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // `last_job.status` resolve to `NULL`, which the widened stranded
     // predicate already treats identically to `'failed'`) candidacy.
     "scan-row-retention-sweep",
+    // General terminal-`jobs`-row retention sweep. Consumed by
+    // `JobsRowRetentionSweepHandler` in the worker. The horizon for every
+    // `jobs.kind` the two sweeps above do not reach: deletes rows whose
+    // `status IN ('completed', 'failed')` and whose `updated_at < now() -
+    // $horizon` (default 7 days) for `kind NOT LIKE 'prefetch%' AND kind
+    // NOT IN ('scan', 'oci-index-child-ingest')`. Those exclusions are the
+    // textual complement of the two sibling predicates, so exactly one
+    // horizon is ever in force per kind — a second sweep over the same
+    // rows would silently win whenever its horizon were the shorter.
+    // Retains, per kind, the newest `completed` row AND the newest
+    // terminal row: both `last_completed_at_by_kind` (the
+    // `hort_staging_sweep_overdue` / `hort_event_chain_verify_overdue`
+    // gauges) and `last_result_summary_by_kind` (the `prefetch-tick`
+    // rotation cursor) filter `status = 'completed'`, so retaining only
+    // the newest terminal row would let a `failed` newest row shadow the
+    // `completed` row underneath it and report "never ran" for a task
+    // that demonstrably ran. Non-destructive at the artifact level —
+    // historical job rows only; no artifact / event / scan data is
+    // touched, and non-terminal rows (including a row abandoned in
+    // `running` by a crashed worker) are never deleted.
+    "jobs-row-retention-sweep",
     // PEP 658 wheel-metadata backfill — consumed by
     // `WheelMetadataBackfillHandler` in the worker. The ingest
     // hook extracts wheel METADATA into CAS + a
@@ -647,6 +668,7 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
     "prefetch-dependencies",
     "prefetch-row-retention-sweep",
     "scan-row-retention-sweep",
+    "jobs-row-retention-sweep",
     "wheel-metadata-backfill",
     "provenance-verify",
     "scanner-registry-prune",
