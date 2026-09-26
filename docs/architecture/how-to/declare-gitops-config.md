@@ -838,6 +838,18 @@ The other scopes carry no repository reference:
 
 **Idempotency:** reapply with no YAML change emits zero events.
 
+**`UnusedFor` is rejected at apply.** The predicate is refused — at the
+root of `spec.predicate` or nested anywhere inside a `Composite` — with
+an error naming the policy, and the apply fails (`hort-server
+validate-config` rejects the same tree offline). Nothing supplies a
+last-download timestamp today, so the evaluator measures the interval
+from the artifact's creation time: `UnusedFor(N)` would expire exactly
+what `AgeExceeds(N)` expires, including an artifact pulled an hour ago.
+On a hosted repository that inverts the intent — a year-old,
+daily-pulled artifact is the last thing "unused" should reach and the
+first thing "old" does. Write `AgeExceeds` if age is what was meant.
+The rejection is lifted when a real usage signal is wired.
+
 **Direct-upload advisory.** A security-driven predicate
 (`HasFixAvailable`, `HasFindingAboveSeverity`, …) under a scope that does
 not exclude `IngestSource(Direct)` logs an apply-time `info!`. It is

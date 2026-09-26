@@ -920,7 +920,8 @@ impl ApplyConfigUseCase {
     /// write** (`apply`'s Stage-1 `save_managed`): snapshot/env validation,
     /// the SA->issuer FK check, the `scanBackends` /
     /// `trust_upstream_publish_time` / `prefetchPolicy.maxAgeDays` /
-    /// provenance linters, and the per-repo storage-backend check. Only the
+    /// provenance / retention-predicate linters, and the per-repo
+    /// storage-backend check. Only the
     /// `build_snapshot` reads touch the database -- zero writes. (The
     /// `scanBackends` check validates against the compiled-in
     /// `crate::scanning::KNOWN_SCAN_BACKENDS` set, so it does no I/O and is
@@ -959,7 +960,7 @@ impl ApplyConfigUseCase {
         }
 
         // The snapshot-free rows (rows 2,3,5,6,6b,
-        // 7,7b) are collected by the pure `StaticConfigValidator`, in
+        // 7,7b,9) are collected by the pure `StaticConfigValidator`, in
         // apply's row order, with NO early return / metric / `tracing`.
         // This caller walks the report below and reproduces the historical
         // first-failing-row abort + per-rule metric emission byte-
@@ -1069,16 +1070,17 @@ impl ApplyConfigUseCase {
             return Err(AppError::Domain(DomainError::Validation(joined)));
         }
 
-        // ----- Post-row-4 snapshot-free rejects (rows 5,6,6b,7,7b,7c),
+        // ----- Post-row-4 snapshot-free rejects (rows 5,6,6b,7,7b,7c,9),
         //       collected by `StaticConfigValidator` above. -----
         //
         // Reproduce the historical first-failing-row abort byte-
-        // identically for rows 5/6/7/7b; rows 6b and 7c are newer but
+        // identically for rows 5/6/7/7b; rows 6b, 7c and 9 are newer but
         // join the same row order and the same rows-5/6 shape. Walk the
         // rule order [trust_pt, prefetch-max-age, prefetch-trigger,
-        // provenance, storage-backend, scan-backend-capability] and, on
-        // the FIRST rule with any error finding,
-        // emit that rule's metric (where it has one — rows 5/6/6b/7c
+        // provenance, storage-backend, scan-backend-capability,
+        // retention-unused-for] and, on the FIRST rule with any error
+        // finding,
+        // emit that rule's metric (where it has one — rows 5/6/6b/7c/9
         // only, via `LinterRule::metric_rule`) once per finding, log the
         // same `error!`, and return that rule's
         // `AppError::Domain(DomainError::Validation(_))`. Later rules are
@@ -1086,8 +1088,9 @@ impl ApplyConfigUseCase {
         //
         // - Rows 5 (trust_upstream_publish_time × scan_backends:[]),
         //   6 (PrefetchPolicy.max_age_days), 6b
-        //   (PrefetchPolicy.triggers requiring VersionDiscovery) and 7c
-        //   (scanBackends × repository-format capability)
+        //   (PrefetchPolicy.triggers requiring VersionDiscovery), 7c
+        //   (scanBackends × repository-format capability) and 9
+        //   (RetentionPolicy predicate using `UnusedFor`)
         //   `"; "`-join every finding of the row AND tick
         //   `hort_apply_config_linter_total{rule, result=reject}` once per
         //   finding (cardinality bounded by mappings / repositories).
@@ -1121,6 +1124,10 @@ impl ApplyConfigUseCase {
                 LinterRule::ScanBackendCapability,
                 "gitops apply: scanBackends linter rejected ScanPolicy envelope(s) (backend cannot analyse a governed repository's format — scanner capability map)",
             ),
+            (
+                LinterRule::RetentionUnusedForNotImplemented,
+                "gitops apply: retention predicate linter rejected RetentionPolicy envelope(s) (UnusedFor has no last-download signal and silently decides on age)",
+            ),
         ] {
             let messages: Vec<&str> = report
                 .errors
@@ -1131,7 +1138,7 @@ impl ApplyConfigUseCase {
             if messages.is_empty() {
                 continue;
             }
-            // Per-rule metric (rows 5/6/6b/7c — `metric_rule` is `None`
+            // Per-rule metric (rows 5/6/6b/7c/9 — `metric_rule` is `None`
             // for rows 7/7b). One increment per offending finding.
             if let Some(metric_rule) = rule.metric_rule() {
                 tracing::error!(error_count = messages.len(), "{error_log}");
@@ -6123,6 +6130,135 @@ mod tests {
     }
 
     // ===================================================================
+    // Gitops apply linter rejecting a `RetentionPolicy` predicate that
+    // uses `UnusedFor` (row 9). No port supplies a last-download anchor,
+    // so the evaluator measures from the creation time and `UnusedFor(N)`
+    // silently decides what `AgeExceeds(N)` decides.
+    // ===================================================================
+
+    /// A `RetentionPolicy` envelope over `AllRepos` carrying `predicate`
+    /// verbatim (the wire form is an opaque `serde_json::Value`).
+    fn retention_policy_env_for_apply(
+        name: &str,
+        predicate: serde_json::Value,
+    ) -> Envelope<hort_config::retention_policy::RetentionPolicySpec> {
+        Envelope {
+            api_version: ApiVersion::V1,
+            kind: Kind::RetentionPolicy,
+            metadata: Metadata { name: name.into() },
+            spec: hort_config::retention_policy::RetentionPolicySpec {
+                predicate,
+                scope: serde_json::json!("AllRepos"),
+            },
+        }
+    }
+
+    /// The pre-write pass rejects `UnusedFor` — nested inside a
+    /// `Composite`, which is the case a root-only rule would let through —
+    /// and ticks `hort_apply_config_linter_total` once for the envelope.
+    #[test]
+    fn apply_rejects_retention_policy_with_nested_unused_for() {
+        use crate::metrics::capture_metrics;
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let desired = DesiredState {
+                    retention_policies: vec![retention_policy_env_for_apply(
+                        "reclaim-cold-nested",
+                        serde_json::json!({
+                            "Composite": [
+                                "Or",
+                                [{ "AgeExceeds": 2_592_000u64 }, { "UnusedFor": 7_776_000u64 }]
+                            ]
+                        }),
+                    )],
+                    ..Default::default()
+                };
+                captured_err = Some(
+                    h.uc.preflight_validate(&desired, &env_oidc())
+                        .await
+                        .expect_err("apply must reject a predicate using UnusedFor"),
+                );
+            });
+        });
+        let err = captured_err.expect("apply must have errored");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("reclaim-cold-nested"),
+                    "validation error must name the offending policy, got: {msg}"
+                );
+                assert!(
+                    msg.contains("UnusedFor"),
+                    "validation error must name the offending predicate, got: {msg}"
+                );
+                assert!(
+                    msg.contains("AgeExceeds"),
+                    "validation error must name the alternative, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+        let entries = snap.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &entries,
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "retention_unused_for_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            1,
+            "linter metric must tick once for the offending RetentionPolicy",
+        );
+    }
+
+    /// `AgeExceeds` — the semantics `UnusedFor` accidentally delivers
+    /// today — passes the pre-write pass untouched and ticks no reject.
+    #[test]
+    fn apply_accepts_retention_policy_with_age_exceeds() {
+        use crate::metrics::capture_metrics;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let desired = DesiredState {
+                    retention_policies: vec![retention_policy_env_for_apply(
+                        "retain-90d",
+                        serde_json::json!({ "AgeExceeds": 7_776_000u64 }),
+                    )],
+                    ..Default::default()
+                };
+                h.uc.preflight_validate(&desired, &env_oidc())
+                    .await
+                    .expect("AgeExceeds must pass the pre-write pass");
+            });
+        });
+        let entries = snap.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &entries,
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "retention_unused_for_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            0,
+            "linter metric must NOT tick reject for AgeExceeds",
+        );
+    }
+
+    // ===================================================================
     // `StaticConfigValidator` extraction.
     // (a) No-drift parity: the apply pre-write pass's static subset
     //     and `StaticConfigValidator::validate` agree on the reject SET
@@ -6244,6 +6380,18 @@ mod tests {
                     ..Default::default()
                 },
                 expect_rule: LinterRule::ScanBackendCapability,
+                effective_backend: None,
+            },
+            // Row 9 — a RetentionPolicy predicate using `UnusedFor`.
+            Case {
+                desired: DesiredState {
+                    retention_policies: vec![retention_policy_env_for_apply(
+                        "reclaim-cold",
+                        serde_json::json!({ "UnusedFor": 7_776_000u64 }),
+                    )],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::RetentionUnusedForNotImplemented,
                 effective_backend: None,
             },
         ];

@@ -4,7 +4,7 @@
 //! Runs the pure
 //! [`StaticConfigValidator`](hort_app::lint::StaticConfigValidator) — the
 //! snapshot-free subset of the apply-time validation/lint pass (rows
-//! 2,3,5,6,6b,7,7b,8) — over a gitops config tree, **DSN-free** and
+//! 2,3,5,6,6b,7,7b,8,9) — over a gitops config tree, **DSN-free** and
 //! **synchronous** (no Tokio runtime; the whole flow is file reads +
 //! parse + validate, none of which is async). It is the offline operator
 //! surface for a CI pre-merge gate: it reproduces the server's *static*
@@ -280,7 +280,7 @@ fn validate_tree(
         }
     };
 
-    // ---- 4. run the snapshot-free validator (rows 2,3,5,6,6b,7,7b,8) ----
+    // ---- 4. run the snapshot-free validator (rows 2,3,5,6,6b,7,7b,8,9) ----
     //
     // Version-static facts baked into the binary: the
     // provenance-capable format set is THE shared
@@ -731,6 +731,54 @@ spec:
         write(dir.path(), "policies/p.yaml", policy);
         let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
         assert_eq!(code_str(code), exit(1));
+    }
+
+    /// Row 9 — a `RetentionPolicy` predicate using `UnusedFor`, nested
+    /// inside a `Composite` → exit 1. This is the case the placement
+    /// decision turns on: the offline gate runs the `StaticConfigValidator`
+    /// rows but NOT `DesiredState::validate()`, so a rejection carried by
+    /// the per-spec validator would not surface here at all.
+    #[test]
+    fn validate_tree_row_9_nested_unused_for_is_exit_1() {
+        let policy = "\
+apiVersion: project-hort.de/v1
+kind: RetentionPolicy
+metadata:
+  name: reclaim-cold
+spec:
+  predicate:
+    Composite:
+      - Or
+      - - AgeExceeds: 2592000
+        - UnusedFor: 7776000
+  scope: AllRepos
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "retention/p.yaml", policy);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), exit(1));
+    }
+
+    /// The same tree with `AgeExceeds` alone is clean — the rejection
+    /// above is `UnusedFor`, not the presence of a retention policy.
+    #[test]
+    fn validate_tree_row_9_age_exceeds_alone_is_success() {
+        let policy = "\
+apiVersion: project-hort.de/v1
+kind: RetentionPolicy
+metadata:
+  name: retain-90d
+spec:
+  predicate:
+    AgeExceeds: 7776000
+  scope: AllRepos
+";
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "repositories/r.yaml", REPO_OCI_HOSTED);
+        write(dir.path(), "retention/p.yaml", policy);
+        let code = validate_tree(dir.path(), EffectiveStorageBackend::Filesystem, None, false);
+        assert_eq!(code_str(code), success());
     }
 
     /// The same tree with `osv` dropped is clean — so the rejection

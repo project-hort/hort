@@ -468,8 +468,14 @@ impl RetentionUseCase {
             now,
             created_at: artifact.created_at,
             // The `UnusedFor` anchor still has no source (no
-            // download-timeseries reader); the pure evaluator fails
-            // that predicate safe (never expire) while it is absent.
+            // download-timeseries reader). The evaluator's `None` arm
+            // does NOT fail safe: it measures the interval from
+            // `created_at`, so `UnusedFor(N)` would decide exactly what
+            // `AgeExceeds(N)` decides — including for an artifact pulled
+            // an hour ago. That is why the gitops apply linter rejects a
+            // retention predicate mentioning `UnusedFor` for as long as
+            // this stays a hard-coded `None`; wiring a real anchor here
+            // is what retires that rejection.
             // The `KeepLastN` inputs below come from the candidate
             // enumeration query, which resolves them in the same
             // statement.
