@@ -9,6 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A job row abandoned in `running` is recovered** (#306). A worker that died
+  holding a claim used to leave its row on `status = 'running'` forever: both
+  claim statements select `status = 'pending'` only, their `locked_until IS
+  NULL OR locked_until < now()` clause re-claims a *pending* row whose
+  not-before has passed and never looks at a `running` one, and nothing
+  anywhere requeued or reaped. For four kinds that was not clutter but a lost
+  capability — `jobs_scan_unique` is `(artifact_id) WHERE kind = 'scan' AND
+  status IN ('pending','running')`, so the artifact became permanently
+  unscannable *and* unrescannable, silently; `provenance-verify`, `prefetch`
+  and `prefetch-dependencies` have the same shape via
+  `find_active_provenance_for_artifact`, `jobs_prefetch_unique` and
+  `jobs_prefetch_dependencies_unique`.
+
+  Two halves. **Lease renewal**: `JobsRepository::renew_lease` plus a renewal
+  task the dispatcher holds across `TaskHandler::run`, ticking three times per
+  lease. `TaskDispatcher::dispatch_one` is the single point every registered
+  kind runs through and `claim_pending_by_kinds` is the only claim statement
+  with a production caller, so one call site covers the whole kind vocabulary
+  and every kind added later. **The sweep**: `requeue_abandoned`, run inline on
+  the dispatcher's poll loop every 60 s on every replica (no leader election —
+  the picking CTE is `FOR UPDATE SKIP LOCKED`), returning `running` rows whose
+  lease lapsed more than one further lease ago to `pending`. Migration `028`
+  adds the partial index `jobs_abandoned_lease_idx ON (locked_until) WHERE
+  status = 'running'` so the sweep does not seq-scan the highest-churn table
+  in the schema.
+
+  Renewal is what makes the discriminator derivable rather than guessed:
+  before it, `locked_until < now()` meant both "the worker died" and "the task
+  is slower than its 15-minute lease", and no per-kind grace multiple is
+  correct for a kind with no upper bound on runtime. A live worker renews
+  three times a lease however long its task runs, so a lapsed lease already
+  means three consecutive renewals failed to land; the extra full lease of
+  grace is the margin for a renewal that is alive but late (a lost database
+  race, a paused container, a rolling upgrade whose older replicas do not
+  renew at all).
+
+  The sweep is also where the retry budget is spent, because it is the only
+  code that runs for a row whose handler never returned — the scan
+  orchestrator's `attempts >= max_attempts` branch and the dispatcher's
+  `TaskOutcome::Failed` arms both require the handler to come back. A row at
+  the attempt cap is failed terminally instead of re-driven; for `kind='scan'`
+  that hands the artifact to the existing stranded-scan recovery, whose
+  predicate is a newest scan job in `failed`. Rows are never deleted: a late
+  completion from the original worker is an unconditional `UPDATE … WHERE id`
+  and must still find a row. `attempts` is left alone by the sweep — the next
+  claim charges it, exactly as for a `reschedule`d row.
+
+  Which kinds are requeued is a decision per kind, not a default:
+  `REQUEUE_ON_LEASE_EXPIRY_KINDS` / `NO_REQUEUE_ON_LEASE_EXPIRY_KINDS` in
+  `hort-domain`, exhaustive over `EVENT_TASK_KINDS` under a guard test, each
+  carrying its reason. The seven excluded kinds are excluded because a
+  concurrent second execution of them is absorbed by nothing —
+  `eventstore-archive` most sharply, whose unbounded `StreamSealed` append is
+  safe only while at most one `seal_and_remove` is in flight cluster-wide and
+  one of the three layers delivering that is a *per-process* semaphore — and
+  the exclusion is free because none of them appears in an in-flight
+  uniqueness predicate, so their next scheduled tick is the recovery. A renewal that
+  reports the row is no longer this worker's is a **fencing token**, not just a
+  log line: the dispatcher discards that handler's outcome rather than writing
+  over the row's current holder, because the damaging write is not the lost
+  result but a `reschedule` returning a row a live worker is mid-way through to
+  `pending`. New metrics `hort_admin_tasks_lease_requeued_total{kind, result}`
+  (worker health) and `hort_admin_tasks_lease_renew_failed_total{kind, result}`
+  (the fence — one `lost` is one execution whose result was discarded).
+
 - **`public.jobs` gets a general horizon, and the newest state row per kind
   survives it** (#297). New `jobs-row-retention-sweep` task kind (migration
   `027`, default-enabled daily CronJob at 03:30 UTC,

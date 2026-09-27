@@ -67,18 +67,23 @@
 //!
 //! # Abandoned non-terminal rows are out of scope
 //!
-//! `pending`/`running` rows are never deleted. A row left `running` by a
-//! crashed worker is therefore not reclaimed here, deliberately: the
-//! only available discriminator is the expired claim lease
-//! (`locked_until < now()`), and since nothing renews a lease mid-task,
-//! an expired lease does not distinguish a dead worker from a task
-//! slower than its 15-minute default lease. Deleting a row that is
+//! `pending`/`running` rows are never deleted, and a row left `running`
+//! by a crashed worker is not reclaimed here. Deleting a row that is
 //! genuinely still running loses its completion when it lands
 //! (`mark_completed` would update zero rows) — for `staging-sweep` that
 //! means destroying the very liveness breadcrumb this handler is
-//! careful to preserve. Recovering an abandoned row is a requeue
-//! (`running` → `pending`), not a delete, and it belongs with the claim
-//! lifecycle rather than with a retention horizon.
+//! careful to preserve.
+//!
+//! Recovering an abandoned row is a requeue (`running` → `pending`), not
+//! a delete, and it belongs with the claim lifecycle rather than with a
+//! retention horizon. It lives there:
+//! `JobsRepository::requeue_abandoned`, run inline on the dispatcher's
+//! poll loop and paired with the lease renewal
+//! (`JobsRepository::renew_lease`) that makes an expired lease mean "the
+//! holder stopped writing to the database" rather than "the task is
+//! slower than its 15-minute default lease". Widening this predicate to
+//! reach non-terminal rows would put a second, delete-shaped mechanism
+//! on top of it.
 //!
 //! Pairs with the per-table autovacuum tuning on `public.jobs`
 //! (migration 009: `autovacuum_vacuum_scale_factor = 0.02`) — the sweep
