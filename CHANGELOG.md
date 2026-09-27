@@ -259,6 +259,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`hort-server validate-config` ran no row-0 rule, and said the opposite**
+  (#304). The offline gate parsed the tree and then went straight to the
+  `StaticConfigValidator` rows: `DesiredState::validate()` — the per-envelope
+  domain rules and the cross-document rules (duplicate `(kind, name)`,
+  dangling references, singleton conflicts, virtual-member resolution) — was
+  never called, and outside `validate_against` it was called nowhere in the
+  binary. A tree with a `PermissionGrant` pointing at an undeclared
+  repository, two envelopes sharing a `(kind, name)`, a `RetentionPolicy`
+  scoped to a repository nothing declares, or a structurally invalid
+  `spec.predicate` such as `{AgeExceeds: 0}` validated clean, exit 0, and then
+  parked the pod not-ready at boot. Three places in the command claimed
+  otherwise — the step-3 comment, the failure branch's "parse / cross-validate
+  error(s)", and an honesty footer naming only rows 1 and 4 as missing — so an
+  operator reading it concluded the coverage was there.
+
+  The command now calls `DesiredState::validate()` between parse and the lint
+  rows. That is the apply path's own row 0 (`validate_against` delegates to it
+  before adding its snapshot/env rules), so this is a shared source rather
+  than a second implementation, and the two verdicts cannot drift. The
+  rejection is headed by a message saying the *gate* got stricter rather than
+  the tree — these errors were already failing that operator's apply,
+  invisibly. Every gitops tree this repository ships already passes row 0 and
+  is now guarded against regressing (`gitops_trees_validate` covers all four,
+  including `deploy/compose/s3/config`, which the three `hort-config` per-tree
+  guards do not reach).
+
+  The footer now names every apply pre-write check the command still skips,
+  and why each is absent — a distinction the old wording flattened. Only two
+  are blocked on the running deployment: the managed-by ownership rule and the
+  `HORT_UPSTREAM_ALLOWLIST_HOSTS` gate (enforced over the create+update slice
+  of the `UpstreamMapping` diff). The `HORT_AUTH_PROVIDER=disabled` ×
+  `ClaimMapping` rule needs only that env var, and the `scanBackends`
+  backend-**name** check (row 4) needs nothing at all; both are merely not
+  wired here yet. Two standing claims were wrong and are corrected in the same
+  change: there is no immutable-field-change check anywhere in the gitops
+  apply path, and row 4 has validated against the compiled-in
+  `KNOWN_SCAN_BACKENDS` rather than the live worker registry since regression
+  H20.
+
 - **A failed OCI manifest `DELETE` stranded a live manifest without its
   keepalive edges** (#301). The digest-`DELETE` handler swept the manifest's
   `content_references` rows *before* the lifecycle delete, non-transactionally

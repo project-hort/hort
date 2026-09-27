@@ -118,12 +118,17 @@ plus `hort-cli auth login --paste`; see `crates/hort-server/README.md`.
 
 ### `validate-config`
 
-Offline gitops-config validation: runs the **static subset** of the
-boot-time apply pass — parse + cross-validate plus the snapshot-free
-linter rules, via the same `StaticConfigValidator`
+Offline gitops-config validation: runs the **snapshot-free subset** of
+the boot-time apply pass over the tree in `HORT_CONFIG_DIR`, with no
+database and no running server — parse, then **row 0**
+(`DesiredState::validate`, the per-envelope domain rules plus the
+cross-document rules: duplicate `(kind, name)`, dangling references,
+singleton conflicts, virtual-member resolution), then the snapshot-free
+linter rows via the same `StaticConfigValidator`
 (`crates/hort-app/src/lint/static_validate.rs`) the apply path delegates
-to — over the tree in `HORT_CONFIG_DIR`, with no database and no running
-server. Implementation:
+to. Row 0 is literally the apply path's own function — `validate_against`
+delegates to it before adding its snapshot/env rules — so the offline
+verdict on those rules cannot drift from apply's. Implementation:
 `crates/hort-server/src/cli/validate_config.rs`. The CI-recipe
 walkthrough (deriving the env from Helm values) is in
 [declare-gitops-config.md §5a](../how-to/declare-gitops-config.md#5a-validate-your-config-before-applying-hort-server-validate-config).
@@ -150,7 +155,7 @@ Exit codes:
 | Code | Meaning |
 |---|---|
 | `0` | Clean — no errors (warnings allowed when `--strict` is off). |
-| `1` | Validation error(s): a parse / cross-validate failure or any reject rule — **or** `--strict` with any warning present. |
+| `1` | Validation error(s): a parse failure, a row-0 failure, or any reject rule — **or** `--strict` with any warning present. |
 | `2` | Missing/invalid required env (`HORT_CONFIG_DIR` / `HORT_STORAGE_BACKEND`). Checked before any file is read. |
 | `3` | Operational — the config directory is unreadable / the directory walk errored. |
 
@@ -158,8 +163,8 @@ Checks run vs. not run:
 
 | | Checks |
 |---|---|
-| **Run (offline)** | YAML parse + per-envelope domain validation + cross-validate + singleton-conflict; desired-internal `ServiceAccount` → `OidcIssuer` reference consistency; the under-constrained `federatedIdentities` advisory (warning); the `trustUpstreamPublishTime` × empty-`scanBackends` cross-opt-in reject; the inert `prefetchPolicy.maxAgeDays` reject; provenance-policy validation against the binary's provenance-capable format set; the per-repo `storage.backend` vs `HORT_STORAGE_BACKEND` mismatch reject; the permission-grant linter (secure-default `LintConfig` base, desired-side overrides applied). |
-| **Not run (need the live deployment)** | Current-state checks (managed-by ownership, immutable-field changes). The `scanBackends` supported-backend check runs only at apply (validating against the binary's compiled-in scanner set, not the live worker registry — regression H20); the offline validator does not currently run it. A clean run is therefore necessary but not sufficient for a clean apply; the command prints a one-line footer saying so. |
+| **Run (offline)** | YAML parse; row 0 — per-envelope domain validation, cross-document references, duplicate `(kind, name)`, singleton-conflict, virtual-member resolution; desired-internal `ServiceAccount` → `OidcIssuer` reference consistency; the under-constrained `federatedIdentities` advisory (warning); the `trustUpstreamPublishTime` × empty-`scanBackends` cross-opt-in reject; the inert `prefetchPolicy.maxAgeDays` reject; provenance-policy validation against the binary's provenance-capable format set; the per-repo `storage.backend` vs `HORT_STORAGE_BACKEND` mismatch reject; the permission-grant linter (secure-default `LintConfig` base, desired-side overrides applied). |
+| **Not run** | Of apply's pre-write pass, four checks: (a) the current-state check — a name declared in the tree that already exists as a `managed_by=local` row; (b) the `HORT_UPSTREAM_ALLOWLIST_HOSTS` check, enforced over the *create+update* slice of the `UpstreamMapping` diff; (c) the auth-provider check — `HORT_AUTH_PROVIDER=disabled` while `ClaimMapping` envelopes are declared; (d) the `scanBackends` backend-**name** check. Only (a) and (b) need the running deployment's current state. (c) needs only the deployment's `HORT_AUTH_PROVIDER` value, which this command does not read; (d) needs nothing at all — apply validates each entry against the binary's compiled-in `KNOWN_SCAN_BACKENDS`, not the live worker registry (regression H20). Both are simply not wired here yet. Row 7c — the `scanBackends` × repository-format *capability* rule — is a different check and **does** run offline. Checks inside apply's write stages are likewise not represented. A clean run is therefore necessary but not sufficient for a clean apply; the command prints a one-line footer saying so. |
 
 A directory that exists but contains zero YAML files validates clean —
 exit `0` — with the warning `validated 0 config files — is
