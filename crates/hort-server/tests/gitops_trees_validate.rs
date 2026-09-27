@@ -1,5 +1,6 @@
 //! Every gitops tree this repository ships clears the offline
-//! `validate-config` static linter.
+//! `validate-config` gate — row 0 (the per-envelope and cross-document
+//! rules) and the static linter rows.
 //!
 //! The trees are operator-facing: the alpha-fixture walk, the compose
 //! e2e stack (and its `s3` overlay), and the Ansible-deployed dogfood
@@ -121,7 +122,17 @@ fn every_shipped_gitops_tree_passes_the_static_linter() {
         assert!(!files.is_empty(), "{rel}: tree should not be empty");
 
         let desired = DesiredState::parse_files(files)
-            .unwrap_or_else(|errs| panic!("{rel}: parse / cross-validate failed:\n{errs}"));
+            .unwrap_or_else(|errs| panic!("{rel}: parse failed:\n{errs}"));
+
+        // Row 0 — the per-envelope and cross-document rules, which the
+        // offline CLI now runs before the lint rows below. Asserted here
+        // and not only in `hort-config`'s per-tree guards because those
+        // cover three of these four trees; `deploy/compose/s3/config` is
+        // reached by nothing else, and a shipped tree that fails row 0
+        // parks a real deployment not-ready at boot.
+        if let Err(errs) = desired.validate() {
+            panic!("{rel}: shipped gitops tree must clear row 0 — fix the tree:\n{errs}");
+        }
 
         // Sanity: the corpus actually carries the surface the rows lint.
         // A tree that lost its repositories or policies would pass every

@@ -1267,8 +1267,9 @@ Failure exits non-zero with the rendered errors in `tracing::error!`.
 
 ## 5a. Validate your config before applying (`hort-server validate-config`)
 
-`hort-server validate-config` runs the **structural + domain + static-linter**
-subset of the boot-time apply pass **offline** — no database, no running
+`hort-server validate-config` runs the **snapshot-free** subset of the
+boot-time apply pass **offline** — parse, the per-envelope domain and
+cross-document rules, and the static-linter rows; no database, no running
 server — so a CI job can reject a bad config tree *before* it is merged or
 rolled out. It is a pre-merge gate, not a substitute for apply.
 
@@ -1296,7 +1297,7 @@ failures; config inputs stay env-only). `validate-config` reads **no**
 | Code | Meaning |
 |---|---|
 | `0` | clean (no errors; warnings present only when not `--strict`) |
-| `1` | a validation error — a parse / cross-validate error, or any reject rule (including the per-repo storage-backend mismatch) — **or** (`--strict` and any warning, including the "0 config files" warning) |
+| `1` | a validation error — a parse error, a row-0 error (per-envelope domain or cross-document rule), or any reject rule (including the per-repo storage-backend mismatch) — **or** (`--strict` and any warning, including the "0 config files" warning) |
 | `2` | a required env var (`HORT_CONFIG_DIR` / `HORT_STORAGE_BACKEND`) is missing or invalid |
 | `3` | operational — the config directory is unreadable |
 
@@ -1310,19 +1311,33 @@ warning) fails the job.
 ### What it does NOT check (necessary, not sufficient)
 
 A clean `validate-config` does **not** guarantee a clean apply. It runs the
-structural (parse + cross-validate), per-envelope domain, and static-linter
-checks. It does **not** run the **current-state** checks (managed-by
-ownership, immutable-field changes — they need the live `ManagedBy=Local`
-snapshot), which run at apply/boot against the running deployment. It also
-does not currently run the `scanBackends` supported-**name** check (apply
-validates each entry against the binary's compiled-in scanner set,
-`KNOWN_SCAN_BACKENDS` — a static set the offline validator could check but
-does not yet). The `scanBackends` **capability** rule above
-(`scan_backend_capability`) is a different check and *does* run offline; it
-happens to catch most typos too, because a name this build does not compile
-in analyses nothing — but it reports the pairing rather than the typo, and
-it says nothing at all about a policy whose scope reaches no declared
-repository. The command prints a one-line footer saying so.
+parse, the per-envelope domain and cross-document rules (row 0 — the same
+`DesiredState::validate` the apply path delegates to), and the static-linter
+rows. Of apply's pre-write pass it does **not** run four checks:
+
+1. the **current-state** check — a name declared in your tree that already
+   exists as a `managed_by=local` row. Needs the live snapshot.
+2. the **`HORT_UPSTREAM_ALLOWLIST_HOSTS`** check. Apply enforces it over the
+   *create+update* slice of the `UpstreamMapping` diff, so it also needs the
+   current state, to know which mappings are new.
+3. the **auth-provider** check — `HORT_AUTH_PROVIDER=disabled` while
+   `ClaimMapping` envelopes are declared. This needs only the deployment's
+   `HORT_AUTH_PROVIDER` value, which the command does not read; not the
+   running deployment.
+4. the `scanBackends` supported-**name** check, which needs nothing the
+   command lacks — apply validates each entry against the binary's
+   compiled-in scanner set, `KNOWN_SCAN_BACKENDS`, not the live worker
+   registry. Like (3), simply not wired here yet.
+
+Only (1) and (2) are blocked on the running deployment.
+
+The `scanBackends` **capability** rule above (`scan_backend_capability`) is a
+different check and *does* run offline; it happens to catch most typos too,
+because a name this build does not compile in analyses nothing — but it
+reports the pairing rather than the typo, and it says nothing at all about a
+policy whose scope reaches no declared repository. Checks inside apply's
+write stages are likewise not represented. The command prints a one-line
+footer saying all of this.
 
 The validating binary **is** the version validated against: the
 provenance-capable format set and the linter defaults are baked into the same
