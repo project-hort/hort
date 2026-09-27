@@ -3613,6 +3613,8 @@ deployment the only registered kind is `"scan"`.
 | `hort_admin_tasks_pending_eligible` | gauge | `kind` | jobs | claim-eligible pending rows per kind (`status='pending'` and the lock free/expired), set once per starvation audit (every 60 s). Covers **every** kind present in `jobs`, including kinds this worker does not claim |
 | `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed, oldest_row_stalled}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |
 | `hort_admin_tasks_claim_unmappable_total` | counter | (none) | — | emitted by the Postgres jobs adapter: one increment per claimed row that failed `JobRow` projection and was resolved terminally instead of being stranded in `running` |
+| `hort_admin_tasks_lease_requeued_total` | counter | `kind`, `result` | — | `result ∈ {requeued, retries_exhausted}` — one increment per row the abandoned-lease sweep resolved (a row left in `running` by a worker that stopped renewing its claim) |
+| `hort_admin_tasks_lease_renew_failed_total` | counter | `kind`, `result` | — | `result ∈ {lost, error}` — `lost` fires when the row is no longer this worker's; the dispatcher then **discards** that handler's outcome rather than writing over the row's current holder, so one `lost` is one run whose result was thrown away. `error` is a transient database failure on the renewal statement and has no such consequence |
 
 **Starvation semantics** (issue #131). A `provenance-verify` backlog once
 grew to ~1450 rows over 33 minutes while the same dispatcher claimed and
@@ -3668,6 +3670,51 @@ Note: the 403 "no principal" path (missing auth middleware or
 `AuthContext::Disabled`) does NOT emit the counter — that path indicates
 a misconfigured caller, not an operator invocation attempt.
 
+**Abandoned-lease semantics.** Both claim statements select `status =
+'pending'` only; their `locked_until IS NULL OR locked_until < now()`
+clause re-claims a *pending* row whose not-before has passed and never
+looks at a `running` one. A worker that dies holding a claim therefore
+used to leave the row on `running` forever, and for `kind='scan'` that
+is a lost capability rather than clutter: `jobs_scan_unique` covers
+`status IN ('pending','running')`, so no further scan job for that
+artifact could ever be enqueued and both rescan predicates skipped the
+artifact as in-flight. `provenance-verify`, `prefetch` and
+`prefetch-dependencies` have the same shape via
+`find_active_provenance_for_artifact`, `jobs_prefetch_unique` and
+`jobs_prefetch_dependencies_unique`.
+
+Two metrics cover the recovery, and they answer different questions:
+
+- `hort_admin_tasks_lease_requeued_total` is the **worker-health**
+  signal. A steady rate means a replica is dying mid-task and being
+  silently compensated for; alarm on
+  `increase(hort_admin_tasks_lease_requeued_total[1h]) > 0`.
+  `result="retries_exhausted"` is strictly worse than
+  `result="requeued"`: the row hit the attempt cap and was failed
+  terminally rather than re-driven into the same crash, so the work did
+  not happen. For `kind="scan"` a terminal row hands the artifact to the
+  stranded-scan recovery sweep, which re-enqueues once the scanner is
+  healthy; for the other kinds the next scheduled tick is the recovery.
+- `hort_admin_tasks_lease_renew_failed_total{result="lost"}` is the
+  **overlap** signal, and it is also a **work-discarded** count. It
+  fires when a running handler discovers its row was handed to someone
+  else, which is the only way a requeue can produce two concurrent
+  executions of one row; the dispatcher responds by discarding that
+  handler's outcome, because the damaging write is not the lost result
+  but a `reschedule` that would return a row a live worker is mid-way
+  through to `pending` — inviting a third concurrent execution and
+  charging an attempt to the wrong run. So one increment is one
+  execution whose result never reached the row. It should be flat at
+  zero; a non-zero rate means the grace window is too tight for the
+  fleet's actual pause behaviour. `result="error"` is not that signal —
+  it is a database flap on the renewal statement, and with three
+  renewals per lease a single one is absorbed with no consequence.
+
+Kinds the sweep deliberately does **not** requeue (so neither counter
+ever carries them) are listed in
+`hort_domain::ports::jobs_repository::NO_REQUEUE_ON_LEASE_EXPIRY_KINDS`,
+with the per-kind reason.
+
 **`hort_admin_tasks_completed_total` result semantics** (emitted by the dispatcher):
 
 - `result="completed"` — handler returned
@@ -3694,11 +3741,16 @@ Cardinality:
   v1: 1 histogram.
 - `hort_admin_tasks_in_flight`: 1 gauge per kind.
   v1: 1 gauge.
+- `hort_admin_tasks_lease_requeued_total`: bounded by the 19 kinds in
+  `REQUEUE_ON_LEASE_EXPIRY_KINDS` × 2 result values = 38 series, and only
+  a kind that has actually been abandoned ever creates one.
+- `hort_admin_tasks_lease_renew_failed_total`: the same 19 kinds × 2
+  result values = 38 series.
 
 Source: `hort-http-admin-tasks::handlers::invoke` constants
 `METRIC_ENQUEUED`, `RESULT_OK`, `RESULT_RBAC_DENIED`, `RESULT_VALIDATION_ERROR`;
 `hort_app::task_dispatcher` constants `METRIC_COMPLETED`, `METRIC_DURATION`,
-`METRIC_IN_FLIGHT`.
+`METRIC_IN_FLIGHT`, `METRIC_LEASE_REQUEUED`, `METRIC_LEASE_RENEW_FAILED`.
 
 ### Policy enforcement
 

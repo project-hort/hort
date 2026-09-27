@@ -600,10 +600,19 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
 /// over the full list — an applied migration can never be edited in place
 /// (`sqlx::migrate!` rejects the changed checksum).
 ///
-/// **Single consumer:** the DB-free lock-step structural guard
-/// (`crates/hort-adapters-postgres/tests/task_kind_check_lockstep_guard.rs`)
-/// that token-scans that migration's `kind IN (…)` list and asserts it
-/// equals this constant exactly. Nothing else reads this constant —
+/// **Two consumers, both structural guards over the whole vocabulary:**
+///
+/// - the DB-free lock-step guard
+///   (`crates/hort-adapters-postgres/tests/task_kind_check_lockstep_guard.rs`)
+///   that token-scans that migration's `kind IN (…)` list and asserts it
+///   equals this constant exactly;
+/// - the abandoned-lease requeue-policy exhaustiveness guard in
+///   `hort_domain::ports::jobs_repository`, which asserts every kind here
+///   is classified by exactly one of `REQUEUE_ON_LEASE_EXPIRY_KINDS` /
+///   `NO_REQUEUE_ON_LEASE_EXPIRY_KINDS`, so a new kind cannot silently
+///   inherit either behaviour.
+///
+/// No *runtime* path reads this constant —
 /// `TaskInvoked::validate` / `TaskFailed::validate` deliberately stay on
 /// the narrower [`ADMIN_INVOKABLE_TASK_KINDS`] (see that constant's doc
 /// for why: no current emitter of either event carries a kind outside the

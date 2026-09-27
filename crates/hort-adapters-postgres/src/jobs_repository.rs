@@ -16,7 +16,7 @@ use uuid::Uuid;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::{
     EnqueueOutcome, JobRow, JobStatus, JobsRepository, KindFields, ListJobsFilter, ListJobsPage,
-    PendingKindBacklog, ScanJob, ScanKindFields, TriggerSource,
+    PendingKindBacklog, RequeueOutcome, RequeuedJob, ScanJob, ScanKindFields, TriggerSource,
 };
 use hort_domain::types::{ContentHash, IdempotencyKey};
 use serde_json::Value as JsonValue;
@@ -165,6 +165,103 @@ const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH oldest AS MATERIALIZED (\n\
                  RETURNING id, kind, status, params, actor_id, priority, trigger_source,\n\
                      attempts, created_at, updated_at, completed_at, last_error, result_summary,\n\
                      artifact_id, repository_id, content_hash, format";
+
+/// Not-before applied to a row the abandoned-lease sweep returns to
+/// `pending`.
+///
+/// The same 30 seconds the dispatcher's `compute_backoff` starts from,
+/// and for the same reason its `return_to_pending` gives an
+/// undispatchable row a backoff at all: the sweeping replica is also a
+/// claiming replica, and a row released with a NULL lease is eligible on
+/// that same replica's very next poll. A worker killed by the task
+/// itself (an OOM on one oversized artifact) would then re-take the row
+/// immediately and die again, spending the whole attempt budget inside
+/// one sweep interval instead of across several.
+///
+/// Flat rather than exponential: the row has already waited a full lease
+/// plus the grace before it gets here, so the purpose of this delay is
+/// only to break the same-replica re-grab, and the attempt cap — not the
+/// spacing — is what bounds a crash loop.
+const REQUEUE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// `last_error` written onto a row the abandoned-lease sweep resolves.
+///
+/// Operator-facing: it is the only record of why a row that no handler
+/// ever reported on changed state, and it has to read as a diagnosis
+/// rather than as a handler's own failure message.
+const REQUEUE_LAST_ERROR: &str =
+    "claim lease expired past the grace window without renewal — the worker holding this row      stopped heartbeating and is presumed dead";
+
+/// `UPDATE` behind [`JobsRepository::renew_lease`].
+///
+/// Three predicates, all load-bearing:
+/// - `id = $1` picks the row.
+/// - `locked_by = $2` is the fence. A renewal from a worker that no
+///   longer holds the claim (the abandoned-lease sweep requeued it and a
+///   sibling re-claimed it) must not extend someone else's lease — and
+///   the zero-rows-updated result is how the losing worker finds out its
+///   execution is no longer the authoritative one.
+/// - `status = 'running'` keeps a renewal that races the outcome write
+///   from resurrecting a lease on an already-terminal row, which would
+///   otherwise leave a `completed` row carrying a future `locked_until`
+///   and make the sweep's own predicate ambiguous.
+const RENEW_LEASE_SQL: &str = "UPDATE public.jobs SET\n\
+                     locked_until = now() + $3,\n\
+                     updated_at = now()\n\
+                 WHERE id = $1\n\
+                   AND locked_by = $2\n\
+                   AND status = 'running'";
+
+/// `UPDATE` behind [`JobsRepository::requeue_abandoned`] — the
+/// abandoned-lease sweep.
+///
+/// Shape notes for anyone editing this string:
+///
+/// - The picking CTE mirrors the claim's `FOR UPDATE SKIP LOCKED` +
+///   `LIMIT`, so two workers sweeping at the same tick take disjoint
+///   rows instead of blocking on each other. The sweep is safe to run on
+///   every replica; it needs no leader election.
+/// - `locked_until IS NOT NULL` is not redundant with the comparison. A
+///   `running` row with a NULL lease cannot have been produced by either
+///   claim statement, and treating "no lease" as "lease long expired"
+///   would sweep a row whose history nobody understands.
+/// - `now() - $2::interval` is the grace on top of the lapse. With lease
+///   renewal running at a third of the lease, a live worker is at most a
+///   third of a lease stale, so a grace of one full lease is the margin
+///   that absorbs a renewal that lost a DB race, a paused container, and
+///   a mixed-version fleet whose older replicas do not renew at all.
+/// - The `CASE` is the retry budget, and this statement is the only
+///   place it can be spent for a row whose handler never returned. Below
+///   the cap the row goes back to `pending` with a short not-before so
+///   the sweeping replica does not immediately re-claim what it just
+///   released; at the cap it goes to `failed`, which for `kind='scan'`
+///   hands the artifact to the stranded-scan recovery sweep — a `failed`
+///   newest scan job is exactly what `select_stranded` re-picks.
+/// - `attempts` is deliberately untouched: the next claim increments it,
+///   so the budget is spent by execution attempts, not by sweeps.
+/// - The row is updated, never deleted. A late `mark_completed` from the
+///   original worker is `WHERE id = $1` with no status predicate, so it
+///   still lands on the surviving row rather than updating nothing.
+const REQUEUE_ABANDONED_SQL: &str = "WITH abandoned AS (\n\
+                     SELECT id FROM public.jobs\n\
+                     WHERE status = 'running'\n\
+                       AND kind = ANY($1::text[])\n\
+                       AND locked_until IS NOT NULL\n\
+                       AND locked_until < now() - $2::interval\n\
+                     ORDER BY locked_until ASC, id ASC\n\
+                     FOR UPDATE SKIP LOCKED\n\
+                     LIMIT $3\n\
+                 )\n\
+                 UPDATE public.jobs j SET\n\
+                     status = CASE WHEN j.attempts >= $4 THEN 'failed' ELSE 'pending' END,\n\
+                     locked_by = NULL,\n\
+                     locked_until = CASE WHEN j.attempts >= $4 THEN NULL\n\
+                                         ELSE now() + $5 END,\n\
+                     last_error = $6,\n\
+                     updated_at = now()\n\
+                 FROM abandoned a\n\
+                 WHERE j.id = a.id\n\
+                 RETURNING j.id, j.kind, j.attempts, j.status";
 
 /// `DELETE` behind [`JobsRepository::delete_terminal_other_kind_rows_older_than`]
 /// — the horizon for every `jobs.kind` the two kind-specific sweeps do not
@@ -1130,11 +1227,14 @@ impl JobsRepository for PgJobsRepository {
             // function *after* the claiming UPDATE had already committed:
             // every row in the batch was `running`, none was returned to
             // the caller, and nothing ever moved them back — the claim
-            // predicate requires `status = 'pending'` and there is no
-            // stale-`running` reaper anywhere in the codebase. One
-            // unmappable row therefore permanently stranded up to
-            // `batch_size` healthy rows (invariant: a claimed-but-not-
-            // dispatched row is never permanently lost). The shape used to
+            // predicate requires `status = 'pending'`. One unmappable row
+            // therefore stranded up to `batch_size` healthy rows
+            // (invariant: a claimed-but-not-dispatched row is never
+            // permanently lost). `requeue_abandoned` would now recover
+            // them a lease plus a grace later, but only for the kinds in
+            // the requeue allow-list and only after half an hour at the
+            // defaults; resolving the unmappable row terminally right
+            // here keeps the rest of the batch moving on this tick. The shape used to
             // be production-reachable: `"scan"` was in
             // `ADMIN_INVOKABLE_TASK_KINDS`, so the admin task-invoke
             // path's `enqueue_task` wrote a `kind='scan'` row with the
@@ -1197,6 +1297,84 @@ impl JobsRepository for PgJobsRepository {
             }
             sort_claimed_jobs(&mut jobs);
             Ok(jobs)
+        })
+    }
+
+    fn renew_lease<'a>(
+        &'a self,
+        job_id: Uuid,
+        worker_id: &'a str,
+        lock_duration: Duration,
+    ) -> BoxFuture<'a, DomainResult<bool>> {
+        let worker_id = worker_id.to_string();
+        let interval = duration_to_pg_interval(lock_duration);
+        Box::pin(async move {
+            tracing::debug!(%job_id, worker_id = %worker_id, "renew_lease");
+            let res = sqlx::query(RENEW_LEASE_SQL)
+                .bind(job_id)
+                .bind(&worker_id)
+                .bind(interval)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Job", "renew_lease"))?;
+            Ok(res.rows_affected() == 1)
+        })
+    }
+
+    fn requeue_abandoned<'a>(
+        &'a self,
+        kinds: &'a [&'a str],
+        grace: Duration,
+        attempt_cap: u32,
+        batch_size: u16,
+    ) -> BoxFuture<'a, DomainResult<Vec<RequeuedJob>>> {
+        let kinds_owned: Vec<String> = kinds.iter().map(ToString::to_string).collect();
+        let grace_interval = duration_to_pg_interval(grace);
+        let backoff_interval = duration_to_pg_interval(REQUEUE_BACKOFF);
+        let cap = i64::from(attempt_cap);
+        let limit = i64::from(batch_size);
+        Box::pin(async move {
+            if kinds_owned.is_empty() {
+                return Ok(Vec::new());
+            }
+            tracing::debug!(
+                kinds = ?kinds_owned,
+                grace_secs = grace.as_secs(),
+                attempt_cap,
+                batch_size,
+                "requeue_abandoned",
+            );
+            let rows = sqlx::query(REQUEUE_ABANDONED_SQL)
+                .bind(&kinds_owned)
+                .bind(grace_interval)
+                .bind(limit)
+                .bind(cap)
+                .bind(backoff_interval)
+                .bind(REQUEUE_LAST_ERROR)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Job", "requeue_abandoned"))?;
+            rows.iter()
+                .map(|row| {
+                    let status: String = row.try_get("status").map_err(|e| invariant(&e))?;
+                    let attempts: i32 = row.try_get("attempts").map_err(|e| invariant(&e))?;
+                    Ok(RequeuedJob {
+                        id: row.try_get("id").map_err(|e| invariant(&e))?,
+                        kind: row.try_get("kind").map_err(|e| invariant(&e))?,
+                        attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+                        outcome: match status.as_str() {
+                            "pending" => RequeueOutcome::Requeued,
+                            "failed" => RequeueOutcome::RetriesExhausted,
+                            other => {
+                                return Err(DomainError::Invariant(format!(
+                                    "requeue_abandoned returned status {other:?}; the CASE \
+                                     produces only 'pending' or 'failed'"
+                                )))
+                            }
+                        },
+                    })
+                })
+                .collect()
         })
     }
 
@@ -1489,6 +1667,102 @@ mod tests {
         let d = Duration::from_secs(u64::MAX / 2);
         let i = duration_to_pg_interval(d);
         assert_eq!(i.microseconds, i64::MAX);
+    }
+
+    // ---- abandoned-lease sweep SQL -----------------------------------------
+
+    /// The sweep must never widen past `status = 'running'`.
+    ///
+    /// A predicate that also matched `pending` would re-drive rows the
+    /// claim already handles correctly; one that matched a terminal row
+    /// would resurrect finished work. The `\n\` continuation hazard the
+    /// `claim_pending_by_kinds_sql_has_no_token_mashing` test documents
+    /// applies verbatim here, so the token-separation check comes along
+    /// with it.
+    #[test]
+    fn requeue_abandoned_sql_targets_only_running_rows_with_a_real_lease() {
+        let sql = REQUEUE_ABANDONED_SQL;
+        for token in [
+            "WHERE status = 'running'",
+            "AND kind = ANY($1::text[])",
+            "AND locked_until IS NOT NULL",
+            "AND locked_until < now() - $2::interval",
+            "FOR UPDATE SKIP LOCKED",
+            "ORDER BY locked_until ASC, id ASC",
+        ] {
+            assert!(
+                sql.contains(token),
+                "requeue_abandoned SQL is missing the token-separated fragment {token:?}; \
+                 a bare `\\` line continuation eats the newline AND the indent and mashes \
+                 adjacent tokens together"
+            );
+        }
+        assert!(
+            !sql.contains("'pending'\n"),
+            "the sweep selects 'running' rows only — the claim already handles 'pending'"
+        );
+        assert!(
+            !sql.contains("DELETE"),
+            "an abandoned row is requeued, never deleted: it may be genuinely running, and \
+             its completion is an unconditional UPDATE by id that must still find a row"
+        );
+    }
+
+    /// The attempt cap is enforced inside the sweep statement.
+    ///
+    /// The sweep is the only code that runs for a row whose handler
+    /// never returned, so a cap applied anywhere else (the scan
+    /// orchestrator's `attempts >= max_attempts`, the dispatcher's
+    /// `TaskOutcome::Failed` arms) is unreachable for exactly the rows
+    /// that need it. A repeatedly-crashing task must terminate.
+    #[test]
+    fn requeue_abandoned_sql_caps_retries_and_leaves_attempts_alone() {
+        let sql = REQUEUE_ABANDONED_SQL;
+        assert!(
+            sql.contains("CASE WHEN j.attempts >= $4 THEN 'failed' ELSE 'pending' END"),
+            "the retry budget has to be spent here or a crash loop is re-driven forever"
+        );
+        assert!(
+            !sql.contains("attempts = attempts + 1") && !sql.contains("attempts = j.attempts"),
+            "the CLAIM increments `attempts`; a sweep that also incremented would charge a \
+             row twice for one execution attempt"
+        );
+        assert!(
+            sql.contains("locked_by = NULL"),
+            "the dead worker's claim must be released or the row reads as still held"
+        );
+    }
+
+    /// The renewal is fenced on both the holder and the status.
+    ///
+    /// `locked_by = $2` stops a worker whose row was swept from
+    /// extending the sibling's lease, and makes the zero-rows result the
+    /// signal that it lost the row. `status = 'running'` stops a renewal
+    /// that races the outcome write from leaving a terminal row with a
+    /// future lease.
+    #[test]
+    fn renew_lease_sql_is_fenced_on_holder_and_status() {
+        let sql = RENEW_LEASE_SQL;
+        for token in [
+            "WHERE id = $1",
+            "AND locked_by = $2",
+            "AND status = 'running'",
+            "locked_until = now() + $3",
+        ] {
+            assert!(sql.contains(token), "renew_lease SQL missing {token:?}");
+        }
+        let (set_clause, _predicate) = sql
+            .split_once("WHERE")
+            .expect("renew_lease SQL has a WHERE clause");
+        assert!(
+            !set_clause.contains("status"),
+            "renewal extends a lease and nothing else; assigning `status` here would let a \
+             renewal tick move a row's lifecycle state behind the handler's back"
+        );
+        assert!(
+            !set_clause.contains("attempts"),
+            "a renewal is not an execution attempt — only the claim charges the budget"
+        );
     }
 
     /// Regression guard for the `claim_pending_by_kinds` SQL. A prior

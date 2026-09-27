@@ -38,6 +38,7 @@
 //!   fresher rows keep `not_claimed`/`unregistered` silent).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,7 +48,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use hort_domain::events::{Actor, InternalActor};
-use hort_domain::ports::jobs_repository::{JobRow, JobsRepository, PendingKindBacklog};
+use hort_domain::ports::jobs_repository::{
+    JobRow, JobsRepository, PendingKindBacklog, RequeueOutcome, REQUEUE_ON_LEASE_EXPIRY_KINDS,
+};
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 
 use crate::error::AppResult;
@@ -62,6 +65,8 @@ const METRIC_DURATION: &str = "hort_admin_tasks_duration_seconds";
 const METRIC_IN_FLIGHT: &str = "hort_admin_tasks_in_flight";
 const METRIC_PENDING_ELIGIBLE: &str = "hort_admin_tasks_pending_eligible";
 const METRIC_STARVED: &str = "hort_admin_tasks_starved_total";
+const METRIC_LEASE_REQUEUED: &str = "hort_admin_tasks_lease_requeued_total";
+const METRIC_LEASE_RENEW_FAILED: &str = "hort_admin_tasks_lease_renew_failed_total";
 
 // Result label values
 const RESULT_COMPLETED: &str = "completed";
@@ -72,6 +77,18 @@ const RESULT_FAILED_TERMINAL: &str = "failed_terminal";
 const STARVED_UNREGISTERED: &str = "unregistered";
 const STARVED_NOT_CLAIMED: &str = "not_claimed";
 const STARVED_OLDEST_ROW: &str = "oldest_row_stalled";
+
+// `result` label values on `hort_admin_tasks_lease_requeued_total`.
+const REQUEUE_RESULT_REQUEUED: &str = "requeued";
+const REQUEUE_RESULT_EXHAUSTED: &str = "retries_exhausted";
+
+// `result` label values on `hort_admin_tasks_lease_renew_failed_total`.
+// `lost` is the fencing signal — the row is no longer this worker's, so
+// whatever it is still running against that row is not the authoritative
+// execution. `error` is a transient database failure on the renewal
+// itself, which says nothing about ownership.
+const RENEW_RESULT_LOST: &str = "lost";
+const RENEW_RESULT_ERROR: &str = "error";
 
 // Default backoff for a retryable failed task (exponential from this base).
 const DEFAULT_BACKOFF_SECS: u64 = 30;
@@ -90,6 +107,109 @@ const STARVATION_THRESHOLD: Duration = Duration::from_secs(600);
 /// eligible-pending rows; at a 5 s poll that would be 12 scans a minute
 /// for no diagnostic gain.
 const STARVATION_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How many lease renewals a healthy worker performs per lease.
+///
+/// The renewal interval is `lock_duration / RENEWALS_PER_LEASE`, so a
+/// live worker's `locked_until` is never more than
+/// `lock_duration × (1 - 1/RENEWALS_PER_LEASE)` from its maximum. Three
+/// is the smallest value that tolerates a lost renewal without letting
+/// the lease lapse: at two, one missed tick puts the row on the sweep's
+/// doorstep with no margin left.
+const RENEWALS_PER_LEASE: u32 = 3;
+
+/// Floor on the renewal interval.
+///
+/// `HORT_SCANNER_LOCK_DURATION_SECS` is operator-set and parses `0`
+/// happily. A zero lease is already a broken configuration — every claim
+/// is instantly re-claimable — but without this floor it would also turn
+/// the renewal into an unthrottled loop issuing an `UPDATE` as fast as
+/// the connection returns, which is a self-inflicted load problem on the
+/// database rather than merely a misconfigured queue. Clamping keeps a
+/// bad number bad instead of letting it become an outage.
+const MIN_RENEWAL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Extra time past a lapsed lease before the sweep calls the holder
+/// dead, as a multiple of the lease.
+///
+/// **This is the discriminator, and this is why the number is derivable
+/// rather than guessed.** Before lease renewal, `locked_until < now()`
+/// on a `running` row said only "the task outlived its nominal lease",
+/// which is equally true of a dead worker and of a task slower than
+/// 15 minutes; picking a per-kind multiple to tell them apart means
+/// guessing an upper bound on runtime, and several kinds have none
+/// (`seed-import` processes an operator-supplied set of arbitrary size,
+/// the prefetch cascade walks a transitive dependency graph over the
+/// network). Renewal removes the guess: a live worker renews three times
+/// a lease no matter how long its task runs, so a lapsed lease already
+/// means three consecutive renewals failed to land.
+///
+/// One further lease on top is the margin for the cases where renewal is
+/// alive but late — a renewal that lost a database race, a container
+/// paused by its host, and the rolling-upgrade window in which older
+/// replicas do not renew at all. A worker that is merely slow is
+/// therefore never swept; one that has stopped writing to the database
+/// for two full leases is recovered.
+const LEASE_EXPIRY_GRACE_MULTIPLE: u32 = 1;
+
+/// Minimum spacing between abandoned-lease sweeps.
+///
+/// Matches [`STARVATION_AUDIT_INTERVAL`] for the same reason: the sweep
+/// is a single indexed range scan over `running` rows and there is no
+/// diagnostic or recovery gain in running it twelve times a minute at a
+/// 5 s poll. Recovery latency is dominated by the lease plus the grace
+/// (30 minutes at the defaults), so a minute of sweep spacing is noise
+/// against it.
+const LEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The renewal interval has to leave headroom for one lost renewal, and
+/// the grace has to cover a fleet whose older replicas do not renew at
+/// all. Both are compile-time so a future tuning edit that collapses the
+/// margin fails the build rather than a test somebody can skim past.
+///
+/// At two renewals per lease a single missed tick puts the row on the
+/// sweep's doorstep with nothing left, and the grace would then be
+/// carrying the discriminator alone — which is the pre-renewal design
+/// this replaced. At a grace below one lease, a rolling upgrade in which
+/// the older replicas do not renew would sweep rows out from under
+/// workers that are alive and working.
+const _: () = assert!(
+    RENEWALS_PER_LEASE >= 3,
+    "fewer than three renewals per lease leaves no spare renewal inside a lease"
+);
+const _: () = assert!(
+    LEASE_EXPIRY_GRACE_MULTIPLE >= 1,
+    "the grace must be at least one full lease"
+);
+
+/// Rows the sweep resolves per pass.
+///
+/// Bounded so one pass cannot hold row locks across an unbounded set
+/// after a fleet-wide restart. A backlog drains over consecutive passes.
+const LEASE_SWEEP_BATCH: u16 = 100;
+
+/// Recovery latency is bounded by lease + grace + one sweep interval.
+/// Pinning the sweep spacing as the small term keeps a future cadence
+/// edit from making housekeeping, rather than the lease, dominate how
+/// long a dead worker's rows stay stranded.
+const _: () = assert!(
+    LEASE_SWEEP_INTERVAL.as_secs() <= 300,
+    "sweep spacing must stay small against the lease-plus-grace recovery bound"
+);
+
+/// `attempts` at which the sweep stops requeueing a row and fails it.
+///
+/// A requeue costs an attempt (the next claim increments the counter),
+/// so this bounds how many times a task that kills its worker can be
+/// re-driven. It has to live here because the sweep is the only code
+/// that runs for such a row: the scan orchestrator's `attempts >=
+/// max_attempts` branch and the dispatcher's `TaskOutcome::Failed` arms
+/// both require the handler to return, which is precisely what did not
+/// happen.
+///
+/// Set to the scan pipeline's own default (`HORT_SCANNER_MAX_ATTEMPTS`,
+/// 5) so a scan row hits one budget rather than two disagreeing ones.
+const LEASE_REQUEUE_ATTEMPT_CAP: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // TaskDispatcher
@@ -212,6 +332,13 @@ impl TaskDispatcher {
         // `STARVATION_THRESHOLD` to elapse, so the early audit cannot
         // false-alarm.
         let mut last_audit: Option<Instant> = None;
+        // The abandoned-lease sweep runs on its own clock, not the
+        // audit's: the audit is diagnostic and the sweep is a recovery
+        // write, and coupling them would make a change to one silently
+        // re-time the other. `None` = sweep on the first poll, so a
+        // worker booting after a fleet-wide crash recovers the rows that
+        // crash stranded without waiting out an interval first.
+        let mut last_lease_sweep: Option<Instant> = None;
 
         loop {
             tokio::select! {
@@ -257,6 +384,11 @@ impl TaskDispatcher {
                 dispatcher
                     .audit_starvation(&registered, &last_claimed, started_at)
                     .await;
+            }
+
+            if last_lease_sweep.is_none_or(|t| t.elapsed() >= LEASE_SWEEP_INTERVAL) {
+                last_lease_sweep = Some(Instant::now());
+                dispatcher.sweep_abandoned_leases().await;
             }
 
             if claimed.is_empty() {
@@ -316,10 +448,20 @@ impl TaskDispatcher {
     /// where the row was claimed and then not dispatched. Leaving such a
     /// row `running` — which is what this code used to do, on the stated
     /// assumption that "the lock expires and another worker claims it" —
-    /// loses it permanently: `claim_pending_by_kinds` selects only
-    /// `status = 'pending'` rows, and nothing anywhere resets a stale
-    /// `running` row. Invariant: a claimed-but-not-dispatched row is
+    /// loses it: `claim_pending_by_kinds` selects only `status =
+    /// 'pending'` rows. Invariant: a claimed-but-not-dispatched row is
     /// never permanently lost.
+    ///
+    /// [`Self::sweep_abandoned_leases`] is a backstop for this shape, not
+    /// a replacement for it, and the revert stays the primary for two
+    /// reasons. The sweep costs a lease plus the grace — half an hour at
+    /// the defaults — where the revert costs one UPDATE and loses
+    /// nothing. And the sweep only touches
+    /// [`REQUEUE_ON_LEASE_EXPIRY_KINDS`], while the first caller below is
+    /// specifically a row whose kind this replica does not recognise: a
+    /// kind excluded from the requeue policy would be stranded by the
+    /// sweep and is not by the revert, because a row that was never
+    /// dispatched cannot be running twice.
     ///
     /// `reschedule` is the revert vehicle (it sets `status = 'pending'`,
     /// clears `locked_by` and records `last_error`); the backoff keeps a
@@ -394,8 +536,174 @@ impl TaskDispatcher {
         }
     }
 
+    /// Abandoned-lease sweep — the recovery path for a row whose worker
+    /// died holding the claim.
+    ///
+    /// Runs on every replica with no leader election. The adapter's
+    /// picking CTE takes its rows `FOR UPDATE SKIP LOCKED`, so
+    /// concurrent sweepers take disjoint sets and a row is resolved
+    /// exactly once.
+    ///
+    /// The kind allow-list is
+    /// [`REQUEUE_ON_LEASE_EXPIRY_KINDS`], not this dispatcher's
+    /// registered kinds. A heterogeneous fleet is the point: a replica
+    /// that does not register `scan` is still the right one to hand a
+    /// dead scanner's abandoned row back to a replica that does. The
+    /// excluded kinds are excluded because a concurrent second execution
+    /// of them is absorbed by nothing — see the constant.
+    async fn sweep_abandoned_leases(&self) {
+        let grace = self.lock_duration * LEASE_EXPIRY_GRACE_MULTIPLE;
+        let resolved = match self
+            .job_repo
+            .requeue_abandoned(
+                REQUEUE_ON_LEASE_EXPIRY_KINDS,
+                grace,
+                LEASE_REQUEUE_ATTEMPT_CAP,
+                LEASE_SWEEP_BATCH,
+            )
+            .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "TaskDispatcher: abandoned-lease sweep failed; will retry on a later tick",
+                );
+                return;
+            }
+        };
+        for row in &resolved {
+            let result = match row.outcome {
+                RequeueOutcome::Requeued => REQUEUE_RESULT_REQUEUED,
+                RequeueOutcome::RetriesExhausted => REQUEUE_RESULT_EXHAUSTED,
+            };
+            metrics::counter!(
+                METRIC_LEASE_REQUEUED,
+                "kind" => row.kind.clone(),
+                "result" => result,
+            )
+            .increment(1);
+        }
+        if resolved.is_empty() {
+            return;
+        }
+        // A worker dying mid-task is an operational fault, not routine
+        // housekeeping: the counter exists so a replica that dies every
+        // few minutes shows up as a rate instead of being silently
+        // compensated, and the log is what names the rows.
+        tracing::warn!(
+            resolved = resolved.len(),
+            requeued = resolved
+                .iter()
+                .filter(|r| r.outcome == RequeueOutcome::Requeued)
+                .count(),
+            retries_exhausted = resolved
+                .iter()
+                .filter(|r| r.outcome == RequeueOutcome::RetriesExhausted)
+                .count(),
+            grace_secs = grace.as_secs(),
+            "TaskDispatcher: rows were stranded in 'running' past their lease plus the grace \
+             window and have been recovered — a worker holding them stopped renewing and is \
+             presumed dead. Requeued rows are claimable again; retries-exhausted rows reached \
+             the attempt cap and were failed terminally rather than re-driven into the same \
+             crash",
+        );
+        for row in &resolved {
+            tracing::info!(
+                job_id = %row.id,
+                kind = %row.kind,
+                attempts = row.attempts,
+                outcome = ?row.outcome,
+                "TaskDispatcher: abandoned-lease row resolved",
+            );
+        }
+    }
+
+    /// Hold the claim lease on `job_id` for as long as the returned
+    /// guard lives.
+    ///
+    /// This is the half of the design that gives the sweep's
+    /// discriminator a meaning. The spawned task extends `locked_until`
+    /// every `lock_duration / RENEWALS_PER_LEASE`; dropping the guard
+    /// aborts it. Placing it here rather than in the handlers is what
+    /// makes the mechanism total: `dispatch_one` is the single point
+    /// through which every registered kind runs, and
+    /// `claim_pending_by_kinds` is the only claim statement with a
+    /// production caller, so one call site covers the whole kind
+    /// vocabulary and every kind added later.
+    ///
+    /// A renewal that reports the row is no longer ours raises the
+    /// guard's `lost` flag, and [`Self::dispatch_one`] reads it before
+    /// writing the outcome. That makes the flag a **fencing token**, not
+    /// just a log line, and it has to be: the sweep only hands a row on
+    /// after two full leases of silence, but once it has, a stale
+    /// worker's `reschedule` would put a row a *live* worker is mid-way
+    /// through back to `pending` — inviting a third concurrent execution
+    /// and charging an attempt to the wrong run. Discarding the stale
+    /// result is the only write that cannot make that worse. The
+    /// handler's own side effects are already done and this dispatcher
+    /// cannot unwind them, which is exactly why the census decides
+    /// per kind whether a second execution is absorbed.
+    fn spawn_lease_renewal(self: &Arc<Self>, job_id: Uuid, kind: String) -> LeaseRenewalGuard {
+        let interval = (self.lock_duration / RENEWALS_PER_LEASE).max(MIN_RENEWAL_INTERVAL);
+        let dispatcher = self.clone();
+        let lost = Arc::new(AtomicBool::new(false));
+        let lost_setter = lost.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                match dispatcher
+                    .job_repo
+                    .renew_lease(job_id, &dispatcher.worker_id, dispatcher.lock_duration)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        lost_setter.store(true, Ordering::SeqCst);
+                        tracing::warn!(
+                            %job_id,
+                            kind = %kind,
+                            worker_id = %dispatcher.worker_id,
+                            "TaskDispatcher: lease renewal found the row is no longer ours — \
+                             it was closed out or an abandoned-lease sweep handed it on. This \
+                             handler's execution is no longer the authoritative one; its \
+                             outcome will be discarded rather than written over whoever holds \
+                             the row now",
+                        );
+                        metrics::counter!(
+                            METRIC_LEASE_RENEW_FAILED,
+                            "kind" => kind.clone(),
+                            "result" => RENEW_RESULT_LOST,
+                        )
+                        .increment(1);
+                        return;
+                    }
+                    Err(e) => {
+                        // Transient and retried on the next tick: with
+                        // three renewals per lease, one failure still
+                        // leaves two chances before the lease lapses.
+                        tracing::warn!(
+                            error = %e,
+                            %job_id,
+                            kind = %kind,
+                            "TaskDispatcher: lease renewal failed; retrying on the next \
+                             renewal tick",
+                        );
+                        metrics::counter!(
+                            METRIC_LEASE_RENEW_FAILED,
+                            "kind" => kind.clone(),
+                            "result" => RENEW_RESULT_ERROR,
+                        )
+                        .increment(1);
+                    }
+                }
+            }
+        });
+        LeaseRenewalGuard { handle, lost }
+    }
+
     /// Invoke the handler for a single job row and record the outcome.
-    async fn dispatch_one(&self, job: JobRow, handler: Arc<dyn TaskHandler>) {
+    async fn dispatch_one(self: &Arc<Self>, job: JobRow, handler: Arc<dyn TaskHandler>) {
         let kind = handler.kind();
 
         // Build a TaskContext from the job row.
@@ -411,9 +719,18 @@ impl TaskDispatcher {
         // Emit in-flight gauge +1.
         metrics::gauge!(METRIC_IN_FLIGHT, "kind" => kind.to_string()).increment(1.0);
 
+        // Hold the lease for the whole of `run`, and stop holding it the
+        // instant `run` returns — the outcome write below is what closes
+        // the row out, and a renewal landing after it would be writing a
+        // lease onto a row that is no longer running.
+        let renewal = self.spawn_lease_renewal(job.id, kind.to_string());
+
         let started = Instant::now();
         let outcome = handler.run(&params, ctx).await;
         let elapsed = started.elapsed();
+
+        let lost_the_row = renewal.lost_the_row();
+        drop(renewal);
 
         // Emit in-flight gauge -1.
         metrics::gauge!(METRIC_IN_FLIGHT, "kind" => kind.to_string()).decrement(1.0);
@@ -421,6 +738,24 @@ impl TaskDispatcher {
         // Observe duration.
         metrics::histogram!(METRIC_DURATION, "kind" => kind.to_string())
             .record(elapsed.as_secs_f64());
+
+        if lost_the_row {
+            // The fence. Writing here would overwrite a row that is now
+            // someone else's — and the worst shape is not a lost result
+            // but a `reschedule` returning a row a live worker is
+            // mid-way through to `pending`, which invites a third
+            // concurrent execution and charges an attempt to the wrong
+            // run. The row's state is whatever its current holder makes
+            // it; this execution's only correct move is to stop.
+            tracing::error!(
+                job_id = %job.id,
+                kind,
+                "TaskDispatcher: discarding this handler's outcome — the row was handed to \
+                 another worker while the handler ran, so writing the outcome would clobber \
+                 an execution that is still in flight",
+            );
+            return;
+        }
 
         match outcome {
             Ok(task_outcome) => {
@@ -508,6 +843,34 @@ impl TaskDispatcher {
                 .increment(1);
             }
         }
+    }
+}
+
+/// Keeps a claim lease alive for as long as it is held.
+///
+/// A plain `JoinHandle` wrapper whose `Drop` aborts the renewal task, so
+/// the lease stops being extended on every exit path out of
+/// `dispatch_one` — including a panic unwinding through it. Letting the
+/// renewal outlive the handler would keep a finished row's lease fresh
+/// and, for a row whose outcome write failed, hide it from the very
+/// sweep that exists to recover it.
+struct LeaseRenewalGuard {
+    handle: tokio::task::JoinHandle<()>,
+    /// Raised by the renewal task when a renewal reports the row is no
+    /// longer this worker's. Read once, after the handler returns.
+    lost: Arc<AtomicBool>,
+}
+
+impl LeaseRenewalGuard {
+    /// Whether this worker lost the row while its handler was running.
+    fn lost_the_row(&self) -> bool {
+        self.lost.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for LeaseRenewalGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
     }
 }
 
@@ -618,8 +981,11 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
+    use hort_domain::error::DomainError;
     use hort_domain::error::DomainResult;
-    use hort_domain::ports::jobs_repository::{JobRow, JobStatus, JobsRepository, ScanJob};
+    use hort_domain::ports::jobs_repository::{
+        JobRow, JobStatus, JobsRepository, RequeuedJob, ScanJob,
+    };
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::ContentHash;
@@ -659,6 +1025,17 @@ mod tests {
 
     /// Controls what `claim_pending_by_kinds` returns: each call returns the
     /// next batch in the queue (oldest-first), or empty if the queue is empty.
+    /// One recorded `requeue_abandoned` invocation. A named struct
+    /// rather than a tuple so an assertion reads as the argument it is
+    /// checking rather than as `.2`.
+    #[derive(Debug, Clone)]
+    struct RequeueCall {
+        kinds: Vec<String>,
+        grace: Duration,
+        attempt_cap: u32,
+        batch_size: u16,
+    }
+
     struct DispatcherMockRepo {
         /// Pre-seeded batches; each `claim` call pops the front.
         claim_batches: Mutex<Vec<Vec<JobRow>>>,
@@ -673,6 +1050,16 @@ mod tests {
         /// When true, `reschedule` returns `Err` — exercises the
         /// "could not return the row to pending" error branch.
         reschedule_fails: Mutex<bool>,
+        /// Every `requeue_abandoned` call's arguments, in order.
+        requeue_calls: Mutex<Vec<RequeueCall>>,
+        /// What `requeue_abandoned` hands back.
+        requeue_result: Mutex<Vec<RequeuedJob>>,
+        /// When true, `requeue_abandoned` returns `Err`.
+        requeue_fails: Mutex<bool>,
+        /// `(job_id, worker_id)` of every `renew_lease` call, in order.
+        renew_calls: Mutex<Vec<(Uuid, String)>>,
+        /// What `renew_lease` answers: `Some(b)` → `Ok(b)`, `None` → `Err`.
+        renew_answer: Mutex<Option<bool>>,
     }
 
     impl DispatcherMockRepo {
@@ -686,6 +1073,11 @@ mod tests {
                 backlog: Mutex::new(Vec::new()),
                 backlog_fails: Mutex::new(false),
                 reschedule_fails: Mutex::new(false),
+                requeue_calls: Mutex::new(Vec::new()),
+                requeue_result: Mutex::new(Vec::new()),
+                requeue_fails: Mutex::new(false),
+                renew_calls: Mutex::new(Vec::new()),
+                renew_answer: Mutex::new(Some(true)),
             }
         }
 
@@ -723,9 +1115,71 @@ mod tests {
         fn mark_failed_calls(&self) -> Vec<(Uuid, String)> {
             self.mark_failed_calls.lock().unwrap().clone()
         }
+
+        fn seed_requeue_result(&self, rows: Vec<RequeuedJob>) {
+            *self.requeue_result.lock().unwrap() = rows;
+        }
+
+        fn fail_requeue(&self) {
+            *self.requeue_fails.lock().unwrap() = true;
+        }
+
+        fn requeue_calls(&self) -> Vec<RequeueCall> {
+            self.requeue_calls.lock().unwrap().clone()
+        }
+
+        fn set_renew_answer(&self, answer: Option<bool>) {
+            *self.renew_answer.lock().unwrap() = answer;
+        }
+
+        fn renew_calls(&self) -> Vec<(Uuid, String)> {
+            self.renew_calls.lock().unwrap().clone()
+        }
     }
 
     impl JobsRepository for DispatcherMockRepo {
+        fn renew_lease<'a>(
+            &'a self,
+            job_id: Uuid,
+            worker_id: &'a str,
+            _lock_duration: Duration,
+        ) -> BoxFuture<'a, DomainResult<bool>> {
+            self.renew_calls
+                .lock()
+                .unwrap()
+                .push((job_id, worker_id.to_string()));
+            let answer = *self.renew_answer.lock().unwrap();
+            Box::pin(async move {
+                match answer {
+                    Some(b) => Ok(b),
+                    None => Err(DomainError::Invariant("renew boom".into())),
+                }
+            })
+        }
+
+        fn requeue_abandoned<'a>(
+            &'a self,
+            kinds: &'a [&'a str],
+            grace: Duration,
+            attempt_cap: u32,
+            batch_size: u16,
+        ) -> BoxFuture<'a, DomainResult<Vec<RequeuedJob>>> {
+            self.requeue_calls.lock().unwrap().push(RequeueCall {
+                kinds: kinds.iter().map(ToString::to_string).collect(),
+                grace,
+                attempt_cap,
+                batch_size,
+            });
+            let fails = *self.requeue_fails.lock().unwrap();
+            let rows = self.requeue_result.lock().unwrap().clone();
+            Box::pin(async move {
+                if fails {
+                    return Err(DomainError::Invariant("requeue boom".into()));
+                }
+                Ok(rows)
+            })
+        }
+
         fn claim_scan_jobs<'a>(
             &'a self,
             _w: &'a str,
@@ -761,7 +1215,7 @@ mod tests {
             let fails = *self.reschedule_fails.lock().unwrap();
             Box::pin(async move {
                 if fails {
-                    Err(hort_domain::error::DomainError::Invariant("boom".into()))
+                    Err(DomainError::Invariant("boom".into()))
                 } else {
                     Ok(())
                 }
@@ -815,9 +1269,7 @@ mod tests {
             let rows = self.backlog.lock().unwrap().clone();
             Box::pin(async move {
                 if fails {
-                    Err(hort_domain::error::DomainError::Invariant(
-                        "backlog boom".into(),
-                    ))
+                    Err(DomainError::Invariant("backlog boom".into()))
                 } else {
                     Ok(rows)
                 }
@@ -1493,7 +1945,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(dispatcher.dispatch_one(row, handler))
+                .block_on(Arc::new(dispatcher).dispatch_one(row, handler))
         });
 
         let snap = snapshotter.snapshot().into_vec();
@@ -1526,7 +1978,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(dispatcher.dispatch_one(row, handler))
+                .block_on(Arc::new(dispatcher).dispatch_one(row, handler))
         });
 
         let snap = snapshotter.snapshot().into_vec();
@@ -1563,7 +2015,7 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(dispatcher.dispatch_one(row, handler))
+                .block_on(Arc::new(dispatcher).dispatch_one(row, handler))
         });
 
         let snap = snapshotter.snapshot().into_vec();
@@ -2052,6 +2504,421 @@ mod tests {
             ),
             0,
             "a kind claimed this tick must not be reported starved: {snapshot:?}"
+        );
+    }
+    // -----------------------------------------------------------------------
+    // Abandoned-lease sweep
+    // -----------------------------------------------------------------------
+
+    /// The sweep passes the policy allow-list, a grace derived from the
+    /// lease, the attempt cap and the batch bound — and the allow-list is
+    /// the domain constant, not this dispatcher's registered kinds.
+    ///
+    /// The distinction is load-bearing in a heterogeneous fleet: a
+    /// replica that registers no scan handler is still the right one to
+    /// hand a dead scanner's abandoned row back to a replica that does.
+    #[tokio::test]
+    async fn sweep_passes_the_policy_allow_list_and_a_lease_derived_grace() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let mut dispatcher = make_dispatcher(repo.clone() as Arc<dyn JobsRepository>);
+        // Register exactly one kind, and not one from the allow-list, so
+        // "the sweep asked for the registered kinds" cannot pass by
+        // coincidence.
+        dispatcher.register(
+            Arc::new(NoopHandler::new(
+                "retry-kind",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            1,
+        );
+        let dispatcher = Arc::new(dispatcher);
+
+        dispatcher.sweep_abandoned_leases().await;
+
+        let calls = repo.requeue_calls();
+        assert_eq!(calls.len(), 1, "one sweep pass, one query");
+        let call = &calls[0];
+        let expected: Vec<String> = REQUEUE_ON_LEASE_EXPIRY_KINDS
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            call.kinds, expected,
+            "the sweep's allow-list is the domain requeue policy, not the registered kinds"
+        );
+        assert_eq!(
+            call.grace,
+            Duration::from_secs(60) * LEASE_EXPIRY_GRACE_MULTIPLE,
+            "grace is a multiple of this dispatcher's lease, not a fixed constant"
+        );
+        assert_eq!(call.attempt_cap, LEASE_REQUEUE_ATTEMPT_CAP);
+        assert_eq!(call.batch_size, LEASE_SWEEP_BATCH);
+    }
+
+    /// Both sweep outcomes land on
+    /// `hort_admin_tasks_lease_requeued_total`, labelled by kind and
+    /// result — so a replica dying every few minutes shows up as a rate
+    /// instead of being silently compensated.
+    #[test]
+    fn sweep_counts_both_outcomes_per_kind() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.seed_requeue_result(vec![
+            RequeuedJob {
+                id: Uuid::new_v4(),
+                kind: "scan".to_string(),
+                attempts: 2,
+                outcome: RequeueOutcome::Requeued,
+            },
+            RequeuedJob {
+                id: Uuid::new_v4(),
+                kind: "scan".to_string(),
+                attempts: 3,
+                outcome: RequeueOutcome::Requeued,
+            },
+            RequeuedJob {
+                id: Uuid::new_v4(),
+                kind: "prefetch".to_string(),
+                attempts: LEASE_REQUEUE_ATTEMPT_CAP,
+                outcome: RequeueOutcome::RetriesExhausted,
+            },
+        ]);
+        let dispatcher = Arc::new(make_dispatcher(repo as Arc<dyn JobsRepository>));
+
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(dispatcher.sweep_abandoned_leases())
+        });
+
+        let snap = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_value(
+                &snap,
+                METRIC_LEASE_REQUEUED,
+                &[("kind", "scan"), ("result", REQUEUE_RESULT_REQUEUED)]
+            ),
+            2,
+        );
+        assert_eq!(
+            counter_value(
+                &snap,
+                METRIC_LEASE_REQUEUED,
+                &[("kind", "prefetch"), ("result", REQUEUE_RESULT_EXHAUSTED)]
+            ),
+            1,
+        );
+    }
+
+    /// A sweep query that fails is logged and swallowed — the poll loop
+    /// keeps claiming. Recovery is best-effort housekeeping; a database
+    /// flap must not take the worker down with it.
+    #[tokio::test]
+    async fn sweep_swallows_a_failing_query() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.fail_requeue();
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+
+        dispatcher.sweep_abandoned_leases().await;
+
+        assert_eq!(repo.requeue_calls().len(), 1, "the query was attempted");
+    }
+
+    /// An empty sweep emits nothing. The counter is an alerting signal,
+    /// so the quiet case has to be genuinely quiet.
+    #[test]
+    fn sweep_with_nothing_to_do_emits_no_counter() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let dispatcher = Arc::new(make_dispatcher(repo as Arc<dyn JobsRepository>));
+
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(dispatcher.sweep_abandoned_leases())
+        });
+
+        let snap = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_value(
+                &snap,
+                METRIC_LEASE_REQUEUED,
+                &[("kind", "scan"), ("result", REQUEUE_RESULT_REQUEUED)]
+            ),
+            0,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lease renewal
+    // -----------------------------------------------------------------------
+
+    /// A handler that outlives its lease keeps the lease alive.
+    ///
+    /// This is the property the whole discriminator rests on: without it
+    /// a slow task and a dead worker are the same observation. Driven on
+    /// a paused clock so the assertion is about the renewal interval
+    /// (`lock_duration / RENEWALS_PER_LEASE`), not about wall time.
+    #[tokio::test(start_paused = true)]
+    async fn a_handler_outliving_its_lease_keeps_renewing() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let lease = Duration::from_secs(60);
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+
+        let guard = dispatcher.spawn_lease_renewal(Uuid::new_v4(), "scan".to_string());
+        // Three lease-lengths of a task that does not return.
+        tokio::time::sleep(lease * 3 + Duration::from_secs(1)).await;
+        drop(guard);
+
+        let calls = repo.renew_calls();
+        assert_eq!(
+            calls.len(),
+            (3 * RENEWALS_PER_LEASE) as usize,
+            "expected {RENEWALS_PER_LEASE} renewals per lease over three leases, got {}",
+            calls.len()
+        );
+        assert!(
+            calls.iter().all(|(_, w)| w == "test-worker"),
+            "the renewal must fence on this worker's id, or it would extend a lease it no \
+             longer holds"
+        );
+    }
+
+    /// Dropping the guard stops the renewals. A finished row whose lease
+    /// kept being extended would be invisible to the very sweep that
+    /// exists to recover it if its outcome write failed.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_guard_stops_renewal() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+
+        let guard = dispatcher.spawn_lease_renewal(Uuid::new_v4(), "scan".to_string());
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        let during = repo.renew_calls().len();
+        assert_eq!(during, 1, "one renewal at the 20 s tick of a 60 s lease");
+        drop(guard);
+
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(
+            repo.renew_calls().len(),
+            during,
+            "no renewal may land after the guard is dropped"
+        );
+    }
+
+    /// A renewal that reports the row is no longer ours stops renewing
+    /// and counts the fencing signal. Continuing would mean repeatedly
+    /// trying to extend a lease on someone else's row.
+    #[test]
+    fn a_lost_row_stops_renewal_and_counts_it() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.set_renew_answer(Some(false));
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let guard = dispatcher.spawn_lease_renewal(Uuid::new_v4(), "scan".to_string());
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                drop(guard);
+            });
+        });
+
+        assert_eq!(
+            repo.renew_calls().len(),
+            1,
+            "renewal must stop at the first 'not yours' answer, not keep hammering"
+        );
+        let snap = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_value(
+                &snap,
+                METRIC_LEASE_RENEW_FAILED,
+                &[("kind", "scan"), ("result", RENEW_RESULT_LOST)]
+            ),
+            1,
+        );
+    }
+
+    /// A renewal that errors is transient: it counts, and the next tick
+    /// tries again. With three renewals per lease, one failure still
+    /// leaves two chances before the lease lapses.
+    #[test]
+    fn a_failing_renewal_counts_and_retries() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.set_renew_answer(None);
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let guard = dispatcher.spawn_lease_renewal(Uuid::new_v4(), "scan".to_string());
+                tokio::time::sleep(Duration::from_secs(61)).await;
+                drop(guard);
+            });
+        });
+
+        assert_eq!(
+            repo.renew_calls().len(),
+            3,
+            "an erroring renewal must retry on the next tick, not give up"
+        );
+        let snap = snapshotter.snapshot().into_vec();
+        assert_eq!(
+            counter_value(
+                &snap,
+                METRIC_LEASE_RENEW_FAILED,
+                &[("kind", "scan"), ("result", RENEW_RESULT_ERROR)]
+            ),
+            3,
+        );
+    }
+
+    /// A worker that lost its row writes nothing.
+    ///
+    /// The fence, end to end. Without it, a stale worker finishing after
+    /// the sweep handed its row on would write over an execution that is
+    /// still in flight — and the damaging shape is not the lost result
+    /// but a `reschedule` putting a live worker's row back to `pending`,
+    /// which invites a third concurrent execution and charges an attempt
+    /// to the wrong run. So the assertion is about *all three* write
+    /// paths being silent, not just the completed one.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_lost_its_row_discards_its_outcome() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        repo.set_renew_answer(Some(false));
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+        // 150 s of work against a 60 s lease, so the first renewal tick
+        // (20 s in) lands well before the handler returns.
+        let handler: Arc<dyn TaskHandler> = Arc::new(SlowHandler {
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+            current: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 150_000,
+        });
+        let row = make_job_row("slow-kind");
+
+        dispatcher.dispatch_one(row, handler).await;
+
+        assert_eq!(repo.renew_calls().len(), 1, "renewal stopped at the fence");
+        assert!(
+            repo.mark_completed_calls().is_empty(),
+            "a fenced worker must not complete a row it no longer holds"
+        );
+        assert!(
+            repo.reschedule_calls().is_empty(),
+            "the reschedule is the dangerous one: it would return a row a live worker is \
+             mid-way through to 'pending'"
+        );
+        assert!(
+            repo.mark_failed_calls().is_empty(),
+            "a fenced worker must not fail a row it no longer holds"
+        );
+    }
+
+    /// The fence does not fire on the ordinary path — a handler that
+    /// keeps its row writes its outcome as usual.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_keeps_its_row_writes_its_outcome() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+        let handler: Arc<dyn TaskHandler> = Arc::new(SlowHandler {
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+            current: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 150_000,
+        });
+        let row = make_job_row("slow-kind");
+        let row_id = row.id;
+
+        dispatcher.dispatch_one(row, handler).await;
+
+        assert_eq!(
+            repo.mark_completed_calls(),
+            vec![row_id],
+            "renewals kept answering 'still yours', so the outcome must be written"
+        );
+    }
+
+    /// A zero lease does not become a hot loop.
+    ///
+    /// `HORT_SCANNER_LOCK_DURATION_SECS` is operator-set and parses `0`.
+    /// Unclamped, `0 / 3` is a zero-length sleep and the renewal task
+    /// would issue `UPDATE`s as fast as the connection returns them —
+    /// turning a misconfigured queue into load on the database.
+    #[tokio::test(start_paused = true)]
+    async fn a_zero_lease_does_not_spin_the_renewal() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let dispatcher = Arc::new(TaskDispatcher::new(
+            repo.clone() as Arc<dyn JobsRepository>,
+            crate::event_store_publisher::wrap_for_test(Arc::new(NoopEventStore)),
+            "test-worker",
+            Duration::ZERO,
+            999_999,
+            16,
+        ));
+
+        let guard = dispatcher.spawn_lease_renewal(Uuid::new_v4(), "scan".to_string());
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        drop(guard);
+
+        // A range, not an exact count: the paused clock interleaves the
+        // renewal task's own sleeps with this one, so the last tick may
+        // or may not land inside the window. The property being pinned
+        // is "paced by the floor", and an unclamped zero interval would
+        // not miss it by one — it would never stop running.
+        let n = repo.renew_calls().len();
+        assert!(
+            (9..=11).contains(&n),
+            "a zero lease must fall back to the one-second floor, not spin; got {n} renewals \
+             in ten seconds"
+        );
+    }
+
+    /// `dispatch_one` holds the lease across the handler and releases it
+    /// when the handler returns — the wiring, not just the helper.
+    #[tokio::test(start_paused = true)]
+    async fn dispatch_one_renews_while_the_handler_runs_and_stops_after() {
+        let repo = Arc::new(DispatcherMockRepo::new());
+        let dispatcher = Arc::new(make_dispatcher(repo.clone() as Arc<dyn JobsRepository>));
+        // 150 s of work against a 60 s lease → two renewal ticks (20 s
+        // and 40 s of each lease, i.e. at 20/40/60/80/100/120/140 s).
+        let handler: Arc<dyn TaskHandler> = Arc::new(SlowHandler {
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+            current: Arc::new(AtomicUsize::new(0)),
+            delay_ms: 150_000,
+        });
+        let row = make_job_row("slow-kind");
+
+        dispatcher.dispatch_one(row, handler).await;
+
+        let during = repo.renew_calls().len();
+        assert_eq!(
+            during, 7,
+            "a 150 s handler against a 60 s lease renews every 20 s"
+        );
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(
+            repo.renew_calls().len(),
+            during,
+            "the lease must stop being renewed once the handler has returned"
         );
     }
 }
