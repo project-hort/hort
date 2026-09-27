@@ -45,7 +45,7 @@ use uuid::Uuid;
 
 async fn admin_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
+    Some(hort_adapters_postgres::test_support::connect_or_panic(&url).await)
 }
 
 async fn create_temp_db(admin: &PgPool) -> (String, PgPool) {
