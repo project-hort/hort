@@ -392,6 +392,43 @@ fails, it has already kicked off a warm for the whole cold set (same batched
 re-running the release rather than retrying immediately — the immediate
 retry will just report the same list again.
 
+## Base images: warm the pinned digests before tagging
+
+`build-images:*` (GitLab) builds from the digest-pinned `FROM …@sha256:` lines
+in `docker/Dockerfile.hort-server`, `docker/Dockerfile.worker` and
+`deploy/compose/Dockerfile`, and resolves them through the dogfood proxy. MR
+pipelines build no images, so without a warm the **first** request for a newly
+pinned digest is the release build itself: ingest and the ADR 0007 observation
+window start inside that build, which then fails for exactly one window with
+`503 artifact is quarantined`. The rule is the same as the crates warm above —
+**the warm must lead the tag by at least one quarantine window** — and three
+things about it decide what to do on release day:
+
+- **A digest bump is a warm-requiring change.** The `warm:base-images` job pulls
+  the whole pinned set through the proxy on every push to `develop` and on
+  schedule, so a routine cut is usually already covered. A digest that landed on
+  `develop` inside the last window is not.
+- **Reaching every object takes more than one warm run.** A quarantined manifest
+  answers 503 with no body, so nothing can enumerate the config and layer digests
+  underneath it until that manifest is released. The first warm after a bump
+  therefore reaches the manifest level — the index plus every child manifest it
+  declares, whose windows all run from that moment — and a later warm reaches the
+  config and layer blobs. Those blobs are referenced-tree descendants of an
+  already-ingested manifest, so they arrive with their window already elapsed and
+  are released by their own clean scan rather than by a second full window. The
+  lead time to plan for is **one window plus one further warm run**, not one
+  window.
+- **Release-day slack is the sweep tick, not the deadline.** Release follows the
+  quarantine-release sweep, which costs a further five to ten minutes after a
+  deadline passes: of three artifacts past their deadline, one answered 200 while
+  two still answered 503. Do not compute the tag time from the deadline.
+
+If a release build does hit the 503, do **not** retry it immediately, and do not
+drive a retry off `Retry-After` — past the deadline that header is the clamp
+value (`Retry-After: 1`), so a well-behaved client retries every second and
+learns nothing. Let `warm:base-images` run (a `develop` push, or the schedule),
+wait out the window, then re-run the build.
+
 ## Docker tags (`docker-publish.yml`, on `v*` tags)
 
 - `:latest` is set **only** for a stable tag (no pre-release suffix) — so
