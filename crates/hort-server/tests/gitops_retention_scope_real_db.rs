@@ -27,7 +27,11 @@
 //! Mirrors `task_use_case_enqueue_real_db`: every test early-returns
 //! when `DATABASE_URL` is unset, so the suite stays green without a
 //! database. The pool is a per-test throwaway database
-//! (`isolated_db_from`), so these tests need no cross-crate serial key.
+//! (`isolated_db_from`) — which isolates the *rows*, not the server:
+//! creating and migrating that database is cluster-global work
+//! (`CREATE DATABASE`, the migration set's `CREATE ROLE`, the shared
+//! catalogs the stale-database sweeper walks), so each test also carries
+//! the workspace-wide `#[serial(hort_pg_db)]` key.
 //!
 //! ```bash
 //! DATABASE_URL=postgresql://registry:registry@localhost:30432/artifact_registry \
@@ -41,6 +45,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+use serial_test::serial;
 use sqlx::{PgPool, Row};
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -142,6 +147,7 @@ async fn repository_id(pool: &PgPool, key: &str) -> Uuid {
 
 /// The acceptance case, end to end: names in, ids on the projection.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn named_repos_scope_lands_on_the_projection_as_uuids() {
     let Some(pool) = isolated_pool().await else {
         return;
@@ -182,6 +188,7 @@ async fn named_repos_scope_lands_on_the_projection_as_uuids() {
 /// the pipeline fills after the repository rows are written, so the new
 /// name is already there.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn a_repository_declared_in_the_same_bundle_resolves_on_the_update_path() {
     let Some(pool) = isolated_pool().await else {
         return;
@@ -225,6 +232,7 @@ async fn a_repository_declared_in_the_same_bundle_resolves_on_the_update_path() 
 /// pre-flight validation stage, not a mid-apply crash — and the message
 /// names the offending value.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn an_undeclared_repository_is_rejected_at_apply() {
     let Some(pool) = isolated_pool().await else {
         return;
@@ -267,6 +275,7 @@ async fn an_undeclared_repository_is_rejected_at_apply() {
 /// A repository UUID is no longer a form this surface accepts: it is
 /// read as a name, matches no declared repository, and is rejected.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn a_scope_still_written_as_uuids_is_rejected() {
     let Some(pool) = isolated_pool().await else {
         return;

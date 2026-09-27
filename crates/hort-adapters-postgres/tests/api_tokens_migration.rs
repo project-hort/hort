@@ -27,41 +27,11 @@
 #![allow(clippy::expect_used)]
 
 use std::env;
-use std::sync::OnceLock;
 
+use serial_test::serial;
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, Executor, PgPool, Row};
-use tokio::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
-
-/// Per-binary serialization gate for the three shared-DB tests
-/// `applies_on_init23_baseline`, `description_length_check_rejects_2kb`
-/// and `kind_check_rejects_unknown_value`. They probe / INSERT
-/// `public.api_tokens` on the shared test database; this per-binary
-/// lock keeps them from racing each other under cargo's intra-binary
-/// test parallelism.
-///
-/// `idempotent_after_rollback` deliberately does NOT take this lock and
-/// does NOT touch the shared database. Its `DROP TABLE … CASCADE` plus
-/// version-8-only `_sqlx_migrations` rewind is globally destructive: the
-/// `CASCADE` drops FKs that other tables depend on (for example
-/// `subscriptions.created_by_token_id`), and only version 8 is
-/// re-applied, so dependent later migrations are not recreated. A
-/// binary-scoped lock cannot contain that, because cargo runs test
-/// binaries in parallel — the destructive test would corrupt the shared
-/// schema other test binaries use concurrently (this was a real
-/// cross-binary CI flake). It is therefore isolated to its own
-/// throwaway database, not merely locked.
-fn serial_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-/// Acquire the per-binary serial lock for the test's duration. Held
-/// until the returned guard is dropped at the end of the test body.
-async fn lock_serial() -> MutexGuard<'static, ()> {
-    serial_lock().lock().await
-}
 
 /// Connect as the migration superuser; run all migrations cleanly.
 /// Returns `None` when `DATABASE_URL` is unset.
@@ -109,8 +79,8 @@ async fn create_test_user(pool: &PgPool) -> Uuid {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn applies_on_baseline() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -160,21 +130,26 @@ async fn applies_on_baseline() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn idempotent_after_rollback() {
-    // NO shared `lock_serial()` / `admin_pool()`. This test's
-    // `DROP TABLE … CASCADE` + version-8-only `_sqlx_migrations` rewind
-    // is globally destructive on whatever database it runs against (the
-    // `CASCADE` collaterally drops every FK that depends on
-    // `api_tokens` — e.g. `subscriptions.created_by_token_id` — and
-    // rewinding only version 8 means dependent later migrations such as
-    // 013 are NOT recreated, so the FK stays gone). Run it against a
-    // dedicated throwaway database so it can never corrupt the shared
-    // test DB that sibling test binaries use concurrently (cargo runs
-    // test binaries in parallel — this was a real cross-binary flake:
-    // `subscription_repo::api_tokens_id_delete_sets_null` saw the
+    // This test builds its own throwaway database rather than taking one
+    // from `admin_pool()`. Its `DROP TABLE … CASCADE` + version-8-only
+    // `_sqlx_migrations` rewind is globally destructive on whatever
+    // database it runs against: the `CASCADE` collaterally drops every
+    // FK that depends on `api_tokens` — e.g.
+    // `subscriptions.created_by_token_id` — and rewinding only version 8
+    // means dependent later migrations such as 013 are NOT recreated, so
+    // the FK stays gone. That once reached a sibling
+    // (`subscription_repo::api_tokens_id_delete_sets_null` saw the
     // CASCADE-dropped FK and failed). The test's purpose — "is
     // `008_api_tokens.sql` re-runnable from a baseline?" — is fully
     // self-contained and needs no shared state.
+    //
+    // A dedicated database is not on its own a reason to skip
+    // `#[serial(hort_pg_db)]`: the `CREATE`/`DROP DATABASE` below and
+    // the migration set's cluster-global `CREATE ROLE` are server-wide
+    // work that collides with a concurrent sibling through the cluster,
+    // whichever database each of them is connected to.
     let Some(base_url) = env::var("DATABASE_URL").ok() else {
         return;
     };
@@ -261,8 +236,8 @@ async fn idempotent_after_rollback() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn description_length_check_rejects_2kb() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -307,8 +282,8 @@ async fn description_length_check_rejects_2kb() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn kind_check_rejects_unknown_value() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };

@@ -22,12 +22,11 @@
 #![allow(clippy::expect_used)]
 
 use std::env;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serial_test::serial;
 use sqlx::PgPool;
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
 
 use hort_adapters_postgres::scanner_registry_repository::PgScannerRegistryRepository;
@@ -42,20 +41,8 @@ async fn admin_pool() -> Option<PgPool> {
     Some(pool)
 }
 
-/// Per-binary serialization gate. Mirrors the `jobs_repository.rs`
-/// rationale — the table is shared across cargo's intra-binary
-/// parallelism and rows would otherwise interfere across tests.
-fn serial_lock() -> &'static AsyncMutex<()> {
-    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| AsyncMutex::new(()))
-}
-
-async fn lock_serial() -> AsyncMutexGuard<'static, ()> {
-    serial_lock().lock().await
-}
-
-/// Generate a unique worker_id per test so concurrent test binaries
-/// don't collide on the primary key.
+/// Generate a unique worker_id per test so a leftover row can never be
+/// mistaken for this test's own.
 fn fresh_worker_id() -> String {
     format!("test-worker-{}", Uuid::new_v4())
 }
@@ -79,8 +66,8 @@ async fn fetch_row(
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn upsert_self_inserts_new_row_with_now_timestamps() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -106,8 +93,8 @@ async fn upsert_self_inserts_new_row_with_now_timestamps() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn upsert_self_preserves_registered_at_on_conflict() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -135,8 +122,8 @@ async fn upsert_self_preserves_registered_at_on_conflict() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn upsert_self_rewrites_backends_on_conflict() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -160,8 +147,8 @@ async fn upsert_self_rewrites_backends_on_conflict() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn refresh_heartbeat_updates_last_heartbeat() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -186,8 +173,8 @@ async fn refresh_heartbeat_updates_last_heartbeat() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_all_returns_every_registered_worker() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -226,8 +213,8 @@ async fn list_all_returns_every_registered_worker() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn prune_stale_deletes_only_rows_older_than_horizon() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };

@@ -34,13 +34,13 @@
 #![allow(clippy::expect_used)]
 
 use std::env;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
+use serial_test::serial;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
 
 use hort_adapters_postgres::api_token_revocation_listener::{
@@ -112,40 +112,21 @@ async fn try_recv(listener: &mut PgListener, max_wait: Duration) -> Option<Strin
     }
 }
 
-/// Per-binary serialization gate.
-///
-/// All four tests in this binary listen on the production
-/// `REVOCATION_CHANNEL` — the file tests the production NOTIFY
-/// contract (user_repo's hardcoded emitter on user deactivation), so
-/// the unique-per-test channel pattern from
-/// `api_token_revocation_listener.rs` does not apply here.
-///
-/// Postgres `LISTEN/NOTIFY` broadcasts to every listener on a channel.
-/// Without serialization, a sibling test's NOTIFY is observed by this
-/// test's listener under cargo test's intra-binary parallelism.
-/// `save_with_is_active_true_does_not_emit_notify` is structurally a
-/// negative-assertion test and would observe sibling notifies as
-/// false positives; the positive-assertion siblings would mis-read a
-/// neighbour's user UUID as their own. Serialization removes both.
-///
-/// Cargo runs different test binaries sequentially by default, so a
-/// binary-scoped lock is sufficient — sibling binaries (e.g.
-/// `api_token_revocation_listener.rs`, which uses unique channels
-/// anyway) are not affected.
-fn serial_lock() -> &'static AsyncMutex<()> {
-    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| AsyncMutex::new(()))
-}
-
-/// Acquire the per-binary serial lock for the test's duration. Held
-/// until the returned guard is dropped at the end of the test body.
-async fn lock_serial() -> AsyncMutexGuard<'static, ()> {
-    serial_lock().lock().await
-}
+// Why every test here carries `#[serial(hort_pg_db)]` and not just the
+// workspace rule's reasons: all four listen on the production
+// `REVOCATION_CHANNEL`, because the file tests the production NOTIFY
+// contract (user_repo's hardcoded emitter on user deactivation) — the
+// unique-per-test channel pattern from
+// `api_token_revocation_listener.rs` does not apply. Postgres
+// `LISTEN/NOTIFY` broadcasts to every listener on a channel, so a
+// concurrent sibling's notification lands in this test's listener:
+// `save_with_is_active_true_does_not_emit_notify` asserts silence and
+// would read it as a false positive, and the positive-assertion tests
+// would mis-read a neighbour's user UUID as their own.
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn save_with_is_active_false_emits_user_prefix_notify() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         eprintln!("DATABASE_URL not set; skipping DB-gated test");
         return;
@@ -169,8 +150,8 @@ async fn save_with_is_active_false_emits_user_prefix_notify() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn save_with_is_active_true_does_not_emit_notify() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         eprintln!("DATABASE_URL not set; skipping DB-gated test");
         return;
@@ -195,8 +176,8 @@ async fn save_with_is_active_true_does_not_emit_notify() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn save_active_then_deactivate_only_second_emits_notify() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         eprintln!("DATABASE_URL not set; skipping DB-gated test");
         return;
@@ -281,8 +262,8 @@ impl ApiTokenCacheInvalidator for CountingInvalidator {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn user_deactivation_invalidates_cached_pat_via_listener() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         eprintln!("DATABASE_URL not set; skipping DB-gated test");
         return;

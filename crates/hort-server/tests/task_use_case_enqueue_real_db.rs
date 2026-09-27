@@ -44,6 +44,7 @@ use std::env;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use serial_test::serial;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -116,6 +117,7 @@ fn rbac_with_task_invoke() -> Arc<ArcSwap<RbacEvaluator>> {
 /// trigger_source literal absent from the SQL CHECK (the historical
 /// "api" regression), every iteration fails with a 23514 violation.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn enqueue_accepts_every_valid_kind() {
     let Some(pool) = admin_pool().await else {
         // No DATABASE_URL — silently skip (matches the convention used

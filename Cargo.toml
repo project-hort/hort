@@ -323,7 +323,7 @@ hmac = "0.13"
 # formatting of its own, so `hex::encode` is how every finalised digest
 # reaches its wire form: the CAS `ContentHash`, the OCI `sha256:<hex>`
 # digest, npm's `dist.shasum`, and the webhook HMAC-SHA256 signature
-# (`X-Ak-Signature: sha256=<hex>`).
+# (`X-Hort-Signature: sha256=<hex>`).
 hex = "0.4"
 # params_digest on TaskInvoked uses BLAKE3-256. BLAKE3 is not
 # cryptographically weaker than SHA-256 for this use case

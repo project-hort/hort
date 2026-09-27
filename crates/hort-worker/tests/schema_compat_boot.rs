@@ -28,6 +28,7 @@ use std::env;
 use std::time::Duration;
 
 use hort_worker::composition::assert_schema_current;
+use serial_test::serial;
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
@@ -138,6 +139,7 @@ async fn insert_register_row(pool: &PgPool, version: i64, min_binary_version: Op
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migrated_db_returns_ok() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -160,6 +162,7 @@ async fn migrated_db_returns_ok() {
 /// and records a version this binary does not embed, strictly newer than
 /// everything it does, recorded as an expansion. The worker must start.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_schema_is_supported() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -185,6 +188,7 @@ async fn newer_schema_is_supported() {
 /// asks, so a contraction the worker is too old for refuses its boot too —
 /// with the migration and the version it would work from named.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_contraction_above_this_binary_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -214,6 +218,7 @@ async fn newer_contraction_above_this_binary_bails() {
 /// Fail closed on the worker side too: an applied migration it does not
 /// embed and the register does not cover is assumed to be a contraction.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_migration_without_a_register_row_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -242,6 +247,7 @@ async fn newer_migration_without_a_register_row_bails() {
 /// A schema behind the binary is still the ordinary upgrade path and must
 /// still refuse, with the wording that names the corrective action.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn behind_schema_bails_with_mismatch() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -277,6 +283,7 @@ async fn behind_schema_bails_with_mismatch() {
 /// A hole below the newest applied version is a broken history, not a
 /// version skew, and is refused with the offending version named.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn mid_sequence_hole_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -313,6 +320,7 @@ async fn mid_sequence_hole_bails() {
 /// The bookkeeping table does not exist at all — the worker points the
 /// operator at the migration step, in its own wording.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn fresh_db_bails_with_table_missing() {
     let Some(admin) = admin_pool().await else {
         return;

@@ -60,6 +60,7 @@ use std::env;
 use std::time::Duration;
 
 use hort_server::migrate::{assert_current, MIGRATOR};
+use serial_test::serial;
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
@@ -204,6 +205,7 @@ async fn insert_fake_migration(pool: &PgPool, version: i64) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn fresh_db_bails_with_table_missing() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -232,6 +234,7 @@ async fn fresh_db_bails_with_table_missing() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migrated_db_returns_ok() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -255,6 +258,7 @@ async fn migrated_db_returns_ok() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn behind_schema_bails_with_mismatch() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -309,6 +313,7 @@ async fn behind_schema_bails_with_mismatch() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn ahead_schema_is_supported() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -342,6 +347,7 @@ async fn ahead_schema_is_supported() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn many_newer_expansions_are_supported() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -374,6 +380,7 @@ async fn many_newer_expansions_are_supported() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_contraction_above_this_binary_bails_and_names_the_way_out() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -414,6 +421,7 @@ async fn newer_contraction_above_this_binary_bails_and_names_the_way_out() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_migration_without_a_register_row_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -450,6 +458,7 @@ async fn newer_migration_without_a_register_row_bails() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn unknown_version_below_the_waterline_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -490,6 +499,7 @@ async fn unknown_version_below_the_waterline_bails() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn missing_mid_sequence_version_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -533,6 +543,7 @@ async fn missing_mid_sequence_version_bails() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn permission_denied_bails_with_grant_message() {
     let Some(admin) = admin_pool().await else {
         return;

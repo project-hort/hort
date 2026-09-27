@@ -135,7 +135,7 @@ pub enum SubscriptionTarget {
         /// `HORT_WEBHOOK_ALLOW_PLAINTEXT=true` (composition-root knob).
         url: Url,
         /// Reference to the shared secret used to HMAC-sign deliveries
-        /// (`X-Ak-Signature: sha256=<hex>`). Resolved at delivery time
+        /// (`X-Hort-Signature: sha256=<hex>`). Resolved at delivery time
         /// via [`SecretPort`]; the **plaintext bytes never touch the
         /// subscription row** — only the `(source, location)` locator
         /// does.
