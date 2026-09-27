@@ -194,6 +194,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The response that triggers a quarantine reported a flat 3600 s
+  `Retry-After`** (#240). A pull-through `GET` that ingested and quarantined
+  an artifact answered `503 UNAVAILABLE` with `retry_after_seconds: 3600`
+  whatever the policy's window, while a later read of the same row reported a
+  correctly computed remaining time (observed against a 48-hour policy: 3600
+  on the triggering response, 143914 on a later one). The computation was
+  never wrong; `quarantine_deadline` is transient and non-persisted — the
+  schema stores only the immutable anchor `quarantine_window_start` and the
+  deadline is derived live, so the Postgres row mapper yields `None` — and
+  nothing on the ingest path filled it in, so the consuming handler's
+  deadline-unknown constant fired on the one response where Hort had just
+  computed the window in order to create it. Wrong in the load-generating
+  direction: a client honouring it returns after an hour on a 48-hour window
+  and is refused again, roughly 47 times.
+
+  Both halves of the ingest path now hydrate, at the use-case layer, so every
+  format's quarantine response inherits the fix with no change of its own.
+  `ArtifactUseCase::find_in_repo_by_hash` — the post-coalesce recovery read
+  the OCI blob and manifest, Cargo, npm, PyPI and Maven pull-through tails all
+  take, since the leg that fetched from upstream discards its own ingest
+  outcome — hydrates through the same `hydrate_quarantine_deadline` a later
+  read goes through. The two `IngestUseCase` mint paths stamp the pair from
+  the anchor and duration already in hand (no extra policy resolution), which
+  covers the cross-repo coalesced-follower row that has no later read to
+  hydrate it. The shared arithmetic lives in one place
+  (`use_cases::quarantine_hold`) so the two layers cannot report different
+  remaining windows for one artifact.
+
+  The deadline is measured from the **derived** anchor, never from `now`:
+  ADR 0054's anchor may legitimately predate the ingest (in the observed case
+  `library/hello-world` inherited an eight-hour-old anchor through the
+  `first_seen` age source, which is why the correct later value was 143914 and
+  not 172800), so reporting the policy duration would be wrong in the other
+  direction — and wrong invisibly, since it looks right on any freshly-seen
+  artifact. No change to the window, the release predicate, the past-deadline
+  clamp, or the `Retry-After` suppression for a hold with no self-resolving
+  deadline.
+
 - **A soft delete never released the content reference, so the bytes had no
   release path at all** (#295). `ArtifactUseCase::delete` is an event-sourced
   soft delete: the adapter appends `ArtifactDeleted` and sets

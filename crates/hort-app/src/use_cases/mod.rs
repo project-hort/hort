@@ -103,6 +103,10 @@ pub mod promotion_use_case;
 // Second stage of the two-stage retention split; refuses to run until
 // the refcount-reconcile gate reports convergence.
 pub mod purge_use_case;
+// Shared computation of the transient (non-persisted) `quarantine_deadline`
+// / `provenance_hold_indefinite` pair, so the read path and the two ingest
+// mint paths cannot report different remaining windows for one artifact.
+pub(crate) mod quarantine_hold;
 pub mod quarantine_use_case;
 pub(crate) mod rejected_reevaluation;
 // `RbacResolveUseCase` backing

@@ -2841,10 +2841,11 @@ pub async fn build_app_context(
         // download-audit emit. Fail-open; no-op unless the served
         // repository has `download_audit_enabled = true`.
         .with_audit_events(event_publisher.clone())
-        // Issue #76 item 2/2: resolves the real policy-duration for
+        // Resolves the real matched-policy duration for
         // `hydrate_quarantine_deadline` (the `find_visible_by_path` /
-        // `find_visible_by_id` read paths) instead of the pre-#76 bare-
-        // anchor approximation.
+        // `find_visible_by_id` / `find_in_repo_by_hash` read paths), so a
+        // `Retry-After` is the configured observation window rather than
+        // the bare anchor.
         .with_policy_projections(policy_projections.clone())
         // ADR 0039 D5: lets the same hydration answer whether an
         // already-expired hold is waiting on a signature, so the OCI 503

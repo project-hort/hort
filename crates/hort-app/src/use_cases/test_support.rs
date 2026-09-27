@@ -253,8 +253,28 @@ impl MockArtifactRepository {
         self.oci_calls.lock().unwrap().clone()
     }
 
+    /// Store (or replace) a row, **dropping the transient hold pair** the
+    /// way the real projection does.
+    ///
+    /// `quarantine_deadline` / `provenance_hold_indefinite` are not
+    /// columns: the schema keeps only the window anchor and
+    /// `hort-adapters-postgres`'s row mapper yields `None` / `false`
+    /// unconditionally, so nothing a caller stamped on an in-memory
+    /// `Artifact` can survive a write-then-read through Postgres. Keeping
+    /// them here would make this mock the ONE place in the system where a
+    /// use case appears to hand a hydrated row to a later reader, which is
+    /// exactly the difference that lets an un-hydrated read path look
+    /// correct in tests and answer with the consuming handler's
+    /// deadline-unknown fallback in production.
+    ///
+    /// Every write reaches the map through here, including
+    /// `MockArtifactLifecycle`'s `commit_transition*`, so this is the only
+    /// place the clear has to happen.
     pub fn insert(&self, artifact: Artifact) {
-        self.artifacts.lock().unwrap().insert(artifact.id, artifact);
+        let mut row = artifact;
+        row.quarantine_deadline = None;
+        row.provenance_hold_indefinite = false;
+        self.artifacts.lock().unwrap().insert(row.id, row);
     }
 
     /// Friendly alias for [`Self::insert`] for the
