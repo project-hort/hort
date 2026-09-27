@@ -259,6 +259,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A failed OCI manifest `DELETE` stranded a live manifest without its
+  keepalive edges** (#301). The digest-`DELETE` handler swept the manifest's
+  `content_references` rows *before* the lifecycle delete, non-transactionally
+  and warn-on-fail, then called `ArtifactUseCase::delete`. A failure in the
+  second step returned 500 and left a live, servable manifest whose
+  `oci_config` / `oci_layer` / `oci_index_member` keepalive edges were
+  permanently gone — `PgRefcountReconcile` re-creates only the single-target
+  `primary_content` / `metadata_blob` kinds, so nothing repairs them. The
+  manifest's config and layer blobs became GC-collectable while every read path
+  still considered the manifest healthy, and at the next purge the bytes
+  vanished underneath it. The two calls are now in the other order: the
+  lifecycle delete commits first, so a failed delete returns 500 with every
+  edge intact, and the sweep runs on the committed-transition side where a
+  projection-write failure can only leave a tombstoned source whose edges
+  stand until the purge clears them — the same eventual-consistency posture
+  every other `content_references` write already has.
+
+  The eager sweep was *not* dropped in favour of the transactional one in
+  `purge_artifact_refs`, despite the two now deleting the same rows. The purge
+  is only ever offered an artifact whose `quarantine_status` is outside the
+  GC-protected set (`quarantined`, `rejected`, `scan_indeterminate`), and
+  nothing stops a caller deleting a quarantined manifest — so for those
+  statuses the purge never runs and the DELETE-time sweep is the *only* sweep.
+  Promptness is load-bearing too: three live readers of the edge set (the OCI
+  referrers projection, `IngestUseCase`'s referenced-tree-descendant
+  quarantine anchor, and the release sweep's parent-gated-blob skip, whose own
+  liveness argument names this sweep) must stop seeing a tombstoned source
+  immediately rather than at the next purge interval.
+
 - **A Postgres that was set but unreachable turned the DB-gated suite into
   silent passes** (#302). `test_support::isolated_db_from` returned `None` on
   every failure — URL parse, maintenance connection, `CREATE DATABASE`, pool

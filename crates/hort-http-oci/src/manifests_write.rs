@@ -58,9 +58,13 @@
 //! # DELETE
 //!
 //! Tag references route through [`RefUseCase::retire`]; digest
-//! references look up the manifest artifact via `find_by_path`, call
-//! [`ContentReferenceIndex::delete_by_source`], then remove the
-//! artifact via [`ArtifactUseCase::delete`]. CAS blob lifetime is GC's
+//! references look up the manifest artifact via `find_by_path`, remove
+//! the artifact via [`ArtifactUseCase::delete`], and only then sweep its
+//! `content_references` rows via
+//! [`ContentReferenceIndex::delete_by_source`]. That order is an
+//! invariant, not a detail: the sweep drops keepalive edges no reconcile
+//! sweep re-creates, so running it first left a failed delete with a
+//! live manifest whose blobs were collectable. CAS blob lifetime is GC's
 //! concern — the DELETE handler never touches storage directly.
 
 use std::sync::Arc;
@@ -1395,10 +1399,69 @@ async fn delete_by_digest(
         }
     };
 
-    // content_references cleanup. Idempotent — missing entries are
-    // `Ok(())` per the port contract. A failure here is logged but
-    // does NOT short-circuit the artifact delete: an orphaned
-    // reference is less harmful than a half-deleted manifest.
+    // Artifact lifecycle delete FIRST, keepalive-edge sweep second. The
+    // ORDER is the invariant here, not an incidental sequence.
+    //
+    // The sweep below drops every `content_references` row sourced from
+    // this manifest — including the keepalive edges `oci_config`,
+    // `oci_layer` and `oci_index_member`, which are what hold the
+    // manifest's config/layer blobs and child manifests against storage
+    // GC. `RefcountReconcileUseCase` re-creates only the single-target
+    // `primary_content` / `metadata_blob` kinds, so nothing repairs the
+    // keepalive kinds once they are gone. Sweeping BEFORE the state
+    // change therefore left a failed delete with a live, servable
+    // manifest whose blobs were collectable: at the next purge the bytes
+    // vanish under an artifact every read path considers healthy.
+    // Sweeping after the transition has committed makes that state
+    // unreachable — a failed delete returns 500 with every edge intact,
+    // and the client's retry is idempotent.
+    //
+    // `ArtifactUseCase::delete` is an event-sourced soft delete: the row
+    // survives with `deleted_at` set and an `ArtifactDeleted` event lands
+    // on the artifact's stream, attributed to this caller. The CAS blob is
+    // NOT removed here (GC concern; multiple artifacts may share CAS
+    // bytes) — the manifest's OWN bytes are released by the storage-GC
+    // sweep, for which the `ArtifactDeleted` appended here is the work
+    // item.
+    if let Err(e) = ctx
+        .artifact_use_case
+        .delete(artifact.id, Actor::Api(actor))
+        .await
+    {
+        tracing::error!(
+            manifest_artifact_id = %artifact.id,
+            error = %e,
+            "OCI manifest DELETE artifact.delete failed"
+        );
+        return OciError::Internal.into_response();
+    }
+
+    // content_references cleanup, on the committed-transition side of the
+    // ordering above. Idempotent — missing entries are `Ok(())` per the
+    // port contract — and unaffected by the soft delete, since
+    // `delete_by_source` keys on the source artifact id alone.
+    //
+    // This sweep is NOT redundant with the one `purge_artifact_refs`
+    // performs inside the purge transaction, for two independent reasons:
+    //
+    // - Reachability. The purge is only ever offered an artifact whose
+    //   `quarantine_status` lies outside the GC-protected set, so a
+    //   manifest deleted while `quarantined` or `scan_indeterminate` is
+    //   never purged and its edges would otherwise stand forever.
+    // - Promptness. These edges feed live decisions — the OCI referrers
+    //   projection, the referenced-tree-descendant quarantine anchor in
+    //   `IngestUseCase`, and the release sweep's parent-gated-blob skip —
+    //   each of which must stop seeing a tombstoned source now, not at
+    //   the next purge interval. The parent-gated skip in particular
+    //   relies on this sweep to resume the expiry backstop for a blob
+    //   whose parent manifest has gone away.
+    //
+    // A failure here is logged and does NOT fail the request: the
+    // transition is already durable, the projection is eventually
+    // authoritative, and answering 500 after a committed delete would
+    // invite a retry of something that has already happened. The
+    // residual state — a tombstoned source with edges still standing —
+    // is the same one the purge sweep is there to clear.
     //
     // Cleanup goes through the use case (ADR 0008). Same no-authz
     // trust contract as `insert_for_repo` above (caller has
@@ -1413,30 +1476,9 @@ async fn delete_by_digest(
         tracing::warn!(
             manifest_artifact_id = %artifact.id,
             error = %e,
-            "content_references delete_by_source failed; proceeding with artifact delete"
+            "content_references delete_by_source failed after the manifest delete \
+             committed; the edges stand until the purge sweep clears them"
         );
-    }
-
-    // Artifact lifecycle delete. `ArtifactUseCase::delete` is an
-    // event-sourced soft delete: the row survives with `deleted_at` set
-    // and an `ArtifactDeleted` event lands on the artifact's stream,
-    // attributed to this caller. The CAS blob is NOT removed here (GC
-    // concern; multiple artifacts may share CAS bytes). The cleanup
-    // above drops this manifest's keepalive edges so its config/layer
-    // blobs stop being held by it; the manifest's OWN bytes are released
-    // by the storage-GC sweep, for which the `ArtifactDeleted` appended
-    // here is the work item.
-    if let Err(e) = ctx
-        .artifact_use_case
-        .delete(artifact.id, Actor::Api(actor))
-        .await
-    {
-        tracing::error!(
-            manifest_artifact_id = %artifact.id,
-            error = %e,
-            "OCI manifest DELETE artifact.delete failed"
-        );
-        return OciError::Internal.into_response();
     }
 
     (StatusCode::ACCEPTED, Body::empty()).into_response()
@@ -4798,6 +4840,229 @@ mod tests {
         assert_eq!(
             post_refs, 0,
             "content_references rows with this source must be swept"
+        );
+    }
+
+    /// The ORDERING invariant of the digest-DELETE path, driven from the
+    /// failure side: when `ArtifactUseCase::delete` fails, the manifest is
+    /// still live and servable, so every keepalive edge it owns must still
+    /// be standing. Those edges (`oci_config` / `oci_layer`) are what hold
+    /// the config and layer blobs against storage GC, and the
+    /// refcount-reconcile sweep re-creates only the single-target
+    /// `primary_content` / `metadata_blob` kinds — so an edge dropped here
+    /// is dropped for good, and the blobs of a manifest every read path
+    /// considers healthy become collectable.
+    ///
+    /// A success-path test cannot distinguish this: both orderings end with
+    /// the artifact gone and the edges gone. Only the forced failure does.
+    #[test]
+    fn failed_digest_delete_leaves_every_keepalive_edge_standing() {
+        let (status, manifest_still_live, config_rows, layer_rows) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+
+            let router = router().with_state(h.ctx.clone());
+            let put = router
+                .clone()
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            assert_eq!(put.status(), StatusCode::CREATED, "PUT must seed the edges");
+
+            // Force the lifecycle delete to fail. The mock leaves the row
+            // in place, matching the adapter: the `deleted_at` write and
+            // the `ArtifactDeleted` append commit together, so a failure
+            // means the manifest never left service.
+            h.artifacts.fail_next_delete(DomainError::Invariant(
+                "injected artifact-delete failure".into(),
+            ));
+
+            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{manifest_hex}");
+            let req = with_principal(HttpRequest::delete(&uri).body(Body::empty()).unwrap());
+            let resp = router.oneshot(req).await.unwrap();
+            let status = resp.status();
+
+            let manifest_still_live = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap()
+                .is_some();
+            let config_rows = h
+                .content_references
+                .find_by_target(repo_id, &config_hash, Some("oci_config"))
+                .await
+                .unwrap()
+                .len();
+            let layer_rows = h
+                .content_references
+                .find_by_target(repo_id, &layer_hash, Some("oci_layer"))
+                .await
+                .unwrap()
+                .len();
+            (status, manifest_still_live, config_rows, layer_rows)
+        });
+
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed lifecycle delete must surface as 500, not a false 202"
+        );
+        assert!(
+            manifest_still_live,
+            "the failed delete must leave the manifest live — otherwise this test \
+             is not exercising the state the ordering protects"
+        );
+        assert_eq!(
+            config_rows, 1,
+            "a live manifest must keep its oci_config keepalive edge; without it \
+             the config blob is collectable while the manifest is still served"
+        );
+        assert_eq!(
+            layer_rows, 1,
+            "a live manifest must keep its oci_layer keepalive edge"
+        );
+    }
+
+    /// The other half of the ordering: on the success path the edges ARE
+    /// swept, per keepalive kind rather than by a bare row count. Pins that
+    /// moving the sweep behind the lifecycle delete did not turn it into a
+    /// no-op.
+    #[test]
+    fn successful_digest_delete_sweeps_the_keepalive_edges() {
+        let (status, manifest_still_live, config_rows, layer_rows) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+
+            let router = router().with_state(h.ctx.clone());
+            let put = router
+                .clone()
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            assert_eq!(put.status(), StatusCode::CREATED, "PUT must seed the edges");
+
+            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{manifest_hex}");
+            let req = with_principal(HttpRequest::delete(&uri).body(Body::empty()).unwrap());
+            let resp = router.oneshot(req).await.unwrap();
+            let status = resp.status();
+
+            let manifest_still_live = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap()
+                .is_some();
+            let config_rows = h
+                .content_references
+                .find_by_target(repo_id, &config_hash, Some("oci_config"))
+                .await
+                .unwrap()
+                .len();
+            let layer_rows = h
+                .content_references
+                .find_by_target(repo_id, &layer_hash, Some("oci_layer"))
+                .await
+                .unwrap()
+                .len();
+            (status, manifest_still_live, config_rows, layer_rows)
+        });
+
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(
+            !manifest_still_live,
+            "the manifest artifact must be deleted"
+        );
+        assert_eq!(config_rows, 0, "the oci_config edge must be swept");
+        assert_eq!(layer_rows, 0, "the oci_layer edge must be swept");
+    }
+
+    /// The residual state the ordering deliberately accepts: the sweep runs
+    /// on the committed-transition side, so a projection-write failure can
+    /// no longer roll the delete back. The request still succeeds and the
+    /// edges stand until the purge sweep clears them — answering 500 here
+    /// would invite a retry of a delete that already happened.
+    #[test]
+    fn digest_delete_succeeds_when_the_edge_sweep_fails_after_the_commit() {
+        let (status, manifest_still_live, config_rows, deletions) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, &[layer_hash]);
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+
+            let router = router().with_state(h.ctx.clone());
+            let put = router
+                .clone()
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            assert_eq!(put.status(), StatusCode::CREATED, "PUT must seed the edges");
+
+            h.content_references
+                .fail_next_delete(DomainError::Invariant("injected sweep failure".into()));
+
+            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{manifest_hex}");
+            let req = with_principal(HttpRequest::delete(&uri).body(Body::empty()).unwrap());
+            let resp = router.oneshot(req).await.unwrap();
+            let status = resp.status();
+
+            let manifest_still_live = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap()
+                .is_some();
+            let config_rows = h
+                .content_references
+                .find_by_target(repo_id, &config_hash, Some("oci_config"))
+                .await
+                .unwrap()
+                .len();
+            (
+                status,
+                manifest_still_live,
+                config_rows,
+                h.artifacts.deletions(),
+            )
+        });
+
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "a failed projection write must not undo a committed delete"
+        );
+        assert!(
+            !manifest_still_live,
+            "the lifecycle delete ran first and committed"
+        );
+        assert_eq!(
+            deletions.len(),
+            1,
+            "exactly one artifact delete reached the port"
+        );
+        assert_eq!(
+            config_rows, 1,
+            "the edge stands after a failed sweep — the purge transaction is \
+             what clears it"
         );
     }
 

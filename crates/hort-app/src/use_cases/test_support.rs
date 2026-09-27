@@ -147,6 +147,14 @@ pub struct MockArtifactRepository {
     /// caller's identity actually reaches the port instead of being
     /// dropped on the way — the event attribution depends on it.
     deletions: Mutex<Vec<(Uuid, Actor)>>,
+    /// FIFO of injected errors for [`ArtifactRepository::delete`]. Each
+    /// call pops the front, returns it verbatim, and leaves the artifact
+    /// in the map — the production adapter commits the soft delete and
+    /// its `ArtifactDeleted` append together, so a failure means no state
+    /// changed. Lets a test drive a caller's delete-failed arm while the
+    /// artifact is still live and servable, which is the only way to
+    /// observe what that arm leaves behind.
+    delete_errors: Mutex<std::collections::VecDeque<DomainError>>,
     /// Every
     /// [`find_pypi_wheels_without_kind`](ArtifactRepository::find_pypi_wheels_without_kind)
     /// call, in order, with its full argument set. Lets a test assert the
@@ -180,6 +188,7 @@ impl MockArtifactRepository {
             first_seen_errors: Mutex::new(std::collections::VecDeque::new()),
             find_by_repo_and_checksum_errors: Mutex::new(std::collections::VecDeque::new()),
             deletions: Mutex::new(Vec::new()),
+            delete_errors: Mutex::new(std::collections::VecDeque::new()),
             pypi_calls: Mutex::new(Vec::new()),
             oci_calls: Mutex::new(Vec::new()),
         }
@@ -188,6 +197,13 @@ impl MockArtifactRepository {
     /// Accepted deletions in call order, each with its attributed actor.
     pub fn deletions(&self) -> Vec<(Uuid, Actor)> {
         self.deletions.lock().unwrap().clone()
+    }
+
+    /// Arm the next [`ArtifactRepository::delete`] call to fail with
+    /// `err`, leaving the artifact live. Queued, so a test can arm
+    /// several consecutive failures.
+    pub fn fail_next_delete(&self, err: DomainError) {
+        self.delete_errors.lock().unwrap().push_back(err);
     }
 
     /// Arm the next
@@ -486,6 +502,12 @@ impl ArtifactRepository for MockArtifactRepository {
     }
 
     fn delete(&self, id: Uuid, actor: Actor) -> BoxFut<'_, DomainResult<()>> {
+        // Failure injection fires BEFORE the removal: the adapter commits
+        // the `deleted_at` write and the `ArtifactDeleted` append in one
+        // transaction, so a failed delete leaves the artifact live.
+        if let Some(err) = self.delete_errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
         // Production soft-deletes and keeps the row; the mock drops it,
         // which is observationally the same for every read here — all of
         // them are live reads, and live reads exclude deleted artifacts.
