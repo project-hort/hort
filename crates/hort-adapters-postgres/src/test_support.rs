@@ -22,6 +22,27 @@
 //! so the embedded-migration set stays crate-local; the workspace
 //! `build.rs` files make that embed track `migrations`).
 //!
+//! ## The skip contract: one condition, and it is not "the DB is down"
+//!
+//! A DB-gated test skips on exactly one condition — `DATABASE_URL`
+//! unset — and that decision is taken by the caller, not here. Every
+//! call site is `let url = env::var("DATABASE_URL").ok()?;` immediately
+//! followed by [`isolated_db_from`], so this module is only ever asked
+//! for a database the operator has declared. From that point a failure
+//! is a hard failure: [`isolated_db_from`], [`connect_or_panic`] and
+//! [`shared_migrated_pool`] panic rather than hand back a `None` the
+//! caller cannot tell apart from "no database configured".
+//!
+//! They did hand back that `None`, and the cost of it was not an
+//! uncertain result but a false one. Measured against a closed port,
+//! `cargo test --workspace --tests --no-fail-fast` reported **12,350
+//! passed, 1 failed, 7 ignored** — 488 of the 489 tests that touch the
+//! database claiming `ok` without having opened a connection, and none
+//! of them counted in the `ignored` column. The one failure was the single test in the
+//! workspace that hand-rolled `.expect()` on its own maintenance
+//! connection. The state in which a green gate is most valuable — the
+//! server has a problem — was the state in which the gate inverted.
+//!
 //! ## Cleanup — a once-per-process sweep (issue #37)
 //!
 //! A throwaway database is still not dropped at the end of its own
@@ -52,7 +73,7 @@
 //!   reason a test fails.
 //!
 //! It does not *prevent* a leak — a drop-on-teardown guard would, at the
-//! cost of a guard type threaded through the 59 files that call
+//! cost of a guard type threaded through the 60 files that call
 //! [`isolated_db_from`] and a database drop issued from a synchronous
 //! `Drop`. Deliberately not done.
 //!
@@ -452,16 +473,130 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Credential-free description of what a set of connection options
+/// points at, for a panic message that will land in a CI log.
+///
+/// Host and port only. The project redacts `database_url` wholesale in
+/// every `Debug` impl that touches it (`hort-server` / `hort-worker`
+/// `config.rs`); a panic message is no different, and the password is
+/// never diagnostic.
+fn connection_target(opts: &PgConnectOptions) -> String {
+    format!("{}:{}", opts.get_host(), opts.get_port())
+}
+
+/// The panic message a configured-but-unusable `DATABASE_URL` earns,
+/// with `stage` naming the step that failed.
+///
+/// Split out from its call sites so the wording — and, more to the
+/// point, the guarantee that it carries no credential — is exercised
+/// without a database, exactly as [`classify_migrate_failure`] is.
+///
+/// `err` is a sqlx error from a connect, a `CREATE DATABASE`, or a URL
+/// parse. None of those echo the connection string: sqlx's
+/// configuration error wraps a `url`/`ParseInt`/`AddrParse` error whose
+/// `Display` names the defect, not the input, and a connect error names
+/// a host, an OS errno or a SQLSTATE.
+fn unusable_database_message(stage: &str, target: &str, err: &dyn std::fmt::Display) -> String {
+    format!(
+        "DATABASE_URL is set (target {target}) but {stage} failed: {err}\n\
+         This is a hard failure, not a skip. Reaching this point means the \
+         caller read DATABASE_URL and got a value — the operator declaring \
+         that a database exists — so there is no database only in the sense \
+         that the declared one could not be used. Returning a skip here would \
+         report a test that never ran as `ok`, which inverts the gate exactly \
+         when the server is unwell. To run the workspace suite DB-free, unset \
+         DATABASE_URL."
+    )
+}
+
+/// Connect a pool to an explicitly-configured `DATABASE_URL`, panicking
+/// rather than skipping when the connection cannot be made.
+///
+/// The shared entry point for the DB-gated fixtures that need a pool on
+/// the `DATABASE_URL` target itself rather than a per-test database from
+/// [`isolated_db_from`] — the `migrate_*` fixtures in `hort-server`, the
+/// worker's schema-compat boot fixture, and [`shared_migrated_pool`].
+/// Each of those grew its own `PgPool::connect(&url).await.ok()`, which
+/// is the silent skip this module no longer performs: five independent
+/// copies of it, none reachable from [`isolated_db_from`], which is why
+/// the fix needed a second entry point rather than one.
+///
+/// The caller still owns the `DATABASE_URL` read and the `None` that
+/// comes with it; this function is only ever handed a URL that exists.
+pub async fn connect_or_panic(url: &str) -> PgPool {
+    let opts = parse_or_panic(url);
+    let target = connection_target(&opts);
+    match PgPool::connect_with(opts).await {
+        Ok(pool) => pool,
+        Err(err) => panic!(
+            "{}",
+            unusable_database_message("connecting a pool", &target, &err)
+        ),
+    }
+}
+
+/// Parse `url` into connection options, panicking with a message that
+/// withholds the value.
+///
+/// A malformed `DATABASE_URL` is a configuration error the operator has
+/// to see; skipping on it hides a typo behind a green run for as long as
+/// the typo lives.
+fn parse_or_panic(url: &str) -> PgConnectOptions {
+    match url.parse::<PgConnectOptions>() {
+        Ok(opts) => opts,
+        Err(err) => panic!(
+            "{}",
+            unusable_database_message(
+                "parsing it as a Postgres connection URL",
+                "<unparseable, value withheld>",
+                &err
+            )
+        ),
+    }
+}
+
 /// Create a uniquely-named database (derived from `base_url`: same
 /// host/user/password, fresh dbname) and return a pool connected to it.
 /// The DB is **empty** — the caller runs its own
 /// `sqlx::migrate!().run()` on the returned pool.
 ///
-/// Returns `None` on any failure (mirrors the prior
-/// `PgPool::connect(&url).await.ok()?` semantics so the suite stays
-/// green when `DATABASE_URL` is unset / the DB is unreachable).
+/// ## It never returns `None`. It panics instead
+///
+/// Every call site in the workspace is `let url =
+/// env::var("DATABASE_URL").ok()?;` immediately followed by this call,
+/// so "not configured" is decided one level up and this function never
+/// sees it. What is left is a database the operator declared and the
+/// harness could not use — and flattening that into the same `None` the
+/// caller uses for "no database" makes the caller early-return, which
+/// libtest reports as `ok`. A test that did not run then claims it
+/// passed, precisely when the server is unwell and the gate matters
+/// most. Measured on the unfixed code against a closed port: 12,350
+/// passed, 1 failed, 7 ignored — the one failure being the single test
+/// in the workspace that hand-rolled `.expect()` on its own maintenance
+/// connection.
+///
+/// The `Option` in the return type belongs to the caller, not to this
+/// function: it is what keeps the `?` carrying the caller's `env::var`
+/// skip compiling. `crates/hort-app/tests/db_gate_not_silent.rs` pins
+/// the property this doc comment asserts.
+///
+/// ## What a transient blip costs
+///
+/// The per-database `PgPool::connect_with` below inherits sqlx's own
+/// connect retry: `ConnectionRefused`, SQLSTATE `57P03`
+/// (`cannot_connect_now` — the server is starting up or in recovery) and
+/// `53300` (`too_many_connections`) are retried with exponential backoff
+/// until `acquire_timeout`, 30 s by default, so a blip shorter than that
+/// never reaches a panic. The maintenance connection is a bare
+/// `PgConnection` and has no such retry — one refused connection fails
+/// that test. The asymmetry is sqlx's, not this module's, and it is left
+/// alone deliberately: a retry here would be a second retry policy
+/// beside the migration loop below, and in the incident this hard
+/// failure was written for — a seven-minute recovery — no retry length
+/// would have changed the outcome.
 pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
-    let opts: PgConnectOptions = base_url.parse().ok()?;
+    let opts = parse_or_panic(base_url);
+    let target = connection_target(&opts);
     // The epoch segment is load-bearing: `sweep_stale_databases` reads
     // it to age-gate candidates. Keep the `hort_test_<epoch>_<uuid>`
     // shape if you rename this.
@@ -473,20 +608,39 @@ pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
 
     // CREATE DATABASE cannot run in a transaction or target the
     // connected DB — use a maintenance connection to `postgres`.
-    let mut admin = PgConnection::connect_with(&opts.clone().database("postgres"))
-        .await
-        .ok()?;
+    let mut admin = match PgConnection::connect_with(&opts.clone().database("postgres")).await {
+        Ok(admin) => admin,
+        Err(err) => panic!(
+            "{}",
+            unusable_database_message(
+                "opening the `postgres` maintenance connection",
+                &target,
+                &err
+            )
+        ),
+    };
 
     // Once per process, on the connection we already hold.
     sweep_stale_databases(&mut admin).await;
 
-    admin
+    if let Err(err) = admin
         .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db}\"")))
         .await
-        .ok()?;
+    {
+        panic!(
+            "{}",
+            unusable_database_message("creating the per-test database", &target, &err)
+        );
+    }
     let _ = admin.close().await;
 
-    let pool = PgPool::connect_with(opts.database(&db)).await.ok()?;
+    let pool = match PgPool::connect_with(opts.database(&db)).await {
+        Ok(pool) => pool,
+        Err(err) => panic!(
+            "{}",
+            unusable_database_message("connecting to the per-test database", &target, &err)
+        ),
+    };
 
     // Migrate here, with a bounded retry. Per-test DB isolation means
     // ~80+ test binaries each `CREATE DATABASE` + run the full
@@ -521,13 +675,17 @@ pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
 /// this database, so no test may assume an earlier-sorting module already
 /// migrated it.
 ///
-/// Returns `None` when `DATABASE_URL` is unset or the target is
-/// unreachable (mirrors [`isolated_db_from`]'s self-skip semantics). A
-/// migration that fails after retries is a real bug, not a skip
-/// condition, and panics rather than handing back an unmigrated pool.
+/// Returns `None` only when `DATABASE_URL` is unset — the one condition
+/// that means "this machine has no database", and the one the workspace
+/// pre-push gate runs under. A target that is set but unreachable panics
+/// through [`connect_or_panic`], as does a migration that fails after
+/// retries: both are a configured database that did not work, and a test
+/// that reports `ok` without having touched it is a false green, not a
+/// skip. Unreachability here used to cost 30 s of `acquire_timeout` per
+/// test and then report `ok` anyway.
 pub async fn shared_migrated_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPool::connect(&url).await.ok()?;
+    let pool = connect_or_panic(&url).await;
 
     // Bounded retry: the shared target is a migration race between every
     // test binary that reaches this helper concurrently, the same
@@ -789,5 +947,141 @@ mod tests {
             message.contains('7'),
             "must retain the underlying error: {message}"
         );
+    }
+
+    // ---- The skip contract: unset is a skip, unusable is a failure.
+    //
+    // These run DB-free. The "unusable" side uses a host under the
+    // reserved `.invalid` TLD (RFC 2606 guarantees it never resolves),
+    // which fails at name resolution rather than at TCP connect. That
+    // matters for timing: sqlx's pool retries `ConnectionRefused` with
+    // backoff until its 30 s `acquire_timeout`, but returns any other
+    // connect error immediately — so a closed port would make these
+    // tests cost 30 s each and an unresolvable host costs milliseconds.
+    //
+    // They call `isolated_db_from` and `connect_or_panic` and still carry
+    // no `#[serial(hort_pg_db)]`, deliberately: the serial key exists
+    // because a test that reaches the Postgres server collides with a
+    // concurrent sibling through cluster-global work (`CREATE ROLE`,
+    // `CREATE`/`DROP DATABASE`, `pg_stat_activity`). Name resolution
+    // fails before a socket is opened, so none of that work is reached
+    // and there is nothing to serialise against. Taking the key here
+    // would only make every DB-backed test in the binary queue behind a
+    // DNS lookup.
+
+    /// The URL shape these tests feed the helpers: syntactically valid,
+    /// unreachable by construction, and carrying a password so the
+    /// redaction assertion below has something to catch.
+    const UNREACHABLE_URL: &str = "postgres://probe:hunter2@hort-db-gate.invalid:5432/hort";
+
+    /// Run `fut` on a fresh current-thread runtime and return the panic
+    /// message it produced.
+    ///
+    /// `#[should_panic(expected = …)]` can only assert a substring is
+    /// present; the credential test has to assert one is *absent*, which
+    /// needs the message itself.
+    fn panic_message_of<F>(make: F) -> String
+    where
+        F: FnOnce() + std::panic::UnwindSafe,
+    {
+        let payload = std::panic::catch_unwind(make).expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default()
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(fut)
+    }
+
+    #[test]
+    fn isolated_db_from_fails_loudly_when_the_configured_server_is_unreachable() {
+        let message = panic_message_of(|| {
+            let _ = block_on(isolated_db_from(UNREACHABLE_URL));
+        });
+        assert!(
+            message.contains("hard failure, not a skip"),
+            "a configured-but-unreachable target must not be flattened into a \
+             skip; got: {message}"
+        );
+        assert!(
+            message.contains("maintenance connection"),
+            "the message must name the stage that failed: {message}"
+        );
+    }
+
+    #[test]
+    fn connect_or_panic_fails_loudly_when_the_configured_server_is_unreachable() {
+        let message = panic_message_of(|| {
+            let _ = block_on(connect_or_panic(UNREACHABLE_URL));
+        });
+        assert!(
+            message.contains("hard failure, not a skip"),
+            "the shared-target connect must not be flattened into a skip; got: {message}"
+        );
+        assert!(
+            message.contains("connecting a pool"),
+            "the message must name the stage that failed: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_database_url_fails_loudly_and_withholds_the_value() {
+        let message = panic_message_of(|| {
+            let _ = block_on(isolated_db_from(
+                "postgres://probe:hunter2@host:notaport/db",
+            ));
+        });
+        assert!(
+            message.contains("parsing it"),
+            "a malformed DATABASE_URL is a configuration error the operator has \
+             to see, not a skip; got: {message}"
+        );
+        assert!(
+            !message.contains("hunter2"),
+            "the panic lands in a CI log and must not carry the password: {message}"
+        );
+    }
+
+    #[test]
+    fn the_unreachable_panic_withholds_the_password() {
+        let message = panic_message_of(|| {
+            let _ = block_on(isolated_db_from(UNREACHABLE_URL));
+        });
+        assert!(
+            !message.contains("hunter2"),
+            "the panic lands in a CI log and must not carry the password: {message}"
+        );
+        assert!(
+            message.contains("hort-db-gate.invalid:5432"),
+            "host:port is the diagnostic part and must survive redaction: {message}"
+        );
+    }
+
+    #[test]
+    fn the_failure_message_names_the_stage_the_target_and_the_way_out() {
+        let message = unusable_database_message("opening a connection", "db.example:5432", &"boom");
+        assert!(message.contains("opening a connection"), "{message}");
+        assert!(message.contains("db.example:5432"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(
+            message.contains("unset DATABASE_URL"),
+            "the message must say how to run the suite DB-free: {message}"
+        );
+    }
+
+    #[test]
+    fn the_target_rendering_carries_no_credentials() {
+        let opts: PgConnectOptions = UNREACHABLE_URL.parse().expect("URL parses");
+        let target = connection_target(&opts);
+        assert_eq!(target, "hort-db-gate.invalid:5432");
+        assert!(!target.contains("hunter2"), "{target}");
+        assert!(!target.contains("probe"), "{target}");
     }
 }

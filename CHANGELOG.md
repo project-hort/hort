@@ -194,6 +194,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A Postgres that was set but unreachable turned the DB-gated suite into
+  silent passes** (#302). `test_support::isolated_db_from` returned `None` on
+  every failure — URL parse, maintenance connection, `CREATE DATABASE`, pool
+  connect — which is the same value its 60 call sites use for "no
+  `DATABASE_URL`, no database, skip". The caller could not tell the two apart,
+  early-returned, and libtest reported `ok`. Not an uncertain result, a false
+  one: the state in which a green gate is most valuable — the server has a
+  problem — was the state in which the gate inverted, and the `ignored` count
+  was not even a lower bound on what had been skipped. Measured against a
+  closed port, `cargo test --workspace --tests --no-fail-fast` reported 12,350
+  passed / 1 failed / 7 ignored, the single failure being the one test in the
+  workspace that hand-rolled `.expect()` on its own maintenance connection; a
+  dead server also cost ten minutes of `acquire_timeout` stalls on the way to
+  that green.
+
+  The `DATABASE_URL` read stays where it is — unset still skips, and an unset
+  workspace run is still green, because that is how the pre-push gate runs.
+  What changed is everything after it: once a URL is in hand the operator has
+  declared a database, so `isolated_db_from`, the new shared
+  `test_support::connect_or_panic`, and `shared_migrated_pool` panic with a
+  message naming the stage that failed and the credential-free target. The
+  same command against an unreachable target now reports 489 failures across
+  42 targets.
+
+  The swallow was not confined to the isolation helpers: five hand-rolled
+  `admin_pool()` fixtures (`hort-server`'s four `migrate_*` targets and
+  `hort-worker`'s `schema_compat_boot`) carried their own
+  `PgPool::connect(&url).await.ok()` and never touched `test_support` at all —
+  35 further tests a helper-only fix would have left silent. They now route
+  through `connect_or_panic`. A new DB-free source guard,
+  `crates/hort-app/tests/db_gate_not_silent.rs`, rejects any
+  `PgPool`/`PgConnection` connect whose error is discarded with `.ok()`, and
+  pins the isolation harness to a single `?`-shaped skip: the `DATABASE_URL`
+  read.
+
 - **The response that triggers a quarantine reported a flat 3600 s
   `Retry-After`** (#240). A pull-through `GET` that ingested and quarantined
   an artifact answered `503 UNAVAILABLE` with `retry_after_seconds: 3600`

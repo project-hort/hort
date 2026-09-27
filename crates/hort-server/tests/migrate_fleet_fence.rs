@@ -88,10 +88,11 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 // ---------------------------------------------------------------------------
 
 /// Connect as the superuser pointed at by `DATABASE_URL`. Returns `None`
-/// when the env var is unset so the suite stays green without a database.
+/// *only* when the env var is unset, so the suite stays green without a
+/// database. A target that is set but unreachable is a hard failure.
 async fn admin_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
+    Some(hort_adapters_postgres::test_support::connect_or_panic(&url).await)
 }
 
 /// Create a uniquely-named throwaway database and return

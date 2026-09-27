@@ -68,12 +68,13 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// Connect as the superuser pointed at by `DATABASE_URL`. Returns
-/// `None` when the env var is unset so the suite stays green in
+/// `None` *only* when the env var is unset, so the suite stays green in
 /// dev environments without a database (mirrors the
-/// `events_role_hardening` skip-when-no-DB convention).
+/// `events_role_hardening` skip-when-no-DB convention). A target that is
+/// set but unreachable is a hard failure, not a skip.
 async fn admin_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
+    Some(hort_adapters_postgres::test_support::connect_or_panic(&url).await)
 }
 
 /// Create a uniquely-named throwaway database under the same host as
