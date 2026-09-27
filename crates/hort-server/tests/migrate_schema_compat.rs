@@ -61,6 +61,7 @@ use std::time::Duration;
 
 use hort_config::schema_compat::{register_from_rows, schema_rollback_floor, SchemaRollbackFloor};
 use hort_server::migrate::{assert_current, run as migrate_run, MIGRATOR};
+use serial_test::serial;
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
@@ -199,6 +200,7 @@ async fn register_rows(pool: &PgPool) -> BTreeMap<i64, Option<String>> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_schema_applies_nothing_and_succeeds() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -232,6 +234,7 @@ async fn newer_schema_applies_nothing_and_succeeds() {
 /// validation of the versions present in both sets is untouched, and this
 /// pins that: a tampered shared-prefix checksum must still abort the run.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_schema_still_verifies_the_shared_prefix_checksums() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -270,6 +273,7 @@ async fn newer_schema_still_verifies_the_shared_prefix_checksums() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn unknown_version_below_the_waterline_refuses() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -300,6 +304,7 @@ async fn unknown_version_below_the_waterline_refuses() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn mid_sequence_hole_refuses() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -343,6 +348,7 @@ async fn mid_sequence_hole_refuses() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migrating_a_fresh_database_registers_every_applied_migration() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -382,6 +388,7 @@ async fn migrating_a_fresh_database_registers_every_applied_migration() {
 /// writes nothing — the rows are already there and an applied migration's
 /// contraction status is frozen (ADR 0022), so there is nothing to update.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn re_running_migrate_leaves_the_register_unchanged() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -405,6 +412,7 @@ async fn re_running_migrate_leaves_the_register_unchanged() {
 /// window and the inspection gap on a database that was never migrated by a
 /// register-carrying binary before.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn an_upgrade_backfills_every_embedded_migration() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -448,6 +456,7 @@ async fn an_upgrade_backfills_every_embedded_migration() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn a_newer_contraction_refuses_the_migrate_gate_too() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -479,6 +488,7 @@ async fn a_newer_contraction_refuses_the_migrate_gate_too() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn an_unregistered_newer_migration_refuses_the_migrate_gate() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -506,6 +516,7 @@ async fn an_unregistered_newer_migration_refuses_the_migrate_gate() {
 /// while the other refuses is what makes a rollback impossible, so the
 /// register must not reintroduce that split.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn both_gates_agree_on_a_registered_expansion_and_on_a_contraction() {
     let Some(admin) = admin_pool().await else {
         return;

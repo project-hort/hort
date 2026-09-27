@@ -87,11 +87,15 @@ pub struct ArtifactUseCase {
     /// `None` for call sites that never construct a `Quarantined`
     /// artifact (the overwhelming majority of this file's own tests),
     /// which fall back to [`DefaultPolicy::quarantine_duration_secs`]
-    /// exactly as the wired-but-no-active-policy case does — a plain
-    /// `ArtifactUseCase::new(..)` never reaches a code path that would
-    /// observe the difference between "unwired" and "wired with no
-    /// policy configured". The production composition root always
-    /// wires this via [`Self::with_policy_projections`].
+    /// exactly as the wired-but-no-active-policy case does. A call site
+    /// that *does* reach a quarantine-deadline computation with this
+    /// unwired gets a `tracing::warn!` out of
+    /// [`Self::resolve_quarantine_window`], because the fallback there
+    /// is not a resolved policy and a `Retry-After` derived from it
+    /// reports the default rather than the configured window. The
+    /// production composition root always wires this via
+    /// [`Self::with_policy_projections`], so that warning is a
+    /// test-harness signal, never a deployed one.
     policy_projections: Option<Arc<dyn PolicyProjectionRepository>>,
     /// Read-only event-store handle consumed by
     /// [`Self::hydrate_quarantine_deadline`] to resolve the provenance
@@ -748,10 +752,22 @@ impl ArtifactUseCase {
     /// the same policy and the same duration here, so they cannot drift.
     ///
     /// Absent an active policy — or with [`Self::policy_projections`]
-    /// unwired, a test-only state — the duration falls back to
+    /// unwired — the duration falls back to
     /// [`DefaultPolicy::quarantine_duration_secs`], the same default
     /// `QuarantineUseCase::is_window_elapsed` uses (ADR 0007
     /// quarantine-by-default posture).
+    ///
+    /// The two are not the same answer, though they produce the same
+    /// number. "Wired, no active policy" is a resolved verdict; "unwired"
+    /// is the port missing, and the default that follows is not the
+    /// configured window but the absence of any lookup. That difference
+    /// is invisible in the returned value, so the unwired arm **warns**:
+    /// the only production construction site
+    /// (`hort-server::composition`) wires the port, so a warning here
+    /// cannot fire in a deployed binary — it fires in a test whose
+    /// harness left the port out, which is exactly the reader who is
+    /// otherwise told a `Retry-After` reflects a policy it never
+    /// consulted.
     ///
     /// The policy itself rides back alongside the duration because
     /// `hydrate_quarantine_deadline` also reads `provenance_mode` off it;
@@ -765,7 +781,21 @@ impl ArtifactUseCase {
             Some(policy_projections) => {
                 resolve_active_policy_for_repo(policy_projections, repository_id).await?
             }
-            None => None,
+            None => {
+                tracing::warn!(
+                    repository_id = %repository_id,
+                    default_quarantine_duration_secs =
+                        DefaultPolicy::quarantine_duration_secs(),
+                    "ArtifactUseCase has no PolicyProjectionRepository wired; the \
+                     quarantine window falls back to the built-in default instead \
+                     of the repository's configured ScanPolicy. Every deadline \
+                     computed from here — a content route's `Retry-After`, an \
+                     index's held-block `available_after` — reports the default, \
+                     not what an operator configured. Call \
+                     `ArtifactUseCase::with_policy_projections` when building it"
+                );
+                None
+            }
         };
         let duration_secs = policy
             .as_ref()

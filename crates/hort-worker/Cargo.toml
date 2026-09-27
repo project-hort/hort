@@ -111,6 +111,13 @@ serde_json   = { workspace = true }
 # metrics-server Router without binding a real socket.
 tower        = { workspace = true }
 tracing-test = "0.2"
+# The DB-backed `schema_compat_boot` fixtures drive `CREATE DATABASE` plus
+# the full migration set (cluster-global `CREATE ROLE` included) against
+# the one Postgres server the whole workspace's tests share; the
+# workspace-wide `#[serial(hort_pg_db)]` key is what orders them against
+# their siblings. `crates/hort-app/tests/db_tests_are_serialized.rs`
+# enforces that.
+serial_test  = { workspace = true }
 # Exercise `read_and_propagate`'s missing-file boot path, which reads
 # `HORT_EXTRA_CA_BUNDLE`. Setting env vars is `unsafe` (2024 edition)
 # and the workspace forbids `unsafe_code`, so `temp_env::with_var` is

@@ -1658,6 +1658,44 @@ pub(crate) fn select_enabled_scanners(
         .collect()
 }
 
+/// A configured scanner backend's binary did not answer its startup
+/// health probe.
+///
+/// Carried as a typed error in the [`build_app_context`] failure chain
+/// because the remediation differs in kind from every other boot
+/// failure. A pool that will not connect, a schema behind the binary, a
+/// Redis that is down: those are environment or rollout faults, usually
+/// transient, and the operator's move is to fix the environment and let
+/// the pod restart. A missing scanner binary is an **image** fault — the
+/// runtime image was built without it, or `HORT_SCANNER_TRIVY_BIN` /
+/// `HORT_SCANNER_OSV_BIN` point at a path that does not exist — and no
+/// number of restarts changes it.
+///
+/// Either way the worker refuses to boot; the distinction is for the
+/// caller that has to say *why*. Downcast for it:
+///
+/// ```ignore
+/// match build_app_context(&cfg, None, None).await {
+///     Ok(out) => out,
+///     Err(e) if e.downcast_ref::<ScannerUnavailable>().is_some() => { /* image fault */ }
+///     Err(e) => return Err(e),
+/// }
+/// ```
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "scanner backend {backend:?} failed its health check: {reason}. \
+     Refusing to start — verify the binary is on PATH or set \
+     HORT_SCANNER_TRIVY_BIN / HORT_SCANNER_OSV_BIN to a discoverable \
+     binary, or rebuild the runtime image with the missing binary \
+     included."
+)]
+pub struct ScannerUnavailable {
+    /// The backend's `ScannerPort::name()` — `"trivy"`, `"osv"`, ….
+    pub backend: String,
+    /// The health probe's own error, rendered.
+    pub reason: String,
+}
+
 /// Probe every configured scanner backend's `health_check` and refuse
 /// to start if ANY backend fails. Returns the ordered list of healthy
 /// backend names.
@@ -1687,13 +1725,10 @@ pub(crate) async fn health_check_all_or_fail(
                     error = %e,
                     "scanner backend failed its health check; refusing to start"
                 );
-                return Err(anyhow!(
-                    "scanner backend {name:?} failed its health check: {e}. \
-                     Refusing to start — verify the binary is on PATH or set \
-                     HORT_SCANNER_TRIVY_BIN / HORT_SCANNER_OSV_BIN to a \
-                     discoverable binary, or rebuild the runtime image with \
-                     the missing binary included."
-                ));
+                return Err(anyhow!(ScannerUnavailable {
+                    backend: name,
+                    reason: e.to_string(),
+                }));
             }
         }
     }
@@ -2564,6 +2599,30 @@ BBBB
         assert!(
             msg.contains("Refusing to start"),
             "error must signal refusal-to-start: {msg}"
+        );
+    }
+
+    /// The failure is typed, not just worded: a caller supervising the
+    /// boot has to tell "the image is missing a scanner binary" from
+    /// every other reason `build_app_context` can fail, and a substring
+    /// match on the message is not that.
+    #[tokio::test]
+    async fn health_check_failure_downcasts_to_scanner_unavailable() {
+        let scanners: Vec<Arc<dyn ScannerPort>> = vec![Arc::new(MockScanner {
+            name: "osv".into(),
+            healthy: false,
+        })];
+        let err = health_check_all_or_fail(&scanners)
+            .await
+            .expect_err("an unhealthy backend must propagate Err");
+        let typed = err
+            .downcast_ref::<ScannerUnavailable>()
+            .expect("the boot failure must be classifiable as ScannerUnavailable");
+        assert_eq!(typed.backend, "osv");
+        assert!(
+            typed.reason.contains("binary not found on PATH"),
+            "the probe's own error must ride along: {}",
+            typed.reason
         );
     }
 

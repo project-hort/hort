@@ -29,11 +29,11 @@
 #![allow(clippy::expect_used)]
 
 use std::env;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
+use serial_test::serial;
 use sqlx::{PgPool, Row};
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
 
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
@@ -76,43 +76,13 @@ async fn seed_scan_job(pool: &PgPool, priority: i16) -> (Uuid, Uuid) {
     (id, artifact_id)
 }
 
-/// Per-binary serialization gate.
-///
-/// Every test in this binary seeds and/or claims rows in the shared
-/// `public.jobs` table. `claim_scan_jobs` uses `FOR UPDATE SKIP
-/// LOCKED` to acquire its batch — under cargo test's intra-binary
-/// parallelism, sibling tests' claims either lock our seeded rows
-/// (so we can't see them) or fill our `batch_size` slots with their
-/// own rows (so ours fall outside the priority/created_at top-N).
-/// The two failure modes observed on CI:
-///
-/// - `claim_scan_jobs_returns_pending_rows_in_priority_then_created_at_order`
-///   only saw 1 of its 3 seeded rows because siblings had already
-///   claimed the other 2 (status=running, locked_until in future →
-///   skipped by SKIP LOCKED).
-/// - `claim_scan_jobs_marks_rows_running_and_increments_attempts`
-///   couldn't find its seeded row in the claimed batch because
-///   sibling-seeded high-priority rows filled the batch ahead of it.
-///
-/// Cargo runs different test binaries sequentially by default, so a
-/// binary-scoped lock is sufficient.
-fn serial_lock() -> &'static AsyncMutex<()> {
-    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| AsyncMutex::new(()))
-}
-
-/// Acquire the per-binary serial lock for the test's duration.
-async fn lock_serial() -> AsyncMutexGuard<'static, ()> {
-    serial_lock().lock().await
-}
-
 // ---------------------------------------------------------------------------
 // claim_scan_jobs — priority DESC, created_at ASC ordering
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn claim_scan_jobs_returns_pending_rows_in_priority_then_created_at_order() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -125,16 +95,14 @@ async fn claim_scan_jobs_returns_pending_rows_in_priority_then_created_at_order(
     let (high_id, _) = seed_scan_job(&pool, 10).await;
     let (med_id, _) = seed_scan_job(&pool, 5).await;
 
-    // Claim with a generous batch size. `lock_serial` synchronises this
-    // binary's tests, but `tests/migration_009_jobs_and_findings.rs`
-    // runs in a sibling binary and inserts into `public.jobs` against
-    // the same DB; cargo runs test binaries in parallel so we cannot
-    // assume an empty table here. With a tight `batch_size: 3` a single
-    // sibling-binary pending row pushes one of our seeds out of the
-    // top-3 picked set and the filter below returns only two of our
-    // ids. A larger batch swamps plausible cross-binary pollution; the
-    // filter still keeps only our three, and the post-query sort
-    // guarantees the order.
+    // Claim with a generous batch size rather than a tight
+    // `batch_size: 3`. `claim_scan_jobs` takes the priority/created_at
+    // top-N under `FOR UPDATE SKIP LOCKED`, so any row this test did not
+    // seed — a leftover from an earlier assertion in the same database —
+    // would push one of the three seeds out of a tight batch and the
+    // filter below would see only two ids. A large batch cannot be
+    // crowded out; the filter keeps only our three and the claim order
+    // is what is asserted.
     let claimed = repo
         .claim_scan_jobs("test-worker", 100, Duration::from_secs(60))
         .await
@@ -158,8 +126,8 @@ async fn claim_scan_jobs_returns_pending_rows_in_priority_then_created_at_order(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn claim_scan_jobs_marks_rows_running_and_increments_attempts() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -196,8 +164,8 @@ async fn claim_scan_jobs_marks_rows_running_and_increments_attempts() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn claim_scan_jobs_skips_locked_rows() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -226,8 +194,8 @@ async fn claim_scan_jobs_skips_locked_rows() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn mark_completed_idempotent_on_already_completed_row() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -257,8 +225,8 @@ async fn mark_completed_idempotent_on_already_completed_row() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn mark_completed_persists_result_summary() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -301,8 +269,8 @@ async fn mark_completed_persists_result_summary() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn reschedule_resets_lock_and_records_error() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -339,8 +307,8 @@ async fn reschedule_resets_lock_and_records_error() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn mark_failed_terminal_status() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -380,8 +348,8 @@ async fn mark_failed_terminal_status() {
 /// asserts the count differs by exactly +1 from the pre-test
 /// baseline.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn pending_scan_count_filters_by_kind_and_status() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -450,8 +418,8 @@ async fn pending_scan_count_filters_by_kind_and_status() {
 }
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn enqueue_scan_rejects_duplicate_artifact() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -513,8 +481,8 @@ async fn seed_scan_job_with_status(pool: &PgPool, artifact_id: Uuid, status: &st
 ///    `find_active_scan_for_artifact` returns the new pending row's id
 ///    (NOT the completed one).
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn jobs_scan_unique_allows_pending_after_prior_completed() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -560,8 +528,8 @@ async fn jobs_scan_unique_allows_pending_after_prior_completed() {
 /// 2. Index still blocks two simultaneously-active scan rows for the
 ///    same artifact (`pending` + `pending` → unique violation).
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn jobs_scan_unique_blocks_two_pending_for_same_artifact() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -602,8 +570,8 @@ async fn jobs_scan_unique_blocks_two_pending_for_same_artifact() {
 /// 3. No active job: `find_active_scan_for_artifact` returns `None`
 ///    when the only row for the artifact is `completed`.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_active_scan_returns_none_when_only_completed_row_exists() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -626,8 +594,8 @@ async fn find_active_scan_returns_none_when_only_completed_row_exists() {
 ///    `artifact_id` (artificial — non-scan kinds typically NULL the
 ///    column) is excluded by the `kind='scan'` predicate.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_active_scan_ignores_non_scan_kinds() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -667,13 +635,9 @@ async fn find_active_scan_ignores_non_scan_kinds() {
 // ticks between the enqueue and the worker running it do not pile up
 // duplicate open rows.
 //
-// Serialization note: like every test in this binary, these acquire the
-// per-binary `lock_serial()` async-mutex gate (see `serial_lock`), which
-// serialises ALL tests here against the shared `public.jobs` table. This
-// is the sibling scan tests' convention and satisfies the crate-wide
-// "DB-backed tests must serialise" contract (stricter than a keyed
-// `#[serial(hort_pg_db)]` group, which the `serial_test` attribute would
-// otherwise provide).
+// Serialization note: like every test in this binary, these carry
+// `#[serial(hort_pg_db)]` — the workspace-wide key for tests that reach
+// the one Postgres server the whole suite shares.
 
 /// Insert a `kind='provenance-verify'` row at an arbitrary status with
 /// `artifact_id` embedded in the `params` JSONB, mirroring
@@ -697,8 +661,8 @@ async fn seed_provenance_job_with_status(pool: &PgPool, artifact_id: Uuid, statu
 ///    (returns its id); a `completed` row for the same artifact is NOT
 ///    (active-status filter — status IN ('pending','running')).
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_active_provenance_surfaces_pending_and_ignores_completed() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -730,8 +694,8 @@ async fn find_active_provenance_surfaces_pending_and_ignores_completed() {
 ///    querying for artifact A (the `params->>'artifact_id'` match is
 ///    exact).
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_active_provenance_isolates_by_artifact_id() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -767,8 +731,8 @@ async fn find_active_provenance_isolates_by_artifact_id() {
 
 /// 3. No active job → returns `None` (only a completed row exists).
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn find_active_provenance_returns_none_when_only_completed_row_exists() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -822,8 +786,8 @@ async fn count_provenance_rows(pool: &PgPool, artifact_id: Uuid) -> i64 {
 /// `Pending` artifact, with the prior verify job never completing, must
 /// never accumulate more than one active row.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn s4_backstop_n_ticks_over_held_artifact_produce_at_most_one_active_verify_row() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -847,8 +811,8 @@ async fn s4_backstop_n_ticks_over_held_artifact_produce_at_most_one_active_verif
 /// enqueues exactly one fresh row (re-arm is intentional — a
 /// completed/failed row is no longer "in-flight").
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn s4_backstop_guard_suppresses_reenqueue_then_rearms_after_completion() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };

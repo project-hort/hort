@@ -3328,6 +3328,7 @@ dependencies = [
  "metrics-util",
  "rand 0.10.3",
  "serde_json",
+ "serial_test",
  "sqlx",
  "temp-env",
  "tempfile",

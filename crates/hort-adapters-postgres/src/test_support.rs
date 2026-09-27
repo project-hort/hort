@@ -760,6 +760,8 @@ fn classify_migrate_failure(err: &sqlx::migrate::MigrateError) -> String {
 mod tests {
     use super::*;
 
+    use serial_test::serial;
+
     /// A [`DropCandidate`] whose every drop costs a fixed amount of time.
     /// Under `tokio::test(start_paused = true)` that time is virtual, so
     /// the budget loop is exercised against a drop far slower than any real
@@ -959,15 +961,17 @@ mod tests {
     // connect error immediately — so a closed port would make these
     // tests cost 30 s each and an unresolvable host costs milliseconds.
     //
-    // They call `isolated_db_from` and `connect_or_panic` and still carry
-    // no `#[serial(hort_pg_db)]`, deliberately: the serial key exists
-    // because a test that reaches the Postgres server collides with a
-    // concurrent sibling through cluster-global work (`CREATE ROLE`,
-    // `CREATE`/`DROP DATABASE`, `pg_stat_activity`). Name resolution
-    // fails before a socket is opened, so none of that work is reached
-    // and there is nothing to serialise against. Taking the key here
-    // would only make every DB-backed test in the binary queue behind a
-    // DNS lookup.
+    // They call `isolated_db_from` and `connect_or_panic`, so they carry
+    // `#[serial(hort_pg_db)]` like every other caller of those. Nothing
+    // about *these four* needs it — name resolution fails before a
+    // socket is opened, so none of the cluster-global work the key
+    // exists for (`CREATE ROLE`, `CREATE`/`DROP DATABASE`,
+    // `pg_stat_activity`) is ever reached. The key is here because the
+    // rule has no exemptions: `crates/hort-app/tests/
+    // db_tests_are_serialized.rs` reports every test that calls one of
+    // these entry points, and an exception carved into it would be an
+    // allow-list the next unkeyed test could hide in. The cost is a
+    // failed DNS lookup's worth of queueing.
 
     /// The URL shape these tests feed the helpers: syntactically valid,
     /// unreachable by construction, and carrying a password so the
@@ -1001,6 +1005,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(hort_pg_db)]
     fn isolated_db_from_fails_loudly_when_the_configured_server_is_unreachable() {
         let message = panic_message_of(|| {
             let _ = block_on(isolated_db_from(UNREACHABLE_URL));
@@ -1017,6 +1022,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(hort_pg_db)]
     fn connect_or_panic_fails_loudly_when_the_configured_server_is_unreachable() {
         let message = panic_message_of(|| {
             let _ = block_on(connect_or_panic(UNREACHABLE_URL));
@@ -1032,6 +1038,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(hort_pg_db)]
     fn an_unparseable_database_url_fails_loudly_and_withholds_the_value() {
         let message = panic_message_of(|| {
             let _ = block_on(isolated_db_from(
@@ -1050,6 +1057,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(hort_pg_db)]
     fn the_unreachable_panic_withholds_the_password() {
         let message = panic_message_of(|| {
             let _ = block_on(isolated_db_from(UNREACHABLE_URL));
