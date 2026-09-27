@@ -160,6 +160,15 @@ pub struct Artifact {
     /// `hort-http-<format>` crates cannot). `#[serde(skip)]` so it never
     /// enters any wire/event form; always `None` on a fresh load from
     /// the store.
+    ///
+    /// A **minting** path fills it in too, from the anchor and duration it
+    /// resolved in order to decide the quarantine: the artifact an ingest
+    /// hands back is rendered straight into a `503` by the cross-repo
+    /// coalesced-follower branch of every format's pull-through, and that
+    /// row has no later read to hydrate it. So "hydrated by the use-case
+    /// layer" covers both directions — a row that carries
+    /// [`Self::quarantine_window_start`] set by THIS request carries the
+    /// deadline that window implies.
     #[serde(skip)]
     pub quarantine_deadline: Option<DateTime<Utc>>,
     /// **Transient, non-persisted** marker that this hold has no

@@ -195,6 +195,13 @@ fi
 
 if grep -qi '^retry-after:' "$ANON_HEADERS"; then
     pass "ANONYMOUS 503 carries a Retry-After header"
+    # Logged, not asserted: the value is the window LEFT, measured from the
+    # derived anchor (ADR 0054 — the minimum over the age sources), so an
+    # inherited anchor legitimately shortens it. Expect at most 86400
+    # (the repo's 24h quarantineDuration) and never a flat 3600, which was the
+    # deadline-unknown fallback this response used to fall back on because
+    # nothing on the ingest path hydrated the transient deadline.
+    log "  INFO: Retry-After = $(grep -i '^retry-after:' "$ANON_HEADERS" | tr -d '\r' | awk '{print $2}') (expected <= 86400, never 3600)"
 else
     fail "ANONYMOUS 503 carries a Retry-After header" "no Retry-After header in response"
 fi
