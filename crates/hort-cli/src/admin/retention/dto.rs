@@ -12,6 +12,12 @@
 //! (`run` for the envelope, `build_preview` for the `preview` object).
 //! The JSON field names are the contract.
 //!
+//! One server field is deliberately **not** projected here: `cursor`, the
+//! keyset position the next run resumes from. It is the sweep's own
+//! rotation state, not a figure an operator reads or acts on — its
+//! operator-visible consequence is already carried by `coverage`. Serde
+//! ignores it, which is the intended handling rather than an omission.
+//!
 //! # Deserialisation posture: tolerate, never invent
 //!
 //! Every numeric field is `#[serde(default)]` so a summary written by an
@@ -46,9 +52,13 @@ pub struct RetentionRunSummary {
     /// `dry_run` or `execute`.
     #[serde(default)]
     pub mode: String,
-    /// `complete` when the sweep reached the end of the candidate
-    /// enumeration; `partial` when it stopped at its per-run batch cap
-    /// with artifacts still unexamined.
+    /// `complete` when this run examined the whole candidate set —
+    /// it both started at the beginning and reached the end. `partial`
+    /// when it stopped at its per-run batch cap, or resumed after an
+    /// earlier run's position, leaving artifacts outside its window
+    /// unexamined. Those artifacts are reached by later runs (the sweep
+    /// persists where it stopped), so `partial` bounds the run's figures
+    /// and not the sweep's reach.
     #[serde(default)]
     pub coverage: String,
     #[serde(default)]

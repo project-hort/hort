@@ -242,8 +242,15 @@ Three things about that output are deliberate:
   the figure back. There is no estimate anywhere, and never a `0` standing
   in for "we did not look".
 - **Partial coverage is in the header.** A sweep that stopped at its
-  per-run batch cap undercounts everything below it, so it is stated
-  above the numbers rather than after them.
+  per-run batch cap undercounts every artifact outside the window it
+  walked, so it is stated above the numbers rather than after them. It
+  bounds the run, not the sweep: each execution records the position it
+  stopped at, the next one resumes strictly after it, and a finished pass
+  wraps to the beginning — so a registry larger than one run's cap is
+  covered across consecutive runs rather than having its tail left
+  permanently unevaluated. A preview reads that position without moving
+  it, which is what makes it a preview of the window the next execution
+  will act on.
 
 `apply` always runs a **fresh** preview immediately before executing.
 With `--from-preview` it compares that fresh preview against the earlier

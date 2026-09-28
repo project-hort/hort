@@ -9,28 +9,113 @@
 //! 1:1 on [`CronRescanTickHandler`](super::cron_rescan_tick):
 //!
 //! 1. Capture `now`.
-//! 2. `RetentionPolicyProjectionRepository::list_active()` → the
+//! 2. Read the keyset position the previous completed run stopped at
+//!    (see *Cross-tick rotation* below).
+//! 3. `RetentionPolicyProjectionRepository::list_active()` → the
 //!    active retention policies (O(1) projection read, NOT a stream
 //!    replay).
-//! 3. Loop `RetentionCandidateReader::list_candidates(BATCH_SIZE,
-//!    cursor, now)` advancing the keyset cursor until a short page (a
-//!    per-tick total cap bounds one tick; the daily cron drains any
-//!    backlog — identical posture to cron-rescan's single-shot cap).
-//! 4. Per batch, map `RetentionCandidateRow → RetentionUseCase::
+//! 4. Loop `RetentionCandidateReader::list_candidates(BATCH_SIZE,
+//!    cursor, now)` from that position, advancing the keyset cursor
+//!    until a short page (the walk reached the highest candidate id) or
+//!    the per-tick page cap [`MAX_BATCHES_PER_TICK`].
+//! 5. Per batch, map `RetentionCandidateRow → RetentionUseCase::
 //!    RetentionCandidate` (a trivial field copy — the type stays in
 //!    `hort-app`) and call
 //!    `RetentionUseCase::evaluate_policies_in_mode(now, &policies,
 //!    &candidates, mode)`, accumulating the per-batch [`EvaluateSummary`]
 //!    and matched rows.
-//! 5. For a dry run, simulate the purge refcount decision and build a
+//! 6. For a dry run, simulate the purge refcount decision and build a
 //!    bounded operator sample; for execution, append expiry events at the
 //!    same use-case boundary used before modes existed.
-//! 6. Return [`TaskOutcome::Completed`] with the projected JSON.
+//! 7. Return [`TaskOutcome::Completed`] with the projected JSON, carrying
+//!    the position the next run resumes from.
 //!
 //! The handler appends nothing directly — `evaluate_policies_in_mode` owns
 //! the `ArtifactExpired` append in execute mode and suppresses that append
 //! in dry-run mode. No new metrics are introduced; the handler returns
 //! `result_summary` JSON only.
+//!
+//! # Cross-tick rotation
+//!
+//! One run evaluates at most `MAX_BATCHES_PER_TICK * BATCH_SIZE`
+//! artifacts, so on a registry holding more eligible artifacts than that
+//! the cap is reached with candidates still unexamined. Where it stopped
+//! is **persisted**: the run writes the last artifact id it evaluated
+//! into its own `result_summary.cursor` ([`SweepCursor`]), and the next
+//! run's fresh `jobs` row reads that back through
+//! [`JobsRepository::last_result_summary_by_kind`] and resumes strictly
+//! after it. No new table, no column on `artifacts`, no operator knob:
+//! `result_summary` is durable per-row state the run already writes, and
+//! the jobs-row retention sweep retains the newest `completed` row of
+//! every kind precisely because readers of this shape exist (see
+//! [`JobsRepository::delete_terminal_other_kind_rows_older_than`]). It is
+//! the [`PrefetchTickHandler`](super::prefetch_tick) rotation's
+//! mechanism applied to a single-dimension keyset walk.
+//!
+//! **A finished pass wraps.** A short — or empty — page means the walk
+//! reached the highest candidate id, so the pass is over and the
+//! persisted cursor goes back to `null`: the next run starts from the
+//! beginning again. A full pass therefore costs
+//! `⌈candidates / (MAX_BATCHES_PER_TICK * BATCH_SIZE)⌉` *executions* —
+//! only an execution advances the position, see below — and a candidate
+//! set that fits inside one run behaves exactly as it did
+//! before the cursor existed — one page, short, pass complete, cursor
+//! `null` — which is every deployment below 64 000 eligible artifacts.
+//!
+//! **Coverage comes from the wrap, not from the ordering.**
+//! `artifacts.id` is a v4 UUID, so the keyset walks UUID space, not
+//! time: a newly ingested artifact lands uniformly at random relative to
+//! the saved cursor, and about half of them land *behind* it. A pass
+//! therefore cannot promise it saw every artifact that was eligible at
+//! some point during it. What is promised is that the next pass, which
+//! starts from the beginning, does.
+//!
+//! **The candidate set is mutable, and that is a property of the design
+//! rather than an oversight.** The sort key is the immutable primary
+//! key, so no row can shift position between two pages — the classic
+//! keyset-over-a-moving-set skip cannot occur here. What moves is
+//! *membership*:
+//!
+//! - An artifact that stops being a candidate (quarantined, rejected,
+//!   soft-deleted) before the cursor reaches it is not evaluated, which
+//!   is the correct answer rather than a miss.
+//! - An artifact that *becomes* a candidate at an id the cursor has
+//!   already passed waits for the wrap. The wait is bounded by two
+//!   passes — the remainder of the current one plus the next — and the
+//!   evaluator is idempotent, so the eventual evaluation reaches the
+//!   same decision it would have reached earlier. The same bound covers
+//!   a policy activated mid-pass: it reaches the artifacts behind the
+//!   cursor on the following pass.
+//!
+//! **A dry run is an observation and leaves the rotation where it found
+//! it.** `dry_run` takes no per-UTC-day single-flight claim (ADR 0028),
+//! so an operator may preview as often as they like; each preview reads
+//! the cursor — which is what makes it a preview of the window the next
+//! execution will act on — and writes back exactly the value it read.
+//! Advancing on a preview would let previews walk the rotation past the
+//! one execution a day allows; writing `null` would reset it. Echoing is
+//! the only value that changes nothing.
+//!
+//! **`coverage` answers for this run, not for the rotation.** It is
+//! `complete` only when the run both started from the beginning and
+//! reached the end. A run that resumed mid-pass and drained to the tail
+//! reports `partial`, because the artifacts behind its start point are
+//! not in its figures.
+//!
+//! **The cursor is progress state, not a lock.** A run that fails writes
+//! no `result_summary` at all — the dispatcher's `mark_completed` is the
+//! only writer of one — so a crashed run leaves the previous position
+//! standing and the next run re-walks from there. Two *executions* cannot
+//! race for it: the admin-tasks route derives a per-UTC-day idempotency
+//! key for every destructive invocation (ADR 0028), so at most one
+//! `execute` row exists per day cluster-wide and the claim is
+//! `FOR UPDATE SKIP LOCKED`. What can overlap is an execution and a
+//! preview, since previews are unkeyed: a preview that read the position
+//! before an execution moved it, and completed after, writes the older
+//! value back. All three outcomes cost one re-walked page and nothing
+//! else — re-evaluation is idempotent, an artifact already carrying
+//! `ArtifactExpired` lands in `already_expired` with no append — so a
+//! repeat is wasted reads, never a wrong decision.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -38,9 +123,11 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use hort_domain::error::DomainResult;
+use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::retention_candidate_reader::RetentionCandidateReader;
 use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
 use hort_domain::ports::retention_preview::{
@@ -57,16 +144,19 @@ use crate::use_cases::retention_use_case::{
 };
 
 /// Per-batch keyset page size. Mirrors `CronRescanTickHandler`'s
-/// `BATCH_SIZE` (a single tick fetches in 1000-row pages). The daily
-/// cron drains backlog across runs; one tick cannot walk the entire
-/// artifact table unbounded — see [`MAX_BATCHES_PER_TICK`].
+/// `BATCH_SIZE` (a single tick fetches in 1000-row pages). One tick
+/// cannot walk the entire artifact table unbounded — see
+/// [`MAX_BATCHES_PER_TICK`].
 const BATCH_SIZE: u32 = 1000;
 
 /// Per-tick batch cap: at most this many keyset pages per invocation
-/// (`MAX_BATCHES_PER_TICK * BATCH_SIZE` artifacts). Bounds one tick's
-/// work even on a huge table; subsequent daily ticks drain the rest
-/// (the cron-rescan single-shot-cap posture, applied to a keyset loop
-/// because retention has no in-flight-job dedup to bound re-visits).
+/// (`MAX_BATCHES_PER_TICK * BATCH_SIZE` artifacts). It bounds one tick's
+/// work even on a huge table, and it is a per-tick **stride** rather than
+/// a visibility ceiling: the run persists the id it stopped at and the
+/// next run resumes strictly after it, so a candidate set larger than the
+/// product is covered across `⌈candidates / product⌉` runs instead of
+/// having everything past the first `product` artifacts go permanently
+/// unevaluated. See *Cross-tick rotation* in the module docs.
 const MAX_BATCHES_PER_TICK: usize = 64;
 
 /// The curation queue's listing cap is the operator-facing precedent for a
@@ -178,6 +268,21 @@ const MAX_SIMULATION_TARGETS: u32 = 128_000;
 /// the slowest stores.
 const SIZE_PROBE_CONCURRENCY: usize = 64;
 
+/// Where the sweep stopped, carried across runs as the run's own
+/// `result_summary.cursor` — see *Cross-tick rotation* in the module
+/// docs for why the state lives there rather than in a new table or a
+/// column on `artifacts`.
+///
+/// A struct rather than a bare UUID string because this value is
+/// operator-visible in `result_summary`, and a reader looking at a
+/// summary needs to know what the UUID is without consulting this file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct SweepCursor {
+    /// The next run enumerates candidates whose `artifacts.id` is
+    /// strictly greater than this one.
+    after_artifact_id: uuid::Uuid,
+}
+
 /// [`TaskHandler`] for the periodic retention-evaluate sweep.
 pub struct RetentionEvaluateHandler {
     policies: Arc<dyn RetentionPolicyProjectionRepository>,
@@ -185,6 +290,21 @@ pub struct RetentionEvaluateHandler {
     retention: Arc<RetentionUseCase>,
     preview: Arc<dyn RetentionPreview>,
     storage: Arc<dyn StoragePort>,
+    /// The jobs port the run reads its predecessor's
+    /// `result_summary.cursor` back through. Port-only, mirroring every
+    /// other `hort-app` task handler's shape.
+    jobs: Arc<dyn JobsRepository>,
+    /// Keyset page size. Defaults to [`BATCH_SIZE`]; a field rather than
+    /// a bare const read so the page boundary — and therefore the
+    /// cross-run resume — is unit-testable without a 1000-row fixture.
+    /// Mirrors [`PrefetchTickHandler`](super::prefetch_tick)'s
+    /// `max_repos_per_tick`.
+    batch_size: u32,
+    /// Per-run page cap. Defaults to [`MAX_BATCHES_PER_TICK`]; a field
+    /// for the same reason as [`Self::batch_size`] — reaching the cap is
+    /// what makes a run resume rather than finish, and a 64 000-row
+    /// fixture is not how that should be proven.
+    max_batches_per_tick: usize,
 }
 
 impl RetentionEvaluateHandler {
@@ -194,6 +314,7 @@ impl RetentionEvaluateHandler {
         retention: Arc<RetentionUseCase>,
         preview: Arc<dyn RetentionPreview>,
         storage: Arc<dyn StoragePort>,
+        jobs: Arc<dyn JobsRepository>,
     ) -> Self {
         Self {
             policies,
@@ -201,6 +322,48 @@ impl RetentionEvaluateHandler {
             retention,
             preview,
             storage,
+            jobs,
+            batch_size: BATCH_SIZE,
+            max_batches_per_tick: MAX_BATCHES_PER_TICK,
+        }
+    }
+
+    /// Read the keyset position the most recently *completed*
+    /// `retention-evaluate` run left in its `result_summary.cursor`.
+    ///
+    /// Every failure mode — the kind has never completed, the port read
+    /// failed, the prior summary carries no `cursor`, the value is
+    /// `null`, or it fails to deserialise — collapses to `None`, which
+    /// means "walk from the beginning". Losing the resume point costs a
+    /// pass restart, which the wrap would have done anyway; it is never
+    /// a reason to fail the sweep or to skip artifacts.
+    async fn read_cursor(&self) -> Option<SweepCursor> {
+        let summary = match self.jobs.last_result_summary_by_kind(self.kind()).await {
+            Ok(s) => s?,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "retention-evaluate: last_result_summary_by_kind failed; \
+                     evaluating from the beginning",
+                );
+                return None;
+            }
+        };
+        let cursor = summary.get("cursor")?.clone();
+        if cursor.is_null() {
+            return None;
+        }
+        match serde_json::from_value::<SweepCursor>(cursor.clone()) {
+            Ok(c) => Some(c),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    %cursor,
+                    "retention-evaluate: malformed cursor in prior result_summary; \
+                     evaluating from the beginning",
+                );
+                None
+            }
         }
     }
 }
@@ -227,6 +390,12 @@ impl TaskHandler for RetentionEvaluateHandler {
                 Err(message) => return Ok(TaskOutcome::fail(message, false)),
             };
 
+            // Read before the policy check, so that an execution's own
+            // walk is the only thing that ever moves the sweep's
+            // position: every other completing path below writes back
+            // the value read here unchanged.
+            let resume_after = self.read_cursor().await;
+
             let policies = match self.policies.list_active().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -235,13 +404,19 @@ impl TaskHandler for RetentionEvaluateHandler {
                 }
             };
             if policies.is_empty() {
-                // Steady state: no policies configured → no-op.
+                // Steady state: no policies configured → no-op. Coverage
+                // is `complete` because there is nothing to evaluate,
+                // and the cursor is echoed rather than cleared: a
+                // policy archived mid-pass must not cost the rotation
+                // its position, since re-activating one would then
+                // restart the pass from the beginning.
                 tracing::info!("retention-evaluate: no active policies — no-op");
                 return Ok(TaskOutcome::Completed {
                     result_summary: json!({
                         "policies": 0,
                         "mode": mode.as_str(),
                         "coverage": "complete",
+                        "cursor": resume_after,
                         "evaluated": 0,
                         "expired": 0,
                         "already_expired": 0,
@@ -265,12 +440,15 @@ impl TaskHandler for RetentionEvaluateHandler {
 
             let mut total = EvaluateSummary::default();
             let mut matches = Vec::new();
-            let mut cursor: Option<uuid::Uuid> = None;
-            let mut coverage_complete = true;
-            for batch_index in 0..MAX_BATCHES_PER_TICK {
+            let mut cursor: Option<uuid::Uuid> = resume_after.map(|c| c.after_artifact_id);
+            // Set when a page comes back short or empty: the walk has
+            // reached the highest candidate id, so this pass is finished
+            // and the next run starts over from the beginning.
+            let mut pass_complete = false;
+            for _ in 0..self.max_batches_per_tick {
                 let rows = match self
                     .candidates
-                    .list_candidates(BATCH_SIZE, cursor, now)
+                    .list_candidates(self.batch_size, cursor, now)
                     .await
                 {
                     Ok(r) => r,
@@ -286,10 +464,11 @@ impl TaskHandler for RetentionEvaluateHandler {
                     }
                 };
                 if rows.is_empty() {
+                    pass_complete = true;
                     break;
                 }
                 cursor = rows.last().map(|r| r.artifact.id);
-                let short_page = (rows.len() as u32) < BATCH_SIZE;
+                let short_page = (rows.len() as u32) < self.batch_size;
 
                 // RetentionCandidateRow → RetentionCandidate
                 // (trivial field copy).
@@ -324,13 +503,35 @@ impl TaskHandler for RetentionEvaluateHandler {
                 }
 
                 if short_page {
+                    pass_complete = true;
                     break;
-                }
-                if batch_index + 1 == MAX_BATCHES_PER_TICK {
-                    coverage_complete = false;
                 }
             }
 
+            // `coverage` answers for this run: it examined everything
+            // only if it both started at the beginning and reached the
+            // end. A run that resumed mid-pass and drained to the tail
+            // still has the artifacts behind its start point missing
+            // from its figures.
+            let coverage_complete = resume_after.is_none() && pass_complete;
+
+            // A finished pass wraps: the next run starts from the
+            // beginning. A dry run reports what the next execution would
+            // do and writes back the position it read, so previewing —
+            // which takes no per-UTC-day claim and may happen any number
+            // of times — cannot walk the rotation forward.
+            let next_cursor = if mode == RetentionEvaluationMode::DryRun {
+                resume_after
+            } else if pass_complete {
+                None
+            } else {
+                cursor.map(|after_artifact_id| SweepCursor { after_artifact_id })
+            };
+
+            // `resumed` + `pass_complete` are what tell an operator
+            // reading logs alone whether the rotation is advancing: the
+            // counters look identical on a run that made progress and on
+            // one that re-walked the same page.
             tracing::info!(
                 policies = policies.len(),
                 evaluated = total.evaluated,
@@ -339,6 +540,8 @@ impl TaskHandler for RetentionEvaluateHandler {
                 skipped_protected = total.skipped_protected,
                 skipped_stale_scan = total.skipped_stale_scan,
                 errors = total.errors,
+                resumed = resume_after.is_some(),
+                pass_complete,
                 "retention-evaluate sweep complete"
             );
 
@@ -352,6 +555,7 @@ impl TaskHandler for RetentionEvaluateHandler {
                 result_summary: json!({
                     "mode": mode.as_str(),
                     "coverage": if coverage_complete { "complete" } else { "partial" },
+                    "cursor": next_cursor,
                     "policies": policies.len(),
                     "evaluated": total.evaluated,
                     "expired": total.expired,
@@ -565,6 +769,8 @@ mod tests {
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use hort_domain::retention::RetentionPolicy;
     use hort_domain::types::{ByteRange, ContentHash};
+
+    use crate::use_cases::test_support::MockJobsRepository;
     use tokio::io::AsyncRead;
     use uuid::Uuid;
 
@@ -881,12 +1087,29 @@ mod tests {
         policies: Arc<dyn RetentionPolicyProjectionRepository>,
         candidates: Arc<dyn RetentionCandidateReader>,
     ) -> RetentionEvaluateHandler {
+        handler_with_jobs(
+            policies,
+            candidates,
+            Arc::new(MockJobsRepository::default()),
+        )
+    }
+
+    /// Variant that threads a caller-supplied jobs port, so a cross-run
+    /// test can feed one run's `result_summary` into the next run's
+    /// cursor read — which is what the dispatcher's `mark_completed`
+    /// plus a fresh `jobs` row do in production.
+    fn handler_with_jobs(
+        policies: Arc<dyn RetentionPolicyProjectionRepository>,
+        candidates: Arc<dyn RetentionCandidateReader>,
+        jobs: Arc<dyn JobsRepository>,
+    ) -> RetentionEvaluateHandler {
         RetentionEvaluateHandler::new(
             policies,
             candidates,
             retention_uc(),
             Arc::new(InertPreview),
             Arc::new(InertStorage::default()),
+            jobs,
         )
     }
 
@@ -1159,6 +1382,7 @@ mod tests {
             retention_uc(),
             preview,
             storage,
+            Arc::new(MockJobsRepository::default()),
         )
     }
 
@@ -1601,5 +1825,474 @@ mod tests {
             }
             other => panic!("expected Completed, got {other:?}"),
         }
+    }
+    // =====================================================================
+    // Cross-run rotation. These fixtures drive the handler across several
+    // simulated runs, feeding each run's `result_summary` into the next
+    // run's `last_result_summary_by_kind` read — which is what the
+    // dispatcher's `mark_completed` plus a fresh `jobs` row do in
+    // production.
+    // =====================================================================
+
+    /// A candidate reader over a fixed corpus that honours the keyset
+    /// `after` bound and the `ORDER BY a.id` the Postgres adapter
+    /// provides (`($3::uuid IS NULL OR a.id > $3)`). [`MockCandidates`]
+    /// hands out pre-baked pages and ignores `after` entirely, so it
+    /// cannot observe where a run started — which is exactly the blind
+    /// spot that let a sweep restarting at the beginning every run look
+    /// correct.
+    struct KeysetCandidates {
+        /// The corpus, ascending by artifact id.
+        rows: Vec<RetentionCandidateRow>,
+        /// The ids served, one entry per `list_candidates` call.
+        served: Mutex<Vec<Vec<Uuid>>>,
+    }
+
+    impl KeysetCandidates {
+        /// A corpus of `count` candidates whose ids ascend in
+        /// construction order, so a test can name "the first four"
+        /// without sorting UUIDs by hand. Production ids are v4 and land
+        /// in the id space at random; the walk only depends on the order
+        /// being total and stable, which sequential ids satisfy.
+        fn with_rows(count: usize) -> Self {
+            Self {
+                rows: (1..=count)
+                    .map(|i| RetentionCandidateRow {
+                        artifact: art(Uuid::from_u128(i as u128)),
+                        format: hort_domain::entities::repository::RepositoryFormat::Generic,
+                        repository_key: "npm-proxy".into(),
+                        resolved_rescan_interval_hours: None,
+                        keep_rank: None,
+                        tag_targeted: false,
+                    })
+                    .collect(),
+                served: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The corpus ids, ascending — the order the reader serves them.
+        fn ids(&self) -> Vec<Uuid> {
+            self.rows.iter().map(|r| r.artifact.id).collect()
+        }
+
+        /// Every id served since the last [`Self::take_served`], in
+        /// order, flattened across pages.
+        fn take_served(&self) -> Vec<Uuid> {
+            std::mem::take(&mut *self.served.lock().unwrap())
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+    }
+
+    impl RetentionCandidateReader for KeysetCandidates {
+        fn list_candidates<'a>(
+            &'a self,
+            batch_size: u32,
+            after: Option<Uuid>,
+            _now: DateTime<Utc>,
+        ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
+            let page: Vec<RetentionCandidateRow> = self
+                .rows
+                .iter()
+                .filter(|r| after.is_none_or(|a| r.artifact.id > a))
+                .take(batch_size as usize)
+                .cloned()
+                .collect();
+            self.served
+                .lock()
+                .unwrap()
+                .push(page.iter().map(|r| r.artifact.id).collect());
+            Box::pin(async move { Ok(page) })
+        }
+    }
+
+    /// A handler whose page size and per-run page cap are shrunk to
+    /// `batch_size` x `max_batches`, so the resume across runs is proven
+    /// at the page boundary rather than with a 64 000-row fixture. The
+    /// policy is active and matches nothing, which keeps every run a pure
+    /// walk: the rotation, not the predicate, is under test.
+    fn rotation_handler(
+        candidates: Arc<dyn RetentionCandidateReader>,
+        jobs: Arc<dyn JobsRepository>,
+        batch_size: u32,
+        max_batches: usize,
+    ) -> RetentionEvaluateHandler {
+        let mut h = handler_with_jobs(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates,
+            jobs,
+        );
+        h.batch_size = batch_size;
+        h.max_batches_per_tick = max_batches;
+        h
+    }
+
+    /// Run one simulated tick and publish its `result_summary` the way
+    /// the dispatcher's `mark_completed` does, so the next run's cursor
+    /// read sees it.
+    async fn tick(
+        h: &RetentionEvaluateHandler,
+        jobs: &MockJobsRepository,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let TaskOutcome::Completed { result_summary } = h.run(&params, ctx()).await.expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        jobs.set_last_result_summary_by_kind("retention-evaluate", result_summary.clone());
+        result_summary
+    }
+
+    fn cursor_value(id: Uuid) -> serde_json::Value {
+        json!({ "after_artifact_id": id })
+    }
+
+    /// The defect this whole mechanism exists for: a second run must see
+    /// artifacts the first did not. Before the cursor was persisted both
+    /// runs walked the same leading page and everything past the per-run
+    /// cap was never evaluated at all.
+    #[tokio::test]
+    async fn a_second_run_sees_candidates_the_first_did_not() {
+        let candidates = Arc::new(KeysetCandidates::with_rows(10));
+        let ids = candidates.ids();
+        let jobs = Arc::new(MockJobsRepository::default());
+        let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+        let first_summary = tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        let first = candidates.take_served();
+        let second_summary = tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        let second = candidates.take_served();
+
+        assert_eq!(first, ids[0..4], "the first run walks the leading page");
+        assert_eq!(
+            second,
+            ids[4..8],
+            "the second run must resume after the first run's last id, not restart at the \
+             beginning"
+        );
+        assert!(
+            second.iter().all(|id| !first.contains(id)),
+            "the two runs must not overlap: {first:?} vs {second:?}"
+        );
+        assert_eq!(first_summary["coverage"], "partial");
+        assert_eq!(
+            first_summary["cursor"],
+            cursor_value(ids[3]),
+            "the run publishes where it stopped, in the shape the next run parses"
+        );
+        assert_eq!(second_summary["cursor"], cursor_value(ids[7]));
+    }
+
+    /// The tail reached as a short page: the pass is over, the cursor
+    /// goes back to `null`, and the next run starts from the beginning
+    /// rather than sitting at the end forever.
+    #[tokio::test]
+    async fn a_pass_that_ends_on_a_short_page_wraps_to_the_beginning() {
+        let candidates = Arc::new(KeysetCandidates::with_rows(5));
+        let ids = candidates.ids();
+        let jobs = Arc::new(MockJobsRepository::default());
+        let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+        tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(candidates.take_served(), ids[0..4]);
+
+        let tail = tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(candidates.take_served(), ids[4..5], "the last, short page");
+        assert_eq!(
+            tail["cursor"],
+            serde_json::Value::Null,
+            "a finished pass wraps: the persisted position goes back to the beginning"
+        );
+
+        tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(
+            candidates.take_served(),
+            ids[0..4],
+            "the run after a completed pass starts over"
+        );
+    }
+
+    /// The same wrap when the tail falls exactly on a page boundary, so
+    /// the walk discovers it through an empty page rather than a short
+    /// one.
+    #[tokio::test]
+    async fn a_pass_that_ends_on_an_empty_page_wraps_to_the_beginning() {
+        let candidates = Arc::new(KeysetCandidates::with_rows(6));
+        let ids = candidates.ids();
+        let jobs = Arc::new(MockJobsRepository::default());
+        let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+        tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(candidates.take_served(), ids[0..4]);
+
+        let tail = tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(
+            candidates.take_served(),
+            ids[4..6],
+            "a full final page followed by an empty one"
+        );
+        assert_eq!(tail["cursor"], serde_json::Value::Null);
+
+        tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(candidates.take_served(), ids[0..4]);
+    }
+
+    /// Eventual coverage: successive runs together reach every candidate,
+    /// which is the property the per-run cap alone cannot give.
+    #[tokio::test]
+    async fn successive_runs_cover_every_candidate() {
+        let candidates = Arc::new(KeysetCandidates::with_rows(10));
+        let ids = candidates.ids();
+        let jobs = Arc::new(MockJobsRepository::default());
+        // Stride 4 over 10 candidates: ceil(10 / 4) = 3 runs.
+        let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+        let mut seen: Vec<Uuid> = Vec::new();
+        for _ in 0..3 {
+            tick(&h, &jobs, json!({ "mode": "execute" })).await;
+            seen.extend(candidates.take_served());
+        }
+
+        seen.sort();
+        assert_eq!(
+            seen.len(),
+            ids.len(),
+            "no candidate is evaluated twice within a pass: the cursor only moves forward",
+        );
+        seen.dedup();
+        assert_eq!(seen, ids, "every candidate is evaluated within one pass");
+    }
+
+    /// A preview is an observation: it reports the window the next
+    /// execution will act on and leaves the rotation exactly where it
+    /// found it. A dry run that advanced the cursor would let previews —
+    /// which take no per-UTC-day single-flight claim — walk the rotation
+    /// past the one execution a day allows.
+    #[tokio::test]
+    async fn a_dry_run_leaves_the_cursor_where_it_found_it() {
+        let candidates = Arc::new(KeysetCandidates::with_rows(10));
+        let ids = candidates.ids();
+        let jobs = Arc::new(MockJobsRepository::default());
+        let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+        tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(candidates.take_served(), ids[0..4]);
+
+        let preview = tick(&h, &jobs, json!({ "mode": "dry_run" })).await;
+        assert_eq!(
+            candidates.take_served(),
+            ids[4..8],
+            "the preview describes the window the next execution will act on"
+        );
+        assert_eq!(
+            preview["cursor"],
+            cursor_value(ids[3]),
+            "the preview writes back the position it read, unchanged"
+        );
+
+        tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(
+            candidates.take_served(),
+            ids[4..8],
+            "the execution after a preview acts on the window the preview showed"
+        );
+    }
+
+    /// A candidate set that fits inside one run behaves exactly as it did
+    /// before the cursor existed — one pass per run, coverage complete —
+    /// and a run that resumed mid-pass reports `partial` even when it
+    /// drains to the tail, because the candidates behind its start point
+    /// are missing from its figures.
+    #[tokio::test]
+    async fn coverage_is_complete_only_when_one_run_examined_everything() {
+        let candidates = Arc::new(KeysetCandidates::with_rows(3));
+        let ids = candidates.ids();
+        let jobs = Arc::new(MockJobsRepository::default());
+        let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+        let whole = tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(candidates.take_served(), ids);
+        assert_eq!(whole["coverage"], "complete");
+        assert_eq!(whole["cursor"], serde_json::Value::Null);
+
+        jobs.set_last_result_summary_by_kind(
+            "retention-evaluate",
+            json!({ "cursor": cursor_value(ids[0]) }),
+        );
+        let resumed = tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(candidates.take_served(), ids[1..3]);
+        assert_eq!(
+            resumed["coverage"], "partial",
+            "a run that started mid-pass did not examine the whole candidate set"
+        );
+    }
+
+    /// No active policies is a no-op that must not cost the rotation its
+    /// position: a policy archived mid-pass and re-activated later would
+    /// otherwise restart the pass from the beginning.
+    #[tokio::test]
+    async fn no_active_policies_carries_the_cursor_through() {
+        let candidates = Arc::new(KeysetCandidates::with_rows(10));
+        let ids = candidates.ids();
+        let jobs = Arc::new(MockJobsRepository::default());
+        jobs.set_last_result_summary_by_kind(
+            "retention-evaluate",
+            json!({ "cursor": cursor_value(ids[3]) }),
+        );
+        let h = handler_with_jobs(
+            Arc::new(MockPolicies::new(vec![])),
+            candidates.clone(),
+            jobs.clone(),
+        );
+
+        let summary = tick(&h, &jobs, json!({ "mode": "execute" })).await;
+        assert_eq!(summary["policies"], 0);
+        assert_eq!(summary["cursor"], cursor_value(ids[3]));
+        assert!(
+            candidates.take_served().is_empty(),
+            "the no-policy short-circuit enumerates nothing"
+        );
+    }
+
+    /// Every unusable cursor — absent, `null`, or not a cursor at all —
+    /// degrades to walking from the beginning. A lost resume point costs
+    /// a pass restart, which the wrap does anyway; it must never fail the
+    /// sweep or skip a candidate.
+    #[tokio::test]
+    async fn an_unusable_cursor_evaluates_from_the_beginning() {
+        for prior in [
+            None,
+            Some(json!({ "coverage": "partial" })),
+            Some(json!({ "cursor": serde_json::Value::Null })),
+            Some(json!({ "cursor": 7 })),
+            Some(json!({ "cursor": { "after_artifact_id": "not-a-uuid" } })),
+        ] {
+            let candidates = Arc::new(KeysetCandidates::with_rows(10));
+            let ids = candidates.ids();
+            let jobs = Arc::new(MockJobsRepository::default());
+            if let Some(prior) = prior.clone() {
+                jobs.set_last_result_summary_by_kind("retention-evaluate", prior);
+            }
+            let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+            let summary = h
+                .run(&json!({ "mode": "execute" }), ctx())
+                .await
+                .expect("Ok");
+            assert!(matches!(summary, TaskOutcome::Completed { .. }));
+            assert_eq!(
+                candidates.take_served(),
+                ids[0..4],
+                "prior summary {prior:?} must not stop the sweep from walking"
+            );
+        }
+    }
+
+    /// A jobs port whose only divergence from the shared mock is that the
+    /// cursor read fails. The shared mock cannot fail this read, and the
+    /// failure branch is the one that decides whether a database blip on
+    /// a read-only progress lookup can take the sweep down.
+    struct CursorReadFails;
+
+    impl JobsRepository for CursorReadFails {
+        fn claim_scan_jobs<'a>(
+            &'a self,
+            _worker_id: &'a str,
+            _batch_size: u32,
+            _lock_duration: std::time::Duration,
+        ) -> BoxFuture<'a, DomainResult<Vec<hort_domain::ports::jobs_repository::ScanJob>>>
+        {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn mark_completed<'a>(
+            &'a self,
+            _job_id: Uuid,
+            _result_summary: serde_json::Value,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn reschedule<'a>(
+            &'a self,
+            _job_id: Uuid,
+            _backoff: std::time::Duration,
+            _last_error: &'a str,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn mark_failed<'a>(
+            &'a self,
+            _job_id: Uuid,
+            _last_error: &'a str,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn enqueue_scan<'a>(
+            &'a self,
+            _artifact_id: Uuid,
+            _repository_id: Uuid,
+            _content_hash: &'a ContentHash,
+            _format: &'a str,
+            _priority: i16,
+            _trigger_source: &'a str,
+        ) -> BoxFuture<'a, DomainResult<Uuid>> {
+            Box::pin(async { Ok(Uuid::nil()) })
+        }
+        fn last_result_summary_by_kind<'a>(
+            &'a self,
+            _kind: &'a str,
+        ) -> BoxFuture<'a, DomainResult<Option<serde_json::Value>>> {
+            Box::pin(async { Err(DomainError::Invariant("jobs read unavailable".into())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_cursor_read_evaluates_from_the_beginning() {
+        let candidates = Arc::new(KeysetCandidates::with_rows(10));
+        let ids = candidates.ids();
+        let h = rotation_handler(candidates.clone(), Arc::new(CursorReadFails), 2, 2);
+
+        let outcome = h
+            .run(&json!({ "mode": "execute" }), ctx())
+            .await
+            .expect("Ok");
+        assert!(
+            matches!(outcome, TaskOutcome::Completed { .. }),
+            "a failed progress lookup must not fail the sweep"
+        );
+        assert_eq!(candidates.take_served(), ids[0..4]);
+    }
+
+    /// The persisted field name is a contract across server versions: a
+    /// summary written before an upgrade has to stay parseable, or the
+    /// upgrade silently restarts the pass.
+    #[test]
+    fn the_cursor_round_trips_through_its_persisted_json_shape() {
+        let cursor = SweepCursor {
+            after_artifact_id: Uuid::from_u128(9),
+        };
+        let encoded = serde_json::to_value(cursor).expect("serialize");
+        assert_eq!(encoded, cursor_value(cursor.after_artifact_id));
+        assert_eq!(
+            serde_json::from_value::<SweepCursor>(encoded).expect("deserialize"),
+            cursor,
+        );
+    }
+
+    /// The per-run bound is what the shipped handler carries; the shrunk
+    /// values above exist only so the page boundary is testable.
+    #[test]
+    fn the_shipped_page_size_and_run_cap_are_the_handler_defaults() {
+        assert_eq!(BATCH_SIZE, 1000, "design pin: BATCH_SIZE = 1000");
+        assert_eq!(
+            MAX_BATCHES_PER_TICK, 64,
+            "design pin: MAX_BATCHES_PER_TICK = 64"
+        );
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![])),
+            Arc::new(MockCandidates::new(vec![])),
+        );
+        assert_eq!(h.batch_size, BATCH_SIZE);
+        assert_eq!(h.max_batches_per_tick, MAX_BATCHES_PER_TICK);
     }
 }
