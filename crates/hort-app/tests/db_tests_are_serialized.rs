@@ -128,6 +128,174 @@ fn blank_range(out: &mut [u8], from: usize, to: usize) {
     }
 }
 
+/// True when the byte at `i` starts a token rather than continuing an
+/// identifier — the `r` of `for` must not read as a raw-string opener,
+/// nor the `b` of `verbose` as a byte-string prefix.
+fn starts_a_token(src: &[u8], i: usize) -> bool {
+    i == 0 || !is_ident_byte(src[i - 1])
+}
+
+/// True when `src` carries `first` immediately followed by `second` at
+/// `i` — the two-byte markers this lexer turns on (`//`, `/*`, `*/`,
+/// `b"`) all read this way.
+fn is_pair(src: &[u8], i: usize, first: u8, second: u8) -> bool {
+    src[i] == first && i + 1 < src.len() && src[i + 1] == second
+}
+
+/// The offset just past a `//` line comment starting at `i`, or `None`
+/// when one does not start there. The terminating newline stays outside
+/// the range, so the line structure survives the blanking.
+fn line_comment_end(src: &[u8], i: usize) -> Option<usize> {
+    if !is_pair(src, i, b'/', b'/') {
+        return None;
+    }
+    let mut end = i;
+    while end < src.len() && src[end] != b'\n' {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// The offset just past a `/* … */` block comment starting at `i`, or
+/// `None` when one does not start there. Nesting counts, as rustc allows
+/// it; an unterminated comment blanks to the end of the input.
+fn block_comment_end(src: &[u8], i: usize) -> Option<usize> {
+    if !is_pair(src, i, b'/', b'*') {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut end = i + 2;
+    while end < src.len() && depth > 0 {
+        if is_pair(src, end, b'/', b'*') {
+            depth += 1;
+            end += 2;
+        } else if is_pair(src, end, b'*', b'/') {
+            depth -= 1;
+            end += 2;
+        } else {
+            end += 1;
+        }
+    }
+    Some(end)
+}
+
+/// The offset just past a `\`-escaped literal whose body starts at
+/// `from` and runs to the next unescaped `terminator`. Shared by the
+/// string and char forms, which differ only in that byte.
+///
+/// An unterminated literal runs to the end of the input, and a trailing
+/// escape can put the answer one byte past it — `blank_range` clamps, so
+/// the overshoot costs nothing and the walk still terminates.
+fn escaped_literal_end(src: &[u8], from: usize, terminator: u8) -> usize {
+    let mut j = from;
+    while j < src.len() {
+        if src[j] == b'\\' {
+            j += 2;
+        } else if src[j] == terminator {
+            return j + 1;
+        } else {
+            j += 1;
+        }
+    }
+    j
+}
+
+/// The offset just past the `"##…` that closes a raw string whose opener
+/// carried `hashes` hashes, scanning from `from`. Unterminated blanks to
+/// the end of the input.
+fn raw_string_close(src: &[u8], from: usize, hashes: usize) -> usize {
+    let n = src.len();
+    let mut j = from;
+    while j < n {
+        if src[j] == b'"' && j + hashes < n && src[j + 1..=j + hashes].iter().all(|c| *c == b'#') {
+            return j + 1 + hashes;
+        }
+        j += 1;
+    }
+    n
+}
+
+/// The offset just past a raw string starting at `i` — `r"…"`, `r#"…"#`,
+/// `br#"…"#` — or `None` when `i` starts something else. A raw string
+/// honours no escapes, so only a `"` trailed by as many `#` as the
+/// opener carried can close it.
+fn raw_string_end(src: &[u8], i: usize) -> Option<usize> {
+    if !starts_a_token(src, i) {
+        return None;
+    }
+    let r_at = match src[i] {
+        b'r' => i,
+        // The `b` of a byte-raw string shifts the `r` one byte right.
+        b'b' if i + 1 < src.len() && src[i + 1] == b'r' => i + 1,
+        _ => return None,
+    };
+    let mut hashes = 0usize;
+    let mut k = r_at + 1;
+    while k < src.len() && src[k] == b'#' {
+        hashes += 1;
+        k += 1;
+    }
+    // No quote after the hash run: a plain identifier such as `r` or
+    // `br`, not a literal.
+    if k >= src.len() || src[k] != b'"' {
+        return None;
+    }
+    Some(raw_string_close(src, k + 1, hashes))
+}
+
+/// The offset just past an ordinary or byte string starting at `i`
+/// (`"…"`, `b"…"`), or `None` when `i` starts something else. Only
+/// reached after `raw_string_end`, which owns the `r`-prefixed forms.
+fn quoted_string_end(src: &[u8], i: usize) -> Option<usize> {
+    let body_at = if src[i] == b'"' {
+        i + 1
+    } else if starts_a_token(src, i) && is_pair(src, i, b'b', b'"') {
+        i + 2
+    } else {
+        return None;
+    };
+    Some(escaped_literal_end(src, body_at, b'"'))
+}
+
+/// The offset just past a char literal starting at `i`, or `None` when
+/// the `'` opens a lifetime instead.
+///
+/// `'\…'` and `'x'` are literals; `'static` is not. A multi-byte char
+/// literal reads here as a lifetime, which is harmless: the bytes it
+/// could otherwise hide from the brace matcher (`{`, `}`, `"`, `/`) are
+/// all single-byte and so all take the literal branch.
+fn char_literal_end(src: &[u8], i: usize) -> Option<usize> {
+    if src[i] != b'\'' {
+        return None;
+    }
+    let escaped = i + 1 < src.len() && src[i + 1] == b'\\';
+    let one_char = i + 2 < src.len() && src[i + 2] == b'\'';
+    if !escaped && !one_char {
+        return None;
+    }
+    Some(escaped_literal_end(src, i + 1, b'\''))
+}
+
+/// The offset just past the comment or literal starting at `i`, or
+/// `None` when code starts there.
+///
+/// The order is load-bearing. Comments come first, because a `/*` is not
+/// a division followed by a glob. The raw-string form precedes the
+/// ordinary one, because `r#"…"#` would otherwise read as an identifier
+/// followed by a string that ends at the first inner `"` — and a raw
+/// string is exactly where an unescaped `"` lives. The char literal
+/// comes last, being the only form a `'` can open.
+///
+/// Every arm reports an end strictly past `i`, which is what keeps the
+/// caller's walk advancing.
+fn noncode_token_end(src: &[u8], i: usize) -> Option<usize> {
+    line_comment_end(src, i)
+        .or_else(|| block_comment_end(src, i))
+        .or_else(|| raw_string_end(src, i))
+        .or_else(|| quoted_string_end(src, i))
+        .or_else(|| char_literal_end(src, i))
+}
+
 /// Replace every comment and every string/char literal with spaces,
 /// preserving byte offsets and line breaks so the result can still be
 /// scanned structurally and mapped back to a line number.
@@ -137,116 +305,16 @@ fn blank_range(out: &mut [u8], from: usize, to: usize) {
 /// and this repository's test files are full of both.
 fn blank_noncode(source: &str) -> String {
     let src = source.as_bytes();
-    let n = src.len();
     let mut out = src.to_vec();
     let mut i = 0usize;
-    while i < n {
-        // Line comment.
-        if src[i] == b'/' && i + 1 < n && src[i + 1] == b'/' {
-            let mut j = i;
-            while j < n && src[j] != b'\n' {
-                j += 1;
-            }
-            blank_range(&mut out, i, j);
-            i = j;
-            continue;
-        }
-        // Block comment (nesting, as rustc allows).
-        if src[i] == b'/' && i + 1 < n && src[i + 1] == b'*' {
-            let mut depth = 1usize;
-            let mut j = i + 2;
-            while j < n && depth > 0 {
-                if src[j] == b'/' && j + 1 < n && src[j + 1] == b'*' {
-                    depth += 1;
-                    j += 2;
-                } else if src[j] == b'*' && j + 1 < n && src[j + 1] == b'/' {
-                    depth -= 1;
-                    j += 2;
-                } else {
-                    j += 1;
-                }
-            }
-            blank_range(&mut out, i, j);
-            i = j;
-            continue;
-        }
-        // A `r`/`b` that starts a literal rather than continuing an
-        // identifier — `for` must not read as a raw-string opener.
-        let fresh_token = i == 0 || !is_ident_byte(src[i - 1]);
-        // Raw string: r"…", r#"…"#, br#"…"#.
-        if fresh_token && (src[i] == b'r' || (src[i] == b'b' && i + 1 < n && src[i + 1] == b'r')) {
-            let r_at = usize::from(src[i] == b'b') + i;
-            let mut hashes = 0usize;
-            let mut k = r_at + 1;
-            while k < n && src[k] == b'#' {
-                hashes += 1;
-                k += 1;
-            }
-            if k < n && src[k] == b'"' {
-                let mut j = k + 1;
-                let end = loop {
-                    if j >= n {
-                        break n;
-                    }
-                    if src[j] == b'"'
-                        && j + hashes < n
-                        && src[j + 1..=j + hashes].iter().all(|c| *c == b'#')
-                    {
-                        break j + 1 + hashes;
-                    }
-                    j += 1;
-                };
+    while i < src.len() {
+        match noncode_token_end(src, i) {
+            Some(end) => {
                 blank_range(&mut out, i, end);
                 i = end;
-                continue;
             }
+            None => i += 1,
         }
-        // Ordinary or byte string.
-        if src[i] == b'"' || (fresh_token && src[i] == b'b' && i + 1 < n && src[i + 1] == b'"') {
-            let start = i;
-            let mut j = if src[i] == b'"' { i + 1 } else { i + 2 };
-            while j < n {
-                if src[j] == b'\\' {
-                    j += 2;
-                } else if src[j] == b'"' {
-                    j += 1;
-                    break;
-                } else {
-                    j += 1;
-                }
-            }
-            blank_range(&mut out, start, j.min(n));
-            i = j;
-            continue;
-        }
-        // Char literal, or a lifetime. `'\…'` and `'x'` are literals;
-        // `'static` is not. A multi-byte char literal reads here as a
-        // lifetime, which is harmless: the bytes it could otherwise hide
-        // from the brace matcher (`{`, `}`, `"`, `/`) are all
-        // single-byte and so all take the literal branch.
-        if src[i] == b'\'' {
-            let escaped = i + 1 < n && src[i + 1] == b'\\';
-            let one_char = i + 2 < n && src[i + 2] == b'\'';
-            if escaped || one_char {
-                let mut j = i + 1;
-                while j < n {
-                    if src[j] == b'\\' {
-                        j += 2;
-                    } else if src[j] == b'\'' {
-                        j += 1;
-                        break;
-                    } else {
-                        j += 1;
-                    }
-                }
-                blank_range(&mut out, i, j.min(n));
-                i = j;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        i += 1;
     }
     String::from_utf8(out).expect("blanking replaces whole tokens with ASCII spaces")
 }
