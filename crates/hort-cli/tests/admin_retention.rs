@@ -57,9 +57,38 @@ fn opts() -> SweepOptions {
     }
 }
 
+/// The scheme the shipped `retention-evaluate` handler tags every
+/// proposal digest with. Two digests are comparable only under the same
+/// one, so the fixtures carry the real tag rather than a placeholder.
+const PROPOSAL_SCHEME: &str = "policy-artifact-pairs-v1";
+
+/// A stand-in proposal identity. The value is a readable seed rather
+/// than 64 hex characters: the CLI compares these for equality and never
+/// parses one, so a real digest would only make the fixtures harder to
+/// read.
+fn digest(seed: &str) -> serde_json::Value {
+    serde_json::json!({ "scheme": PROPOSAL_SCHEME, "value": seed })
+}
+
 /// A realistic dry-run `result_summary`: two policies over two
 /// repositories, a measured byte figure, and a sample.
+///
+/// The proposal identity is seeded from the row count, so two fixtures
+/// with the same totals name the same artifacts — which is what makes
+/// [`dry_run_summary_proposing`] the interesting case.
 fn dry_run_summary(rows: u64, coverage: &str, freed: &serde_json::Value) -> serde_json::Value {
+    dry_run_summary_proposing(rows, coverage, freed, &format!("rows-{rows}"))
+}
+
+/// The same fixture with the proposed set named independently of the
+/// totals, so a test can hold every figure still and move only the
+/// artifacts.
+fn dry_run_summary_proposing(
+    rows: u64,
+    coverage: &str,
+    freed: &serde_json::Value,
+    proposal: &str,
+) -> serde_json::Value {
     // Split the rows across the two groups so the per-group figures stay
     // consistent with the total for any fixture size.
     let pypi_rows = rows / 12;
@@ -78,6 +107,7 @@ fn dry_run_summary(rows: u64, coverage: &str, freed: &serde_json::Value) -> serd
             "rows": rows,
             "distinct_contents": 34_102,
             "freed_bytes": freed,
+            "proposal_digest": digest(&format!("run/{proposal}")),
             "groups": [
                 {
                     "policy_id": "a1b2c3d4-0000-0000-0000-000000000001",
@@ -85,7 +115,8 @@ fn dry_run_summary(rows: u64, coverage: &str, freed: &serde_json::Value) -> serd
                     "repository_id": NPM_REPO_UUID,
                     "repository_key": "npm-proxy",
                     "rows": npm_rows,
-                    "distinct_contents": 30_884
+                    "distinct_contents": 30_884,
+                    "proposal_digest": digest(&format!("npm-proxy/{proposal}"))
                 },
                 {
                     "policy_id": "a1b2c3d4-0000-0000-0000-000000000002",
@@ -93,7 +124,8 @@ fn dry_run_summary(rows: u64, coverage: &str, freed: &serde_json::Value) -> serd
                     "repository_id": PYPI_REPO_UUID,
                     "repository_key": "pypi-proxy",
                     "rows": pypi_rows,
-                    "distinct_contents": 3_218
+                    "distinct_contents": 3_218,
+                    "proposal_digest": digest(&format!("pypi-proxy/{proposal}"))
                 }
             ],
             "sample": [
@@ -385,6 +417,12 @@ async fn preview_json_carries_the_coverage_flag_and_the_omission_status() {
     assert_eq!(doc["groups"][0]["repository_key"], "npm-proxy");
     assert_eq!(doc["groups"][0]["repository_id"], NPM_REPO_UUID);
     assert_eq!(doc["sample"].as_array().expect("sample").len(), 3);
+    assert_eq!(doc["proposal_digest"]["scheme"], PROPOSAL_SCHEME);
+    assert_eq!(doc["proposal_digest"]["value"], "run/rows-51535");
+    assert_eq!(
+        doc["groups"][0]["proposal_digest"]["value"], "npm-proxy/rows-51535",
+        "the per-group identity rides through too, so a script can say which group moved",
+    );
 }
 
 #[tokio::test]
@@ -848,6 +886,224 @@ async fn an_identical_preview_is_confirmed_once_and_says_nothing_changed() {
         "one question when nothing moved:\n{}",
         run.prompts
     );
+    assert!(
+        run.stdout.contains("The SAME artifacts"),
+        "and it is earned by the artifacts, not by the totals:\n{}",
+        run.stdout
+    );
+}
+
+/// The failure this whole mechanism exists for, end to end: between the
+/// baseline preview and the apply, one artifact stops matching and an
+/// equally sized one starts. Every figure on the page is identical —
+/// rows, distinct contents, bytes, coverage, both per-group rollups —
+/// and the comparison must still demand the confirmation, because the
+/// apply is about to destroy a different artifact than the operator
+/// read about.
+#[tokio::test]
+async fn an_equal_sized_substitution_is_detected_and_asked_about() {
+    let mut server = Server::new_async().await;
+    let freed = serde_json::json!({ "status": "exact", "bytes": 4_096 });
+    let baseline = dry_run_summary_proposing(51_535, "complete", &freed, "before");
+    let fresh = dry_run_summary_proposing(51_535, "complete", &freed, "after");
+
+    // Nothing an aggregate comparison can see has moved.
+    assert_eq!(baseline["preview"]["rows"], fresh["preview"]["rows"]);
+    assert_eq!(
+        baseline["preview"]["distinct_contents"],
+        fresh["preview"]["distinct_contents"]
+    );
+    assert_eq!(
+        baseline["preview"]["freed_bytes"],
+        fresh["preview"]["freed_bytes"]
+    );
+    assert_eq!(baseline["coverage"], fresh["coverage"]);
+    for group in 0..2 {
+        assert_eq!(
+            baseline["preview"]["groups"][group]["rows"],
+            fresh["preview"]["groups"][group]["rows"]
+        );
+        assert_eq!(
+            baseline["preview"]["groups"][group]["distinct_contents"],
+            fresh["preview"]["groups"][group]["distinct_contents"]
+        );
+    }
+
+    mock_job(&mut server, BASELINE_JOB, "completed", Some(baseline)).await;
+    mock_invoke(&mut server, "dry_run", DRY_RUN_JOB, 202).await;
+    mock_job(&mut server, DRY_RUN_JOB, "completed", Some(fresh)).await;
+    mock_invoke(&mut server, "execute", EXECUTE_JOB, 202).await;
+    mock_job(
+        &mut server,
+        EXECUTE_JOB,
+        "completed",
+        Some(execute_summary(51_535)),
+    )
+    .await;
+
+    let run = run_apply(
+        &server.url(),
+        apply_args(Some(BASELINE_JOB), false),
+        OutputFormat::Table,
+        "yes\nyes\n",
+    )
+    .await;
+
+    assert_eq!(run.exit, RetentionExit::Success);
+    assert!(
+        !run.stdout.contains("NOTHING CHANGED"),
+        "equal totals must not earn it:\n{}",
+        run.stdout
+    );
+    assert!(run.stdout.contains("WHAT CHANGED SINCE"), "{}", run.stdout);
+    assert!(run.stdout.contains("DIFFERENT artifacts"), "{}", run.stdout);
+    assert_eq!(
+        run.prompts.matches("Type \"yes\"").count(),
+        2,
+        "the change acknowledgement is demanded even though every figure held:\n{}",
+        run.prompts
+    );
+    assert!(
+        run.prompts
+            .contains("different artifacts would be expired now"),
+        "{}",
+        run.prompts
+    );
+}
+
+/// A server that reports no proposal identity cannot earn `NOTHING
+/// CHANGED` on equal totals — it gets the confirmation and a statement
+/// that the check did not run.
+#[tokio::test]
+async fn a_preview_without_a_proposal_identity_is_not_reported_as_unchanged() {
+    let mut server = Server::new_async().await;
+    let mut same = dry_run_summary(
+        51_535,
+        "complete",
+        &serde_json::json!({ "status": "exact", "bytes": 4_096 }),
+    );
+    // A server older than the proposal-identity field: totals and
+    // groups, no statement of which rows they cover.
+    same["preview"]
+        .as_object_mut()
+        .expect("preview object")
+        .remove("proposal_digest");
+    for group in same["preview"]["groups"]
+        .as_array_mut()
+        .expect("groups array")
+    {
+        group
+            .as_object_mut()
+            .expect("group object")
+            .remove("proposal_digest");
+    }
+
+    mock_job(&mut server, BASELINE_JOB, "completed", Some(same.clone())).await;
+    mock_invoke(&mut server, "dry_run", DRY_RUN_JOB, 202).await;
+    mock_job(&mut server, DRY_RUN_JOB, "completed", Some(same)).await;
+    mock_invoke(&mut server, "execute", EXECUTE_JOB, 202).await;
+    mock_job(
+        &mut server,
+        EXECUTE_JOB,
+        "completed",
+        Some(execute_summary(51_535)),
+    )
+    .await;
+
+    let run = run_apply(
+        &server.url(),
+        apply_args(Some(BASELINE_JOB), false),
+        OutputFormat::Table,
+        "yes\nyes\n",
+    )
+    .await;
+
+    assert_eq!(run.exit, RetentionExit::Success);
+    assert!(
+        !run.stdout.contains("NOTHING CHANGED"),
+        "a comparison that could not check must not sound like one that did:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout
+            .contains("THIS COMPARISON COULD NOT CHECK WHICH ARTIFACTS"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(run.prompts.matches("Type \"yes\"").count(), 2);
+    assert!(
+        run.prompts.contains("could not check WHICH artifacts"),
+        "{}",
+        run.prompts
+    );
+}
+
+/// Two `partial` runs walk windows of the candidate set, and the sweep's
+/// saved position moves under them. A comparison across them says what
+/// it compared instead of reporting the window as the world.
+#[tokio::test]
+async fn a_comparison_across_partial_coverage_says_it_compared_windows() {
+    let mut server = Server::new_async().await;
+    let freed = serde_json::json!({ "status": "exact", "bytes": 4_096 });
+    mock_job(
+        &mut server,
+        BASELINE_JOB,
+        "completed",
+        Some(dry_run_summary_proposing(
+            51_535,
+            "partial",
+            &freed,
+            "first-window",
+        )),
+    )
+    .await;
+    mock_invoke(&mut server, "dry_run", DRY_RUN_JOB, 202).await;
+    mock_job(
+        &mut server,
+        DRY_RUN_JOB,
+        "completed",
+        Some(dry_run_summary_proposing(
+            51_535,
+            "partial",
+            &freed,
+            "second-window",
+        )),
+    )
+    .await;
+    mock_invoke(&mut server, "execute", EXECUTE_JOB, 202).await;
+    mock_job(
+        &mut server,
+        EXECUTE_JOB,
+        "completed",
+        Some(execute_summary(51_535)),
+    )
+    .await;
+
+    let run = run_apply(
+        &server.url(),
+        apply_args(Some(BASELINE_JOB), false),
+        OutputFormat::Table,
+        "yes\nyes\n",
+    )
+    .await;
+
+    assert_eq!(run.exit, RetentionExit::Success);
+    let flat = run.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("what was compared here is two windows"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        flat.contains("may be the window moving rather than the world"),
+        "the difference is not attributed to the world:\n{}",
+        run.stdout
+    );
+    assert!(
+        run.prompts.contains("what was compared is two windows"),
+        "and the prompt says it too:\n{}",
+        run.prompts
+    );
 }
 
 #[tokio::test]
@@ -918,6 +1174,15 @@ async fn apply_json_puts_one_document_on_stdout_and_the_proposal_on_stderr() {
     assert_eq!(doc["execution"]["artifact_rows_expired"], 51_907);
     assert_eq!(doc["baseline"]["task_job_id"], BASELINE_JOB);
     assert_eq!(doc["fresh_preview"]["task_job_id"], DRY_RUN_JOB);
+    assert_eq!(doc["delta"]["proposal"]["comparison"], "different");
+    assert_eq!(
+        doc["delta"]["proposal"]["window_limited"], true,
+        "the fresh side is partial, and a script must be able to see that",
+    );
+    assert_eq!(
+        doc["delta"]["groups"][0]["proposal_comparison"],
+        "different"
+    );
     // The human still gets the comparison, on the stream that does not
     // have to stay parseable.
     assert!(

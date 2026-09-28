@@ -24,9 +24,10 @@
 //!    `RetentionUseCase::evaluate_policies_in_mode(now, &policies,
 //!    &candidates, mode)`, accumulating the per-batch [`EvaluateSummary`]
 //!    and matched rows.
-//! 6. For a dry run, simulate the purge refcount decision and build a
-//!    bounded operator sample; for execution, append expiry events at the
-//!    same use-case boundary used before modes existed.
+//! 6. For a dry run, simulate the purge refcount decision, build a
+//!    bounded operator sample, and digest the proposal's identity (see
+//!    *What the preview proposes* below); for execution, append expiry
+//!    events at the same use-case boundary used before modes existed.
 //! 7. Return [`TaskOutcome::Completed`] with the projected JSON, carrying
 //!    the position the next run resumes from.
 //!
@@ -96,6 +97,32 @@
 //! one execution a day allows; writing `null` would reset it. Echoing is
 //! the only value that changes nothing.
 //!
+//! # What the preview proposes
+//!
+//! Every figure in the preview — `rows`, `distinct_contents`, the byte
+//! total — says *how much* would be expired. None of them says *what*.
+//! Two previews can agree on all of them and still name different rows,
+//! because an artifact that stopped matching and an equally sized one
+//! that started are the same number; among artifacts of the same kind
+//! that is not a rare coincidence. The bounded sample cannot close the
+//! gap either, since it is capped and may be empty.
+//!
+//! So a dry run also states the proposal's **identity**:
+//! `preview.proposal_digest`, over the `(policy_id, artifact_id)` pairs
+//! this run matched, plus one per `(policy, repository)` group so a
+//! reader can say which group moved. See [`proposal_digest`] for the
+//! encoding and why its ordering is canonical. It is fixed-width on the
+//! wire whatever the proposal's size, and it is not content identity —
+//! it digests identifiers, never artifact bytes.
+//!
+//! **Coverage qualifies a comparison of two identities, never a match.**
+//! Equal digests mean the same proposed rows however much of the
+//! candidate set each run examined. Differing digests over a `partial`
+//! run are another matter: the rotation below persists its position, so
+//! an execution between two previews moves the window under them, and a
+//! reader must say it compared two windows rather than report the window
+//! as the world.
+//!
 //! **`coverage` answers for this run, not for the rotation.** It is
 //! `complete` only when the run both started from the beginning and
 //! reached the end. A run that resumed mid-pass and drained to the tail
@@ -125,6 +152,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use hort_domain::error::DomainResult;
 use hort_domain::ports::jobs_repository::JobsRepository;
@@ -162,6 +190,31 @@ const MAX_BATCHES_PER_TICK: usize = 64;
 /// The curation queue's listing cap is the operator-facing precedent for a
 /// bounded sanity-check sample.
 const MAX_SAMPLE_SIZE: usize = 500;
+
+/// The compatibility tag that travels with every proposal digest.
+///
+/// A single `apply --from-preview` can compare a baseline written before
+/// a rolling upgrade against a fresh preview written after it, so the two
+/// digests it holds may have been computed by two different servers. With
+/// no tag, a change to the input encoding below would surface to the
+/// operator as "the proposal changed" when nothing had — and a warning
+/// that fires when nothing moved is trained away, which is precisely how
+/// it comes to be ignored on the run where something did. The tag lets
+/// the reader say "computed differently, not comparable" instead. Any
+/// change to [`proposal_digest`]'s input — what is hashed, its order, or
+/// its framing — bumps this string.
+const PROPOSAL_DIGEST_SCHEME: &str = "policy-artifact-pairs-v1";
+
+/// Domain-separation prefix hashed ahead of every proposal digest input.
+///
+/// A proposal digest answers "which rows would this sweep expire". It is
+/// **not** content identity: a `ContentHash` is SHA-256 over an
+/// artifact's stored bytes, this is SHA-256 over a list of identifiers,
+/// and no storage path accepts one in place of the other. The prefix
+/// makes that separation structural rather than merely conventional —
+/// with it in the input no proposal digest can coincide with the hash of
+/// any stored blob except by the collision resistance of SHA-256 itself.
+const PROPOSAL_DIGEST_DOMAIN: &str = "hort retention proposal";
 
 /// Input ceiling on the byte simulation, checked before the walk touches the
 /// database.
@@ -428,6 +481,17 @@ impl TaskHandler for RetentionEvaluateHandler {
                                 "rows": 0,
                                 "distinct_contents": 0,
                                 "freed_bytes": { "status": "exact", "bytes": 0 },
+                                // The digest over the empty proposal, not
+                                // an absent one: "this run proposes
+                                // nothing" is a fact a reader may compare
+                                // against, whereas an absent digest means
+                                // "identity unknown" and costs the
+                                // comparison its teeth on the one path
+                                // where the answer is trivially certain.
+                                "proposal_digest": proposal_digest(
+                                    RUN_DIGEST_SCOPE,
+                                    &ProposalPairs::new(),
+                                ),
                                 "groups": [],
                                 "sample": [],
                             }))
@@ -582,11 +646,22 @@ impl RetentionEvaluateHandler {
             repository_key: String,
             rows: u64,
             checksums: BTreeSet<String>,
+            /// This group's share of the proposal, in the canonical
+            /// order [`proposal_digest`] requires.
+            pairs: ProposalPairs,
         }
 
         let mut groups: BTreeMap<(uuid::Uuid, uuid::Uuid), Group> = BTreeMap::new();
         let mut distinct_contents = BTreeSet::new();
         let mut artifact_ids = BTreeSet::new();
+        // The whole proposal, accumulated beside the group breakdown
+        // rather than derived from it: the run digest is specified over
+        // pairs ordered by `(policy_id, artifact_id)`, and concatenating
+        // the groups would order them by `(policy_id, repository_id,
+        // artifact_id)` instead. Both are deterministic, but only the
+        // first can be restated — and reproduced — without reference to
+        // how this handler happens to bucket its groups.
+        let mut proposal: ProposalPairs = ProposalPairs::new();
         let mut sample = Vec::new();
 
         for hit in matches {
@@ -597,8 +672,10 @@ impl RetentionEvaluateHandler {
             group.repository_key.clone_from(&hit.repository_key);
             group.rows += 1;
             group.checksums.insert(hit.checksum_sha256.clone());
+            group.pairs.insert((hit.policy_id, hit.artifact_id));
             distinct_contents.insert(hit.checksum_sha256.clone());
             artifact_ids.insert(hit.artifact_id);
+            proposal.insert((hit.policy_id, hit.artifact_id));
             if sample.len() < MAX_SAMPLE_SIZE {
                 sample.push(json!({
                     "artifact_id": hit.artifact_id,
@@ -622,6 +699,10 @@ impl RetentionEvaluateHandler {
                     "repository_key": group.repository_key,
                     "rows": group.rows,
                     "distinct_contents": group.checksums.len(),
+                    "proposal_digest": proposal_digest(
+                        &group_digest_scope(policy_id, repository_id),
+                        &group.pairs,
+                    ),
                 })
             })
             .collect();
@@ -659,11 +740,100 @@ impl RetentionEvaluateHandler {
             "rows": matches.len(),
             "distinct_contents": distinct_contents.len(),
             "freed_bytes": freed_bytes,
+            "proposal_digest": proposal_digest(RUN_DIGEST_SCOPE, &proposal),
             "groups": group_rows,
             "sample": sample,
             "sample_limit": MAX_SAMPLE_SIZE,
         })
     }
+}
+
+/// The proposal, as the set of `(policy_id, artifact_id)` pairs a sweep
+/// matched.
+///
+/// The pair — not the artifact — is the unit, because one artifact can be
+/// matched by several policies and each of those matches is a separate
+/// expiry. `BTreeSet` is the type rather than an implementation detail:
+/// it *is* the canonical ordering [`proposal_digest`] relies on, so a
+/// caller cannot hand the digest an order that varies with how the sweep
+/// happened to walk.
+type ProposalPairs = BTreeSet<(uuid::Uuid, uuid::Uuid)>;
+
+/// Scope line for the digest that covers a whole run's proposal.
+const RUN_DIGEST_SCOPE: &str = "run";
+
+/// Scope line for the digest that covers one `(policy, repository)`
+/// group's share of the proposal.
+///
+/// Separating the two scopes keeps a single-group run — where the group
+/// holds exactly the pairs the run does — from producing one value for
+/// both, which would let a group digest and a run digest be compared
+/// against each other by accident and agree for the wrong reason.
+fn group_digest_scope(policy_id: uuid::Uuid, repository_id: uuid::Uuid) -> String {
+    format!("group {policy_id} {repository_id}")
+}
+
+/// The identity of the set a preview proposes to expire, as
+/// `{"scheme": …, "value": …}`.
+///
+/// # Why an identity has to be on the wire at all
+///
+/// `rows`, `distinct_contents` and the byte total say *how much* a sweep
+/// proposes to expire and nothing about *what*. A reader comparing two
+/// previews on those figures alone cannot see an artifact that stopped
+/// matching being replaced by an equally sized one that started — and
+/// among artifacts of the same kind, equal totals are not a rare
+/// coincidence. The sample cannot close that gap either: it is capped and
+/// may be empty. A digest closes it exactly, and costs one fixed-width
+/// field however large the proposal is.
+///
+/// # Why this ordering is canonical
+///
+/// Pairs arrive in walk order — keyset order over `artifacts.id`, crossed
+/// with the order the policies were listed in. Neither is a property of
+/// the proposal, and both move when a run resumes at a different keyset
+/// position, so digesting arrival order would make two previews of the
+/// same proposal disagree. [`ProposalPairs`] re-imposes ascending
+/// `(policy_id, artifact_id)` order, which is a function of the set
+/// alone: two runs proposing the same pairs hash the same bytes however
+/// they reached them.
+///
+/// # Why the encoding cannot be ambiguous
+///
+/// Each pair is framed as `<policy_id> <artifact_id>\n`. A UUID's
+/// canonical text form is 36 characters of lowercase hex and hyphens, so
+/// it contains neither the separator nor the terminator; no two different
+/// pair sets can encode to the same bytes. The scope line and the
+/// domain-separation prefix are framed the same way and for the same
+/// reason.
+fn proposal_digest(scope: &str, pairs: &ProposalPairs) -> serde_json::Value {
+    let mut hasher = Sha256::new();
+    hasher.update(PROPOSAL_DIGEST_DOMAIN.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(scope.as_bytes());
+    hasher.update(b"\n");
+    let mut policy_buf = uuid::Uuid::encode_buffer();
+    let mut artifact_buf = uuid::Uuid::encode_buffer();
+    for (policy_id, artifact_id) in pairs {
+        hasher.update(
+            policy_id
+                .as_hyphenated()
+                .encode_lower(&mut policy_buf)
+                .as_bytes(),
+        );
+        hasher.update(b" ");
+        hasher.update(
+            artifact_id
+                .as_hyphenated()
+                .encode_lower(&mut artifact_buf)
+                .as_bytes(),
+        );
+        hasher.update(b"\n");
+    }
+    json!({
+        "scheme": PROPOSAL_DIGEST_SCHEME,
+        "value": hex::encode(hasher.finalize()),
+    })
 }
 
 /// Sum the stored size of every reclaimable target, or say why no sum may be
@@ -1483,6 +1653,259 @@ mod tests {
                 "the id stays beside the key for machine consumers"
             );
         }
+    }
+
+    // -- proposal identity -------------------------------------------------
+
+    /// Pull the digest value out of a preview (or one of its groups),
+    /// asserting the scheme tag rides with it.
+    fn digest_value(node: &serde_json::Value) -> String {
+        let digest = &node["proposal_digest"];
+        assert_eq!(
+            digest["scheme"], PROPOSAL_DIGEST_SCHEME,
+            "every digest carries the scheme that produced it: {digest}"
+        );
+        let value = digest["value"]
+            .as_str()
+            .expect("a digest value")
+            .to_string();
+        assert_eq!(value.len(), 64, "lowercase hex over a 256-bit digest");
+        assert!(
+            value
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "lowercase hex only: {value}"
+        );
+        value
+    }
+
+    fn identity_preview_handler() -> RetentionEvaluateHandler {
+        preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![]))),
+            Arc::new(InertStorage::default()),
+        )
+    }
+
+    const IDENTITY_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// The whole point of the digest: two runs proposing the same rows
+    /// agree even though the sweep reached them in a different order,
+    /// which is what a resumed keyset walk routinely does.
+    #[tokio::test]
+    async fn the_proposal_digest_does_not_depend_on_the_order_the_sweep_walked() {
+        let h = identity_preview_handler();
+        let policy_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
+
+        let forward: Vec<_> = ids
+            .iter()
+            .map(|id| evaluation_match(*id, policy_id, repository_id, IDENTITY_HASH))
+            .collect();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        let a = h.build_preview(Utc::now(), &forward).await;
+        let b = h.build_preview(Utc::now(), &reversed).await;
+        assert_eq!(
+            digest_value(&a),
+            digest_value(&b),
+            "walk order is not a property of the proposal"
+        );
+        assert_eq!(
+            digest_value(&a["groups"][0]),
+            digest_value(&b["groups"][0]),
+            "and neither is it a property of a group's share of it"
+        );
+    }
+
+    /// The failure this whole field exists for: one artifact stops
+    /// matching, an equally sized one starts, and every total stays put.
+    #[tokio::test]
+    async fn an_equal_sized_substitution_moves_the_digest_while_every_total_holds() {
+        let h = identity_preview_handler();
+        let policy_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let kept = Uuid::new_v4();
+
+        let before = vec![
+            evaluation_match(kept, policy_id, repository_id, IDENTITY_HASH),
+            evaluation_match(Uuid::new_v4(), policy_id, repository_id, IDENTITY_HASH),
+        ];
+        let after = vec![
+            evaluation_match(kept, policy_id, repository_id, IDENTITY_HASH),
+            evaluation_match(Uuid::new_v4(), policy_id, repository_id, IDENTITY_HASH),
+        ];
+
+        let a = h.build_preview(Utc::now(), &before).await;
+        let b = h.build_preview(Utc::now(), &after).await;
+
+        assert_eq!(
+            a["rows"], b["rows"],
+            "the totals are the trap, not the tell"
+        );
+        assert_eq!(a["distinct_contents"], b["distinct_contents"]);
+        assert_eq!(a["groups"][0]["rows"], b["groups"][0]["rows"]);
+        assert_eq!(
+            a["groups"][0]["distinct_contents"],
+            b["groups"][0]["distinct_contents"]
+        );
+        assert_ne!(
+            digest_value(&a),
+            digest_value(&b),
+            "a substituted artifact must move the run's identity"
+        );
+        assert_ne!(
+            digest_value(&a["groups"][0]),
+            digest_value(&b["groups"][0]),
+            "and the identity of the group it happened in, so a reader can \
+             say which one moved"
+        );
+    }
+
+    /// One artifact matched by two policies is two expiries, so the pair
+    /// — not the artifact — is the proposal's unit.
+    #[tokio::test]
+    async fn the_digest_is_over_policy_artifact_pairs_not_over_artifacts() {
+        let h = identity_preview_handler();
+        let artifact_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let one_policy = vec![evaluation_match(
+            artifact_id,
+            Uuid::new_v4(),
+            repository_id,
+            IDENTITY_HASH,
+        )];
+        let other_policy = vec![evaluation_match(
+            artifact_id,
+            Uuid::new_v4(),
+            repository_id,
+            IDENTITY_HASH,
+        )];
+
+        let a = h.build_preview(Utc::now(), &one_policy).await;
+        let b = h.build_preview(Utc::now(), &other_policy).await;
+        assert_ne!(
+            digest_value(&a),
+            digest_value(&b),
+            "the same artifact expired by a different policy is a different proposal"
+        );
+    }
+
+    /// A group digest and a run digest over the same pairs must not
+    /// collide, or a reader comparing the wrong pair of fields would
+    /// agree for a reason that is not about the data.
+    #[tokio::test]
+    async fn a_single_group_run_does_not_reuse_its_group_digest_as_the_run_digest() {
+        let h = identity_preview_handler();
+        let matches = vec![evaluation_match(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            IDENTITY_HASH,
+        )];
+        let preview = h.build_preview(Utc::now(), &matches).await;
+        assert_eq!(preview["groups"].as_array().expect("groups").len(), 1);
+        assert_ne!(
+            digest_value(&preview),
+            digest_value(&preview["groups"][0]),
+            "the two scopes are separated in the digest input"
+        );
+    }
+
+    /// A proposal of nothing is a fact, and two of them compare equal.
+    /// An absent digest would instead mean "identity unknown" and would
+    /// cost a reader the confirmation it is owed.
+    #[tokio::test]
+    async fn a_proposal_of_nothing_still_has_an_identity() {
+        let h = identity_preview_handler();
+        let empty = h.build_preview(Utc::now(), &[]).await;
+        assert_eq!(empty["rows"], 0);
+        let value = digest_value(&empty);
+
+        let noop = handler(
+            Arc::new(MockPolicies::new(vec![])),
+            Arc::new(MockCandidates::new(vec![vec![]])),
+        );
+        match noop
+            .run(&json!({ "mode": "dry_run" }), ctx())
+            .await
+            .unwrap()
+        {
+            TaskOutcome::Completed { result_summary } => assert_eq!(
+                digest_value(&result_summary["preview"]),
+                value,
+                "the no-active-policies short-circuit proposes the same nothing, \
+                 and says so in the same words"
+            ),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The digest is an identity over identifiers, not content identity.
+    /// Two proposals that differ only in the checksums their artifacts
+    /// happen to carry are the same proposal.
+    #[tokio::test]
+    async fn the_digest_ignores_the_content_the_proposed_rows_point_at() {
+        let h = identity_preview_handler();
+        let artifact_id = Uuid::new_v4();
+        let policy_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let a = h
+            .build_preview(
+                Utc::now(),
+                &[evaluation_match(
+                    artifact_id,
+                    policy_id,
+                    repository_id,
+                    IDENTITY_HASH,
+                )],
+            )
+            .await;
+        let b = h
+            .build_preview(
+                Utc::now(),
+                &[evaluation_match(
+                    artifact_id,
+                    policy_id,
+                    repository_id,
+                    "4444444444444444444444444444444444444444444444444444444444444444",
+                )],
+            )
+            .await;
+        assert_eq!(
+            digest_value(&a),
+            digest_value(&b),
+            "the same rows are the same proposal whatever bytes they reference"
+        );
+    }
+
+    /// The domain-separation prefix is what keeps a proposal digest from
+    /// ever being read as CAS identity by coincidence.
+    #[test]
+    fn the_digest_input_is_domain_separated_from_a_bare_hash_of_the_same_pairs() {
+        let policy_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let pairs: ProposalPairs = [(policy_id, artifact_id)].into_iter().collect();
+
+        let bare = hex::encode(Sha256::digest(
+            format!("{policy_id} {artifact_id}\n").as_bytes(),
+        ));
+        assert_ne!(
+            proposal_digest(RUN_DIGEST_SCOPE, &pairs)["value"]
+                .as_str()
+                .expect("a value"),
+            bare.as_str(),
+        );
+    }
+
+    #[test]
+    fn the_group_scope_names_both_halves_of_the_group_key() {
+        let policy_id = Uuid::new_v4();
+        let repository_id = Uuid::new_v4();
+        let scope = group_digest_scope(policy_id, repository_id);
+        assert_eq!(scope, format!("group {policy_id} {repository_id}"));
+        assert_ne!(scope, RUN_DIGEST_SCOPE);
     }
 
     #[tokio::test]

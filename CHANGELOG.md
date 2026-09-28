@@ -259,6 +259,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`NOTHING CHANGED SINCE THE PREVIEW YOU NAMED` compared totals, not the
+  artifacts** (#326). `render::diff` had nothing else to compare with:
+  `PreviewGroup` carried `rows` and `distinct_contents` and no statement of
+  *which* rows, so the CLI could not detect an identity change even in
+  principle. Between the baseline preview and the apply, artifact A could stop
+  matching and an equally sized B start — same row count, same distinct
+  contents, same byte total, same coverage — and the comparison reported that
+  nothing had changed, **skipped the acknowledgement confirmation**, and the
+  apply expired B instead of A. The sample could not close the gap either: it
+  is capped server-side and may be empty. Among artifacts of the same kind,
+  equal totals are not a rare coincidence, and the confirmation is the last
+  place a human sees what disappears.
+
+  The preview now carries the proposal's identity. `retention-evaluate`'s
+  `build_preview` digests the `(policy_id, artifact_id)` pairs it matched —
+  the proposal's own unit, since one artifact matched by two policies is two
+  expiries — in ascending pair order, framed one pair per line and
+  domain-separated from every other digest in the system, and emits it as
+  `preview.proposal_digest` plus one per `(policy, repository)` group so a
+  reader can say *which* group moved. It is fixed-width whatever the
+  proposal's size, it is computed inside the walk the preview already
+  performs, and it is not a content hash: it digests identifiers, never
+  artifact bytes. A `scheme` tag rides with each value, so a baseline written
+  before a server upgrade and a fresh preview written after it report "not
+  comparable" instead of a false "the proposal changed".
+
+  The comparison decides on that identity, and fails closed: `NOTHING
+  CHANGED` is now earned only by matching identities, and every other
+  outcome — different rows, no identity reported, two schemes — demands the
+  acknowledgement and says which of the three it found. `delta.changed` in
+  the JSON keeps that reading (`true` whenever sameness was not *established*),
+  so a script gating an unattended apply on `changed == false` stops rather
+  than proceeding blind; `delta.proposal.comparison` distinguishes the cases.
+
+  **Partial coverage qualifies a difference, never a match.** Equal digests
+  mean the same proposed rows however much of the candidate set each run
+  examined. Differing digests over a `partial` run are another matter: the
+  sweep persists its keyset position, so an execution between the two
+  previews moves the window under them, and reporting that as "the proposal
+  changed" would be a warning that fires when nothing moved — trained away,
+  then missed on the run where something did. The output says it compared two
+  windows and that the difference may be the window rather than the world;
+  `delta.proposal.window_limited` carries the same fact for a script.
+
 - **The retention expiry could push an artifact stream past the 200-event cap,
   and every capped reader then decided on the oldest 200 events** (#324).
   `STREAM_EVENT_CAP` is an enforced bound, not an estimate: it is what makes a

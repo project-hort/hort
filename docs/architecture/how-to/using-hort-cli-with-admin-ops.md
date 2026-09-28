@@ -225,9 +225,11 @@ $ hort-cli admin retention apply --from-preview <task_job_id>
 `preview` runs `retention-evaluate` in `dry_run` mode and renders the
 result: artifact rows, distinct stored contents, the bytes a purge would
 actually reclaim, a per-policy/per-repository rollup naming repositories
-by the key you write into a policy, and a capped sample.
+by the key you write into a policy, a capped sample, and — beside the
+run and each group — a **proposal digest** identifying *which* rows the
+run proposes to expire.
 
-Three things about that output are deliberate:
+Four things about that output are deliberate:
 
 - **Rows are not bytes.** One stored blob can back many artifact rows, so
   the row count and the byte figure will not agree. The output labels the
@@ -251,6 +253,18 @@ Three things about that output are deliberate:
   permanently unevaluated. A preview reads that position without moving
   it, which is what makes it a preview of the window the next execution
   will act on.
+- **The proposal has an identity, not just a size.** Every count in the
+  output says *how much* would be expired; none of them says *what*. Two
+  previews can agree on every figure and still name different rows — one
+  artifact stopped matching and an equally sized one started — and among
+  artifacts of the same kind that is not a rare coincidence. So each run
+  also reports a `proposal_digest` over the `(policy, artifact)` pairs it
+  matched, in canonical order, with a per-group digest beside it. It is a
+  fixed-width field whatever the proposal's size, and it is **not** a
+  content hash: it digests identifiers, never artifact bytes, and no
+  storage path accepts one. The `scheme` tag beside each value says which
+  construction produced it; two digests are comparable only under the
+  same scheme.
 
 `apply` always runs a **fresh** preview immediately before executing.
 With `--from-preview` it compares that fresh preview against the earlier
@@ -259,6 +273,38 @@ to acknowledge the change and then to authorise the run — two separate
 questions. `--yes` skips the questions and never the comparison. Without
 `--from-preview` there is nothing to compare against and no delta is
 invented: the fresh preview is presented on its own terms.
+
+That comparison decides on the proposal's identity, so `NOTHING CHANGED
+SINCE THE PREVIEW YOU NAMED` means *the same artifacts*, not *the same
+totals*. Three answers are possible and the output distinguishes them,
+because they ask for different judgement:
+
+- **The same artifacts.** Both previews reported a comparable identity
+  and the two agree. This is the only answer that skips the extra
+  question.
+- **Different artifacts.** The proposed rows moved. You are asked to
+  acknowledge that before authorising the run, whether or not any figure
+  moved with them.
+- **Not compared.** One side reported no identity (a server older than
+  the field), or the two were computed under different schemes (a server
+  upgrade between the two runs). The output says so and still asks — a
+  comparison that could not check must not sound like one that did.
+
+`delta.proposal.comparison` in the JSON carries the same answers, with
+the two causes of "not compared" kept apart: `same`, `different`,
+`unreported`, `scheme_mismatch`. `delta.changed` is fail-closed — `true`
+whenever sameness was not *established* — so a script gating an
+unattended apply on `changed == false` stops rather than proceeding
+blind.
+
+**Partial coverage qualifies a difference, never a match.** Equal digests
+mean the two previews name the same rows however much of the candidate
+set each examined. Differing digests over a `partial` run are another
+matter: two runs can legitimately walk different windows — an execution
+between them moves the sweep's saved position — so the output says it
+compared two windows and that the difference may be the window moving
+rather than the world, instead of reporting it as the proposal changing.
+`delta.proposal.window_limited` is the same fact for a script.
 
 Authority: `preview` needs only the ordinary admin-task permission;
 `apply`'s execute step additionally needs the `task:destructive` claim,

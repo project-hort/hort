@@ -45,7 +45,8 @@ use crate::client::AkClient;
 use crate::config::OutputFormat;
 use crate::output::format_json;
 
-use super::preview::{freed_bytes_json, preview_json};
+use super::dto::ProposalComparison;
+use super::preview::{freed_bytes_json, preview_json, proposal_digest_json};
 use super::render::{self, PreviewDelta};
 use super::{
     read_finished_job, read_later_command, render_still_running, run_sweep, FinishedSweep,
@@ -181,8 +182,11 @@ pub async fn run_with_io(
             if !ask(
                 prompt,
                 input,
-                "The proposal changed since the preview you named. Type \"yes\" to confirm you \
-                 have read the difference above: ",
+                &change_question(
+                    delta
+                        .as_ref()
+                        .expect("world_moved is false without a delta to have moved"),
+                ),
             )? {
                 return finish_unconfirmed(
                     out,
@@ -281,6 +285,39 @@ pub async fn run_with_io(
         )?,
     }
     Ok(RetentionExit::Success)
+}
+
+/// The question that acknowledges a comparison which did not leave the
+/// proposal where the operator last read it.
+///
+/// It names *what* the comparison found, because the three findings ask
+/// for different judgement: rows that moved, figures that moved around
+/// rows that did not, and a comparison that could not see the rows at
+/// all. Wording all three as "the proposal changed" would be false on
+/// two of them — and a prompt an operator learns is sometimes false is a
+/// prompt they stop reading.
+fn change_question(delta: &PreviewDelta) -> String {
+    let finding = match delta.identity() {
+        ProposalComparison::Different => {
+            "The proposal changed since the preview you named: different artifacts would be \
+             expired now."
+        }
+        ProposalComparison::Same => {
+            "The same artifacts would be expired as in the preview you named, but the figures \
+             around them moved."
+        }
+        ProposalComparison::Unreported | ProposalComparison::SchemeMismatch => {
+            "This comparison could not check WHICH artifacts would be expired — it compared \
+             totals only, and equal totals are not the same artifacts."
+        }
+    };
+    let window = if delta.window_limited() {
+        " At least one of the two previews examined only a window of the candidate set, so what \
+         was compared is two windows."
+    } else {
+        ""
+    };
+    format!("{finding}{window} Type \"yes\" to confirm you have read the difference above: ")
 }
 
 /// The question that authorises the run.
@@ -446,10 +483,38 @@ pub fn apply_json(
     })
 }
 
+/// The wire word for a comparison outcome.
+///
+/// One function for the run-level field and the per-group one, so the
+/// two vocabularies cannot drift apart under a consumer that switches on
+/// either.
+fn comparison_word(comparison: ProposalComparison) -> &'static str {
+    match comparison {
+        ProposalComparison::Same => "same",
+        ProposalComparison::Different => "different",
+        ProposalComparison::Unreported => "unreported",
+        ProposalComparison::SchemeMismatch => "scheme_mismatch",
+    }
+}
+
 /// Project the delta. `changed` is the field a script gates on.
+///
+/// `changed` is fail-closed: it is `true` whenever this comparison did
+/// not *establish* that the same rows would be expired, which includes
+/// the case where no identity was reported at all. A script that
+/// auto-applies on `changed == false` therefore stops when the
+/// comparison could not check, which is the only safe reading of a field
+/// by that name. `proposal.comparison` is there for a consumer that
+/// needs to tell the two apart.
 pub fn delta_json(delta: &PreviewDelta) -> serde_json::Value {
     json!({
         "changed": delta.changed(),
+        "proposal": {
+            "comparison": comparison_word(delta.identity()),
+            "window_limited": delta.window_limited(),
+            "baseline": proposal_digest_json(delta.baseline_proposal.as_ref()),
+            "fresh": proposal_digest_json(delta.fresh_proposal.as_ref()),
+        },
         "artifact_rows": { "baseline": delta.baseline_rows, "fresh": delta.fresh_rows },
         "distinct_contents": {
             "baseline": delta.baseline_distinct,
@@ -466,6 +531,7 @@ pub fn delta_json(delta: &PreviewDelta) -> serde_json::Value {
             "repository_id": g.repository_id,
             "repository_key": g.repository_key,
             "changed": g.changed(),
+            "proposal_comparison": g.identity.map(comparison_word),
             "baseline": g.baseline.map(|(rows, distinct)| json!({
                 "artifact_rows": rows, "distinct_contents": distinct,
             })),
@@ -482,9 +548,20 @@ mod tests {
 
     use super::*;
     use crate::admin::retention::dto::{
-        FreedBytes, PreviewBody, PreviewGroup, RetentionRunSummary, OMITTED_BYTES_REASON,
+        FreedBytes, PreviewBody, PreviewGroup, ProposalDigest, RetentionRunSummary,
+        OMITTED_BYTES_REASON,
     };
     use crate::admin::retention::render::JobFacts;
+
+    /// A stand-in proposal identity, seeded so that two fixtures with
+    /// the same rows name the same artifacts and two with different rows
+    /// do not — which is what the server's digest would say about them.
+    fn digest(seed: &str) -> Option<ProposalDigest> {
+        Some(ProposalDigest {
+            scheme: "policy-artifact-pairs-v1".into(),
+            value: seed.to_string(),
+        })
+    }
 
     fn sweep(job: &str, rows: u64) -> FinishedSweep {
         FinishedSweep {
@@ -504,6 +581,7 @@ mod tests {
                     rows,
                     distinct_contents: rows,
                     freed_bytes: FreedBytes::Exact { bytes: rows * 10 },
+                    proposal_digest: digest(&format!("run/{rows}")),
                     groups: vec![PreviewGroup {
                         policy_id: "p1".into(),
                         policy_name: "npm-90d".into(),
@@ -511,6 +589,7 @@ mod tests {
                         repository_key: "npm-proxy".into(),
                         rows,
                         distinct_contents: rows,
+                        proposal_digest: digest(&format!("npm-proxy/{rows}")),
                     }],
                     sample: vec![],
                     sample_limit: Some(500),
@@ -664,6 +743,177 @@ mod tests {
         assert_eq!(doc["execution"]["mode"], "execute");
         assert_eq!(doc["baseline"]["task_job_id"], "base-1");
         assert_eq!(doc["fresh_preview"]["task_job_id"], "fresh-1");
+    }
+
+    /// A substitution the totals hide still reaches the question, and
+    /// the question says what moved rather than leaving the operator to
+    /// find it in the table.
+    #[test]
+    fn the_change_question_names_a_substituted_proposal_as_different_artifacts() {
+        let baseline = sweep("base-1", 10);
+        let mut fresh = sweep("fresh-1", 10);
+        {
+            let preview = fresh.summary.preview.as_mut().expect("preview");
+            preview.proposal_digest = digest("run/after-the-substitution");
+            preview.groups[0].proposal_digest = digest("npm-proxy/after-the-substitution");
+        }
+        let delta = render::diff(&baseline.summary, &fresh.summary);
+        assert!(delta.changed(), "the confirmation is demanded");
+
+        let q = change_question(&delta);
+        assert!(q.contains("changed since the preview you named"), "{q}");
+        assert!(
+            q.contains("different artifacts would be expired now"),
+            "{q}"
+        );
+        assert!(
+            !q.contains("window"),
+            "complete coverage carries no caveat: {q}"
+        );
+        assert!(q.contains(r#"Type "yes""#), "{q}");
+    }
+
+    /// Figures moving around an unchanged set is a real change, and
+    /// calling it "the proposal changed" would be false — a prompt an
+    /// operator learns is sometimes false is a prompt they stop reading.
+    #[test]
+    fn the_change_question_does_not_claim_the_artifacts_moved_when_only_figures_did() {
+        let baseline = sweep("base-1", 10);
+        let mut fresh = sweep("fresh-1", 10);
+        fresh.summary.preview.as_mut().expect("preview").freed_bytes =
+            FreedBytes::Exact { bytes: 4_096 };
+        let delta = render::diff(&baseline.summary, &fresh.summary);
+
+        let q = change_question(&delta);
+        assert!(q.contains("The same artifacts would be expired"), "{q}");
+        assert!(q.contains("the figures around them moved"), "{q}");
+    }
+
+    #[test]
+    fn the_change_question_says_when_it_could_not_check_which_artifacts() {
+        let baseline = sweep("base-1", 10);
+        let mut fresh = sweep("fresh-1", 10);
+        fresh
+            .summary
+            .preview
+            .as_mut()
+            .expect("preview")
+            .proposal_digest = None;
+        let delta = render::diff(&baseline.summary, &fresh.summary);
+        assert!(
+            delta.changed(),
+            "a comparison that could not check still demands the confirmation",
+        );
+
+        let q = change_question(&delta);
+        assert!(q.contains("could not check WHICH artifacts"), "{q}");
+        assert!(q.contains("equal totals are not the same artifacts"), "{q}");
+    }
+
+    #[test]
+    fn the_change_question_says_when_it_compared_two_windows() {
+        let mut baseline = sweep("base-1", 10);
+        baseline.summary.coverage = "partial".into();
+        let mut fresh = sweep("fresh-1", 10);
+        fresh.summary.coverage = "partial".into();
+        fresh
+            .summary
+            .preview
+            .as_mut()
+            .expect("preview")
+            .proposal_digest = digest("run/a-different-window");
+        let delta = render::diff(&baseline.summary, &fresh.summary);
+
+        let q = change_question(&delta);
+        assert!(q.contains("only a window of the candidate set"), "{q}");
+        assert!(q.contains("what was compared is two windows"), "{q}");
+    }
+
+    /// `changed` is what a script gates an unattended apply on, so it
+    /// has to be false only when sameness was actually established.
+    #[test]
+    fn delta_json_exposes_the_identity_beside_the_fail_closed_changed_flag() {
+        let baseline = sweep("base-1", 10);
+        let mut fresh = sweep("fresh-1", 10);
+        {
+            let preview = fresh.summary.preview.as_mut().expect("preview");
+            preview.proposal_digest = digest("run/after-the-substitution");
+            preview.groups[0].proposal_digest = digest("npm-proxy/after-the-substitution");
+        }
+        let doc = delta_json(&render::diff(&baseline.summary, &fresh.summary));
+
+        assert_eq!(doc["changed"], true);
+        assert_eq!(doc["proposal"]["comparison"], "different");
+        assert_eq!(doc["proposal"]["window_limited"], false);
+        assert_eq!(doc["proposal"]["baseline"]["value"], "run/10");
+        assert_eq!(
+            doc["proposal"]["fresh"]["value"],
+            "run/after-the-substitution"
+        );
+        assert_eq!(
+            doc["artifact_rows"]["baseline"],
+            doc["artifact_rows"]["fresh"]
+        );
+        assert_eq!(doc["groups"][0]["proposal_comparison"], "different");
+        assert_eq!(doc["groups"][0]["changed"], true);
+    }
+
+    #[test]
+    fn delta_json_reports_an_undecidable_identity_as_such_and_still_as_changed() {
+        let baseline = sweep("base-1", 10);
+        let mut fresh = sweep("fresh-1", 10);
+        {
+            let preview = fresh.summary.preview.as_mut().expect("preview");
+            preview.proposal_digest = None;
+            preview.groups[0].proposal_digest = None;
+        }
+        let doc = delta_json(&render::diff(&baseline.summary, &fresh.summary));
+
+        assert_eq!(doc["proposal"]["comparison"], "unreported");
+        assert!(doc["proposal"]["fresh"].is_null());
+        assert_eq!(
+            doc["changed"], true,
+            "a script that auto-applies on !changed must stop when the check did not run",
+        );
+        assert_eq!(doc["groups"][0]["proposal_comparison"], "unreported");
+        assert_eq!(
+            doc["groups"][0]["changed"], false,
+            "an undecidable identity is not this group moving",
+        );
+    }
+
+    #[test]
+    fn delta_json_marks_two_identities_from_different_schemes_as_not_comparable() {
+        let baseline = sweep("base-1", 10);
+        let mut fresh = sweep("fresh-1", 10);
+        fresh
+            .summary
+            .preview
+            .as_mut()
+            .expect("preview")
+            .proposal_digest = Some(ProposalDigest {
+            scheme: "policy-artifact-pairs-v2".into(),
+            value: "run/10".into(),
+        });
+        let doc = delta_json(&render::diff(&baseline.summary, &fresh.summary));
+        assert_eq!(doc["proposal"]["comparison"], "scheme_mismatch");
+        assert_eq!(doc["changed"], true);
+    }
+
+    #[test]
+    fn delta_json_reports_a_group_present_on_one_side_only_with_no_verdict() {
+        let baseline = sweep("base-1", 10);
+        let mut fresh = sweep("fresh-1", 10);
+        fresh
+            .summary
+            .preview
+            .as_mut()
+            .expect("preview")
+            .groups
+            .clear();
+        let doc = delta_json(&render::diff(&baseline.summary, &fresh.summary));
+        assert!(doc["groups"][0]["proposal_comparison"].is_null());
+        assert_eq!(doc["groups"][0]["changed"], true);
     }
 
     #[test]
