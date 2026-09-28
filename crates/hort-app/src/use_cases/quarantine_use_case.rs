@@ -23,9 +23,7 @@ use hort_domain::policy::{
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
-use hort_domain::ports::event_store::{
-    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
-};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::quarantine_release::ReleaseExpiredSummary;
@@ -54,7 +52,7 @@ use crate::metrics::{
     policy_decision_point, values, PolicyEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
-use crate::use_cases::{read_expected_version, CallerPrivileges};
+use crate::use_cases::{read_artifact_stream, read_expected_version, CallerPrivileges};
 
 /// The static authority-kind label for the timer-release
 /// `info!` line. Only the three timer-authorities reach this:
@@ -117,10 +115,6 @@ fn build_scan_findings_rows(
 /// the single CAS write site for the findings blob, so this cap is the
 /// canonical enforcement point. 8 MiB.
 const FINDINGS_BLOB_MAX_BYTES: usize = 8 * 1024 * 1024;
-
-/// Cap on the number of events read when scanning for the prior
-/// `ScanCompleted`. Mirrors `use_cases::STREAM_EVENT_CAP` (200).
-const STREAM_READ_LIMIT: u64 = 200;
 
 /// Wire string for the `ingest_source` label.
 /// Mirrors the `IngestSource` enum (`Direct` / `Proxied`). Returns
@@ -1101,10 +1095,11 @@ impl QuarantineUseCase {
         artifact_id: Uuid,
     ) -> AppResult<Option<(ScanCompleted, DateTime<Utc>)>> {
         let stream_id = StreamId::artifact(artifact_id);
-        let persisted = self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-            .await?;
+        // Full-stream read: the reverse scan below wants the most recent
+        // `ScanCompleted`, and over an oldest-prefix of the stream that is
+        // a superseded one — the clean → vulnerable delta would then be
+        // computed against the wrong baseline.
+        let persisted = read_artifact_stream(&*self.events, &stream_id).await?;
         for event in persisted.iter().rev() {
             if let DomainEvent::ScanCompleted(payload) = &event.event {
                 return Ok(Some((payload.clone(), event.stored_at)));
@@ -1197,18 +1192,22 @@ impl QuarantineUseCase {
     ///
     /// The `hort_artifact_became_vulnerable_total.ingest_source`
     /// label mirrors `IngestSource`. Returns `None` when the stream
-    /// contains no `ArtifactIngested` event within
-    /// [`STREAM_READ_LIMIT`] (defensive — every artifact stream begins
-    /// with one, but we surface the absence rather than panic). The
-    /// caller folds `None` into the
+    /// contains no `ArtifactIngested` event at all (defensive — every
+    /// artifact stream begins with one, but we surface the absence rather
+    /// than panic). The caller folds `None` into the
     /// [`values::FORMAT_UNKNOWN`]-equivalent sentinel
     /// (`"unknown"`) on the metric label.
+    ///
+    /// This is the one artifact-stream read whose answer truncation
+    /// cannot corrupt — `ArtifactIngested` is the genesis event, so a
+    /// forward scan finds it in the first page of any non-empty stream.
+    /// It still goes through
+    /// [`read_artifact_stream`](crate::use_cases::read_artifact_stream)
+    /// rather than a bare capped read, so the file holds no read that a
+    /// future reverse-scan could be added to unnoticed.
     async fn read_ingest_source(&self, artifact_id: Uuid) -> AppResult<Option<IngestSource>> {
         let stream_id = StreamId::artifact(artifact_id);
-        let persisted = self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-            .await?;
+        let persisted = read_artifact_stream(&*self.events, &stream_id).await?;
         for event in persisted.iter() {
             if let DomainEvent::ArtifactIngested(payload) = &event.event {
                 return Ok(Some(payload.source));
@@ -1360,8 +1359,21 @@ impl QuarantineUseCase {
     /// Construct the timer-release authority for a candidate, **fail
     /// closed**. The candidacy filter (`quarantine_until <= now()`) is
     /// the *caller's* concern and is NEVER consulted here — this helper
-    /// reads only the artifact's event stream and resolved scan policy,
+    /// looks only at the artifact's event stream and resolved scan policy,
     /// so expiry can never become a release authority.
+    ///
+    /// `stream` is the artifact's **complete** event stream, read by the
+    /// caller through
+    /// [`read_artifact_stream`](crate::use_cases::read_artifact_stream).
+    /// Completeness is load-bearing for both halves of step 1 below: over
+    /// an oldest-prefix of the stream, "the latest `ScanCompleted`" is a
+    /// superseded verdict and the `ArtifactRejected` that condemned the
+    /// artifact sits in the part that was not read, so a stale clean scan
+    /// would mint `ScanSucceeded` for a rejected artifact. Taking the
+    /// stream as a parameter also keeps the sweep at one read per
+    /// candidate for this gate, and puts the refusal of an unreadable
+    /// stream at the one place that can skip the candidate without
+    /// abandoning the rest of the pass.
     ///
     /// Order:
     /// 1. A **successful** [`DomainEvent::ScanCompleted`] on the artifact
@@ -1400,15 +1412,9 @@ impl QuarantineUseCase {
     ///    artifact).
     async fn resolve_release_authority(
         &self,
-        artifact_id: Uuid,
+        persisted: &[hort_domain::events::PersistedEvent],
         repository_id: Uuid,
     ) -> AppResult<Option<ReleaseAuthorization>> {
-        let stream_id = StreamId::artifact(artifact_id);
-        let persisted = self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-            .await?;
-
         // The LATEST ScanCompleted's index (stream order — `read_stream`
         // returns ascending `stream_position`), so "no ArtifactRejected
         // later than it" can be checked over exactly the suffix after it.
@@ -1656,6 +1662,29 @@ impl QuarantineUseCase {
             let stream_id = StreamId::artifact(artifact_id);
             let correlation_id = Uuid::new_v4();
 
+            // The candidate's complete event stream, read once and handed
+            // to the release-authority gate below. A stream that breached
+            // `STREAM_EVENT_CAP` cannot be read to its tail, so no gate can
+            // be decided from it: skip this candidate — it stays
+            // quarantined, which is the fail-closed answer — and keep
+            // sweeping, because one unreadable stream must not stop every
+            // other candidate from releasing. `error!`, not `warn!`: the
+            // artifact is frozen until an operator intervenes, and nothing
+            // else in the system will say so.
+            let persisted = match read_artifact_stream(&*self.events, &stream_id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        artifact_id = %artifact_id,
+                        error = %e,
+                        "skipping: artifact stream cannot be read completely, so no \
+                         release authority can be derived from it — artifact stays \
+                         quarantined and accepts no further lifecycle events"
+                    );
+                    continue;
+                }
+            };
+
             let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
 
             let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
@@ -1777,7 +1806,7 @@ impl QuarantineUseCase {
             // artifact stays quarantined. quarantine_until is
             // candidacy-only and is never consulted here.
             let Some(authz) = self
-                .resolve_release_authority(artifact_id, repository_id)
+                .resolve_release_authority(&persisted, repository_id)
                 .await?
             else {
                 // Counted only when provenance already cleared — one of
@@ -4861,6 +4890,138 @@ mod tests {
             "a clean ScanCompleted followed by a LATER ArtifactRejected must not authorize \
              release — issue #108 H3"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Truncation is not completeness.
+    //
+    // The authority above is derived from the LATEST `ScanCompleted` and
+    // the suffix after it. Both halves are answers about the whole
+    // stream, and a capped `ReadFrom::Start` read only supplies the whole
+    // stream while the stream fits inside `STREAM_EVENT_CAP`. Past the
+    // cap the reverse scan finds the latest scan *among the oldest 200*
+    // and the suffix check runs over events that are not the suffix — so
+    // a stale clean scan reads as current and the rejection that
+    // superseded it is invisible. `read_artifact_stream` refuses such a
+    // read instead; the candidate stays quarantined, which is the
+    // fail-closed answer.
+    // -----------------------------------------------------------------
+
+    /// Pad `stream` out to `total` events with `ArtifactQuarantined`
+    /// filler, renumbering nothing: callers place the meaningful events
+    /// and say where the filler goes.
+    fn filler_events(
+        stream_id: &StreamId,
+        artifact_id: Uuid,
+        positions: std::ops::Range<u64>,
+    ) -> Vec<PersistedEvent> {
+        positions
+            .map(|p| dummy_persisted_event(stream_id, artifact_id, p))
+            .collect()
+    }
+
+    /// A clean scan early on the stream, a rejection PAST the cap, and
+    /// enough events between them that a 200-event read sees the first and
+    /// not the second. The release authorization must not decide at all.
+    ///
+    /// This is the shape the retention-expiry bypass produced: nothing but
+    /// that append could grow an artifact stream this far, and the moment
+    /// one did, this sweep would release a rejected artifact on the
+    /// strength of a superseded clean scan.
+    #[tokio::test]
+    async fn release_expired_refuses_to_decide_on_a_stream_past_the_event_cap() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+
+        let mut stream = vec![
+            dummy_persisted_event(&stream_id, artifact_id, 0),
+            // The stale clean verdict — inside any capped read.
+            scan_completed_event(artifact_id, 1, 0),
+        ];
+        stream.extend(filler_events(&stream_id, artifact_id, 2..201));
+        // The rejection that supersedes it — outside a 200-event read.
+        stream.push(rejected_event(artifact_id, 201));
+        assert_eq!(stream.len(), 202);
+        events.set_stream(&stream_id, stream);
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            summary.released.is_empty(),
+            "an over-cap stream must not authorize release: the clean scan a truncated \
+             read finds is superseded by an ArtifactRejected the read never reaches"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no transition at all — the candidate is skipped, not released and not \
+             re-quarantined"
+        );
+    }
+
+    /// The counter-factual for the test above: the SAME event shape, with
+    /// the rejection inside the cap. Without it the assertion above would
+    /// also hold for a fixture that never had a release authority to begin
+    /// with.
+    #[tokio::test]
+    async fn release_expired_reads_a_rejection_that_sits_at_the_cap_boundary() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let stream_id = StreamId::artifact(artifact_id);
+
+        let mut stream = vec![
+            dummy_persisted_event(&stream_id, artifact_id, 0),
+            scan_completed_event(artifact_id, 1, 0),
+        ];
+        stream.extend(filler_events(&stream_id, artifact_id, 2..199));
+        // Last event of a stream that sits exactly ON the cap: still read.
+        stream.push(rejected_event(artifact_id, 199));
+        assert_eq!(stream.len(), 200);
+        events.set_stream(&stream_id, stream);
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+
+        assert!(
+            summary.released.is_empty(),
+            "a stream exactly at the cap IS read completely, so the trailing rejection \
+             is seen and denies the authority"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// One frozen candidate must not stop the pass: the over-cap artifact
+    /// is skipped and the healthy candidate behind it still releases.
+    /// Propagating the refusal instead would let a single unreadable
+    /// stream stall every release in the fleet, tick after tick.
+    #[tokio::test]
+    async fn release_expired_skips_an_over_cap_candidate_and_keeps_sweeping() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections) = make_use_case();
+        let frozen =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let healthy =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let frozen_stream = StreamId::artifact(frozen);
+        let mut stream = vec![dummy_persisted_event(&frozen_stream, frozen, 0)];
+        stream.extend(filler_events(&frozen_stream, frozen, 1..201));
+        assert_eq!(stream.len(), 201);
+        events.set_stream(&frozen_stream, stream);
+
+        seed_stream_with_scan_completed(&events, healthy);
+
+        let summary = uc
+            .release_expired(vec![frozen, healthy])
+            .await
+            .expect("an unreadable candidate must not fail the whole sweep");
+
+        assert_eq!(
+            summary.released,
+            vec![healthy],
+            "the healthy candidate behind the frozen one must still release"
+        );
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
     }
 
     /// An EARLIER dirty scan + reject, then a LATER clean rescan with no

@@ -33,17 +33,12 @@ use hort_domain::entities::scan_policy::ProvenanceMode;
 use hort_domain::events::{DomainEvent, StreamId};
 use hort_domain::policy::{evaluate_curation, CurationOutcome};
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
-use hort_domain::ports::event_store::{EventStore, ReadFrom};
+use hort_domain::ports::event_store::EventStore;
 use hort_domain::types::ArtifactCoords;
 
 use crate::error::AppResult;
+use crate::use_cases::read_artifact_stream;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
-
-/// Cap on the number of events read when scanning an artifact stream for
-/// a `ProvenanceVerified` event. Mirrors the `STREAM_READ_LIMIT` /
-/// `STREAM_EVENT_CAP` (200) used by the quarantine use case and
-/// `scan_history`; every artifact stream begins well within this bound.
-const STREAM_READ_LIMIT: u64 = 200;
 
 /// Compute the provenance side of the release gate for a candidate
 /// artifact under the given [`ProvenanceMode`] (ADR 0027). This is the
@@ -65,6 +60,14 @@ const STREAM_READ_LIMIT: u64 = 200;
 /// absent policy resolves to the default `VerifyIfPresent` ⇒
 /// `NotRequired`); this helper owns only the stream read + the verdict
 /// mapping so the two callers cannot diverge.
+///
+/// The `Required` arm reads the artifact stream in full via
+/// [`read_artifact_stream`](crate::use_cases::read_artifact_stream): an
+/// over-cap stream surfaces as an error rather than as a `Pending` that
+/// merely means "the verification is outside the read window". Both are
+/// fail-closed for release, but only the error is honest — and the
+/// difference matters where this same resolution feeds an operator-facing
+/// answer (the transient-hold `Retry-After` on the read path).
 pub(crate) async fn resolve_provenance_clearance(
     events: &dyn EventStore,
     artifact_id: Uuid,
@@ -77,9 +80,7 @@ pub(crate) async fn resolve_provenance_clearance(
         }
         ProvenanceMode::Required => {
             let stream_id = StreamId::artifact(artifact_id);
-            let persisted = events
-                .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-                .await?;
+            let persisted = read_artifact_stream(events, &stream_id).await?;
             let verified = persisted
                 .iter()
                 .any(|e| matches!(e.event, DomainEvent::ProvenanceVerified(_)));
@@ -145,7 +146,7 @@ mod tests {
     use hort_domain::events::{
         ArtifactQuarantined, PersistedEvent, ProvenanceVerified, StreamCategory,
     };
-    use hort_domain::ports::event_store::{AppendEvents, AppendResult, SubscribeFrom};
+    use hort_domain::ports::event_store::{AppendEvents, AppendResult, ReadFrom, SubscribeFrom};
     use hort_domain::ports::provenance::SignerIdentity;
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::ContentHash;

@@ -374,6 +374,175 @@ async fn dry_run_and_execute_select_identical_candidates_but_only_execute_append
     assert_eq!(store.appended_batches().len(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// Stream-event cap
+//
+// The expiry append is the one artifact-stream writer that appends at
+// `ExpectedVersion::Any`, so the adapter performs no version check on it
+// and it inherits none of the bound `read_expected_version` gives every
+// `Exact` writer. It therefore carries the refusal itself; without it the
+// daily sweep is the only writer able to push an artifact stream past
+// `STREAM_EVENT_CAP`, and past the cap every capped reader of that stream
+// — the quarantine release authorization first — silently decides on the
+// oldest prefix.
+// ---------------------------------------------------------------------------
+
+/// Seed a stream of exactly `total` events: the genesis
+/// `ArtifactIngested` followed by `total - 1` padding events, none of
+/// which is an `ArtifactExpired` (so the idempotency check does not
+/// short-circuit) and none a `ScanCompleted` (so the age predicate below
+/// needs no freshness proof).
+fn seed_stream_of_length(store: &MockEventStore, c: &RetentionCandidate, total: u64) -> StreamId {
+    let stream_id = StreamId::artifact(c.artifact.id);
+    let mut events = vec![persisted(
+        &stream_id,
+        0,
+        c.artifact.created_at,
+        ingested(c.artifact.id, IngestSource::Proxied),
+    )];
+    for pos in 1..total {
+        events.push(persisted(
+            &stream_id,
+            pos,
+            c.artifact.created_at,
+            DomainEvent::ArtifactReleased(hort_domain::events::ArtifactReleased {
+                artifact_id: c.artifact.id,
+                released_by: hort_domain::events::ReleaseReason::Timer,
+                released_by_user_id: None,
+                justification: None,
+            }),
+        ));
+    }
+    store.set_stream(&stream_id, events);
+    stream_id
+}
+
+/// A stream sitting exactly ON the cap still reads completely — so the
+/// predicate matches — but the append that would take it to 201 events is
+/// refused. The pair is reported as an error (the sweep keeps going) and
+/// NOTHING is appended.
+#[tokio::test]
+async fn expiry_append_refuses_a_stream_already_at_the_event_cap() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let c = candidate(QuarantineStatus::Released, ts(0));
+    seed_stream_of_length(&store, &c, 200);
+
+    let report = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            std::slice::from_ref(&c),
+            RetentionEvaluationMode::Execute,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store.appended_batches().is_empty(),
+        "the expiry append must refuse a stream the cap does not have room for; \
+         appending here is the bypass that lets the sweep grow a stream without bound"
+    );
+    assert_eq!(report.summary.expired, 0);
+    assert_eq!(
+        report.summary.errors, 1,
+        "the refusal is reported as a per-pair error so the sweep continues"
+    );
+}
+
+/// One event short of the cap there IS room, so the same fixture expires
+/// normally. Without this counter-factual the assertion above would also
+/// hold for a fixture that simply never matched.
+#[tokio::test]
+async fn expiry_append_still_lands_one_event_short_of_the_cap() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let c = candidate(QuarantineStatus::Released, ts(0));
+    seed_stream_of_length(&store, &c, 199);
+
+    let report = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            std::slice::from_ref(&c),
+            RetentionEvaluationMode::Execute,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.expired, 1);
+    assert_eq!(report.summary.errors, 0);
+    let batches = store.appended_batches();
+    assert_eq!(batches.len(), 1);
+    assert!(matches!(
+        batches[0].events[0].event,
+        DomainEvent::ArtifactExpired(_)
+    ));
+}
+
+/// The evaluator's own read is the second half of the close, and it is
+/// load-bearing independently of the append guard: the idempotency check
+/// runs over the stream this read returns, so over a truncated prefix an
+/// `ArtifactExpired` for the same policy that sits past the cap is
+/// invisible and the pair reads as "never expired" every pass.
+///
+/// Asserted in **dry-run** mode deliberately — dry run never reaches
+/// `append_expired`, so the only thing that can refuse here is the read.
+/// The existing `ArtifactExpired` is the last event on the stream, i.e.
+/// exactly where a truncated read cannot see it.
+#[tokio::test]
+async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let c = candidate(QuarantineStatus::Released, ts(0));
+    let stream_id = seed_stream_of_length(&store, &c, 201);
+    let mut stream = store
+        .read_stream(&stream_id, ReadFrom::Start, 1_000)
+        .await
+        .unwrap();
+    stream.push(persisted(
+        &stream_id,
+        201,
+        c.artifact.created_at,
+        DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
+            artifact_id: c.artifact.id,
+            policy_id: p.id,
+            policy_name: p.name.clone(),
+            reason: ExpirationReason::AgeExceeded {
+                published_at: ts(0),
+                ttl_secs: 100,
+            },
+            eligible_at: ts(900),
+        }),
+    ));
+    assert_eq!(stream.len(), 202);
+    store.set_stream(&stream_id, stream);
+
+    let report = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            std::slice::from_ref(&c),
+            RetentionEvaluationMode::DryRun,
+        )
+        .await
+        .unwrap();
+
+    assert!(store.appended_batches().is_empty());
+    assert_eq!(report.summary.errors, 1);
+    assert_eq!(
+        report.summary.already_expired, 0,
+        "the pair is reported as an error, not as an idempotent no-op — the read \
+         could not prove either answer"
+    );
+    assert!(
+        report.matches.is_empty(),
+        "a stream that cannot be read completely yields no decision at all, not a \
+         decision derived from its oldest 200 events — which here would be a second \
+         ArtifactExpired for a policy that already expired this artifact"
+    );
+}
+
 /// A match reports the repository by the key the operator writes into a
 /// policy, carried from the candidate the reader supplied — not resolved
 /// afterwards by a per-repository lookup. The UUID stays alongside it.
