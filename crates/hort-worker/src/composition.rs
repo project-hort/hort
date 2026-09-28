@@ -1338,6 +1338,7 @@ pub async fn build_app_context(
                 retention_uc,
                 retention_preview,
                 storage.clone(),
+                jobs.clone(),
             )),
             1,
         );

@@ -259,6 +259,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The retention evaluation restarted at the beginning of the keyset every
+  run** (#322). `RetentionEvaluateHandler` walks at most
+  `MAX_BATCHES_PER_TICK * BATCH_SIZE` = 64 x 1000 = 64,000 artifacts per run,
+  and re-initialised its keyset cursor to `None` on every invocation. Since
+  `RetentionCandidateReader::list_candidates` is paginated by `artifacts.id`
+  (`a.id > $3 ORDER BY a.id`) and excludes nothing it has already looked at,
+  every daily run re-walked the same leading 64,000 ids and stopped. The doc
+  comment claimed "subsequent daily ticks drain the rest", which holds only if
+  the candidate set shrinks — that needs the leading artifacts to expire *and*
+  be purged, and purge is disabled by default. On a registry with more than
+  64,000 eligible artifacts the tail was therefore never evaluated, with no
+  error signal: the run reported success with `partial` coverage. This broke
+  **logical** retirement (artifacts being marked expired and leaving service),
+  independently of physical byte reclamation.
+
+  The run now persists where it stopped and resumes there. The position rides
+  the run's own `result_summary.cursor` and is read back by the next run's
+  fresh `jobs` row through `JobsRepository::last_result_summary_by_kind` — the
+  `prefetch-tick` rotation's mechanism, applied to a single-dimension keyset
+  walk. No new table, no column on `artifacts`, no operator knob, and the
+  jobs-row retention sweep already retains the newest `completed` row of every
+  kind precisely because readers of this shape exist. A short or empty page
+  means the walk reached the highest candidate id, so the pass is over and the
+  cursor goes back to `null`: the next run starts from the beginning. Full
+  coverage costs `ceil(candidates / 64,000)` runs, and a candidate set that
+  fits inside one run behaves exactly as before — one page, pass complete,
+  cursor `null`.
+
+  Two properties are now stated rather than left to be rediscovered.
+  **Coverage comes from the wrap, not from the ordering**: `artifacts.id` is a
+  v4 UUID, so the walk traverses UUID space rather than time and a newly
+  eligible artifact lands behind the saved cursor about half the time; the
+  bound on when it is seen is two passes, delivered by the wrap. **A dry run
+  leaves the rotation where it found it**: a preview takes no per-UTC-day
+  single-flight claim (ADR 0028) and so may run any number of times a day, and
+  it reads the cursor — which is what makes it a preview of the window the
+  next execution will act on — and writes back exactly the value it read.
+  Advancing on a preview would let previews walk the rotation past the one
+  execution a day allows; writing `null` would reset it.
+
+  `coverage` now answers for the run rather than for the enumeration:
+  `complete` only when the run both started at the beginning and reached the
+  end, so a run that resumed mid-pass and drained to the tail reports
+  `partial` — the artifacts behind its start point are not in its figures. The
+  CLI's `PARTIAL` header says what becomes of them instead of leaving "still
+  unexamined" to read as a permanent blind spot.
+
 - **`hort-server validate-config` ran no row-0 rule, and said the opposite**
   (#304). The offline gate parsed the tree and then went straight to the
   `StaticConfigValidator` rows: `DesiredState::validate()` — the per-envelope

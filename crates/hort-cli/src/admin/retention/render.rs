@@ -112,7 +112,11 @@ pub struct JobFacts {
 
 /// Render the coverage line. `partial` is spelled out in full because an
 /// operator who skims past it is reading undercounted totals as if they
-/// were the whole picture.
+/// were the whole picture. It says so about *this run* and then says what
+/// happens to the rest, because "still unexamined" on its own reads as a
+/// permanent blind spot: the sweep records the position it stopped at and
+/// later executions resume from there, wrapping to the beginning once a
+/// pass finishes.
 fn coverage_block(summary: &RetentionRunSummary) -> String {
     if summary.coverage_is_partial() {
         // Name the server's own word only when it is not the expected
@@ -127,10 +131,12 @@ fn coverage_block(summary: &RetentionRunSummary) -> String {
         format!(
             "  coverage    PARTIAL{verbatim} — the sweep stopped at its per-run batch cap\n\
              \x20             with artifacts still unexamined. Every figure below counts\n\
-             \x20             only what it reached; the real totals are larger.\n"
+             \x20             only what it reached; the real totals are larger. Those\n\
+             \x20             artifacts are not skipped for good: the sweep records where\n\
+             \x20             it stopped and later executions resume from there.\n"
         )
     } else {
-        "  coverage    complete — the sweep reached the end of the candidate set.\n".to_string()
+        "  coverage    complete — this run examined the whole candidate set.\n".to_string()
     }
 }
 
