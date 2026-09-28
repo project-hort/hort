@@ -367,7 +367,21 @@ ships only in a release strictly after the last one whose code referenced the
 identifier. Cross-checks every migration's destructive DDL against the
 checked-in manifest `migrations/CONTRACTIONS.toml`, requires the workspace
 version to exceed each entry's `reference_removed_in`, and rejects a
-still-referenced identifier in `crates/*/src`), `retention_registration_guard` (ADR 0030 —
+still-referenced identifier in `crates/*/src`), `capped_stream_reads` (ADR 0007 —
+pins that a **bounded** `EventStore::read_stream` exists in exactly one
+production file: every `.read_stream(` call in `crates/*/src` passes either
+`u64::MAX` (an unbounded category, no budget to truncate), a forwarded
+`max_count` inside a `fn read_stream(` (an `EventStore` decorator delegating),
+or `STREAM_EVENT_CAP + 1` and only in `hort-app/src/use_cases/mod.rs`. Any
+other budget is a read that cannot tell a complete stream from a truncated
+one — a reverse scan over it silently answers about the *oldest* N events, so
+a superseded scan verdict reads as current and the `ArtifactRejected` after it
+is invisible to the release authorization. The correct idiom predated the
+guard and convention alone did not hold it: ten capped-read sites across seven
+files got it wrong, nine of them reading exactly `200` with no overflow
+detection. Carries a counter-assertion that the scan still
+finds both audited reads, so a rename cannot make it vacuously green),
+`retention_registration_guard` (ADR 0030 —
 asserts the code-held eventstore-retention rule set
 (`canonical_retention_rules`) only ever registers the permitted categories
 `{Artifact, AuthAttempts, DownloadAudit, TokenUse}`, with a no-wildcard

@@ -259,6 +259,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The retention expiry could push an artifact stream past the 200-event cap,
+  and every capped reader then decided on the oldest 200 events** (#324).
+  `STREAM_EVENT_CAP` is an enforced bound, not an estimate: it is what makes a
+  single capped `ReadFrom::Start` read of an artifact stream equal to reading
+  the whole stream, which is what `read_expected_version` relies on when it
+  reads `cap + 1` events and refuses a stream longer than that. One writer sat
+  outside that bound. `RetentionUseCase::append_expired` appends at
+  `ExpectedVersion::Any`, the adapter treats `Any` as no version check at all,
+  and the method took the stream length as `_stream_len` and discarded it — so
+  the daily expiry sweep was the only writer able to grow an artifact stream
+  without limit.
+
+  Past the cap, every full-stream reader silently answered a question about the
+  oldest 200 events instead of the stream. **The release authorization is the
+  one that matters**: it resolves `ScanSucceeded` from the *latest*
+  `ScanCompleted` plus the absence of an `ArtifactRejected` *later than it*, and
+  both halves are wrong over a truncated prefix — a stale clean scan reads as
+  current and the rejection that superseded it lies outside the read, so the
+  timer sweep releases an artifact the scanner condemned. The same truncation
+  reached the retention evaluation itself (an existing `ArtifactExpired` past
+  position 199 is invisible, and since the append was unchecked another was
+  added every pass), scan history, the provenance clearance, the provenance
+  cascade's idempotency check *and* its derived append version, the
+  misrejection-repair conjuncts, and the event-store retention terminal proof —
+  which decides whether to **delete** a stream.
+
+  Both sides are now closed. The expiry append refuses when the length it was
+  already handed leaves no room under the cap. Every full-artifact-stream read
+  goes through one helper, `read_artifact_stream`, which reads `cap + 1` events
+  so that a read returning at most `cap` has provably reached the tail, and
+  refuses one that has not rather than return a prefix; the six duplicated
+  `STREAM_READ_LIMIT`/`READ_LIMIT`/`TERMINAL_PROOF_READ_LIMIT` constants that
+  each carried their own copy of the number are gone with it. Raising the cap
+  was explicitly not the fix — a larger number only moves the point at which
+  the same silent truncation happens. A candidate whose stream cannot be read
+  completely is skipped by the release sweep at `error!` level and stays
+  quarantined (fail-closed), rather than failing the whole sweep tick and
+  stalling every other candidate's release.
+
 - **The `retention-purge` start-gate opened after a sweep that did not
   converge** (#321). `RefcountReconcileUseCase::sweep_drift` keeps sweeping
   past a repository it cannot scan or a repair it cannot apply, counts each

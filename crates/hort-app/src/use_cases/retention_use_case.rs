@@ -76,9 +76,7 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::events::{retention_scheduler_actor, DomainEvent, StreamId};
-use hort_domain::ports::event_store::{
-    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
-};
+use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
 use hort_domain::retention::{
     evaluate, EvaluationInputs, EvaluationOutcome, ExpirationReason, RetentionEvaluationMode,
@@ -91,12 +89,7 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
     emit_retention_evaluation, emit_retention_expired, RetentionEvaluationResult,
 };
-
-/// Per-artifact-stream read cap. Mirrors the
-/// `quarantine_use_case::STREAM_READ_LIMIT` value — an artifact stream
-/// in v2 is short (ingest → scan(s) → release/reject → maybe expire);
-/// 200 events is far beyond any real stream.
-const STREAM_READ_LIMIT: u64 = 200;
+use crate::use_cases::{read_artifact_stream, STREAM_EVENT_CAP};
 
 /// Default rescan interval (hours) when the caller resolved no policy
 /// interval. Mirrors the policy chain's "default 24 h" tail
@@ -369,11 +362,14 @@ impl RetentionUseCase {
 
         // -- idempotency on (policy_id, artifact_id) ----------------------
         let stream_id = StreamId::artifact(artifact.id);
-        let stream = match self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-            .await
-        {
+        // One full read of the artifact stream serves every decision below
+        // (idempotency, the `ArtifactIngested` scope input, the freshness
+        // signal, the `HasFindingDetectedFor` anchor). `read_artifact_stream`
+        // refuses a stream it cannot prove it read to the end, which is what
+        // keeps the idempotency check honest: over a truncated prefix an
+        // `ArtifactExpired` past the cap is invisible and the sweep would
+        // append another one on every pass.
+        let stream = match read_artifact_stream(&*self.events, &stream_id).await {
             Ok(s) => s,
             Err(e) => return self.errored(policy_id_label, policy, artifact, "read_stream", e),
         };
@@ -644,6 +640,23 @@ impl RetentionUseCase {
     /// read-then-check above, not by optimistic concurrency; a
     /// concurrent ingest appending in between is harmless — it cannot
     /// produce a duplicate `ArtifactExpired` for the same policy).
+    ///
+    /// **The cap is enforced here, not by the adapter.**
+    /// `ExpectedVersion::Any` means the adapter performs no version check
+    /// at all, so this append gets none of the bound that
+    /// [`read_expected_version`](crate::use_cases::read_expected_version)
+    /// gives every `ExpectedVersion::Exact` writer. Without a refusal of
+    /// its own, the expiry sweep is the one writer able to push an
+    /// artifact stream past [`STREAM_EVENT_CAP`] — and past the cap every
+    /// capped reader of that stream (the release authorization above all)
+    /// silently decides on the oldest prefix. `stream_len` is the length
+    /// of the same full read the idempotency check above used, so the
+    /// decision to refuse needs no extra I/O.
+    ///
+    /// A refusal returns `DomainError::Conflict`, matching
+    /// `read_expected_version`'s refusal for the same condition; the
+    /// caller folds it into [`EvalStep::Errored`] and keeps sweeping, so
+    /// one frozen artifact does not stall the pass.
     async fn append_expired(
         &self,
         stream_id: &StreamId,
@@ -651,8 +664,16 @@ impl RetentionUseCase {
         policy: &RetentionPolicy,
         reason: ExpirationReason,
         now: DateTime<Utc>,
-        _stream_len: u64,
+        stream_len: u64,
     ) -> AppResult<()> {
+        if stream_len.saturating_add(1) > STREAM_EVENT_CAP {
+            return Err(AppError::Domain(hort_domain::error::DomainError::Conflict(
+                format!(
+                    "stream {stream_id} holds {stream_len} events; appending \
+                     ArtifactExpired would exceed the {STREAM_EVENT_CAP}-event cap"
+                ),
+            )));
+        }
         let event = hort_domain::events::ArtifactExpired {
             artifact_id: artifact.id,
             policy_id: policy.id,

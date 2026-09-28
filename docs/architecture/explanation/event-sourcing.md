@@ -356,6 +356,32 @@ The operator-facing how-to is at
   the two. Per-format sanity caps below the 64 KB event-log ceiling are
   applied at the application layer — see
   [format-handlers.md](format-handlers.md).
-- **Stream length cap: 200 events.** The application layer reads the
-  current stream before appending and refuses to grow past the cap — an
-  artifact that needs more events is a bug or abuse.
+- **Stream length cap: 200 events** (`hort_app::use_cases::STREAM_EVENT_CAP`),
+  enforced on **both** sides, because the cap is what makes a single capped
+  `ReadFrom::Start` read of an artifact stream equal to reading the whole
+  stream. An artifact that needs more events is a bug or abuse.
+  - *Writing.* `read_expected_version` reads the current stream before
+    appending and refuses to derive a version for one that already exceeds
+    the cap, which bounds every `ExpectedVersion::Exact` writer. An
+    `ExpectedVersion::Any` append gets no version check from the adapter at
+    all, so a repeatable `Any` writer on an artifact stream must refuse for
+    itself — `RetentionUseCase::append_expired` (the daily expiry sweep) is
+    the only one and does. The remaining `Any` appends on that category
+    (`ArtifactPurged`, `ArtifactDeleted`, the CAS-corruption tombstone) are
+    terminal and single-shot and deliberately do not refuse.
+  - *Reading.* Every consumer that answers a question about an artifact's
+    whole history — the latest `ScanCompleted` and whether an
+    `ArtifactRejected` followed it, whether an `ArtifactExpired` for a policy
+    is already present, whether a `ProvenanceVerified` exists, what the
+    stream's terminal event is — reads through
+    `hort_app::use_cases::read_artifact_stream`, which reads `cap + 1` events
+    so a read returning at most `cap` has provably reached the tail, and
+    refuses one that has not. It never returns the oldest prefix: over a
+    prefix, a reverse scan turns "the latest X" into "the latest X among the
+    oldest 200", and a superseded scan verdict would read as the current one.
+    Raising the cap does not fix that; it only moves it.
+  - *Consequence.* A stream that reaches the cap is frozen in both
+    directions: no further event is accepted and no gate is decided from it.
+    That is the intended fail-closed outcome (see
+    [ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)),
+    not a state to engineer around.

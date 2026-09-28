@@ -217,16 +217,111 @@ use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::events::{StreamCategory, StreamId};
+use hort_domain::events::{PersistedEvent, StreamCategory, StreamId};
 use hort_domain::ports::event_store::{
     AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom,
 };
 
 use crate::error::{AppError, AppResult};
 
-/// Maximum number of events allowed in a single artifact stream.
-/// Streams exceeding this limit indicate a bug or abuse and are rejected.
+/// The maximum number of events an artifact stream may hold.
+///
+/// This is an **enforced, fail-closed bound**, not an estimate of how
+/// long a stream gets. It is what makes a single capped
+/// `ReadFrom::Start` read of an artifact stream equal to reading the
+/// whole stream — the property every consumer of the stream's history
+/// silently depends on, and the reason the number is enforced on both
+/// sides:
+///
+/// - **Write side.** [`read_expected_version`] refuses to derive an
+///   append version for a stream that already exceeds the cap, so every
+///   `ExpectedVersion::Exact` writer is bounded by it. An
+///   `ExpectedVersion::Any` append gets no version check from the
+///   adapter at all, so such a writer must refuse for itself:
+///   `RetentionUseCase::append_expired` is the only *repeatable* one and
+///   does. The rest are terminal and single-shot (`ArtifactPurged`,
+///   `ArtifactDeleted`, the CAS-corruption tombstone pair) and
+///   deliberately do not refuse — they record destructive work that has
+///   already happened, they are the last events a stream ever takes, and
+///   no reader consults an artifact's stream after its terminal event.
+///   A NEW repeatable `Any` writer on [`StreamCategory::Artifact`]
+///   without a refusal of its own reopens the breach.
+/// - **Read side.** [`read_artifact_stream`] reads `STREAM_EVENT_CAP + 1`
+///   events: a read that comes back with at most `STREAM_EVENT_CAP` has
+///   provably seen the entire stream, and one that comes back with more
+///   refuses to answer rather than hand its caller the oldest prefix.
+///
+/// An artifact's realistic lifecycle is a few dozen events at most
+/// (ingest → quarantine → scan(s) → release/reject → maybe expire →
+/// purge), so the bound leaves roughly an order of magnitude of
+/// headroom. A stream that reaches it is a bug or abuse, and the
+/// resulting freeze — no further event accepted, no decision derived
+/// from a read that cannot prove completeness — is the intended
+/// fail-closed outcome, not a degradation to work around. Raising the
+/// number would only move the point at which the same failure appears.
 const STREAM_EVENT_CAP: u64 = 200;
+
+/// Read a bounded artifact stream **in full**, or refuse.
+///
+/// Every consumer that asks a question about an artifact's whole history
+/// — the latest `ScanCompleted` and whether an `ArtifactRejected`
+/// followed it, whether an `ArtifactExpired` for a policy is already on
+/// the stream, whether a `ProvenanceVerified` exists, what the stream's
+/// terminal event is — needs the whole stream. A capped
+/// `ReadFrom::Start` read yields the whole stream only while the stream
+/// fits inside the cap, and cannot by itself tell the two cases apart:
+/// reading `n` events with a budget of `n` proves nothing about what
+/// comes after them.
+///
+/// So this helper reads [`STREAM_EVENT_CAP`] `+ 1` events, making the
+/// two cases distinguishable, and refuses the second:
+///
+/// - at most [`STREAM_EVENT_CAP`] events came back ⇒ the budget was not
+///   exhausted, so the read reached the end of the stream — return it;
+/// - more came back ⇒ the stream breached the cap and no capped read can
+///   prove it saw the tail. Returning the oldest prefix is the defect
+///   this refusal exists to prevent: a reverse scan over a truncated
+///   prefix turns "the latest X" into "the latest X among the oldest
+///   [`STREAM_EVENT_CAP`]", so a superseded scan verdict reads as the
+///   current one and a rejection that came after it is invisible.
+///
+/// The refusal is [`DomainError::Invariant`] and deliberately NOT
+/// [`DomainError::Conflict`]: the condition is a breach that re-reading
+/// cannot change, and [`append_any_with_conflict_retry`] retries
+/// `Conflict` and nothing else — a `Conflict` here would let a
+/// retry-wrapped caller spend its entire budget waiting for a stream
+/// length to shrink.
+pub(crate) async fn read_artifact_stream(
+    events: &dyn EventStore,
+    stream_id: &StreamId,
+) -> AppResult<Vec<PersistedEvent>> {
+    if stream_id.category != StreamCategory::Artifact {
+        return Err(DomainError::Invariant(format!(
+            "read_artifact_stream called on non-artifact stream {stream_id} \
+             (category {:?}) — a capped full-stream read is only correct for \
+             a stream bounded by STREAM_EVENT_CAP, which today is exclusively \
+             the per-artifact lifecycle stream; an unbounded category needs a \
+             paged or tail read, not a larger cap",
+            stream_id.category
+        ))
+        .into());
+    }
+
+    let stream_events = events
+        .read_stream(stream_id, ReadFrom::Start, STREAM_EVENT_CAP + 1)
+        .await?;
+
+    if stream_events.len() as u64 > STREAM_EVENT_CAP {
+        return Err(DomainError::Invariant(format!(
+            "stream {stream_id} exceeds the {STREAM_EVENT_CAP}-event cap — \
+             a capped read cannot prove it reached the tail, so no decision \
+             is derived from it"
+        ))
+        .into());
+    }
+
+    Ok(stream_events)
+}
 
 /// Read a stream's current position and compute the `ExpectedVersion` for
 /// the next append.
@@ -552,6 +647,101 @@ mod read_expected_version_tests {
         let stream_id = StreamId::user(Uuid::new_v4());
 
         let err = read_expected_version(&*events, &stream_id, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-artifact stream"), "got {err}");
+        assert_eq!(
+            events.read_stream_call_count(),
+            0,
+            "the category guard must fire before any read_stream I/O"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_artifact_stream_tests {
+    use std::sync::Arc;
+
+    use hort_domain::events::StreamId;
+
+    use super::*;
+    use crate::use_cases::test_support::*;
+
+    fn seed(events: &Arc<MockEventStore>, artifact_id: Uuid, count: u64) -> StreamId {
+        let stream_id = StreamId::artifact(artifact_id);
+        let dummy: Vec<_> = (0..count)
+            .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
+            .collect();
+        events.set_stream(&stream_id, dummy);
+        stream_id
+    }
+
+    #[tokio::test]
+    async fn empty_stream_reads_as_empty() {
+        let events = Arc::new(MockEventStore::new());
+        let stream_id = StreamId::artifact(Uuid::new_v4());
+
+        let stream = read_artifact_stream(&*events, &stream_id).await.unwrap();
+        assert!(stream.is_empty());
+    }
+
+    #[tokio::test]
+    async fn short_stream_reads_completely() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = seed(&events, artifact_id, 3);
+
+        let stream = read_artifact_stream(&*events, &stream_id).await.unwrap();
+        assert_eq!(stream.len(), 3);
+    }
+
+    /// The boundary that decides "complete": a stream of exactly
+    /// [`STREAM_EVENT_CAP`] events is read in full, because the `+ 1`
+    /// budget was not exhausted — the read provably saw the tail.
+    #[tokio::test]
+    async fn stream_at_exactly_the_cap_reads_completely() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = seed(&events, artifact_id, STREAM_EVENT_CAP);
+
+        let stream = read_artifact_stream(&*events, &stream_id).await.unwrap();
+        assert_eq!(stream.len() as u64, STREAM_EVENT_CAP);
+        assert_eq!(
+            stream.last().unwrap().stream_position,
+            STREAM_EVENT_CAP - 1,
+            "the last event read must be the stream's true tail"
+        );
+    }
+
+    /// One event past the cap and the read can no longer prove it reached
+    /// the tail, so it refuses instead of handing back the oldest prefix.
+    /// This is the whole point: a caller that reverse-scans the prefix
+    /// would read a superseded verdict as the current one.
+    #[tokio::test]
+    async fn stream_past_the_cap_is_refused_not_truncated() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = seed(&events, artifact_id, STREAM_EVENT_CAP + 1);
+
+        let err = read_artifact_stream(&*events, &stream_id)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("200-event cap"),
+            "the refusal must name the cap it is enforcing; got {err}"
+        );
+    }
+
+    /// A capped full-stream read is only correct for a stream the cap
+    /// bounds. Rejecting any other category up front is what keeps a
+    /// future unbounded-category caller from silently reading a prefix —
+    /// the same guard `read_expected_version` carries for the same reason.
+    #[tokio::test]
+    async fn rejects_non_artifact_stream_category() {
+        let events = Arc::new(MockEventStore::new());
+        let stream_id = StreamId::user(Uuid::new_v4());
+
+        let err = read_artifact_stream(&*events, &stream_id)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("non-artifact stream"), "got {err}");
