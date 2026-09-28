@@ -12,7 +12,9 @@
 //! - re-run idempotency → second pass is a no-op;
 //! - multi-repo iteration + per-repo `info!` summary shape;
 //! - per-repo scan error is recorded and the sweep continues;
-//! - per-repair apply error is recorded and the sweep continues.
+//! - per-repair apply error is recorded and the sweep continues;
+//! - the convergence verdict: `errors == 0`, never the `Ok`-ness of the
+//!   return — a partially-failed sweep is `Ok` and NOT converged.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -24,7 +26,7 @@ use hort_domain::ports::refcount_reconcile::{RefcountReconcilePort, RefcountRepa
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::ContentHash;
 
-use crate::use_cases::refcount_reconcile_use_case::RefcountReconcileUseCase;
+use crate::use_cases::refcount_reconcile_use_case::{ReconcileSummary, RefcountReconcileUseCase};
 
 const HASH_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HASH_B: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -462,4 +464,100 @@ async fn apply_error_on_one_repair_is_recorded_and_sweep_continues() {
     assert_eq!(summary.errors, 2);
     assert_eq!(summary.drift_repaired, 0, "neither repair landed");
     assert!(port.applied().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The convergence verdict: `errors == 0`, NOT the `Ok`-ness of the
+// return. A partially-failed sweep returns `Ok` and must read as NOT
+// converged — that is what the refcount-gated purge start-gate keys on.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_summary_is_converged() {
+    // A deployment with zero repositories sweeps nothing and fails
+    // nothing — vacuously converged, which is what lets a fresh
+    // install's purge gate open.
+    assert!(ReconcileSummary::default().converged());
+}
+
+#[test]
+fn repaired_drift_without_errors_is_converged() {
+    let summary = ReconcileSummary {
+        repos_swept: 3,
+        drift_repaired: 7,
+        errors: 0,
+    };
+    assert!(
+        summary.converged(),
+        "finding drift and healing all of it IS convergence"
+    );
+}
+
+#[test]
+fn any_error_is_not_converged() {
+    for errors in [1, 2, u64::MAX] {
+        let summary = ReconcileSummary {
+            repos_swept: 9,
+            drift_repaired: 40,
+            errors,
+        };
+        assert!(
+            !summary.converged(),
+            "a pass that left {errors} failure(s) behind may still be drifted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn partially_failed_sweep_returns_ok_but_is_not_converged() {
+    // The shape the purge start-gate has to reject: one repository's
+    // scan fails, the rest of the sweep succeeds and repairs real
+    // drift, the run returns `Ok` — and the projection is still
+    // possibly drifted in the repository that was never scanned.
+    let bad = Uuid::new_v4();
+    let good = Uuid::new_v4();
+    let art = Uuid::new_v4();
+    let port = Arc::new(
+        MockRefcountReconcilePort::new()
+            .with_repos(vec![bad, good])
+            .with_scan_err_for(bad)
+            .push_drift(
+                good,
+                RepoDrift {
+                    repairs: vec![RefcountRepair::CreatePrimaryContent {
+                        source_artifact_id: art,
+                        expected_hash: hash(HASH_A),
+                    }],
+                },
+            ),
+    );
+    let summary = uc(port).sweep_drift().await.expect("partial failure is Ok");
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.drift_repaired, 1, "the healthy repo still healed");
+    assert!(
+        !summary.converged(),
+        "Ok with errors > 0 must NOT read as converged"
+    );
+}
+
+#[tokio::test]
+async fn fully_successful_sweep_is_converged() {
+    let repo = Uuid::new_v4();
+    let art = Uuid::new_v4();
+    let port = Arc::new(
+        MockRefcountReconcilePort::new()
+            .with_repos(vec![repo])
+            .push_drift(
+                repo,
+                RepoDrift {
+                    repairs: vec![RefcountRepair::CreatePrimaryContent {
+                        source_artifact_id: art,
+                        expected_hash: hash(HASH_A),
+                    }],
+                },
+            ),
+    );
+    let summary = uc(port).sweep_drift().await.expect("Ok");
+    assert_eq!(summary.errors, 0);
+    assert!(summary.converged());
 }

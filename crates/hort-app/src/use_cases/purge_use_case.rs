@@ -143,11 +143,18 @@ use crate::metrics::{emit_retention_purged, RetentionPurgedResult};
 /// The gate is therefore satisfied by the composition root — the layer
 /// that already owns `HORT_REFCOUNT_RECONCILE_ON_STARTUP` and runs the
 /// boot sweep. The contract: `is_converged()` returns `true` **only**
-/// once a reconcile sweep has completed successfully on this
-/// deployment.
+/// once a reconcile sweep has *converged* on this deployment — which is
+/// [`ReconcileSummary::converged`](super::refcount_reconcile_use_case::ReconcileSummary::converged),
+/// not the `Ok`-ness of `sweep_drift`. The sweep keeps going past a
+/// failing repository and still returns `Ok`, so a composition root
+/// that reads `Ok` as convergence opens this gate over a projection
+/// that may still be missing edges.
 pub trait RefcountReconcileGate: Send + Sync {
     /// `true` iff the reconcile sweep (`RefcountReconcileUseCase::sweep_drift`) has
-    /// converged at least once on this deployment. While `false`, the
+    /// converged at least once on this deployment — a pass that swept
+    /// every repository and applied every repair with **zero**
+    /// recorded failures. A partially-failed pass is not convergence.
+    /// While `false`, the
     /// refcount projection may be drifted and no GC consumer may treat
     /// a decremented / missing refcount row as authoritative — the
     /// purge sweep refuses to run.

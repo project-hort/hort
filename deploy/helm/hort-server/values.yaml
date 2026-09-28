@@ -1839,8 +1839,10 @@ scheduledTasks:
     enabled: false
     schedule: "0 3 * * *"
   # retention-purge: the destructive storage-GC walk. Refuses until
-  # the worker boot refcount-reconcile sweep converged. Daily, after
-  # retention-evaluate.
+  # the worker boot refcount-reconcile sweep converged — zero repository
+  # scan/repair failures, not merely "the sweep ran". A refusal lands in
+  # jobs.last_error, and the worker restates a closed gate on its
+  # 60-second heartbeat. Daily, after retention-evaluate.
   #
   # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
   # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`

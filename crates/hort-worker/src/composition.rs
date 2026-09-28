@@ -176,6 +176,13 @@ pub struct WorkerContext {
     /// Held so the heartbeat loop can query `hort_scan_queue_depth` from
     /// the same pool the rest of the composition uses.
     pub pool: PgPool,
+    /// The boot-time refcount-reconcile verdict the
+    /// `RetentionPurgeHandler` start-gate was built from. Held so the
+    /// heartbeat loop can restate a CLOSED gate every tick — the gate is
+    /// decided once at boot and holds for the life of the process, so
+    /// the boot log line alone would describe a live condition only in
+    /// scrollback. See [`ReconcileGateState`].
+    pub reconcile_gate: ReconcileGateState,
 }
 
 /// The full output of [`build_app_context`]: the shared context handle
@@ -1233,7 +1240,17 @@ pub async fn build_app_context(
     );
 
     // -----------------------------------------------------------------
-    // Register the three retention TaskHandlers + boot sweep +
+    // Run the refcount-reconcile boot sweep and decide the purge gate.
+    // Kept ahead of the retention block (rather than inside it) so the
+    // verdict — not just the boolean the gate reads — is in scope for
+    // `WorkerContext`: the heartbeat loop re-asserts a CLOSED gate for
+    // as long as the process holds it, which is the only signal an
+    // operator has when the worker `/metrics` listener is off.
+    // -----------------------------------------------------------------
+    let reconcile_gate_state = run_boot_reconcile_sweep(cfg, &pool).await;
+
+    // -----------------------------------------------------------------
+    // Register the three retention TaskHandlers +
     // in-process RefcountReconcileGate + optional hort_retention_role
     // pool (ADR 0020). Registered unconditionally: a handler whose
     // Helm CronJob is `enabled:false` is simply never invoked —
@@ -1245,7 +1262,6 @@ pub async fn build_app_context(
     // -----------------------------------------------------------------
     {
         use hort_adapters_postgres::purge_gc::PgPurgeGcPort;
-        use hort_adapters_postgres::refcount_reconcile::PgRefcountReconcile;
         use hort_adapters_postgres::retention_candidate_reader::PgRetentionCandidateReader;
         use hort_adapters_postgres::retention_policy_projection_repo::PgRetentionPolicyProjectionRepository;
         use hort_adapters_postgres::retention_preview::PgRetentionPreview;
@@ -1263,60 +1279,15 @@ pub async fn build_app_context(
         use hort_domain::ports::retention_scan_reader::RetentionScanReader;
         use hort_domain::ports::terminal_stream_reader::TerminalStreamReader;
 
-        // -- Boot sweep + in-process gate -----------------------------
-        // Run the reconcile sweep exactly as hort-server's serve.rs does
-        // (inline from the pool — a one-shot boot step,
-        // no serving-path coupling). Flip the gate true ONLY on a
-        // successful sweep (or when the operator opted out of the
-        // sweep on an upgrade install with authoritative state — the
-        // serve.rs else-branch semantics).
+        // -- In-process gate over the hoisted boot verdict -------------
         struct InProcessReconcileGate(bool);
         impl RefcountReconcileGate for InProcessReconcileGate {
             fn is_converged(&self) -> bool {
                 self.0
             }
         }
-        let gate_converged = if cfg.refcount_reconcile_on_startup {
-            use hort_app::use_cases::refcount_reconcile_use_case::RefcountReconcileUseCase;
-            use hort_domain::ports::refcount_reconcile::RefcountReconcilePort;
-            tracing::info!("refcount-reconcile boot sweep starting (ADR 0020)");
-            let port: Arc<dyn RefcountReconcilePort> =
-                Arc::new(PgRefcountReconcile::new(pool.clone()));
-            match RefcountReconcileUseCase::new(port).sweep_drift().await {
-                Ok(summary) => {
-                    tracing::info!(
-                        repos_swept = summary.repos_swept,
-                        drift_repaired = summary.drift_repaired,
-                        errors = summary.errors,
-                        "refcount-reconcile boot sweep converged — \
-                         RetentionPurgeHandler gate OPEN"
-                    );
-                    true
-                }
-                Err(e) => {
-                    // Fail-safe: the gate stays closed; the purge
-                    // handler refuses + retries next cron. Boot does
-                    // NOT abort (the projection is eventually
-                    // authoritative; next worker boot retries).
-                    tracing::warn!(
-                        error = %e,
-                        "refcount-reconcile boot sweep FAILED — \
-                         RetentionPurgeHandler gate CLOSED (purge refuses + \
-                         retries; not a boot failure)"
-                    );
-                    false
-                }
-            }
-        } else {
-            tracing::info!(
-                "refcount-reconcile boot sweep skipped \
-                 (HORT_REFCOUNT_RECONCILE_ON_STARTUP=false — upgrade-install \
-                 opt-out; projection assumed authoritative — gate OPEN)"
-            );
-            true
-        };
         let reconcile_gate: Arc<dyn RefcountReconcileGate> =
-            Arc::new(InProcessReconcileGate(gate_converged));
+            Arc::new(InProcessReconcileGate(reconcile_gate_state.is_open()));
 
         // -- RetentionEvaluateHandler ---------------------------------
         let retention_policy_projections: Arc<dyn RetentionPolicyProjectionRepository> =
@@ -1625,6 +1596,7 @@ pub async fn build_app_context(
         scanners: healthy_names,
         config: cfg.clone(),
         pool,
+        reconcile_gate: reconcile_gate_state,
     });
 
     Ok(BuildOutput { ctx, dispatcher })
@@ -1657,6 +1629,153 @@ pub(crate) fn select_enabled_scanners(
         .filter(|(enabled, _)| *enabled)
         .map(|(_, adapter)| adapter.clone())
         .collect()
+}
+
+/// The boot-time refcount-reconcile verdict the `RetentionPurgeHandler`
+/// start-gate is derived from, carried on [`WorkerContext`] so the
+/// heartbeat loop can re-assert a CLOSED gate for as long as this
+/// process holds one.
+///
+/// # Why the verdict outlives the boot log line
+///
+/// The gate is decided once, at boot, and never re-decided: a closed
+/// gate holds for the life of the pod. A single boot log line therefore
+/// records the decision at the instant it is made and then scrolls out
+/// of every retention window, while the condition it describes is still
+/// live — and the condition is "destructive storage reclamation is
+/// refused", which an operator has to be able to find *while it
+/// persists*. Keeping the verdict (and its reason) addressable is what
+/// lets the 60-second heartbeat tick restate it; see
+/// `heartbeat::reassert_reconcile_gate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconcileGateState {
+    /// The boot sweep converged, or the operator opted out of it on an
+    /// upgrade install with authoritative state. `PurgeUseCase` may
+    /// run.
+    Open,
+    /// The boot sweep did not converge. `PurgeUseCase` refuses every
+    /// invocation until this process is replaced by one whose sweep
+    /// converges. `reason` is the operator-facing summary of what held
+    /// it closed, restated on every heartbeat tick.
+    Closed {
+        /// Why the gate is closed, phrased for the operator who is
+        /// asking why nothing is being purged.
+        reason: String,
+    },
+}
+
+impl ReconcileGateState {
+    /// `true` iff the purge start-gate is satisfied.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        matches!(self, Self::Open)
+    }
+}
+
+/// Run the refcount-reconcile boot sweep (or honour the operator's
+/// opt-out) and return the purge start-gate verdict.
+///
+/// Mirrors `hort-server`'s `serve.rs` boot sweep — the adapter is
+/// constructed inline from the pool, a one-shot boot step with no
+/// serving-path coupling. Unlike `serve.rs` this one also *decides*,
+/// because only the worker hosts the `RetentionPurgeHandler`.
+///
+/// Boot never aborts on this path: a drifted projection is a hold on
+/// destructive GC, not a reason to refuse service.
+async fn run_boot_reconcile_sweep(cfg: &WorkerConfig, pool: &PgPool) -> ReconcileGateState {
+    use hort_adapters_postgres::refcount_reconcile::PgRefcountReconcile;
+    use hort_app::use_cases::refcount_reconcile_use_case::RefcountReconcileUseCase;
+    use hort_domain::ports::refcount_reconcile::RefcountReconcilePort;
+
+    if !cfg.refcount_reconcile_on_startup {
+        tracing::info!(
+            "refcount-reconcile boot sweep skipped \
+             (HORT_REFCOUNT_RECONCILE_ON_STARTUP=false — upgrade-install \
+             opt-out; projection assumed authoritative — gate OPEN)"
+        );
+        return ReconcileGateState::Open;
+    }
+
+    tracing::info!("refcount-reconcile boot sweep starting (ADR 0020)");
+    let port: Arc<dyn RefcountReconcilePort> = Arc::new(PgRefcountReconcile::new(pool.clone()));
+    let outcome = RefcountReconcileUseCase::new(port).sweep_drift().await;
+    reconcile_gate_verdict(&outcome)
+}
+
+/// Map a boot sweep's outcome onto the purge start-gate verdict, and log
+/// it.
+///
+/// Three outcomes, **two** postures:
+///
+/// - converged (`Ok`, zero errors) → gate OPEN;
+/// - **incomplete** (`Ok`, `errors > 0`) → gate CLOSED;
+/// - failed (`Err`) → gate CLOSED.
+///
+/// The incomplete case shares the failed case's posture rather than
+/// inventing a third: the purge refuses and retries, and boot does not
+/// abort. `sweep_drift` returns `Ok` after skipping a repository it
+/// could not scan or a repair it could not apply, so `Ok` alone says
+/// only that the pass ran to the end — a `primary_content` edge that
+/// should exist may still be missing in the part it skipped. Opening
+/// the gate on that lets the GC walk read the projection as
+/// authoritative: the artifact whose edge is missing contributes
+/// nothing to its hash's cross-`kind` count, so purging a retired
+/// sibling that shares the hash drives the count to zero and deletes a
+/// live artifact's bytes.
+///
+/// Split out from [`run_boot_reconcile_sweep`] so the verdict — the part
+/// that has to be right — is exercised without a Postgres pool.
+fn reconcile_gate_verdict(
+    outcome: &hort_app::error::AppResult<
+        hort_app::use_cases::refcount_reconcile_use_case::ReconcileSummary,
+    >,
+) -> ReconcileGateState {
+    match outcome {
+        Ok(summary) if summary.converged() => {
+            tracing::info!(
+                repos_swept = summary.repos_swept,
+                drift_repaired = summary.drift_repaired,
+                errors = summary.errors,
+                "refcount-reconcile boot sweep converged — \
+                 RetentionPurgeHandler gate OPEN"
+            );
+            ReconcileGateState::Open
+        }
+        // Partial failure. Same fail-safe posture as a whole-sweep
+        // failure below; the log line must not claim the convergence
+        // that did not happen.
+        Ok(summary) => {
+            let reason = format!(
+                "the boot sweep recorded {} repository-scan/repair failure(s) \
+                 across {} repositories, so the content_references refcount \
+                 projection may still be missing edges",
+                summary.errors, summary.repos_swept
+            );
+            tracing::warn!(
+                repos_swept = summary.repos_swept,
+                drift_repaired = summary.drift_repaired,
+                errors = summary.errors,
+                "refcount-reconcile boot sweep INCOMPLETE (did NOT converge) — \
+                 RetentionPurgeHandler gate CLOSED (purge refuses + retries; \
+                 not a boot failure)"
+            );
+            ReconcileGateState::Closed { reason }
+        }
+        // Fail-safe: the gate stays closed; the purge handler refuses +
+        // retries next invocation. Boot does NOT abort (the projection
+        // is eventually authoritative; the next worker boot retries).
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "refcount-reconcile boot sweep FAILED — \
+                 RetentionPurgeHandler gate CLOSED (purge refuses + \
+                 retries; not a boot failure)"
+            );
+            ReconcileGateState::Closed {
+                reason: format!("the boot sweep failed outright: {e}"),
+            }
+        }
+    }
 }
 
 /// A configured scanner backend's binary did not answer its startup
@@ -2474,6 +2593,125 @@ mod tests {
     use hort_domain::ports::scanner::{ScanAnalysis, ScanTarget};
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::Sbom;
+    use tracing_test::traced_test;
+
+    // -----------------------------------------------------------------
+    // The refcount-reconcile purge start-gate verdict.
+    //
+    // Three sweep outcomes, TWO postures: converged opens the gate,
+    // and both the partially-failed and the wholly-failed sweep close
+    // it. The partial case is the one that shipped wrong — `sweep_drift`
+    // returns `Ok` after skipping a repository it could not scan, and
+    // reading that `Ok` as convergence opens the destructive GC walk
+    // over a projection that may still be missing edges.
+    // -----------------------------------------------------------------
+
+    use hort_app::use_cases::refcount_reconcile_use_case::ReconcileSummary;
+
+    #[test]
+    fn verdict_opens_the_gate_on_a_clean_sweep() {
+        let outcome = Ok(ReconcileSummary {
+            repos_swept: 4,
+            drift_repaired: 0,
+            errors: 0,
+        });
+        assert_eq!(reconcile_gate_verdict(&outcome), ReconcileGateState::Open);
+    }
+
+    #[test]
+    fn verdict_opens_the_gate_when_every_repair_landed() {
+        // Drift found and fully healed is convergence — the gate must
+        // not read "we had to fix something" as "we are unsure".
+        let outcome = Ok(ReconcileSummary {
+            repos_swept: 4,
+            drift_repaired: 11,
+            errors: 0,
+        });
+        assert!(reconcile_gate_verdict(&outcome).is_open());
+    }
+
+    #[test]
+    fn verdict_closes_the_gate_on_a_partially_failed_sweep() {
+        let outcome = Ok(ReconcileSummary {
+            repos_swept: 6,
+            drift_repaired: 3,
+            errors: 1,
+        });
+        let verdict = reconcile_gate_verdict(&outcome);
+        assert!(
+            !verdict.is_open(),
+            "one unrepaired drift case is enough to hold destructive GC"
+        );
+        let ReconcileGateState::Closed { reason } = verdict else {
+            panic!("expected Closed, got {verdict:?}");
+        };
+        // The reason travels to every heartbeat tick, so it has to say
+        // what happened without the operator reading the boot log.
+        assert!(
+            reason.contains('1'),
+            "reason names the failure count: {reason}"
+        );
+        assert!(
+            reason.contains("content_references"),
+            "reason names what may still be drifted: {reason}"
+        );
+    }
+
+    #[test]
+    fn verdict_closes_the_gate_on_a_wholly_failed_sweep() {
+        let outcome: hort_app::error::AppResult<ReconcileSummary> =
+            Err(hort_app::error::AppError::Domain(DomainError::Invariant(
+                "repo list failed".to_owned(),
+            )));
+        let verdict = reconcile_gate_verdict(&outcome);
+        let ReconcileGateState::Closed { reason } = verdict else {
+            panic!("expected Closed, got {verdict:?}");
+        };
+        assert!(
+            reason.contains("repo list failed"),
+            "reason carries the underlying failure: {reason}"
+        );
+    }
+
+    /// The acceptance criterion in its own right: the partial-failure
+    /// log line must not claim the convergence that did not happen.
+    /// Before the fix an operator read `errors=1` and `converged — gate
+    /// OPEN` on the same line.
+    #[traced_test]
+    #[test]
+    fn partial_failure_log_line_does_not_claim_convergence() {
+        let outcome = Ok(ReconcileSummary {
+            repos_swept: 2,
+            drift_repaired: 0,
+            errors: 1,
+        });
+        let _ = reconcile_gate_verdict(&outcome);
+        assert!(
+            logs_contain("gate CLOSED"),
+            "the partial case must announce a closed gate"
+        );
+        assert!(
+            !logs_contain("gate OPEN"),
+            "no line may announce an open gate for a sweep that did not converge"
+        );
+        assert!(
+            !logs_contain("boot sweep converged"),
+            "no line may claim convergence for a sweep that recorded errors"
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn clean_sweep_log_line_announces_convergence() {
+        let outcome = Ok(ReconcileSummary {
+            repos_swept: 2,
+            drift_repaired: 1,
+            errors: 0,
+        });
+        let _ = reconcile_gate_verdict(&outcome);
+        assert!(logs_contain("boot sweep converged"));
+        assert!(logs_contain("gate OPEN"));
+    }
 
     #[test]
     fn split_pem_public_keys_splits_multiple_blocks_for_rotation_overlap() {
