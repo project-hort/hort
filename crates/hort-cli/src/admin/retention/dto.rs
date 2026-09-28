@@ -29,6 +29,14 @@
 //! surface as `0`, as a blank, or as a dash — each of those reads as
 //! "nothing to free", which is a different and much more dangerous
 //! claim than "hort did not measure this".
+//!
+//! [`ProposalDigest`] carries the same posture on the same grounds. It
+//! is `Option`, and a digest missing either half counts as absent
+//! ([`ProposalDigest::is_usable`]): an identity this client cannot use
+//! must read as "which rows were not reported", never as "the same rows
+//! as the other side". A blank comparing equal to another blank would
+//! manufacture the one verdict — the same artifacts would be expired —
+//! that lets the CLI skip a confirmation.
 
 use serde::{Deserialize, Serialize};
 
@@ -86,8 +94,14 @@ impl RetentionRunSummary {
     /// as truncated — an unrecognised coverage word must not read as a
     /// reassurance.
     pub fn coverage_is_partial(&self) -> bool {
-        self.coverage != "complete"
+        coverage_is_partial(&self.coverage)
     }
+}
+
+/// The coverage rule in one place, so the delta — which holds only the
+/// raw words — decides it exactly as the summary does.
+pub fn coverage_is_partial(raw: &str) -> bool {
+    raw != "complete"
 }
 
 /// The dry run's `preview` object.
@@ -103,6 +117,11 @@ pub struct PreviewBody {
     /// measure them. Never an estimate.
     #[serde(default)]
     pub freed_bytes: FreedBytes,
+    /// Which rows this run proposes to expire, as a bounded identity.
+    /// `None` from a server that does not report one — see
+    /// [`ProposalDigest`].
+    #[serde(default)]
+    pub proposal_digest: Option<ProposalDigest>,
     #[serde(default)]
     pub groups: Vec<PreviewGroup>,
     #[serde(default)]
@@ -181,12 +200,112 @@ pub struct PreviewGroup {
     pub rows: u64,
     #[serde(default)]
     pub distinct_contents: u64,
+    /// This group's share of the proposal, as a bounded identity.
+    #[serde(default)]
+    pub proposal_digest: Option<ProposalDigest>,
 }
 
 impl PreviewGroup {
     /// Stable identity of a group across two sweeps.
     pub fn key(&self) -> (String, String) {
         (self.policy_id.clone(), self.repository_id.clone())
+    }
+}
+
+/// Which rows a preview proposes to expire, stated as a fixed-width
+/// digest over their identifiers.
+///
+/// # Why the wire carries this and not a list
+///
+/// `rows`, `distinct_contents` and the byte total are all *quantities*.
+/// Two previews agreeing on every one of them can still name different
+/// artifacts — one stopped matching and an equally sized one started —
+/// and among artifacts of the same kind that is not a rare coincidence.
+/// The sample cannot close the gap: it is capped server-side and may be
+/// empty. A digest closes it exactly and costs the same on the wire for
+/// a proposal of five rows as for one of fifty thousand.
+///
+/// # This is not a content hash
+///
+/// It digests `(policy, artifact)` identifiers, never artifact bytes. It
+/// is not CAS identity, no storage path accepts it, and the server
+/// domain-separates its input precisely so the two can never coincide.
+/// Reading a value here as something to look up in storage is a
+/// category error.
+///
+/// # Why `scheme` rides along
+///
+/// A single `apply --from-preview` can hold a baseline written before a
+/// server upgrade and a fresh preview written after it. Comparing two
+/// values produced by different constructions would report "the
+/// proposal changed" when nothing had — and a warning that fires when
+/// nothing moved is trained away, then missed on the run where
+/// something did. Two digests are comparable only when their schemes
+/// match; otherwise this CLI says it could not compare rather than
+/// guessing.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProposalDigest {
+    #[serde(default)]
+    pub scheme: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+impl ProposalDigest {
+    /// `true` when both halves are present. A digest missing either is
+    /// treated exactly as an absent one: half a digest cannot decide
+    /// anything, and letting one compare equal to another half-digest
+    /// would manufacture a "same artifacts" verdict out of two blanks.
+    pub fn is_usable(&self) -> bool {
+        !self.scheme.is_empty() && !self.value.is_empty()
+    }
+}
+
+/// What comparing two previews' proposal identities established.
+///
+/// Deliberately four answers and not a boolean: "these name different
+/// artifacts" and "nobody told me which artifacts either names" demand
+/// the same caution from an operator but are not the same statement,
+/// and an output that collapses them teaches the reader to disbelieve
+/// the one that is load-bearing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalComparison {
+    /// Both previews reported a comparable identity and the two agree:
+    /// the same rows would be expired.
+    Same,
+    /// Both reported a comparable identity and the two differ: the
+    /// proposed set is not the one the baseline showed.
+    Different,
+    /// At least one side reported no usable identity, so only totals
+    /// were compared — and equal totals are not the same artifacts.
+    Unreported,
+    /// Both sides reported an identity, computed by different schemes.
+    /// Not comparable, which is a different statement from "different".
+    SchemeMismatch,
+}
+
+impl ProposalComparison {
+    /// `true` only for the one answer that lets a reader conclude the
+    /// same artifacts would be expired. Every other answer — including
+    /// both flavours of "could not tell" — fails closed.
+    pub fn is_same(self) -> bool {
+        self == Self::Same
+    }
+}
+
+/// Compare two proposal identities.
+pub fn compare_proposals(
+    baseline: Option<&ProposalDigest>,
+    fresh: Option<&ProposalDigest>,
+) -> ProposalComparison {
+    match (
+        baseline.filter(|d| d.is_usable()),
+        fresh.filter(|d| d.is_usable()),
+    ) {
+        (Some(b), Some(f)) if b.scheme != f.scheme => ProposalComparison::SchemeMismatch,
+        (Some(b), Some(f)) if b.value == f.value => ProposalComparison::Same,
+        (Some(_), Some(_)) => ProposalComparison::Different,
+        _ => ProposalComparison::Unreported,
     }
 }
 
@@ -313,6 +432,115 @@ mod tests {
             ..RetentionRunSummary::default()
         };
         assert!(summary.coverage_is_partial());
+    }
+
+    /// The digest travels as an object, so a reader can tell a value it
+    /// may compare from one it may not.
+    #[test]
+    fn a_proposal_digest_parses_from_the_handler_shape() {
+        let body: PreviewBody = serde_json::from_value(serde_json::json!({
+            "rows": 2,
+            "proposal_digest": { "scheme": "policy-artifact-pairs-v1", "value": "abc123" },
+            "groups": [{
+                "policy_id": "p1", "repository_id": "r1", "rows": 2,
+                "proposal_digest": { "scheme": "policy-artifact-pairs-v1", "value": "def456" }
+            }]
+        }))
+        .expect("parses");
+        let run = body.proposal_digest.expect("a run digest");
+        assert_eq!(run.scheme, "policy-artifact-pairs-v1");
+        assert_eq!(run.value, "abc123");
+        assert!(run.is_usable());
+        assert_eq!(
+            body.groups[0]
+                .proposal_digest
+                .as_ref()
+                .expect("a group digest")
+                .value,
+            "def456",
+            "the per-group identity is what lets a reader say which group moved",
+        );
+    }
+
+    /// A server that reports no identity must not be read as reporting
+    /// the *same* identity.
+    #[test]
+    fn an_absent_or_half_present_digest_is_not_usable() {
+        let body: PreviewBody =
+            serde_json::from_value(serde_json::json!({ "rows": 1 })).expect("parses");
+        assert!(body.proposal_digest.is_none());
+
+        for half in [
+            serde_json::json!({ "scheme": "policy-artifact-pairs-v1" }),
+            serde_json::json!({ "value": "abc123" }),
+            serde_json::json!({}),
+        ] {
+            let digest: ProposalDigest = serde_json::from_value(half.clone()).expect("parses");
+            assert!(!digest.is_usable(), "{half}");
+        }
+    }
+
+    #[test]
+    fn comparing_two_identities_answers_same_different_or_not_at_all() {
+        let d = |scheme: &str, value: &str| ProposalDigest {
+            scheme: scheme.into(),
+            value: value.into(),
+        };
+        let v1 = d("policy-artifact-pairs-v1", "aaaa");
+        let v1_other = d("policy-artifact-pairs-v1", "bbbb");
+        let v2 = d("policy-artifact-pairs-v2", "aaaa");
+        let blank = ProposalDigest::default();
+
+        assert_eq!(
+            compare_proposals(Some(&v1), Some(&v1)),
+            ProposalComparison::Same
+        );
+        assert_eq!(
+            compare_proposals(Some(&v1), Some(&v1_other)),
+            ProposalComparison::Different
+        );
+        assert_eq!(
+            compare_proposals(Some(&v1), Some(&v2)),
+            ProposalComparison::SchemeMismatch,
+            "the same value under two constructions proves nothing",
+        );
+        assert_eq!(
+            compare_proposals(None, Some(&v1)),
+            ProposalComparison::Unreported
+        );
+        assert_eq!(
+            compare_proposals(Some(&v1), None),
+            ProposalComparison::Unreported
+        );
+        assert_eq!(
+            compare_proposals(None, None),
+            ProposalComparison::Unreported
+        );
+        assert_eq!(
+            compare_proposals(Some(&blank), Some(&blank)),
+            ProposalComparison::Unreported,
+            "two blanks must not agree with each other",
+        );
+    }
+
+    #[test]
+    fn only_a_matching_identity_counts_as_the_same_proposal() {
+        assert!(ProposalComparison::Same.is_same());
+        for other in [
+            ProposalComparison::Different,
+            ProposalComparison::Unreported,
+            ProposalComparison::SchemeMismatch,
+        ] {
+            assert!(!other.is_same(), "{other:?} must fail closed");
+        }
+    }
+
+    #[test]
+    fn the_coverage_rule_is_the_same_whether_read_from_a_summary_or_a_word() {
+        assert!(!coverage_is_partial("complete"));
+        assert!(coverage_is_partial("partial"));
+        assert!(coverage_is_partial(""));
+        assert!(coverage_is_partial("who-knows"));
     }
 
     #[test]

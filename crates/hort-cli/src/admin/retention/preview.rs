@@ -20,7 +20,7 @@ use crate::client::AkClient;
 use crate::config::OutputFormat;
 use crate::output::format_json;
 
-use super::dto::{FreedBytes, RetentionRunSummary};
+use super::dto::{FreedBytes, ProposalDigest, RetentionRunSummary};
 use super::render::JobFacts;
 use super::{render, render_still_running, run_sweep, RetentionExit, SweepOptions, SweepResult};
 
@@ -137,6 +137,7 @@ pub fn preview_json(
         "distinct_contents": preview.distinct_contents,
         "freed_bytes": freed_bytes_json(&preview.freed_bytes),
     });
+    doc["proposal_digest"] = proposal_digest_json(preview.proposal_digest.as_ref());
     doc["groups"] = json!(preview
         .groups
         .iter()
@@ -147,6 +148,7 @@ pub fn preview_json(
             "repository_key": g.repository_key,
             "artifact_rows": g.rows,
             "distinct_contents": g.distinct_contents,
+            "proposal_digest": proposal_digest_json(g.proposal_digest.as_ref()),
         }))
         .collect::<Vec<_>>());
     doc["sample"] = json!(preview
@@ -164,6 +166,21 @@ pub fn preview_json(
         .collect::<Vec<_>>());
     doc["sample_limit"] = json!(preview.sample_limit);
     doc
+}
+
+/// Project the identity of the proposed rows, or an explicit `null`.
+///
+/// `null` is the whole point of the shape: a consumer comparing two
+/// previews on this field must be able to tell "these name different
+/// rows" from "this server did not say which rows it names". Collapsing
+/// the second into an empty string would let a script compare two blanks
+/// and conclude the proposals agree. The `scheme` half travels with the
+/// value because two digests are comparable only under the same scheme.
+pub fn proposal_digest_json(digest: Option<&ProposalDigest>) -> serde_json::Value {
+    match digest.filter(|d| d.is_usable()) {
+        Some(d) => json!({ "scheme": d.scheme, "value": d.value }),
+        None => json!(null),
+    }
 }
 
 /// Project the byte accounting so no consumer can read an unmeasured run
@@ -214,6 +231,10 @@ mod tests {
                 rows: 812,
                 distinct_contents: 634,
                 freed_bytes: freed,
+                proposal_digest: Some(ProposalDigest {
+                    scheme: "policy-artifact-pairs-v1".into(),
+                    value: "run-abc".into(),
+                }),
                 groups: vec![PreviewGroup {
                     policy_id: "p1".into(),
                     policy_name: "npm-90d".into(),
@@ -221,6 +242,10 @@ mod tests {
                     repository_key: "npm-proxy".into(),
                     rows: 812,
                     distinct_contents: 634,
+                    proposal_digest: Some(ProposalDigest {
+                        scheme: "policy-artifact-pairs-v1".into(),
+                        value: "group-abc".into(),
+                    }),
                 }],
                 sample: vec![PreviewSampleRow {
                     artifact_id: "a1".into(),
@@ -251,6 +276,44 @@ mod tests {
         assert_eq!(doc["sample"][0]["repository_key"], "npm-proxy");
         assert_eq!(doc["totals"]["artifact_rows"], 812);
         assert_eq!(doc["sample_limit"], 500);
+    }
+
+    /// A machine consumer gets the same identity the human rendering
+    /// decides on, so a script can compare two previews on which rows
+    /// they name rather than on how many.
+    #[test]
+    fn json_carries_the_identity_of_the_proposed_rows_at_both_levels() {
+        let doc = preview_json(
+            "preview",
+            &facts(),
+            &summary(FreedBytes::Exact { bytes: 7 }),
+        );
+        assert_eq!(doc["proposal_digest"]["scheme"], "policy-artifact-pairs-v1");
+        assert_eq!(doc["proposal_digest"]["value"], "run-abc");
+        assert_eq!(doc["groups"][0]["proposal_digest"]["value"], "group-abc");
+    }
+
+    /// `null`, never a blank: a consumer must be able to tell "names
+    /// different rows" from "did not say which rows", and two blanks
+    /// comparing equal would manufacture the first answer out of the
+    /// second.
+    #[test]
+    fn json_reports_an_absent_or_half_present_identity_as_null() {
+        let mut s = summary(FreedBytes::Exact { bytes: 7 });
+        {
+            let preview = s.preview.as_mut().expect("preview");
+            preview.proposal_digest = None;
+            preview.groups[0].proposal_digest = Some(ProposalDigest {
+                scheme: "policy-artifact-pairs-v1".into(),
+                value: String::new(),
+            });
+        }
+        let doc = preview_json("preview", &facts(), &s);
+        assert!(doc["proposal_digest"].is_null());
+        assert!(
+            doc["groups"][0]["proposal_digest"].is_null(),
+            "half a digest decides nothing and is reported as none",
+        );
     }
 
     #[test]
