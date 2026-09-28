@@ -374,6 +374,13 @@ async fn run_async() -> anyhow::Result<()> {
     // the projection is eventually authoritative and the next boot (or
     // a future scheduled task) retries; only a hard "cannot even list
     // repositories" surfaces as a boot error.
+    //
+    // This binary decides nothing on the summary — it hosts no
+    // `RetentionPurgeHandler`, so there is no purge start-gate here to
+    // open or close. `converged` is logged because `Ok` with
+    // `errors > 0` is NOT convergence (see
+    // `ReconcileSummary::converged`), and a reader comparing this line
+    // with the worker's gate decision must not have to infer that.
     if cfg.refcount_reconcile_on_startup {
         use hort_app::use_cases::refcount_reconcile_use_case::RefcountReconcileUseCase;
         use hort_domain::ports::refcount_reconcile::RefcountReconcilePort;
@@ -390,6 +397,7 @@ async fn run_async() -> anyhow::Result<()> {
             repos_swept = summary.repos_swept,
             drift_repaired = summary.drift_repaired,
             errors = summary.errors,
+            converged = summary.converged(),
             "refcount-reconcile sweep complete (pre-traffic)"
         );
     } else {

@@ -15,6 +15,12 @@
 //! GC-eligible **only after a positive reconcile** — this is that
 //! reconcile gate).
 //!
+//! **A positive reconcile is `errors == 0`, not `Ok`.** The sweep keeps
+//! going past a failing repository by design and still returns `Ok`, so
+//! the gate consumer reads [`ReconcileSummary::converged`] — never the
+//! `Ok`-ness of the return. See that method for why a partial pass has
+//! to be held the same way a total failure is.
+//!
 //! For every artifact in every repository it converges:
 //!
 //! 1. **exactly one** `(repo, artifact, "primary_content")` row with
@@ -54,6 +60,12 @@
 //! tracing-only. No `docs/metrics-catalog.md` row is
 //! added (correctly — a metric-without-catalog row is a hard block;
 //! there is no metric here).
+//!
+//! The *gate* built from this sweep's verdict does carry one
+//! (`hort_refcount_reconcile_gate_closed`), emitted by the worker's
+//! heartbeat loop and catalogued there. It is a property of the
+//! consumer's start-gate, not of this pass, which is why it lives in
+//! the composition root rather than here.
 
 use std::sync::Arc;
 
@@ -75,7 +87,40 @@ pub struct ReconcileSummary {
     /// recorded and the sweep continues; the run still returns `Ok`.
     /// A non-zero value means the projection may still be drifted —
     /// the next sweep retries.
+    ///
+    /// `Ok` therefore does NOT mean "converged": read
+    /// [`ReconcileSummary::converged`], never the `Ok`-ness of the
+    /// return, when deciding whether a refcount consumer may treat the
+    /// projection as authoritative.
     pub errors: u64,
+}
+
+impl ReconcileSummary {
+    /// `true` iff this pass left the projection converged: every
+    /// repository scanned and every observed drift case repaired,
+    /// without a single failure.
+    ///
+    /// **A partially-failed sweep is not a converged one.** A non-zero
+    /// [`errors`](Self::errors) means at least one repository's drift
+    /// was never observed, or at least one observed drift case was
+    /// never repaired — so a `primary_content` / `metadata_blob` edge
+    /// that should exist may still be missing. A GC consumer that
+    /// treats a missing or decremented refcount row as authoritative
+    /// on that projection can delete a live artifact's bytes: the
+    /// artifact whose edge is missing contributes nothing to its
+    /// hash's cross-`kind` count, so a retired sibling sharing the
+    /// hash drives the count to zero and the blob goes with it.
+    /// "Could not be determined" is therefore a hold, not a pass — the
+    /// same posture as a whole-sweep failure, reached from a partial
+    /// one.
+    ///
+    /// Repairs do not spoil convergence: `drift_repaired > 0` with
+    /// `errors == 0` is a sweep that found drift and healed all of it,
+    /// which is exactly what convergence means here.
+    #[must_use]
+    pub fn converged(&self) -> bool {
+        self.errors == 0
+    }
 }
 
 /// The refcount-reconcile sweep. Pure orchestration over
@@ -100,6 +145,11 @@ impl RefcountReconcileUseCase {
     /// next run retries the still-drifted slots (the projection is
     /// eventually authoritative; one bad repo must not block the rest
     /// from converging).
+    ///
+    /// **`Ok` is not the convergence verdict.** The return carries how
+    /// far the pass got; [`ReconcileSummary::converged`] is what a
+    /// refcount-gated consumer must read. A partially-failed pass
+    /// returns `Ok` with `errors > 0` and is *not* converged.
     #[tracing::instrument(skip(self))]
     pub async fn sweep_drift(&self) -> AppResult<ReconcileSummary> {
         let repo_ids = self.port.list_repository_ids().await?;
@@ -126,6 +176,7 @@ impl RefcountReconcileUseCase {
             repos_swept = summary.repos_swept,
             drift_repaired = summary.drift_repaired,
             errors = summary.errors,
+            converged = summary.converged(),
             "refcount-reconcile sweep complete"
         );
         Ok(summary)

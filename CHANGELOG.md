@@ -259,6 +259,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The `retention-purge` start-gate opened after a sweep that did not
+  converge** (#321). `RefcountReconcileUseCase::sweep_drift` keeps sweeping
+  past a repository it cannot scan or a repair it cannot apply, counts each
+  failure in `ReconcileSummary::errors`, and returns `Ok` either way — by
+  design, so one bad repository does not block the rest from converging. The
+  worker's boot sweep read that `Ok` as convergence and opened the gate,
+  logging `errors=1` and `converged — RetentionPurgeHandler gate OPEN` on the
+  same line. The error count was logged and never read.
+
+  The gate exists to keep the destructive storage-GC walk off an unconverged
+  `content_references` refcount projection, and a partially-failed sweep is
+  exactly an unconverged one: an artifact whose `primary_content` edge is
+  missing (repair failed) or was never looked at (scan failed) contributes
+  nothing to its hash's cross-`kind` count, so purging a retired sibling that
+  shares the hash drives the count to zero and deletes the live artifact's
+  bytes.
+
+  The convergence verdict is now `ReconcileSummary::converged()`
+  (`errors == 0`), read by the worker composition root; a partial failure
+  takes the same fail-safe posture the whole-sweep failure already had — gate
+  CLOSED, purge refuses and retries, boot does not abort — with a log line
+  that no longer claims the convergence that did not happen. `hort-server`'s
+  pre-traffic sweep keeps its own behaviour (it hosts no purge handler) and
+  now reports `converged` alongside the counts.
+
+  Because the gate is decided once per boot and holds for the life of the pod,
+  a closed gate is now discoverable **while it persists**, not only at the
+  instant it is decided: the worker's 60-second heartbeat tick restates it as
+  a `warn!` carrying the worker id, the reason and the remediation, and sets
+  the new `hort_refcount_reconcile_gate_closed` gauge (0/1, refreshed per
+  tick). The log line is the primary signal deliberately — the worker
+  `/metrics` listener is off by default, so a gauge alone can be unreadable in
+  a real deployment. Every refused purge also continues to land its refusal in
+  `jobs.last_error`, served by the always-on admin task API.
+
 - **The retention evaluation restarted at the beginning of the keyset every
   run** (#322). `RetentionEvaluateHandler` walks at most
   `MAX_BATCHES_PER_TICK * BATCH_SIZE` = 64 x 1000 = 64,000 artifacts per run,

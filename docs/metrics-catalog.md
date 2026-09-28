@@ -1880,6 +1880,59 @@ emitted on the healthy path too (`0.0`) so a fresh scrape always sees
 the series (absence vs `0.0` is ambiguous to dashboards), matching the
 `hort_unsafe_config_active` convention.
 
+### Refcount-reconcile purge start-gate
+
+| Metric | Type | Labels | Unit | Values |
+|--------|------|--------|------|--------|
+| `hort_refcount_reconcile_gate_closed` | gauge | — (no labels) | Boolean (0/1) | `0` = the worker's boot refcount-reconcile sweep converged (or the operator opted out with authoritative state) and `retention-purge` may run; `1` = the sweep did not converge and this worker refuses every `retention-purge` invocation |
+
+Emitted by `hort-worker`'s heartbeat loop
+(`heartbeat::reassert_reconcile_gate`), **refreshed on every 60-second
+tick** and phase-locked with `hort_scan_queue_depth` and the
+`scanner_registry.last_heartbeat` refresh — the tick that proves the
+worker is alive is the tick that says what it is refusing to do.
+
+`RefcountReconcileUseCase::sweep_drift` keeps sweeping past a
+repository it cannot scan or a repair it cannot apply, counting each
+failure, and still returns `Ok`. A *converged* sweep is therefore
+`errors == 0`, not `Ok`: a partially-failed pass may have left a
+`primary_content` / `metadata_blob` edge missing, and the GC walk
+reading that projection as authoritative can drive a shared hash's
+cross-`kind` count to zero and delete a live artifact's bytes. Both the
+partial and the total failure close the gate.
+
+**Why refreshed per tick, not set once at boot** — unlike
+`hort_staging_sweep_overdue` (a `hort-server` boot signal, where an
+in-process re-check would re-introduce the deliberately-absent server
+scheduler), the worker already runs a 60-second loop, so there is no
+new scheduler to pay for. Alerting is on the instantaneous value
+(`hort_refcount_reconcile_gate_closed > 0`) with no `max_over_time`
+window needed to catch a boot-only emission. The gate itself is still
+decided once per boot and never re-decided: clearing the cause and
+restarting the worker is what re-runs the sweep.
+
+**No labels** — one gate per worker process; the emitting replica is
+already the series' identity to the scraper, and a `worker_id` label
+would be unbounded by construction (pod churn) for no analytical value.
+The `worker_id` is on the accompanying log line instead.
+
+**This gauge is the secondary signal, and cannot be the only one.** The
+worker `/metrics` listener is off by default (`worker.metrics.enabled:
+false`, and enabling it also requires declaring `scrapeFrom`), so a
+gauge alone can be unreadable in a real deployment. The gate is decided
+once at boot and holds for the life of the pod, so a closed gate must
+be discoverable *while it persists*:
+
+1. **Primary — the worker log stream** (always on, no listener, no
+   knob): the same heartbeat tick emits a `warn!` naming the worker, the
+   reason the gate is closed, and the remediation, for as long as the
+   condition holds.
+2. **Durable — `jobs.last_error`**: every refused `retention-purge`
+   (CronJob or hand-invoked) is rescheduled with the refusal text, which
+   the server's always-on admin task API serves. That says the gate is
+   closed; the log line says why.
+3. **This gauge**, for deployments that do scrape the worker.
+
 ### Quarantine-aware index serve
 
 | Metric | Type | Labels | Unit | `result` values |

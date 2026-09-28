@@ -1123,7 +1123,7 @@
           }
         },
         "retentionPurge": {
-          "description": "executionPath: admin-task. Destructive storage-GC walk: for every ArtifactExpired with no following ArtifactPurged, decrement content_references, delete the CAS blob iff the cross-kind refcount hit 0, append ArtifactPurged. Refuses to run until the worker boot refcount-reconcile sweep converged. DEFAULT-DISABLED — the most destructive retention task.",
+          "description": "executionPath: admin-task. Destructive storage-GC walk: for every ArtifactExpired with no following ArtifactPurged, decrement content_references, delete the CAS blob iff the cross-kind refcount hit 0, append ArtifactPurged. Refuses to run until the worker boot refcount-reconcile sweep converged (zero repository scan/repair failures, not merely that the sweep ran). DEFAULT-DISABLED — the most destructive retention task.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
