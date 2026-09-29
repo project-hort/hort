@@ -259,6 +259,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The non-k8s deploy never reclaimed terminal `scan` job rows** (#308).
+  `scan-row-retention-sweep` was the only default-on chart CronJob with no
+  systemd counterpart in `hort_timers`, so on an Ansible-deployed instance
+  every artifact scan — ingest plus every periodic rescan — left a terminal
+  `jobs` row forever. Added the timer (daily 03:00, matching the chart), and
+  added `crates/hort-config/tests/deploy_schedule_parity.rs`, a DB-free source
+  scan that holds the chart's `cronjob-*.yaml` set against
+  `hort_timers_tasks` in both directions, so the next task that ships on one
+  flavour and not the other fails a test instead of standing for years. The
+  one legitimate asymmetry (`noop`, a heartbeat for the k8s svc-token chain
+  the native deploy does not have) is named in the test with its reason, and
+  the test fails if that reason goes stale in either direction.
+
+- **The prefetch rotation cursor sat in a sweep with no keep-newest clause**
+  (#308). `delete_terminal_prefetch_rows_older_than` matched `kind LIKE
+  'prefetch%'`, which also caught `prefetch-tick` — whose keyset rotation
+  cursor lives in the `result_summary` of its newest `completed` row and is
+  read back by `PrefetchTickHandler::read_cursor`. An instance whose
+  `prefetch-tick` schedule was off (it is default-disabled) or failing for
+  longer than the 7-day horizon lost the cursor and restarted the rotation
+  from the beginning, so on a large instance the tail packages came up rarely
+  or never. The kind is now carved out of the cascade predicate and swept by
+  `jobs-row-retention-sweep`, which retains the newest `completed` row per
+  kind. `prefetch-tick` is a scheduled tick, not cascade work; it matched the
+  cascade only by name prefix.
+
+- **Ten places documented a way to set a retention horizon that does not
+  exist** (#308). The two row-retention CLI subcommands, four chart CronJob
+  templates, five `scheduledTasks` blocks in `values.yaml`, three
+  `values.schema.json` descriptions and several handler docs pointed operators
+  at `hort-cli admin task invoke <kind>`. `hort-http-admin-tasks::router()`
+  enumerates its invoke routes one by one and none of
+  `quarantine-release-sweep`, `prefetch-tick`, `wheel-metadata-backfill` or the
+  three row-retention sweeps is among them, so those requests answer 404;
+  the `enqueue-*` subcommands behind the CronJobs and timers take no horizon
+  argument and write `params` unconditionally empty. Every such comment now
+  says what is true: the handler's 7-day `DEFAULT_HORIZON` is the horizon in
+  force on every supported path. No route, flag or chart value was added —
+  `horizon_seconds` and the 365-day cap stay as they are, now documented as
+  what they are. The cap's stated justification was also invented: it claimed
+  a wide horizon "falls off the `updated_at` index", and no migration creates
+  an index on `jobs.updated_at`.
+
 - **`NOTHING CHANGED SINCE THE PREVIEW YOU NAMED` compared totals, not the
   artifacts** (#326). `render::diff` had nothing else to compare with:
   `PreviewGroup` carried `rows` and `distinct_contents` and no statement of

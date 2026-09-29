@@ -2,12 +2,12 @@
 //! `jobs.kind` the two kind-specific retention sweeps do not reach.
 //!
 //! `public.jobs` had no general horizon. Two sweeps existed
-//! (`prefetch-row-retention-sweep` over `kind LIKE 'prefetch%' OR kind =
-//! 'oci-index-child-ingest'`, `scan-row-retention-sweep` over
-//! `kind = 'scan'`); every other kind in the `jobs_kind_check` allow-list
-//! accumulated terminal rows forever. The highest-churn of them,
-//! `staging-sweep`, runs every five minutes — roughly 288 terminal rows a
-//! day that nothing reclaimed. This handler closes that gap:
+//! (`prefetch-row-retention-sweep` over the pull-through ingest cascade,
+//! `scan-row-retention-sweep` over `kind = 'scan'`); every other kind in
+//! the `jobs_kind_check` allow-list accumulated terminal rows forever.
+//! The highest-churn of them, `staging-sweep`, runs every five minutes
+//! — roughly 288 terminal rows a day that nothing reclaimed. This
+//! handler closes that gap:
 //!
 //! ```sql
 //! WITH live AS (
@@ -17,7 +17,7 @@
 //!            max(created_at) AS newest_created_at
 //!       FROM public.jobs
 //!      WHERE status IN ('completed', 'failed')
-//!        AND kind NOT LIKE 'prefetch%'
+//!        AND (kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick')
 //!        AND kind NOT IN ('scan', 'oci-index-child-ingest')
 //!      GROUP BY kind
 //! )
@@ -42,9 +42,9 @@
 //!   `hort_event_chain_verify_overdue` (86400 s).
 //! - `JobsRepository::last_result_summary_by_kind` — the newest
 //!   `completed` row's `result_summary`, which is where the
-//!   `prefetch-tick` rotation persists its keyset cursor. (That kind
-//!   rides the cascade sweep, not this one, so this handler never
-//!   reaches it — but the read shape is the one to protect.)
+//!   `prefetch-tick` rotation persists its keyset cursor. That kind is
+//!   swept **here**, not by the cascade sweep whose name prefix it
+//!   shares, precisely so this retention clause covers it.
 //!
 //! **Both filter `status = 'completed'`.** That is why retaining "the
 //! newest terminal row" alone would not be enough: a kind that ran
@@ -58,12 +58,27 @@
 //!
 //! # Why the two existing sweeps' kinds are excluded
 //!
-//! Each of those sweeps carries its own operator-tunable horizon. A
-//! second sweep over the same rows on a different horizon silently wins
-//! whenever its horizon is the shorter of the two, so an operator who
-//! widened the scan sweep to 30 days would still watch scan rows vanish
-//! at this sweep's 7. One horizon per kind, enforced by making this
-//! predicate the textual complement of the other two.
+//! Exactly one sweep must own each kind. Two sweeps over the same rows
+//! carry two horizon constants, and the shorter one silently wins — so a
+//! kind covered twice ages out on a horizon neither of its two sweeps
+//! documents. The three constants all read 7 days today, which makes the
+//! overlap invisible rather than harmless: it would surface the first
+//! time one of them moved. The exclusions are therefore the textual
+//! complement of the other two predicates, so the property holds by
+//! construction rather than by the constants happening to agree, and a
+//! future `prefetch%` kind inherits the cascade sweep with no edit here.
+//!
+//! # Why `prefetch-tick` is swept here and not by the cascade sweep
+//!
+//! `prefetch-tick` matches `kind LIKE 'prefetch%'` by name, but it is
+//! not cascade work: it is a scheduled tick, like `cron-rescan-tick` and
+//! `staging-sweep`, and its newest `completed` row's `result_summary`
+//! holds the rotation's keyset cursor. The cascade sweep's whole premise
+//! is that none of its rows hold durable state, and it carries no
+//! keep-newest clause because of it. Carving `prefetch-tick` out of that
+//! predicate and admitting it here puts the kind with its actual class
+//! and leaves "the newest terminal row per kind is state" implemented in
+//! exactly one statement.
 //!
 //! # Abandoned non-terminal rows are out of scope
 //!
@@ -95,8 +110,15 @@
 //! { "horizon_seconds": 604800 }
 //! ```
 //!
-//! `horizon_seconds` is optional — when omitted the handler defaults to
-//! [`DEFAULT_HORIZON`] (7 days).
+//! `horizon_seconds` is optional, and **no supported path supplies
+//! it.** The Helm CronJob and the systemd timer both run `hort-server
+//! enqueue-jobs-row-retention-sweep`, which takes no arguments and
+//! writes `params` unconditionally empty; this kind has no
+//! `hort-http-admin-tasks` invoke route, so `POST
+//! /api/v1/admin/tasks/jobs-row-retention-sweep` answers 404. So
+//! [`DEFAULT_HORIZON`] (7 days) is the horizon in force on every
+//! deployment; nothing short of a hand-written `INSERT` into
+//! `public.jobs` produces another one.
 //!
 //! # Why a handler instead of a CLI subcommand
 //!
@@ -111,7 +133,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde_json::json;
 
 use hort_domain::error::DomainResult;
@@ -119,8 +140,10 @@ use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
 
-/// 7 days — default retention horizon, operator-tunable via the
-/// `horizon_seconds` param.
+use super::sweep_horizon::resolve_sweep_horizon;
+
+/// 7 days — the retention horizon, and the only one any supported path
+/// produces (see the module docs).
 ///
 /// The value matches the two sibling sweeps, but not because they chose
 /// it: the kinds this sweep covers argue for it independently, from both
@@ -155,24 +178,16 @@ use hort_domain::ports::BoxFuture;
 /// problem.
 pub const DEFAULT_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Hard upper bound on the operator-supplied horizon — 365 days, the
-/// same cap the two sibling sweeps enforce. Beyond a year the deleted
-/// count is dominated by rows no audit window wants, and the failure
-/// mode stays "rejected on the way in" rather than "ran a year-wide
-/// DELETE in production".
+/// Hard upper bound on any horizon that reaches this handler — 365
+/// days, the same cap the two sibling sweeps enforce. Beyond a year the
+/// deleted count is dominated by rows no audit window wants, and the
+/// failure mode stays "rejected on the way in" rather than "ran a
+/// year-wide DELETE in production". It is not a query-plan argument —
+/// see the sibling sweeps' `MAX_HORIZON` docs for why there is no
+/// `jobs.updated_at` index to fall off. Since no supported path
+/// supplies a horizon at all, the cap's live job is to keep a
+/// hand-written `INSERT` from becoming a year-wide DELETE.
 pub const MAX_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
-
-/// Parsed shape of the `params` JSONB column for a
-/// `jobs-row-retention-sweep` row.
-#[derive(Debug, Deserialize, Default)]
-struct JobsRowRetentionSweepParams {
-    /// Retention horizon in seconds. Terminal rows whose `updated_at` is
-    /// older than `now() - horizon_seconds` are deleted, except the
-    /// per-kind state rows the module docs describe. Defaults to
-    /// [`DEFAULT_HORIZON`] when absent.
-    #[serde(default)]
-    horizon_seconds: Option<u64>,
-}
 
 /// `TaskHandler` for the general terminal-`jobs`-row retention sweep.
 /// Constructed at worker composition time with the `JobsRepository`
@@ -199,31 +214,11 @@ impl TaskHandler for JobsRowRetentionSweepHandler {
         _ctx: TaskContext,
     ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
         Box::pin(async move {
-            let parsed: JobsRowRetentionSweepParams = match serde_json::from_value(params.clone()) {
-                Ok(p) => p,
-                Err(err) => {
-                    return Ok(TaskOutcome::fail(
-                        format!("jobs-row-retention-sweep params JSON invalid: {err}"),
-                        false,
-                    ));
-                }
-            };
-            let horizon = match parsed.horizon_seconds {
-                Some(s) => {
-                    let d = Duration::from_secs(s);
-                    if d > MAX_HORIZON {
-                        return Ok(TaskOutcome::fail(
-                            format!(
-                                "horizon_seconds {s} exceeds {MAX_SECS}-second cap (365 days)",
-                                MAX_SECS = MAX_HORIZON.as_secs(),
-                            ),
-                            false,
-                        ));
-                    }
-                    d
-                }
-                None => DEFAULT_HORIZON,
-            };
+            let horizon =
+                match resolve_sweep_horizon(self.kind(), params, DEFAULT_HORIZON, MAX_HORIZON) {
+                    Ok(h) => h,
+                    Err(outcome) => return Ok(outcome),
+                };
 
             let deleted = match self
                 .jobs

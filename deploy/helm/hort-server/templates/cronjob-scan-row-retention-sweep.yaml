@@ -6,14 +6,22 @@ which inserts ONE `kind='scan-row-retention-sweep'` row into
 `public.jobs` using the runtime DSN. The always-on worker (`hort-worker`)
 picks the row up and dispatches to `ScanRowRetentionSweepHandler`, which
 deletes terminal (`status IN ('completed', 'failed')`) `kind = 'scan'`
-rows older than a configurable horizon (default 7 days).
+rows older than the 7-day `DEFAULT_HORIZON`. No supported path supplies a
+different horizon: this CronJob runs the subcommand with no arguments, the
+subcommand writes `params` unconditionally empty, and there is no chart
+value and no CLI flag behind it.
 
 Design rationale: a default-enabled CronJob going through the `hort-cli`
 HTTP admin-task path would drag the whole `svc-token-bootstrap` Job chain
 + a standing `admin_task_invoke` token mount to default-on. The runtime
 DSN is least-privilege — it can `INSERT INTO public.jobs` and read the
-schema, full stop. The `hort-http-admin-tasks` HTTP route stays available
-for **manual** operator invocation.
+schema, full stop.
+
+There is **no** HTTP invoke route for this kind. `hort-http-admin-tasks`
+enumerates its invoke routes one by one and this kind is not among them,
+so `POST /api/v1/admin/tasks/scan-row-retention-sweep` answers 404 —
+an off-schedule run is `hort-server enqueue-scan-row-retention-sweep` on the
+runtime DSN, the same command this CronJob runs.
 
 So this CronJob:
 

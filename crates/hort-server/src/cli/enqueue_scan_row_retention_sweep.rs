@@ -21,10 +21,15 @@
 //! runtime DSN is least-privilege — it can `INSERT INTO public.jobs`
 //! and read the schema, full stop.
 //!
-//! The `hort-http-admin-tasks` HTTP route stays available for
-//! **manual** operator invocation — `hort-cli admin task
-//! invoke scan-row-retention-sweep` works for operators who want to
-//! drive one ad-hoc; the default scheduled path bypasses it.
+//! There is **no** HTTP invoke route for this kind, so there is no
+//! ad-hoc path either. The kind IS in `ADMIN_INVOKABLE_TASK_KINDS` — an
+//! operator-driven enqueue is authorised by the same model as any other
+//! admin task — but that constant is the set of kinds an admin may
+//! enqueue at all, not the router's list: `hort-http-admin-tasks::router()`
+//! enumerates its invoke routes one by one and this kind is not among
+//! them, so `POST /api/v1/admin/tasks/scan-row-retention-sweep`
+//! answers 404. Running one off-schedule means running this
+//! subcommand.
 //!
 //! ## Configuration
 //!
@@ -104,14 +109,12 @@ async fn run_async(_args: EnqueueScanRowRetentionSweepArgs) -> anyhow::Result<()
 
     let jobs: Arc<dyn JobsRepository> = Arc::new(PgJobsRepository::new(pool));
 
-    // The `params` jsonb is empty — the handler uses the default
-    // retention horizon (7 days) when `horizon_seconds` is absent.
-    // Operators wanting a custom horizon use the `hort-cli admin task
-    // invoke scan-row-retention-sweep --params
-    // '{"horizon_seconds": …}'` HTTP path instead. `actor_id` is
-    // `None` because the scheduled path is system-driven (a CronJob
-    // is not a human caller; the runtime DSN owns nothing
-    // identity-wise).
+    // The `params` jsonb is empty, unconditionally: this subcommand takes
+    // no arguments and there is no HTTP invoke route for the kind, so the
+    // handler's 7-day `DEFAULT_HORIZON` is the horizon in force on every
+    // supported path. `actor_id` is `None` because the scheduled path is
+    // system-driven (a CronJob is not a human caller; the runtime DSN
+    // owns nothing identity-wise).
     let outcome = jobs
         .enqueue_task(
             "scan-row-retention-sweep",

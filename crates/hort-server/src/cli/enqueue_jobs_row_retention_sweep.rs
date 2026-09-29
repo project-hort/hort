@@ -26,13 +26,17 @@
 //! schema, full stop.
 //!
 //! The kind is in `ADMIN_INVOKABLE_TASK_KINDS`, so an operator-driven
-//! enqueue is authorised by the same model as any other admin task.
-//! There is no per-kind HTTP invoke route for it today, though: the
+//! enqueue is authorised by the same model as any other admin task —
+//! but that constant is the set of kinds an admin may enqueue at all,
+//! not the router's list. There is no per-kind HTTP invoke route: the
 //! `hort-http-admin-tasks` router enumerates its routes explicitly and
 //! the three row-retention kinds are not among them, so `POST
-//! /api/v1/admin/tasks/jobs-row-retention-sweep` is a 404 until a route
-//! is added. An ad-hoc run today is this subcommand (or a hand-written
-//! `INSERT`), which is also how an operator picks a non-default horizon.
+//! /api/v1/admin/tasks/jobs-row-retention-sweep` answers 404. An ad-hoc
+//! run is this subcommand, which — like the CronJob and the systemd
+//! timer that call it — takes no arguments and writes `params`
+//! unconditionally empty. So the handler's 7-day `DEFAULT_HORIZON` is
+//! the horizon in force on every supported path; a different one needs a
+//! hand-written `INSERT` into `public.jobs`.
 //!
 //! ## Configuration
 //!

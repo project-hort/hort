@@ -263,15 +263,50 @@ const REQUEUE_ABANDONED_SQL: &str = "WITH abandoned AS (\n\
                  WHERE j.id = a.id\n\
                  RETURNING j.id, j.kind, j.attempts, j.status";
 
+/// `DELETE` behind [`JobsRepository::delete_terminal_prefetch_rows_older_than`]
+/// — the pull-through ingest cascade's rows, none of which hold durable
+/// state. The port doc carries the full rationale; the load-bearing
+/// details for anyone editing this string:
+///
+/// - **`prefetch-tick` is carved out by name.** It matches
+///   `kind LIKE 'prefetch%'` but is a scheduled tick, not cascade work,
+///   and its newest `completed` row's `result_summary` holds the
+///   rotation's keyset cursor (read back by
+///   [`JobsRepository::last_result_summary_by_kind`]). This sweep has no
+///   keep-newest clause — it does not need one, because with the carve-out
+///   every row it reaches really is stateless — so deleting a
+///   `prefetch-tick` row here would restart the rotation from the
+///   beginning. The kind is swept by
+///   [`JobsRepository::delete_terminal_other_kind_rows_older_than`]
+///   instead, which retains the newest `completed` row per kind.
+/// - The carve-out must stay the exact mirror image of the generic
+///   sweep's `OR kind = 'prefetch-tick'` admission, or the kind is either
+///   swept twice on two horizons or never swept at all. Pinned DB-free by
+///   `the_two_sweeps_partition_the_prefetch_prefix`.
+/// - Kept as a named constant so those DB-free tests can read the
+///   predicate without a database.
+const DELETE_TERMINAL_PREFETCH_ROWS_SQL: &str = "DELETE FROM public.jobs\n\
+                 WHERE ((kind LIKE 'prefetch%' AND kind <> 'prefetch-tick')\n\
+                        OR kind = 'oci-index-child-ingest')\n\
+                   AND status IN ('completed', 'failed')\n\
+                   AND updated_at < now() - $1::interval";
+
 /// `DELETE` behind [`JobsRepository::delete_terminal_other_kind_rows_older_than`]
 /// — the horizon for every `jobs.kind` the two kind-specific sweeps do not
 /// reach. The port doc carries the full rationale; the load-bearing details
 /// for anyone editing this string:
 ///
 /// - The kind predicate is the **textual complement** of the two sibling
-///   sweeps (`NOT LIKE 'prefetch%'`, `NOT IN ('scan',
-///   'oci-index-child-ingest')`), so exactly one horizon is ever in force
-///   per kind and a future `prefetch%` kind needs no edit here.
+///   sweeps (`NOT LIKE 'prefetch%'` with `prefetch-tick` readmitted,
+///   `NOT IN ('scan', 'oci-index-child-ingest')`), so exactly one sweep
+///   is ever in force per kind and a future `prefetch%` kind needs no
+///   edit here.
+/// - `OR kind = 'prefetch-tick'` readmits the one `prefetch%` kind the
+///   cascade sweep carves out. That kind's newest `completed` row carries
+///   the rotation's keyset cursor, so it needs the keep-newest clause
+///   below; the cascade sweep has none. The two predicates must stay
+///   mirror images — pinned DB-free by
+///   `the_two_sweeps_partition_the_prefetch_prefix`.
 /// - The `live` CTE aggregates over **all** terminal rows of a kind, not
 ///   only the aged ones. Aggregating over the aged subset instead would
 ///   retain "the newest row that happened to be old", which is a
@@ -292,7 +327,7 @@ const DELETE_TERMINAL_OTHER_KIND_ROWS_SQL: &str = "WITH live AS (\n\
                             max(created_at) AS newest_created_at\n\
                      FROM public.jobs\n\
                      WHERE status IN ('completed', 'failed')\n\
-                       AND kind NOT LIKE 'prefetch%'\n\
+                       AND (kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick')\n\
                        AND kind NOT IN ('scan', 'oci-index-child-ingest')\n\
                      GROUP BY kind\n\
                  )\n\
@@ -1588,18 +1623,16 @@ impl JobsRepository for PgJobsRepository {
             // `oci-index-child-ingest` rides this sweep rather than getting
             // its own: it is the same class of work as the cascade — a
             // high-churn, best-effort, per-content unit of pull-through
-            // ingest whose terminal row holds no durable state. See the port
-            // doc for why deleting one is safe.
-            let res = sqlx::query(
-                "DELETE FROM public.jobs \
-                  WHERE (kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest') \
-                    AND status IN ('completed', 'failed') \
-                    AND updated_at < now() - $1::interval",
-            )
-            .bind(interval)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "Job", "delete_terminal_prefetch_rows_older_than"))?;
+            // ingest whose terminal row holds no durable state. `prefetch-tick`
+            // is carved back out for the opposite reason. See the port doc
+            // and the SQL constant for both.
+            let res = sqlx::query(DELETE_TERMINAL_PREFETCH_ROWS_SQL)
+                .bind(interval)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    map_sqlx_error(&e, "Job", "delete_terminal_prefetch_rows_older_than")
+                })?;
             Ok(res.rows_affected())
         })
     }
@@ -1894,10 +1927,11 @@ mod tests {
     // state some other reader depends on.
 
     /// The kind predicate must stay the exact textual complement of the
-    /// two kind-specific sweeps. Overlap would put two horizons in force
-    /// for the same rows, and the shorter one would always win — so an
-    /// operator who widened `scan-row-retention-sweep`'s horizon to 30
-    /// days would still watch scan rows vanish at this sweep's 7.
+    /// two kind-specific sweeps. Overlap would put two horizon constants
+    /// in force for the same rows and let the shorter one silently win,
+    /// so the kind would age out on a horizon neither of its sweeps
+    /// documents — invisible today only because all three constants read
+    /// 7 days.
     #[test]
     fn delete_terminal_other_kind_rows_sql_excludes_the_kind_specific_sweeps() {
         let sql = DELETE_TERMINAL_OTHER_KIND_ROWS_SQL;
@@ -1910,6 +1944,76 @@ mod tests {
             sql.contains("kind NOT IN ('scan', 'oci-index-child-ingest')"),
             "the scan sweep's `kind = 'scan'` and the cascade sweep's \
              `oci-index-child-ingest` must be excluded. Full SQL:\n{sql}"
+        );
+    }
+
+    /// The `prefetch%` prefix is **partitioned** between the two sweeps,
+    /// not shared and not dropped: the cascade sweep carves
+    /// `prefetch-tick` out, the generic sweep takes it back. Both halves
+    /// are load-bearing and they fail in opposite directions — lose the
+    /// carve-out and the cascade sweep (which has no keep-newest clause)
+    /// deletes the rotation's keyset cursor, restarting the walk from the
+    /// beginning; lose the readmission and the kind is swept by nothing
+    /// at all and its terminal rows accumulate forever. Neither failure
+    /// is visible in a passing run of either sweep, which is why the pin
+    /// reads both strings in one test.
+    #[test]
+    fn the_two_sweeps_partition_the_prefetch_prefix() {
+        let cascade = DELETE_TERMINAL_PREFETCH_ROWS_SQL;
+        let generic = DELETE_TERMINAL_OTHER_KIND_ROWS_SQL;
+        assert!(
+            cascade.contains("kind LIKE 'prefetch%' AND kind <> 'prefetch-tick'"),
+            "the cascade sweep must carve `prefetch-tick` out of the prefix match — \
+             its newest `completed` row carries the prefetch rotation's keyset cursor \
+             and this sweep has no keep-newest clause. Full SQL:\n{cascade}"
+        );
+        assert!(
+            generic.contains("kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick'"),
+            "the generic sweep must readmit `prefetch-tick`, or the kind is swept by \
+             nothing and its terminal rows accumulate forever. Full SQL:\n{generic}"
+        );
+        assert!(
+            cascade.contains("kind = 'oci-index-child-ingest'")
+                && generic.contains("kind NOT IN ('scan', 'oci-index-child-ingest')"),
+            "`oci-index-child-ingest` stays wholly on the cascade side — it is the \
+             counter-example to the carve-out: high-churn, stateless terminal row. \
+             Cascade SQL:\n{cascade}\nGeneric SQL:\n{generic}"
+        );
+    }
+
+    /// Counter-assertion for the partition pin above: the cascade
+    /// predicate really is a `prefetch%` prefix match plus the one
+    /// `oci-index-child-ingest` literal, restricted to terminal rows on
+    /// the same `$1::interval` horizon as its siblings. A rewrite that
+    /// dropped the prefix match entirely would leave
+    /// `the_two_sweeps_partition_the_prefetch_prefix` asserting about a
+    /// predicate that no longer selects the cascade.
+    #[test]
+    fn delete_terminal_prefetch_rows_sql_is_the_cascade_predicate() {
+        let sql = DELETE_TERMINAL_PREFETCH_ROWS_SQL;
+        assert!(
+            sql.starts_with("DELETE FROM public.jobs\n"),
+            "Full SQL:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("kind LIKE 'prefetch%'").count(),
+            1,
+            "exactly one prefix match, so a future `prefetch%` kind inherits this sweep \
+             without an edit. Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("status IN ('completed', 'failed')"),
+            "`pending` / `running` rows are never swept. Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("updated_at < now() - $1::interval"),
+            "the horizon is the bound parameter, not a literal. Full SQL:\n{sql}"
+        );
+        assert!(
+            !sql.contains("newest_completed_at"),
+            "this sweep deliberately has NO keep-newest clause — adding one here would \
+             put the rule in two statements. `prefetch-tick` is carved out instead. \
+             Full SQL:\n{sql}"
         );
     }
 
@@ -2666,6 +2770,14 @@ mod tests {
             // A foreign kind whose newest terminal row IS durable state —
             // widening the predicate must never reach it.
             mk("completed", "verify-event-chain", 1_000_000),
+            // `prefetch-tick` matches the `prefetch%` prefix by name but
+            // is carved out: the rotation's keyset cursor lives in its
+            // newest `completed` row's `result_summary`, and this sweep
+            // has no keep-newest clause to protect it. Both rows must
+            // survive — even the superseded one, because the carve-out is
+            // by kind, not by rank.
+            mk("completed", "prefetch-tick", 1_000_000),
+            mk("failed", "prefetch-tick", 900_000),
         ];
         for (status, kind, key, age_secs) in &fixtures {
             sqlx::query(
@@ -2695,7 +2807,8 @@ mod tests {
         assert_eq!(
             deleted, 4,
             "exactly the four old-terminal in-scope rows are deleted (not pending/running, \
-             not fresh, not a foreign kind's durable state)",
+             not fresh, not a foreign kind's durable state, and not `prefetch-tick` — \
+             which matches the prefix but is swept by the generic sweep instead)",
         );
 
         // Cleanup: drop the remaining seeded rows for isolation.
@@ -2908,22 +3021,28 @@ mod tests {
         let prefetch_old = seed_aged_row(&pool, "prefetch", "completed", 400_000).await;
         let prefetch_newer = seed_aged_row(&pool, "prefetch", "completed", 300_000).await;
         let prefetch_deps = seed_aged_row(&pool, "prefetch-dependencies", "failed", 400_000).await;
-        let prefetch_tick_old = seed_aged_row(&pool, "prefetch-tick", "completed", 400_000).await;
-        let prefetch_tick_newer = seed_aged_row(&pool, "prefetch-tick", "completed", 300_000).await;
         let prefetch_sweep =
             seed_aged_row(&pool, "prefetch-row-retention-sweep", "completed", 400_000).await;
         let child_old = seed_aged_row(&pool, "oci-index-child-ingest", "completed", 400_000).await;
         let child_newer =
             seed_aged_row(&pool, "oci-index-child-ingest", "completed", 300_000).await;
 
+        // `prefetch-tick` is the one `prefetch%` kind this sweep DOES own:
+        // it is a scheduled tick, not cascade work, and its newest
+        // `completed` row carries the rotation's keyset cursor — so it
+        // needs the keep-newest clause the cascade sweep does not have.
+        let prefetch_tick_old = seed_aged_row(&pool, "prefetch-tick", "completed", 400_000).await;
+        let prefetch_tick_newer = seed_aged_row(&pool, "prefetch-tick", "completed", 300_000).await;
+
         let deleted = repo
             .delete_terminal_other_kind_rows_older_than(TEST_HORIZON)
             .await
             .expect("generic retention sweep");
         assert_eq!(
-            deleted, 5,
-            "exactly the five superseded, aged, terminal, in-scope rows are deleted: two \
-             `noop` completions, two `cron-rescan-tick` failures, and one of the sweep's own",
+            deleted, 6,
+            "exactly the six superseded, aged, terminal, in-scope rows are deleted: two \
+             `noop` completions, two `cron-rescan-tick` failures, one of the sweep's own, \
+             and the superseded `prefetch-tick` completion",
         );
 
         for (id, why) in [
@@ -2932,6 +3051,10 @@ mod tests {
             (tick_oldest, "superseded aged `cron-rescan-tick` failure"),
             (tick_older, "superseded aged `cron-rescan-tick` failure"),
             (self_old, "superseded aged row of the sweep's own kind"),
+            (
+                prefetch_tick_old,
+                "superseded aged `prefetch-tick` completion — the kind is swept here",
+            ),
         ] {
             assert!(!row_present(&pool, id).await, "{why} must be deleted");
         }
@@ -2965,15 +3088,11 @@ mod tests {
             (prefetch_old, "`prefetch%` belongs to the cascade sweep"),
             (prefetch_newer, "`prefetch%` belongs to the cascade sweep"),
             (prefetch_deps, "`prefetch%` belongs to the cascade sweep"),
-            (
-                prefetch_tick_old,
-                "`prefetch%` belongs to the cascade sweep",
-            ),
+            (prefetch_sweep, "`prefetch%` belongs to the cascade sweep"),
             (
                 prefetch_tick_newer,
-                "`prefetch%` belongs to the cascade sweep",
+                "newest `prefetch-tick` completion carries the rotation cursor",
             ),
-            (prefetch_sweep, "`prefetch%` belongs to the cascade sweep"),
             (
                 child_old,
                 "`oci-index-child-ingest` belongs to the cascade sweep",
@@ -3152,10 +3271,12 @@ mod tests {
 
     /// The cross-tick rotation cursor rides the newest completed row's
     /// `result_summary` and is read back by
-    /// `last_result_summary_by_kind`. `prefetch-tick` rides the cascade
-    /// sweep rather than this one, so this sweep must not reach it at
-    /// all; an in-scope kind must still keep its newest completion's
-    /// summary readable.
+    /// `last_result_summary_by_kind`. `prefetch-tick` is swept HERE, so
+    /// the cursor's survival rests on this sweep's keep-newest clause
+    /// rather than on an exclusion: the superseded tick row carrying a
+    /// stale cursor must age out while the current one stays readable.
+    /// `eventstore-checkpoint` covers the same shape for a kind whose
+    /// newest completion is NOT its newest terminal row.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn other_kind_retention_sweep_keeps_the_newest_result_summary_readable() {
@@ -3164,13 +3285,23 @@ mod tests {
         };
         let repo = PgJobsRepository::new(pool.clone());
 
-        let cursor = serde_json::json!({"cursor": {"position": "after_repo",
+        let stale_cursor = serde_json::json!({"cursor": {"position": "after_repo",
             "repository_id": "00000000-0000-0000-0000-000000000001"}});
-        let tick_row = seed_aged_row_with_summary(
+        let cursor = serde_json::json!({"cursor": {"position": "after_repo",
+            "repository_id": "00000000-0000-0000-0000-000000000002"}});
+        let tick_superseded = seed_aged_row_with_summary(
             &pool,
             "prefetch-tick",
             "completed",
             500_000,
+            Some(stale_cursor),
+        )
+        .await;
+        let tick_row = seed_aged_row_with_summary(
+            &pool,
+            "prefetch-tick",
+            "completed",
+            400_000,
             Some(cursor.clone()),
         )
         .await;
@@ -3203,13 +3334,14 @@ mod tests {
             .await
             .expect("generic retention sweep");
         assert_eq!(
-            deleted, 1,
-            "only the superseded `eventstore-checkpoint` completion ages out — \
-             `prefetch-tick` is the cascade sweep's kind, not this one's",
+            deleted, 2,
+            "the two superseded completions age out — one `eventstore-checkpoint`, \
+             one `prefetch-tick` — and nothing else",
         );
         assert!(row_present(&pool, ck_failed).await);
         assert!(!row_present(&pool, ck_superseded).await);
         assert!(row_present(&pool, ck_current).await);
+        assert!(!row_present(&pool, tick_superseded).await);
         assert!(row_present(&pool, tick_row).await);
 
         assert_eq!(
@@ -3217,7 +3349,9 @@ mod tests {
                 .await
                 .expect("prefetch-tick summary"),
             Some(cursor),
-            "the rotation cursor is untouched — this sweep excludes every `prefetch%` kind",
+            "the rotation resumes from the cursor it wrote, not from the beginning — \
+             this sweep owns `prefetch-tick` and its keep-newest clause is what \
+             protects the cursor",
         );
         assert_eq!(
             repo.last_result_summary_by_kind("eventstore-checkpoint")

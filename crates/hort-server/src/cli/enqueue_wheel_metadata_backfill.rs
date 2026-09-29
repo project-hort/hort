@@ -20,10 +20,15 @@
 //! least-privilege — it can `INSERT INTO public.jobs` and read the
 //! schema, full stop.
 //!
-//! The `hort-http-admin-tasks` HTTP route stays available for **manual**
-//! operator invocation — `hort-cli admin task invoke
-//! wheel-metadata-backfill` works for operators who want to drive one
-//! ad-hoc; the default scheduled path bypasses it.
+//! There is **no** HTTP invoke route for this kind, so there is no
+//! ad-hoc path either. The kind IS in `ADMIN_INVOKABLE_TASK_KINDS` — an
+//! operator-driven enqueue is authorised by the same model as any other
+//! admin task — but that constant is the set of kinds an admin may
+//! enqueue at all, not the router's list: `hort-http-admin-tasks::router()`
+//! enumerates its invoke routes one by one and this kind is not among
+//! them, so `POST /api/v1/admin/tasks/wheel-metadata-backfill`
+//! answers 404. Running one off-schedule means running this
+//! subcommand.
 //!
 //! ## Configuration
 //!

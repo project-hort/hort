@@ -15,9 +15,12 @@ Design rationale for the runtime-DSN delivery: a default-shipped CronJob
 going through the `hort-cli` HTTP admin-task path would drag the whole
 `svc-token-bootstrap` Job chain (and a standing `admin_task_invoke` token
 mount) to default-on. The runtime DSN is least-privilege — it can
-`INSERT INTO public.jobs` and read the schema, full stop. The
-`hort-http-admin-tasks` HTTP route stays available for **manual** operator
-invocation: `hort-cli admin task invoke wheel-metadata-backfill --params-file ...`.
+`INSERT INTO public.jobs` and read the schema, full stop. There is **no**
+HTTP invoke route for this kind: `hort-http-admin-tasks` enumerates its
+invoke routes one by one and `wheel-metadata-backfill` is not among them,
+so `POST /api/v1/admin/tasks/wheel-metadata-backfill` answers 404. An
+off-schedule pass is `hort-server enqueue-wheel-metadata-backfill
+[--batch-size N]`.
 
 So this CronJob:
 

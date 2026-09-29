@@ -1061,8 +1061,8 @@ pub trait JobsRepository: Send + Sync {
     }
 
     /// Retention sweep for the pull-through ingest cascade — delete
-    /// terminal `kind LIKE 'prefetch%'` and `kind =
-    /// 'oci-index-child-ingest'` rows whose `updated_at < now() -
+    /// terminal `kind LIKE 'prefetch%'` (minus `prefetch-tick`) and
+    /// `kind = 'oci-index-child-ingest'` rows whose `updated_at < now() -
     /// $horizon`. Returns the number of rows deleted.
     ///
     /// The cascade is high-churn (a closure-warm enqueues thousands
@@ -1071,10 +1071,28 @@ pub trait JobsRepository: Send + Sync {
     ///
     /// ```sql
     /// DELETE FROM public.jobs
-    ///  WHERE (kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest')
+    ///  WHERE ((kind LIKE 'prefetch%' AND kind <> 'prefetch-tick')
+    ///         OR kind = 'oci-index-child-ingest')
     ///    AND status IN ('completed', 'failed')
     ///    AND updated_at < now() - $1::interval
     /// ```
+    ///
+    /// **Why `prefetch-tick` is carved out.** This sweep has no
+    /// keep-newest clause, because its premise is that none of the rows
+    /// it reaches hold durable state. `prefetch-tick` breaks that
+    /// premise: it matches the `prefetch%` prefix by name only — it is a
+    /// scheduled tick, not cascade work — and the rotation's keyset
+    /// cursor lives in the `result_summary` of its newest `completed`
+    /// row, read back through [`Self::last_result_summary_by_kind`]. An
+    /// instance whose `prefetch-tick` schedule was off or failing for
+    /// longer than the horizon would lose the cursor here and restart the
+    /// rotation from the beginning, so on a large instance the tail
+    /// packages would come up rarely or never. The kind is swept by
+    /// [`Self::delete_terminal_other_kind_rows_older_than`] instead,
+    /// which retains the newest `completed` row per kind. The carve-out
+    /// and that sweep's matching `OR kind = 'prefetch-tick'` admission
+    /// are mirror images: break one and the kind is either swept twice or
+    /// never swept.
     ///
     /// **Why `oci-index-child-ingest` rides this sweep and not its own.**
     /// It is the same class of work as the cascade: high-churn (one row
@@ -1089,7 +1107,8 @@ pub trait JobsRepository: Send + Sync {
     /// a re-fetch and never a re-anchor. Every other `jobs.kind` outside
     /// these two keeps its newest terminal row as durable state (e.g.
     /// `verify-event-chain`'s liveness breadcrumb), which is why widening
-    /// the predicate further is not a free change.
+    /// the predicate further is not a free change — `prefetch-tick` is
+    /// the worked example of exactly that cost.
     ///
     /// `pending`/`running` rows are deliberately excluded — they are
     /// either claim-pending (the worker has not picked them up yet)
@@ -1125,8 +1144,8 @@ pub trait JobsRepository: Send + Sync {
     ///
     /// **`kind = 'scan'` exactly** — every other `jobs.kind` keeps its
     /// newest terminal row as durable state (e.g. `verify-event-chain`'s
-    /// liveness breadcrumb; the transitive-cascade `prefetch%` rows have
-    /// their own sweep in [`Self::delete_terminal_prefetch_rows_older_than`]).
+    /// liveness breadcrumb; the transitive-cascade rows have their own
+    /// sweep in [`Self::delete_terminal_prefetch_rows_older_than`]).
     /// Widening the `WHERE kind = 'scan'` predicate would delete another
     /// kind's durable state out from under it.
     ///
@@ -1167,7 +1186,7 @@ pub trait JobsRepository: Send + Sync {
     ///            max(created_at) AS newest_created_at
     ///       FROM public.jobs
     ///      WHERE status IN ('completed', 'failed')
-    ///        AND kind NOT LIKE 'prefetch%'
+    ///        AND (kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick')
     ///        AND kind NOT IN ('scan', 'oci-index-child-ingest')
     ///      GROUP BY kind
     /// )
@@ -1181,17 +1200,27 @@ pub trait JobsRepository: Send + Sync {
     ///    AND j.created_at <> l.newest_created_at
     /// ```
     ///
-    /// **Why the kind exclusions.** `kind = 'scan'` and
-    /// `kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest'` already
-    /// have sweeps of their own, each with its own operator-tunable
-    /// horizon. A second sweep covering the same rows on a different
-    /// horizon would silently win whenever its horizon were the shorter
-    /// of the two, so an operator who widened the scan sweep to 30 days
-    /// would still see scan rows disappear at this sweep's 7. The
-    /// exclusions keep exactly one horizon in force per kind. They are
-    /// expressed as the complement of the two sibling predicates —
-    /// textually, not as a list of kinds — so a new `prefetch%` kind
-    /// inherits the cascade sweep without a matching edit here.
+    /// **Why the kind exclusions.** `kind = 'scan'` and the cascade
+    /// predicate already have sweeps of their own, each carrying its own
+    /// horizon constant. A second sweep covering the same rows would let
+    /// the shorter of the two constants silently win, so a kind covered
+    /// twice would age out on a horizon neither of its sweeps documents.
+    /// All three constants read 7 days today, which makes such an overlap
+    /// invisible rather than harmless — it would surface the first time
+    /// one of them moved. The exclusions are therefore expressed as the
+    /// complement of the two sibling predicates — textually, not as a
+    /// list of kinds — so the one-sweep-per-kind property holds by
+    /// construction and a new `prefetch%` kind inherits the cascade sweep
+    /// without a matching edit here.
+    ///
+    /// **Why `prefetch-tick` is readmitted.** It is the single exception
+    /// to the textual complement, and it is written as one: the cascade
+    /// sweep carves the kind out, and `OR kind = 'prefetch-tick'` takes
+    /// it back here. That kind's newest `completed` row carries the
+    /// prefetch rotation's keyset cursor, and this is the sweep with the
+    /// keep-newest clause that protects it. See
+    /// [`Self::delete_terminal_prefetch_rows_older_than`] for the full
+    /// argument.
     ///
     /// **Why two rows per kind can survive the horizon.** "Keep the
     /// newest terminal row" is not sufficient: the two liveness gauges

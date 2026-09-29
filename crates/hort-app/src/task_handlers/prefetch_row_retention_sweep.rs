@@ -10,7 +10,8 @@
 //!
 //! ```sql
 //! DELETE FROM public.jobs
-//!  WHERE (kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest')
+//!  WHERE ((kind LIKE 'prefetch%' AND kind <> 'prefetch-tick')
+//!         OR kind = 'oci-index-child-ingest')
 //!    AND status IN ('completed', 'failed')
 //!    AND updated_at < now() - $horizon
 //! ```
@@ -25,6 +26,23 @@
 //! [`JobsRepository::delete_terminal_prefetch_rows_older_than`] for the
 //! full statement of that invariant.
 //!
+//! # Why `prefetch-tick` is carved out of the prefix match
+//!
+//! This sweep has **no keep-newest clause**, and it does not need one:
+//! its premise is that every row it reaches is stateless. `prefetch-tick`
+//! would break that premise. It matches `kind LIKE 'prefetch%'` by name
+//! only — it is a scheduled tick, not cascade work — and the rotation's
+//! keyset cursor lives in the `result_summary` of its newest `completed`
+//! row, read back by `PrefetchTickHandler::read_cursor`. Sweeping it here
+//! would restart the rotation from the beginning, so on a large instance
+//! the tail packages would come up rarely or never.
+//!
+//! The kind is swept by `jobs-row-retention-sweep` instead, which retains
+//! the newest `completed` row per kind. The carve-out here and that
+//! sweep's matching `OR kind = 'prefetch-tick'` admission are mirror
+//! images: break one and the kind is swept twice, break the other and it
+//! is swept never.
+//!
 //! Pairs with the per-table autovacuum tuning on `public.jobs`
 //! (migration 009): the sweep deletes the rows, autovacuum reclaims
 //! the page space (lowered `autovacuum_vacuum_scale_factor` = 0.02
@@ -37,9 +55,16 @@
 //! { "horizon_seconds": 604800 }
 //! ```
 //!
-//! `horizon_seconds` is optional — when omitted the handler defaults
-//! to [`DEFAULT_HORIZON`] (7 days). The Helm CronJob writes the value
-//! the operator chose; bare invocations get the default.
+//! `horizon_seconds` is optional, and **no supported path supplies
+//! it.** The Helm CronJob and the systemd timer both run `hort-server
+//! enqueue-prefetch-row-retention-sweep`, which takes no arguments and
+//! writes `params` unconditionally empty; this kind has no
+//! `hort-http-admin-tasks` invoke route (that router enumerates its
+//! routes one by one and this kind is not among them, so `POST
+//! /api/v1/admin/tasks/prefetch-row-retention-sweep` answers 404). So
+//! [`DEFAULT_HORIZON`] (7 days) is the horizon in force on every
+//! deployment; nothing short of a hand-written `INSERT` into
+//! `public.jobs` produces another one.
 //!
 //! # Why a handler instead of a CLI subcommand
 //!
@@ -54,7 +79,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
 use serde_json::json;
 
 use hort_domain::error::DomainResult;
@@ -62,35 +86,36 @@ use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
 
-/// 7 days — default retention horizon. Operators tune
-/// via the `horizon_seconds` param on the enqueue. Picked as a
-/// compromise: long enough that an operator debugging a cascade
-/// failure can read the failed rows the next morning; short enough
-/// that a high-throughput proxy (thousands of cohorts / day) does
-/// not accumulate millions of historical rows.
+use super::sweep_horizon::resolve_sweep_horizon;
+
+/// 7 days — the retention horizon, and the only one any supported path
+/// produces (see the module docs). Picked as a compromise: long enough
+/// that an operator debugging a cascade failure can read the failed
+/// rows the next morning; short enough that a high-throughput proxy
+/// (thousands of cohorts / day) does not accumulate millions of
+/// historical rows.
 pub const DEFAULT_HORIZON: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Hard upper bound on the operator-supplied horizon — 365 days.
-/// Beyond a year, the deleted-rows count would be dominated by
-/// extremely old terminal entries the operator almost certainly does
-/// not want to keep, AND the sweep query plan changes (an
-/// open-ended `WHERE updated_at < now() - <huge>` falls off the
-/// `updated_at` index entirely). A 365-day cap is permissive
-/// enough for any audit-window use case while keeping the failure
-/// mode at "rejected on the way in" instead of "took out
-/// production".
+/// Hard upper bound on any horizon that reaches this handler — 365
+/// days. Beyond a year the deleted-rows count is dominated by
+/// extremely old terminal entries no audit window wants, and the
+/// failure mode stays "rejected on the way in" rather than "ran a
+/// year-wide DELETE in production".
+///
+/// The cap is **not** a query-plan argument. No migration creates an
+/// index on `jobs.updated_at` — migration 009 adds `jobs_scan_unique`,
+/// `jobs_claim_idx`, `jobs_prefetch_unique`,
+/// `jobs_prefetch_dependencies_unique` and `jobs_idempotency_key_uq`;
+/// migration 015 adds `idx_jobs_scan_artifact_created_at` — so every
+/// horizon, wide or narrow, plans as a sequential scan. That is the
+/// right shape at this table size and daily cadence; widening the
+/// horizon changes how many rows the scan deletes, not how it finds
+/// them.
+///
+/// Since no supported path supplies a horizon at all, the cap's live
+/// job is to keep a hand-written `INSERT` from becoming a year-wide
+/// DELETE.
 pub const MAX_HORIZON: Duration = Duration::from_secs(365 * 24 * 60 * 60);
-
-/// Parsed shape of the `params` JSONB column for a
-/// `prefetch-row-retention-sweep` row.
-#[derive(Debug, Deserialize, Default)]
-struct PrefetchRowRetentionSweepParams {
-    /// Retention horizon in seconds. Rows whose `updated_at` is
-    /// older than `now() - horizon_seconds` are deleted. Defaults to
-    /// [`DEFAULT_HORIZON`] when absent.
-    #[serde(default)]
-    horizon_seconds: Option<u64>,
-}
 
 /// `TaskHandler` for the cascade-row retention sweep. Constructed
 /// at worker composition time with the `JobsRepository` port.
@@ -116,32 +141,11 @@ impl TaskHandler for PrefetchRowRetentionSweepHandler {
         _ctx: TaskContext,
     ) -> BoxFuture<'a, DomainResult<TaskOutcome>> {
         Box::pin(async move {
-            let parsed: PrefetchRowRetentionSweepParams =
-                match serde_json::from_value(params.clone()) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        return Ok(TaskOutcome::fail(
-                            format!("prefetch-row-retention-sweep params JSON invalid: {err}"),
-                            false,
-                        ));
-                    }
+            let horizon =
+                match resolve_sweep_horizon(self.kind(), params, DEFAULT_HORIZON, MAX_HORIZON) {
+                    Ok(h) => h,
+                    Err(outcome) => return Ok(outcome),
                 };
-            let horizon = match parsed.horizon_seconds {
-                Some(s) => {
-                    let d = Duration::from_secs(s);
-                    if d > MAX_HORIZON {
-                        return Ok(TaskOutcome::fail(
-                            format!(
-                                "horizon_seconds {s} exceeds {MAX_SECS}-second cap (365 days)",
-                                MAX_SECS = MAX_HORIZON.as_secs(),
-                            ),
-                            false,
-                        ));
-                    }
-                    d
-                }
-                None => DEFAULT_HORIZON,
-            };
 
             let deleted = match self
                 .jobs
