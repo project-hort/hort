@@ -22,7 +22,7 @@ its labels and units.
 | `result` | Per-metric enum (see catalog) | ~5-10 per metric |
 | `backend` | `filesystem`, `s3`, `gcs`, `azure`, `memory` (tests) | 5 |
 | `upstream` | Hostname | ~20 typical |
-| `operation` | `put`, `get`, `exists`, `append`, `read_stream`, `read_category` | ~10 |
+| `operation` | `put`, `get`, `exists`, `append`, `read_stream`, `read_category`, `read_categories` | ~10 |
 | `category` | Per-metric — event-stream metrics use `artifact`, `policy`, `admin`, `ref`, `artifact_group`, `curation`, `repository` (7 values); `hort_advisory_ingest_count` uses its own advisory-ecosystem-class taxonomy (see §"Advisory ingest efficacy"). Each metric's catalog entry is the authoritative source for its `category` value set. | per-metric |
 | `strategy` | `inline`, `hash_reference` | 2 |
 | `kind` | 10 values — see `hort_gitops_objects_total` for the full kind enum (`repository`, `claim_mapping`, `permission_grant`, `curation_rule`, `scan_policy`, `retention_policy`, `exclusion`, `upstream_mapping`, `oidc_issuer`, `service_account`) | 10 |
@@ -4294,7 +4294,7 @@ values). Retention-set metrics-catalog completeness: **closed**.
 |--------|------|--------|------|-----------------|
 | `hort_event_store_appends_total` | counter | `category`, `result` | — | `success`, `conflict`, `error` |
 | `hort_event_store_append_duration_seconds` | histogram | `category` | seconds | — |
-| `hort_event_store_reads_total` | counter | `category`, `operation` | — | `operation` ∈ `read_stream`, `read_category` |
+| `hort_event_store_reads_total` | counter | `category`, `operation` | — | `operation` ∈ `read_stream`, `read_category`, `read_categories` |
 | `hort_audit_events_blocked_total` | counter | `attempted_op`, `decision_point` | — | `attempted_op` ∈ `update`, `delete`, `truncate`; `decision_point` ∈ `startup_probe`, `trigger_caught` |
 
 **`category` label values** (source of truth:
@@ -4344,6 +4344,13 @@ values). Retention-set metrics-catalog completeness: **closed**.
 
 Note: for `read_category`, the `category` label is technically redundant
 (it's the lookup key). Kept for symmetry with `read_stream`; not a bug.
+
+`read_categories` — the dispatcher's merged read across a subscription's
+whole filter — increments once **per category in the request**, so the
+`category` label stays comparable with `read_category`'s. The distinct
+operation name is what keeps the two paths separable: N increments under
+`read_categories` are one round trip and one page, where N increments
+under `read_category` are N of each.
 
 `hort_audit_events_blocked_total` is emitted by `PgEventStore`
 at exactly two
@@ -4744,11 +4751,13 @@ The single source of truth for prefix → class mapping is `hort_app::ephemeral_
 |---|---|---|---|
 | `hort_notify_delivery_total` | counter | `target_kind ∈ {webhook, nats_jetstream}`, `result ∈ {delivered, downstream_rejected, failed}` | Counts each per-event delivery attempt by the dispatcher's per-subscription task. NO `subscription_id` label (cardinality). |
 | `hort_notify_delivery_duration_seconds` | histogram | `target_kind`, `result` | Wraps the entire `EventNotifier::notify` call (one event → one transport send). |
-| `hort_notify_broadcast_lagged_total` | counter | (none) | Increments on `tokio::sync::broadcast::error::RecvError::Lagged` in a per-subscription task. Operator signal that `HORT_NOTIFY_CHANNEL_CAPACITY` should be raised. |
+| `hort_notify_broadcast_lagged_total` | counter | (none) | Increments when a per-subscription task observes a lag on the hint channel — on `tokio::sync::broadcast::error::RecvError::Lagged` or while draining queued hints. Operator signal that `HORT_NOTIFY_CHANNEL_CAPACITY` should be raised. A lag costs latency, not an event: delivery is driven by reads of the event store (ADR 0061) and the read that follows covers what the lost hints would have announced. |
+| `hort_notify_store_read_errors_total` | counter | (none) | Increments when a per-subscription task's merged `read_categories` pass fails. The read is fail-closed — the cursor does not move, so nothing is skipped — which makes a *transient* failure invisible except here, and a *deterministic* one (a row this build cannot decode, e.g. mid-rollout or after a rollback) an indefinite stall of every subscription whose filter covers it, delivering nothing. `last_failure` cannot carry this: its `reason` enum describes transport outcomes, and `hort_event_store_reads_total` counts attempts with no outcome. **Alert on a non-zero rate that does not decay.** NO `subscription_id` label (cardinality). |
 | `hort_subscription_total` | gauge | `state ∈ {active, paused, disabled}` | Refreshed by the dispatcher's 30s reconcile. v1 surfaces the active count only — paused/disabled rows are not returned by `list_active`, so they're not enumerated by the reconcile. A future enhancement adds an explicit `list_by_state` call for full breakdown. |
 
-Emitted by [`hort_app::metrics::emit_notify_delivery`](../crates/hort-app/src/metrics.rs)
-and [`hort_app::metrics::emit_broadcast_lagged`](../crates/hort-app/src/metrics.rs)
+Emitted by [`hort_app::metrics::emit_notify_delivery`](../crates/hort-app/src/metrics.rs),
+[`hort_app::metrics::emit_broadcast_lagged`](../crates/hort-app/src/metrics.rs)
+and [`hort_app::metrics::emit_subscription_read_error`](../crates/hort-app/src/metrics.rs)
 from
 [`hort_app::dispatcher::subscription_task`](../crates/hort-app/src/dispatcher/subscription_task.rs).
 The `target_kind` and `result` label values are mapped from

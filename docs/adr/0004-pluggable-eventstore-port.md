@@ -1,7 +1,7 @@
 # 0004 — Backend-agnostic EventStore port
 
 - **Status:** Accepted
-- **Enforced by:** the `EventStore` trait exposes only `append(batch: AppendEvents)`, `read_stream(stream_id, from, max_count)`, `read_category(...)`, `delete_stream(stream_id)`, and `archive_stream(stream_id, target)`; it carries no PostgreSQL-specific type. There is no `subscribe` method on the trait — in-process publish/subscribe fan-out is a separate `EventStorePublisher` concern in `hort-app`. The Postgres implementation lives in `crates/hort-adapters-postgres/src/event_store.rs` behind the trait.
+- **Enforced by:** the `EventStore` trait exposes only `append(batch: AppendEvents)`, `read_stream(stream_id, from, max_count)`, `read_category(...)`, `read_categories(...)`, `health_check()`, `delete_stream(stream_id)`, and `archive_stream(stream_id, target)`; it carries no PostgreSQL-specific type. There is no `subscribe` method on the trait — in-process publish/subscribe fan-out is a separate `EventStorePublisher` concern in `hort-app`. The Postgres implementation lives in `crates/hort-adapters-postgres/src/event_store.rs` behind the trait.
 - **Supersedes:** —
 
 ## Context

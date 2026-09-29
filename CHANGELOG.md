@@ -565,6 +565,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clamp, or the `Retry-After` suppression for a hold with no self-resolving
   deadline.
 
+- **Notification subscribers never received the artifact lifecycle** (#296).
+  Push delivery ran off an in-process `tokio::sync::broadcast` channel fed by
+  `EventStorePublisher` after `EventStore::append`. But every event that must
+  land atomically with a projection write goes through
+  `PgEventStore::append_in_tx` instead — reached via `ArtifactLifecyclePort`,
+  `RefLifecyclePort`, `ArtifactGroupLifecyclePort`, the artifact delete and
+  the purge sweep — which sits *below* the publisher and therefore below the
+  `send`. That is the whole subscribable artifact lifecycle: `ArtifactIngested`,
+  `ChecksumVerified`, `ArtifactQuarantined`, `ScanRequested`, `ScanCompleted`,
+  `ArtifactBecameVulnerable`, `ArtifactReleased`, `ArtifactRejected`,
+  `ScanIndeterminate`, `ProvenanceVerified`, `ProvenanceRejected`,
+  `ArtifactReEvaluated`, `PromotionRequested`, `PolicyEvaluated`,
+  `ApprovalRequested`, `ApprovalDecided`, `ArtifactPromoted`,
+  `PromotionRejected`, `ArtifactDeleted`, `ArtifactPurged` and
+  `ArtifactCorrupted`, plus `RefMoved` / `RefRetired`
+  and every `ArtifactGroup*` kind. Exactly two artifact-stream kinds reached the
+  channel — `ArtifactExpired` and `CasIntegrityMismatch`, both appended through
+  the publisher. The same channel is per-process and the dispatcher
+  has no leader election, so at `replicaCount > 1` a replica also never saw any
+  other replica's appends. This was not new with #286's atomicity work —
+  `ArtifactDeleted` had behaved this way since the delete path existed (#281);
+  #286 only made it visible on a second event.
+
+  Catch-up did not save it. The read is `global_position > last_delivered_position`,
+  so as soon as one *delivered* event checkpointed a higher position, every
+  never-delivered event below it was below the mark and never revisited —
+  permanent loss, from that moment rather than from the next restart. (The
+  documentation claiming that marker was "operator visibility, not a delivery
+  cursor" was simply false.)
+
+  Delivery is now driven by reads of the event store
+  ([ADR 0061](docs/adr/0061-store-driven-notification-delivery.md)): every event
+  is delivered by `catch_up` — already the filter, dispatch and progress path —
+  which runs on every 5-second `STORE_POLL_INTERVAL` tick and not only at
+  startup and on `Lagged`. The broadcast becomes a **wake-up**: its
+  `global_position` is discarded, and only its *category* is used, as the
+  predicate deciding whether this subscription has anything to read at all.
+  Delivering the payload directly is the tempting shortcut and is the same bug
+  one layer up — the delivered position would advance the cursor over every
+  transactional append below it, so a subscriber getting a publisher-path event
+  at position 100 would skip the appends at 51..99. Only reads advance the
+  cursor, which is what keeps the walk contiguous.
+
+  **A pass reads the filter's categories as one ordered stream**, via a new
+  `EventStore::read_categories`. The task holds one cursor over one
+  `global_position`-ordered page rather than one cursor per category, which is
+  what makes the single persisted `last_delivered_position` scalar correct
+  instead of approximately correct — a per-category walk over one scalar loses
+  events across a restart, because the scalar is seeded into every category at
+  spawn and an advance driven by one category becomes the floor for all of
+  them. The port ships a default that merges per-category reads (right for the
+  ~20 in-memory implementations); Postgres overrides it with a `UNION ALL` of
+  per-category keyset arms that the planner serves with a `Merge Append`. The
+  shape is the deliverable: the obvious `stream_category = ANY($1)` spelling
+  measures 160 641 buffers and 33.9 ms — 160 001 rows scanned and discarded to
+  return nothing — against 9 buffers and 0.011 ms for what ships, on a seeded
+  200 000-event table under both custom and generic plans. A source-scan guard
+  pins it.
+
+  **A failed delivery is no longer checkpointed past.** Previously the failed
+  event's own position was written to `last_delivered_position` and reads
+  resume strictly above it: one transport attempt, ever, and a 30-second
+  receiver outage silently swallowed every event that arrived in it. The pass
+  now stops at the failed event, leaves the cursor below it, persists the
+  position *before* it, and retries on every subsequent tick — until it
+  succeeds or the existing 100-failures-in-1h budget disables the subscription
+  visibly. That is what makes "at-least-once" a statement about deliveries
+  rather than about attempts, and the budget is what bounds the head-of-line
+  block the in-order retry creates.
+
+  No transaction gained, lost or reordered a statement, and
+  `hort-adapters-postgres` still holds no broadcast sender — asserted both
+  behaviourally (`event_delivery_visibility.rs`) and as a source-scan guard on
+  the crate (`no_broadcast_in_adapter.rs`), since a sender reached through a
+  setter would leave the behavioural test green. The stated guarantee moves
+  from "best-effort, may drop" to **at-least-once for every event visible to a
+  category read when the cursor passes it, duplicates possible**: a duplicate
+  is the receiver's to drop (`X-Hort-Delivery-Id` + stable `global_position`),
+  a gap is nobody's to recover.
+
+  Three residuals are deliberate and named in the ADR.
+  `events.global_position` is a `nextval` default evaluated at INSERT while a
+  row becomes visible at COMMIT, so a later-committing transaction can hold a
+  lower position and a bare high-water-mark cursor steps over it — pinned
+  against a live database, and it bounds `GET /api/v1/events`'s `next_after`
+  checkpoint at least as much as the dispatcher, so closing it is a change to
+  the position model. It is *widened* here, measurably rather than slightly:
+  the old live loop delivered whatever it received regardless of position, so
+  publisher-path events were immune by accident, and the window is the whole
+  transaction tail including lock waits (every transactional port appends first
+  and writes projections after), not one commit latency. Second: the event
+  store is swept on age, not on delivery, so a subscription paused across a
+  retention sweep can miss events that were deleted — bounded by both sweeps
+  being `enabled: false` by default and the floor defaulting to 1 080 days.
+  Third: N replicas still deliver N times.
+
+  A failed *read* is fail-closed the same way (the cursor does not move), which
+  means a deterministic read failure — one row a replica cannot decode, as a
+  mid-rollout version skew produces — stalls a subscription indefinitely rather
+  than skipping. `hort_notify_store_read_errors_total` is the alertable signal;
+  before it, the only signal was a `warn!` per tick.
+
+- **Failure-budget exhaustion during catch-up did not stop the task** (#296).
+  `catch_up` returned `()`, so its early exit on an exhausted budget ended only
+  the pass: `run` carried on into the live loop and kept delivering to a
+  subscription it had just transitioned to `Disabled`. Contradicted both the
+  module documentation and the inline comment asserting the opposite. `catch_up`
+  now reports the exit to its caller — load-bearing now that the pass runs on
+  every poll tick.
+
 - **A soft delete never released the content reference, so the bytes had no
   release path at all** (#295). `ArtifactUseCase::delete` is an event-sourced
   soft delete: the adapter appends `ArtifactDeleted` and sets

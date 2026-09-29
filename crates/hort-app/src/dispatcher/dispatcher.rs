@@ -588,7 +588,7 @@ mod tests {
         fn update_last_delivered(
             &self,
             _id: SubscriptionId,
-            _position: u64,
+            _position: Option<u64>,
             _last_failure: Option<&hort_domain::entities::subscription::SubscriptionFailure>,
         ) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })

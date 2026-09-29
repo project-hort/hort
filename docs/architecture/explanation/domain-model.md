@@ -158,6 +158,7 @@ interface EventStore {
   append(AppendEvents) : AppendResult
   read_stream(stream_id, from, max) : Vec<PersistedEvent>
   read_category(category, from, max) : Vec<PersistedEvent>
+  read_categories(categories, from, max) : Vec<PersistedEvent>
 }
 
 interface ArtifactLifecyclePort {

@@ -63,6 +63,7 @@ pub mod event_chain_reader;
 pub mod event_store;
 pub mod jobs_repository;
 pub mod mappers;
+pub(crate) mod merged_category_read;
 pub mod metrics;
 pub mod oidc_issuer_repo;
 pub mod patch_candidate_repo;
