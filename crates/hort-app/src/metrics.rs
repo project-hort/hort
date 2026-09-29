@@ -4070,6 +4070,15 @@ pub enum RetentionPurgedResult {
     /// The `ArtifactExpired` decision is NOT lost (no `ArtifactPurged`
     /// emitted); the next sweep retries (two-stage idempotency).
     StorageError,
+    /// The hash-scoped blob-reclamation lock was held elsewhere, so the
+    /// refcount-0 decision could not be re-verified and no delete was
+    /// attempted. The worklist row stands and the next sweep retries.
+    ///
+    /// A non-zero rate here run after run is the signal that
+    /// reclamation is being *skipped* rather than that there is
+    /// nothing to reclaim — the two are indistinguishable from
+    /// `success` alone, which is why this value exists.
+    Deferred,
 }
 
 impl RetentionPurgedResult {
@@ -4079,13 +4088,14 @@ impl RetentionPurgedResult {
             Self::Success => "success",
             Self::BlobKept => "blob_kept",
             Self::StorageError => "storage_error",
+            Self::Deferred => "deferred",
         }
     }
 }
 
 /// Emit `hort_retention_purged_total{result}` once per content-hash
 /// purge decision.
-/// Cardinality: a fixed three-value `result` only — per-artifact
+/// Cardinality: a fixed four-value `result` only — per-artifact
 /// attribution (`artifact_id` / `content_hash`) stays in `tracing`,
 /// never on this series (architect anti-pattern hard-block).
 pub fn emit_retention_purged(result: RetentionPurgedResult) {

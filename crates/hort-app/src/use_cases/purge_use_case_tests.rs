@@ -14,12 +14,16 @@ use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{retention_scheduler_actor, ArtifactPurged, DomainEvent};
 use hort_domain::ports::event_store::AppendEvents;
-use hort_domain::ports::purge_gc::{PendingPurge, PurgeGcPort, PurgedRef};
+use hort_domain::ports::purge_gc::{
+    BlobReclaim, BlobReclaimGuard, PendingPurge, PurgeGcPort, PurgedRef,
+};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ByteRange, ContentHash};
 
-use crate::use_cases::purge_use_case::{PurgeUseCase, RefcountReconcileGate};
+use crate::use_cases::purge_use_case::{
+    PurgeUseCase, RefcountReconcileGate, BATCH_SIZE, MAX_BATCHES_PER_TICK,
+};
 
 const HASH_PRIMARY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HASH_META: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -72,11 +76,77 @@ struct MockPurgeGc {
     completed_batches: Mutex<Vec<AppendEvents>>,
     retired: Mutex<HashSet<Uuid>>,
     list_calls: AtomicUsize,
+    /// Per-hash script for `begin_blob_reclaim`. Absent ⇒ `Granted`.
+    reclaim_script: Mutex<HashMap<ContentHash, Reclaim>>,
+    reclaim_calls: Mutex<Vec<(Uuid, ContentHash)>>,
+    /// Ordered trace of lease/delete/release, shared with
+    /// [`MockStorage`] — the only way to assert that the delete happens
+    /// *between* the two, which is the property the fix rests on.
+    trace: Arc<Mutex<Vec<String>>>,
+    /// Leases handed out and not yet released.
+    outstanding_leases: Arc<AtomicUsize>,
+}
+
+/// What [`MockPurgeGc::begin_blob_reclaim`] should answer for a hash.
+#[derive(Clone, Debug)]
+enum Reclaim {
+    Granted,
+    Contended,
+    Referenced(u32),
+    Err,
+    /// Granted, but the guard fails to release. The delete still
+    /// happened; the sweep must not treat the release failure as a
+    /// storage failure.
+    GrantedReleaseFails,
+}
+
+/// Guard handed back by the mock. Records its release in the shared
+/// trace and flips the outstanding-lease flag, so a test can prove the
+/// lease is not still held after the sweep returns.
+struct MockGuard {
+    trace: Arc<Mutex<Vec<String>>>,
+    outstanding: Arc<AtomicUsize>,
+    fail: bool,
+}
+
+impl BlobReclaimGuard for MockGuard {
+    fn release(self: Box<Self>) -> BoxFuture<'static, DomainResult<()>> {
+        self.trace.lock().unwrap().push("release".to_owned());
+        self.outstanding.fetch_sub(1, Ordering::SeqCst);
+        let fail = self.fail;
+        Box::pin(async move {
+            if fail {
+                Err(DomainError::Invariant("release failed".into()))
+            } else {
+                Ok(())
+            }
+        })
+    }
 }
 
 impl MockPurgeGc {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn reclaim(self, content_hash: ContentHash, outcome: Reclaim) -> Self {
+        self.reclaim_script
+            .lock()
+            .unwrap()
+            .insert(content_hash, outcome);
+        self
+    }
+
+    fn reclaim_calls(&self) -> Vec<(Uuid, ContentHash)> {
+        self.reclaim_calls.lock().unwrap().clone()
+    }
+
+    fn trace(&self) -> Vec<String> {
+        self.trace.lock().unwrap().clone()
+    }
+
+    fn outstanding_leases(&self) -> usize {
+        self.outstanding_leases.load(Ordering::SeqCst)
     }
 
     fn with_pending(self, pending: Vec<PendingPurge>) -> Self {
@@ -131,25 +201,81 @@ impl MockPurgeGc {
 }
 
 impl PurgeGcPort for MockPurgeGc {
-    fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+    fn list_pending_purge(
+        &self,
+        limit: u32,
+        after_artifact_id: Option<Uuid>,
+    ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
         let fail = self.list_err.load(Ordering::SeqCst);
         let retired = self.retired.lock().unwrap().clone();
-        let pending = self
+        let mut rows: Vec<PendingPurge> = self
             .pending
             .lock()
             .unwrap()
             .iter()
             .filter(|item| !retired.contains(&item.artifact_id))
+            .filter(|item| after_artifact_id.is_none_or(|a| item.artifact_id > a))
             .cloned()
             .collect();
+        // The adapter's contract: ordered by `artifact_id`, so the
+        // caller can hand the last one back as the next page's cursor.
+        rows.sort_by_key(|item| item.artifact_id);
+        rows.truncate(limit as usize);
         Box::pin(async move {
             if fail {
                 Err(DomainError::Invariant("pending list failed".into()))
             } else {
-                Ok(pending)
+                Ok(rows)
             }
         })
+    }
+
+    fn begin_blob_reclaim(
+        &self,
+        artifact_id: Uuid,
+        content_hash: &ContentHash,
+    ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+        self.reclaim_calls
+            .lock()
+            .unwrap()
+            .push((artifact_id, content_hash.clone()));
+        self.trace.lock().unwrap().push("lease".to_owned());
+        let scripted = self
+            .reclaim_script
+            .lock()
+            .unwrap()
+            .get(content_hash)
+            .cloned()
+            .unwrap_or(Reclaim::Granted);
+        let outcome = match scripted {
+            Reclaim::Granted | Reclaim::GrantedReleaseFails => {
+                self.outstanding_leases.fetch_add(1, Ordering::SeqCst);
+                Ok(BlobReclaim::Granted(Box::new(MockGuard {
+                    trace: Arc::clone(&self.trace),
+                    outstanding: Arc::clone(&self.outstanding_leases),
+                    fail: matches!(scripted, Reclaim::GrantedReleaseFails),
+                })))
+            }
+            Reclaim::Contended => Ok(BlobReclaim::Contended),
+            Reclaim::Referenced(n) => {
+                // The adapter refreshes the worklist row under the
+                // lock; mirror that so a retry reads the same thing the
+                // use case just adopted.
+                if let Some(item) = self
+                    .refs
+                    .lock()
+                    .unwrap()
+                    .get_mut(&artifact_id)
+                    .and_then(|v| v.iter_mut().find(|item| item.content_hash == *content_hash))
+                {
+                    item.refs_remaining = n;
+                }
+                Ok(BlobReclaim::Referenced { refs_now: n })
+            }
+            Reclaim::Err => Err(DomainError::Invariant("lease failed".into())),
+        };
+        Box::pin(async move { outcome })
     }
 
     fn purge_artifact_refs(
@@ -233,11 +359,20 @@ struct MockStorage {
     present: Mutex<Vec<ContentHash>>,
     transient_fail_once: Mutex<HashSet<ContentHash>>,
     delete_attempts: Mutex<Vec<ContentHash>>,
+    /// Shared with [`MockPurgeGc`] when a test needs the interleaving.
+    trace: Mutex<Option<Arc<Mutex<Vec<String>>>>>,
 }
 
 impl MockStorage {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Record `delete` into the same ordered trace the lease/release
+    /// pair writes to.
+    fn tracing_into(self, trace: Arc<Mutex<Vec<String>>>) -> Self {
+        *self.trace.lock().unwrap() = Some(trace);
+        self
     }
 
     fn with_present(self, content_hash: ContentHash) -> Self {
@@ -291,6 +426,9 @@ impl StoragePort for MockStorage {
             .lock()
             .unwrap()
             .push(content_hash.clone());
+        if let Some(trace) = self.trace.lock().unwrap().as_ref() {
+            trace.lock().unwrap().push("delete".to_owned());
+        }
         let fail = self
             .transient_fail_once
             .lock()
@@ -345,6 +483,27 @@ fn build(gc: MockPurgeGc, storage: MockStorage, gate: Arc<MockReconcileGate>) ->
     let storage = Arc::new(storage);
     let uc = PurgeUseCase::new(gc.clone(), storage.clone(), gate);
     Harness { uc, gc, storage }
+}
+
+/// An unremarkable pending item — no tag, no delete, no quarantine —
+/// so a test that is about something else does not restate the four
+/// flags each time.
+fn plain_pending(artifact_id: Uuid) -> PendingPurge {
+    PendingPurge {
+        artifact_id,
+        quarantine_status: QuarantineStatus::None,
+        tag_targeted: false,
+        expired_only_by_keep_last_n: false,
+        user_deleted: false,
+    }
+}
+
+/// `n` distinct ids in ascending order — the keyset walk's order, so a
+/// test can assert which ones a capped run reached.
+fn sorted_ids(n: usize) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = (0..n).map(|_| Uuid::new_v4()).collect();
+    ids.sort();
+    ids
 }
 
 fn purged_events(gc: &MockPurgeGc) -> Vec<ArtifactPurged> {
@@ -1100,4 +1259,310 @@ async fn the_summary_separates_delete_driven_from_expiry_driven_work() {
     assert_eq!(summary.user_deletes_visited, 1);
     assert_eq!(summary.blobs_deleted, 2);
     assert_eq!(summary.purged_events, 2);
+}
+
+// ---------------------------------------------------------------------------
+// The blob-reclamation lease: the lock the destructive step happens under
+// ---------------------------------------------------------------------------
+
+/// The ordering the whole fix rests on: the lease is taken, the bytes
+/// are deleted **while it is held**, and only then is it released. A
+/// delete outside the lease is the bug this unit exists to remove — the
+/// count and the act would again be two unrelated moments.
+#[tokio::test]
+async fn the_delete_happens_between_taking_the_lease_and_releasing_it() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let gc = MockPurgeGc::new()
+        .with_pending(vec![plain_pending(artifact_id)])
+        .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]);
+    let trace = Arc::clone(&gc.trace);
+    let h = build(
+        gc,
+        MockStorage::new()
+            .with_present(content_hash.clone())
+            .tracing_into(trace),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(
+        h.gc.trace(),
+        vec![
+            "lease".to_owned(),
+            "delete".to_owned(),
+            "release".to_owned()
+        ],
+        "the delete must be inside the lease, not before or after it"
+    );
+    assert_eq!(h.gc.reclaim_calls(), vec![(artifact_id, content_hash)]);
+    assert_eq!(
+        h.gc.outstanding_leases(),
+        0,
+        "the lease must not outlive the sweep"
+    );
+}
+
+/// A blob a live reference already keeps never reaches the lease at
+/// all: there is nothing to authorise, because nothing is going to be
+/// deleted. Pins that the lock is taken on the destructive path only —
+/// a sweep that leased every hash it walked would contend with every
+/// ingest for no reason.
+#[tokio::test]
+async fn a_blob_with_live_references_is_never_leased() {
+    let artifact_id = Uuid::new_v4();
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(artifact_id, vec![work(hash(HASH_PRIMARY), 3)]),
+        MockStorage::new(),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_kept, 1);
+    assert!(h.gc.reclaim_calls().is_empty());
+    assert!(h.gc.trace().is_empty());
+}
+
+/// Contention is a deferral, not a failure and not a delete: nothing is
+/// removed, no terminal event is emitted, the artifact stays pending,
+/// and the summary says so in a field an operator can watch.
+#[tokio::test]
+async fn a_contended_lease_defers_the_blob_and_leaves_the_work_standing() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .reclaim(content_hash.clone(), Reclaim::Contended),
+        MockStorage::new().with_present(content_hash),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_deferred, 1);
+    assert_eq!(summary.blobs_deleted, 0);
+    assert_eq!(summary.purged_events, 0);
+    assert_eq!(
+        summary.errors, 0,
+        "a deferral is the mechanism working, not an error"
+    );
+    assert!(h.storage.delete_attempts().is_empty());
+    assert!(!h.gc.is_retired(artifact_id));
+    assert_eq!(h.gc.complete_call_count(), 0);
+}
+
+/// …and the next run picks it up from the retained worklist. This is
+/// the retry half of "skip when in doubt": a deferred blob is not a
+/// lost one.
+#[tokio::test]
+async fn a_deferred_blob_is_retried_by_the_next_run() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .reclaim(content_hash.clone(), Reclaim::Contended),
+        MockStorage::new().with_present(content_hash.clone()),
+        MockReconcileGate::converged(),
+    );
+
+    assert_eq!(
+        h.uc.process_expired(ts(2000)).await.unwrap().blobs_deferred,
+        1
+    );
+
+    // The lock frees; the same durable worklist is walked again.
+    h.gc.reclaim_script.lock().unwrap().remove(&content_hash);
+    let second = h.uc.process_expired(ts(3000)).await.unwrap();
+    assert_eq!(second.blobs_deleted, 1);
+    assert_eq!(second.purged_events, 1);
+    assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
+    assert!(h.gc.is_retired(artifact_id));
+}
+
+/// The worklist's zero was a snapshot, and under the lock it turns out
+/// to be stale: the bytes are claimed again. The blob stays, the purge
+/// still finishes (re-asking forever would leave the artifact
+/// permanently unfinishable), and the terminal event states the count
+/// that actually held rather than the zero that no longer did.
+#[tokio::test]
+async fn a_recount_that_is_no_longer_zero_keeps_the_blob_and_states_the_count() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .reclaim(content_hash.clone(), Reclaim::Referenced(2)),
+        MockStorage::new().with_present(content_hash),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_deleted, 0);
+    assert_eq!(summary.blobs_kept, 1);
+    assert_eq!(summary.blobs_deferred, 0);
+    assert_eq!(summary.purged_events, 1);
+    assert!(
+        h.storage.delete_attempts().is_empty(),
+        "bytes something references must not be deleted"
+    );
+    assert!(h.gc.is_retired(artifact_id));
+    assert_eq!(purged_events(&h.gc)[0].refs_remaining, 2);
+}
+
+/// A lease that cannot be taken at all (port/infra failure) is an
+/// error, and errors do not delete.
+#[tokio::test]
+async fn a_failing_lease_deletes_nothing_and_is_counted_as_an_error() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .reclaim(content_hash.clone(), Reclaim::Err),
+        MockStorage::new().with_present(content_hash),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.blobs_deleted, 0);
+    assert_eq!(summary.blobs_deferred, 0);
+    assert!(h.storage.delete_attempts().is_empty());
+    assert!(!h.gc.is_retired(artifact_id));
+}
+
+/// The release is best-effort reporting, not part of the decision: the
+/// bytes are already gone by the time it runs, and the lock ends with
+/// the transaction whether or not the release statement succeeds.
+/// Treating the failure as a storage error would strand a completed
+/// delete behind a `StorageError` retry forever.
+#[tokio::test]
+async fn a_release_failure_does_not_undo_a_completed_delete() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let h = build(
+        MockPurgeGc::new()
+            .with_pending(vec![plain_pending(artifact_id)])
+            .with_refs(artifact_id, vec![work(content_hash.clone(), 0)])
+            .reclaim(content_hash.clone(), Reclaim::GrantedReleaseFails),
+        MockStorage::new().with_present(content_hash.clone()),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.blobs_deleted, 1);
+    assert_eq!(summary.errors, 0);
+    assert_eq!(summary.purged_events, 1);
+    assert_eq!(h.storage.delete_attempts(), vec![content_hash]);
+    assert!(h.gc.is_retired(artifact_id));
+}
+
+/// A storage failure inside a granted lease still releases it. Without
+/// this the failure path would hold a pooled connection's transaction —
+/// and the hash lock with it — for as long as the error path took, and
+/// every ingest touching those bytes would queue behind a sweep that
+/// had already given up.
+#[tokio::test]
+async fn a_storage_failure_inside_the_lease_still_releases_it() {
+    let artifact_id = Uuid::new_v4();
+    let content_hash = hash(HASH_PRIMARY);
+    let gc = MockPurgeGc::new()
+        .with_pending(vec![plain_pending(artifact_id)])
+        .with_refs(artifact_id, vec![work(content_hash.clone(), 0)]);
+    let trace = Arc::clone(&gc.trace);
+    let h = build(
+        gc,
+        MockStorage::new()
+            .with_present(content_hash.clone())
+            .fail_delete_once(content_hash)
+            .tracing_into(trace),
+        MockReconcileGate::converged(),
+    );
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.errors, 1);
+    assert_eq!(summary.purged_events, 0);
+    assert_eq!(
+        h.gc.trace(),
+        vec![
+            "lease".to_owned(),
+            "delete".to_owned(),
+            "release".to_owned()
+        ]
+    );
+    assert_eq!(h.gc.outstanding_leases(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The capped, paged walk
+// ---------------------------------------------------------------------------
+
+/// The walk pages by keyset and the cursor advances over rows it did
+/// not act on, so a full page is followed by the next one rather than
+/// by the same one again.
+#[tokio::test]
+async fn the_walk_pages_by_keyset_until_the_set_is_exhausted() {
+    let ids = sorted_ids(5);
+    let gc = MockPurgeGc::new().with_pending(ids.iter().copied().map(plain_pending).collect());
+    let mut h = build(gc, MockStorage::new(), MockReconcileGate::converged());
+    h.uc.batch_size = 2;
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.artifacts_visited, 5);
+    // 2 + 2 + 1: the short page ends the walk without a further probe.
+    assert_eq!(h.gc.list_call_count(), 3);
+    assert_eq!(h.gc.purge_calls.lock().unwrap().clone(), ids);
+}
+
+/// One run examines at most `max_batches_per_tick * batch_size`
+/// artifacts. The first sweep after a deployment faces the whole
+/// accumulated backlog, and "load it all and find out how big it was"
+/// is exactly what a destructive sweep may not do.
+#[tokio::test]
+async fn one_run_stops_at_the_per_tick_cap_and_leaves_the_rest() {
+    let ids = sorted_ids(9);
+    let gc = MockPurgeGc::new().with_pending(ids.iter().copied().map(plain_pending).collect());
+    let mut h = build(gc, MockStorage::new(), MockReconcileGate::converged());
+    h.uc.batch_size = 2;
+    h.uc.max_batches_per_tick = 3;
+
+    let summary = h.uc.process_expired(ts(2000)).await.unwrap();
+    assert_eq!(summary.artifacts_visited, 6, "3 pages of 2");
+    assert_eq!(h.gc.list_call_count(), 3);
+    assert_eq!(h.gc.purge_calls.lock().unwrap().clone(), ids[..6].to_vec());
+
+    // The remainder is the next run's work: nothing was skipped, only
+    // deferred, and the set is consumed as artifacts retire.
+    h.gc.purge_calls.lock().unwrap().clear();
+    let second = h.uc.process_expired(ts(3000)).await.unwrap();
+    assert_eq!(second.artifacts_visited, 6);
+    assert_eq!(h.gc.purge_calls.lock().unwrap().clone(), ids[..6].to_vec());
+}
+
+/// The defaults are the design, pinned: a silent drift to a larger cap
+/// re-opens the unbounded first run the cap exists to close, and the
+/// numbers are deliberately retention-evaluate's rather than a second
+/// idiom.
+#[test]
+fn the_page_cap_defaults_mirror_retention_evaluate() {
+    assert_eq!(BATCH_SIZE, 1000, "design pin: BATCH_SIZE = 1000");
+    assert_eq!(
+        MAX_BATCHES_PER_TICK, 64,
+        "design pin: MAX_BATCHES_PER_TICK = 64"
+    );
+    let uc = PurgeUseCase::new(
+        Arc::new(MockPurgeGc::new()),
+        Arc::new(MockStorage::new()),
+        MockReconcileGate::converged(),
+    );
+    assert_eq!(uc.batch_size, BATCH_SIZE);
+    assert_eq!(uc.max_batches_per_tick, MAX_BATCHES_PER_TICK);
 }

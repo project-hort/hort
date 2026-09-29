@@ -74,7 +74,7 @@ does not corrupt projected state.
 |---|---|---|
 | `artifact_id` | `Uuid` | The artifact whose reference was removed; equals the artifact stream's `entity_id`. |
 | `content_hash` | `ContentHash` | CAS content hash whose reference this purge removed (64 lowercase hex chars by construction). |
-| `refs_remaining` | `u32` | Cross-`kind` `content_references` count for `content_hash` **after** this artifact's reference was removed. `0` ⇒ the blob itself was deleted; `> 0` ⇒ a still-live reference keeps the blob and only this artifact's reference is gone. |
+| `refs_remaining` | `u32` | Cross-`kind` `content_references` count for `content_hash` **after** this artifact's reference was removed. `0` ⇒ the blob itself was deleted; `> 0` ⇒ a still-live reference keeps the blob and only this artifact's reference is gone. The count is the one observed under the hash-scoped blob-reclamation lock immediately before the storage decision, not the one the sweep's preparation transaction recorded earlier: a re-reference that lands in between corrects the value here and keeps the blob. |
 | `purged_at` | `DateTime<Utc>` | Wall-clock at which the purge (or already-absent confirmation) completed. Distinct from the event store's `stored_at`. |
 
 **Consumer contract.** A consumer reconstructing retention state keys on
@@ -87,6 +87,14 @@ must treat the second and later occurrences as no-ops. `refs_remaining`
 is observational — it tells a consumer whether the underlying blob
 survived deduplication, not whether this artifact's purge succeeded
 (it always did, by the time the event is emitted).
+
+**Byte reclamation does not gate this event's meaning.** An artifact is
+externally gone once `ArtifactPurged` is on its stream; the bytes behind
+it are reclaimed by a best-effort sweep that declines to act whenever it
+cannot prove, under the blob lock, that nothing references them. A blob
+whose reclamation was deferred keeps its durable worklist row and is
+retried by the next run, so `refs_remaining` is a statement about what
+the sweep observed, never a promise about disk.
 
 ## Deletion
 

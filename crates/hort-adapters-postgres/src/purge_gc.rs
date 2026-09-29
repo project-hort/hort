@@ -78,7 +78,10 @@
 //! 1. `SELECT … FROM artifacts WHERE id = $1 FOR UPDATE` — lock the
 //!    artifact row so a concurrent ingest/promote cannot race the
 //!    refcount decrement; also recovers the authoritative
-//!    `checksum_sha256` for the idempotent-retry path.
+//!    `checksum_sha256` for the idempotent-retry path. This lock is
+//!    about *this artifact's* bookkeeping and says nothing about the
+//!    blobs it points at — see `begin_blob_reclaim` below, which is the
+//!    lock the destructive step runs under.
 //! 2. `DELETE FROM content_references WHERE source_artifact_id = $1
 //!    RETURNING target_content_hash` — remove **every** kind of this
 //!    artifact's own source-edges: the `primary_content` /
@@ -100,6 +103,28 @@
 //!    `artifact_purge_worklist` before committing. Retries read this
 //!    table rather than trying to reconstruct targets from deleted
 //!    edges, so every OCI target remains actionable.
+//!
+//! ## `begin_blob_reclaim` — the lock the delete happens under
+//!
+//! Steps 1-4 above lock an **artifact row**. What the sweep destroys is
+//! a **blob**, and CAS deduplicates precisely so that one blob may
+//! belong to many artifacts — so that lock is the wrong granularity for
+//! the destructive decision, and the `refs_remaining` it produced is a
+//! snapshot of a count that the delete may act on sweeps later.
+//!
+//! `begin_blob_reclaim` is where that is corrected: it takes the
+//! hash-scoped [`blob_lock`](crate::blob_lock) with `try` (never
+//! waiting — see that module) and re-reads the cross-`kind` count under
+//! it. Zero still ⇒ a `BlobReclaim::Granted` guard the caller holds
+//! across `StoragePort::delete`. Non-zero ⇒ `Referenced`, with the
+//! worklist row corrected in place so the terminal event states the
+//! count that held. Lock busy ⇒ `Contended`, and nothing is read or
+//! changed.
+//!
+//! Every production `content_references` write takes the same lock
+//! (`pg_content_reference_repo::insert`, `refcount_reconcile`'s repair
+//! upsert), which is what makes the re-read conclusive rather than just
+//! fresher.
 //!
 //! After storage decisions have been checkpointed per worklist row,
 //! `complete_artifact_purge` appends the whole per-hash terminal event
@@ -127,7 +152,9 @@ use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{DomainEvent, StreamId};
 use hort_domain::ports::event_store::AppendEvents;
-use hort_domain::ports::purge_gc::{PendingPurge, PurgeGcPort, PurgedRef};
+use hort_domain::ports::purge_gc::{
+    BlobReclaim, BlobReclaimGuard, PendingPurge, PurgeGcPort, PurgedRef,
+};
 use hort_domain::types::ContentHash;
 
 use crate::event_store::PgEventStore;
@@ -215,6 +242,41 @@ pub(crate) fn map_status(raw: Option<&str>) -> DomainResult<QuarantineStatus> {
 fn parse_hash(raw: &str, ctx: &str) -> DomainResult<ContentHash> {
     ContentHash::from_str(raw.trim())
         .map_err(|_| DomainError::Invariant(format!("purge_gc: corrupt hash {raw:?} ({ctx})")))
+}
+
+/// A held [`blob_lock`](crate::blob_lock), carried as the open
+/// transaction that owns it.
+///
+/// The lock has to outlive the transaction that *decided* — the
+/// worklist preparation commits long before the sweep reaches the
+/// bytes, and on a retry it may have committed a day earlier. So this
+/// guard is a second, deliberately short transaction that does nothing
+/// but hold the lock and the count it read under it, kept open across
+/// `StoragePort::delete` and closed immediately after.
+///
+/// It is read-only: `pg_try_advisory_xact_lock` and one `count(*)`.
+/// Nothing is pending in it, so the only cost of holding it open is one
+/// pooled connection for the duration of one blob delete. Dropping it
+/// without [`release`](BlobReclaimGuard::release) queues a rollback on
+/// the connection — which also ends the lock — so a lost guard cannot
+/// strand the lock the way a session-scoped `pg_advisory_lock` would.
+struct PgBlobReclaimGuard {
+    tx: Transaction<'static, Postgres>,
+}
+
+impl BlobReclaimGuard for PgBlobReclaimGuard {
+    fn release(self: Box<Self>) -> hort_domain::ports::BoxFuture<'static, DomainResult<()>> {
+        Box::pin(async move {
+            // Commit rather than roll back: the transaction wrote
+            // nothing, so the two are equivalent in effect, and a
+            // commit is the statement that says "this lease ended
+            // normally" to anyone reading the session's log.
+            self.tx
+                .commit()
+                .await
+                .map_err(|e| map_sqlx_error(&e, "purge_gc", "release_blob_lock"))
+        })
+    }
 }
 
 impl PgPurgeGcPort {
@@ -321,7 +383,11 @@ impl PgPurgeGcPort {
 }
 
 impl PurgeGcPort for PgPurgeGcPort {
-    fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+    fn list_pending_purge(
+        &self,
+        limit: u32,
+        after_artifact_id: Option<Uuid>,
+    ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
         Box::pin(async move {
             // An artifact stream serializes as `artifact-<uuid>`
             // (`StreamId::Display`). The pending-purge set is every
@@ -334,6 +400,12 @@ impl PurgeGcPort for PgPurgeGcPort {
             // soft-deleted row is deliberately NOT excluded: `deleted_at`
             // marks an artifact out of service, which is the condition
             // for collecting its bytes, not against it.
+            //
+            // Keyset-paged on `a.id` (the existing sort key) and capped
+            // at `limit`: the first sweep after a deployment faces the
+            // entire backlog, and a work set whose size is only known
+            // once it is fully loaded is not a set this query may
+            // return.
             let sql = format!(
                 r#"
                 SELECT a.id                AS artifact_id,
@@ -367,12 +439,16 @@ impl PurgeGcPort for PgPurgeGcPort {
                        )
                    AND (a.quarantine_status IS NULL
                         OR a.quarantine_status <> ALL($1::text[]))
+                   AND ($2::uuid IS NULL OR a.id > $2::uuid)
                  ORDER BY a.id
+                 LIMIT $3
                 "#,
                 tag_targeted = crate::ARTIFACT_IS_TAG_TARGETED_SQL,
             );
             let rows: Vec<PendingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(crate::gc_protected_quarantine_status_names())
+                .bind(after_artifact_id)
+                .bind(i64::from(limit))
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "purge_gc", "list_pending"))?;
@@ -509,6 +585,64 @@ impl PurgeGcPort for PgPurgeGcPort {
                 DomainError::Invariant(format!("purge_gc purge_artifact_refs commit: {e}"))
             })?;
             Self::map_worklist(worklist)
+        })
+    }
+
+    fn begin_blob_reclaim(
+        &self,
+        artifact_id: Uuid,
+        content_hash: &ContentHash,
+    ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+        let hash = content_hash.clone();
+        Box::pin(async move {
+            let mut tx = self.pool.begin().await.map_err(|e| {
+                DomainError::Invariant(format!("purge_gc begin_blob_reclaim begin: {e}"))
+            })?;
+
+            // Try, never wait. The lock's other holder is a
+            // reference write serving a request; a destructive sweep
+            // that queued behind it would be trading a user-visible
+            // stall for housekeeping it is explicitly allowed to defer.
+            if !crate::blob_lock::try_lock_blob_in_tx(&mut tx, &hash).await? {
+                tx.rollback().await.map_err(|e| {
+                    DomainError::Invariant(format!("purge_gc blob-lock contended rollback: {e}"))
+                })?;
+                return Ok(BlobReclaim::Contended);
+            }
+
+            // The authoritative count, read under the lock. The
+            // worklist's `refs_remaining` was computed in a transaction
+            // that has already committed — potentially in an earlier
+            // sweep — so it is a snapshot, and a snapshot is not
+            // permission to delete.
+            let refs_now = Self::remaining_refs(&mut tx, &hash).await?;
+            if refs_now > 0 {
+                // Something re-referenced these bytes. The blob is
+                // alive; correct the worklist so the `ArtifactPurged`
+                // the caller emits carries the count that actually
+                // held rather than the stale zero, then let go.
+                let updated = sqlx::query(
+                    "UPDATE artifact_purge_worklist SET refs_remaining = $3 \
+                     WHERE artifact_id = $1 AND content_hash = $2",
+                )
+                .bind(artifact_id)
+                .bind(hash.as_ref())
+                .bind(i64::from(refs_now))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "purge_gc", "refresh_worklist_refs"))?;
+                if updated.rows_affected() != 1 {
+                    return Err(DomainError::Invariant(format!(
+                        "purge_gc: no worklist row for artifact {artifact_id} hash {hash}"
+                    )));
+                }
+                tx.commit().await.map_err(|e| {
+                    DomainError::Invariant(format!("purge_gc blob-lock refresh commit: {e}"))
+                })?;
+                return Ok(BlobReclaim::Referenced { refs_now });
+            }
+
+            Ok(BlobReclaim::Granted(Box::new(PgBlobReclaimGuard { tx })))
         })
     }
 
@@ -1062,7 +1196,7 @@ mod tests {
     async fn pending_for(pool: &PgPool, artifact: Uuid) -> PendingPurge {
         adapter(pool)
             .await
-            .list_pending_purge()
+            .list_pending_purge(1000, None)
             .await
             .expect("list pending")
             .into_iter()
@@ -1128,7 +1262,7 @@ mod tests {
         append_event(&pool, purged, "ArtifactPurged", 1).await;
 
         let adapter = adapter(&pool).await;
-        let pending = adapter.list_pending_purge().await.unwrap();
+        let pending = adapter.list_pending_purge(1000, None).await.unwrap();
         let ids: Vec<Uuid> = pending.iter().map(|p| p.artifact_id).collect();
 
         assert!(
@@ -2057,7 +2191,7 @@ mod tests {
         // Still pending: the delete verb retires the projection, it does
         // not remove the bytes.
         assert!(adapter
-            .list_pending_purge()
+            .list_pending_purge(1000, None)
             .await
             .unwrap()
             .iter()
@@ -2093,7 +2227,7 @@ mod tests {
         assert_eq!(outstanding, 0, "the worklist is cleared");
         assert!(
             !adapter
-                .list_pending_purge()
+                .list_pending_purge(1000, None)
                 .await
                 .unwrap()
                 .iter()
@@ -2489,7 +2623,7 @@ mod tests {
         let rejected = seed_artifact(&pool, repo, "rejected", HASH_B, Some("rejected")).await;
         soft_delete(&pool, &adapter, rejected).await;
 
-        let pending = adapter.list_pending_purge().await.unwrap();
+        let pending = adapter.list_pending_purge(1000, None).await.unwrap();
         let ids: Vec<Uuid> = pending.iter().map(|p| p.artifact_id).collect();
         assert!(
             ids.contains(&deleted),
@@ -2590,7 +2724,7 @@ mod tests {
         );
         assert!(
             !adapter
-                .list_pending_purge()
+                .list_pending_purge(1000, None)
                 .await
                 .unwrap()
                 .iter()
@@ -2865,6 +2999,521 @@ mod tests {
         let mut fetched = Vec::new();
         reader.read_to_end(&mut fetched).await.unwrap();
         assert_eq!(fetched, bytes, "the artifact serves its bytes again");
+
+        cleanup(&pool, repo).await;
+    }
+
+    // -----------------------------------------------------------------
+    // The blob-reclamation lock: the purge locks the artifact, but the
+    // blob is what it destroys
+    // -----------------------------------------------------------------
+
+    /// Seed one repository holding one artifact whose primary content
+    /// is `hash`, with the durable purge worklist already prepared and
+    /// its refcount recorded as zero. This is the exact state the race
+    /// is about: the count has been taken, the bytes are still there,
+    /// and the delete has not happened yet.
+    async fn worklist_prepared_at_zero(
+        pool: &PgPool,
+        adapter: &PgPurgeGcPort,
+        hash: &str,
+    ) -> (Uuid, Uuid) {
+        let repo = seed_repo(pool).await;
+        let art = seed_artifact(pool, repo, "reclaim-race", hash, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(pool)
+            .await
+            .unwrap();
+        insert_cr(pool, repo, art, "primary_content", hash).await;
+        append_event(pool, art, "ArtifactExpired", 0).await;
+
+        let refs = adapter
+            .purge_artifact_refs(art)
+            .await
+            .expect("worklist prepared");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].refs_remaining, 0,
+            "the preparation transaction saw no remaining references"
+        );
+        (repo, art)
+    }
+
+    /// Record a `primary_content` reference through the **real** ingest
+    /// write path (`ContentReferenceIndex::insert`) — the path a
+    /// deduplicating ingest takes when `exists(hash)` is true, so
+    /// nothing is written to CAS and only the reference is recorded.
+    async fn ingest_dedup_reference(pool: &PgPool, repo: Uuid, source: Uuid, hash: &ContentHash) {
+        use hort_domain::ports::content_reference_index::{
+            ContentReference, ContentReferenceIndex,
+        };
+        crate::pg_content_reference_repo::PgContentReferenceRepo::new(pool.clone())
+            .insert(ContentReference {
+                source_artifact_id: source,
+                target_content_hash: hash.clone(),
+                kind: "primary_content".to_owned(),
+                metadata: serde_json::Value::Object(serde_json::Map::new()),
+                repository_id: repo,
+                recorded_at: Utc::now(),
+            })
+            .await
+            .expect("reference recorded");
+    }
+
+    /// **The race.** The sweep has a worklist row saying "zero
+    /// references"; before it reaches the bytes, an ingest deduplicates
+    /// onto the same hash — `exists(hash)` is true, so nothing is
+    /// written — and records its reference. The worklist's zero is now
+    /// stale.
+    ///
+    /// Before the fix, `finish_one_ref` read that stale zero and
+    /// deleted: the new artifact ended up pointing at bytes that no
+    /// longer existed. Now the count is re-read under the hash lock
+    /// immediately before the delete, sees the new reference, and keeps
+    /// the blob — and the `ArtifactPurged` it emits carries the count
+    /// that actually held rather than the zero that did not.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_dedup_landing_between_the_count_and_the_delete_keeps_its_bytes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let put = storage
+            .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+            .await
+            .unwrap();
+        assert_eq!(put.hash.as_ref(), HASH_B);
+
+        let adapter = Arc::new(adapter(&pool).await);
+        let (repo, expiring) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+
+        // The concurrent ingest: a second artifact deduplicates onto the
+        // same content and records its reference.
+        let newcomer = seed_artifact(&pool, repo, "dedup-newcomer", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(newcomer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        ingest_dedup_reference(&pool, repo, newcomer, &put.hash).await;
+
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert!(
+            storage.exists(&put.hash).await.unwrap(),
+            "the newcomer's bytes must survive the sweep that decided \
+             before it arrived"
+        );
+        assert_eq!(summary.blobs_deleted, 0);
+        assert_eq!(summary.blobs_kept, 1);
+        assert_eq!(summary.errors, 0);
+
+        // The expiring artifact still finishes — declining to delete is
+        // not declining to complete.
+        let purged: Vec<i64> = sqlx::query_scalar(
+            "SELECT (event_data->'data'->>'refs_remaining')::bigint FROM events \
+             WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(StreamId::artifact(expiring).to_string())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            purged,
+            vec![1],
+            "the terminal event states the count observed under the lock"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The other half of the same window: the ingest's reference write
+    /// is **in flight** — it holds the hash lock and has not committed,
+    /// so the sweep's re-count could not see it even if it ran. The
+    /// sweep does not run it: the lock is taken with `try`, contention
+    /// is an answer, and the answer is "not this run".
+    ///
+    /// Then the reference commits and the sweep asks again, which is
+    /// the retry half of skip-when-in-doubt: a deferred blob is not a
+    /// lost one, and the worklist row is what carries it forward.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_in_flight_reference_write_defers_the_sweep_which_then_retries() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let put = storage
+            .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+            .await
+            .unwrap();
+
+        let adapter = Arc::new(adapter(&pool).await);
+        let (repo, art) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+
+        // An uncommitted reference write, modelled exactly as
+        // `PgContentReferenceRepo::insert` opens one: a transaction that
+        // has taken the hash lock and not yet committed.
+        let mut in_flight = pool.begin().await.unwrap();
+        crate::blob_lock::lock_blob_in_tx(&mut in_flight, &put.hash)
+            .await
+            .unwrap();
+
+        let deferred = uc.process_expired(Utc::now()).await.expect("sweep runs");
+        assert_eq!(deferred.blobs_deferred, 1);
+        assert_eq!(deferred.blobs_deleted, 0);
+        assert_eq!(deferred.purged_events, 0);
+        assert_eq!(
+            deferred.errors, 0,
+            "a deferral is the mechanism working, not an error"
+        );
+        assert!(
+            storage.exists(&put.hash).await.unwrap(),
+            "nothing may be deleted while a reference write is in flight"
+        );
+
+        // The skip is observable in the durable state too: the worklist
+        // row is still there, uncompleted, which is what makes the next
+        // run pick it up.
+        let outstanding: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifact_purge_worklist \
+             WHERE artifact_id = $1 AND completed_at IS NULL",
+        )
+        .bind(art)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(outstanding, 1);
+
+        // The reference write finishes (rolled back here — the point is
+        // that the lock frees), and the next run reclaims.
+        in_flight.rollback().await.unwrap();
+        let second = uc.process_expired(Utc::now()).await.expect("sweep runs");
+        assert_eq!(second.blobs_deferred, 0);
+        assert_eq!(second.blobs_deleted, 1);
+        assert_eq!(second.purged_events, 1);
+        assert!(
+            !storage.exists(&put.hash).await.unwrap(),
+            "with the lock free and the count still zero, the bytes go"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// **Both sides take the same lock — shown, not asserted.** The
+    /// sweep holds a granted reclamation lease; the real ingest write
+    /// path (`ContentReferenceIndex::insert`) is started against the
+    /// same hash and does not complete while the lease is held. Release
+    /// the lease and it completes.
+    ///
+    /// A lock only the deleting side takes would leave this insert
+    /// finishing immediately, which is exactly what the `timeout`
+    /// asserts it does not do. The second half — a *different* hash
+    /// inserting straight through the same held lease — is what keeps
+    /// the first half from being satisfied by any global lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(hort_pg_db)]
+    async fn the_ingest_write_waits_on_the_very_lock_the_sweep_holds() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = adapter(&pool).await;
+        let (repo, art) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+        let target: ContentHash = HASH_B.parse().unwrap();
+        let other: ContentHash = HASH_C.parse().unwrap();
+
+        let newcomer = seed_artifact(&pool, repo, "waiting-ingest", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(newcomer)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let BlobReclaim::Granted(guard) = adapter
+            .begin_blob_reclaim(art, &target)
+            .await
+            .expect("lease")
+        else {
+            panic!("an unreferenced hash on a free lock must grant");
+        };
+
+        let landed = Arc::new(AtomicBool::new(false));
+        let waiting = {
+            let pool = pool.clone();
+            let target = target.clone();
+            let landed = Arc::clone(&landed);
+            tokio::spawn(async move {
+                ingest_dedup_reference(&pool, repo, newcomer, &target).await;
+                landed.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // A reference write on a *different* hash is unaffected: the
+        // lock is per-blob, not a global reclamation mutex. This also
+        // gives the spawned write above a real, timed opportunity to
+        // finish — an assertion that only ever observed an unscheduled
+        // task would pass with no lock at all.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            ingest_dedup_reference(&pool, repo, newcomer, &other),
+        )
+        .await
+        .expect("an unrelated hash must not queue behind this lease");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            !landed.load(Ordering::SeqCst),
+            "the ingest write must be blocked on the lease's lock"
+        );
+
+        guard.release().await.expect("release");
+        tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("the ingest write proceeds once the lease ends")
+            .expect("the spawned write did not panic");
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM content_references WHERE target_content_hash = $1",
+        )
+        .bind(HASH_B)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "the newcomer's reference landed after the lease");
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The refcount-reconcile repair is a reference write too — it
+    /// restores a claim on bytes that already exist — so it takes the
+    /// same lock. Same proof shape as the ingest path: it does not
+    /// complete while a reclamation lease is held on its target.
+    ///
+    /// Reconcile and purge are ordered by a convergence gate, not kept
+    /// apart by it: the gate says a sweep has converged *once*, not
+    /// that one is not running now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial(hort_pg_db)]
+    async fn the_reconcile_repair_waits_on_the_same_lock() {
+        use hort_domain::ports::refcount_reconcile::RefcountRepair;
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = adapter(&pool).await;
+        let (repo, art) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+        let target: ContentHash = HASH_B.parse().unwrap();
+
+        let drifted = seed_artifact(&pool, repo, "drifted", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(drifted)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let BlobReclaim::Granted(guard) = adapter
+            .begin_blob_reclaim(art, &target)
+            .await
+            .expect("lease")
+        else {
+            panic!("an unreferenced hash on a free lock must grant");
+        };
+
+        let landed = Arc::new(AtomicBool::new(false));
+        let repairing = {
+            let pool = pool.clone();
+            let target = target.clone();
+            let landed = Arc::clone(&landed);
+            tokio::spawn(async move {
+                crate::refcount_reconcile::PgRefcountReconcile::new(pool)
+                    .apply_repair(
+                        repo,
+                        &RefcountRepair::CreatePrimaryContent {
+                            source_artifact_id: drifted,
+                            expected_hash: target,
+                        },
+                    )
+                    .await
+                    .expect("repair applied");
+                landed.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // Give the spawned repair a real chance to run to completion if
+        // it were not blocked: an assertion that only ever observed an
+        // unscheduled task would pass with no lock at all.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !landed.load(Ordering::SeqCst),
+            "the reconcile repair must be blocked on the lease's lock"
+        );
+
+        guard.release().await.expect("release");
+        tokio::time::timeout(std::time::Duration::from_secs(10), repairing)
+            .await
+            .expect("the repair proceeds once the lease ends")
+            .expect("the spawned repair did not panic");
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The lease's three answers, straight from the adapter: granted on
+    /// a free lock over an unreferenced hash, `Referenced` (with the
+    /// worklist row corrected in place) once a reference exists, and
+    /// `Contended` while someone else holds the lock.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn the_lease_reports_granted_referenced_and_contended() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = adapter(&pool).await;
+        let (repo, art) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+        let target: ContentHash = HASH_B.parse().unwrap();
+
+        // Granted, and released cleanly.
+        let BlobReclaim::Granted(guard) = adapter
+            .begin_blob_reclaim(art, &target)
+            .await
+            .expect("lease")
+        else {
+            panic!("expected Granted");
+        };
+
+        // Contended: the lease above still holds the lock.
+        assert!(
+            matches!(
+                adapter
+                    .begin_blob_reclaim(art, &target)
+                    .await
+                    .expect("lease"),
+                BlobReclaim::Contended
+            ),
+            "a second lease on a held lock is contention, not a wait"
+        );
+        guard.release().await.expect("release");
+
+        // Referenced: a reference arrives, and the lease reports the
+        // live count *and* corrects the durable worklist row, so the
+        // terminal event and a later retry both read the truth.
+        let newcomer = seed_artifact(&pool, repo, "later-claim", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(newcomer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        ingest_dedup_reference(&pool, repo, newcomer, &target).await;
+
+        assert!(matches!(
+            adapter
+                .begin_blob_reclaim(art, &target)
+                .await
+                .expect("lease"),
+            BlobReclaim::Referenced { refs_now: 1 }
+        ));
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT refs_remaining FROM artifact_purge_worklist \
+             WHERE artifact_id = $1 AND content_hash = $2",
+        )
+        .bind(art)
+        .bind(HASH_B)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted, 1,
+            "the worklist's stale zero is corrected under the lock"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// A *referenced* hash with no worklist row to correct is a bug in
+    /// the caller, not a silent no-op: the refresh has nowhere to land,
+    /// and a sweep that carried on would emit a terminal event stating
+    /// a count no durable row holds.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_referenced_lease_with_no_worklist_row_is_loud() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = adapter(&pool).await;
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "no-worklist", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, art, "primary_content", HASH_B).await;
+        let target: ContentHash = HASH_B.parse().unwrap();
+
+        let err = adapter
+            .begin_blob_reclaim(art, &target)
+            .await
+            .expect_err("a referenced hash with no worklist row must not pass silently");
+        assert!(matches!(err, DomainError::Invariant(_)));
+        assert!(err.to_string().contains("no worklist row"));
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The pending-purge query is keyset-paged: a page is bounded by
+    /// `limit` and starts strictly after `after_artifact_id`, which is
+    /// what lets the sweep cap a first run that would otherwise have to
+    /// load the whole backlog to find out how big it was.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn the_pending_query_pages_by_keyset_and_respects_the_limit() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = adapter(&pool).await;
+
+        let mut seeded = Vec::new();
+        for i in 0..3 {
+            let art =
+                seed_artifact(&pool, repo, &format!("paged-{i}"), HASH_A, Some("released")).await;
+            append_event(&pool, art, "ArtifactExpired", 0).await;
+            seeded.push(art);
+        }
+        seeded.sort();
+
+        let first = adapter.list_pending_purge(2, None).await.unwrap();
+        let first_ids: Vec<Uuid> = first.iter().map(|p| p.artifact_id).collect();
+        assert_eq!(first_ids, seeded[..2].to_vec(), "ordered, and capped at 2");
+
+        let second = adapter
+            .list_pending_purge(2, Some(seeded[1]))
+            .await
+            .unwrap();
+        let second_ids: Vec<Uuid> = second.iter().map(|p| p.artifact_id).collect();
+        assert_eq!(
+            second_ids,
+            seeded[2..].to_vec(),
+            "the cursor is exclusive, so no row is seen twice"
+        );
+
+        assert!(
+            adapter
+                .list_pending_purge(2, Some(seeded[2]))
+                .await
+                .unwrap()
+                .is_empty(),
+            "past the last row the page is empty, which ends the walk"
+        );
 
         cleanup(&pool, repo).await;
     }

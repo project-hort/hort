@@ -372,6 +372,16 @@ impl PgRefcountReconcile {
             .await
             .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", &ctx()))?;
 
+        // The blob-reclamation lock (`crate::blob_lock`). A repair is a
+        // reference write like any other — it restores a claim on bytes
+        // that already exist — so it takes the same lock the ingest
+        // path takes and the storage-GC walk re-counts under. Taken
+        // first, before the delete below opens the window where the old
+        // row is gone and the new one is not yet there: a sweep that
+        // counted in that window would see one fewer reference than
+        // either state has.
+        crate::blob_lock::lock_blob_in_tx(&mut tx, target).await?;
+
         // Delete any existing row under this single-target `(repo, source,
         // kind)` — whatever its current target — so the re-insert replaces
         // a mis-targeted row rather than colliding with it on the widened

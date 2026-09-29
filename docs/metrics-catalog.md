@@ -4138,11 +4138,11 @@ purge to a policy again would only duplicate that signal and is not in
 the schema (`hort_retention_purged_total{result}` — `result` only).
 Per-artifact attribution (`artifact_id` / `content_hash`) is the
 architect anti-pattern hard-block and stays in `tracing` fields, never
-on this series. Cardinality ceiling is a fixed `result_arity (3)`.
+on this series. Cardinality ceiling is a fixed `result_arity (4)`.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_retention_purged_total` | counter | `result` | — | `result ∈ {success, blob_kept, storage_error}` |
+| `hort_retention_purged_total` | counter | `result` | — | `result ∈ {success, blob_kept, storage_error, deferred}` |
 
 `result` value semantics (one emission per content-hash purge
 decision; an empty pending set emits nothing):
@@ -4160,6 +4160,19 @@ decision; an empty pending set emits nothing):
   `ArtifactPurged` is emitted, the `content_references` rows are not
   removed (the deletion is rolled back with the failed transaction),
   and the next sweep retries this artifact (two-stage idempotency).
+- `deferred` — the hash-scoped blob-reclamation lock was held by
+  another session, so the refcount-0 decision could not be re-verified
+  under it and **no delete was attempted**. Something is writing a
+  `content_references` row for exactly these bytes, or a second sweep
+  is already on them. No `ArtifactPurged` is emitted, the worklist row
+  stands, and the next sweep asks again.
+
+  This is the value that distinguishes *nothing to reclaim* from
+  *reclamation is being skipped*: a deployment with no expired content
+  emits nothing at all, while one whose sweeps keep losing the race
+  emits `deferred` run after run with `success` flat. Alert on a
+  sustained non-zero `deferred` rate, not on a single spike — one
+  deferral is the mechanism working.
 
 Source: `hort_app::metrics::{emit_retention_purged,
 RetentionPurgedResult}`.

@@ -259,6 +259,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The storage-GC purge locked the artifact, but the blob is what it
+  destroys** (#320). `purge_gc` took `SELECT checksum_sha256 FROM artifacts
+  WHERE id = $1 FOR UPDATE` — a lock on one artifact row — and then deleted a
+  **CAS blob**, which by construction may belong to any number of artifacts;
+  deduplication is the whole point. So the refcount-zero observation and the
+  `StoragePort::delete` that acted on it were two unrelated moments, and the
+  worklist's `refs_remaining` is a *snapshot* the delete can act on sweeps
+  later. A concurrent ingest that deduplicated onto the same hash
+  (`exists(hash)` true, nothing written) and recorded its reference in between
+  left its new artifact pointing at bytes that no longer existed.
+
+  Closed with a **hash-scoped Postgres advisory lock**
+  (`hort-adapters-postgres/src/blob_lock.rs`) that both sides take. The sweep
+  takes it with `try` and re-reads the cross-`kind` count under it immediately
+  before deleting, holding it across the storage call (the guard *is* the open
+  transaction, which is how the lock spans the commit boundary the reference
+  bookkeeping ended at). Every production `content_references` write —
+  `PgContentReferenceRepo::insert`, which every ingest / OCI / provenance /
+  wheel-metadata / curation path funnels through, and
+  `PgRefcountReconcile`'s repair upsert — takes the same lock in the same
+  transaction as its write, so a re-reference is either committed before the
+  re-count or blocked until the lease ends.
+
+  **Skip when in doubt**, reusing the retry the sweep already had: contention
+  defers (nothing deleted, no terminal event, the durable worklist row stands,
+  the next run asks again) and surfaces as `blobs_deferred` in the
+  `retention-purge` summary plus `hort_retention_purged_total{result="deferred"}`
+  — which is what distinguishes *nothing to reclaim* from *reclamation being
+  skipped every run*. A count that is no longer zero is a **keep**, not a
+  deferral: the blob stays, the worklist row is corrected under the lock, the
+  purge finishes, and the `ArtifactPurged` states the count that actually held
+  instead of the stale zero.
+
+  Also capped the sweep's first run, which was unbounded because the pending
+  set's size is only known once it is fully loaded: `list_pending_purge` is now
+  keyset-paged and the walk stops at `MAX_BATCHES_PER_TICK * BATCH_SIZE`
+  (64 × 1000), retention-evaluate's shape and numbers. No cursor is persisted —
+  unlike retention-evaluate's candidates, this sweep *consumes* its work set.
+
+  Enforced by `crates/hort-app/tests/blob_reclaim_lock.rs` (DB-free source
+  scan: every production `INSERT INTO content_references` is preceded by the
+  lock helper in its own function, the advisory-lock SQL is spelled in exactly
+  one file, and the sweep never takes the waiting form), alongside DB-backed
+  proofs that the ingest write and the reconcile repair each block on the very
+  lease the sweep holds.
+
 - **The non-k8s deploy never reclaimed terminal `scan` job rows** (#308).
   `scan-row-retention-sweep` was the only default-on chart CronJob with no
   systemd counterpart in `hort_timers`, so on an Ansible-deployed instance

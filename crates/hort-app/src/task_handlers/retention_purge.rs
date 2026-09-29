@@ -56,6 +56,7 @@ impl TaskHandler for RetentionPurgeHandler {
                         artifacts_visited = s.artifacts_visited,
                         blobs_deleted = s.blobs_deleted,
                         blobs_kept = s.blobs_kept,
+                        blobs_deferred = s.blobs_deferred,
                         purged_events = s.purged_events,
                         skipped_protected = s.skipped_protected,
                         skipped_tag_exempt = s.skipped_tag_exempt,
@@ -68,6 +69,7 @@ impl TaskHandler for RetentionPurgeHandler {
                             "artifacts_visited": s.artifacts_visited,
                             "blobs_deleted": s.blobs_deleted,
                             "blobs_kept": s.blobs_kept,
+                            "blobs_deferred": s.blobs_deferred,
                             "purged_events": s.purged_events,
                             "skipped_protected": s.skipped_protected,
                             "skipped_tag_exempt": s.skipped_tag_exempt,
@@ -108,7 +110,7 @@ mod tests {
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
     use hort_domain::ports::event_store::AppendEvents;
-    use hort_domain::ports::purge_gc::{PendingPurge, PurgeGcPort, PurgedRef};
+    use hort_domain::ports::purge_gc::{BlobReclaim, PendingPurge, PurgeGcPort, PurgedRef};
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use uuid::Uuid;
 
@@ -126,12 +128,30 @@ mod tests {
         pending: Mutex<Vec<PendingPurge>>,
     }
     impl PurgeGcPort for MockGc {
-        fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
-            let v = self.pending.lock().unwrap().clone();
+        fn list_pending_purge(
+            &self,
+            _limit: u32,
+            after_artifact_id: Option<Uuid>,
+        ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+            // One page only: the keyset cursor makes the second call
+            // return nothing, which is how the use case's page loop
+            // terminates.
+            let v = if after_artifact_id.is_some() {
+                Vec::new()
+            } else {
+                self.pending.lock().unwrap().clone()
+            };
             Box::pin(async move { Ok(v) })
         }
         fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+        fn begin_blob_reclaim(
+            &self,
+            _artifact_id: Uuid,
+            _content_hash: &hort_domain::types::ContentHash,
+        ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+            Box::pin(async { Ok(BlobReclaim::Contended) })
         }
         fn mark_purge_ref_complete(
             &self,
@@ -269,11 +289,22 @@ mod tests {
     async fn list_pending_error_returns_failed_retry() {
         struct FailGc;
         impl PurgeGcPort for FailGc {
-            fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+            fn list_pending_purge(
+                &self,
+                _limit: u32,
+                _after_artifact_id: Option<Uuid>,
+            ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
                 Box::pin(async { Err(DomainError::Invariant("db down".into())) })
             }
             fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
                 Box::pin(async { Ok(Vec::new()) })
+            }
+            fn begin_blob_reclaim(
+                &self,
+                _artifact_id: Uuid,
+                _content_hash: &hort_domain::types::ContentHash,
+            ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+                Box::pin(async { Ok(BlobReclaim::Contended) })
             }
             fn mark_purge_ref_complete(
                 &self,
