@@ -1,7 +1,7 @@
 //! What the broadcast channel and a `global_position` cursor can and
 //! cannot tell a notification subscriber.
 //!
-//! Both tests state a property of the *store*, which is what the
+//! Each test states a property of the *store*, which is what the
 //! dispatcher's delivery loop reads
 //! (`hort-app::dispatcher::subscription_task`). Each needs a live
 //! PostgreSQL; without `DATABASE_URL` they early-return, matching the
@@ -26,6 +26,15 @@
 //!    `global_position` — the dispatcher's `last_delivered_position` and
 //!    the `GET /api/v1/events` `next_after` alike — and the property
 //!    bounds what any of them can promise.
+//! 3. `an_xmin_horizon_does_not_close_the_late_commit_race` — the
+//!    obvious reader-side answer to (2) is a visibility horizon: return
+//!    only rows whose inserting transaction is already below
+//!    `pg_snapshot_xmin(pg_current_snapshot())`, so a cursor cannot pass
+//!    a row that was still in flight. It does not hold, because the
+//!    `nextval` order and the xid-assignment order are independent, and
+//!    several transactional write paths take their xid *before* they
+//!    draw a position. Pinned so the next unit over this question does
+//!    not adopt the horizon on sight.
 
 use std::env;
 use std::sync::Arc;
@@ -125,6 +134,47 @@ fn auth_batch() -> AppendEvents {
     }
 }
 
+/// One `auth`-category event INSERT with exactly the columns
+/// `append_with_conn` binds, `global_position` left to its `nextval`
+/// DEFAULT. Raw SQL because the tests below hold two appends open across
+/// each other, which the adapter's own `append` (one transaction per
+/// call) cannot do and which `append_in_tx` is crate-internal for.
+const RAW_AUTH_EVENT_INSERT: &str = r#"
+    INSERT INTO events (
+        event_id, stream_id, stream_category, stream_position,
+        event_type, event_version, event_data, correlation_id,
+        actor_type, prev_event_hash, event_hash
+    )
+    VALUES ($1, $2, 'auth', $3, 'AuthenticationAttempted', 1, $4::jsonb,
+            $5, 'system', $6, $6)
+    RETURNING global_position"#;
+
+/// Append one raw event on an open transaction and return its
+/// `global_position`. The chain hashes are a 32-byte placeholder: these
+/// tests are about positions and visibility, not the chain, and the
+/// `octet_length = 32` CHECK is all the column enforces here.
+async fn raw_append(tx: &mut sqlx::PgConnection, stream_id: &str, stream_position: i64) -> i64 {
+    let payload = serde_json::json!({
+        "type": "AuthenticationAttempted",
+        "data": {
+            "client_ip": "127.0.0.1",
+            "result": "local_invalid_credentials",
+            "external_id_if_decoded": null,
+            "at": Utc::now(),
+        }
+    });
+    sqlx::query_scalar(RAW_AUTH_EVENT_INSERT)
+        .bind(Uuid::new_v4())
+        .bind(stream_id)
+        .bind(stream_position)
+        .bind(&payload)
+        .bind(Uuid::new_v4())
+        .bind(vec![0u8; 32])
+        .fetch_one(tx)
+        .await
+        .expect("raw event insert")
+}
+
 /// A lifecycle-port append reaches the store and not the channel; a
 /// port append through the publisher reaches both. The asymmetry is
 /// structural — the adapter has no sender to call — so a subscriber
@@ -218,53 +268,13 @@ async fn a_later_committing_transaction_can_hold_a_lower_global_position() {
     // Raw INSERTs rather than the adapter's `append`: `append` opens and
     // commits its own transaction, so two appends cannot be held open
     // across each other through it, and `append_in_tx` — which can — is
-    // crate-internal. The columns below are exactly what
+    // crate-internal. `RAW_AUTH_EVENT_INSERT` carries the columns
     // `append_with_conn` binds.
-    let chain_placeholder = vec![0u8; 32];
-    let insert = r#"
-        INSERT INTO events (
-            event_id, stream_id, stream_category, stream_position,
-            event_type, event_version, event_data, correlation_id,
-            actor_type, prev_event_hash, event_hash
-        )
-        VALUES ($1, $2, 'auth', $3, 'AuthenticationAttempted', 1, $4::jsonb,
-                $5, 'system', $6, $7)
-        RETURNING global_position"#;
-    let payload = serde_json::json!({
-        "type": "AuthenticationAttempted",
-        "data": {
-            "client_ip": "127.0.0.1",
-            "result": "local_invalid_credentials",
-            "external_id_if_decoded": null,
-            "at": Utc::now(),
-        }
-    });
-
     let mut slow = pool.begin().await.expect("begin slow");
-    let slow_position: i64 = sqlx::query_scalar(insert)
-        .bind(Uuid::new_v4())
-        .bind(&stream_id)
-        .bind(0_i64)
-        .bind(&payload)
-        .bind(Uuid::new_v4())
-        .bind(&chain_placeholder)
-        .bind(&chain_placeholder)
-        .fetch_one(&mut *slow)
-        .await
-        .expect("insert in the slow transaction");
+    let slow_position = raw_append(&mut slow, &stream_id, 0).await;
 
     let mut quick = pool.begin().await.expect("begin quick");
-    let quick_position: i64 = sqlx::query_scalar(insert)
-        .bind(Uuid::new_v4())
-        .bind(&stream_id)
-        .bind(1_i64)
-        .bind(&payload)
-        .bind(Uuid::new_v4())
-        .bind(&chain_placeholder)
-        .bind(&chain_placeholder)
-        .fetch_one(&mut *quick)
-        .await
-        .expect("insert in the quick transaction");
+    let quick_position = raw_append(&mut quick, &stream_id, 1).await;
     quick.commit().await.expect("commit quick");
 
     assert!(
@@ -300,5 +310,157 @@ async fn a_later_committing_transaction_can_hold_a_lower_global_position() {
         "a reader that advanced to {quick_position} never sees \
          {slow_position} again: a bare high-water-mark cursor cannot \
          promise completeness over a sequence taken at INSERT"
+    );
+}
+
+/// An `xmin` visibility horizon does not close the race the test above
+/// pins, and this states why in the shape the codebase actually writes in.
+///
+/// The horizon is the obvious reader-side fix: return only rows whose
+/// inserting transaction is below `pg_snapshot_xmin(pg_current_snapshot())`
+/// — i.e. rows whose transaction has already finished — so a cursor can
+/// never advance past a position that was still in flight. That reasoning
+/// needs the two orders to agree: it bounds *positions* by reasoning about
+/// *transaction ids*, and it is sound only if a lower position implies a
+/// lower-or-equal xid.
+///
+/// The two orders are independent. A position is drawn by `nextval` when
+/// the events INSERT executes; an xid is assigned by the transaction's
+/// first write. So a transaction that writes its projection row *before*
+/// it appends holds a low xid and draws a high position, and it is exactly
+/// that shape the adapter ships in: `ref_lifecycle::move_ref` (a
+/// `SELECT … FOR UPDATE` plus an `UPDATE mutable_refs`, then the append),
+/// `ref_lifecycle::retire_ref`, `artifact_group_lifecycle::{commit_member_added,
+/// commit_member_removed}` and `purge_gc::complete_artifact_purge` all
+/// write first and append last, while `artifact_lifecycle::commit_transition`
+/// appends first. Race the two and the committed row carries the *lower*
+/// xid and the *higher* position: it is below the horizon while the lower
+/// position is above it, so the horizon reader advances over the gap
+/// exactly as the bare high-water mark does.
+///
+/// This is not a specification of PostgreSQL's internals. What it pins is
+/// that the horizon cannot be assumed to cover the race — if a future
+/// server made xid assignment precede default evaluation and turned this
+/// red, the conclusion to re-derive is what the horizon covers *then*, not
+/// that it now covers everything: the converse window (a position drawn
+/// before the inserting transaction has an xid at all) closes only if the
+/// two steps become one atomic step, which nothing promises.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn an_xmin_horizon_does_not_close_the_late_commit_race() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool).await;
+    let event_store = PgEventStore::new(pool.clone()).await.expect("event store");
+    let stream_id = StreamId::auth_attempts(Utc::now().date_naive()).to_string();
+
+    // The append-last writer: its projection row goes in first, which is
+    // what assigns its xid — the order `ref_lifecycle::move_ref` and
+    // `artifact_group_lifecycle::commit_member_added` both write in.
+    let mut append_last = pool.begin().await.expect("begin append-last");
+    sqlx::query(
+        r#"INSERT INTO mutable_refs (
+               id, repository_id, namespace, ref_name, target_kind, target_version
+           ) VALUES ($1, $2, 'library', $3, 'version', '1.0.0')"#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(repo_id)
+    .bind(format!("ref-{}", Uuid::new_v4().simple()))
+    .execute(&mut *append_last)
+    .await
+    .expect("projection write");
+    let xid_append_last: Option<i64> =
+        sqlx::query_scalar("SELECT pg_current_xact_id_if_assigned()::text::bigint")
+            .fetch_one(&mut *append_last)
+            .await
+            .expect("xid probe");
+    let xid_append_last = xid_append_last.expect(
+        "the projection write assigns the transaction id, before this transaction \
+         has drawn any global_position — that is the whole premise",
+    );
+
+    // The append-first writer: its xid comes from the events INSERT
+    // itself, so it is assigned *after* the one above and its position is
+    // drawn *before*.
+    let mut append_first = pool.begin().await.expect("begin append-first");
+    let position_append_first = raw_append(&mut append_first, &stream_id, 0).await;
+    let xid_append_first: i64 =
+        sqlx::query_scalar("SELECT pg_current_xact_id_if_assigned()::text::bigint")
+            .fetch_one(&mut *append_first)
+            .await
+            .expect("xid probe");
+
+    let position_append_last = raw_append(&mut append_last, &stream_id, 1).await;
+    append_last.commit().await.expect("commit append-last");
+
+    assert!(
+        position_append_first < position_append_last,
+        "the still-open transaction drew the lower position \
+         ({position_append_first} vs {position_append_last})"
+    );
+    assert!(
+        xid_append_first > xid_append_last,
+        "and the committed transaction holds the LOWER xid ({xid_append_last}) \
+         than the still-open one ({xid_append_first}): the position order and the \
+         xid order disagree, which is what the horizon cannot survive"
+    );
+
+    // The horizon read: the same category read plus "only settled rows".
+    // The `::text::bigint` casts compare a 32-bit row `xmin` with a 64-bit
+    // snapshot xid and so ignore xid epoch — fine on a freshly created
+    // database, and one more cost of this shape rather than a detail.
+    let horizon_read = r#"
+        SELECT global_position
+          FROM events
+         WHERE stream_category = 'auth'
+           AND global_position > $1
+           AND xmin::text::bigint
+               < pg_snapshot_xmin(pg_current_snapshot())::text::bigint
+         ORDER BY global_position
+         LIMIT 100"#;
+    let settled: Vec<i64> = sqlx::query_scalar(horizon_read)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .expect("horizon read while the append-first transaction is open");
+    assert_eq!(
+        settled,
+        vec![position_append_last],
+        "the horizon returns the committed row — it is below the horizon because \
+         its xid is lower — and a reader that returns it advances its cursor to \
+         {position_append_last}, over the still-open {position_append_first}"
+    );
+
+    append_first.commit().await.expect("commit append-first");
+
+    let after_horizon: Vec<i64> = sqlx::query_scalar(horizon_read)
+        .bind(position_append_last)
+        .fetch_all(&pool)
+        .await
+        .expect("horizon read from the position the reader had reached");
+    assert!(
+        !after_horizon.contains(&position_append_first),
+        "a horizon reader that advanced to {position_append_last} never sees \
+         {position_append_first} either: an xmin horizon bounds positions by \
+         reasoning about transaction ids, and the two orders are independent"
+    );
+
+    // Same for the shipped read, which is what the dispatcher and
+    // `GET /api/v1/events` actually call — stated here so the two are
+    // compared on one page rather than across two tests.
+    let after_plain = event_store
+        .read_category(
+            StreamCategory::AuthAttempts,
+            SubscribeFrom::AfterGlobal(position_append_last as u64),
+            100,
+        )
+        .await
+        .expect("read_category from the position the reader had reached");
+    assert!(
+        !after_plain
+            .iter()
+            .any(|e| e.global_position == position_append_first as u64),
+        "and the shipped bare-mark read does not see it either"
     );
 }
