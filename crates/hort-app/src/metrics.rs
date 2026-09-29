@@ -3547,11 +3547,35 @@ pub fn emit_notify_delivery(target_kind: &'static str, result: &'static str, ela
 }
 
 /// Increment `hort_notify_broadcast_lagged_total` (no labels) — emitted
-/// when a per-subscription task receives
-/// [`tokio::sync::broadcast::error::RecvError::Lagged`].
+/// when a per-subscription task observes a lag on the hint channel,
+/// whether on
+/// [`tokio::sync::broadcast::error::RecvError::Lagged`] or mid-drain.
 /// Operator signal that `HORT_NOTIFY_CHANNEL_CAPACITY` should be raised.
+/// A lag no longer costs an event — the store read the task runs next
+/// covers what the lost hints would have announced — so this counts a
+/// latency and sizing signal, not a loss.
 pub fn emit_broadcast_lagged() {
     metrics::counter!("hort_notify_broadcast_lagged_total").increment(1);
+}
+
+/// Increment `hort_notify_store_read_errors_total` (no labels) — emitted
+/// when a per-subscription task's merged `read_categories` pass fails.
+///
+/// The alertable half of a fail-closed read. The pass leaves its cursor
+/// where it is, so nothing is skipped and a *transient* failure costs only
+/// latency; but a *deterministic* one — one row this build cannot decode,
+/// which is what a mixed-version rollout or a rollback produces — stalls
+/// every subscription whose filter covers it, indefinitely and with no
+/// other signal. `last_failure` cannot carry it (that column's closed
+/// `reason` enum describes transport outcomes, not store reads) and
+/// `hort_event_store_reads_total` counts attempts without an outcome, so
+/// this counter is what an operator alerts on. A non-zero rate that does
+/// not decay is a stalled subscription, not a blip.
+///
+/// No `subscription_id` label: cardinality, same rule as
+/// `hort_notify_delivery_total`.
+pub fn emit_subscription_read_error() {
+    metrics::counter!("hort_notify_store_read_errors_total").increment(1);
 }
 
 /// Set `hort_subscription_total{state}` gauge. Called by the dispatcher's

@@ -539,13 +539,16 @@ impl SubscriptionRepository for MockSubscriptionRepository {
     fn update_last_delivered(
         &self,
         id: SubscriptionId,
-        position: u64,
+        position: Option<u64>,
         last_failure: Option<&SubscriptionFailure>,
     ) -> BoxFuture<'_, DomainResult<()>> {
         let lf = last_failure.cloned();
         let mut items = self.items.lock().unwrap();
         if let Some(s) = items.get_mut(&id) {
-            s.last_delivered_position = Some(position);
+            // `None` = no advance to record; mirrors the adapter's COALESCE.
+            if let Some(position) = position {
+                s.last_delivered_position = Some(position);
+            }
             s.last_failure = lf;
         }
         Box::pin(async { Ok(()) })

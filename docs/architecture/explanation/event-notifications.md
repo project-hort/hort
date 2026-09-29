@@ -10,12 +10,12 @@ require polling the database and the registry never holds integration
 credentials for each downstream system.
 
 The design rests on one load-bearing split: **the event store is the
-source of truth; the notification is a hint.** Push delivery is
-best-effort and may drop events. Consumers that need completeness
-reconcile through the pull surface, `GET /api/v1/events`, which exposes
-the same event log over HTTP. Anything inside the server that needs to
-*react* to an event reads the event store directly — the notifier is a
-leaf consumer, never an input to further state.
+source of truth; every delivery path is a read of it.** Push delivery is
+at-least-once with duplicates, never exactly-once, and the pull surface
+`GET /api/v1/events` exposes the same log over HTTP for consumers that
+would rather drive the cursor themselves. Anything inside the server
+that needs to *react* to an event reads the event store directly — the
+notifier is a leaf consumer, never an input to further state.
 
 ## How events reach the dispatcher
 
@@ -39,16 +39,52 @@ subscription. It reconciles the task set every 30 seconds and on
 active subscriptions and cancelling tasks whose rows vanished or were
 disabled.
 
-Each per-subscription task
-(`crates/hort-app/src/dispatcher/subscription_task.rs`) starts with a
-**catch-up** pass — paging `EventStore::read_category` forward from the
-subscription's `last_delivered_position` in 1000-event pages — and then
-enters the live loop on the broadcast receiver. When the receiver
-reports `Lagged` (the fixed-capacity channel overwrote events the task
-had not consumed), the task drops back into catch-up against the event
-store and re-enters the live loop once caught up. The broadcast channel
-is therefore only a low-latency signal path; the event store remains the
-backing read model even for live delivery.
+**Delivery is driven by the event store, not by that channel**
+([ADR 0061](../../adr/0061-store-driven-notification-delivery.md)). Each
+per-subscription task
+(`crates/hort-app/src/dispatcher/subscription_task.rs`) pages
+`EventStore::read_categories` forward from its cursor in 1000-event pages
+— at startup, on every 5-second `STORE_POLL_INTERVAL` tick, and whenever a
+hint for one of its own categories arrives on the broadcast receiver — and
+dispatches what it reads. The broadcast is a **wake-up**: it says
+something landed, sooner than the next tick would. Its *category* is used
+as the wake predicate, the same thing `GET /api/v1/events` does with it,
+so an append to a category nobody here subscribes to costs no read. Its
+*position* is discarded: delivering the payload directly would advance the
+subscription's cursor to that `global_position` and resume above it,
+skipping every transactional append below — which is precisely the set the
+channel cannot carry.
+
+`read_categories` returns **one `global_position`-ordered page across the
+whole filter**, not one page per category. That is what makes the single
+persisted `last_delivered_position` true rather than approximate: a
+position at or below the mark has been read in every subscribed category,
+so a task respawning from the mark cannot step over anything. Reading the
+categories one at a time and checkpointing one scalar cannot say that — an
+advance driven by the first category carries the mark over the second
+category's unread events below it, and the respawn seeds every category
+from the moved mark.
+
+The channel cannot be the delivery path, for two reasons that are
+properties of where it sits rather than bugs in it:
+
+- **Transactional appends are below the sender.** An event that must land
+  atomically with a projection write does not go through
+  `EventStore::append` at all — it goes through
+  `PgEventStore::append_in_tx` via a lifecycle port
+  (`ArtifactLifecyclePort`, `RefLifecyclePort`,
+  `ArtifactGroupLifecyclePort`, the artifact delete, the purge sweep),
+  which sits below `EventStorePublisher` and therefore below the `send`.
+  That covers the whole subscribable artifact lifecycle. Sending from
+  inside the transaction would announce a write that may still roll back;
+  sending from the adapter after commit would put a notification concern
+  in `hort-adapters-postgres`.
+- **The channel is per-process.** With `replicaCount > 1` each replica's
+  sender carries only that replica's own appends, and there is no leader
+  election over the dispatcher.
+
+Reading the store is subject to neither: it sees every append, from every
+process, from every write path, once it commits.
 
 ## The notifier port and its adapters
 
@@ -205,19 +241,73 @@ and both surfaced through the `hort_unsafe_config_active` gauge at boot
 `HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS` skips the create-time guard
 entirely.
 
-## Delivery semantics: best-effort, loudly
+## Delivery semantics: at-least-once, duplicates possible
 
-Delivery is **not at-least-once**. Every layer refuses to upgrade the
-hint into a guarantee: the publisher drops on a full channel, the
-adapters make exactly one attempt per event with no retry, and the
-catch-up path exists to bound the drop volume after a restart or lag —
-not to close it. What the system promises instead is that loss is
-*recoverable and observable*:
+**Every event visible to a category read when a subscription's cursor
+passes it is delivered at least once.** Duplicates are expected and are
+the receiver's to drop: each delivery carries a fresh
+`X-Hort-Delivery-Id` and a stable `global_position`, and the same event
+is re-sent on a restart (the persisted cursor is debounced up to 5
+minutes behind) and once per server replica. The
+asymmetry is deliberate — a duplicate costs a receiver one idempotent
+write, a gap is recoverable by nobody.
+
+What is *not* promised, and why:
+
+- **A single transport attempt per *pass*.** The notifier adapters try
+  once and never retry internally. The dispatcher does: a failed delivery
+  stops the pass at that event, the cursor is not advanced over it, and
+  the position persisted alongside the failure is the position *before*
+  it, so the next 5-second tick re-reads the same event and tries again.
+  Retries therefore continue until the delivery succeeds or the failure
+  budget below runs out — 100 failures in an hour, roughly eight minutes
+  of ticks — and the budget is what bounds the head-of-line block the
+  retry creates. A receiver that is down for thirty seconds loses nothing;
+  a receiver that is down for an hour is disabled visibly. The publisher
+  still drops on a full channel, and a receiver can still report `Lagged` —
+  both cost only latency, because the wake-up they lost is also
+  produced by the tick.
+- **Exactly-once.** Nothing anywhere de-duplicates across restarts or
+  replicas.
+- **Completeness against an event whose transaction commits late.**
+  `events.global_position` comes from a sequence evaluated at INSERT
+  while a row becomes visible at COMMIT, so a transaction holding a
+  lower position can commit after a reader has already passed it. A
+  cursor that is a bare high-water mark cannot see it again. This bounds
+  what *any* consumer of the log can promise, the `GET /api/v1/events`
+  `next_after` checkpoint included, and closing it is a change to the
+  position model rather than to the dispatcher
+  ([ADR 0061](../../adr/0061-store-driven-notification-delivery.md), and
+  `crates/hort-adapters-postgres/tests/event_delivery_visibility.rs` for
+  the reproduction).
+- **Completeness against retention.** The event store is the outbox, and
+  it is swept on age rather than on delivery. An artifact stream whose
+  *oldest* event is past the audit floor can be sealed and deleted within
+  one sweep interval of its newest events being written, so a subscription
+  that is paused or whose replicas are down across that interval never
+  sees them. Bounded — both retention sweeps are `enabled: false` by
+  default and the default floor is 1,080 days — but it is the one case
+  where an undelivered event disappears rather than waiting
+  ([ADR 0061](../../adr/0061-store-driven-notification-delivery.md)).
+- **One delivery per event cluster-wide.** N replicas run N tasks per
+  subscription and all N deliver.
+
+Loss and degradation stay observable:
 
 - The per-task progress marker (`last_delivered_position`) is persisted
-  with a 5-minute debounce on success and immediately on failure — it
-  is operator visibility, not a delivery cursor
-  (`subscription_task.rs`, `ProgressDebouncer`).
+  with a 5-minute debounce on success and immediately on failure
+  (`subscription_task.rs`, `ProgressDebouncer`). It is both the operator
+  signal and the cursor a restarting task resumes from — and because it
+  lags, it resumes *behind* rather than ahead. It is one scalar per
+  subscription, and the merged `read_categories` walk is what makes that
+  exact for a multi-category filter rather than a position in whichever
+  category was read last.
+- A failed *read* — as opposed to a failed delivery — is fail-closed: the
+  cursor does not move, so nothing is skipped, and the next tick retries
+  the same page. A deterministic read failure (one row a replica cannot
+  decode, which a mid-rollout version skew produces) therefore stalls the
+  subscription indefinitely rather than losing anything, and
+  `hort_notify_store_read_errors_total` is the alertable signal for it.
 - A sliding-window failure budget
   (`crates/hort-app/src/dispatcher/failure_budget.rs`) counts
   consecutive failures; 100 within an hour transitions the subscription
@@ -230,14 +320,15 @@ not to close it. What the system promises instead is that loss is
   (`crates/hort-http-events/src/handler.rs`), checkpointing on
   `global_position` and treating re-delivered positions as no-ops. The
   long-poll variant uses the broadcast channel purely as a wake-up
-  signal and re-reads the event store for the payload. Per-event
-  repository filtering applies to the response, but `next_after` is the
-  unfiltered last-seen position, so a caller never replays events that
-  were filtered out for them.
+  signal and re-reads the event store for the payload — so an event the
+  channel does not carry costs a caller up to one `wait_ms` of latency,
+  never the event. Per-event repository filtering applies to the
+  response, but `next_after` is the unfiltered last-seen position, so a
+  caller never replays events that were filtered out for them.
 
 This is the same posture throughout: durable truth lives in the event
-log, push is an optimisation on top of it, and every degradation path
-lands back on a pull from the log.
+log, every delivery path is a read of that log, and the push channel is
+a latency optimisation on top of it.
 
 ## Related pages
 
@@ -249,4 +340,5 @@ lands back on a pull from the log.
 - [Security model](security.md) — the wider authorization model the
   privileged-category gate and live-grant intersection plug into.
 - [ADR 0002 — Event-sourced artifact lifecycle](../../adr/0002-event-sourced-artifact-lifecycle.md)
+- [ADR 0061 — Store-driven notification delivery](../../adr/0061-store-driven-notification-delivery.md)
 - [ADR 0010 — TLS via builder, no insecure knobs](../../adr/0010-tls-builder-no-insecure-knobs.md)

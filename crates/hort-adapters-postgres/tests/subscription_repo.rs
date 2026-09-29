@@ -535,7 +535,7 @@ async fn update_last_delivered_persists_position_and_failure() {
         consecutive_failures: 7,
     };
     repository
-        .update_last_delivered(sub.id, 12_891, Some(&failure))
+        .update_last_delivered(sub.id, Some(12_891), Some(&failure))
         .await
         .expect("update_last_delivered succeeds");
 
@@ -547,12 +547,37 @@ async fn update_last_delivered_persists_position_and_failure() {
 
     // Clearing the failure (first-success path) leaves position intact.
     repository
-        .update_last_delivered(sub.id, 12_900, None)
+        .update_last_delivered(sub.id, Some(12_900), None)
         .await
         .expect("clear failure");
     let cleared = repository.find_by_id(sub.id).await.expect("find_by_id");
     assert_eq!(cleared.last_delivered_position, Some(12_900));
     assert!(cleared.last_failure.is_none());
+
+    // `None` position = "record the failure, leave the position alone".
+    // The dispatcher writes it when the event that failed is the first one
+    // this subscription has ever been handed, and the column MUST NOT be
+    // nulled — that would rewind the cursor to the start of the log and
+    // replay the whole history to a receiver that is already failing.
+    let later_failure = SubscriptionFailure {
+        at: Utc::now(),
+        reason: NotifyFailureReason::Dns,
+        consecutive_failures: 1,
+    };
+    repository
+        .update_last_delivered(sub.id, None, Some(&later_failure))
+        .await
+        .expect("failure without an advance succeeds");
+    let held = repository.find_by_id(sub.id).await.expect("find_by_id");
+    assert_eq!(
+        held.last_delivered_position,
+        Some(12_900),
+        "a None position must not overwrite the stored cursor"
+    );
+    assert_eq!(
+        held.last_failure.expect("failure recorded").reason,
+        NotifyFailureReason::Dns
+    );
 }
 
 // ---------------------------------------------------------------------------

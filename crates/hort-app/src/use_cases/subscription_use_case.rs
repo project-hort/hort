@@ -1163,11 +1163,15 @@ impl SubscriptionUseCase {
 
     /// Debounced position + failure update from the dispatcher. No event
     /// emission (high-frequency, not audit-relevant).
+    ///
+    /// `position = None` records the failure without moving the stored
+    /// cursor — see
+    /// [`SubscriptionRepository::update_last_delivered`](hort_domain::ports::subscription_repository::SubscriptionRepository::update_last_delivered).
     #[tracing::instrument(skip(self, failure))]
     pub async fn record_delivery_progress(
         &self,
         id: SubscriptionId,
-        position: u64,
+        position: Option<u64>,
         failure: Option<&SubscriptionFailure>,
     ) -> Result<(), SubscriptionError> {
         self.subscriptions
@@ -1434,13 +1438,18 @@ mod tests {
         fn update_last_delivered(
             &self,
             id: SubscriptionId,
-            position: u64,
+            position: Option<u64>,
             last_failure: Option<&SubscriptionFailure>,
         ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
             let lf = last_failure.cloned();
             let mut items = self.items.lock().unwrap();
             if let Some(s) = items.get_mut(&id) {
-                s.last_delivered_position = Some(position);
+                // `None` = no advance to record; mirrors the adapter's
+                // COALESCE so a test cannot see a rewind the real store
+                // would never produce.
+                if let Some(position) = position {
+                    s.last_delivered_position = Some(position);
+                }
                 s.last_failure = lf;
             }
             Box::pin(async { Ok(()) })
@@ -3547,7 +3556,7 @@ mod tests {
             .unwrap();
         let batches_before = fx.events.appended_batches().len();
         fx.uc
-            .record_delivery_progress(sub.id, 42, None)
+            .record_delivery_progress(sub.id, Some(42), None)
             .await
             .unwrap();
         assert_eq!(fx.events.appended_batches().len(), batches_before);

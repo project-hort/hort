@@ -2,15 +2,30 @@
 //! a [`tokio::sync::broadcast`] channel after a successful append.
 //!
 //! See `docs/architecture/explanation/event-notifications.md` (the
-//! wrapper portion only). The [`NotificationDispatcher`]
-//! subscribes to the broadcast sender; it is the only consumer.
+//! wrapper portion only). Two consumers subscribe to the sender today:
+//! the per-subscription dispatcher tasks and the `GET /api/v1/events`
+//! long-poll handler.
+//!
+//! # The send is a hint, not a delivery
+//!
+//! Neither consumer treats a received event as the thing to act on —
+//! both re-read the event store for the payload (ADR 0061). They must,
+//! because this sender cannot see every persisted event: an event
+//! appended inside a caller-owned transaction
+//! (`PgEventStore::append_in_tx`, reached through the artifact / ref /
+//! artifact-group lifecycle ports) never reaches
+//! [`append`](EventStore::append) at all, and the channel is per-process
+//! so it carries nothing another replica wrote. What a `send` buys is
+//! latency: a consumer learns there is something to read sooner than
+//! its own poll would have told it.
 //!
 //! # Best-effort contract
 //!
 //! After a successful [`append`](EventStore::append), the publisher calls
 //! [`broadcast::Sender::send`] for each persisted event. A [`broadcast::error::SendError`]
 //! (no receivers, capacity exhausted) is silently dropped — the use-case
-//! append path NEVER blocks on or retries broadcast.
+//! append path NEVER blocks on or retries broadcast. Dropping one costs
+//! a consumer latency and never an event.
 //!
 //! # No behaviour change without consumers
 //!
@@ -67,8 +82,9 @@ impl EventStorePublisher {
     ///
     /// Returns `None` when the publisher was constructed without a sender
     /// (`HORT_NOTIFICATIONS_ENABLED=false`). The dispatcher calls this
-    /// once per process; other consumers (future projections, replicator)
-    /// do likewise.
+    /// once per process, and the `GET /api/v1/events` long-poll handler
+    /// once per waiting request; future consumers (projections,
+    /// replicator) would do likewise.
     pub fn subscribe(&self) -> Option<broadcast::Receiver<Arc<PersistedEvent>>> {
         self.sender.as_ref().map(broadcast::Sender::subscribe)
     }
@@ -173,6 +189,22 @@ impl EventStore for EventStorePublisher {
         max_count: u64,
     ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
         self.inner.read_category(category, from, max_count)
+    }
+
+    /// Forwarded, NOT inherited from the port's default.
+    ///
+    /// The default implementation would merge `self.read_category` calls,
+    /// which reach the inner store one category at a time and so never let
+    /// a backend that implements the merge itself do so. Every other read
+    /// here is a pass-through; this one has to be, for the extra reason
+    /// that the pass-through is the whole point of the method.
+    fn read_categories<'a>(
+        &'a self,
+        categories: &[StreamCategory],
+        from: SubscribeFrom,
+        max_count: u64,
+    ) -> BoxFuture<'a, DomainResult<Vec<PersistedEvent>>> {
+        self.inner.read_categories(categories, from, max_count)
     }
 
     fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {

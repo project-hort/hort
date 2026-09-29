@@ -112,6 +112,13 @@ pub mod values {
     pub const OPERATION_READ_STREAM: &str = "read_stream";
     /// Operation name: read events across a category.
     pub const OPERATION_READ_CATEGORY: &str = "read_category";
+    /// Operation name: one merged `global_position`-ordered read across
+    /// several categories at once. Counted once per category in the
+    /// request, so the `category` label stays comparable with
+    /// [`OPERATION_READ_CATEGORY`] while the distinct operation name keeps
+    /// the two read paths separable — one merged read is one round trip,
+    /// not N.
+    pub const OPERATION_READ_CATEGORIES: &str = "read_categories";
 }
 
 /// Outcome of an event-store append operation, used as the `result` label of
@@ -336,6 +343,11 @@ mod tests {
     #[test]
     fn value_operation_read_category_is_read_category() {
         assert_eq!(values::OPERATION_READ_CATEGORY, "read_category");
+    }
+
+    #[test]
+    fn value_operation_read_categories_is_read_categories() {
+        assert_eq!(values::OPERATION_READ_CATEGORIES, "read_categories");
     }
 
     // -------------------------------------------------------------------
