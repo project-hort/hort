@@ -61,3 +61,13 @@ rustls-pki-types = { version = "1", features = ["std"] }
 # to a runtime and make the unit tests slower.
 
 [dev-dependencies]
+# `tests/deploy_schedule_parity.rs` parses the Ansible `hort_timers`
+# defaults to hold the systemd timer set against the chart's CronJob
+# templates. A hand-rolled line scanner would be fail-open — a reformat to
+# flow style, or an entry written with different indentation, would shrink
+# the parsed set silently and leave the comparison vacuous — so the guard
+# parses real YAML. Already a normal dependency above (the gitops envelope
+# parser needs it at runtime); integration tests do not inherit a crate's
+# own dependencies, hence the restatement here. No new crate enters
+# `Cargo.lock`.
+serde_yaml_ng = { workspace = true }

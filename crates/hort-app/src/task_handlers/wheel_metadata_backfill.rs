@@ -31,11 +31,14 @@
 //!    a freshly-deployed operator's wheel inventory is empty; the
 //!    backfill is a one-shot retrofit, not a steady-state sweep.
 //!
-//! 2. **Manual operator invocation** via the `hort-http-admin-tasks`
-//!    HTTP route — `hort-cli admin task invoke wheel-metadata-backfill
-//!    --params-file /tmp/p.json`. The `hort-cli` machinery accepts
-//!    arbitrary kinds; the kind is gated server-side against
-//!    `ADMIN_INVOKABLE_TASK_KINDS`.
+//! 2. **Manual operator invocation** — the same subcommand, run
+//!    off-schedule: `hort-server enqueue-wheel-metadata-backfill
+//!    [--batch-size N]`. There is no HTTP path: the kind is in
+//!    `ADMIN_INVOKABLE_TASK_KINDS` (which is the set of kinds an admin
+//!    may enqueue at all, not the router's list), but
+//!    `hort-http-admin-tasks::router()` enumerates its invoke routes one
+//!    by one and this kind is not among them, so `POST
+//!    /api/v1/admin/tasks/wheel-metadata-backfill` answers 404.
 //!
 //! # Params
 //!

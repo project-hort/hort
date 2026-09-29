@@ -799,9 +799,9 @@ pub async fn build_app_context(
     //          single-flights the prefetch-vs-client-pull race.
     //
     //          `PrefetchRowRetentionSweepHandler` — periodically
-    //          deletes terminal `prefetch%` and
-    //          `oci-index-child-ingest` rows older than a
-    //          configurable horizon (default 7d). Enqueued by the
+    //          deletes terminal `prefetch%` (minus `prefetch-tick`) and
+    //          `oci-index-child-ingest` rows older than the handler's
+    //          7-day `DEFAULT_HORIZON`. Enqueued by the
     //          `enqueue-prefetch-row-retention-sweep` hort-server
     //          subcommand.
     //

@@ -7,7 +7,7 @@
 //! `hort-server::http`). The local router carries only the suffix:
 //!
 //! ```text
-//! POST   /                           → invoke::<NoopParams>         (noop)
+//! POST   /noop                       → invoke::<NoopParams>
 //! POST   /cron-rescan-tick           → invoke::<CronRescanTickRawParams>
 //! POST   /advisory-watch-tick        → invoke::<AdvisoryWatchTickRawParams>
 //! POST   /retention-evaluate         → invoke::<RetentionEvaluateParams>
@@ -19,8 +19,23 @@
 //! POST   /replay-seen-prune          → invoke::<ReplaySeenPruneRawParams>
 //! POST   /scanner-registry-prune     → invoke::<ScannerRegistryPruneRawParams>
 //! GET    /                           → list_tasks
-//! GET    /:id                        → get_task
+//! GET    /{id}                       → get_task
 //! ```
+//!
+//! # The invoke routes are a strict subset of `ADMIN_INVOKABLE_TASK_KINDS`
+//!
+//! Those eleven `POST` routes are the whole invoke surface. Every other
+//! member of `hort_domain::events::ADMIN_INVOKABLE_TASK_KINDS` — the
+//! three row-retention sweeps, `quarantine-release-sweep`,
+//! `prefetch-tick`, `wheel-metadata-backfill`, and the rest — answers
+//! **404** here. That is not a gap to be closed by widening this list:
+//! `ADMIN_INVOKABLE_TASK_KINDS` is the set of kinds an admin may enqueue
+//! *at all* (it also gates the DSN-direct `hort-server enqueue-*`
+//! subcommands, event validation, and two handler-level assertions), so
+//! the router being a subset of it is the design. The routeless kinds are
+//! reached off-schedule by running their `hort-server enqueue-*`
+//! subcommand on the runtime DSN, which is the same command their
+//! CronJob / systemd timer runs.
 //!
 //! # Dep-graph invariant
 //!

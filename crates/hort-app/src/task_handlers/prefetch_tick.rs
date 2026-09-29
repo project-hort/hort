@@ -146,7 +146,18 @@
 //! tick.yaml`, default `enabled: false`) runs `hort-server enqueue-
 //! prefetch-tick`, which inserts one `kind = 'prefetch-tick'` row via
 //! the runtime DSN — same delivery contract as the
-//! quarantine-release sweep.
+//! quarantine-release sweep. There is no HTTP invoke route for this
+//! kind, so an off-schedule tick is that same subcommand.
+//!
+//! # Retention of this kind's own `jobs` rows
+//!
+//! `prefetch-tick` matches `kind LIKE 'prefetch%'` but is deliberately
+//! carved out of `prefetch-row-retention-sweep` and swept by
+//! `jobs-row-retention-sweep` instead. That sweep retains the newest
+//! `completed` row per kind, which is where `read_cursor` below finds
+//! the rotation cursor; the cascade sweep has no such clause, because
+//! its premise is that none of the rows it reaches hold durable
+//! state.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -292,6 +303,15 @@ impl PrefetchTickHandler {
     /// deserialise — collapses to `None` (walk from the beginning): a
     /// missing or malformed cursor is a resumability optimisation lost,
     /// never a reason to fail the tick.
+    ///
+    /// Row *retention* is not among those failure modes, and must not
+    /// become one. The `jobs` row this reads is swept by
+    /// `jobs-row-retention-sweep`, which retains the newest `completed`
+    /// row per kind — see the module docs for why this kind is carved
+    /// out of `prefetch-row-retention-sweep`, which retains nothing. A
+    /// horizon that collected the row would silently restart the
+    /// rotation, so on a large instance the tail packages would come up
+    /// rarely or never.
     async fn read_cursor(&self) -> Option<TickCursor> {
         let summary = match self.jobs.last_result_summary_by_kind(self.kind()).await {
             Ok(s) => s?,

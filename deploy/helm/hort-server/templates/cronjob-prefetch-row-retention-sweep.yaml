@@ -5,17 +5,29 @@ Periodically invokes `hort-server enqueue-prefetch-row-retention-sweep`,
 which inserts ONE `kind='prefetch-row-retention-sweep'` row into
 `public.jobs` using the runtime DSN. The always-on worker (`hort-worker`)
 picks the row up and dispatches to `PrefetchRowRetentionSweepHandler`,
-which deletes terminal `kind LIKE 'prefetch%'` and
-`kind = 'oci-index-child-ingest'` rows older than a configurable horizon
-(default 7 days) — the pull-through ingest cascade's rows, none of which
-hold durable state.
+which deletes terminal `kind LIKE 'prefetch%'` (minus `prefetch-tick`) and
+`kind = 'oci-index-child-ingest'` rows older than the 7-day
+`DEFAULT_HORIZON` — the pull-through ingest cascade's rows, none of which
+hold durable state. `prefetch-tick` is carved out because its newest
+`completed` row carries the prefetch rotation's keyset cursor; that kind
+is swept by `jobs-row-retention-sweep`, which retains it.
+
+No supported path supplies a different horizon: this CronJob runs the
+subcommand with no arguments, the subcommand writes `params`
+unconditionally empty, and there is no chart value and no CLI flag behind
+it.
 
 Design rationale: a default-enabled CronJob going through the `hort-cli`
 HTTP admin-task path would drag the whole `svc-token-bootstrap` Job chain
 + a standing `admin_task_invoke` token mount to default-on. The runtime
 DSN is least-privilege — it can `INSERT INTO public.jobs` and read the
-schema, full stop. The `hort-http-admin-tasks` HTTP route stays available
-for **manual** operator invocation.
+schema, full stop.
+
+There is **no** HTTP invoke route for this kind. `hort-http-admin-tasks`
+enumerates its invoke routes one by one and this kind is not among them,
+so `POST /api/v1/admin/tasks/prefetch-row-retention-sweep` answers 404 —
+an off-schedule run is `hort-server enqueue-prefetch-row-retention-sweep` on the
+runtime DSN, the same command this CronJob runs.
 
 So this CronJob:
 
