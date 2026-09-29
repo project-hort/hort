@@ -30,6 +30,7 @@ pub mod artifact_group_repo;
 pub mod artifact_lifecycle;
 pub mod artifact_metadata_repo;
 pub mod artifact_repo;
+pub(crate) mod blob_lock;
 pub mod claim_mapping_repo;
 // Transient write-contention (serialization failure / deadlock): the
 // sqlstate classifier and the bounded whole-transaction retry over it.

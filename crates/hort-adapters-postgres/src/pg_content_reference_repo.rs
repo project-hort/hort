@@ -52,6 +52,29 @@
 //! under a *different* kind OR a different target adds a sibling row —
 //! the refcount design and the OCI index's N-children membership both
 //! require this.
+//!
+//! # Why the upsert runs in a transaction that first takes a lock
+//!
+//! Recording a reference is the act of claiming bytes that already
+//! exist — the CAS dedup path writes nothing and records a row. The
+//! storage-GC walk destroys bytes whose reference count is zero. Those
+//! two have to be serialised on the **content hash**, because the hash
+//! is what one of them destroys and the other lays claim to, and
+//! nothing else in either transaction is about the same thing: the
+//! sweep locks an artifact row, this path writes a projection row, and
+//! neither lock is the blob.
+//!
+//! So this upsert runs inside a transaction that first takes the
+//! hash's [`blob_lock`](crate::blob_lock). The sweep re-counts under
+//! the same lock immediately before it deletes, so a row written here
+//! is either visible to that count or still blocked behind the lock
+//! when it runs — and a sweep that cannot take the lock does not
+//! delete at all.
+//!
+//! This is the *only* reference-writing path in the crate besides
+//! `refcount_reconcile`'s repair upsert, and the pair is pinned by a
+//! source-scan guard (`crates/hort-app/tests/blob_reclaim_lock.rs`)
+//! rather than by convention.
 
 use std::str::FromStr;
 
@@ -154,13 +177,16 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
             // buildkit image index references the same empty-config blob — so
             // their edge upserts contend on a single row whenever the push is
             // concurrent, which for a multi-architecture client it always is.
-            // The upsert is one self-contained statement, so re-running it is
-            // re-running the whole unit of work; and it is idempotent by the
-            // `ON CONFLICT DO UPDATE` above, so a re-run cannot double-write
-            // even in the case where the abort was reported after the row
-            // landed. A genuine `Conflict` is not retried here (see
-            // `crate::contention`), which is what keeps that idempotence
-            // intact rather than papering over it.
+            // The retried unit of work is the whole transaction below —
+            // the blob lock and the upsert — and re-running it is
+            // re-opening it from the start, so a retry re-acquires the
+            // lock rather than proceeding without it. The upsert is
+            // idempotent by the `ON CONFLICT DO UPDATE` above, so a
+            // re-run cannot double-write even in the case where the
+            // abort was reported after the row landed. A genuine
+            // `Conflict` is not retried here (see `crate::contention`),
+            // which is what keeps that idempotence intact rather than
+            // papering over it.
             with_contention_retry(
                 "content-reference upsert",
                 CONTENTION_RETRY_ATTEMPTS,
@@ -169,6 +195,23 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                     let target_hex = target_hex.clone();
                     let reference = &reference;
                     async move {
+                        let ctx = || {
+                            format!(
+                                "{}/{}",
+                                reference.repository_id, reference.source_artifact_id
+                            )
+                        };
+                        let mut tx = self
+                            .pool
+                            .begin()
+                            .await
+                            .map_err(|e| map_sqlx_error(&e, "ContentReference", &ctx()))?;
+                        // The blob-reclamation lock, taken before the
+                        // row that claims those bytes exists. Held to
+                        // this transaction's end, which is one
+                        // statement away.
+                        crate::blob_lock::lock_blob_in_tx(&mut tx, &reference.target_content_hash)
+                            .await?;
                         sqlx::query(
                             r#"INSERT INTO content_references (
                        source_artifact_id, target_content_hash, kind, metadata,
@@ -185,18 +228,12 @@ impl ContentReferenceIndex for PgContentReferenceRepo {
                         .bind(&reference.metadata)
                         .bind(reference.repository_id)
                         .bind(reference.recorded_at)
-                        .execute(&self.pool)
+                        .execute(&mut *tx)
                         .await
-                        .map_err(|e| {
-                            map_sqlx_error(
-                                &e,
-                                "ContentReference",
-                                &format!(
-                                    "{}/{}",
-                                    reference.repository_id, reference.source_artifact_id
-                                ),
-                            )
-                        })?;
+                        .map_err(|e| map_sqlx_error(&e, "ContentReference", &ctx()))?;
+                        tx.commit()
+                            .await
+                            .map_err(|e| map_sqlx_error(&e, "ContentReference", &ctx()))?;
                         Ok(())
                     }
                 },

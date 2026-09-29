@@ -152,6 +152,84 @@ pub struct PurgedRef {
     pub completed: bool,
 }
 
+/// A **held** hash-scoped blob-reclamation lock.
+///
+/// Handed back by [`PurgeGcPort::begin_blob_reclaim`] when the lock was
+/// taken *and* the cross-`kind` reference count for the hash was still
+/// `0` under it. While it is alive no other session can record a
+/// `content_references` row for that hash, so the storage delete the
+/// caller performs next cannot race a re-reference.
+///
+/// # The contract the guard carries
+///
+/// The lock has to span a commit boundary: the reference bookkeeping
+/// commits in one transaction and [`StoragePort`](super::storage::StoragePort)`::delete`
+/// runs afterwards, in the application layer. A transaction-scoped lock
+/// released at that commit would not cover the delete — so the guard
+/// *is* the open transaction, and the delete happens underneath it.
+///
+/// **Release it after the storage call, on every path** (success and
+/// failure alike). Dropping the guard without calling
+/// [`release`](Self::release) must also release the lock — an
+/// implementation may not leave a lock standing behind a lost
+/// guard — but `release` is the path that reports a failure to do so.
+pub trait BlobReclaimGuard: Send {
+    /// Release the lock. Consumes the guard; the caller must have
+    /// finished its storage call first.
+    fn release(self: Box<Self>) -> BoxFuture<'static, DomainResult<()>>;
+}
+
+/// Outcome of [`PurgeGcPort::begin_blob_reclaim`] — the three answers a
+/// destructive sweep is allowed to get, and only one of them authorises
+/// a delete.
+///
+/// The posture is **skip when in doubt**: two of the three outcomes
+/// leave the bytes standing. They are not the same skip.
+/// [`Contended`](Self::Contended) is a *deferral* — nothing was read,
+/// nothing was changed, the worklist row stands and the next sweep asks
+/// again. [`Referenced`](Self::Referenced) is a *keep* — the answer is
+/// in, the blob is alive, and the purge finishes without it.
+pub enum BlobReclaim {
+    /// The lock is held and the hash had **zero** references under it.
+    /// The caller may delete the bytes, and must
+    /// [`release`](BlobReclaimGuard::release) the guard afterwards.
+    Granted(Box<dyn BlobReclaimGuard>),
+    /// The lock was taken, and under it the hash turned out to have
+    /// `refs_now > 0` live references — the worklist's `0` was a stale
+    /// snapshot and something re-referenced these bytes since. The blob
+    /// is alive: do not delete it. The lock is already released.
+    ///
+    /// This is a *terminal* answer, not a deferral: a reference that
+    /// exists now keeps the blob, and re-asking forever would leave the
+    /// artifact's purge permanently unfinishable. The worklist row is
+    /// refreshed to `refs_now` so the `ArtifactPurged` the caller
+    /// emits states the count that actually held.
+    Referenced {
+        /// The cross-`kind` `content_references` count observed under
+        /// the lock.
+        refs_now: u32,
+    },
+    /// Another session holds the hash lock — a concurrent ingest is
+    /// recording a reference to exactly these bytes, or a second sweep
+    /// is already reclaiming them. Nothing was read and nothing was
+    /// changed. Leave the bytes and the worklist row; the next sweep
+    /// retries.
+    Contended,
+}
+
+impl std::fmt::Debug for BlobReclaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Granted(_) => f.write_str("Granted(..)"),
+            Self::Referenced { refs_now } => f
+                .debug_struct("Referenced")
+                .field("refs_now", refs_now)
+                .finish(),
+            Self::Contended => f.write_str("Contended"),
+        }
+    }
+}
+
 /// Read + transactional-transition outbound port for the storage-GC
 /// walk. The Postgres adapter owns the worklist, reference deletion,
 /// completion checkpoints, and atomic event/projection transition;
@@ -171,7 +249,20 @@ pub trait PurgeGcPort: Send + Sync {
     /// [`PendingPurge::user_deleted`]) and the use case owns the
     /// decision, so the skip is observable in the sweep summary instead
     /// of vanishing into a `WHERE` clause.
-    fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>>;
+    ///
+    /// **Paged, and the caller owns the page cap.** The pending set is
+    /// only known once it is fully loaded, and on the first sweep after
+    /// a deployment it is the whole backlog — so the port never hands
+    /// back an unbounded result. `limit` bounds one page;
+    /// `after_artifact_id` is the exclusive keyset position (`None`
+    /// starts at the beginning). Rows come back ordered by
+    /// `artifact_id` so the caller can pass the last one back as the
+    /// next page's `after_artifact_id`.
+    fn list_pending_purge(
+        &self,
+        limit: u32,
+        after_artifact_id: Option<Uuid>,
+    ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>>;
 
     /// Prepare the durable worklist in **one committed, idempotent
     /// transaction**: lock the artifact row, delete every source edge,
@@ -183,6 +274,38 @@ pub trait PurgeGcPort: Send + Sync {
     /// targets that no artifact column can reconstruct after deletion.
     fn purge_artifact_refs(&self, artifact_id: Uuid)
         -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>>;
+
+    /// Take the hash-scoped blob-reclamation lock and re-verify, under
+    /// it, that the hash still has **zero** `content_references`.
+    ///
+    /// This is the authorisation for the destructive step, and it
+    /// exists because the worklist's `refs_remaining` is a snapshot:
+    /// it was computed in the preparation transaction, which has long
+    /// since committed, and a retry can run the delete sweeps later.
+    /// A count that was `0` then says nothing about now.
+    ///
+    /// The lock is the same one every `content_references` write takes,
+    /// so a re-reference of these bytes is either already committed
+    /// (and counted here) or blocked behind this lock until the guard
+    /// is released.
+    ///
+    /// Returns [`BlobReclaim::Granted`] with a live guard the caller
+    /// holds across
+    /// [`StoragePort::delete`](super::storage::StoragePort::delete),
+    /// [`BlobReclaim::Referenced`] when the hash is alive after all
+    /// (and the worklist row is refreshed to the observed count so the
+    /// terminal `ArtifactPurged` states it), or
+    /// [`BlobReclaim::Contended`] when the lock is held elsewhere.
+    ///
+    /// **Never blocks.** A destructive sweep that waits on a lock held
+    /// by a live ingest is a sweep that has decided its housekeeping
+    /// outranks a request; it does not. Contention is an answer, and
+    /// the answer is "not this run".
+    fn begin_blob_reclaim(
+        &self,
+        artifact_id: Uuid,
+        content_hash: &ContentHash,
+    ) -> BoxFuture<'_, DomainResult<BlobReclaim>>;
 
     /// Checkpoint one hash after its storage decision succeeds. The
     /// operation is idempotent so a delete-success/checkpoint-failure
@@ -234,8 +357,19 @@ mod tests {
     /// for adapter impls in cross-crate tests.
     struct EmptyPort;
     impl PurgeGcPort for EmptyPort {
-        fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+        fn list_pending_purge(
+            &self,
+            _limit: u32,
+            _after_artifact_id: Option<Uuid>,
+        ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+        fn begin_blob_reclaim(
+            &self,
+            _artifact_id: Uuid,
+            _content_hash: &ContentHash,
+        ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+            Box::pin(async { Ok(BlobReclaim::Contended) })
         }
         fn purge_artifact_refs(
             &self,
@@ -264,8 +398,14 @@ mod tests {
     #[tokio::test]
     async fn empty_port_returns_no_pending_and_no_refs() {
         let p = EmptyPort;
-        assert!(p.list_pending_purge().await.unwrap().is_empty());
+        assert!(p.list_pending_purge(10, None).await.unwrap().is_empty());
         assert!(p.purge_artifact_refs(Uuid::nil()).await.unwrap().is_empty());
+        assert!(matches!(
+            p.begin_blob_reclaim(Uuid::nil(), &hash(HASH_A))
+                .await
+                .unwrap(),
+            BlobReclaim::Contended
+        ));
         p.mark_purge_ref_complete(Uuid::nil(), &hash(HASH_A), Utc::now())
             .await
             .unwrap();
@@ -293,8 +433,19 @@ mod tests {
         use crate::error::DomainError;
         struct ErrPort;
         impl PurgeGcPort for ErrPort {
-            fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+            fn list_pending_purge(
+                &self,
+                _limit: u32,
+                _after_artifact_id: Option<Uuid>,
+            ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
                 Box::pin(async { Err(DomainError::Invariant("pending list failed".into())) })
+            }
+            fn begin_blob_reclaim(
+                &self,
+                _artifact_id: Uuid,
+                _content_hash: &ContentHash,
+            ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+                Box::pin(async { Err(DomainError::Invariant("reclaim lease failed".into())) })
             }
             fn purge_artifact_refs(
                 &self,
@@ -321,7 +472,13 @@ mod tests {
         }
         let p = ErrPort;
         assert!(matches!(
-            p.list_pending_purge().await.unwrap_err(),
+            p.list_pending_purge(10, None).await.unwrap_err(),
+            DomainError::Invariant(_)
+        ));
+        assert!(matches!(
+            p.begin_blob_reclaim(Uuid::nil(), &hash(HASH_A))
+                .await
+                .unwrap_err(),
             DomainError::Invariant(_)
         ));
         assert!(matches!(
@@ -351,6 +508,37 @@ mod tests {
             .unwrap_err(),
             DomainError::Invariant(_)
         ));
+    }
+
+    /// The three reclamation outcomes are distinguishable and the
+    /// granted one hands back a guard that releases. `Debug` is
+    /// exercised on every arm: it is what a sweep's `tracing` field
+    /// renders, and a guard arm that printed its transaction would put
+    /// connection state in a log line.
+    #[tokio::test]
+    async fn blob_reclaim_outcomes_round_trip_and_the_guard_releases() {
+        struct Guard;
+        impl BlobReclaimGuard for Guard {
+            fn release(self: Box<Self>) -> BoxFuture<'static, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let granted = BlobReclaim::Granted(Box::new(Guard));
+        assert_eq!(format!("{granted:?}"), "Granted(..)");
+        let BlobReclaim::Granted(guard) = granted else {
+            panic!("constructed Granted");
+        };
+        guard.release().await.expect("release");
+
+        let referenced = BlobReclaim::Referenced { refs_now: 3 };
+        assert_eq!(format!("{referenced:?}"), "Referenced { refs_now: 3 }");
+        assert!(matches!(
+            referenced,
+            BlobReclaim::Referenced { refs_now: 3 }
+        ));
+
+        assert_eq!(format!("{:?}", BlobReclaim::Contended), "Contended");
     }
 
     /// The data types are plain value structs — round-trip equality +
