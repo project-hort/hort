@@ -14,7 +14,7 @@
   `a_failed_delivery_is_retried_by_every_pass_until_the_budget_runs_out`
   pins the retry (checkpointing past a failure turns it red).
   `crates/hort-adapters-postgres/tests/event_delivery_visibility.rs` pins
-  the two store-side properties the decision rests on, and
+  the three store-side properties the decision rests on, and
   `tests/no_broadcast_in_adapter.rs` pins the layering rule against the
   crate rather than against one wiring of it.
   `tests/merged_category_read.rs` pins the merged read's ordering and
@@ -260,7 +260,7 @@ statement is per-arity: at most one cached plan per distinct filter width
 (1..=13). The category values stay bound parameters; only the arm count is
 interpolated.
 
-### The residual, and why it is not closed here
+### The residual, and why it is accepted
 
 `events.global_position` defaults to `nextval`, evaluated at **INSERT**,
 while a row becomes visible at **COMMIT**. The two orders can disagree:
@@ -309,15 +309,109 @@ delivered whatever it received, regardless of position) and now carry this
 rate; and the wake-up correlates the read with a commit, which is the
 moment a sibling transaction is most likely still in its tail.
 
-**What closing it would take, and what is rejected.**
+**The decision: the gap is accepted and stated, not closed.** This is not
+a deferral. There is no scheduled follow-on that discharges it, and a
+future unit that wants to close it re-opens this decision rather than
+completing it. Nothing in the position model moves as a result:
+`global_position` keeps its meaning, `GET /api/v1/events`'s `next_after`
+keeps its meaning, the cursor stays a bare high-water mark, no read gains
+a visibility filter, and no wire shape changes. What changes is the
+documentation, which stops implying a completeness the log cannot deliver
+and starts telling a consumer that needs completeness what it can actually
+do — see *Delivery semantics* and *Detecting a late-commit skip* in
+`docs/architecture/explanation/event-notifications.md`.
 
-- An exact *reader-side* fix means the cursor stops being a bare
-  high-water mark — a change to the position model itself, which
-  `global_position` being on the wire format and on `GET /api/v1/events`'s
-  `next_after` makes a public-contract change. Deferred to that decision.
-  An `xmin`-horizon read does **not** substitute for it: xid assignment
-  and `nextval` are separate atomic operations whose order can disagree in
-  both directions.
+**Both reader-side horizons are rejected, and on evidence rather than on
+cost.**
+
+- **The naive `xmin` horizon is unsound.** Return only rows whose
+  inserting transaction is already below
+  `pg_snapshot_xmin(pg_current_snapshot())` — only settled rows — and a
+  cursor supposedly cannot advance past a position that was still in
+  flight. The reasoning bounds *positions* by reasoning about *transaction
+  ids*, so it holds only if a lower position implies a lower-or-equal xid.
+  It does not. An xid is assigned by a transaction's first write and a
+  position is drawn when the events INSERT executes, and the adapter ships
+  append paths in exactly the order that breaks the implication:
+  `ref_lifecycle::move_ref`, `ref_lifecycle::retire_ref`,
+  `artifact_group_lifecycle::commit_member_added` and
+  `artifact_group_lifecycle::commit_member_removed` write their projection
+  row first and append last, holding a low xid against a high position.
+  Race one of those against an append-first path and the committed row is
+  *below* the horizon while the still-open lower position is *above* it:
+  the horizon reader steps over the gap exactly as the bare mark does.
+  `an_xmin_horizon_does_not_close_the_late_commit_race` pins this against
+  a live database.
+- **A sound sampled horizon exists, and it is worse.** Sample the sequence
+  value together with the oldest transaction running at that same instant,
+  and release the sampled value as the read ceiling only once every
+  transaction that was running at the sample has concluded. That *is*
+  correct — it compares positions and transactions taken at one consistent
+  instant instead of assuming the two orders agree — and it removes a
+  partial loss measured at 0.5–1.9% of appends (468 stranded of 38,756, at
+  four- to eight-way concurrent *ingest*) at the price of an **unbounded
+  total stall**: one long-open transaction, read-only in
+  the variant that is safe, freezes delivery for every subscription for as
+  long as it stays open.
+  A bounded partial loss a consumer can detect is the better failure mode
+  than an unbounded stall an operator meets as silence.
+  That rate and the table above are not in tension: the table measured the
+  *shortest possible* tail — the adapter's own append plus an immediate
+  commit — and is therefore the floor, while 0.5–1.9% is concurrent ingest
+  through the append-first ports, whose longer tails hold more positions in
+  flight per unit of concurrency. This section predicts exactly that
+  difference two paragraphs above.
+
+**Acceptance is defensible because the loss is detectable by the consumer,
+with what is already on the wire.** Both positions ride every delivery —
+`PersistedEvent` serialises `global_position` and `stream_position`, and
+the webhook body, the NATS payload and the `GET /api/v1/events` DTO all
+embed them — so none of the following needs a new field, a new endpoint
+or an operator opt-in:
+
+- **A gap in `global_position` is a trigger, never a verdict.** The
+  sequence is not transactional: a rolled-back append burns its number
+  permanently, so gaps occur in ordinary operation and a gap on its own
+  proves nothing.
+- **A gap in `stream_position` is exact.** Per stream it is 0-based and
+  gapless by construction — `append_with_conn` derives it as the stream's
+  tail + 1 inside the append transaction, and the unique index
+  `(stream_id, stream_position)` is the serialiser, so a concurrent
+  appender loses with a 23505 rather than creating a hole. A consumer
+  tracking the last position per `stream_id` detects a skipped event with
+  certainty, and a first sighting of a stream above position 0 is the same
+  signal. Three limits, and all of them belong wherever the recipe is
+  given: a subscription carrying an `event_types` filter sees holes by
+  design and cannot use this at all; **authorization filtering has the
+  same effect and is easier to miss**, because both `subscription_filter`
+  and the `GET /api/v1/events` handler drop an individual event whose
+  `repository_id` the principal cannot `Read` — or whose type is an
+  authorization-model mutation or privileged audit fact — while passing
+  its stream-mates that carry no repository association, so a partially
+  authorised consumer sees holes that mean nothing; and a skipped event
+  that was its stream's last is never revealed, because no successor
+  arrives to expose the hole.
+- **Re-reading a trailing window is exact, and is the consumer's to run.**
+  Re-read `(H − Δ, H]` over the `(stream_category, global_position)` index
+  and compare against what was already handled; anything appearing in a
+  window already passed is precisely a late committer. It is a bounded
+  index range scan, and it costs nothing semantically because delivery is
+  already at-least-once with duplicates — a consumer may re-handle the
+  window rather than remember it. Δ must exceed the longest write
+  transaction, and the bound on that is the `lock_timeout` named above,
+  120 s on the worker pools. This is a recipe for the *consumer*: the
+  corresponding trailing-window lag **inside the dispatcher** was put
+  alongside this decision and was not taken, so adding one re-opens this
+  decision rather than implementing it.
+
+**What closing it would take, and what stays rejected.** An exact
+*reader-side* close means the cursor stops being a bare high-water mark,
+which is a change to the position model itself — and `global_position`
+being on the wire format and on `next_after` makes that a public-contract
+change. That is the decision this one declines to take, with the two
+horizons above as the evidence that the cheap versions of it do not
+substitute.
+
 - A *write-side* fix: a `pg_advisory_xact_lock` taken immediately before
   the events INSERT in `append_with_conn` makes INSERT order equal COMMIT
   order exactly, with no position-model change and no wire impact.
@@ -334,8 +428,10 @@ moment a sibling transaction is most likely still in its tail.
   difference between the table above and its first row. It is not done
   here because it touches five transaction bodies and the constraint of
   this unit is that nothing is added to, removed from, or reordered inside
-  any transaction; it should be scheduled with a guard, since nothing
-  enforces the ordering today.
+  any transaction. With the gap accepted it is no longer on the path to
+  closing anything — it narrows the window and nothing more — and nothing
+  enforces append-last ordering today, so doing it would mean adding a
+  guard with it.
 
 ### The retention residual
 
@@ -462,10 +558,12 @@ and is not designed here.
   cross-replica duplication, separately.
 - **Making category reads return only settled rows** (a visibility
   horizon derived from `pg_snapshot_xmin(pg_current_snapshot())`), so
-  every cursor becomes safe. Not rejected — deferred, and see the
-  residual above for why it is not sufficient on its own. It changes the
-  semantics of a port the low-latency read API also uses, so it belongs
-  with the position-model decision rather than inside this loop change.
+  every cursor becomes safe. Rejected — it was deferred when this ADR was
+  first written and the deferral is now discharged against it: the naive
+  form is unsound (the position order and the xid order are independent,
+  and four append paths ship the shape that separates them), and the
+  sampled form that *is* sound trades the partial loss for an unbounded
+  stall. See the residual above.
 
 ## References
 
@@ -482,6 +580,8 @@ and is not designed here.
 - `migrations/004_events.sql` — `global_position` as a `nextval` default,
   and `idx_events_category_global`.
 - `crates/hort-adapters-postgres/tests/event_delivery_visibility.rs` —
-  the two pinned store-side properties.
+  the three pinned store-side properties: the transactional append absent
+  from the channel, the late-commit race, and the `xmin` horizon that does
+  not close it.
 - `docs/architecture/explanation/event-notifications.md` — the page this
   decision rewrites the delivery-semantics section of.
