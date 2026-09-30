@@ -106,6 +106,7 @@ fn build_scan_findings_rows(
             source_scanner: f.source_scanner.clone(),
             title: f.title.clone(),
             detected_at,
+            fixed_versions: f.fixed_versions.clone(),
             informational_class: f.informational_class.clone(),
         })
         .collect()
@@ -2434,6 +2435,21 @@ mod tests {
             });
         }
         out
+    }
+
+    #[test]
+    fn scan_findings_rows_preserve_fixed_versions() {
+        let mut findings = findings_from_summary(&SeveritySummary {
+            critical: 0,
+            high: 1,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        });
+        findings[0].fixed_versions = vec!["1.2.3".into(), "2.0.0".into()];
+        let rows = build_scan_findings_rows(&findings, Uuid::new_v4(), Uuid::new_v4(), Utc::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fixed_versions, findings[0].fixed_versions);
     }
 
     /// Seed an artifact + its repository in one shot. The default

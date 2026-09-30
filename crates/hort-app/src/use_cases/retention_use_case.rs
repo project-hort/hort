@@ -62,11 +62,10 @@
 //!   zero-`tracing`; the warning lives where the YAML is applied).
 //! - `RetentionPurgeHandler` / `TaskHandler` registration → the worker
 //!   composition root.
-//! - Blob-sourced `fixed_versions` precision for `HasFixAvailable`
-//!   (the projection does not carry `fixed_versions`; see
-//!   [`hort_domain::ports::retention_scan_reader`] module docs) → the
-//!   out-of-scope "successor-in-our-repo /
-//!   per-finding first-seen" refinement family.
+//! - Per-finding first-seen refinement: this use case retains the
+//!   projection's existing across-scans read contract. Fix availability
+//!   is already projected; see
+//!   [`hort_domain::ports::retention_scan_reader`] module docs.
 
 use std::sync::Arc;
 

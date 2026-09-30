@@ -184,6 +184,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Retention policies using `HasFixAvailable` now expire matching artifacts**
+  (#323). The scan findings projection now preserves advisory fix versions, so
+  policies that previously did nothing can take effect without an operator
+  change. Findings recorded before this change read as "no fix" until their
+  artifact is rescanned; the scheduled rescan closes that gap over time.
+
 - **`UnusedFor` is refused at gitops apply while no usage signal exists**
   (#299). A `RetentionPolicy` whose predicate uses `UnusedFor` — at the root
   of `spec.predicate` or nested anywhere inside a `Composite` — is now

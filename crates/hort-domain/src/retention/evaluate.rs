@@ -16,14 +16,11 @@
 //!
 //! ## `HasFixAvailable` precision note
 //!
-//! `HasFixAvailable` is sourced from "a non-empty `fixed_versions`
-//! array on its source advisory". The v1 `scan_findings` projection
-//! does not carry `fixed_versions` (see
-//! [`crate::ports::retention_scan_reader`] module docs), so with the
-//! projection-only adapter every [`Finding::fixed_versions`] is empty
-//! and `HasFixAvailable` never matches. The predicate logic here is
-//! still written against `fixed_versions` so a future blob-sourced
-//! adapter makes it correct unchanged.
+//! `HasFixAvailable` matches a non-empty `fixed_versions` array from
+//! the source advisory. The `scan_findings` projection carries that
+//! array for new or rescanned findings (see
+//! [`crate::ports::retention_scan_reader`] module docs). Findings
+//! written before migration 029 have the empty default until rescan.
 
 use chrono::{DateTime, Utc};
 
