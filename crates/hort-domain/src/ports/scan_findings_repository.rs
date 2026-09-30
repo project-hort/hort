@@ -33,6 +33,9 @@ pub struct ScanFindingsRow {
     pub source_scanner: String,
     pub title: String,
     pub detected_at: DateTime<Utc>,
+    /// Source advisory versions containing a fix. The projection retains
+    /// these so retention can evaluate `HasFixAvailable` from stored rows.
+    pub fixed_versions: Vec<String>,
     /// Mirrors [`crate::types::Finding::informational_class`] — the raw OSV
     /// `database_specific.informational` class verbatim (RustSec
     /// `unmaintained` / `unsound` / `notice`), or `None` for a scored
@@ -97,6 +100,7 @@ mod tests {
             source_scanner: "trivy".into(),
             title: "t".into(),
             detected_at: DateTime::<Utc>::from_timestamp(0, 0).expect("ts"),
+            fixed_versions: vec!["1.2.3".into()],
             informational_class: None,
         };
         let cloned = r.clone();
@@ -137,6 +141,7 @@ mod tests {
             source_scanner: "trivy".into(),
             title: "t".into(),
             detected_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
+            fixed_versions: vec![],
             informational_class: None,
         };
         repo.insert_batch(std::slice::from_ref(&row)).await.unwrap();

@@ -58,7 +58,7 @@ pub(crate) async fn insert_findings_in_tx(
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "INSERT INTO scan_findings (\
             artifact_id, scan_id, purl, vulnerability_id, severity, \
-            cvss_score, source_scanner, title, detected_at, informational_class\
+            cvss_score, source_scanner, title, detected_at, fixed_versions, informational_class\
         ) ",
     );
     qb.push_values(rows, |mut b, row| {
@@ -71,6 +71,7 @@ pub(crate) async fn insert_findings_in_tx(
             .push_bind(&row.source_scanner)
             .push_bind(&row.title)
             .push_bind(row.detected_at)
+            .push_bind(&row.fixed_versions)
             .push_bind(row.informational_class.as_deref());
     });
     let query = qb.build();
@@ -103,6 +104,8 @@ impl ScanFindingsRepository for PgScanFindingsRepository {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use hort_domain::ports::retention_scan_reader::RetentionScanReader;
+    use hort_domain::retention::{matches_bool, EvaluationInputs, PolicyPredicate};
     use serial_test::serial;
     use sqlx::PgPool;
     use uuid::Uuid;
@@ -228,6 +231,7 @@ mod tests {
             source_scanner: "trivy".into(),
             title: "test".into(),
             detected_at: Utc::now(),
+            fixed_versions: vec![],
             informational_class: None,
         };
         let info = ScanFindingsRow {
@@ -240,6 +244,7 @@ mod tests {
             source_scanner: "osv".into(),
             title: "unmaintained".into(),
             detected_at: Utc::now(),
+            fixed_versions: vec![],
             informational_class: Some("unmaintained".to_string()),
         };
 
@@ -294,6 +299,86 @@ mod tests {
             .await;
     }
 
+    /// A finding's fix versions must survive the production write and
+    /// retention read adapters before the predicate evaluates them.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn fixed_versions_round_trip_into_retention_predicate() {
+        let Some(pool) = crate::test_support::shared_migrated_pool().await else {
+            return;
+        };
+
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = Uuid::new_v4();
+        let now = Utc::now();
+        let fixed_versions = vec!["1.2.3".to_string(), "2.0.0".to_string()];
+        let fixed = ScanFindingsRow {
+            artifact_id,
+            scan_id,
+            purl: format!("pkg:pypi/fixed-{}@1", artifact_id.simple()),
+            vulnerability_id: "CVE-FIX-1".into(),
+            severity: SeverityThreshold::High,
+            cvss_score: Some(7.0),
+            source_scanner: "osv".into(),
+            title: "fixed upstream".into(),
+            detected_at: now,
+            fixed_versions: fixed_versions.clone(),
+            informational_class: None,
+        };
+        let without_fix = ScanFindingsRow {
+            purl: format!("pkg:pypi/unfixed-{}@1", artifact_id.simple()),
+            vulnerability_id: "CVE-FIX-2".into(),
+            fixed_versions: Vec::new(),
+            ..fixed.clone()
+        };
+
+        let writer = PgScanFindingsRepository::new(pool.clone());
+        writer
+            .insert_batch(&[fixed, without_fix])
+            .await
+            .expect("write projected findings");
+
+        let reader = crate::retention_scan_reader::PgRetentionScanReader::new(pool.clone());
+        let findings = reader
+            .list_findings_for_artifact(artifact_id)
+            .await
+            .expect("read projected findings");
+        assert_eq!(findings.len(), 2);
+        assert_eq!(
+            findings
+                .iter()
+                .find(|f| f.vulnerability_id == "CVE-FIX-1")
+                .expect("fixed finding")
+                .fixed_versions,
+            fixed_versions
+        );
+        assert!(findings
+            .iter()
+            .find(|f| f.vulnerability_id == "CVE-FIX-2")
+            .expect("unfixed finding")
+            .fixed_versions
+            .is_empty());
+
+        let inputs = EvaluationInputs {
+            now,
+            created_at: now,
+            last_downloaded_at: None,
+            keep_rank: None,
+            tag_targeted: false,
+            findings: &findings,
+            first_detected_at: now,
+            latest_scan_at: now,
+        };
+        assert!(matches_bool(&PolicyPredicate::HasFixAvailable, &inputs));
+
+        sqlx::query("DELETE FROM repositories WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup");
+    }
+
     /// DB-backed: a duplicate primary key surfaces as a Conflict
     /// (idempotency contract — see port docstring).
     #[tokio::test]
@@ -316,6 +401,7 @@ mod tests {
             source_scanner: "trivy".into(),
             title: "dup".into(),
             detected_at: Utc::now(),
+            fixed_versions: vec![],
             informational_class: None,
         };
 

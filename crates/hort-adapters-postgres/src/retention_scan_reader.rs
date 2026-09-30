@@ -2,22 +2,16 @@
 //! the retention evaluator uses against the `scan_findings` and
 //! `repo_security_scores` projections from migration 009.
 //!
-//! Purely additive: a brand-new adapter for a brand-new (additive)
-//! port. No existing adapter or port signature is touched.
+//! Implements the dedicated retention read port against the scan
+//! projections.
 //!
-//! ## `fixed_versions` not projected
+//! ## Projection precision
 //!
-//! `scan_findings` (migration 009) stores
-//! `(artifact_id, scan_id, purl, vulnerability_id, severity,
-//! cvss_score, source_scanner, title, detected_at)` only. It does NOT
-//! carry `fixed_versions` / `references` / `aliases` — those live in
-//! the per-finding CAS blob (`ScanCompleted.findings_blob`). This
-//! adapter therefore returns [`Finding`] rows with those three vec
-//! fields **empty**. Consequence: with this projection-only adapter
-//! `HasFixAvailable` can never observe a non-empty `fixed_versions`
-//! and so never matches. The blob-sourced precision is a named
-//! follow-on (successor-in-our-repo / per-finding first-seen
-//! refinement family).
+//! `scan_findings` carries `fixed_versions` from migration 029, so the
+//! retention evaluator can observe fix availability on rescanned
+//! findings. Rows written before migration 029 read as an empty array
+//! until rescan. `references` and `aliases` remain in the per-finding
+//! CAS blob (`ScanCompleted.findings_blob`) and are empty here.
 
 use std::str::FromStr;
 
@@ -54,13 +48,14 @@ struct FindingRow {
     cvss_score: Option<f32>,
     source_scanner: String,
     title: String,
+    fixed_versions: Vec<String>,
     informational_class: Option<String>,
 }
 
 impl FindingRow {
     /// Map a projection row to the shipped [`Finding`] value type.
-    /// `fixed_versions` / `references` / `aliases` are empty — the
-    /// projection has no columns to populate them from (see module docs).
+    /// `fixed_versions` comes from the projection; `references` and
+    /// `aliases` are empty because they have no projection columns.
     /// `informational_class` is read from the persisted column (migration
     /// 015) so an exclusion-triggered re-evaluation reconstructs the same
     /// negligible-lane routing the original scan produced. An
@@ -81,7 +76,7 @@ impl FindingRow {
             severity,
             cvss_score: self.cvss_score,
             title: self.title,
-            fixed_versions: Vec::new(),
+            fixed_versions: self.fixed_versions,
             source_scanner: self.source_scanner,
             references: Vec::new(),
             aliases: Vec::new(),
@@ -147,7 +142,7 @@ impl RetentionScanReader for PgRetentionScanReader {
             let rows = sqlx::query_as::<_, FindingRow>(
                 r#"
                 SELECT purl, vulnerability_id, severity, cvss_score,
-                       source_scanner, title, informational_class
+                       source_scanner, title, fixed_versions, informational_class
                 FROM scan_findings
                 WHERE artifact_id = $1
                 ORDER BY detected_at ASC
@@ -208,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn finding_row_maps_severity_and_leaves_vec_fields_empty() {
+    fn finding_row_maps_severity_and_projected_fix_versions() {
         let r = FindingRow {
             purl: "pkg:npm/x@1".into(),
             vulnerability_id: "CVE-1".into(),
@@ -216,12 +211,13 @@ mod tests {
             cvss_score: Some(7.0),
             source_scanner: "trivy".into(),
             title: "t".into(),
+            fixed_versions: vec!["1.2.3".into()],
             informational_class: None,
         };
         let f = r.into_domain().unwrap();
         assert_eq!(f.severity, SeverityThreshold::High);
         assert_eq!(f.cvss_score, Some(7.0));
-        assert!(f.fixed_versions.is_empty());
+        assert_eq!(f.fixed_versions, ["1.2.3"]);
         assert!(f.references.is_empty());
         assert!(f.aliases.is_empty());
         assert_eq!(f.informational_class, None);
@@ -240,6 +236,7 @@ mod tests {
             cvss_score: None,
             source_scanner: "osv".into(),
             title: "unmaintained".into(),
+            fixed_versions: vec![],
             informational_class: Some("unmaintained".to_string()),
         };
         let f = r.into_domain().unwrap();
@@ -256,6 +253,7 @@ mod tests {
             cvss_score: None,
             source_scanner: "trivy".into(),
             title: "t".into(),
+            fixed_versions: vec![],
             informational_class: None,
         };
         let err = r.into_domain().unwrap_err();

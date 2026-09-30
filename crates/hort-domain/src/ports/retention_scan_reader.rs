@@ -25,25 +25,14 @@
 //! - `list_findings_for_artifact` reads the per-finding `scan_findings`
 //!   projection.
 //!
-//! ## Precision note — `fixed_versions` is **not** projected
+//! ## Projection precision
 //!
-//! The `scan_findings` table (migration 009) stores only
-//! `(artifact_id, scan_id, purl, vulnerability_id, severity,
-//! cvss_score, source_scanner, title, detected_at)`. It does **not**
-//! carry `fixed_versions` / `references` / `aliases` — those live only
-//! in the per-finding CAS blob referenced by `ScanCompleted.findings_blob`.
-//! `HasFixAvailable`'s intended source is a
-//! non-empty `fixed_versions` array on its source advisory. The
-//! Postgres adapter therefore returns [`Finding`] rows with
-//! `fixed_versions` / `references` / `aliases` **empty** (the
-//! projection has nothing to populate them from). The predicate logic
-//! is written against `Finding::fixed_versions` so that a future
-//! richer source makes `HasFixAvailable` work
-//! unchanged — but **with the v1 projection-only adapter,
-//! `HasFixAvailable` can only ever observe an empty `fixed_versions`
-//! and so never matches from projection data.** This is the honest
-//! precision gap; the named follow-on is "blob-sourced
-//! `fixed_versions` precision for `HasFixAvailable`".
+//! `scan_findings` projects the source advisory's `fixed_versions`
+//! (migration 029), so `HasFixAvailable` can match a finding with a
+//! non-empty array. Rows written before that migration retain its empty
+//! default until the artifact is rescanned, so they conservatively do
+//! not match on fix availability. `references` and `aliases` remain only
+//! in the per-finding CAS blob and read as empty through this port.
 
 use uuid::Uuid;
 
@@ -67,8 +56,8 @@ pub trait RetentionScanReader: Send + Sync {
     /// scan, or one that has never been scanned — the caller
     /// distinguishes "never scanned" via [`Self::repo_security_score`]'s
     /// `last_scan_at`, not via an empty findings list). `fixed_versions`
-    /// / `references` / `aliases` are empty on every returned row — see
-    /// the module-level precision note.
+    /// is projected; `references` and `aliases` are empty on every
+    /// returned row. See the module-level precision note.
     fn list_findings_for_artifact(
         &self,
         artifact_id: Uuid,
