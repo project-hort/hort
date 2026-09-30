@@ -29,6 +29,19 @@ For every event on this page:
   timestamp is the decision time.** They are deliberately distinct (see
   per-event notes). Consumers ordering by causality use the per-stream
   `stream_position` / cross-stream `global_position`, not wall-clock.
+- **The two positions carry different guarantees, and a consumer that
+  needs completeness has to know which.** `stream_position` is 0-based
+  and **gapless** within its `stream_id` — the store derives it as that
+  stream's tail plus one inside the appending transaction, and a unique
+  index on `(stream_id, stream_position)` holds it there — so a hole in
+  it is a genuinely skipped event. `global_position` is a total order
+  across streams but is **not** gapless and is **not** a completeness
+  guarantee: it comes from a sequence, so a rolled-back append burns its
+  number permanently, and the number is drawn at INSERT while the row
+  becomes visible at COMMIT, so a cursor that is a bare high-water mark
+  can step over a transaction that commits late. That is accepted
+  behaviour, and it is detectable; the detectors are in
+  [../explanation/event-notifications.md](../explanation/event-notifications.md#detecting-a-late-commit-skip).
 - **Replay-safe.** Events are immutable and may be re-delivered after a
   projector restart; consumers must apply them idempotently.
 

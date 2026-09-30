@@ -33,8 +33,15 @@
 //!    a row that was still in flight. It does not hold, because the
 //!    `nextval` order and the xid-assignment order are independent, and
 //!    several transactional write paths take their xid *before* they
-//!    draw a position. Pinned so the next unit over this question does
-//!    not adopt the horizon on sight.
+//!    draw a position. Pinned so a later reader does not adopt the
+//!    horizon on sight.
+//!
+//! (2) and (3) pin **accepted behaviour**, not an open defect. ADR 0061
+//! takes the decision: the late-commit gap is accepted and documented,
+//! because the naive horizon is unsound (3) and the sound sampled one
+//! trades a bounded partial loss for an unbounded delivery stall. A
+//! change that turns either red is a change to the position model, which
+//! re-opens that decision rather than discharging it.
 
 use std::env;
 use std::sync::Arc;
@@ -256,6 +263,14 @@ async fn transactional_append_is_absent_from_the_broadcast_channel() {
 /// `global_position` orders INSERTs, not COMMITs. A reader that has
 /// already passed position N cannot be promised it saw everything below
 /// N, because a transaction holding a lower position may still commit.
+///
+/// Accepted behaviour under ADR 0061, which decides to state this gap
+/// honestly rather than close it: the cursor stays a bare high-water
+/// mark, `global_position` and `next_after` keep their meaning, and a
+/// consumer that needs completeness detects the loss instead — per-stream
+/// `stream_position` contiguity, or a re-read of a trailing window. So
+/// what this test pins is the promise the log makes, and a change that
+/// turns it red re-opens that decision.
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn a_later_committing_transaction_can_hold_a_lower_global_position() {
@@ -315,6 +330,12 @@ async fn a_later_committing_transaction_can_hold_a_lower_global_position() {
 
 /// An `xmin` visibility horizon does not close the race the test above
 /// pins, and this states why in the shape the codebase actually writes in.
+///
+/// This is the evidence behind a decision rather than a report of an open
+/// defect: ADR 0061 rejects the horizon on the strength of what is
+/// asserted below, and accepts the race it fails to close. A change that
+/// turns this test red re-opens that rejection — it does not license
+/// adopting the horizon.
 ///
 /// The horizon is the obvious reader-side fix: return only rows whose
 /// inserting transaction is below `pg_snapshot_xmin(pg_current_snapshot())`

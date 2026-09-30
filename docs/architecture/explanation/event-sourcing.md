@@ -50,6 +50,20 @@ Two positions coexist: **stream position** is unique within a stream and
 drives optimistic concurrency; **global position** is monotonic across
 all streams and drives category-wide projections.
 
+The two carry different guarantees, and anything that walks the log with
+a cursor has to know which. Stream position is **gapless** within its
+stream — derived as the stream's tail plus one inside the appending
+transaction, with a unique index on `(stream_id, stream_position)`
+holding it there. Global position is monotonic *in assignment* and is
+neither gapless nor a completeness guarantee: it comes from a sequence,
+so a rolled-back append burns its number, and the number is drawn at
+INSERT while the row becomes visible at COMMIT — so a transaction can
+commit *below* a cursor that has already passed, and a bare high-water
+mark never sees it again. That is accepted behaviour
+([ADR 0061](../../adr/0061-store-driven-notification-delivery.md)); the
+detectors are on
+[the event-notifications page](event-notifications.md#detecting-a-late-commit-skip).
+
 ## Appending events
 
 `EventStore::append` takes an `AppendEvents` batch with an

@@ -250,7 +250,10 @@ the receiver's to drop: each delivery carries a fresh
 is re-sent on a restart (the persisted cursor is debounced up to 5
 minutes behind) and once per server replica. The
 asymmetry is deliberate — a duplicate costs a receiver one idempotent
-write, a gap is recoverable by nobody.
+write, while a gap is recoverable by nobody once every reader's cursor
+has passed it and none of them looks back. Looking back is therefore the
+consumer's lever, and it is the one this page's
+[detection section](#detecting-a-late-commit-skip) hands you.
 
 What is *not* promised, and why:
 
@@ -275,11 +278,17 @@ What is *not* promised, and why:
   lower position can commit after a reader has already passed it. A
   cursor that is a bare high-water mark cannot see it again. This bounds
   what *any* consumer of the log can promise, the `GET /api/v1/events`
-  `next_after` checkpoint included, and closing it is a change to the
-  position model rather than to the dispatcher
-  ([ADR 0061](../../adr/0061-store-driven-notification-delivery.md), and
-  `crates/hort-adapters-postgres/tests/event_delivery_visibility.rs` for
-  the reproduction).
+  `next_after` checkpoint included. **It is accepted, not scheduled for a
+  fix**: the reader-side horizons that look like they close it either do
+  not close it (a `pg_snapshot_xmin` horizon — the position order and the
+  transaction-id order are independent) or stall delivery without bound
+  (a horizon sampled against the oldest running transaction, which one
+  long-open transaction freezes entirely)
+  ([ADR 0061](../../adr/0061-store-driven-notification-delivery.md), with
+  `crates/hort-adapters-postgres/tests/event_delivery_visibility.rs` as
+  the reproduction of both). What you can do about it is
+  [detect it](#detecting-a-late-commit-skip), below — the loss is
+  exactly detectable from what you already receive.
 - **Completeness against retention.** The event store is the outbox, and
   it is swept on age rather than on delivery. An artifact stream whose
   *oldest* event is past the audit floor can be sealed and deleted within
@@ -318,8 +327,17 @@ Loss and degradation stay observable:
 - Consumers reconcile through `GET
   /api/v1/events?category=<cat>&after=<checkpoint>&max=<n>&wait_ms=<n>`
   (`crates/hort-http-events/src/handler.rs`), checkpointing on
-  `global_position` and treating re-delivered positions as no-ops. The
-  long-poll variant uses the broadcast channel purely as a wake-up
+  `global_position` and treating re-delivered positions as no-ops. That
+  recovers a failed delivery, a receiver that was down, a subscription
+  that was paused, and a push path you never wired up — but **not** an
+  event whose transaction committed late. `next_after` is the same bare
+  high-water mark the dispatcher's cursor is, over the same log, so
+  re-reading forward from it steps over exactly what the push path
+  stepped over; the pull surface is a second reader of the same log, not
+  a second source. For that one class, use
+  [the detectors below](#detecting-a-late-commit-skip) — a re-read of a
+  *trailing* window recovers it, a re-read from your checkpoint does not.
+  The long-poll variant uses the broadcast channel purely as a wake-up
   signal and re-reads the event store for the payload — so an event the
   channel does not carry costs a caller up to one `wait_ms` of latency,
   never the event. Per-event repository filtering applies to the
@@ -329,6 +347,88 @@ Loss and degradation stay observable:
 This is the same posture throughout: durable truth lives in the event
 log, every delivery path is a read of that log, and the push channel is
 a latency optimisation on top of it.
+
+## Detecting a late-commit skip
+
+If you are a replication relay, a SIEM shipper or an SBOM indexer — a
+consumer for which a missing event is a correctness problem rather than a
+latency one — a position cursor alone cannot give you completeness, for
+the reason *Delivery semantics* above gives: the log's cross-stream
+sequence is drawn at INSERT and becomes visible at COMMIT. It can give
+you *detection*, exactly, from fields that are already in every payload
+you receive. Both positions ride every event — in a webhook body, in a
+NATS message and in a `GET /api/v1/events` page alike: `global_position`,
+the cross-stream sequence, and `stream_position`, a counter within one
+`stream_id`.
+
+Three detectors, strongest first.
+
+**Per-stream contiguity — exact.** `stream_position` is 0-based and
+gapless within a stream. The server derives it as that stream's current
+tail plus one, inside the same transaction that appends the event, and a
+unique index on `(stream_id, stream_position)` rejects a second event at
+the same position — so a concurrent appender loses the race rather than
+creating a hole, and an append that rolls back leaves nothing behind to
+skip over. Keep the last `stream_position` you handled per `stream_id`:
+an event arriving more than one position above it means you missed
+something, with certainty and not as a suspicion. A stream you first see
+at a position above 0 is the same signal. This is the detector to build
+on, and it has two limits that are not corner cases:
+
+- **Anything that filters events out of your feed breaks it.** An
+  `event_types` filter is the obvious one: you asked for a subset of each
+  stream, so you are *supposed* to receive `stream_position` 0 and 4 and
+  nothing between, and holes carry no information. Authorization
+  filtering breaks it the same way and less visibly, because it is
+  applied **per event, not per stream** — both the dispatcher
+  (`crates/hort-app/src/use_cases/subscription_filter.rs`) and the pull
+  surface drop an individual event whose `repository_id` you lack `Read`
+  on, or whose type is an authorization-model mutation or a privileged
+  audit fact you are not admin for, while passing its stream-mates that
+  carry no repository association at all. So contiguity is a detector
+  only when nothing between you and the log is removing events: no
+  `event_types` filter, and a principal that can read everything in the
+  categories you take. Where that does not hold, use the trailing-window
+  re-read below and compare it against the same filtered view — it
+  compares like with like, so a filter does not disturb it.
+- **A skipped event that was its stream's last is never revealed.** The
+  hole is exposed by the successor that arrives above it. If no successor
+  is ever appended — an artifact's final lifecycle event, the last event
+  of a retired ref — nothing arrives to expose it, and the stream simply
+  looks shorter than it is. Nothing on this page closes that; a consumer
+  that cannot tolerate it needs the trailing-window re-read below, which
+  does not depend on a successor.
+
+**A trailing-window re-read — exact, bounded, and the one that works
+under a filter.** Do not only read forward from your current checkpoint.
+Also keep the checkpoint value you held Δ ago, and periodically re-read
+`GET /api/v1/events?category=<cat>&after=<that older checkpoint>` —
+paging on `next_after` until `has_more` is false — comparing what comes
+back against what you already handled. Anything that appears inside a
+window you had already passed is precisely a late-committing append. The
+read is a bounded range scan of the `(stream_category, global_position)`
+index server-side, and it costs you nothing semantically: delivery is
+at-least-once with duplicates already, so you may simply re-handle the
+window rather than remember which positions were in it.
+
+Δ is a *time* span, which is why the recipe is "the checkpoint you held Δ
+ago" rather than a subtraction on the position number — positions are a
+sequence, not a clock, and you cannot convert one to the other without
+knowing the instance's append rate. Choose Δ larger than the longest
+write transaction on the server. The bound Hort puts on that is the
+worker pools' `lock_timeout` (`HORT_WORKER_LOCK_TIMEOUT_MS`, default
+`120000` ms), so 120 seconds covers a default deployment; an operator who
+raised that value — or set it to `0`, which disables the backstop — has
+raised your floor with it, so confirm it rather than assuming. Round
+generously: a Δ that is too large costs a few more duplicate events, a Δ
+that is too small silently costs you the events it was meant to catch.
+
+**A `global_position` gap — a trigger, never a verdict.** A missing
+number in the sequence is worth a second look and is not by itself
+evidence of anything. The sequence is not transactional: an append whose
+transaction rolls back burns its number permanently, so gaps occur in
+ordinary operation. Treat a gap as a reason to run one of the two
+detectors above, never as a conclusion that an event was lost.
 
 ## Related pages
 
