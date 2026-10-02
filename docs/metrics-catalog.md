@@ -4182,9 +4182,10 @@ RetentionPurgedResult}`.
 The audit-retention sweep: for each enumerated candidate stream
 whose per-category retention rule + the compliance retention floor are
 satisfied, the stream is sealed via the `seal_and_remove` chokepoint
-(`delete_stream` for `StreamRetentionMode::Delete`, `archive_stream`
-for `Archive`) — the `StreamSealed` tombstone is emitted by the
-adapter, never by this metric path. One
+(`delete_stream` for `StreamRetentionMode::Delete` — the only mode
+config parsing accepts; `archive_stream` for the config-refused
+`Archive`, see the `archived` note below) — the `StreamSealed` tombstone
+is emitted by the adapter, never by this metric path. One
 `hort_event_store_streams_archived_total` emission per candidate-stream
 decision (sealed or skipped).
 
@@ -4212,9 +4213,14 @@ decision; an empty candidate set emits nothing):
 
 - `archived` — the stream was sealed via `EventStore::archive_stream`
   (`StreamRetentionMode::Archive`); the chokepoint emitted the
-  `StreamSealed` tombstone and moved the stream to the configured cold-
-  storage target prefix (the cold-storage *write* is a named
-  follow-on; v1 only threads the target through the chokepoint).
+  `StreamSealed` tombstone and **removed the live rows**, carrying the
+  configured target prefix no further than a `tracing` field. **Never
+  emitted by a shipped deployment:** the cold-storage *write* is deferred
+  post-v1, so `HORT_RETENTION_STREAM_MODE=archive` is refused at config
+  parsing in both binaries and the `Archive` mode is unreachable. Do not
+  build a "cold-storage offload" dashboard or alert on this series — it
+  stays documented as the value this seal mode will emit once a
+  cold-storage writer backs it.
 - `deleted` — the stream was sealed via `EventStore::delete_stream`
   (`StreamRetentionMode::Delete`, the v1 default); the chokepoint
   emitted the `StreamSealed` tombstone and removed the live rows.

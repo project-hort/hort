@@ -66,8 +66,12 @@
 //! call the retention chokepoint per the one global [`StreamRetentionModeRef`]
 //! (`Delete` → `delete_stream`, `Archive` → `archive_stream` with a
 //! target of `format!("{prefix}/{stream_id}")` — opaque per
-//! `event_store.rs:191-199`; designing the cold-storage *write* is
-//! future work). A chokepoint `Err` is per-stream:
+//! `EventStore::archive_stream`). Only `Delete` is reachable in a
+//! shipped deployment: the cold-storage *write* is deferred post-v1, so
+//! `archive_stream` deletes the stream exactly as `delete_stream` does
+//! and both binaries refuse `HORT_RETENTION_STREAM_MODE=archive` at
+//! config parsing rather than report a delete as an archive. A
+//! chokepoint `Err` is per-stream:
 //! `summary.errors += 1`, `tracing::error!`, **continue** (mirrors
 //! `purge_use_case.rs` per-artifact handling). A `list_*` enumeration
 //! error aborts the whole sweep (`Err`) — distinct from per-stream
@@ -236,10 +240,22 @@ pub struct CategoryRetentionRule {
 /// explicitly out of v1 scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamRetentionModeRef {
-    /// `EventStore::delete_stream` (the v1 default).
+    /// `EventStore::delete_stream` (the v1 default, and the only mode a
+    /// shipped deployment can select).
     Delete,
     /// `EventStore::archive_stream` with target
     /// `format!("{target_prefix}/{stream_id}")`.
+    ///
+    /// **Only tests construct this.** No `EventStore` implementation
+    /// writes to cold storage yet — the Postgres adapter's
+    /// `archive_stream` seals and deletes exactly like the delete path —
+    /// so `HORT_RETENTION_STREAM_MODE=archive` is refused at config
+    /// parsing in both binaries and the composition root never produces
+    /// this variant. The arm below stays so the routing does not have to
+    /// be reconstructed when the cold-storage writer ships; it must not
+    /// be made reachable before then, because its `Ok` path increments
+    /// [`RetentionArchiveSummary::archived`] for events that were
+    /// removed.
     Archive { target_prefix: String },
 }
 
@@ -249,7 +265,10 @@ pub enum StreamRetentionModeRef {
 pub struct RetentionArchiveSummary {
     /// Candidate streams the sweep visited.
     pub candidates_visited: u64,
-    /// Streams sealed via `archive_stream` (`Archive` mode).
+    /// Streams sealed via `archive_stream` (`Archive` mode). Always `0`
+    /// in a shipped deployment — `Archive` is unreachable while the
+    /// cold-storage writer is deferred post-v1 (see
+    /// [`StreamRetentionModeRef::Archive`]).
     pub archived: u64,
     /// Streams sealed via `delete_stream` (`Delete` mode).
     pub deleted: u64,
@@ -548,6 +567,14 @@ impl EventStoreRetentionUseCase {
                     );
                 }
             },
+            // Unreachable in a shipped deployment: both binaries refuse
+            // `HORT_RETENTION_STREAM_MODE=archive` at config parsing while
+            // the cold-storage writer is deferred post-v1, because
+            // `archive_stream` deletes the stream exactly as
+            // `delete_stream` does. The `Ok` arm below therefore counts
+            // and logs an archive that did not happen — do not make this
+            // path reachable before an `EventStore` implementation
+            // actually writes the stream somewhere.
             StreamRetentionModeRef::Archive { target_prefix } => {
                 let target = format!("{target_prefix}/{}", candidate.stream_id);
                 match self.events.archive_stream(stream_id, &target).await {

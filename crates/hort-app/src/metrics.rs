@@ -4136,7 +4136,13 @@ pub fn emit_retention_purged(result: RetentionPurgedResult) {
 pub enum StreamsArchivedResult {
     /// The stream was sealed via `EventStore::archive_stream`
     /// (`StreamRetentionMode::Archive`) — the seal chokepoint emitted the
-    /// `StreamSealed` tombstone and moved the stream to cold storage.
+    /// `StreamSealed` tombstone and removed the live rows, carrying the
+    /// archive target no further than a `tracing` field. **Never emitted
+    /// by a shipped deployment:** the cold-storage write is deferred
+    /// post-v1, so `HORT_RETENTION_STREAM_MODE=archive` is refused at
+    /// config parsing and the `Archive` mode is unreachable. The label
+    /// value stays in the catalog as the one this seal mode will emit
+    /// once a cold-storage writer backs it.
     Archived,
     /// The stream was sealed via `EventStore::delete_stream`
     /// (`StreamRetentionMode::Delete`) — the seal chokepoint emitted the
