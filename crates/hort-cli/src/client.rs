@@ -147,6 +147,38 @@ impl AkClient {
         Self::handle_response(resp).await
     }
 
+    /// Issue a `POST` and return the response status alongside the
+    /// deserialised body.
+    ///
+    /// The admin-tasks invoke endpoint distinguishes a fresh enqueue
+    /// (`202 Accepted`) from a same-day idempotency dedup that handed
+    /// back an **already existing** job (`200 OK`). A caller that needs
+    /// to know whether the job it is about to read was actually created
+    /// by its own request — rather than inherited from an earlier one —
+    /// cannot get that from the body, which carries the same
+    /// `task_job_id` shape either way. Comparing timestamps instead
+    /// would make the answer depend on clock skew between the operator's
+    /// host and the server; the status code is the server's own verdict.
+    pub async fn post_with_status<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<(reqwest::StatusCode, T)> {
+        let url = self.base_url.join(path).context("joining URL path")?;
+        // SECURITY: only the URL is traced — no headers, no body.
+        tracing::debug!(method = "POST", url = %url, "request");
+        let resp = self
+            .http
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .context("HTTP POST")?;
+        let status = resp.status();
+        let parsed = Self::handle_response(resp).await?;
+        Ok((status, parsed))
+    }
+
     /// POST to `path` with `body` serialised as JSON; succeed on any 2xx
     /// without attempting to deserialise the response body. Used by
     /// endpoints that return 204 No Content (e.g.

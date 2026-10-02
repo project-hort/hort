@@ -42,6 +42,15 @@ pub enum ExpirationReason {
     /// `KeepLastN` predicate fired. `rank` is this artifact's position
     /// (1-based, newest = 1) among `total` versions; it expired because
     /// `rank > keep`.
+    ///
+    /// `total` counts the **usable** siblings — the ones
+    /// [`Artifact::is_downloadable`](crate::entities::artifact::Artifact::is_downloadable)
+    /// admits — not every row in the group, because that is what
+    /// `KeepLastN(n)` promises to leave behind. A soft-deleted or
+    /// quarantine-protected sibling is in neither number. The field
+    /// keeps its plain name: it is serialized into the persisted
+    /// `ArtifactExpired` payload as `total`, so renaming it would
+    /// orphan every reason already written to the event store.
     KeepLastN { keep: u32, total: u32, rank: u32 },
     /// An operator manually expired the artifact.
     Manual { actor: Uuid, reason: String },

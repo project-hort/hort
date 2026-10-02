@@ -51,6 +51,7 @@ pub mod enqueue_quarantine_release_sweep;
 // CronJob runs to schedule the terminal-scan-row retention sweep.
 // Runtime DSN; no svc-token. Same delivery contract
 // as `enqueue-prefetch-row-retention-sweep`.
+pub mod enqueue_jobs_row_retention_sweep;
 pub mod enqueue_scan_row_retention_sweep;
 // DB-only enqueue subcommand the Helm CronJob
 // runs to retrofit older PyPI wheels with their PEP 658 metadata
@@ -227,11 +228,14 @@ pub enum Command {
     /// dependency). The always-on worker picks the row up and
     /// dispatches to `PrefetchRowRetentionSweepHandler`, which
     /// deletes terminal (`status IN ('completed', 'failed')`)
-    /// `kind LIKE 'prefetch%'` and `kind = 'oci-index-child-ingest'`
-    /// rows older than a configurable horizon
-    /// (default 7 days). Pairs with the per-table
-    /// autovacuum tuning on `public.jobs` (migration 009) so the
-    /// transitive-cascade churn does not grow the table unbounded.
+    /// `kind LIKE 'prefetch%'` (minus `prefetch-tick`, whose newest
+    /// completion carries the prefetch rotation cursor and which
+    /// `jobs-row-retention-sweep` retains) and
+    /// `kind = 'oci-index-child-ingest'` rows older than the handler's
+    /// 7-day `DEFAULT_HORIZON` — the schedule is a chart value, the
+    /// horizon is not settable by any supported path. Pairs with the
+    /// per-table autovacuum tuning on `public.jobs` (migration 009) so
+    /// the transitive-cascade churn does not grow the table unbounded.
     EnqueuePrefetchRowRetentionSweep(
         enqueue_prefetch_row_retention_sweep::EnqueuePrefetchRowRetentionSweepArgs,
     ),
@@ -242,12 +246,31 @@ pub enum Command {
     /// dependency). The always-on worker picks the row up and
     /// dispatches to `ScanRowRetentionSweepHandler`, which
     /// deletes terminal (`status IN ('completed', 'failed')`)
-    /// `kind = 'scan'` rows older than a configurable horizon
-    /// (default 7 days). Pairs with the per-table
+    /// `kind = 'scan'` rows older than the handler's 7-day
+    /// `DEFAULT_HORIZON` — the schedule is a chart value, the horizon is
+    /// not settable by any supported path. Pairs with the per-table
     /// autovacuum tuning on `public.jobs` (migration 009) so
     /// scan-lifecycle churn does not grow the table unbounded.
     EnqueueScanRowRetentionSweep(
         enqueue_scan_row_retention_sweep::EnqueueScanRowRetentionSweepArgs,
+    ),
+    /// Enqueue one `jobs-row-retention-sweep` job and exit. The Helm
+    /// CronJob runs this daily (operator-tunable) using the runtime DSN
+    /// (no svc-token; no `cronJobs.enabled` umbrella dependency). The
+    /// always-on worker picks the row up and dispatches to
+    /// `JobsRowRetentionSweepHandler`, which deletes terminal
+    /// (`status IN ('completed', 'failed')`) rows of every kind the two
+    /// kind-specific sweeps above do not reach (`(kind NOT LIKE
+    /// 'prefetch%' OR kind = 'prefetch-tick') AND kind NOT IN ('scan',
+    /// 'oci-index-child-ingest')`) older than the handler's 7-day
+    /// `DEFAULT_HORIZON` — the schedule is a chart value, the horizon is
+    /// not settable by any supported path — retaining per
+    /// kind the newest `completed` row and the newest terminal row — the
+    /// rows the boot-time liveness gauges and the prefetch rotation
+    /// cursor read back. Closes the growth gap the two kind-specific
+    /// sweeps left on the remaining ~19 kinds.
+    EnqueueJobsRowRetentionSweep(
+        enqueue_jobs_row_retention_sweep::EnqueueJobsRowRetentionSweepArgs,
     ),
     /// Enqueue one `wheel-metadata-backfill`
     /// job and exit. The Helm CronJob runs this on the operator's
@@ -308,6 +331,7 @@ fn dispatch(command: Command) -> ExitCode {
             enqueue_prefetch_row_retention_sweep::run(args)
         }
         Command::EnqueueScanRowRetentionSweep(args) => enqueue_scan_row_retention_sweep::run(args),
+        Command::EnqueueJobsRowRetentionSweep(args) => enqueue_jobs_row_retention_sweep::run(args),
         Command::EnqueueWheelMetadataBackfill(args) => enqueue_wheel_metadata_backfill::run(args),
         Command::ValidateConfig(args) => validate_config::run(&args),
         Command::License(args) => license::run(&args),
@@ -519,6 +543,18 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::EnqueueScanRowRetentionSweep(_))
+        ));
+    }
+
+    // `enqueue-jobs-row-retention-sweep` subcommand parses.
+    // Accepts bare invocation — the subcommand has no flags.
+
+    #[test]
+    fn enqueue_jobs_row_retention_sweep_parses_bare_invocation() {
+        let cli = Cli::try_parse_from(["hort-server", "enqueue-jobs-row-retention-sweep"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::EnqueueJobsRowRetentionSweep(_))
         ));
     }
 

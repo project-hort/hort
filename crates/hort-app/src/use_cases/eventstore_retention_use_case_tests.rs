@@ -472,6 +472,51 @@ async fn non_terminal_tail_is_skipped_not_sealed() {
 }
 
 // ---------------------------------------------------------------------------
+// Over-cap stream → read error, never sealed
+// ---------------------------------------------------------------------------
+
+/// Sealing DELETES a stream, so "the tail is the terminal" must be an
+/// answer about the real tail. A stream past `STREAM_EVENT_CAP` cannot be
+/// read to its tail, so the proof reports a read error and the stream is
+/// left alone — rather than being sealed because the 200th event of a
+/// longer stream happened to be an `ArtifactPurged`.
+#[tokio::test]
+async fn over_cap_stream_is_not_sealed_and_counts_as_an_error() {
+    let aid = Uuid::new_v4();
+    let sid = artifact_stream(aid);
+    // 201 events with an `ArtifactPurged` at BOTH the 200th position and
+    // the true tail: the read is refused on length alone, so neither the
+    // tail that a truncated read would have found nor the real one can
+    // authorise a seal.
+    let mut stream: Vec<PersistedEvent> = (0..199).map(|p| ingested_persisted(aid, p)).collect();
+    stream.push(purged_persisted(aid, 199));
+    stream.push(purged_persisted(aid, 200));
+    assert_eq!(stream.len(), 201);
+
+    let h = build(
+        MockReader::new().with(vec![candidate(
+            sid.clone(),
+            StreamCategory::Artifact,
+            ts(1_000),
+            "ArtifactPurged",
+        )]),
+        MockEventStore::new().seed_stream(&sid, stream),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Delete,
+    );
+
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+
+    assert_eq!(s.errors, 1);
+    assert_eq!(s.deleted, 0);
+    assert_eq!(s.skipped_non_terminal, 0);
+    assert!(
+        h.store.deleted_streams().is_empty(),
+        "a stream whose tail cannot be proven must never be deleted"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Floor not elapsed → skipped_floor_not_elapsed, no chokepoint
 // ---------------------------------------------------------------------------
 

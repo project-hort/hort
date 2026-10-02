@@ -29,6 +29,19 @@ For every event on this page:
   timestamp is the decision time.** They are deliberately distinct (see
   per-event notes). Consumers ordering by causality use the per-stream
   `stream_position` / cross-stream `global_position`, not wall-clock.
+- **The two positions carry different guarantees, and a consumer that
+  needs completeness has to know which.** `stream_position` is 0-based
+  and **gapless** within its `stream_id` — the store derives it as that
+  stream's tail plus one inside the appending transaction, and a unique
+  index on `(stream_id, stream_position)` holds it there — so a hole in
+  it is a genuinely skipped event. `global_position` is a total order
+  across streams but is **not** gapless and is **not** a completeness
+  guarantee: it comes from a sequence, so a rolled-back append burns its
+  number permanently, and the number is drawn at INSERT while the row
+  becomes visible at COMMIT, so a cursor that is a bare high-water mark
+  can step over a transaction that commits late. That is accepted
+  behaviour, and it is detectable; the detectors are in
+  [../explanation/event-notifications.md](../explanation/event-notifications.md#detecting-a-late-commit-skip).
 - **Replay-safe.** Events are immutable and may be re-delivered after a
   projector restart; consumers must apply them idempotently.
 
@@ -40,6 +53,10 @@ Both events land on the **artifact** stream — wire-form id
 `ArtifactExpired` records the policy decision; `ArtifactPurged`
 terminates that work item once storage has been reconciled. Source:
 `crates/hort-domain/src/events/artifact_events.rs`.
+
+`ArtifactPurged` also terminates an `ArtifactDeleted` (see
+[Deletion](#deletion) below): one storage-GC sweep releases the bytes of
+every retired artifact, whether a policy or a caller retired it.
 
 ### `ArtifactExpired`
 
@@ -60,7 +77,8 @@ is the pending-purge work item the GC walk consumes.
 ### `ArtifactPurged`
 
 Emitted when the storage delete completes, or the blob is confirmed
-already absent, terminating an `ArtifactExpired` work item. Re-emitting
+already absent, terminating a byte-release work item — an
+`ArtifactExpired` or an `ArtifactDeleted`. Re-emitting
 on an already-absent blob is **correct, not an error** (idempotent — §6
 invariant 4): re-applying to an already-purged artifact is a no-op that
 does not corrupt projected state.
@@ -69,18 +87,27 @@ does not corrupt projected state.
 |---|---|---|
 | `artifact_id` | `Uuid` | The artifact whose reference was removed; equals the artifact stream's `entity_id`. |
 | `content_hash` | `ContentHash` | CAS content hash whose reference this purge removed (64 lowercase hex chars by construction). |
-| `refs_remaining` | `u32` | Cross-`kind` `content_references` count for `content_hash` **after** this artifact's reference was removed. `0` ⇒ the blob itself was deleted; `> 0` ⇒ a still-live reference keeps the blob and only this artifact's reference is gone. |
+| `refs_remaining` | `u32` | Cross-`kind` `content_references` count for `content_hash` **after** this artifact's reference was removed. `0` ⇒ the blob itself was deleted; `> 0` ⇒ a still-live reference keeps the blob and only this artifact's reference is gone. The count is the one observed under the hash-scoped blob-reclamation lock immediately before the storage decision, not the one the sweep's preparation transaction recorded earlier: a re-reference that lands in between corrects the value here and keeps the blob. |
 | `purged_at` | `DateTime<Utc>` | Wall-clock at which the purge (or already-absent confirmation) completed. Distinct from the event store's `stored_at`. |
 
 **Consumer contract.** A consumer reconstructing retention state keys on
 `(artifact_id)` within the `artifact-{uuid}` stream: an `ArtifactExpired`
-is "pending purge" until a subsequent `ArtifactPurged` on the same
+— or an `ArtifactDeleted` — is "pending purge" until a subsequent
+`ArtifactPurged` on the same
 stream terminates it. Because `ArtifactPurged` is idempotent, a consumer
 that sees it more than once (replay, or a retried already-absent purge)
 must treat the second and later occurrences as no-ops. `refs_remaining`
 is observational — it tells a consumer whether the underlying blob
 survived deduplication, not whether this artifact's purge succeeded
 (it always did, by the time the event is emitted).
+
+**Byte reclamation does not gate this event's meaning.** An artifact is
+externally gone once `ArtifactPurged` is on its stream; the bytes behind
+it are reclaimed by a best-effort sweep that declines to act whenever it
+cannot prove, under the blob lock, that nothing references them. A blob
+whose reclamation was deferred keeps its durable worklist row and is
+retried by the next run, so `refs_remaining` is a statement about what
+the sweep observed, never a promise about disk.
 
 ## Deletion
 
@@ -95,13 +122,25 @@ envelope's `actor` / `stored_at`, not the payload. Source:
 `crates/hort-domain/src/events/artifact_events.rs`.
 
 Deletion is a **soft delete**: the `artifacts` projection row is retained
-with `deleted_at` set, and the CAS blob is untouched — blob lifetime stays
-refcount-gated GC, because another artifact may reference the same bytes.
+with `deleted_at` set, and the CAS blob is untouched *at this transition*
+— blob lifetime stays refcount-gated GC, because another artifact may
+reference the same bytes.
 A deleted artifact is excluded from every live read, and its path is
 released: the `(repository_id, path)` unique index is predicated on
 `deleted_at IS NULL`, so a later ingest at the same path mints a **new**
 artifact with a new id and its own stream rather than resurrecting this
 one.
+
+`ArtifactDeleted` is **also the byte-release work item** that makes that
+refcount-gated GC fire. The storage-GC sweep enumerates every artifact
+stream carrying an `ArtifactExpired` *or* an `ArtifactDeleted` with no
+following `ArtifactPurged`; the sweep — not the delete — removes the
+artifact's `content_references` source edges and deletes the blob once
+its cross-kind refcount reaches zero. The event is emitted in the same
+transaction as `deleted_at`, so the work item is exactly as durable as
+the retirement it authorises. A caller-deleted artifact whose bytes were
+also GC-eligible therefore acquires an `ArtifactPurged` on a later sweep;
+byte release is asynchronous by design, bounded by the sweep interval.
 
 Deletion is orthogonal to the quarantine axis. The event does not change
 `quarantine_status`, and there is no `Deleted` status value: a `Released`
@@ -122,6 +161,8 @@ are a separate axis — they decide the blob's fate, not the catalog's, and
 may still appear on the stream afterwards). A consumer projecting a live
 catalog removes the artifact on this event and must not reinstate it — a later
 artifact at the same `path` arrives under a *different* `artifact_id` and
-a different stream. It is not a purge signal: `content_hash` may still be
-referenced by other artifacts, and the blob's fate is decided separately
-by `ArtifactExpired` / `ArtifactPurged` above.
+a different stream. It is not itself a purge *confirmation*:
+`content_hash` may still be referenced by other artifacts, and whether
+the blob was actually removed is reported only by the `ArtifactPurged`
+that later terminates this work item (`refs_remaining = 0` ⇒ the bytes
+are gone).

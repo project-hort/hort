@@ -44,6 +44,18 @@ hort_timers_tasks:
     on_calendar: "*-*-* 02:00:00"    # daily 02:00 (Helm: 0 2 * * *)
     enabled: true
     description: "Delete terminal prefetch job rows older than the retention horizon; also covers the eager OCI index-child ingest rows, which accrue on any OCI proxy repository with no opt-in at all."
+  - kind: scan-row-retention-sweep
+    path: dsn-direct
+    exec_subcommand: enqueue-scan-row-retention-sweep
+    on_calendar: "*-*-* 03:00:00"    # daily 03:00 (Helm: 0 3 * * *)
+    enabled: true
+    description: "Delete terminal scan job rows older than the retention horizon; every artifact scan — ingest and every periodic rescan — leaves one, on every deployment from day one."
+  - kind: jobs-row-retention-sweep
+    path: dsn-direct
+    exec_subcommand: enqueue-jobs-row-retention-sweep
+    on_calendar: "*-*-* 03:30:00"    # daily 03:30 (Helm: 30 3 * * *)
+    enabled: true
+    description: "Delete terminal job rows older than the retention horizon for every kind the two kind-specific sweeps do not reach; retains per kind the newest completed row and the newest terminal row, which the liveness gauges and the prefetch rotation cursor read."
   # ── enabled — admin-task (hort-cli; needs the cronjob-tasks token) ───────────
   - kind: scanner-registry-prune
     path: admin-task
@@ -121,7 +133,7 @@ hort_timers_tasks:
     idempotency_window: hour
     on_calendar: "*-*-* 04:00:00"
     enabled: false
-    description: "Retention purge — needs HORT_RETENTION_DATABASE_URL wired."
+    description: "Retention purge — needs HORT_RETENTION_DATABASE_URL wired. Also the only path that reclaims a deleted artifact's bytes."
   - kind: eventstore-archive
     path: admin-task
     idempotency_window: day

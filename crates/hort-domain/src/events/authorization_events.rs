@@ -61,11 +61,14 @@
 //! disclosed, not hashed) to preserve forensic correlation against
 //! the secret-store audit log.
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::rbac::{GrantSubject, Permission};
 use crate::error::{DomainError, DomainResult};
+use crate::retention::RetentionEvaluationMode;
 
 // ---------------------------------------------------------------------------
 // GrantSubjectRecord — serializable audit mirror of GrantSubject
@@ -453,6 +456,27 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // `last_job.status` resolve to `NULL`, which the widened stranded
     // predicate already treats identically to `'failed'`) candidacy.
     "scan-row-retention-sweep",
+    // General terminal-`jobs`-row retention sweep. Consumed by
+    // `JobsRowRetentionSweepHandler` in the worker. The horizon for every
+    // `jobs.kind` the two sweeps above do not reach: deletes rows whose
+    // `status IN ('completed', 'failed')` and whose `updated_at < now() -
+    // $horizon` (default 7 days) for `kind NOT LIKE 'prefetch%' AND kind
+    // NOT IN ('scan', 'oci-index-child-ingest')`. Those exclusions are the
+    // textual complement of the two sibling predicates, so exactly one
+    // horizon is ever in force per kind — a second sweep over the same
+    // rows would silently win whenever its horizon were the shorter.
+    // Retains, per kind, the newest `completed` row AND the newest
+    // terminal row: both `last_completed_at_by_kind` (the
+    // `hort_staging_sweep_overdue` / `hort_event_chain_verify_overdue`
+    // gauges) and `last_result_summary_by_kind` (the `prefetch-tick`
+    // rotation cursor) filter `status = 'completed'`, so retaining only
+    // the newest terminal row would let a `failed` newest row shadow the
+    // `completed` row underneath it and report "never ran" for a task
+    // that demonstrably ran. Non-destructive at the artifact level —
+    // historical job rows only; no artifact / event / scan data is
+    // touched, and non-terminal rows (including a row abandoned in
+    // `running` by a crashed worker) are never deleted.
+    "jobs-row-retention-sweep",
     // PEP 658 wheel-metadata backfill — consumed by
     // `WheelMetadataBackfillHandler` in the worker. The ingest
     // hook extracts wheel METADATA into CAS + a
@@ -576,10 +600,19 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
 /// over the full list — an applied migration can never be edited in place
 /// (`sqlx::migrate!` rejects the changed checksum).
 ///
-/// **Single consumer:** the DB-free lock-step structural guard
-/// (`crates/hort-adapters-postgres/tests/task_kind_check_lockstep_guard.rs`)
-/// that token-scans that migration's `kind IN (…)` list and asserts it
-/// equals this constant exactly. Nothing else reads this constant —
+/// **Two consumers, both structural guards over the whole vocabulary:**
+///
+/// - the DB-free lock-step guard
+///   (`crates/hort-adapters-postgres/tests/task_kind_check_lockstep_guard.rs`)
+///   that token-scans that migration's `kind IN (…)` list and asserts it
+///   equals this constant exactly;
+/// - the abandoned-lease requeue-policy exhaustiveness guard in
+///   `hort_domain::ports::jobs_repository`, which asserts every kind here
+///   is classified by exactly one of `REQUEUE_ON_LEASE_EXPIRY_KINDS` /
+///   `NO_REQUEUE_ON_LEASE_EXPIRY_KINDS`, so a new kind cannot silently
+///   inherit either behaviour.
+///
+/// No *runtime* path reads this constant —
 /// `TaskInvoked::validate` / `TaskFailed::validate` deliberately stay on
 /// the narrower [`ADMIN_INVOKABLE_TASK_KINDS`] (see that constant's doc
 /// for why: no current emitter of either event carries a kind outside the
@@ -644,6 +677,7 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
     "prefetch-dependencies",
     "prefetch-row-retention-sweep",
     "scan-row-retention-sweep",
+    "jobs-row-retention-sweep",
     "wheel-metadata-backfill",
     "provenance-verify",
     "scanner-registry-prune",
@@ -671,8 +705,15 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
 /// The reversal is recorded here (the place the next deferred-items
 /// sweep finds it) as a decision, not silence. The set is **closed at
 /// exactly these three**; adding a fourth is a scope-creep regression
-/// and must be treated as re-opening the audit finding. The same kinds
-/// also carry the durable idempotency layer (ADR 0028).
+/// and must be treated as re-opening the audit finding.
+///
+/// Membership is per **kind** and is the coarse tier: it says a kind can
+/// destroy, not that a given call will. Whether a particular invocation
+/// needs the [`DESTRUCTIVE_TASK_CLAIM`] and takes the durable
+/// per-UTC-day idempotency layer (ADR 0028) is
+/// [`task_invocation_is_destructive`], which refines this set by the
+/// call's own params — `retention-evaluate` in `dry_run` mode is a
+/// member here and does neither.
 pub const DESTRUCTIVE_TASK_KINDS: &[&str] = &[
     "retention-evaluate",
     "retention-purge",
@@ -709,6 +750,85 @@ pub const DESTRUCTIVE_TASK_CLAIM: &str = "task:destructive";
 #[must_use]
 pub fn task_kind_is_destructive(kind: &str) -> bool {
     DESTRUCTIVE_TASK_KINDS.contains(&kind)
+}
+
+/// The one [`DESTRUCTIVE_TASK_KINDS`] kind whose params carry an
+/// invocation mode, so that two invocations of it can differ in whether
+/// they destroy anything.
+pub const RETENTION_EVALUATE_TASK_KIND: &str = "retention-evaluate";
+
+/// Read the [`RetentionEvaluationMode`] out of a
+/// [`RETENTION_EVALUATE_TASK_KIND`] invocation's params.
+///
+/// The sole owner of the wire convention: the mode lives at `"mode"`, and
+/// an absent (or non-string) `mode` is [`RetentionEvaluationMode::Execute`]
+/// — the shipped CronJob posts `{}` and must keep executing. Spelling that
+/// default a second time somewhere else is how two readers of the same
+/// params come to disagree about what an invocation does.
+///
+/// Pure, zero-I/O. Errors with [`DomainError::Validation`] for a `mode`
+/// string outside the closed [`RetentionEvaluationMode`] vocabulary; the
+/// evaluator has no defined behaviour for one, and guessing would either
+/// under- or over-claim authority.
+pub fn retention_evaluate_mode(
+    params: &serde_json::Value,
+) -> DomainResult<RetentionEvaluationMode> {
+    let raw = params
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(RetentionEvaluationMode::Execute.as_str());
+    RetentionEvaluationMode::from_str(raw)
+        .map_err(|message| DomainError::Validation(message.to_owned()))
+}
+
+/// Classify a single **invocation** — a `kind` together with the params it
+/// was invoked with — as destructive.
+///
+/// This is the finer of the two destructive classifiers, and the two are
+/// not interchangeable:
+///
+/// - [`task_kind_is_destructive`] answers "is this kind *ever*
+///   destructive?". That is the right question for audit routing — a dry
+///   run's `TaskInvoked` still belongs on the never-deleted
+///   destructive-kind audit stream — and the wrong question for anything
+///   that must act on what *this* call will actually do.
+/// - This function answers "will this call destroy anything?".
+///   [`RETENTION_EVALUATE_TASK_KIND`] is where the two diverge: its
+///   `dry_run` mode runs the same selection and predicates and appends
+///   nothing.
+///
+/// **Exactly two consumers, and they must never disagree**, because
+/// together they decide the authority an invocation needs and the
+/// single-flight claim it takes:
+///
+/// 1. The [`DESTRUCTIVE_TASK_CLAIM`] gate in the admin-task authorization
+///    path — a destructive invocation needs strictly more authority than
+///    an ordinary one.
+/// 2. The durable per-UTC-day idempotency key (ADR 0028) the invoke
+///    handler derives — a *destructive* sweep must not re-fire after a
+///    controller restart. An observation has no such hazard, and denying
+///    a repeat of one would make "look again" impossible, which is the
+///    one thing a preview has to support.
+///
+/// A consumer that asks the per-kind question instead grants a dry run a
+/// single-flight claim it has no reason to hold, so the second dry run of
+/// a UTC day is deduplicated back to the first and silently reports a
+/// stale observation as a fresh one.
+///
+/// Pure, zero-I/O, total for every `kind`: an unrecognised kind is not
+/// destructive (fail-safe, matching [`task_kind_is_destructive`] — the
+/// `ADMIN_INVOKABLE_TASK_KINDS` allowlist rejects it upstream).
+pub fn task_invocation_is_destructive(
+    kind: &str,
+    params: &serde_json::Value,
+) -> DomainResult<bool> {
+    if !task_kind_is_destructive(kind) {
+        return Ok(false);
+    }
+    if kind != RETENTION_EVALUATE_TASK_KIND {
+        return Ok(true);
+    }
+    Ok(retention_evaluate_mode(params)?.is_destructive())
 }
 
 // ---------------------------------------------------------------------------
@@ -1765,5 +1885,128 @@ mod tests {
     #[test]
     fn destructive_task_claim_is_the_documented_literal() {
         assert_eq!(DESTRUCTIVE_TASK_CLAIM, "task:destructive");
+    }
+
+    // -----------------------------------------------------------------
+    // Per-invocation destructive classification
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn retention_evaluate_task_kind_is_one_of_the_destructive_kinds() {
+        // The mode-carrying kind must stay a member of the closed set, or
+        // `task_invocation_is_destructive` would short-circuit to `false`
+        // before it ever read the mode.
+        assert!(DESTRUCTIVE_TASK_KINDS.contains(&RETENTION_EVALUATE_TASK_KIND));
+        assert!(ADMIN_INVOKABLE_TASK_KINDS.contains(&RETENTION_EVALUATE_TASK_KIND));
+    }
+
+    #[test]
+    fn retention_evaluate_mode_defaults_to_execute_when_absent_or_not_a_string() {
+        // The shipped CronJob posts `{}`; a non-string `mode` is not a mode
+        // the evaluator can read either. Both must keep executing rather
+        // than silently downgrading a scheduled sweep to an observation.
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "mode": null }),
+            serde_json::json!({ "mode": 7 }),
+            serde_json::json!({ "mode": ["dry_run"] }),
+        ] {
+            assert_eq!(
+                retention_evaluate_mode(&params).expect("defaults, never errors"),
+                RetentionEvaluationMode::Execute,
+                "params {params} must read as execute"
+            );
+        }
+    }
+
+    #[test]
+    fn retention_evaluate_mode_reads_both_vocabulary_values() {
+        assert_eq!(
+            retention_evaluate_mode(&serde_json::json!({ "mode": "execute" })).expect("parses"),
+            RetentionEvaluationMode::Execute
+        );
+        assert_eq!(
+            retention_evaluate_mode(&serde_json::json!({ "mode": "dry_run" })).expect("parses"),
+            RetentionEvaluationMode::DryRun
+        );
+    }
+
+    #[test]
+    fn retention_evaluate_mode_rejects_a_value_outside_the_vocabulary() {
+        let err = retention_evaluate_mode(&serde_json::json!({ "mode": "preview" }))
+            .expect_err("outside the closed vocabulary");
+        assert!(
+            matches!(err, DomainError::Validation(ref m) if m.contains("execute, dry_run")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn task_invocation_is_destructive_matches_the_kind_classifier_where_there_is_no_mode() {
+        // For every kind except the mode-carrying one, the per-invocation
+        // answer is exactly the per-kind answer, whatever the params say.
+        for kind in ADMIN_INVOKABLE_TASK_KINDS
+            .iter()
+            .filter(|k| **k != RETENTION_EVALUATE_TASK_KIND)
+        {
+            for params in [
+                serde_json::json!({}),
+                serde_json::json!({ "mode": "dry_run" }),
+                serde_json::json!({ "mode": "nonsense" }),
+            ] {
+                assert_eq!(
+                    task_invocation_is_destructive(kind, &params).expect("total for these kinds"),
+                    task_kind_is_destructive(kind),
+                    "kind {kind:?} with params {params} diverged from the per-kind answer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn task_invocation_is_destructive_splits_the_retention_evaluate_modes() {
+        let execute = serde_json::json!({ "mode": "execute" });
+        let dry_run = serde_json::json!({ "mode": "dry_run" });
+        let defaulted = serde_json::json!({});
+
+        assert!(
+            task_invocation_is_destructive(RETENTION_EVALUATE_TASK_KIND, &execute).expect("parses"),
+        );
+        assert!(
+            task_invocation_is_destructive(RETENTION_EVALUATE_TASK_KIND, &defaulted)
+                .expect("parses"),
+            "an absent mode is the shipped CronJob's execute",
+        );
+        assert!(
+            !task_invocation_is_destructive(RETENTION_EVALUATE_TASK_KIND, &dry_run)
+                .expect("parses"),
+            "a dry run appends nothing and is not destructive",
+        );
+
+        // The finer classifier disagrees with the coarser one exactly here,
+        // and that divergence is the point: audit routing wants the kind,
+        // the claim gate and the idempotency key want the invocation.
+        assert!(task_kind_is_destructive(RETENTION_EVALUATE_TASK_KIND));
+    }
+
+    #[test]
+    fn task_invocation_is_destructive_propagates_an_unreadable_mode() {
+        let err = task_invocation_is_destructive(
+            RETENTION_EVALUATE_TASK_KIND,
+            &serde_json::json!({ "mode": "preview" }),
+        )
+        .expect_err("an unreadable mode cannot be classified");
+        assert!(matches!(err, DomainError::Validation(_)), "{err:?}");
+    }
+
+    #[test]
+    fn task_invocation_is_destructive_never_over_claims_an_unknown_kind() {
+        for kind in ["bogus-kind", ""] {
+            assert!(
+                !task_invocation_is_destructive(kind, &serde_json::json!({ "mode": "execute" }))
+                    .expect("total"),
+                "kind {kind:?} must not be classified destructive"
+            );
+        }
     }
 }

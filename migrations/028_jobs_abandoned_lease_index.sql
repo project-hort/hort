@@ -1,0 +1,54 @@
+-- 028_jobs_abandoned_lease_index.sql
+--
+-- Partial index supporting the abandoned-lease sweep
+-- (`JobsRepository::requeue_abandoned`) — the recovery path for a `jobs`
+-- row left in `status = 'running'` by a worker that died holding the
+-- claim.
+--
+-- ## The gap this index serves
+--
+-- Both claim statements select `status = 'pending'` only. Their
+-- `locked_until IS NULL OR locked_until < now()` clause re-claims a
+-- *pending* row whose not-before has passed; it never looks at a
+-- `running` one. For `kind = 'scan'` that is not clutter but a lost
+-- capability: `jobs_scan_unique` is `(artifact_id) WHERE kind = 'scan'
+-- AND status IN ('pending','running')`, so while the abandoned row sits
+-- there no further scan job for that artifact can be enqueued, and both
+-- rescan predicates skip the artifact as in-flight. The same shape traps
+-- `provenance-verify` (`params->>'artifact_id'` in-flight read) and the
+-- two cascade kinds (`jobs_prefetch_unique`,
+-- `jobs_prefetch_dependencies_unique` on `target_key`).
+--
+-- ## Why this index and not `jobs_claim_idx`
+--
+-- `jobs_claim_idx` is `(kind, priority DESC, created_at) WHERE status =
+-- 'pending'`. Its partial predicate excludes exactly the rows the sweep
+-- looks for, so the sweep would seq-scan `public.jobs` on every tick —
+-- and that table is the highest-churn table in the schema under prefetch
+-- cascade load.
+--
+-- `WHERE status = 'running'` keeps the index tiny by construction: a
+-- running row is one a worker is actively holding, so the index size is
+-- bounded by fleet concurrency (batch size × replicas), not by table
+-- size. The leading `locked_until` column serves both the sweep's range
+-- predicate and its `ORDER BY locked_until ASC` — oldest lapse first, so
+-- a batch-limited sweep drains the longest-stranded rows rather than an
+-- arbitrary subset.
+--
+-- `kind` is deliberately NOT in the index key. The sweep's `kind =
+-- ANY($1)` allow-list matches most of the kind vocabulary, so filtering
+-- it after the range scan over an already-tiny relation is cheaper than
+-- widening the key.
+--
+-- ## Why a new numbered migration
+--
+-- ADR 0022: every already-applied migration is frozen — `sqlx::migrate!`
+-- validates each applied migration's checksum, and any edit (including a
+-- comment-only one) makes an already-migrated database fail with
+-- `VersionMismatch` and refuse to boot. Purely additive: `CREATE INDEX`
+-- names no identifier that previous-release code could lose, so it needs
+-- no `CONTRACTIONS.toml` entry.
+
+CREATE INDEX IF NOT EXISTS jobs_abandoned_lease_idx
+    ON public.jobs (locked_until)
+    WHERE status = 'running';

@@ -22,7 +22,7 @@ its labels and units.
 | `result` | Per-metric enum (see catalog) | ~5-10 per metric |
 | `backend` | `filesystem`, `s3`, `gcs`, `azure`, `memory` (tests) | 5 |
 | `upstream` | Hostname | ~20 typical |
-| `operation` | `put`, `get`, `exists`, `append`, `read_stream`, `read_category` | ~10 |
+| `operation` | `put`, `get`, `exists`, `append`, `read_stream`, `read_category`, `read_categories` | ~10 |
 | `category` | Per-metric — event-stream metrics use `artifact`, `policy`, `admin`, `ref`, `artifact_group`, `curation`, `repository` (7 values); `hort_advisory_ingest_count` uses its own advisory-ecosystem-class taxonomy (see §"Advisory ingest efficacy"). Each metric's catalog entry is the authoritative source for its `category` value set. | per-metric |
 | `strategy` | `inline`, `hash_reference` | 2 |
 | `kind` | 10 values — see `hort_gitops_objects_total` for the full kind enum (`repository`, `claim_mapping`, `permission_grant`, `curation_rule`, `scan_policy`, `retention_policy`, `exclusion`, `upstream_mapping`, `oidc_issuer`, `service_account`) | 10 |
@@ -231,6 +231,7 @@ attached to the router in that mode.
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|-----------------|
 | `hort_authz_decisions_total` | counter | `result`, `permission` | — | `result` ∈ `allow`, `deny` / `permission` ∈ `read`, `write`, `delete`, `admin`, `curate`, `read_metrics` |
+| `hort_authz_denials_total` | counter | `permission`, `reason` | — | `permission` ∈ `read`, `write`, `delete`, `admin`, `read_metrics` (**no `curate`** — see below) / `reason` ∈ `grants`, `cap`, `both` |
 | `hort_http_404_repo_lookups_total` | counter | `format` | — | `format` ∈ known [`RepositoryFormat`](../crates/hort-domain/src/entities/repository.rs) values + sentinel `unknown` |
 
 Emission of `hort_authz_decisions_total` moved from per-handler helpers
@@ -262,6 +263,53 @@ call's inputs + decision:
   curator surface", not "which authority the evaluator consulted".
   An admin-only caller hitting `/api/v1/admin/curation/...` ticks
   `curate=allow`, NOT `admin=allow`.
+
+`hort_authz_denials_total` is the **deny-only sibling** of the decision
+counter, carrying WHICH leg of the two-leg authorization AND
+([ADR 0036](adr/0036-oci-auth-capability-token.md)) produced the deny. The two
+legs have disjoint remediations, and the caller-visible response collapses
+both to the same status by anti-enumeration, so without this the identical
+signal covers two unrelated faults:
+
+- `reason=grants` — the identity holds no such permission on the resource.
+  The presented token's cap would have allowed it. Remediation is a
+  `kind: PermissionGrant` (or the `kind: ClaimMapping` / IdP group claim
+  upstream of it).
+- `reason=cap` — the identity DOES hold the permission; the presented
+  token's cap excluded the resource. Remediation is on the token: widen its
+  declared permissions or its repository set, or re-mint it. The grant table
+  is not at fault. A correct, applied grant with a token cap scoped to a
+  different repository lands here, and used to be indistinguishable from
+  `grants`.
+- `reason=both` — both legs denied. A distinct third value rather than
+  folded into `grants`: reporting one of two faults sends the operator round
+  the diagnosis loop twice.
+
+The spellings come from `AuthzDecision::denial_reason` in
+`crates/hort-app/src/rbac.rs`, so the label set cannot drift from the
+variant set. The deny log line carries the same distinction as the
+`denial_reason` field (the variant name — `DeniedCap`, `DeniedGrants`,
+`DeniedBoth`), so a spike on this counter pivots onto the log records that
+explain it.
+
+**Emitted only where a single decision exists.** The composite
+`CurateOrAdminPrincipal` gate evaluates two permissions (`Curate`, then
+`Admin`) and denies on the pair; neither decision describes that deny on its
+own, so this series is **absent** at that site rather than carrying an
+`unknown` reason. Its deny log line reports both decisions as separate
+`curate_decision` / `admin_decision` fields instead. That gate is the only
+emitter of `permission="curate"`, so **no `curate` series exists on this
+counter at all** — a dashboard must not wait for one. Every other label
+value comes from the shared `authorize()` helper, which has exactly one
+decision per request.
+`hort_authz_decisions_total` remains the complete decision count —
+`sum(hort_authz_denials_total)` is therefore ≤
+`sum(hort_authz_decisions_total{result="deny"})`, and a dashboard must not
+treat the two as interchangeable.
+
+No `repository` label — the same cardinality-control decision
+`hort_authz_decisions_total` documents. Cardinality is bounded by
+permissions × three reasons on deny paths only.
 
 Some legacy call sites (`pypi.rs::upload` / `cargo.rs::publish` /
 `npm.rs::publish_*`) still emit via per-handler `emit_authz_metric`
@@ -608,7 +656,7 @@ so they don't all hit the snapshot queries on the same edge
 | Metric | Type | Labels | Unit | Description |
 |---|---|---|---|---|
 | `hort_dispatcher_principal_resolved_total` | counter | `source ∈ {snapshot_present, snapshot_empty_admin, snapshot_empty_no_admin}` | — | One increment per principal synthesis in the subscription-delivery dispatcher. 3-series. `snapshot_present` = `subscription.snapshot_claims` was non-empty and was used as the evaluation claim set; `snapshot_empty_admin` = `snapshot_claims` empty but the owner carries the admin bit (evaluates with admin authority); `snapshot_empty_no_admin` = `snapshot_claims` empty and owner is not an admin — the operator diagnostic for "subscription created via PAT by a non-admin user" (such a subscription can never match a claims-scoped grant). |
-| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format. `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability` — cardinality is fixed at the rule count (8). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 8 rules × 3 results = 24. |
+| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired). `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented` — cardinality is fixed at the rule count (9). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 9 rules × 3 results = 27. |
 | `hort_effective_permissions_lookups_total` | counter | `result ∈ {ok, denied, not_found}` | — | One increment per call to the admin effective-permissions endpoint (`GET /api/v1/admin/users/:user_id/effective-permissions`). 3-series. `ok` = admin caller, inspected user resolved, view returned; `denied` = `require_admin()` rejected the caller (emitted before the early return; the inspected user was never resolved); `not_found` = caller was admin but the inspected `user_id` did not resolve to a user row. |
 
 Emitted by
@@ -1831,6 +1879,59 @@ unbounded-by-construction with no analytical value. The metric is
 emitted on the healthy path too (`0.0`) so a fresh scrape always sees
 the series (absence vs `0.0` is ambiguous to dashboards), matching the
 `hort_unsafe_config_active` convention.
+
+### Refcount-reconcile purge start-gate
+
+| Metric | Type | Labels | Unit | Values |
+|--------|------|--------|------|--------|
+| `hort_refcount_reconcile_gate_closed` | gauge | — (no labels) | Boolean (0/1) | `0` = the worker's boot refcount-reconcile sweep converged (or the operator opted out with authoritative state) and `retention-purge` may run; `1` = the sweep did not converge and this worker refuses every `retention-purge` invocation |
+
+Emitted by `hort-worker`'s heartbeat loop
+(`heartbeat::reassert_reconcile_gate`), **refreshed on every 60-second
+tick** and phase-locked with `hort_scan_queue_depth` and the
+`scanner_registry.last_heartbeat` refresh — the tick that proves the
+worker is alive is the tick that says what it is refusing to do.
+
+`RefcountReconcileUseCase::sweep_drift` keeps sweeping past a
+repository it cannot scan or a repair it cannot apply, counting each
+failure, and still returns `Ok`. A *converged* sweep is therefore
+`errors == 0`, not `Ok`: a partially-failed pass may have left a
+`primary_content` / `metadata_blob` edge missing, and the GC walk
+reading that projection as authoritative can drive a shared hash's
+cross-`kind` count to zero and delete a live artifact's bytes. Both the
+partial and the total failure close the gate.
+
+**Why refreshed per tick, not set once at boot** — unlike
+`hort_staging_sweep_overdue` (a `hort-server` boot signal, where an
+in-process re-check would re-introduce the deliberately-absent server
+scheduler), the worker already runs a 60-second loop, so there is no
+new scheduler to pay for. Alerting is on the instantaneous value
+(`hort_refcount_reconcile_gate_closed > 0`) with no `max_over_time`
+window needed to catch a boot-only emission. The gate itself is still
+decided once per boot and never re-decided: clearing the cause and
+restarting the worker is what re-runs the sweep.
+
+**No labels** — one gate per worker process; the emitting replica is
+already the series' identity to the scraper, and a `worker_id` label
+would be unbounded by construction (pod churn) for no analytical value.
+The `worker_id` is on the accompanying log line instead.
+
+**This gauge is the secondary signal, and cannot be the only one.** The
+worker `/metrics` listener is off by default (`worker.metrics.enabled:
+false`, and enabling it also requires declaring `scrapeFrom`), so a
+gauge alone can be unreadable in a real deployment. The gate is decided
+once at boot and holds for the life of the pod, so a closed gate must
+be discoverable *while it persists*:
+
+1. **Primary — the worker log stream** (always on, no listener, no
+   knob): the same heartbeat tick emits a `warn!` naming the worker, the
+   reason the gate is closed, and the remediation, for as long as the
+   condition holds.
+2. **Durable — `jobs.last_error`**: every refused `retention-purge`
+   (CronJob or hand-invoked) is rescheduled with the refusal text, which
+   the server's always-on admin task API serves. That says the gate is
+   closed; the log line says why.
+3. **This gauge**, for deployments that do scrape the worker.
 
 ### Quarantine-aware index serve
 
@@ -3565,6 +3666,8 @@ deployment the only registered kind is `"scan"`.
 | `hort_admin_tasks_pending_eligible` | gauge | `kind` | jobs | claim-eligible pending rows per kind (`status='pending'` and the lock free/expired), set once per starvation audit (every 60 s). Covers **every** kind present in `jobs`, including kinds this worker does not claim |
 | `hort_admin_tasks_starved_total` | counter | `kind`, `reason` | — | `reason ∈ {unregistered, not_claimed, oldest_row_stalled}` — one increment per audit at which the kind's eligible backlog has gone unserved for > 600 s |
 | `hort_admin_tasks_claim_unmappable_total` | counter | (none) | — | emitted by the Postgres jobs adapter: one increment per claimed row that failed `JobRow` projection and was resolved terminally instead of being stranded in `running` |
+| `hort_admin_tasks_lease_requeued_total` | counter | `kind`, `result` | — | `result ∈ {requeued, retries_exhausted}` — one increment per row the abandoned-lease sweep resolved (a row left in `running` by a worker that stopped renewing its claim) |
+| `hort_admin_tasks_lease_renew_failed_total` | counter | `kind`, `result` | — | `result ∈ {lost, error}` — `lost` fires when the row is no longer this worker's; the dispatcher then **discards** that handler's outcome rather than writing over the row's current holder, so one `lost` is one run whose result was thrown away. `error` is a transient database failure on the renewal statement and has no such consequence |
 
 **Starvation semantics** (issue #131). A `provenance-verify` backlog once
 grew to ~1450 rows over 33 minutes while the same dispatcher claimed and
@@ -3620,6 +3723,51 @@ Note: the 403 "no principal" path (missing auth middleware or
 `AuthContext::Disabled`) does NOT emit the counter — that path indicates
 a misconfigured caller, not an operator invocation attempt.
 
+**Abandoned-lease semantics.** Both claim statements select `status =
+'pending'` only; their `locked_until IS NULL OR locked_until < now()`
+clause re-claims a *pending* row whose not-before has passed and never
+looks at a `running` one. A worker that dies holding a claim therefore
+used to leave the row on `running` forever, and for `kind='scan'` that
+is a lost capability rather than clutter: `jobs_scan_unique` covers
+`status IN ('pending','running')`, so no further scan job for that
+artifact could ever be enqueued and both rescan predicates skipped the
+artifact as in-flight. `provenance-verify`, `prefetch` and
+`prefetch-dependencies` have the same shape via
+`find_active_provenance_for_artifact`, `jobs_prefetch_unique` and
+`jobs_prefetch_dependencies_unique`.
+
+Two metrics cover the recovery, and they answer different questions:
+
+- `hort_admin_tasks_lease_requeued_total` is the **worker-health**
+  signal. A steady rate means a replica is dying mid-task and being
+  silently compensated for; alarm on
+  `increase(hort_admin_tasks_lease_requeued_total[1h]) > 0`.
+  `result="retries_exhausted"` is strictly worse than
+  `result="requeued"`: the row hit the attempt cap and was failed
+  terminally rather than re-driven into the same crash, so the work did
+  not happen. For `kind="scan"` a terminal row hands the artifact to the
+  stranded-scan recovery sweep, which re-enqueues once the scanner is
+  healthy; for the other kinds the next scheduled tick is the recovery.
+- `hort_admin_tasks_lease_renew_failed_total{result="lost"}` is the
+  **overlap** signal, and it is also a **work-discarded** count. It
+  fires when a running handler discovers its row was handed to someone
+  else, which is the only way a requeue can produce two concurrent
+  executions of one row; the dispatcher responds by discarding that
+  handler's outcome, because the damaging write is not the lost result
+  but a `reschedule` that would return a row a live worker is mid-way
+  through to `pending` — inviting a third concurrent execution and
+  charging an attempt to the wrong run. So one increment is one
+  execution whose result never reached the row. It should be flat at
+  zero; a non-zero rate means the grace window is too tight for the
+  fleet's actual pause behaviour. `result="error"` is not that signal —
+  it is a database flap on the renewal statement, and with three
+  renewals per lease a single one is absorbed with no consequence.
+
+Kinds the sweep deliberately does **not** requeue (so neither counter
+ever carries them) are listed in
+`hort_domain::ports::jobs_repository::NO_REQUEUE_ON_LEASE_EXPIRY_KINDS`,
+with the per-kind reason.
+
 **`hort_admin_tasks_completed_total` result semantics** (emitted by the dispatcher):
 
 - `result="completed"` — handler returned
@@ -3646,11 +3794,16 @@ Cardinality:
   v1: 1 histogram.
 - `hort_admin_tasks_in_flight`: 1 gauge per kind.
   v1: 1 gauge.
+- `hort_admin_tasks_lease_requeued_total`: bounded by the 19 kinds in
+  `REQUEUE_ON_LEASE_EXPIRY_KINDS` × 2 result values = 38 series, and only
+  a kind that has actually been abandoned ever creates one.
+- `hort_admin_tasks_lease_renew_failed_total`: the same 19 kinds × 2
+  result values = 38 series.
 
 Source: `hort-http-admin-tasks::handlers::invoke` constants
 `METRIC_ENQUEUED`, `RESULT_OK`, `RESULT_RBAC_DENIED`, `RESULT_VALIDATION_ERROR`;
 `hort_app::task_dispatcher` constants `METRIC_COMPLETED`, `METRIC_DURATION`,
-`METRIC_IN_FLIGHT`.
+`METRIC_IN_FLIGHT`, `METRIC_LEASE_REQUEUED`, `METRIC_LEASE_RENEW_FAILED`.
 
 ### Policy enforcement
 
@@ -3952,12 +4105,18 @@ emit nothing):
 `hort_domain::retention::ExpirationReason::metric_label` string (the
 domain owns the label vocabulary so emitter and catalog cannot drift):
 `age_exceeded` / `unused_ttl` / `keep_last_n` / `manual` /
-`security_finding`. The B3 evaluator currently emits `age_exceeded`
-and `security_finding` (its in-scope predicates); `unused_ttl` /
-`keep_last_n` / `manual` are reserved for the same metric and emitted
-once the `UnusedFor` / `KeepLastN` / manual-expiry input ports are
-wired (named follow-on; the reason vocabulary is locked now so the
-catalog does not churn later).
+`security_finding`. The evaluator currently emits `age_exceeded`,
+`keep_last_n`, and `security_finding` — `keep_last_n` went live with
+the sibling ranking the candidate-enumeration query now resolves.
+`unused_ttl` / `manual` are reserved for the same metric and emitted
+once the `UnusedFor` / manual-expiry inputs are wired (named
+follow-on; the reason vocabulary is locked now so the catalog does not
+churn later). `unused_ttl` is unreachable rather than merely unused:
+the gitops apply linter
+(`hort_apply_config_linter_total{rule=retention_unused_for_not_implemented}`)
+rejects any policy whose predicate uses `UnusedFor` while no
+last-download anchor exists, so no active policy can produce the
+reason.
 
 Source: `hort_app::metrics::{emit_retention_evaluation,
 emit_retention_expired, RetentionEvaluationResult}`;
@@ -3979,11 +4138,11 @@ purge to a policy again would only duplicate that signal and is not in
 the schema (`hort_retention_purged_total{result}` — `result` only).
 Per-artifact attribution (`artifact_id` / `content_hash`) is the
 architect anti-pattern hard-block and stays in `tracing` fields, never
-on this series. Cardinality ceiling is a fixed `result_arity (3)`.
+on this series. Cardinality ceiling is a fixed `result_arity (4)`.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_retention_purged_total` | counter | `result` | — | `result ∈ {success, blob_kept, storage_error}` |
+| `hort_retention_purged_total` | counter | `result` | — | `result ∈ {success, blob_kept, storage_error, deferred}` |
 
 `result` value semantics (one emission per content-hash purge
 decision; an empty pending set emits nothing):
@@ -4001,6 +4160,19 @@ decision; an empty pending set emits nothing):
   `ArtifactPurged` is emitted, the `content_references` rows are not
   removed (the deletion is rolled back with the failed transaction),
   and the next sweep retries this artifact (two-stage idempotency).
+- `deferred` — the hash-scoped blob-reclamation lock was held by
+  another session, so the refcount-0 decision could not be re-verified
+  under it and **no delete was attempted**. Something is writing a
+  `content_references` row for exactly these bytes, or a second sweep
+  is already on them. No `ArtifactPurged` is emitted, the worklist row
+  stands, and the next sweep asks again.
+
+  This is the value that distinguishes *nothing to reclaim* from
+  *reclamation is being skipped*: a deployment with no expired content
+  emits nothing at all, while one whose sweeps keep losing the race
+  emits `deferred` run after run with `success` flat. Alert on a
+  sustained non-zero `deferred` rate, not on a single spike — one
+  deferral is the mechanism working.
 
 Source: `hort_app::metrics::{emit_retention_purged,
 RetentionPurgedResult}`.
@@ -4116,9 +4288,9 @@ label-assertion coverage is complete:
 `hort_retention_evaluations_total` — all six `result` arms
 (`retention_use_case` `tests::metrics`);
 `hort_retention_expired_total` — `age_exceeded`
-+ `security_finding` (`unused_ttl` / `keep_last_n` /
-`manual` are reserved, emitted once their input ports are wired —
-named follow-on, vocabulary locked now);
++ `keep_last_n` + `security_finding` (`unused_ttl` / `manual` are
+reserved, emitted once their inputs are wired — named follow-on,
+vocabulary locked now);
 `hort_retention_purged_total` (`purge_use_case` `tests`, all 3
 values); `hort_event_store_streams_archived_total`
 (`eventstore_retention_use_case` `tests`, all 3 values);
@@ -4135,7 +4307,7 @@ values). Retention-set metrics-catalog completeness: **closed**.
 |--------|------|--------|------|-----------------|
 | `hort_event_store_appends_total` | counter | `category`, `result` | — | `success`, `conflict`, `error` |
 | `hort_event_store_append_duration_seconds` | histogram | `category` | seconds | — |
-| `hort_event_store_reads_total` | counter | `category`, `operation` | — | `operation` ∈ `read_stream`, `read_category` |
+| `hort_event_store_reads_total` | counter | `category`, `operation` | — | `operation` ∈ `read_stream`, `read_category`, `read_categories` |
 | `hort_audit_events_blocked_total` | counter | `attempted_op`, `decision_point` | — | `attempted_op` ∈ `update`, `delete`, `truncate`; `decision_point` ∈ `startup_probe`, `trigger_caught` |
 
 **`category` label values** (source of truth:
@@ -4185,6 +4357,13 @@ values). Retention-set metrics-catalog completeness: **closed**.
 
 Note: for `read_category`, the `category` label is technically redundant
 (it's the lookup key). Kept for symmetry with `read_stream`; not a bug.
+
+`read_categories` — the dispatcher's merged read across a subscription's
+whole filter — increments once **per category in the request**, so the
+`category` label stays comparable with `read_category`'s. The distinct
+operation name is what keeps the two paths separable: N increments under
+`read_categories` are one round trip and one page, where N increments
+under `read_category` are N of each.
 
 `hort_audit_events_blocked_total` is emitted by `PgEventStore`
 at exactly two
@@ -4585,11 +4764,13 @@ The single source of truth for prefix → class mapping is `hort_app::ephemeral_
 |---|---|---|---|
 | `hort_notify_delivery_total` | counter | `target_kind ∈ {webhook, nats_jetstream}`, `result ∈ {delivered, downstream_rejected, failed}` | Counts each per-event delivery attempt by the dispatcher's per-subscription task. NO `subscription_id` label (cardinality). |
 | `hort_notify_delivery_duration_seconds` | histogram | `target_kind`, `result` | Wraps the entire `EventNotifier::notify` call (one event → one transport send). |
-| `hort_notify_broadcast_lagged_total` | counter | (none) | Increments on `tokio::sync::broadcast::error::RecvError::Lagged` in a per-subscription task. Operator signal that `HORT_NOTIFY_CHANNEL_CAPACITY` should be raised. |
+| `hort_notify_broadcast_lagged_total` | counter | (none) | Increments when a per-subscription task observes a lag on the hint channel — on `tokio::sync::broadcast::error::RecvError::Lagged` or while draining queued hints. Operator signal that `HORT_NOTIFY_CHANNEL_CAPACITY` should be raised. A lag costs latency, not an event: delivery is driven by reads of the event store (ADR 0061) and the read that follows covers what the lost hints would have announced. |
+| `hort_notify_store_read_errors_total` | counter | (none) | Increments when a per-subscription task's merged `read_categories` pass fails. The read is fail-closed — the cursor does not move, so nothing is skipped — which makes a *transient* failure invisible except here, and a *deterministic* one (a row this build cannot decode, e.g. mid-rollout or after a rollback) an indefinite stall of every subscription whose filter covers it, delivering nothing. `last_failure` cannot carry this: its `reason` enum describes transport outcomes, and `hort_event_store_reads_total` counts attempts with no outcome. **Alert on a non-zero rate that does not decay.** NO `subscription_id` label (cardinality). |
 | `hort_subscription_total` | gauge | `state ∈ {active, paused, disabled}` | Refreshed by the dispatcher's 30s reconcile. v1 surfaces the active count only — paused/disabled rows are not returned by `list_active`, so they're not enumerated by the reconcile. A future enhancement adds an explicit `list_by_state` call for full breakdown. |
 
-Emitted by [`hort_app::metrics::emit_notify_delivery`](../crates/hort-app/src/metrics.rs)
-and [`hort_app::metrics::emit_broadcast_lagged`](../crates/hort-app/src/metrics.rs)
+Emitted by [`hort_app::metrics::emit_notify_delivery`](../crates/hort-app/src/metrics.rs),
+[`hort_app::metrics::emit_broadcast_lagged`](../crates/hort-app/src/metrics.rs)
+and [`hort_app::metrics::emit_subscription_read_error`](../crates/hort-app/src/metrics.rs)
 from
 [`hort_app::dispatcher::subscription_task`](../crates/hort-app/src/dispatcher/subscription_task.rs).
 The `target_kind` and `result` label values are mapped from

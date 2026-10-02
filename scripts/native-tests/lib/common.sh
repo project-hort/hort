@@ -145,6 +145,34 @@ bounded_poll() {
   done
 }
 
+# capture_match [-i] <pattern> <cmd...> — runs <cmd...>, captures its stdout
+# into a fresh temp file (never a pipe), then greps that FILE for the
+# extended regex <pattern>. Returns 0 on a match, 1 on no match or on
+# <cmd...> exiting non-zero. Optional leading -i makes the match
+# case-insensitive. Always removes its temp file, on every return path.
+#
+# Exists because `<cmd...> | grep -Eq <pattern>` under this file's
+# `set -o pipefail` misreports "no match" once <pattern>'s first hit lands
+# before <cmd...> has finished writing a body bigger than the pipe buffer
+# (64 KiB): `grep -q` exits at its first match, the still-writing producer
+# takes SIGPIPE, and `pipefail` promotes that exit to the pipeline's
+# status — indistinguishable from a genuine no-match. Short enough to
+# read inside a `bounded_poll` predicate string (see assert_metric_ingest
+# below) as well as a plain `if`.
+capture_match() {
+  local -a grep_flags=(-Eq)
+  if [ "$1" = "-i" ]; then grep_flags=(-Eqi); shift; fi
+  local pattern="$1"; shift
+  local tmp
+  tmp="$(mktemp)"
+  if "$@" >"$tmp" 2>/dev/null && grep "${grep_flags[@]}" "$pattern" "$tmp"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 # metrics_scrape_diag <url> [line_prefix] — one-shot GET of a metrics
 # endpoint, echoes "HTTP <code> (curl exit <n>)" for FAIL-message
 # diagnostics. `-w '%{http_code}'` without `-f` so a non-2xx still yields a
@@ -259,7 +287,7 @@ assert_metric_ingest() {
     return
   fi
   if bounded_poll "ingest-metric($fmt)" 60 \
-      "curl -sf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" 2>/dev/null | grep -Eq '^hort_ingest_total\{[^}]*format=\"${fmt}\"[^}]*result=\"success\"[^}]*\}'"; then
+      "capture_match '^hort_ingest_total\{[^}]*format=\"${fmt}\"[^}]*result=\"success\"[^}]*\}' curl -sf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\""; then
     pass "hort_ingest_total{format=\"$fmt\",result=\"success\"} present"
   else
     fail "ingest metric for $fmt" \

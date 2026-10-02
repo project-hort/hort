@@ -48,6 +48,8 @@ fi
 # 2. Listing carries rejection_reason_kind
 # -----------------------------------------------------------------------------
 
+# Bounded: hort-cli's own queue-listing summary JSON for this test's small
+# fixture set, not an unbounded scrape/log.
 if printf '%s' "$QUEUE_OUT" | grep -q '"rejection_reason_kind"'; then
     assert_pass "queue rows expose rejection_reason_kind field"
 else

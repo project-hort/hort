@@ -438,22 +438,26 @@ pub struct ApplyConfigUseCase {
     /// `upstream_allowlist` opt-in/opt-out shape). There is no
     /// env-var and no global `warn` switch.
     lint_config: crate::lint::LintConfig,
-    /// The event-sourced
-    /// retention-policy apply slot. `None` when the retention
-    /// projection port + use case are not wired (test
-    /// harnesses, and any composition that does not opt in); the
-    /// production composition root (`hort-server`/`hort-worker`) installs
-    /// it via [`Self::with_retention`]. When `None`,
-    /// `apply_retention_policies` is a logged no-op (a `RetentionPolicy`
-    /// YAML present with the slot unwired is operator-visible, not a
-    /// silent drop). Builder-shaped exactly like
-    /// `with_federated_jwt_validator` / `with_lint_config` so the
-    /// constructor signature (9 call sites) stays unchanged.
+    /// The event-sourced retention-policy apply slot.
     ///
-    /// Open item — retention-apply slot unwired:
-    /// `with_retention()` stays builder-optional until the
-    /// consumer ships. Sweep this slot's `Option` shape when
-    /// artifact retention goes live.
+    /// A **required** [`Self::new`] parameter — `Option`-typed but not
+    /// omittable. The distinction is the point: the slot stayed
+    /// builder-optional while retention had no consumer, and the
+    /// production composition root was written without ever calling the
+    /// builder, so every `RetentionPolicy` envelope an operator authored
+    /// was parsed, validated, warned about and dropped. A required
+    /// argument forces every composition point to state its answer;
+    /// omission is a compile error rather than an inherited `None`.
+    /// Mirrors [`Self::version_discovery_capable_formats`], which is
+    /// required for the same reason.
+    ///
+    /// `None` stays expressible — a composition with no retention
+    /// projection (test harnesses) is legitimate. When `None`,
+    /// `apply_retention_policies` is a **loud** no-op: a `RetentionPolicy`
+    /// YAML present with the slot unwired warns, never silently drops.
+    /// [`Self::with_retention`] overrides the initial value after
+    /// construction (call-site ergonomics only — it does not make the
+    /// slot optional).
     retention: Option<RetentionApply>,
     /// The deployment's **effective global storage backend**.
     ///
@@ -625,6 +629,7 @@ impl ApplyConfigUseCase {
         service_accounts: Arc<dyn ServiceAccountRepository>,
         users: Arc<dyn UserRepository>,
         version_discovery_capable_formats: Arc<HashSet<String>>,
+        retention: Option<RetentionApply>,
     ) -> Self {
         Self {
             repositories,
@@ -643,11 +648,11 @@ impl ApplyConfigUseCase {
             service_accounts,
             users,
             federated_jwt_validator: None,
-            // Retention apply opt-in (None until the
-            // composition root calls `with_retention`). A
-            // `RetentionPolicy` YAML with this unwired is a logged
-            // no-op, never a silent drop.
-            retention: None,
+            // Supplied by the caller, not defaulted: a composition
+            // point that has no retention projection must say `None`
+            // out loud. `None` keeps `apply_retention_policies` a
+            // warned no-op, never a silent drop.
+            retention,
             // Secure-by-default linter posture (ADR 0015). The
             // production path constructs through `new` only, so the
             // linter rejects single-claim / wildcard-non-admin /
@@ -774,15 +779,17 @@ impl ApplyConfigUseCase {
         self
     }
 
-    /// Install the event-sourced retention-policy apply
-    /// dependencies (projection reader + `RetentionPolicyUseCase`).
+    /// Override the event-sourced retention-policy apply dependencies
+    /// (projection reader + `RetentionPolicyUseCase`) installed as a
+    /// required [`Self::new`] argument.
     ///
-    /// Composition root calls this after [`Self::new`]; without it,
-    /// `apply_retention_policies` is a logged no-op. Builder-shaped
-    /// like `with_federated_jwt_validator` so the constructor stays
-    /// unchanged (the 9 `ApplyConfigUseCase::new` call sites are not
-    /// touched — only the production composition root chains
-    /// `.with_retention(...)`).
+    /// Builder-style purely for call-site ergonomics (a caller holding
+    /// an already-constructed use case does not have to re-supply every
+    /// other constructor argument); it does **not** make the slot
+    /// optional — [`Self::new`] already requires an explicit value.
+    /// Same shape, and same rationale, as
+    /// [`Self::with_version_discovery_capable_formats`].
+    #[must_use]
     pub fn with_retention(mut self, retention: RetentionApply) -> Self {
         self.retention = Some(retention);
         self
@@ -913,7 +920,8 @@ impl ApplyConfigUseCase {
     /// write** (`apply`'s Stage-1 `save_managed`): snapshot/env validation,
     /// the SA->issuer FK check, the `scanBackends` /
     /// `trust_upstream_publish_time` / `prefetchPolicy.maxAgeDays` /
-    /// provenance linters, and the per-repo storage-backend check. Only the
+    /// provenance / retention-predicate linters, and the per-repo
+    /// storage-backend check. Only the
     /// `build_snapshot` reads touch the database -- zero writes. (The
     /// `scanBackends` check validates against the compiled-in
     /// `crate::scanning::KNOWN_SCAN_BACKENDS` set, so it does no I/O and is
@@ -952,7 +960,7 @@ impl ApplyConfigUseCase {
         }
 
         // The snapshot-free rows (rows 2,3,5,6,6b,
-        // 7,7b) are collected by the pure `StaticConfigValidator`, in
+        // 7,7b,9) are collected by the pure `StaticConfigValidator`, in
         // apply's row order, with NO early return / metric / `tracing`.
         // This caller walks the report below and reproduces the historical
         // first-failing-row abort + per-rule metric emission byte-
@@ -1062,16 +1070,17 @@ impl ApplyConfigUseCase {
             return Err(AppError::Domain(DomainError::Validation(joined)));
         }
 
-        // ----- Post-row-4 snapshot-free rejects (rows 5,6,6b,7,7b,7c),
+        // ----- Post-row-4 snapshot-free rejects (rows 5,6,6b,7,7b,7c,9),
         //       collected by `StaticConfigValidator` above. -----
         //
         // Reproduce the historical first-failing-row abort byte-
-        // identically for rows 5/6/7/7b; rows 6b and 7c are newer but
+        // identically for rows 5/6/7/7b; rows 6b, 7c and 9 are newer but
         // join the same row order and the same rows-5/6 shape. Walk the
         // rule order [trust_pt, prefetch-max-age, prefetch-trigger,
-        // provenance, storage-backend, scan-backend-capability] and, on
-        // the FIRST rule with any error finding,
-        // emit that rule's metric (where it has one — rows 5/6/6b/7c
+        // provenance, storage-backend, scan-backend-capability,
+        // retention-unused-for] and, on the FIRST rule with any error
+        // finding,
+        // emit that rule's metric (where it has one — rows 5/6/6b/7c/9
         // only, via `LinterRule::metric_rule`) once per finding, log the
         // same `error!`, and return that rule's
         // `AppError::Domain(DomainError::Validation(_))`. Later rules are
@@ -1079,8 +1088,9 @@ impl ApplyConfigUseCase {
         //
         // - Rows 5 (trust_upstream_publish_time × scan_backends:[]),
         //   6 (PrefetchPolicy.max_age_days), 6b
-        //   (PrefetchPolicy.triggers requiring VersionDiscovery) and 7c
-        //   (scanBackends × repository-format capability)
+        //   (PrefetchPolicy.triggers requiring VersionDiscovery), 7c
+        //   (scanBackends × repository-format capability) and 9
+        //   (RetentionPolicy predicate using `UnusedFor`)
         //   `"; "`-join every finding of the row AND tick
         //   `hort_apply_config_linter_total{rule, result=reject}` once per
         //   finding (cardinality bounded by mappings / repositories).
@@ -1114,6 +1124,10 @@ impl ApplyConfigUseCase {
                 LinterRule::ScanBackendCapability,
                 "gitops apply: scanBackends linter rejected ScanPolicy envelope(s) (backend cannot analyse a governed repository's format — scanner capability map)",
             ),
+            (
+                LinterRule::RetentionUnusedForNotImplemented,
+                "gitops apply: retention predicate linter rejected RetentionPolicy envelope(s) (UnusedFor has no last-download signal and silently decides on age)",
+            ),
         ] {
             let messages: Vec<&str> = report
                 .errors
@@ -1124,7 +1138,7 @@ impl ApplyConfigUseCase {
             if messages.is_empty() {
                 continue;
             }
-            // Per-rule metric (rows 5/6/6b/7c — `metric_rule` is `None`
+            // Per-rule metric (rows 5/6/6b/7c/9 — `metric_rule` is `None`
             // for rows 7/7b). One increment per offending finding.
             if let Some(metric_rule) = rule.metric_rule() {
                 tracing::error!(error_count = messages.len(), "{error_log}");
@@ -1283,7 +1297,8 @@ impl ApplyConfigUseCase {
             .await?;
         // Event-sourced retention policies, same shape
         // as ScanPolicy (gitops-authored via RetentionPolicyUseCase).
-        self.apply_retention_policies(&desired, &mut report).await?;
+        self.apply_retention_policies(&desired, &repo_id_by_name, &mut report)
+            .await?;
 
         // ----- Stage 3: depends on stage 2 -----
         // Exclusion (refs ScanPolicy projection), UpstreamMapping (refs
@@ -1730,6 +1745,29 @@ fn resolve_scope(scope: &ScopeSpec, repo_id_by_name: &HashMap<String, Uuid>) -> 
             PolicyScope::Repository(id)
         }
     }
+}
+
+/// Resolve a `RetentionPolicy`'s operator-authored scope into the
+/// domain form, mirroring [`resolve_scope`].
+///
+/// Panics on a repository name absent from `repo_id_by_name`, for the
+/// same reason `resolve_scope` does: the cross-spec validator in
+/// `hort-config` has already proved every named repository is declared,
+/// and the apply pipeline fills the map from `DesiredState` before
+/// dispatching policy applies. A softer fallback here would mean the
+/// linter's guarantee is no longer load-bearing, and the two resolution
+/// paths would drift.
+fn resolve_retention_scope(
+    scope: &hort_config::retention_policy::RetentionScopeSpec,
+    repo_id_by_name: &HashMap<String, Uuid>,
+) -> hort_domain::retention::RetentionScope {
+    scope.resolve(repo_id_by_name).unwrap_or_else(|missing| {
+        panic!(
+            "INVARIANT: RetentionPolicy references repository name '{missing}' that is not in \
+             repo_id_by_name — pipeline must populate the map from DesiredState before \
+             dispatching retention-policy applies"
+        )
+    })
 }
 
 fn humantime_secs(s: &str) -> i64 {
@@ -2697,6 +2735,11 @@ mod tests {
             // don't care about this rule keep passing unmodified. Tests
             // that DO care override via `with_version_discovery_capable_formats`.
             Arc::new(["npm".to_string()].into_iter().collect()),
+            // No retention projection in this harness. Explicit,
+            // not inherited: the slot is a required argument so a
+            // composition that skips retention says so, and the
+            // apply warns on every envelope it then drops.
+            None,
         )
         // The caller supplies the `LintConfig`.
         // `build_harness` passes `permissive_for_tests()` (the
@@ -2776,6 +2819,11 @@ mod tests {
             users.clone(),
             // See `build_harness_with_lint_config` — same default posture.
             Arc::new(["npm".to_string()].into_iter().collect()),
+            // No retention projection in this harness. Explicit,
+            // not inherited: the slot is a required argument so a
+            // composition that skips retention says so, and the
+            // apply warns on every envelope it then drops.
+            None,
         )
         // Permissive linter (see `build_harness`).
         .with_lint_config(crate::lint::LintConfig::permissive_for_tests());
@@ -5344,6 +5392,11 @@ mod tests {
             h.service_accounts.clone(),
             h.users.clone(),
             Arc::new(["npm".to_string()].into_iter().collect()),
+            // No retention projection in this harness. Explicit,
+            // not inherited: the slot is a required argument so a
+            // composition that skips retention says so, and the
+            // apply warns on every envelope it then drops.
+            None,
         );
         let without_mapping = DesiredState {
             repositories: vec![repo_env("oci-mirror", "proxy")],
@@ -6077,6 +6130,135 @@ mod tests {
     }
 
     // ===================================================================
+    // Gitops apply linter rejecting a `RetentionPolicy` predicate that
+    // uses `UnusedFor` (row 9). No port supplies a last-download anchor,
+    // so the evaluator measures from the creation time and `UnusedFor(N)`
+    // silently decides what `AgeExceeds(N)` decides.
+    // ===================================================================
+
+    /// A `RetentionPolicy` envelope over `AllRepos` carrying `predicate`
+    /// verbatim (the wire form is an opaque `serde_json::Value`).
+    fn retention_policy_env_for_apply(
+        name: &str,
+        predicate: serde_json::Value,
+    ) -> Envelope<hort_config::retention_policy::RetentionPolicySpec> {
+        Envelope {
+            api_version: ApiVersion::V1,
+            kind: Kind::RetentionPolicy,
+            metadata: Metadata { name: name.into() },
+            spec: hort_config::retention_policy::RetentionPolicySpec {
+                predicate,
+                scope: serde_json::json!("AllRepos"),
+            },
+        }
+    }
+
+    /// The pre-write pass rejects `UnusedFor` — nested inside a
+    /// `Composite`, which is the case a root-only rule would let through —
+    /// and ticks `hort_apply_config_linter_total` once for the envelope.
+    #[test]
+    fn apply_rejects_retention_policy_with_nested_unused_for() {
+        use crate::metrics::capture_metrics;
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let desired = DesiredState {
+                    retention_policies: vec![retention_policy_env_for_apply(
+                        "reclaim-cold-nested",
+                        serde_json::json!({
+                            "Composite": [
+                                "Or",
+                                [{ "AgeExceeds": 2_592_000u64 }, { "UnusedFor": 7_776_000u64 }]
+                            ]
+                        }),
+                    )],
+                    ..Default::default()
+                };
+                captured_err = Some(
+                    h.uc.preflight_validate(&desired, &env_oidc())
+                        .await
+                        .expect_err("apply must reject a predicate using UnusedFor"),
+                );
+            });
+        });
+        let err = captured_err.expect("apply must have errored");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("reclaim-cold-nested"),
+                    "validation error must name the offending policy, got: {msg}"
+                );
+                assert!(
+                    msg.contains("UnusedFor"),
+                    "validation error must name the offending predicate, got: {msg}"
+                );
+                assert!(
+                    msg.contains("AgeExceeds"),
+                    "validation error must name the alternative, got: {msg}"
+                );
+            }
+            other => panic!("expected AppError::Domain(DomainError::Validation(_)), got {other:?}"),
+        }
+        let entries = snap.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &entries,
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "retention_unused_for_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            1,
+            "linter metric must tick once for the offending RetentionPolicy",
+        );
+    }
+
+    /// `AgeExceeds` — the semantics `UnusedFor` accidentally delivers
+    /// today — passes the pre-write pass untouched and ticks no reject.
+    #[test]
+    fn apply_accepts_retention_policy_with_age_exceeds() {
+        use crate::metrics::capture_metrics;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let desired = DesiredState {
+                    retention_policies: vec![retention_policy_env_for_apply(
+                        "retain-90d",
+                        serde_json::json!({ "AgeExceeds": 7_776_000u64 }),
+                    )],
+                    ..Default::default()
+                };
+                h.uc.preflight_validate(&desired, &env_oidc())
+                    .await
+                    .expect("AgeExceeds must pass the pre-write pass");
+            });
+        });
+        let entries = snap.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &entries,
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "retention_unused_for_not_implemented"),
+                    ("result", "reject"),
+                ],
+            ),
+            0,
+            "linter metric must NOT tick reject for AgeExceeds",
+        );
+    }
+
+    // ===================================================================
     // `StaticConfigValidator` extraction.
     // (a) No-drift parity: the apply pre-write pass's static subset
     //     and `StaticConfigValidator::validate` agree on the reject SET
@@ -6198,6 +6380,18 @@ mod tests {
                     ..Default::default()
                 },
                 expect_rule: LinterRule::ScanBackendCapability,
+                effective_backend: None,
+            },
+            // Row 9 — a RetentionPolicy predicate using `UnusedFor`.
+            Case {
+                desired: DesiredState {
+                    retention_policies: vec![retention_policy_env_for_apply(
+                        "reclaim-cold",
+                        serde_json::json!({ "UnusedFor": 7_776_000u64 }),
+                    )],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::RetentionUnusedForNotImplemented,
                 effective_backend: None,
             },
         ];

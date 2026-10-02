@@ -3,21 +3,98 @@
 //! Each active subscription is owned by one [`tokio::spawn`] task
 //! running [`run`]. The task:
 //!
-//! 1. Performs a startup **catch-up** read across each filter category,
-//!    starting `AfterGlobal(last_delivered_position)` and walking
-//!    forward in 1000-event pages until the category returns less than
-//!    a full page (caught up to head).
-//! 2. Enters the **live loop**: `recv()` on the broadcast receiver,
-//!    filter the event against [`SubscriptionFilter`], and dispatch via
-//!    the first [`EventNotifier`] that `supports` the target.
-//! 3. On [`broadcast::error::RecvError::Lagged`], drops back into
-//!    catch-up against `read_category` then re-enters the live loop.
+//! 1. Performs a startup **catch-up**: one merged
+//!    [`EventStore::read_categories`] walk across every category in the
+//!    filter at once, starting `AfterGlobal(last_delivered_position)` and
+//!    paging forward in 1000-event pages until a page comes back short
+//!    (head reached).
+//! 2. Enters the **delivery loop**. Every event is delivered by a
+//!    catch-up pass; the loop only decides when to run one. A
+//!    [`STORE_POLL_INTERVAL`] tick runs one, and so does a hint on the
+//!    broadcast receiver whose category the filter subscribes to — the
+//!    channel is a wake-up that removes the tick's latency, and its
+//!    payload is never the thing delivered. Each event read is filtered
+//!    against [`SubscriptionFilter`] and dispatched via the first
+//!    [`EventNotifier`] that `supports` the target.
+//! 3. [`broadcast::error::RecvError::Lagged`] is a third trigger for the
+//!    same pass; overrunning the hint channel costs nothing but the
+//!    counter that records it.
 //! 4. Tracks a per-task [`FailureBudget`]. 100 consecutive failures in
 //!    a 1h window → call `SubscriptionUseCase::disable` and exit.
 //! 5. Persists `last_delivered_position` debounced (5-min floor); a
 //!    failure flushes immediately.
 //! 6. Honours a [`tokio_util::sync::CancellationToken`] for graceful
 //!    shutdown.
+//!
+//! # The event store is the delivery path; the broadcast is a hint
+//!
+//! The broadcast channel cannot carry every persisted event, for two
+//! structural reasons that no amount of extra `send` calls fixes:
+//!
+//! - **Transactional appends do not broadcast.** Events written inside
+//!   a caller-owned transaction — the artifact, ref and artifact-group
+//!   lifecycle ports, the artifact delete, the purge sweep — reach the
+//!   `events` table through `PgEventStore::append_in_tx`, which sits
+//!   below [`crate::event_store_publisher::EventStorePublisher`] and
+//!   therefore below the `send`. Broadcasting from inside the
+//!   transaction would announce a write that may still roll back;
+//!   broadcasting from the adapter after commit would invert the
+//!   dependency the publisher exists to express. So the whole artifact
+//!   lifecycle — ingest, scan, release, promotion, deletion, purge —
+//!   is silent on this channel by construction, bar the two kinds that
+//!   reach an artifact stream through the publisher instead
+//!   (`ArtifactExpired`, `CasIntegrityMismatch`).
+//! - **The channel is per-process.** With more than one server replica,
+//!   a replica's sender carries only that replica's own appends.
+//!
+//! Delivery is therefore driven by reads of the event store, which sees
+//! every append from every process once it commits, and the broadcast
+//! is kept for what it is good at: saying "something landed" sooner
+//! than the next tick would. The hint's **category** is used as the wake
+//! predicate — the same thing the pull surface (`GET /api/v1/events`)
+//! does with it — so an append to a category nobody here subscribes to
+//! does not cost a store read. The hint's **position** is discarded.
+//!
+//! Delivering the broadcast payload *directly* is the tempting
+//! shortcut, and it is wrong for a reason worth stating: the payload
+//! carries a `global_position`, so delivering it advances the cursor to
+//! that position and the walk resumes above it — skipping every
+//! transactional append below, which is exactly the set the channel
+//! cannot carry. One cursor, advanced only by reads, is what keeps the
+//! walk contiguous.
+//!
+//! # One ordered stream, one cursor
+//!
+//! A pass reads the filter's categories as a single
+//! `global_position`-ordered stream, not one stream per category. That is
+//! what makes the single persisted `last_delivered_position` scalar
+//! *true*: every position at or below the mark has been read in every
+//! subscribed category, so a restart that resumes from the mark cannot
+//! step over anything. Walking the categories one at a time and
+//! checkpointing one scalar cannot say that — an advance driven by the
+//! first category carries the mark over the second category's unread
+//! events below it, and a respawn seeds every category from the moved
+//! mark. That is silent, permanent loss, and it is why the merged read
+//! exists rather than being an optimisation.
+//!
+//! # A failed delivery is not checkpointed past
+//!
+//! When `notify` reports `Failed` / `DownstreamRejected`, the pass
+//! **stops at that event**: the cursor is not advanced over it, the
+//! position persisted alongside the failure is the position *before* it,
+//! and the next pass re-reads it. One transport attempt per pass, retried
+//! every [`STORE_POLL_INTERVAL`] until it succeeds or the failure budget
+//! runs out — which is what bounds the head-of-line block the retry
+//! creates, and what makes "at-least-once" a statement about deliveries
+//! rather than about attempts.
+//!
+//! Residual: an event whose transaction commits *after* a concurrent
+//! reader has already advanced this task's cursor past its
+//! `global_position` is not re-read. `global_position` comes from a
+//! sequence evaluated at INSERT while visibility arrives at COMMIT, so
+//! the two orders can disagree. Closing that needs a cursor that is not
+//! a bare high-water mark, which is a change to the position model
+//! itself and not to this loop.
 //!
 
 use std::sync::{Arc, Mutex};
@@ -30,7 +107,7 @@ use tokio_util::sync::CancellationToken;
 
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::subscription::{
-    DisableReason, Subscription, SubscriptionFailure, SubscriptionTarget,
+    DisableReason, Subscription, SubscriptionFailure, SubscriptionId, SubscriptionTarget,
 };
 use hort_domain::events::PersistedEvent;
 use hort_domain::ports::event_notifier::{EventNotifier, NotifyOutcome};
@@ -40,7 +117,8 @@ use hort_domain::ports::repository_repository::RepositoryRepository;
 use crate::dispatcher::failure_budget::FailureBudget;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
-    emit_broadcast_lagged, emit_notify_delivery, notify_outcome_label, target_kind_label,
+    emit_broadcast_lagged, emit_notify_delivery, emit_subscription_read_error,
+    notify_outcome_label, target_kind_label,
 };
 use crate::rbac::RbacEvaluator;
 use crate::use_cases::subscription_filter::{matches as filter_matches, FilterContext};
@@ -55,10 +133,101 @@ pub(crate) const PROGRESS_DEBOUNCE: Duration = Duration::from_secs(5 * 60);
 /// `CATCHUP_PAGE`, signalling head reached.
 pub(crate) const CATCHUP_PAGE: u64 = 1000;
 
-/// Maximum events to fan in to one `notify` call from the live broadcast.
-/// v1 dispatches one event per notify call — batching is a future
-/// optimisation.
+/// Maximum events to fan in to one `notify` call. v1 dispatches one
+/// event per notify call — batching a page's worth into one delivery is
+/// a future optimisation.
 pub(crate) const NOTIFY_BATCH_SIZE: usize = 1;
+
+/// How long a committed event can wait before the task reads it out of
+/// the event store.
+///
+/// This is the delivery latency on every path the broadcast does not
+/// cover — the whole transactional artifact lifecycle, and every append
+/// made by another server replica (see the module docs). Sized against
+/// the dispatcher's own 30s reconcile: short enough that a supply-chain
+/// reaction is not visibly late, long enough that the per-subscription
+/// merged read stays negligible at realistic subscription counts.
+///
+/// What one tick costs is the shape of that read, not the tick rate.
+/// `EventStore::read_categories` on Postgres is a `Merge Append` over one
+/// keyset index scan per subscribed category, so a caught-up subscription
+/// reads 3 shared buffers in ~4 µs regardless of how far the rest of the
+/// log has moved on, and a subscription behind by a page reads that page
+/// and nothing else. That is a property of the statement shape — see
+/// `hort-adapters-postgres::merged_category_read` for the alternatives
+/// that are not, one of which reads 160 000 rows to return none.
+///
+/// A subscription whose events do reach the broadcast is woken
+/// immediately and does not wait for a tick; the tick is the floor, not
+/// the norm.
+pub(crate) const STORE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How far this task has **read** the merged category stream, whether or
+/// not the filter matched what it read.
+///
+/// One mark over one ordered stream. Delivery walks this cursor and
+/// nothing else, which is what makes the walk contiguous: every position
+/// between the mark and the head is read, so an event the broadcast
+/// channel could never carry cannot be stepped over by one it did. A
+/// cursor the broadcast also advanced would reintroduce exactly the gap
+/// this module exists to close — a live event at position 100 would carry
+/// the mark past the transactional appends at 51..99 that no `send` ever
+/// announced.
+///
+/// It is one mark rather than one per category because
+/// `last_delivered_position` is one scalar, and the two have to agree.
+/// Per-category marks over a single persisted scalar is a loss bug, not a
+/// refinement: the scalar is seeded into every category at spawn, so a
+/// mark that one category advanced becomes the floor for all of them
+/// after a respawn. The merged read is what lets a single mark be exact.
+///
+/// Distinct from the persisted `last_delivered_position`, which moves
+/// only on an actual delivery and lags it by up to
+/// [`PROGRESS_DEBOUNCE`]. A subscription that matches nothing in a busy
+/// category must still stop re-reading the same pages on every tick,
+/// and the persisted position cannot do that job — it never advances for
+/// such a subscription. The persisted position is the **seed**: reads
+/// resume from it, so a restart re-reads (and may re-deliver) rather
+/// than skipping. That asymmetry is deliberate — a duplicate is the
+/// receiver's to drop (every delivery carries a fresh
+/// `X-Hort-Delivery-Id` and a stable `global_position`), a gap is
+/// recoverable by nobody.
+#[derive(Debug)]
+pub(crate) struct ReadCursor {
+    /// `None` ⇒ nothing read and nothing ever delivered, so the walk
+    /// starts at the head of the log.
+    position: Option<u64>,
+}
+
+impl ReadCursor {
+    /// Start at the subscription's persisted `last_delivered_position`.
+    pub(crate) fn new(seed: Option<u64>) -> Self {
+        Self { position: seed }
+    }
+
+    /// Where the next merged read should start.
+    fn read_from(&self) -> SubscribeFrom {
+        match self.position {
+            Some(pos) => SubscribeFrom::AfterGlobal(pos),
+            None => SubscribeFrom::Start,
+        }
+    }
+
+    /// The mark itself — the position a restart may safely resume from,
+    /// and therefore the position persisted alongside a delivery failure.
+    fn mark(&self) -> Option<u64> {
+        self.position
+    }
+
+    /// Record that `position` has been read. Monotonic: a page that comes
+    /// back out of order cannot rewind the mark onto events this task has
+    /// already walked.
+    fn observe(&mut self, position: u64) {
+        if self.position.is_none_or(|current| position > current) {
+            self.position = Some(position);
+        }
+    }
+}
 
 /// Wires the dependencies one [`run`] invocation needs.
 ///
@@ -170,40 +339,59 @@ pub async fn run(
         "dispatcher task starting"
     );
 
+    let mut cursor = ReadCursor::new(subscription.last_delivered_position);
+
     // Step 1: catch-up.
-    catch_up(&subscription, &deps, &cancel).await;
-    if cancel.is_cancelled() {
-        tracing::info!(subscription_id = %sub_id.0, "dispatcher task cancelled during catch-up");
+    if catch_up(&subscription, &deps, &cancel, &mut cursor).await {
+        tracing::info!(subscription_id = %sub_id.0, "dispatcher task stopping after catch-up");
         return;
     }
 
-    // Step 2: live loop.
+    // Step 2: delivery loop. The tick is what makes delivery independent
+    // of which write path and which process persisted the event; the
+    // broadcast arm only removes the tick's latency where it can.
+    let mut poll = tokio::time::interval(STORE_POLL_INTERVAL);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // `interval`'s first tick is immediate, and the startup catch-up
+    // above just did that work.
+    poll.tick().await;
+
     loop {
-        tokio::select! {
+        // Every arm below says the same thing — go read the store — and
+        // differs only in what prompted it. A relevant hint, an overrun
+        // channel and an elapsed tick are one instruction with three
+        // triggers; keeping one call site is what stops them drifting.
+        let wake = tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!(subscription_id = %sub_id.0, "dispatcher task cancelled");
                 return;
             }
+            _ = poll.tick() => Wake::Read,
             recv = receiver.recv() => match recv {
                 Ok(event) => {
-                    if process_event_for_subscription(&event, &subscription, &deps).await {
-                        // Budget exhausted — task exits; orchestrator
-                        // sees the now-disabled row on next reconcile
-                        // and does not respawn.
-                        return;
-                    }
+                    // The payload is not delivered, and its position is
+                    // deliberately unused. Delivering it here would
+                    // advance the cursor to that position and carry the
+                    // walk past every transactional append below it — the
+                    // gap this module exists to close. Its *category*, on
+                    // the other hand, is exactly the predicate that says
+                    // whether this subscription has anything to read: an
+                    // append to a category outside the filter cannot
+                    // produce an event this task would deliver, so waking
+                    // for it buys a store read and nothing else.
+                    let hinted = subscribes_to(&subscription, &event);
+                    // Drained unconditionally, in its own binding: the
+                    // queue has to be consumed whatever the first hint
+                    // said, so this must never become the right-hand side
+                    // of a short-circuiting `||`.
+                    let drained = drain_pending_hints(&mut receiver, &subscription);
+                    if hinted || drained { Wake::Read } else { Wake::Skip }
                 }
+                // A lag is the one case where the categories that were
+                // dropped are unknowable, so it always reads.
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(
-                        subscription_id = %sub_id.0,
-                        skipped = skipped,
-                        "broadcast channel lagged; dropping to catch-up"
-                    );
-                    emit_broadcast_lagged();
-                    catch_up(&subscription, &deps, &cancel).await;
-                    if cancel.is_cancelled() {
-                        return;
-                    }
+                    note_lagged(sub_id, skipped);
+                    Wake::Read
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     tracing::info!(
@@ -213,85 +401,197 @@ pub async fn run(
                     return;
                 }
             }
+        };
+
+        if matches!(wake, Wake::Skip) {
+            continue;
+        }
+
+        if catch_up(&subscription, &deps, &cancel, &mut cursor).await {
+            return;
         }
     }
 }
 
-/// Catch-up read across every category in the filter, walking forward
-/// from `last_delivered_position` until each category returns less than
-/// a full page.
+/// What a trip round the delivery loop decided to do.
+enum Wake {
+    /// Run a catch-up pass.
+    Read,
+    /// Nothing this subscription could deliver has landed — go back to
+    /// waiting without touching the store.
+    Skip,
+}
+
+/// Does `event` belong to a category this subscription reads?
 ///
-/// Errors from `read_category` are logged and the category is skipped
-/// for the rest of this catch-up pass — the next reconcile / live loop
-/// will retry.
+/// The category is the only part of a hint that is safe to act on. It is
+/// also sufficient: the pass that follows re-derives everything else from
+/// the store, and a hint for an unsubscribed category cannot change what
+/// that pass would return.
+fn subscribes_to(subscription: &Subscription, event: &PersistedEvent) -> bool {
+    subscription
+        .filter
+        .categories
+        .contains(&event.stream_id.category)
+}
+
+/// Consume every hint already queued, so a burst of appends costs one
+/// store read rather than one per event. Returns whether any of them
+/// named a category this subscription reads; the payloads are discarded
+/// for the same reason the arm that called this discards its own. A lag
+/// observed mid-drain counts as relevant, because what it dropped is
+/// unknown.
+fn drain_pending_hints(
+    receiver: &mut broadcast::Receiver<Arc<PersistedEvent>>,
+    subscription: &Subscription,
+) -> bool {
+    let mut relevant = false;
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => relevant |= subscribes_to(subscription, &event),
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                note_lagged(subscription.id, skipped);
+                relevant = true;
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                return relevant
+            }
+        }
+    }
+}
+
+/// Record that the hint channel overran. Overrunning it costs nothing
+/// but the count: the store read that follows covers exactly what the
+/// lost hints would have announced. The counter stays because it is the
+/// signal that the channel is undersized for the append rate — and it is
+/// recorded identically whether the lag surfaced on `recv` or mid-drain,
+/// so the two cannot report differently.
+fn note_lagged(sub_id: SubscriptionId, skipped: u64) {
+    tracing::warn!(
+        subscription_id = %sub_id.0,
+        skipped = skipped,
+        "broadcast channel lagged; the store read covers it"
+    );
+    emit_broadcast_lagged();
+}
+
+/// Catch-up walk of the filter's categories as one `global_position`-
+/// ordered stream, paging forward from [`ReadCursor`]'s mark until a page
+/// comes back short.
+///
+/// This is the delivery path, not a recovery path: it is what a
+/// transactionally appended event — and an event appended by another
+/// replica — is reached by, so it runs on every [`STORE_POLL_INTERVAL`]
+/// tick and not only at startup.
+///
+/// One merged read rather than one read per category, because the mark it
+/// advances is one scalar and the two have to describe the same stream
+/// (see [`ReadCursor`]).
+///
+/// The pass ends early, with the mark left where it is, in two cases that
+/// are not task-fatal: a failed read (the next tick retries the same page,
+/// so a transient read failure costs latency and never an event) and a
+/// failed delivery (the next tick retries the same event — see
+/// [`process_event_for_subscription`]).
+///
+/// Returns `true` when the task must exit — the cancellation token
+/// fired, or a delivery exhausted the failure budget and the
+/// subscription is now disabled. A caller that ignored the budget half
+/// would keep delivering to a subscription the dispatcher has already
+/// given up on.
 async fn catch_up(
     subscription: &Subscription,
     deps: &SubscriptionTaskDeps,
     cancel: &CancellationToken,
-) {
-    let start_pos = subscription.last_delivered_position.unwrap_or(0);
-    for &cat in &subscription.filter.categories {
+    cursor: &mut ReadCursor,
+) -> bool {
+    loop {
         if cancel.is_cancelled() {
-            return;
+            return true;
         }
-        let mut cursor = start_pos;
-        loop {
+        let from = cursor.read_from();
+        let events = match deps
+            .event_store
+            .read_categories(&subscription.filter.categories, from, CATCHUP_PAGE)
+            .await
+        {
+            Ok(evts) => evts,
+            Err(e) => {
+                // Fail closed: the mark does not move, so nothing is
+                // skipped. A deterministic failure — one row this build
+                // cannot decode, which is what a mixed-version rollout
+                // produces — therefore stalls the subscription until an
+                // operator intervenes, and the counter is how they find
+                // out. `warn!` alone is not an alertable signal.
+                emit_subscription_read_error();
+                tracing::warn!(
+                    subscription_id = %subscription.id.0,
+                    categories = ?subscription.filter.categories,
+                    error = %e,
+                    "catch-up read failed; the pass stops and the next tick retries the same page"
+                );
+                return false;
+            }
+        };
+        if events.is_empty() {
+            return false;
+        }
+        let was_full_page = events.len() as u64 >= CATCHUP_PAGE;
+        for event in events {
             if cancel.is_cancelled() {
-                return;
+                return true;
             }
-            let from = if cursor == 0 && subscription.last_delivered_position.is_none() {
-                SubscribeFrom::Start
-            } else {
-                SubscribeFrom::AfterGlobal(cursor)
-            };
-            let events = match deps
-                .event_store
-                .read_category(cat, from, CATCHUP_PAGE)
-                .await
-            {
-                Ok(evts) => evts,
-                Err(e) => {
-                    tracing::warn!(
-                        subscription_id = %subscription.id.0,
-                        category = ?cat,
-                        error = %e,
-                        "catch-up read_category failed; skipping category for this pass"
-                    );
-                    break;
+            // The mark before this event: where a restart would resume if
+            // this event is not consumed here.
+            let resume_from = cursor.mark();
+            match process_event_for_subscription(&event, subscription, deps, resume_from).await {
+                Disposition::Consumed => {
+                    // Advance only over an event this task is done with —
+                    // delivered, filtered out, or dropped for want of a
+                    // notifier. Recording the read is what stops the next
+                    // tick re-reading the page forever.
+                    cursor.observe(event.global_position);
                 }
-            };
-            if events.is_empty() {
-                break;
+                // Not consumed, so not marked: the next pass reads this
+                // same event again. That is the retry, and the failure
+                // budget is what bounds the head-of-line block it creates.
+                Disposition::Halt => return false,
+                Disposition::ExitTask => return true,
             }
-            let last_pos = events.last().map(|e| e.global_position).unwrap_or(cursor);
-            let was_full_page = events.len() as u64 >= CATCHUP_PAGE;
-            for event in events {
-                if cancel.is_cancelled() {
-                    return;
-                }
-                // Budget-exhaust during catch-up exits the task
-                // immediately; orchestrator's next reconcile sees the
-                // disabled row.
-                if process_event_for_subscription(&event, subscription, deps).await {
-                    return;
-                }
-            }
-            cursor = last_pos;
-            if !was_full_page {
-                break;
-            }
+        }
+        if !was_full_page {
+            return false;
         }
     }
 }
 
-/// Process a single event for the subscription. Returns `true` when
-/// the failure budget exhausted as a result of this delivery — the
-/// caller exits the task.
+/// What the pass should do after handing one event to the notifier.
+enum Disposition {
+    /// This task is done with the event; advance the cursor over it.
+    Consumed,
+    /// Delivery failed. Leave the cursor where it is and end the pass;
+    /// the next one retries this event.
+    Halt,
+    /// The failure budget exhausted and the subscription is now disabled.
+    ExitTask,
+}
+
+/// Process a single event for the subscription.
+///
+/// `resume_from` is the cursor mark *before* this event — the position a
+/// restart would resume from if this event is not consumed here. It is
+/// what gets persisted alongside a delivery failure, and it is the whole
+/// of the at-least-once guarantee: writing this event's own position
+/// there instead would checkpoint the mark at an event nobody received,
+/// and because reads resume with a strict `>` the next pass would start
+/// above it. One transport attempt, ever, and a 30-second receiver outage
+/// would silently swallow every event that arrived in it.
 async fn process_event_for_subscription(
     event: &PersistedEvent,
     subscription: &Subscription,
     deps: &SubscriptionTaskDeps,
-) -> bool {
+    resume_from: Option<u64>,
+) -> Disposition {
     // 1. Load the current evaluator snapshot. One `.load()` per event;
     //    revocation propagates within the auth cache TTL.
     let evaluator_guard = deps.rbac.load();
@@ -304,7 +604,7 @@ async fn process_event_for_subscription(
         owner_principal: &deps.owner_principal,
     };
     if !filter_matches(&subscription.filter, event, &ctx).await {
-        return false;
+        return Disposition::Consumed;
     }
 
     // 3. Find a notifier that supports the target.
@@ -317,7 +617,7 @@ async fn process_event_for_subscription(
             subscription_id = %subscription.id.0,
             "no EventNotifier supports this target_kind; dropping event"
         );
-        return false;
+        return Disposition::Consumed;
     };
 
     // 4. Send.
@@ -363,11 +663,16 @@ async fn process_event_for_subscription(
 
     // 7. Persist progress.
     //
-    // - On success: respect the 5-min debounce floor; first persist on
-    //   each interval boundary.
-    // - On failure: persist immediately (audit signal — operators
-    //   inspecting `last_failure` need it current). Even when
-    //   debounced, the position update piggybacks.
+    // - On success: this event's own position, respecting the 5-min
+    //   debounce floor; first persist on each interval boundary.
+    // - On failure: `resume_from` — the position *before* this event —
+    //   and immediately, because `last_failure` is an audit signal
+    //   operators read live. `None` there means "record the failure, do
+    //   not move the position"; the adapter leaves the column alone.
+    let position = match &failure_record {
+        Some(_) => resume_from,
+        None => Some(event.global_position),
+    };
     let should_persist = match &failure_record {
         Some(_) => true,
         None => deps.progress.lock().unwrap().should_persist(now),
@@ -375,11 +680,7 @@ async fn process_event_for_subscription(
     if should_persist {
         if let Err(e) = deps
             .use_case
-            .record_delivery_progress(
-                subscription.id,
-                event.global_position,
-                failure_record.as_ref(),
-            )
+            .record_delivery_progress(subscription.id, position, failure_record.as_ref())
             .await
         {
             tracing::warn!(
@@ -411,10 +712,14 @@ async fn process_event_for_subscription(
                 "disable on budget-exhaust failed; task will still exit"
             );
         }
-        return true;
+        return Disposition::ExitTask;
     }
 
-    false
+    if failure_record.is_some() {
+        Disposition::Halt
+    } else {
+        Disposition::Consumed
+    }
 }
 
 /// Compile-time check: the unused-target case in the dispatch helper is
@@ -502,6 +807,48 @@ mod tests {
         fn supports(&self, target: &SubscriptionTarget) -> bool {
             matches!(target, SubscriptionTarget::Webhook { .. })
                 || matches!(target, SubscriptionTarget::NatsJetStream { .. })
+        }
+    }
+
+    /// Notifier that delivers successfully and then cancels the task,
+    /// standing in for the process dying immediately after a delivery has
+    /// been persisted. Records what it was handed, like
+    /// [`RecordingNotifier`].
+    pub(super) struct CancelAfterFirstDelivery {
+        cancel: CancellationToken,
+        calls: Mutex<Vec<u64>>,
+    }
+
+    impl CancelAfterFirstDelivery {
+        fn new(cancel: CancellationToken) -> Self {
+            Self {
+                cancel,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn delivered(&self) -> Vec<u64> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl EventNotifier for CancelAfterFirstDelivery {
+        fn notify<'a>(
+            &'a self,
+            _target: &'a SubscriptionTarget,
+            _subscription_id: SubscriptionId,
+            events: &'a [PersistedEvent],
+        ) -> BoxFuture<'a, NotifyOutcome> {
+            self.calls
+                .lock()
+                .unwrap()
+                .extend(events.iter().map(|e| e.global_position));
+            self.cancel.cancel();
+            Box::pin(async { NotifyOutcome::Delivered })
+        }
+
+        fn supports(&self, target: &SubscriptionTarget) -> bool {
+            matches!(target, SubscriptionTarget::Webhook { .. })
         }
     }
 
@@ -642,10 +989,15 @@ mod tests {
         }
     }
 
+    /// One recorded `update_last_delivered` call: the subscription, the
+    /// position it was asked to store (`None` = "do not move it") and the
+    /// failure it carried.
+    type ProgressCall = (SubscriptionId, Option<u64>, Option<SubscriptionFailure>);
+
     /// In-memory subscription repo with deterministic id-keyed lookups.
     struct MockSubRepo {
         rows: Mutex<HashMap<SubscriptionId, Subscription>>,
-        progress_calls: Mutex<Vec<(SubscriptionId, u64, Option<SubscriptionFailure>)>>,
+        progress_calls: Mutex<Vec<ProgressCall>>,
     }
 
     impl MockSubRepo {
@@ -658,7 +1010,9 @@ mod tests {
         fn insert(&self, sub: Subscription) {
             self.rows.lock().unwrap().insert(sub.id, sub);
         }
-        fn progress_calls(&self) -> Vec<(SubscriptionId, u64, Option<SubscriptionFailure>)> {
+        fn progress_calls(
+            &self,
+        ) -> Vec<(SubscriptionId, Option<u64>, Option<SubscriptionFailure>)> {
             self.progress_calls.lock().unwrap().clone()
         }
     }
@@ -747,7 +1101,7 @@ mod tests {
         fn update_last_delivered(
             &self,
             id: SubscriptionId,
-            position: u64,
+            position: Option<u64>,
             last_failure: Option<&SubscriptionFailure>,
         ) -> BoxFuture<'_, DomainResult<()>> {
             self.progress_calls
@@ -755,10 +1109,14 @@ mod tests {
                 .unwrap()
                 .push((id, position, last_failure.cloned()));
             // Also mirror into the row so subsequent reads see the
-            // updated state.
+            // updated state. `None` leaves the position alone, mirroring
+            // the adapter's COALESCE — a test must not be able to observe
+            // a rewind the real store would never write.
             let mut rows = self.rows.lock().unwrap();
             if let Some(row) = rows.get_mut(&id) {
-                row.last_delivered_position = Some(position);
+                if let Some(position) = position {
+                    row.last_delivered_position = Some(position);
+                }
                 row.last_failure = last_failure.cloned();
             }
             Box::pin(async { Ok(()) })
@@ -818,6 +1176,24 @@ mod tests {
         }
     }
 
+    /// Fill a task's failure budget to one failure short of its
+    /// threshold, so the next failed delivery is the one that exhausts it.
+    ///
+    /// Needed because a pass halts at its first failed delivery: a task
+    /// starting from an empty budget takes 100 passes — 500 seconds of
+    /// poll ticks — to reach the disable, which is the retry loop's
+    /// property and not the property a `run`-level exit test is about.
+    fn prime_budget_to_one_short_of_exhaustion(deps: &SubscriptionTaskDeps) {
+        let now = Instant::now();
+        let mut budget = deps.budget.lock().unwrap();
+        for _ in 0..99 {
+            assert!(
+                !budget.record_failure(now),
+                "99 failures must not exhaust a 100-failure budget"
+            );
+        }
+    }
+
     // -- ProgressDebouncer unit tests ------------------------------------
 
     #[test]
@@ -871,8 +1247,11 @@ mod tests {
         );
         let event = ingested_event(repo_id, 1);
         // No budget exhaustion possible — single event, mismatched filter.
-        let exhausted = process_event_for_subscription(&event, &sub, &deps).await;
-        assert!(!exhausted);
+        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        assert!(
+            matches!(disposition, Disposition::Consumed),
+            "a filtered-out event is consumed, so the pass walks on past it"
+        );
         assert!(notifier.calls().is_empty(), "notifier MUST NOT be called");
     }
 
@@ -897,8 +1276,8 @@ mod tests {
             principal,
         );
         let event = ingested_event(repo_id, 5);
-        let exhausted = process_event_for_subscription(&event, &sub, &deps).await;
-        assert!(!exhausted);
+        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        assert!(matches!(disposition, Disposition::Consumed));
         let calls = notifier.calls();
         assert_eq!(calls.len(), 1, "exactly one notify call");
         assert_eq!(calls[0].1.len(), 1, "one event in the batch");
@@ -929,11 +1308,15 @@ mod tests {
         );
         // Zero-interval debouncer in make_deps → first success persists.
         let event = ingested_event(repo_id, 42);
-        let _ = process_event_for_subscription(&event, &sub, &deps).await;
+        let _ = process_event_for_subscription(&event, &sub, &deps, Some(41)).await;
         let progress = sub_repo.progress_calls();
         assert_eq!(progress.len(), 1);
         assert_eq!(progress[0].0, sub.id);
-        assert_eq!(progress[0].1, 42);
+        assert_eq!(
+            progress[0].1,
+            Some(42),
+            "a delivered event checkpoints its own position"
+        );
         assert!(progress[0].2.is_none(), "no failure on success");
     }
 
@@ -961,10 +1344,19 @@ mod tests {
             principal,
         );
         let event = ingested_event(repo_id, 7);
-        let exhausted = process_event_for_subscription(&event, &sub, &deps).await;
-        assert!(!exhausted, "single failure must not exhaust budget");
+        let disposition = process_event_for_subscription(&event, &sub, &deps, Some(6)).await;
+        assert!(
+            matches!(disposition, Disposition::Halt),
+            "a failed delivery halts the pass; a single failure does not exhaust the budget"
+        );
         let progress = sub_repo.progress_calls();
         assert_eq!(progress.len(), 1);
+        assert_eq!(
+            progress[0].1,
+            Some(6),
+            "the position persisted alongside the failure is the one BEFORE the failed \
+             event — reads must resume at it, not past it"
+        );
         let failure = progress[0].2.as_ref().expect("failure payload present");
         assert_eq!(failure.reason, NotifyFailureReason::Dns);
         assert_eq!(failure.consecutive_failures, 1);
@@ -993,11 +1385,15 @@ mod tests {
             mock_es,
             principal,
         );
-        // Cycle 100 events.
+        // Cycle 100 events. In production each of these is a separate
+        // pass retrying the same event; here the positions differ only so
+        // the assertion can tell the calls apart.
         let mut exhausted = false;
         for i in 1..=100u64 {
             let event = ingested_event(repo_id, i);
-            exhausted = process_event_for_subscription(&event, &sub, &deps).await;
+            let disposition =
+                process_event_for_subscription(&event, &sub, &deps, Some(i - 1)).await;
+            exhausted = matches!(disposition, Disposition::ExitTask);
             if exhausted {
                 break;
             }
@@ -1030,8 +1426,11 @@ mod tests {
         // Replace with empty registry to also exercise the empty branch.
         deps.notifiers = vec![];
         let event = ingested_event(repo_id, 1);
-        let exhausted = process_event_for_subscription(&event, &sub, &deps).await;
-        assert!(!exhausted);
+        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        assert!(
+            matches!(disposition, Disposition::Consumed),
+            "an undeliverable target is not a delivery failure — it must not wedge the pass"
+        );
         assert!(
             sub_repo.progress_calls().is_empty(),
             "no notifier called → no progress recorded"
@@ -1060,7 +1459,7 @@ mod tests {
             principal,
         );
         let event = ingested_event(Uuid::new_v4(), 1);
-        let _ = process_event_for_subscription(&event, &sub, &deps).await;
+        let _ = process_event_for_subscription(&event, &sub, &deps, None).await;
         assert_eq!(notifier.calls().len(), 1);
     }
 
@@ -1090,11 +1489,17 @@ mod tests {
             principal,
         );
         let cancel = CancellationToken::new();
-        catch_up(&sub, &deps, &cancel).await;
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        assert!(!exit, "healthy catch-up must not signal task exit");
         assert_eq!(
             notifier.calls().len(),
             2,
             "both seeded events delivered via catch-up"
+        );
+        assert!(
+            matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(2)),
+            "the cursor must have advanced over everything the pass read"
         );
     }
 
@@ -1119,7 +1524,9 @@ mod tests {
             principal,
         );
         let cancel = CancellationToken::new();
-        catch_up(&sub, &deps, &cancel).await;
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        assert!(!exit);
         assert!(notifier.calls().is_empty());
     }
 
@@ -1145,11 +1552,449 @@ mod tests {
         );
         let cancel = CancellationToken::new();
         cancel.cancel();
-        catch_up(&sub, &deps, &cancel).await;
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        assert!(exit, "cancellation must signal task exit");
         assert!(notifier.calls().is_empty());
     }
 
+    // -- ReadCursor unit tests -------------------------------------------
+
+    #[test]
+    fn read_cursor_resumes_from_the_persisted_position() {
+        let cursor = ReadCursor::new(Some(42));
+        assert!(matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(42)));
+        assert_eq!(cursor.mark(), Some(42));
+    }
+
+    #[test]
+    fn read_cursor_without_a_persisted_position_reads_from_the_start() {
+        let mut cursor = ReadCursor::new(None);
+        assert!(matches!(cursor.read_from(), SubscribeFrom::Start));
+        assert_eq!(
+            cursor.mark(),
+            None,
+            "nothing read and nothing delivered — there is no position to resume from"
+        );
+        cursor.observe(1);
+        assert!(matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(1)));
+    }
+
+    /// Monotonic: a page returned out of order cannot rewind the mark
+    /// onto events this task has already walked.
+    #[test]
+    fn read_cursor_never_rewinds() {
+        let mut cursor = ReadCursor::new(None);
+        cursor.observe(10);
+        cursor.observe(4);
+        assert!(matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(10)));
+    }
+
+    /// One mark over one merged stream — not one per category. This is
+    /// what makes the single persisted `last_delivered_position` exact:
+    /// the mark is a position in the same ordered stream the reads walk,
+    /// so everything at or below it has been read in every subscribed
+    /// category.
+    #[test]
+    fn read_cursor_is_one_mark_over_the_merged_stream() {
+        let mut cursor = ReadCursor::new(None);
+        // A merged page arrives in global order across categories; the
+        // cursor records positions, not which category they came from.
+        cursor.observe(10);
+        cursor.observe(11);
+        assert_eq!(cursor.mark(), Some(11));
+        assert!(matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(11)));
+    }
+
+    // -- hint-drain tests -------------------------------------------------
+
+    /// Draining consumes everything already queued and stops at the end,
+    /// so a burst of appends costs one store read rather than one per
+    /// event. It must also survive the channel overrunning mid-drain,
+    /// which is the one way this loop could fail to terminate.
+    #[tokio::test]
+    async fn drain_pending_hints_consumes_the_queue_including_a_lag() {
+        let repo_id = Uuid::new_v4();
+        let sub = make_subscription(Uuid::new_v4(), RepositoryScope::OwnedByActor);
+        // Capacity 1 with three sends and no reads: the first
+        // `try_recv` reports the overrun, the rest drain normally.
+        let (sender, mut receiver) = broadcast::channel::<Arc<PersistedEvent>>(1);
+        for pos in 1..=3u64 {
+            sender
+                .send(Arc::new(ingested_event(repo_id, pos)))
+                .expect("receiver attached");
+        }
+        assert!(
+            drain_pending_hints(&mut receiver, &sub),
+            "a lag makes the drain relevant regardless of what it dropped"
+        );
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "the drain must leave the channel empty"
+        );
+
+        // And it returns on a closed channel rather than spinning.
+        drop(sender);
+        assert!(!drain_pending_hints(&mut receiver, &sub));
+    }
+
+    /// A drained hint for a category outside the filter is not a reason to
+    /// read: the pass it would trigger cannot return anything this
+    /// subscription would deliver.
+    #[tokio::test]
+    async fn drain_pending_hints_reports_only_subscribed_categories() {
+        let repo_id = Uuid::new_v4();
+        let mut sub = make_subscription(Uuid::new_v4(), RepositoryScope::OwnedByActor);
+        sub.filter.categories = vec![StreamCategory::Policy];
+        let (sender, mut receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        sender
+            .send(Arc::new(ingested_event(repo_id, 1)))
+            .expect("receiver attached");
+        assert!(
+            !drain_pending_hints(&mut receiver, &sub),
+            "an Artifact hint says nothing to a Policy-only subscription"
+        );
+
+        let mut policy = ingested_event(repo_id, 2);
+        policy.stream_id = StreamId {
+            category: StreamCategory::Policy,
+            entity_id: Uuid::new_v4(),
+        };
+        sender.send(Arc::new(policy)).expect("receiver attached");
+        assert!(drain_pending_hints(&mut receiver, &sub));
+    }
+
+    // -- catch_up cursor / exit-signal tests ------------------------------
+
+    /// A failed `read_category` must leave the mark where it was, so the
+    /// next tick re-reads the page it could not read rather than
+    /// stepping over it.
+    #[tokio::test]
+    async fn catch_up_read_error_does_not_advance_the_cursor() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let mut sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        sub.last_delivered_position = Some(5);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 6)]);
+        mock_es.inject_category_error_after_global_position(5);
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo,
+            mock_es,
+            principal,
+        );
+        let cancel = CancellationToken::new();
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        assert!(!exit, "a read error is not a reason to stop the task");
+        assert!(
+            notifier.calls().is_empty(),
+            "nothing was read, nothing sent"
+        );
+        assert!(
+            matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(5)),
+            "the next tick must retry the page this one could not read"
+        );
+    }
+
+    /// A failed delivery stops the pass at the failed event, and the
+    /// budget is what bounds the retry.
+    ///
+    /// The two halves are one mechanism: each pass re-reads the same
+    /// event, so the 100 failures the budget allows are 100 *passes* and
+    /// the subscription is disabled at the 100th rather than looping
+    /// forever. Without the halt, one pass would burn the whole budget on
+    /// 100 *different* events and checkpoint past every one of them.
+    #[tokio::test]
+    async fn a_failed_delivery_is_retried_by_every_pass_until_the_budget_runs_out() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let mut sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        sub.last_delivered_position = Some(40);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            vec![ingested_event(repo_id, 41), ingested_event(repo_id, 42)],
+        );
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
+            reason: NotifyFailureReason::Dns,
+        }));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo.clone(),
+            mock_es,
+            principal,
+        );
+        let cancel = CancellationToken::new();
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+
+        // Pass 1: position 41 fails, the pass stops there, and position 42
+        // is not touched.
+        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        assert!(!exit, "one failure is not a reason to stop the task");
+        assert_eq!(
+            notifier
+                .calls()
+                .iter()
+                .flat_map(|(_, evts)| evts.iter().map(|e| e.global_position))
+                .collect::<Vec<_>>(),
+            vec![41],
+            "the pass must stop at the failed event, not walk on over it"
+        );
+        assert!(
+            matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(40)),
+            "the cursor must not advance over an event nobody received"
+        );
+        let progress = sub_repo.progress_calls();
+        assert_eq!(progress.last().unwrap().1, Some(40));
+
+        // Passes 2..=100: the same event, every time, until the budget goes.
+        let mut passes = 1;
+        loop {
+            passes += 1;
+            if catch_up(&sub, &deps, &cancel, &mut cursor).await {
+                break;
+            }
+            assert!(passes < 200, "the budget must bound the retry");
+        }
+        assert_eq!(passes, 100, "the 100-in-1h budget is what ends the retry");
+        let delivered: Vec<u64> = notifier
+            .calls()
+            .iter()
+            .flat_map(|(_, evts)| evts.iter().map(|e| e.global_position))
+            .collect();
+        assert_eq!(delivered.len(), 100);
+        assert!(
+            delivered.iter().all(|p| *p == 41),
+            "every attempt is the same event; got {delivered:?}"
+        );
+        let row = sub_repo.rows.lock().unwrap().get(&sub.id).cloned().unwrap();
+        assert!(matches!(row.state, SubscriptionState::Disabled { .. }));
+        assert_eq!(
+            row.last_delivered_position,
+            Some(40),
+            "the persisted cursor never moved past the undelivered event"
+        );
+    }
+
+    /// Budget exhaustion inside catch-up has to reach the caller. The
+    /// pass now runs on every poll tick, so a task that kept looping
+    /// would keep delivering to a subscription the dispatcher has
+    /// already disabled.
+    #[tokio::test]
+    async fn catch_up_signals_exit_when_the_budget_exhausts() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            (1..=150u64).map(|i| ingested_event(repo_id, i)).collect(),
+        );
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
+            reason: NotifyFailureReason::Dns,
+        }));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo.clone(),
+            mock_es,
+            principal,
+        );
+        let cancel = CancellationToken::new();
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        // Each pass makes one attempt and halts, so the budget takes 100
+        // of them; the 100th must reach the caller as an exit signal.
+        let mut exit = false;
+        for _ in 0..100 {
+            exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+            if exit {
+                break;
+            }
+        }
+        assert!(exit, "budget exhaustion must stop the task");
+        assert_eq!(
+            notifier.calls().len(),
+            100,
+            "one attempt per pass, and the budget ends it at 100"
+        );
+        let row = sub_repo.rows.lock().unwrap().get(&sub.id).cloned().unwrap();
+        assert!(matches!(row.state, SubscriptionState::Disabled { .. }));
+    }
+
     // -- run() integration tests -----------------------------------------
+
+    /// The property the whole delivery loop exists for: an event that is
+    /// in the event store but was never broadcast still reaches the
+    /// subscriber. This is every transactionally appended event — the
+    /// entire artifact lifecycle — and every event appended by another
+    /// replica.
+    #[tokio::test(start_paused = true)]
+    async fn store_poll_delivers_an_event_the_broadcast_never_carried() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo,
+            mock_es.clone(),
+            principal,
+        );
+        // A live sender that never sends: the task has a healthy
+        // broadcast receiver and the event simply does not arrive on it.
+        let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { run(sub, deps, receiver, task_cancel).await });
+
+        // Startup catch-up saw an empty store; the event lands after it.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(notifier.calls().is_empty(), "nothing to deliver yet");
+        mock_es.set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 1)]);
+
+        tokio::time::sleep(STORE_POLL_INTERVAL * 2).await;
+        assert_eq!(
+            notifier.calls().len(),
+            1,
+            "the store poll must deliver an event the broadcast never carried"
+        );
+
+        cancel.cancel();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("task exits on cancel")
+            .expect("task must not panic");
+    }
+
+    /// The publisher does both halves for an event it appends: the row
+    /// lands in the store and the same event goes on the channel. The
+    /// subscriber must see it once.
+    #[tokio::test(start_paused = true)]
+    async fn a_broadcast_wake_up_and_the_store_read_deliver_an_event_once() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo,
+            mock_es.clone(),
+            principal,
+        );
+        let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { run(sub, deps, receiver, task_cancel).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // The publisher's two halves: the row lands in the store AND the
+        // same event is broadcast.
+        let event = ingested_event(repo_id, 1);
+        mock_es.set_category(StreamCategory::Artifact, vec![event.clone()]);
+        sender.send(Arc::new(event)).expect("receiver attached");
+
+        tokio::time::sleep(STORE_POLL_INTERVAL * 3).await;
+        assert_eq!(
+            notifier.calls().len(),
+            1,
+            "position 1 delivered exactly once across both paths"
+        );
+
+        cancel.cancel();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("task exits on cancel")
+            .expect("task must not panic");
+    }
+
+    /// The reverse order of the pair above: the tick gets there first,
+    /// and the broadcast copy arrives afterwards. It wakes a read that
+    /// starts above the position already delivered, so it sends nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_broadcast_copy_of_an_already_delivered_event_sends_nothing() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo,
+            mock_es.clone(),
+            principal,
+        );
+        let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { run(sub, deps, receiver, task_cancel).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let event = ingested_event(repo_id, 1);
+        mock_es.set_category(StreamCategory::Artifact, vec![event.clone()]);
+        // Let the poll carry it first.
+        tokio::time::sleep(STORE_POLL_INTERVAL * 2).await;
+        assert_eq!(notifier.calls().len(), 1, "poll delivered it");
+
+        sender.send(Arc::new(event)).expect("receiver attached");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            notifier.calls().len(),
+            1,
+            "the late broadcast copy must be recognised, not re-sent"
+        );
+
+        cancel.cancel();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("task exits on cancel")
+            .expect("task must not panic");
+    }
 
     #[tokio::test]
     async fn run_exits_cleanly_on_cancellation() {
@@ -1179,7 +2024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_processes_a_live_event_then_cancellation_stops_it() {
+    async fn run_delivers_on_a_broadcast_wake_up_then_cancellation_stops_it() {
         let owner_user_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
         let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
@@ -1190,18 +2035,28 @@ mod tests {
         let mock_es = Arc::new(MockEventStore::new());
         let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
         let notifier_for_assert = notifier.clone();
-        let deps = make_deps(owner_user_id, rbac, notifier, sub_repo, mock_es, principal);
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier,
+            sub_repo,
+            mock_es.clone(),
+            principal,
+        );
         let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let handle = tokio::spawn(async move {
             run(sub, deps, receiver, cancel_clone).await;
         });
-        // Send one event.
-        sender
-            .send(Arc::new(ingested_event(repo_id, 100)))
-            .expect("send ok");
-        // Wait briefly.
+        // Let the startup pass run against an empty store, so what
+        // follows is attributable to the wake-up and not to it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let event = ingested_event(repo_id, 100);
+        mock_es.set_category(StreamCategory::Artifact, vec![event.clone()]);
+        sender.send(Arc::new(event)).expect("send ok");
+        // Real time, and well inside STORE_POLL_INTERVAL: delivery this
+        // soon can only have come from the broadcast wake-up.
         tokio::time::sleep(Duration::from_millis(150)).await;
         cancel.cancel();
         tokio::time::timeout(Duration::from_secs(2), handle)
@@ -1254,6 +2109,463 @@ mod tests {
         assert!(
             calls >= 1,
             "Lagged → catch-up must dispatch at least once; got {calls}"
+        );
+    }
+
+    /// The gap that makes the broadcast a wake-up and not a payload: a
+    /// live event carries a `global_position`, and delivering it
+    /// directly would advance the cursor to that position over the
+    /// transactional appends sitting below it — which is precisely the
+    /// set the channel never carries. The wake-up must make the task
+    /// read *from its cursor*, not from the event it was handed.
+    #[tokio::test(start_paused = true)]
+    async fn a_broadcast_wake_up_does_not_carry_the_cursor_past_unbroadcast_events() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo,
+            mock_es.clone(),
+            principal,
+        );
+        let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { run(sub, deps, receiver, task_cancel).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // Position 1 is a transactional append: in the store, never on
+        // the channel. Position 2 went through the publisher, so it is
+        // in the store AND broadcast.
+        let silent = ingested_event(repo_id, 1);
+        let announced = ingested_event(repo_id, 2);
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            vec![silent.clone(), announced.clone()],
+        );
+        sender.send(Arc::new(announced)).expect("receiver attached");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let delivered: Vec<u64> = notifier
+            .calls()
+            .iter()
+            .flat_map(|(_, events)| events.iter().map(|e| e.global_position))
+            .collect();
+        assert_eq!(
+            delivered,
+            vec![1, 2],
+            "the wake-up must deliver the silent append below it, not skip to the announced one"
+        );
+
+        cancel.cancel();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("task exits on cancel")
+            .expect("task must not panic");
+    }
+
+    /// An exhausted budget during the startup pass must stop the task
+    /// before it ever enters the delivery loop — the subscription is
+    /// already `Disabled` by then.
+    ///
+    /// The budget is pre-loaded to one short of its threshold because a
+    /// pass now makes exactly ONE delivery attempt before halting: the
+    /// 100 failures the budget allows are 100 passes, so exhausting it
+    /// from empty would take 100 ticks and say nothing about this branch.
+    #[tokio::test(start_paused = true)]
+    async fn run_stops_when_the_startup_catch_up_exhausts_the_budget() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            (1..=150u64).map(|i| ingested_event(repo_id, i)).collect(),
+        );
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
+            reason: NotifyFailureReason::Dns,
+        }));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier,
+            sub_repo.clone(),
+            mock_es,
+            principal,
+        );
+        prime_budget_to_one_short_of_exhaustion(&deps);
+        let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        // Never cancelled: the task must stop on its own.
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(async move { run(sub.clone(), deps, receiver, cancel).await });
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("task exits without cancellation")
+            .expect("task must not panic");
+        drop(sender);
+        let row = sub_repo
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+            .unwrap();
+        assert!(matches!(row.state, SubscriptionState::Disabled { .. }));
+    }
+
+    /// Same, one tick later: the pass now runs repeatedly, so a task
+    /// that ignored the exhaust signal would keep delivering to a
+    /// disabled subscription every 5 seconds forever.
+    #[tokio::test(start_paused = true)]
+    async fn run_stops_when_a_poll_tick_exhausts_the_budget() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
+            reason: NotifyFailureReason::Dns,
+        }));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier,
+            sub_repo.clone(),
+            mock_es.clone(),
+            principal,
+        );
+        prime_budget_to_one_short_of_exhaustion(&deps);
+        let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(async move { run(sub.clone(), deps, receiver, cancel).await });
+        // Startup pass sees an empty store; the failing events arrive after.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            (1..=150u64).map(|i| ingested_event(repo_id, i)).collect(),
+        );
+        tokio::time::timeout(Duration::from_secs(60), handle)
+            .await
+            .expect("task exits without cancellation")
+            .expect("task must not panic");
+        drop(sender);
+        let row = sub_repo
+            .rows
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+            .unwrap();
+        assert!(matches!(row.state, SubscriptionState::Disabled { .. }));
+    }
+
+    // -- the two defects this module was rewritten to close ---------------
+
+    /// **A restart mid-pass must not seed over an unread event.**
+    ///
+    /// The persisted `last_delivered_position` is one scalar. A pass that
+    /// walked `filter.categories` one at a time would deliver the
+    /// *Artifact* event at 11 first (list order), persist 11, and a task
+    /// respawning from that scalar would seed every category at
+    /// `AfterGlobal(11)` — so the *Ref* event at 10, which nothing had
+    /// read, is below the mark and never revisited. Nothing recovers it:
+    /// no later read starts below the cursor, and the receiver never heard
+    /// of it.
+    ///
+    /// The merged walk is what closes it. Reading the categories as one
+    /// ordered stream means the mark is always a position in that stream,
+    /// so a persist at P asserts only that everything up to P was read —
+    /// which, in global order, is true.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_mid_pass_does_not_seed_over_an_unread_event_of_another_category() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let mut sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        // Ref listed second, and holding the LOWER position — the shape
+        // that loses the event under a per-category walk.
+        sub.filter.categories = vec![StreamCategory::Artifact, StreamCategory::Ref];
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+
+        let mock_es = Arc::new(MockEventStore::new());
+        let mut ref_event = ingested_event(repo_id, 10);
+        ref_event.stream_id = StreamId {
+            category: StreamCategory::Ref,
+            entity_id: Uuid::new_v4(),
+        };
+        mock_es.set_category(StreamCategory::Ref, vec![ref_event]);
+        mock_es.set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 11)]);
+
+        // Life 1: the process dies right after its first delivery is
+        // persisted.
+        let life1_cancel = CancellationToken::new();
+        let life1_notifier = Arc::new(CancelAfterFirstDelivery::new(life1_cancel.clone()));
+        let deps = make_deps(
+            owner_user_id,
+            rbac.clone(),
+            life1_notifier.clone(),
+            sub_repo.clone(),
+            mock_es.clone(),
+            principal.clone(),
+        );
+        let (sender1, receiver1) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let sub_for_life1 = sub.clone();
+        let handle = tokio::spawn(async move {
+            run(sub_for_life1, deps, receiver1, life1_cancel).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("life 1 stops when its notifier cancels it")
+            .expect("task must not panic");
+        drop(sender1);
+
+        let life1_delivered = life1_notifier.delivered();
+        let seed = sub_repo
+            .rows
+            .lock()
+            .unwrap()
+            .get(&sub.id)
+            .cloned()
+            .unwrap()
+            .last_delivered_position;
+        assert_eq!(
+            life1_delivered,
+            vec![10],
+            "the merged walk delivers in global order, so the FIRST delivery — and \
+             therefore the persisted position — is the lowest unread position, not the \
+             lowest unread position of whichever category happens to be listed first"
+        );
+        assert_eq!(seed, Some(10));
+
+        // Life 2: respawn from the persisted seed.
+        let mut sub2 = sub.clone();
+        sub2.last_delivered_position = seed;
+        let life2_notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let deps2 = make_deps(
+            owner_user_id,
+            rbac,
+            life2_notifier.clone(),
+            sub_repo.clone(),
+            mock_es,
+            principal,
+        );
+        let (sender2, receiver2) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let cancel2 = CancellationToken::new();
+        let task_cancel = cancel2.clone();
+        let handle2 = tokio::spawn(async move { run(sub2, deps2, receiver2, task_cancel).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        cancel2.cancel();
+        drop(sender2);
+        tokio::time::timeout(Duration::from_secs(2), handle2)
+            .await
+            .expect("life 2 exits on cancel")
+            .expect("task must not panic");
+
+        let mut seen: Vec<u64> = life1_delivered;
+        seen.extend(
+            life2_notifier
+                .calls()
+                .iter()
+                .flat_map(|(_, evts)| evts.iter().map(|e| e.global_position)),
+        );
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            vec![10, 11],
+            "every event in the store must reach the subscriber across the restart; \
+             a position missing here is a permanent gap"
+        );
+    }
+
+    /// A subscription whose very first delivery fails has no earlier
+    /// position to checkpoint, and must not invent one.
+    ///
+    /// `None` is the honest answer and the adapter treats it as "leave the
+    /// column alone". Writing this event's position would be the F2 defect
+    /// in its purest form; writing `0` would work only by the coincidence
+    /// that `global_position` starts at 1.
+    #[tokio::test]
+    async fn a_failed_first_delivery_records_the_failure_without_inventing_a_position() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        assert_eq!(sub.last_delivered_position, None, "fresh subscription");
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 7)]);
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
+            reason: NotifyFailureReason::Dns,
+        }));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier,
+            sub_repo.clone(),
+            mock_es,
+            principal,
+        );
+        let cancel = CancellationToken::new();
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+        assert!(!exit);
+        let progress = sub_repo.progress_calls();
+        assert_eq!(progress.len(), 1, "a failure persists immediately");
+        assert_eq!(
+            progress[0].1, None,
+            "there is no position before the first event, so none is written"
+        );
+        assert!(progress[0].2.is_some(), "the failure itself is recorded");
+        let row = sub_repo.rows.lock().unwrap().get(&sub.id).cloned().unwrap();
+        assert_eq!(row.last_delivered_position, None);
+        assert!(matches!(cursor.read_from(), SubscribeFrom::Start));
+    }
+
+    /// A hint naming a category outside the filter must not cost a store
+    /// read.
+    ///
+    /// Observable as latency: the store holds an event this subscription
+    /// *would* deliver, and the unsubscribed hint must leave it there
+    /// until the tick. The dispatcher subscribes one receiver per task to
+    /// a channel every publisher-path append goes onto — throttled auth
+    /// audit, per-download audit, token use, the retention sweep's bulk
+    /// expiries — so an unfiltered wake-up turns one append into one read
+    /// per subscription in the process.
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_for_an_unsubscribed_category_does_not_trigger_a_store_read() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(empty_eval()));
+        let principal = admin_principal(owner_user_id);
+        let mut sub = make_subscription(owner_user_id, RepositoryScope::All);
+        sub.filter.categories = vec![StreamCategory::Policy];
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo,
+            mock_es.clone(),
+            principal,
+        );
+        let (sender, receiver) = broadcast::channel::<Arc<PersistedEvent>>(16);
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let handle = tokio::spawn(async move { run(sub, deps, receiver, task_cancel).await });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // A deliverable Policy event is waiting in the store.
+        let mut policy = ingested_event(repo_id, 1);
+        policy.stream_id = StreamId {
+            category: StreamCategory::Policy,
+            entity_id: Uuid::new_v4(),
+        };
+        mock_es.set_category(StreamCategory::Policy, vec![policy.clone()]);
+
+        // An Artifact append announces itself. This subscription does not
+        // read Artifact, so the hint says nothing about its stream.
+        sender
+            .send(Arc::new(ingested_event(repo_id, 2)))
+            .expect("receiver attached");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            notifier.calls().is_empty(),
+            "an unsubscribed category's hint must not wake a read"
+        );
+
+        // A hint on a subscribed category does.
+        sender.send(Arc::new(policy)).expect("receiver attached");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            notifier.calls().len(),
+            1,
+            "a subscribed category's hint is still a wake-up"
+        );
+
+        cancel.cancel();
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("task exits on cancel")
+            .expect("task must not panic");
+    }
+
+    /// A failed read is fail-closed AND alertable.
+    ///
+    /// Leaving the mark put is the correct half — nothing is skipped. But
+    /// a read that fails deterministically (one row this build cannot
+    /// decode, which a mixed-version rollout produces) then retries the
+    /// same page every tick forever, delivering nothing, and a `warn!` per
+    /// tick is not something an operator can alert on.
+    #[test]
+    fn a_failed_catch_up_read_increments_the_alertable_counter() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let owner_user_id = Uuid::new_v4();
+                    let repo_id = Uuid::new_v4();
+                    let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+                    let principal = dev_principal(owner_user_id);
+                    let mut sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+                    sub.last_delivered_position = Some(5);
+                    let sub_repo = Arc::new(MockSubRepo::new());
+                    sub_repo.insert(sub.clone());
+                    let mock_es = Arc::new(MockEventStore::new());
+                    mock_es
+                        .set_category(StreamCategory::Artifact, vec![ingested_event(repo_id, 6)]);
+                    mock_es.inject_category_error_after_global_position(5);
+                    let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+                    let deps =
+                        make_deps(owner_user_id, rbac, notifier, sub_repo, mock_es, principal);
+                    let cancel = CancellationToken::new();
+                    let mut cursor = ReadCursor::new(sub.last_delivered_position);
+                    assert!(!catch_up(&sub, &deps, &cancel, &mut cursor).await);
+                });
+        });
+
+        let read_errors = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, _, _, _)| key.key().name() == "hort_notify_store_read_errors_total")
+            .map(|(_, _, _, value)| value);
+        assert!(
+            matches!(read_errors, Some(DebugValue::Counter(1))),
+            "a failed read must leave an alertable signal, not only a log line; got \
+             {read_errors:?}"
         );
     }
 

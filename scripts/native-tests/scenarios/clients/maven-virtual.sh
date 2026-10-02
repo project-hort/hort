@@ -157,7 +157,7 @@ fi
 # ---- Test 2: A-level metadata THROUGH the virtual lists the version ----
 log "==> [2/4] A-level maven-metadata.xml through the virtual (authed)..."
 META_A="$(curl -sf -u "__token__:${DEV_TOKEN}" "${VIRTUAL_URL}/${GA_PATH}/maven-metadata.xml" 2>/dev/null || true)"
-if printf '%s' "$META_A" | grep -q "<version>${RELEASE_VERSION}</version>"; then
+if capture_match "<version>${RELEASE_VERSION}</version>" printf '%s' "$META_A"; then
   pass "virtual A-level metadata lists $RELEASE_VERSION (merged from the member)"
 else
   fail "virtual A-level metadata" "missing <version>${RELEASE_VERSION}</version> in: $META_A"
@@ -182,7 +182,7 @@ fi
 # not surface. (--max-time bounds the proxy-member fall-through to Central.)
 log "==> [4/4] Anonymous read through the virtual must not leak the private artifact..."
 ANON_META="$(curl -sS --max-time 30 "${VIRTUAL_URL}/${GA_PATH}/maven-metadata.xml" 2>/dev/null || true)"
-if printf '%s' "$ANON_META" | grep -q "${RELEASE_VERSION}"; then
+if capture_match "${RELEASE_VERSION}" printf '%s' "$ANON_META"; then
   fail "anonymous read leaked the private artifact" "version $RELEASE_VERSION visible anonymously"
 else
   pass "anonymous read through the virtual does not leak the private artifact"

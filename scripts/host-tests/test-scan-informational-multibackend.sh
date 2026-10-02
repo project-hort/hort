@@ -83,6 +83,7 @@ if ! curl -fsSL -o /dev/null --max-time 5 "$METRICS_URL"; then
     log "SKIP: hort-server not reachable at $METRICS_URL (bring up the compose stack + worker profile first)"
     exit 2
 fi
+# Bounded: psql_count's own output is a single COUNT(*) scalar.
 if ! psql_count "SELECT COUNT(*) FROM scanner_registry WHERE worker_id = 'hort-worker-v2';" | grep -q '^[1-9]'; then
     log "SKIP: no worker registered (run 'docker compose --profile worker up -d')"
     exit 1

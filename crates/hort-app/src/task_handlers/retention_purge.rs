@@ -5,7 +5,11 @@
 //! (the route lives in `hort-http-admin-tasks`).
 //! Default schedule `0 4 * * *`. Thin orchestration over
 //! [`PurgeUseCase::process_expired`] (the destructive storage-GC
-//! walk). The use case **refuses to run** until the
+//! walk). The name is narrower than the job: the sweep collects the
+//! bytes of *every* retired artifact, policy-expired and caller-deleted
+//! alike, which is why `user_deletes_visited` is in the summary — a
+//! deployment with no retention policy configured at all still has work
+//! here. The use case **refuses to run** until the
 //! [`RefcountReconcileGate`](crate::use_cases::purge_use_case::RefcountReconcileGate)
 //! reports the refcount reconcile has converged — a gate-false purge surfaces here as a
 //! retryable `TaskOutcome::fail` (fail-safe; the worker boot sweep
@@ -52,8 +56,11 @@ impl TaskHandler for RetentionPurgeHandler {
                         artifacts_visited = s.artifacts_visited,
                         blobs_deleted = s.blobs_deleted,
                         blobs_kept = s.blobs_kept,
+                        blobs_deferred = s.blobs_deferred,
                         purged_events = s.purged_events,
                         skipped_protected = s.skipped_protected,
+                        skipped_tag_exempt = s.skipped_tag_exempt,
+                        user_deletes_visited = s.user_deletes_visited,
                         errors = s.errors,
                         "retention-purge sweep complete"
                     );
@@ -62,8 +69,11 @@ impl TaskHandler for RetentionPurgeHandler {
                             "artifacts_visited": s.artifacts_visited,
                             "blobs_deleted": s.blobs_deleted,
                             "blobs_kept": s.blobs_kept,
+                            "blobs_deferred": s.blobs_deferred,
                             "purged_events": s.purged_events,
                             "skipped_protected": s.skipped_protected,
+                            "skipped_tag_exempt": s.skipped_tag_exempt,
+                            "user_deletes_visited": s.user_deletes_visited,
                             "errors": s.errors,
                         }),
                     })
@@ -99,12 +109,13 @@ mod tests {
     use chrono::{DateTime, Utc};
     use hort_domain::error::DomainError;
     use hort_domain::events::system_actor;
-    use hort_domain::ports::purge_gc::{PendingPurge, PurgeGcPort, PurgedRef};
+    use hort_domain::ports::event_store::AppendEvents;
+    use hort_domain::ports::purge_gc::{BlobReclaim, PendingPurge, PurgeGcPort, PurgedRef};
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use uuid::Uuid;
 
     use crate::use_cases::purge_use_case::RefcountReconcileGate;
-    use crate::use_cases::test_support::{MockEventStore, MockStoragePort};
+    use crate::use_cases::test_support::MockStoragePort;
 
     struct Gate(bool);
     impl RefcountReconcileGate for Gate {
@@ -117,12 +128,46 @@ mod tests {
         pending: Mutex<Vec<PendingPurge>>,
     }
     impl PurgeGcPort for MockGc {
-        fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
-            let v = self.pending.lock().unwrap().clone();
+        fn list_pending_purge(
+            &self,
+            _limit: u32,
+            after_artifact_id: Option<Uuid>,
+        ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+            // One page only: the keyset cursor makes the second call
+            // return nothing, which is how the use case's page loop
+            // terminates.
+            let v = if after_artifact_id.is_some() {
+                Vec::new()
+            } else {
+                self.pending.lock().unwrap().clone()
+            };
             Box::pin(async move { Ok(v) })
         }
         fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
             Box::pin(async { Ok(Vec::new()) })
+        }
+        fn begin_blob_reclaim(
+            &self,
+            _artifact_id: Uuid,
+            _content_hash: &hort_domain::types::ContentHash,
+        ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+            Box::pin(async { Ok(BlobReclaim::Contended) })
+        }
+        fn mark_purge_ref_complete(
+            &self,
+            _artifact_id: Uuid,
+            _content_hash: &hort_domain::types::ContentHash,
+            _completed_at: DateTime<Utc>,
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn complete_artifact_purge(
+            &self,
+            _artifact_id: Uuid,
+            _retired_at: DateTime<Utc>,
+            _events: AppendEvents,
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -132,7 +177,6 @@ mod tests {
                 pending: Mutex::new(Vec::new()),
             }),
             Arc::new(MockStoragePort::new()),
-            crate::event_store_publisher::wrap_for_test(Arc::new(MockEventStore::new())),
             Arc::new(Gate(gate)),
         ))
     }
@@ -162,6 +206,16 @@ mod tests {
         }
     }
 
+    fn purge_uc_with_pending(pending: Vec<PendingPurge>) -> Arc<PurgeUseCase> {
+        Arc::new(PurgeUseCase::new(
+            Arc::new(MockGc {
+                pending: Mutex::new(pending),
+            }),
+            Arc::new(MockStoragePort::new()),
+            Arc::new(Gate(true)),
+        ))
+    }
+
     #[test]
     fn kind_is_retention_purge() {
         assert_eq!(
@@ -177,7 +231,38 @@ mod tests {
             TaskOutcome::Completed { result_summary } => {
                 assert_eq!(result_summary["artifacts_visited"], 0);
                 assert_eq!(result_summary["blobs_deleted"], 0);
+                assert_eq!(result_summary["user_deletes_visited"], 0);
                 assert_eq!(result_summary["errors"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    /// The summary separates delete-driven from expiry-driven work: the
+    /// sweep is the collector for both, so without the split an operator
+    /// watching a retention-free deployment could not attribute the
+    /// destructive work it does here.
+    #[tokio::test]
+    async fn summary_reports_delete_driven_work_separately() {
+        let deleted = PendingPurge {
+            artifact_id: Uuid::new_v4(),
+            quarantine_status: hort_domain::entities::artifact::QuarantineStatus::Released,
+            tag_targeted: false,
+            expired_only_by_keep_last_n: true,
+            user_deleted: true,
+        };
+        let expired = PendingPurge {
+            artifact_id: Uuid::new_v4(),
+            quarantine_status: hort_domain::entities::artifact::QuarantineStatus::Released,
+            tag_targeted: false,
+            expired_only_by_keep_last_n: false,
+            user_deleted: false,
+        };
+        let h = RetentionPurgeHandler::new(purge_uc_with_pending(vec![deleted, expired]));
+        match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["artifacts_visited"], 2);
+                assert_eq!(result_summary["user_deletes_visited"], 1);
             }
             other => panic!("expected Completed, got {other:?}"),
         }
@@ -204,17 +289,43 @@ mod tests {
     async fn list_pending_error_returns_failed_retry() {
         struct FailGc;
         impl PurgeGcPort for FailGc {
-            fn list_pending_purge(&self) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+            fn list_pending_purge(
+                &self,
+                _limit: u32,
+                _after_artifact_id: Option<Uuid>,
+            ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
                 Box::pin(async { Err(DomainError::Invariant("db down".into())) })
             }
             fn purge_artifact_refs(&self, _a: Uuid) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
                 Box::pin(async { Ok(Vec::new()) })
             }
+            fn begin_blob_reclaim(
+                &self,
+                _artifact_id: Uuid,
+                _content_hash: &hort_domain::types::ContentHash,
+            ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+                Box::pin(async { Ok(BlobReclaim::Contended) })
+            }
+            fn mark_purge_ref_complete(
+                &self,
+                _artifact_id: Uuid,
+                _content_hash: &hort_domain::types::ContentHash,
+                _completed_at: DateTime<Utc>,
+            ) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn complete_artifact_purge(
+                &self,
+                _artifact_id: Uuid,
+                _retired_at: DateTime<Utc>,
+                _events: AppendEvents,
+            ) -> BoxFuture<'_, DomainResult<()>> {
+                Box::pin(async { Ok(()) })
+            }
         }
         let uc = Arc::new(PurgeUseCase::new(
             Arc::new(FailGc),
             Arc::new(MockStoragePort::new()),
-            crate::event_store_publisher::wrap_for_test(Arc::new(MockEventStore::new())),
             Arc::new(Gate(true)),
         ));
         let h = RetentionPurgeHandler::new(uc);

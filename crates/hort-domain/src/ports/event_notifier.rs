@@ -118,7 +118,7 @@ pub trait EventNotifier: Send + Sync {
     /// Dispatch one batch of events to one subscription's target.
     ///
     /// The `subscription_id` is threaded through so adapters that surface
-    /// the id on the wire (webhook `X-Ak-Subscription-Id` header + JSON
+    /// the id on the wire (webhook `X-Hort-Subscription-Id` header + JSON
     /// body `subscription_id` field; NATS JetStream JSON body
     /// `subscription_id` field) do not need to ferry it via a separate
     /// channel. Adapters that do not need it (test stubs, future

@@ -2,13 +2,28 @@
 Retention-purge CronJob.
 
 Periodically invokes `hort-cli admin task invoke retention-purge`. The
-handler runs the destructive storage-GC walk: for every `ArtifactExpired`
-with no following `ArtifactPurged`, decrement `content_references`,
-delete the CAS blob iff the cross-`kind` refcount hit 0, append
-`ArtifactPurged` (RetentionScheduler actor). The use case REFUSES to
-run until the worker's boot refcount-reconcile sweep has converged
-(gate-false → the handler returns a retryable failure; the next worker
-boot flips the gate). Default daily cadence, after retention-evaluate.
+handler runs the destructive storage-GC walk: for every byte-release work
+item — an `ArtifactExpired` (a retention policy decided) or an
+`ArtifactDeleted` (a caller deleted the artifact through the registry
+API) — with no following `ArtifactPurged`, decrement
+`content_references`, delete the CAS blob iff the cross-`kind` refcount
+hit 0, append `ArtifactPurged` (RetentionScheduler actor). The use case
+REFUSES to run until the worker's boot refcount-reconcile sweep has
+converged — swept every repository and applied every repair with zero
+failures (gate-false → the handler returns a retryable failure whose
+reason lands in `jobs.last_error`; the next worker boot re-runs the
+sweep and re-decides the gate). Diagnosing a refusal: the worker
+restates a closed gate, with the reason, on its 60-second heartbeat, so
+`kubectl logs` on the worker shows it without enabling the worker
+`/metrics` listener (`hort_refcount_reconcile_gate_closed` is the gauge
+for deployments that do scrape it). Default daily cadence, after
+retention-evaluate.
+
+This sweep is the ONLY path that reclaims the bytes of a deleted
+artifact, so leaving it disabled (the default below) means a repository
+that is only ever written to and deleted from — no retention policy
+configured at all — never reclaims storage. The summary's
+`user_deletes_visited` counts the delete-driven half of a run.
 
 Schedule-overlap protection: `concurrencyPolicy: Forbid` (layer 1) +
 the worker per-kind semaphore concurrency=1 (layer 2).

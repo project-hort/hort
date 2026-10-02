@@ -204,6 +204,16 @@ stream. In addition to `Permission::AdminTaskInvoke`, invoking one of
 these requires the caller to carry the `task:destructive` **claim**. This
 is a hard architectural line, not a configuration gap:
 
+> **Storage reclamation depends on `retention-purge` running.** Its name
+> understates its job: the sweep releases the bytes of *every* retired
+> artifact, whether a retention policy expired it or a caller deleted it
+> through the registry API (an OCI manifest `DELETE`, today). It is the
+> only path that does so. Leaving it disabled — the shipped default,
+> deliberately, because it is the most destructive of the three — means a
+> registry with no retention policy at all still never reclaims the
+> storage behind its deletes. Run it by hand on the cadence your capacity
+> planning needs, per the CliSession flow below.
+
 - Service-account tokens (the `cronjob-tasks` bootstrap svc-token
   included) are **claimless by construction** — `authenticate_pat`
   resolves no IdP claims for a native token. A claimless caller can never
@@ -213,6 +223,12 @@ is a hard architectural line, not a configuration gap:
   work — the CronJob will fail every run with `destructive task kind
   "retention-purge" requires the "task:destructive" claim in addition to
   Permission::AdminTaskInvoke`.
+
+The one exception is `retention-evaluate` with `{"mode":"dry_run"}`, which
+records nothing and therefore needs only `Permission::AdminTaskInvoke`. The
+claim gate follows the invocation's mode, and the mode defaults to `execute`
+when the request body omits it — so every invocation shown below, and the
+shipped CronJob, still needs the claim.
 
 To run a destructive task, use a **fresh IdP-backed admin CliSession** by
 hand, from an operator workstation — never a static token:

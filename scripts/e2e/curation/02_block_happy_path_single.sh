@@ -85,6 +85,7 @@ fi
 
 # `rejected_by` is a tagged enum: `Curator { curator_id: Uuid }` renders
 # as `{"Curator": {"curator_id": "<uuid>"}}`. Look for the Curator tag.
+# Bounded: EVENT_ROW is a single events-table row's JSON payload.
 if printf '%s' "$EVENT_ROW" | grep -q '"Curator"'; then
     assert_pass "ArtifactRejected.rejected_by = Curator { curator_id }"
 else

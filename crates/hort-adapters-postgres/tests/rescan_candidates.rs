@@ -39,23 +39,25 @@
 //! - `select_stranded_skips_rejected_artifact_even_with_failed_scan`
 //! - `select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_failed_job`
 //!
-//! New tests carry `#[serial(hort_pg_db)]` per the crate-wide DB-test
-//! parallel-safety contract (CLAUDE.md → Test Coverage Tiers → DB-backed
-//! test isolation), in addition to this file's own in-binary
-//! `lock_serial()` gate (both are kept — `lock_serial()` predates the
-//! `#[serial(hort_pg_db)]` convention and only serializes within this one
-//! test binary; `#[serial(hort_pg_db)]` is the cross-binary lock).
+//! Every test here carries `#[serial(hort_pg_db)]`, the workspace-wide
+//! DB-test parallel-safety key (CLAUDE.md → Test Coverage Tiers →
+//! DB-backed test isolation), and that key is the file's **only**
+//! serialization. Do not add a file-local mutex beside it: two
+//! independent orders do not compose into one, so a test taking only
+//! the mutex and a test taking only the key run concurrently. What
+//! needs ordering here is the policy read — a Global-scoped
+//! `ScanPolicy` created by a sibling shadows the `WHERE NOT EXISTS
+//! Repository` fallback these tests resolve through — and the key
+//! covers it.
 
 #![allow(clippy::expect_used)]
 
 use std::env;
-use std::sync::OnceLock;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::json;
 use serial_test::serial;
 use sqlx::PgPool;
-use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use uuid::Uuid;
 
 use hort_adapters_postgres::rescan_candidates::PgRescanCandidatesRepository;
@@ -68,22 +70,6 @@ async fn admin_pool() -> Option<PgPool> {
     let pool = hort_adapters_postgres::test_support::isolated_db_from(&url).await?;
     hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
     Some(pool)
-}
-
-/// Per-binary serialization gate. Tests share `public.artifacts`,
-/// `public.policy_projections`, and `public.jobs` against a single DB
-/// — every test seeds rows with fresh UUIDs and filters its assertions
-/// to those UUIDs, but a global Global-scoped policy that `WHERE NOT
-/// EXISTS Repository` falls back to could be created by sibling
-/// binaries running migrations in parallel. The serial lock confines
-/// our policy reads to a single test at a time.
-fn serial_lock() -> &'static AsyncMutex<()> {
-    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| AsyncMutex::new(()))
-}
-
-async fn lock_serial() -> AsyncMutexGuard<'static, ()> {
-    serial_lock().lock().await
 }
 
 /// Seed a minimal repository row with a unique key/name and return its id.
@@ -248,8 +234,8 @@ fn filter_to<'a>(
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_returns_never_scanned_released_artifact() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -280,8 +266,8 @@ async fn select_eligible_returns_never_scanned_released_artifact() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_skips_recently_scanned_within_interval() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -308,8 +294,8 @@ async fn select_eligible_skips_recently_scanned_within_interval() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_returns_artifact_scanned_before_interval() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -338,8 +324,8 @@ async fn select_eligible_returns_artifact_scanned_before_interval() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_skips_zero_interval_disabled_policy() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -365,8 +351,8 @@ async fn select_eligible_skips_zero_interval_disabled_policy() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_skips_quarantined_artifact() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -391,8 +377,8 @@ async fn select_eligible_skips_quarantined_artifact() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_skips_rejected_artifact() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -417,8 +403,8 @@ async fn select_eligible_skips_rejected_artifact() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_skips_artifact_with_pending_scan_job() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -444,8 +430,8 @@ async fn select_eligible_skips_artifact_with_pending_scan_job() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_returns_artifact_with_completed_scan_job_only() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -477,8 +463,8 @@ async fn select_eligible_returns_artifact_with_completed_scan_job_only() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_returns_null_quarantine_artifact() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -511,8 +497,8 @@ async fn select_eligible_returns_null_quarantine_artifact() {
 // =====================================================================
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn select_eligible_returns_null_quarantine_no_policy_artifact() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -528,10 +514,10 @@ async fn select_eligible_returns_null_quarantine_no_policy_artifact() {
 
     // The LEFT JOIN keeps a no-policy artifact; pre-fix the INNER JOIN
     // dropped it. `rescan_interval_hours` is intentionally NOT asserted
-    // here — a Global ScanPolicy created by a sibling test binary would
-    // shadow the DefaultPolicy fallback (the residual the `lock_serial`
-    // doc names). Test (i) pins the interval deterministically via a
-    // repo-scoped policy.
+    // here — a Global ScanPolicy created by a sibling would shadow the
+    // DefaultPolicy fallback, and `WHERE NOT EXISTS Repository` makes
+    // that fallback global by construction. Test (i) pins the interval
+    // deterministically via a repo-scoped policy instead.
     assert_eq!(
         filter_to(&rows, &[artifact]).len(),
         1,
@@ -579,7 +565,6 @@ async fn seed_scan_job_at(
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_returns_quarantined_artifact_with_failed_last_scan() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -612,7 +597,6 @@ async fn select_stranded_returns_quarantined_artifact_with_failed_last_scan() {
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_errs_on_malformed_checksum() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -643,7 +627,6 @@ async fn select_stranded_errs_on_malformed_checksum() {
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_eligible_errs_on_malformed_checksum() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -683,7 +666,6 @@ async fn select_eligible_errs_on_malformed_checksum() {
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_returns_quarantined_artifact_with_no_scan_job_under_scanning_policy() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -729,7 +711,6 @@ async fn select_stranded_returns_quarantined_artifact_with_no_scan_job_under_sca
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_skips_quarantined_artifact_with_no_scan_job_under_scan_waived_policy() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -759,7 +740,6 @@ async fn select_stranded_skips_quarantined_artifact_with_no_scan_job_under_scan_
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_skips_quarantined_artifact_with_pending_last_scan() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -788,7 +768,6 @@ async fn select_stranded_skips_quarantined_artifact_with_pending_last_scan() {
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_skips_released_artifact_even_with_failed_scan() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -818,7 +797,6 @@ async fn select_stranded_skips_released_artifact_even_with_failed_scan() {
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -847,7 +825,6 @@ async fn select_stranded_skips_scan_indeterminate_artifact_even_with_failed_scan
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_skips_rejected_artifact_even_with_failed_scan() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };
@@ -878,7 +855,6 @@ async fn select_stranded_skips_rejected_artifact_even_with_failed_scan() {
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn select_stranded_skips_artifact_with_newer_in_flight_job_despite_older_failed_job() {
-    let _serial = lock_serial().await;
     let Some(pool) = admin_pool().await else {
         return;
     };

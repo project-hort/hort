@@ -47,11 +47,15 @@
 //! 2. **Registered-rule lookup** — no rule for the candidate's
 //!    category ⇒ skip + `debug!` (`skipped_unregistered_category`),
 //!    continue.
-//! 3. **Terminal proof** (`TerminalGated` only) — `read_stream(.. ,
-//!    Start, LIMIT)`: an empty read ⇒ `already_sealed` + `debug!`
+//! 3. **Terminal proof** (`TerminalGated` only) — one full-stream read
+//!    via [`read_artifact_stream`](crate::use_cases::read_artifact_stream):
+//!    an empty read ⇒ `already_sealed` + `debug!`
 //!    (idempotent re-run); a last event whose
 //!    [`DomainEvent::event_type`] ≠ the category terminal ⇒
-//!    `skipped_non_terminal` + `warn!` (NOT an error), continue.
+//!    `skipped_non_terminal` + `warn!` (NOT an error), continue. A stream
+//!    that breached `STREAM_EVENT_CAP` cannot be read to its tail, so it
+//!    is reported as a read error (`errors += 1`, never sealed) rather
+//!    than sealed on the 200th event as if that were the terminal.
 //! 4. **C-1 floor proof** — `now - first_event_at < floor` ⇒
 //!    `skipped_floor_not_elapsed` + `debug!`, continue. The floor is
 //!    proven against the **oldest** event's `stored_at` (every later
@@ -74,21 +78,12 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use hort_domain::events::StreamId;
-use hort_domain::ports::event_store::{EventStore, ReadFrom};
+use hort_domain::ports::event_store::EventStore;
 use hort_domain::ports::terminal_stream_reader::{TerminalStreamCandidate, TerminalStreamReader};
 
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{emit_streams_archived, StreamsArchivedResult};
-
-/// How many events to read when proving a `TerminalGated` stream's
-/// tail. We only need the last event's type; the stream is read from
-/// `Start` (so an empty read is the idempotent already-sealed signal),
-/// and the largest `stream_position` in the page is the tail. Terminal
-/// artifact streams are short (ingest → … → purge); ~200 covers any
-/// realistic lifecycle with margin, and the read is bounded so a
-/// pathological stream cannot OOM the sweep.
-const TERMINAL_PROOF_READ_LIMIT: u64 = 200;
 
 /// Per-category seal rule. `TerminalGated` artifact-category streams
 /// seal only on a matching terminal tail; `AgeGated` rotated audit
@@ -472,17 +467,19 @@ impl EventStoreRetentionUseCase {
                 return TerminalProof::ReadError;
             }
         };
-        let events = match self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, TERMINAL_PROOF_READ_LIMIT)
-            .await
-        {
+        // The tail is the whole point of this read, so it must be a read
+        // that can prove it reached the tail: `read_artifact_stream` reads
+        // one event past `STREAM_EVENT_CAP` and refuses a stream longer
+        // than that. Sealing deletes a stream — deciding "terminal" from
+        // the 200th event of a longer stream would delete an audit trail
+        // that had not terminated.
+        let events = match crate::use_cases::read_artifact_stream(&*self.events, &stream_id).await {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!(
                     stream_id = %candidate.stream_id,
                     error = %e,
-                    "terminal-proof read_stream failed — NOT sealed, retried \
+                    "terminal-proof stream read failed — NOT sealed, retried \
                      next sweep (fail-safe)"
                 );
                 return TerminalProof::ReadError;

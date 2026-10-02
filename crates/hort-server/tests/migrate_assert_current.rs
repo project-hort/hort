@@ -60,6 +60,7 @@ use std::env;
 use std::time::Duration;
 
 use hort_server::migrate::{assert_current, MIGRATOR};
+use serial_test::serial;
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
@@ -68,12 +69,13 @@ use uuid::Uuid;
 // ---------------------------------------------------------------------------
 
 /// Connect as the superuser pointed at by `DATABASE_URL`. Returns
-/// `None` when the env var is unset so the suite stays green in
+/// `None` *only* when the env var is unset, so the suite stays green in
 /// dev environments without a database (mirrors the
-/// `events_role_hardening` skip-when-no-DB convention).
+/// `events_role_hardening` skip-when-no-DB convention). A target that is
+/// set but unreachable is a hard failure, not a skip.
 async fn admin_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
+    Some(hort_adapters_postgres::test_support::connect_or_panic(&url).await)
 }
 
 /// Create a uniquely-named throwaway database under the same host as
@@ -203,6 +205,7 @@ async fn insert_fake_migration(pool: &PgPool, version: i64) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn fresh_db_bails_with_table_missing() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -231,6 +234,7 @@ async fn fresh_db_bails_with_table_missing() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migrated_db_returns_ok() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -254,6 +258,7 @@ async fn migrated_db_returns_ok() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn behind_schema_bails_with_mismatch() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -308,6 +313,7 @@ async fn behind_schema_bails_with_mismatch() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn ahead_schema_is_supported() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -341,6 +347,7 @@ async fn ahead_schema_is_supported() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn many_newer_expansions_are_supported() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -373,6 +380,7 @@ async fn many_newer_expansions_are_supported() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_contraction_above_this_binary_bails_and_names_the_way_out() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -413,6 +421,7 @@ async fn newer_contraction_above_this_binary_bails_and_names_the_way_out() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn newer_migration_without_a_register_row_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -449,6 +458,7 @@ async fn newer_migration_without_a_register_row_bails() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn unknown_version_below_the_waterline_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -489,6 +499,7 @@ async fn unknown_version_below_the_waterline_bails() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn missing_mid_sequence_version_bails() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -532,6 +543,7 @@ async fn missing_mid_sequence_version_bails() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn permission_denied_bails_with_grant_message() {
     let Some(admin) = admin_pool().await else {
         return;

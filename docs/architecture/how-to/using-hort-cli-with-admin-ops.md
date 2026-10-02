@@ -209,6 +209,131 @@ Both of the above endpoints are gated by the same `AdminPrincipal` check as
 rationale behind the admin-only scope, the in-memory apply-status
 semantics, and the secrets-exclusion mechanism.
 
+### Preview and execute a retention cleanup
+
+Retention deletes real content, so the CLI puts a readable proposal and a
+confirmation between the operator and the sweep. Two subcommands:
+
+```sh
+# What would retention take if it ran right now? Read-only.
+$ hort-cli admin retention preview
+
+# Execute it, after re-measuring and showing what moved since that preview.
+$ hort-cli admin retention apply --from-preview <task_job_id>
+```
+
+`preview` runs `retention-evaluate` in `dry_run` mode and renders the
+result: artifact rows, distinct stored contents, the bytes a purge would
+actually reclaim, a per-policy/per-repository rollup naming repositories
+by the key you write into a policy, a capped sample, and — beside the
+run and each group — a **proposal digest** identifying *which* rows the
+run proposes to expire.
+
+Four things about that output are deliberate:
+
+- **Rows are not bytes.** One stored blob can back many artifact rows, so
+  the row count and the byte figure will not agree. The output labels the
+  counts as counts and gives no per-group byte column, because a blob is
+  freed only when its last reference anywhere goes away.
+- **An unmeasured size says so.** When the evaluator's byte accounting
+  exceeds its exact-accounting bound it reports `omitted`, and the CLI
+  prints `NOT MEASURED` with the reason. The reason names which of the two
+  bounds was hit (the candidate artifacts handed to the simulation, or the
+  reclaimable content targets it produced), what that bound is set to, and
+  what this run reached — so you can tell whether a narrower scope brings
+  the figure back. There is no estimate anywhere, and never a `0` standing
+  in for "we did not look".
+- **Partial coverage is in the header.** A sweep that stopped at its
+  per-run batch cap undercounts every artifact outside the window it
+  walked, so it is stated above the numbers rather than after them. It
+  bounds the run, not the sweep: each execution records the position it
+  stopped at, the next one resumes strictly after it, and a finished pass
+  wraps to the beginning — so a registry larger than one run's cap is
+  covered across consecutive runs rather than having its tail left
+  permanently unevaluated. A preview reads that position without moving
+  it, which is what makes it a preview of the window the next execution
+  will act on.
+- **The proposal has an identity, not just a size.** Every count in the
+  output says *how much* would be expired; none of them says *what*. Two
+  previews can agree on every figure and still name different rows — one
+  artifact stopped matching and an equally sized one started — and among
+  artifacts of the same kind that is not a rare coincidence. So each run
+  also reports a `proposal_digest` over the `(policy, artifact)` pairs it
+  matched, in canonical order, with a per-group digest beside it. It is a
+  fixed-width field whatever the proposal's size, and it is **not** a
+  content hash: it digests identifiers, never artifact bytes, and no
+  storage path accepts one. The `scheme` tag beside each value says which
+  construction produced it; two digests are comparable only under the
+  same scheme.
+
+`apply` always runs a **fresh** preview immediately before executing.
+With `--from-preview` it compares that fresh preview against the earlier
+one you name and renders the difference; if anything moved you are asked
+to acknowledge the change and then to authorise the run — two separate
+questions. `--yes` skips the questions and never the comparison. Without
+`--from-preview` there is nothing to compare against and no delta is
+invented: the fresh preview is presented on its own terms.
+
+That comparison decides on the proposal's identity, so `NOTHING CHANGED
+SINCE THE PREVIEW YOU NAMED` means *the same artifacts*, not *the same
+totals*. Three answers are possible and the output distinguishes them,
+because they ask for different judgement:
+
+- **The same artifacts.** Both previews reported a comparable identity
+  and the two agree. This is the only answer that skips the extra
+  question.
+- **Different artifacts.** The proposed rows moved. You are asked to
+  acknowledge that before authorising the run, whether or not any figure
+  moved with them.
+- **Not compared.** One side reported no identity (a server older than
+  the field), or the two were computed under different schemes (a server
+  upgrade between the two runs). The output says so and still asks — a
+  comparison that could not check must not sound like one that did.
+
+`delta.proposal.comparison` in the JSON carries the same answers, with
+the two causes of "not compared" kept apart: `same`, `different`,
+`unreported`, `scheme_mismatch`. `delta.changed` is fail-closed — `true`
+whenever sameness was not *established* — so a script gating an
+unattended apply on `changed == false` stops rather than proceeding
+blind.
+
+**Partial coverage qualifies a difference, never a match.** Equal digests
+mean the two previews name the same rows however much of the candidate
+set each examined. Differing digests over a `partial` run are another
+matter: two runs can legitimately walk different windows — an execution
+between them moves the sweep's saved position — so the output says it
+compared two windows and that the difference may be the window moving
+rather than the world, instead of reporting it as the proposal changing.
+`delta.proposal.window_limited` is the same fact for a script.
+
+Authority: `preview` needs only the ordinary admin-task permission;
+`apply`'s execute step additionally needs the `task:destructive` claim,
+which the `--admin` session above carries. Nothing here introduces a new
+permission, claim, or token lifetime.
+
+Exit codes worth scripting against: `0` ran and the result was read, `3`
+the job outlived `--wait-timeout` (the job id is printed and nothing is
+reported about its outcome), `4` the operator declined and nothing was
+executed.
+
+Three operational notes:
+
+- **A `preview` is always a fresh sweep.** Run it as often as you like:
+  an observation destroys nothing, so it takes no single-flight claim and
+  is never deduplicated. That is what lets `apply --from-preview` compare
+  its pre-execution re-measure against the proposal you named rather than
+  against itself.
+- **An `apply` execution is deduplicated per UTC day.** The first
+  execution of a day owns the day; a second one gets that job back rather
+  than sweeping again, and the CLI says so explicitly rather than
+  presenting it as a fresh run. This is deliberate — the cron schedule is
+  the retry mechanism, and re-firing a destructive sweep inside the day is
+  what [ADR 0028](../../adr/0028-destructive-task-idempotency.md) exists
+  to prevent. Recovering inside the same day means deleting the earlier
+  `jobs` row, which is an explicit and audited operator action.
+- Expiry marks artifact records. Reclaiming the bytes is the separate
+  purge stage.
+
 ### Re-login after expiry ("session expired")
 
 A 15 min admin session expires quickly. Once the token crosses `expires_at`,

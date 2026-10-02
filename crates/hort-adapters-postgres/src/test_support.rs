@@ -2,25 +2,48 @@
 //!
 //! `#[doc(hidden)]` — not part of the public API; compiled always so
 //! that `hort-adapters-postgres`'s own `#[cfg(test)]` modules, its
-//! `tests/` integration binaries, and the `hort-server` / `hort-worker`
-//! integration tests can all share one isolation helper without a
-//! feature-flag dance.
+//! `tests/` integration binaries, and the `hort-server` integration
+//! tests can all share one isolation helper without a feature-flag
+//! dance.
 //!
 //! ## Why
 //!
 //! The DB-backed test suites historically connected to ONE shared
-//! database and each ran `sqlx::migrate!().run()` against it. Under
-//! `cargo test --tests` cargo runs many test binaries in parallel, so
-//! they raced and corrupted each other's schema/data (concurrent
-//! migrate, `DROP TABLE … CASCADE` collateral, before/after deltas on
-//! global streams, …). [`isolated_db_from`] gives every caller its own
+//! database and each ran `sqlx::migrate!().run()` against it. Cargo
+//! runs the test binaries one after another, but libtest runs the tests
+//! *within* a binary on many threads at once, and each binary in turn
+//! inherited every earlier binary's leftovers — so they raced and
+//! corrupted each other's schema/data (concurrent migrate,
+//! `DROP TABLE … CASCADE` collateral, before/after deltas on global
+//! streams, …). [`isolated_db_from`] gives every caller its own
 //! freshly-created database, so cross-test/cross-binary interference is
 //! structurally impossible. The caller still runs its own
 //! `sqlx::migrate!().run()` on the returned pool (kept at the call site
 //! so the embedded-migration set stays crate-local; the workspace
 //! `build.rs` files make that embed track `migrations`).
 //!
-//! ## Cleanup — bounded, not unbounded (issue #37)
+//! ## The skip contract: one condition, and it is not "the DB is down"
+//!
+//! A DB-gated test skips on exactly one condition — `DATABASE_URL`
+//! unset — and that decision is taken by the caller, not here. Every
+//! call site is `let url = env::var("DATABASE_URL").ok()?;` immediately
+//! followed by [`isolated_db_from`], so this module is only ever asked
+//! for a database the operator has declared. From that point a failure
+//! is a hard failure: [`isolated_db_from`], [`connect_or_panic`] and
+//! [`shared_migrated_pool`] panic rather than hand back a `None` the
+//! caller cannot tell apart from "no database configured".
+//!
+//! They did hand back that `None`, and the cost of it was not an
+//! uncertain result but a false one. Measured against a closed port,
+//! `cargo test --workspace --tests --no-fail-fast` reported **12,350
+//! passed, 1 failed, 7 ignored** — 488 of the 489 tests that touch the
+//! database claiming `ok` without having opened a connection, and none
+//! of them counted in the `ignored` column. The one failure was the single test in the
+//! workspace that hand-rolled `.expect()` on its own maintenance
+//! connection. The state in which a green gate is most valuable — the
+//! server has a problem — was the state in which the gate inverted.
+//!
+//! ## Cleanup — a once-per-process sweep (issue #37)
 //!
 //! A throwaway database is still not dropped at the end of its own
 //! test (there is no teardown hook — [`isolated_db_from`] hands back a
@@ -49,25 +72,331 @@
 //!   proceeds to create its own database. Cleanup must never be the
 //!   reason a test fails.
 //!
-//! This bounds accumulation to roughly one run's worth. It does not
-//! *prevent* a leak — a drop-on-teardown guard would, at the cost of a
-//! guard type threaded through 22 test files and a database drop issued
-//! from a synchronous `Drop`. Deliberately not done; revisit only if
-//! the between-sweep accumulation ever bites.
+//! It does not *prevent* a leak — a drop-on-teardown guard would, at the
+//! cost of a guard type threaded through the 60 files that call
+//! [`isolated_db_from`] and a database drop issued from a synchronous
+//! `Drop`. Deliberately not done.
+//!
+//! ## The sweep is bounded in wall clock, not in candidates
+//!
+//! The sweep's cost falls on the run it belongs to rather than on the
+//! sibling it is trying not to disturb. Every `DROP DATABASE` makes the
+//! backend request an immediate, waited-on checkpoint — visible as
+//! `IPC/CheckpointStart` then `IPC/CheckpointDone` in
+//! `pg_stat_activity.wait_event`, and as `checkpoints_req` rising by
+//! exactly +1251 across 1251 drops — so a sweep is a serial queue of
+//! forced checkpoints, one per candidate, issued from inside the first
+//! DB-backed test of the process, which holds the crate-wide
+//! `#[serial(hort_pg_db)]` key for the whole of it. Measured: 60–80 ms
+//! per drop against an otherwise idle server, so 1,251 candidates became
+//! a 77-second stall that pushed three unrelated tests past libtest's
+//! 60-second slow-test threshold. And the per-drop cost is bounded by
+//! nothing the harness controls: a single `DROP DATABASE` was observed
+//! waiting 136 seconds for its checkpoint while a second process ran
+//! migration sets, and 73 seconds on `Lock/object` when two test
+//! processes swept the same candidate list at once (each
+//! `DROP DATABASE` takes an exclusive lock on the database object, so
+//! concurrent sweeps serialise against each other).
+//!
+//! A cap on the *number* of drops therefore bounds the wrong quantity:
+//! at the worst measured per-drop cost, fifty drops is over an hour with
+//! the serial key held throughout. Three bounds instead, each on
+//! something it can actually hold:
+//!
+//! - [`SWEEP_BUDGET`] — wall clock across the whole drop loop, checked
+//!   between drops.
+//! - [`DROP_STATEMENT_TIMEOUT_MS`] — server-side ceiling on one
+//!   `DROP DATABASE`. This is what closes the one drop the budget cannot
+//!   interrupt.
+//! - [`DROP_LOCK_TIMEOUT_MS`] — server-side ceiling on the object-lock
+//!   wait alone. A candidate whose lock is held is one a concurrent
+//!   sweeper is already dropping, so waiting on it spends this sweep's
+//!   budget on work that is being done anyway.
+//!
+//! Candidates are taken in random order for the same reason: sweeps that
+//! walk one stable order meet on the same first candidates, which is the
+//! `Lock/object` measurement above. Re-dropping a candidate a peer
+//! already removed is free (`DROP DATABASE IF EXISTS` on an absent name
+//! returns in under a millisecond — no checkpoint), so overlap costs
+//! nothing beyond the lock wait that [`DROP_LOCK_TIMEOUT_MS`] bounds.
+//!
+//! ### What the bound guarantees
+//!
+//! One sweep holds `#[serial(hort_pg_db)]` for at most [`SWEEP_BUDGET`]
+//! plus [`DROP_STATEMENT_TIMEOUT_MS`]. Both halves are verified rather
+//! than assumed: the loop's budget by this module's DB-free tests
+//! against an artificially slowed drop, and the statement timeout
+//! against a real server — a `DROP DATABASE` parked on
+//! `IPC/CheckpointStart`/`IPC/CheckpointDone` is cancelled at exactly
+//! the configured deadline with SQLSTATE 57014. A checkpoint wait is not
+//! a lock wait, so that one had to be measured.
+//!
+//! Interrupting a `DROP DATABASE` is *safe*, not merely tolerated, and
+//! that is a property of the server version: PostgreSQL 16 commits an
+//! "invalid database" marker (`pg_database.datconnlimit = -2`) before
+//! the destructive phase, so a cancelled drop leaves a database that
+//! cannot be connected to, is still matched by the candidate query, and
+//! is finished by the next sweep in tens of milliseconds. Both CI
+//! pipelines and the sandbox run PostgreSQL 16; on an older server an
+//! interrupted drop carries no such guarantee, and
+//! [`DROP_STATEMENT_TIMEOUT_MS`] would have to be re-justified there.
+//!
+//! ### What the bound does not guarantee
+//!
+//! It does not bound the *population*. A budget bounds what one sweep
+//! costs, not how many databases exist: if `CREATE DATABASE` outruns the
+//! aggregate drain rate across a run's sweeping processes, the
+//! population still climbs. The only thing that says so is the
+//! budget-exhausted line [`report_sweep`] writes to stderr.
+//!
+//! It does not make the cluster safe. The crash this bound sits next to
+//! was `/dev/shm` exhaustion — 60 of 63 MB at 634 test databases, against
+//! a single dynamic-shared-memory segment request of 32 MB — and the
+//! 63 MB ceiling is a container `--shm-size`, outside this repository.
+//! Measured the same morning, the baseline is 44 MB with *zero* test
+//! databases: the population is the multiplier, not the cause, and
+//! shrinking it is not a substitute for raising the ceiling.
+//!
+//! It does not bound anything else [`isolated_db_from`] does. `CREATE
+//! DATABASE` and the migration set that follows it run with no timeout,
+//! deliberately: cancelling either one fails the test that asked for the
+//! database, which is the opposite of the best-effort contract the sweep
+//! holds itself to.
+//!
+//! ## Pool sizing is deliberately left at sqlx's defaults
+//!
+//! A `PoolTimedOut` from a DB-backed test invites capping
+//! `max_connections` on these pools. Measurement refutes that reading
+//! twice over, so the defaults stay. Sampling `pg_stat_activity` once a
+//! second through a whole `cargo test --workspace` (1,072 samples)
+//! peaked at **11 concurrent client backends against 97 usable**
+//! (`max_connections` 100 less 3 reserved — and one of the 11 was the
+//! sampler itself), sat at 2 for 69% of them, and never had more than 3
+//! test databases connected at once: sqlx pools are lazy
+//! (`min_connections = 0`) and cargo runs test binaries one at a time,
+//! so they never approach the server's limit. And a second
+//! process's full acquisition path — connect, `CREATE DATABASE`, build
+//! the pool, `acquire`, run the whole migration set — showed no
+//! degradation at all across a 242-second sweep of 600 databases: every
+//! one of its 90 `acquire` calls returned in under a millisecond. A
+//! timeout here is not a connection budget that is full, so a smaller
+//! pool would change nothing.
 
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
+use std::time::Duration;
+// `tokio::time::Instant` rather than `std::time::Instant` so
+// `tokio::test(start_paused = true)` can drive the budget loop through
+// virtual time; outside a paused runtime the two behave identically.
+use tokio::time::Instant;
 
-/// Age below which a stray `hort_test_*` database is left alone. Well
-/// above any single test's lifetime, so a concurrently-running test is
-/// never a sweep candidate.
-const STALE_AFTER_SECS: u64 = 3600;
+/// Age below which a stray `hort_test_*` database is left alone.
+///
+/// The age gate only has to cover the window between `CREATE DATABASE` and
+/// the creating process's first connection appearing in `pg_stat_activity`
+/// — milliseconds. After that the live-connection check is the stronger
+/// test, and it holds for as long as the owning pool keeps a connection:
+/// sqlx reaps an idle one after ten minutes, so ten minutes here means a
+/// database is exposed only once its owner has gone that long without
+/// touching it *and* is still running — an order of magnitude past
+/// libtest's 60-second slow-test threshold.
+///
+/// One hour was the reason nothing ever came back. It exceeds the interval
+/// between consecutive runs during active development, so a run reclaimed
+/// neither its own databases nor, usually, its predecessor's, and the
+/// population climbed monotonically: four `cargo test --workspace` runs
+/// against a cluster reset to zero left **1,251 databases / 11 GB**
+/// standing, where one run creates **429**. Ten minutes makes a run's own
+/// early databases reclaimable by its own later processes — which is only
+/// safe because [`SWEEP_BUDGET`] already bounds what the larger candidate
+/// list costs.
+const STALE_AFTER_SECS: u64 = 600;
+
+/// Wall-clock ceiling on one sweep's drop loop, and so on the extra time
+/// the first DB-backed test of a process holds `#[serial(hort_pg_db)]`.
+///
+/// Derived, not picked. 36 processes per `cargo test --workspace` reach the
+/// sweep (34 integration-test binaries plus the `hort-adapters-postgres` and
+/// `hort-server` lib unittest binaries), and a run creates ~437 databases, so
+/// the steady state needs 437 / 36 ≈ 12 drops per sweep.
+///
+/// The per-drop cost that sizes this is **not** the 60–80 ms an idle server
+/// gives. Measured across two whole workspace runs — 36 sweeps each, every
+/// one of them spending its full budget — the in-run cost was 167 ms and
+/// 200 ms per drop: a run saturates the server with its own `CREATE
+/// DATABASE` and migration sets, and the sweep's forced checkpoints queue
+/// behind that. Twelve drops is therefore ~2.4 s of work, not ~1 s.
+///
+/// Five seconds is a little over twice the steady-state requirement
+/// (36 × 5 s / 200 ms ≈ 900 drops per run against ~437 created), and leaves
+/// the worst-case hold — budget plus [`DROP_STATEMENT_TIMEOUT_MS`] — at
+/// 6.5 s, an order of magnitude under libtest's 60-second slow-test
+/// threshold. Sizing it against the idle cost instead gives 3 s, which
+/// measured out at only 1.14–1.39× the creation rate: a drain that slow
+/// leaves the population converging over many runs instead of settling.
+const SWEEP_BUDGET: Duration = Duration::from_secs(5);
+
+/// Server-side ceiling on a single `DROP DATABASE`, in milliseconds.
+///
+/// The budget is checked between drops and so cannot interrupt one in
+/// flight; this is the bound that can. 1.5 s is ~18× the idle per-drop
+/// cost and ~2.5× the cost measured with a concurrent writer and a
+/// competing manual `CHECKPOINT`, so it does not fire on a healthy
+/// server — and when it does fire the candidate is simply skipped, which
+/// is the path every other failure in this sweep already takes.
+const DROP_STATEMENT_TIMEOUT_MS: u64 = 1_500;
+
+/// Server-side ceiling on the object-lock wait inside a single
+/// `DROP DATABASE`, in milliseconds.
+///
+/// Subsumed by [`DROP_STATEMENT_TIMEOUT_MS`] as a safety bound, but it
+/// buys something that one does not: a contended candidate is one a
+/// concurrent sweeper is already dropping, so yielding after a quarter
+/// of a second leaves the budget for candidates nobody else is taking.
+const DROP_LOCK_TIMEOUT_MS: u64 = 250;
+
+/// The relationship the three bounds above exist to hold: a sweep adds at
+/// most the budget plus the one drop the budget cannot interrupt to the time
+/// the serial key is held, and libtest calls a test slow at 60 seconds. A
+/// compile error rather than a test, because the only way to break it is to
+/// edit a constant.
+const _: () = assert!(
+    SWEEP_BUDGET.as_millis() as u64 + DROP_STATEMENT_TIMEOUT_MS <= 7_000,
+    "worst-case sweep hold must stay an order of magnitude under libtest's 60s slow threshold"
+);
+/// A contended candidate is one a peer sweeper is already dropping, so it
+/// must be abandoned sooner than one this sweep is making progress on.
+const _: () = assert!(DROP_LOCK_TIMEOUT_MS < DROP_STATEMENT_TIMEOUT_MS);
 
 /// Ensures the stale-database sweep runs at most once per process.
 static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The one operation the budgeted sweep loop performs per candidate.
+///
+/// Factored out of [`sweep_stale_databases`] so [`drop_within_budget`] and
+/// its clock can be exercised against an artificially slow drop with no
+/// server in reach. That seam is not a convenience: the DB-gated suites are
+/// main/release-scoped, so a bound tested only through a real (and fast)
+/// `DROP DATABASE` would be unverified on the very pipeline that reviews a
+/// change to it.
+trait DropCandidate {
+    /// Returns `true` when the candidate is gone afterwards.
+    async fn drop_candidate(&mut self, name: &str) -> bool;
+}
+
+/// [`DropCandidate`] backed by the real maintenance connection.
+struct SqlDrop<'a>(&'a mut PgConnection);
+
+impl DropCandidate for SqlDrop<'_> {
+    async fn drop_candidate(&mut self, name: &str) -> bool {
+        // DROP DATABASE cannot run in a transaction; a concurrent
+        // connection arriving between the query and here makes this
+        // fail, which is exactly the outcome we want — skip it. Same for
+        // the server-side timeouts set on this connection: a timed-out
+        // drop is the existing skip path with a clock on it.
+        self.0
+            .execute(sqlx::AssertSqlSafe(format!(
+                "DROP DATABASE IF EXISTS \"{name}\""
+            )))
+            .await
+            .is_ok()
+    }
+}
+
+/// What one budgeted drop loop did.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SweepOutcome {
+    /// Everything the candidate query returned.
+    candidates: usize,
+    /// Candidates a drop was actually issued for.
+    attempted: usize,
+    /// Candidates that were gone afterwards.
+    dropped: usize,
+    /// True when the loop stopped on the clock rather than on the end of
+    /// the candidate list — i.e. the population is outrunning the sweep.
+    exhausted_budget: bool,
+}
+
+/// Drop `names` one at a time until the list is done or `budget` is spent.
+///
+/// The clock is checked *between* drops, so the loop returns at `budget`
+/// plus at most one drop — it cannot interrupt a drop already in flight.
+/// That tail is bounded server-side instead, by
+/// [`DROP_STATEMENT_TIMEOUT_MS`]; without it the tail is whatever one
+/// `DROP DATABASE` costs, which is unbounded.
+async fn drop_within_budget<D: DropCandidate>(
+    names: Vec<String>,
+    budget: Duration,
+    dropper: &mut D,
+) -> SweepOutcome {
+    let started = Instant::now();
+    let mut outcome = SweepOutcome {
+        candidates: names.len(),
+        ..SweepOutcome::default()
+    };
+    for name in names {
+        if started.elapsed() >= budget {
+            outcome.exhausted_budget = true;
+            break;
+        }
+        outcome.attempted += 1;
+        if dropper.drop_candidate(&name).await {
+            outcome.dropped += 1;
+        }
+    }
+    outcome
+}
+
+/// The one line a sweep owes a human, or `None` when it owes none.
+///
+/// A sweep that finished its candidate list is not news, and 36 test
+/// processes per workspace run each announcing themselves would train the
+/// reader to skip the line. A sweep that ran out of budget is the one state
+/// that needs somebody: the population is growing faster than the sweeps
+/// drain it, and nothing else in a plain `cargo test` says so.
+fn budget_warning(outcome: &SweepOutcome, elapsed: Duration) -> Option<String> {
+    if !outcome.exhausted_budget {
+        return None;
+    }
+    Some(format!(
+        "hort test-database sweep stopped on its {}s budget after {} ms: {} candidates, \
+         {} attempted, {} dropped. Stale `hort_test_*` databases are accumulating faster \
+         than the per-process sweep drains them — check the server for slow or contended \
+         DROP DATABASE.",
+        SWEEP_BUDGET.as_secs(),
+        elapsed.as_millis(),
+        outcome.candidates,
+        outcome.attempted,
+        outcome.dropped,
+    ))
+}
+
+/// Report the sweep where it will actually be read.
+///
+/// The routine summary stays on `tracing` for whoever reruns with
+/// `RUST_LOG=hort_adapters_postgres=debug`; no test binary that reaches this
+/// sweep installs a subscriber, so on its own that is a no-op. The warning goes
+/// straight to `io::stderr()` rather than through `eprintln!`, because
+/// libtest captures the print macros and throws the capture away for a test
+/// that passes — which is every test this runs inside.
+fn report_sweep(outcome: &SweepOutcome, elapsed: Duration) {
+    tracing::debug!(
+        candidates = outcome.candidates,
+        attempted = outcome.attempted,
+        dropped = outcome.dropped,
+        exhausted_budget = outcome.exhausted_budget,
+        elapsed_ms = elapsed.as_millis(),
+        "swept stale test databases"
+    );
+    if let Some(warning) = budget_warning(outcome, elapsed) {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{warning}");
+    }
+}
+
 /// Drop `hort_test_*` databases older than [`STALE_AFTER_SECS`] that
-/// have no live connections. Best-effort: every failure is ignored.
+/// have no live connections, for at most [`SWEEP_BUDGET`]. Best-effort:
+/// every failure is ignored.
 ///
 /// Runs at most once per process (first [`isolated_db_from`] call).
 /// Takes the maintenance connection already opened for `CREATE
@@ -85,6 +414,12 @@ async fn sweep_stale_databases(admin: &mut PgConnection) {
     // naming have a non-numeric segment there; `~ '^[0-9]+$'` excludes
     // them from the age test, and the second arm sweeps them on the
     // connection check alone (they are, by definition, older).
+    //
+    // `ORDER BY random()` keeps concurrent sweepers off each other's
+    // first candidates: `DROP DATABASE` takes an exclusive lock on the
+    // database object, so two sweeps walking one stable order serialise
+    // against each other. The whole list is still fetched — its length
+    // is the diagnostic the budget warning carries.
     let sql = format!(
         "SELECT d.datname FROM pg_database d \
          LEFT JOIN (SELECT datname, count(*) AS cnt FROM pg_stat_activity GROUP BY datname) a \
@@ -93,25 +428,42 @@ async fn sweep_stale_databases(admin: &mut PgConnection) {
            AND COALESCE(a.cnt, 0) = 0 \
            AND (CASE WHEN split_part(d.datname, '_', 3) ~ '^[0-9]+$' \
                      THEN split_part(d.datname, '_', 3)::bigint < {cutoff} \
-                     ELSE true END)"
+                     ELSE true END) \
+         ORDER BY random()"
     );
 
+    let started = Instant::now();
     let Ok(rows) = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(sql))
         .fetch_all(&mut *admin)
         .await
     else {
         return;
     };
-    for name in rows {
-        // DROP DATABASE cannot run in a transaction; a concurrent
-        // connection arriving between the query and here makes this
-        // fail, which is exactly the outcome we want — skip it.
-        let _ = admin
-            .execute(sqlx::AssertSqlSafe(format!(
-                "DROP DATABASE IF EXISTS \"{name}\""
-            )))
-            .await;
-    }
+
+    // Bound each drop on the server too — the budget below is checked
+    // between drops and cannot interrupt one in flight.
+    let _ = admin
+        .execute(sqlx::AssertSqlSafe(format!(
+            "SET lock_timeout = {DROP_LOCK_TIMEOUT_MS}; \
+             SET statement_timeout = {DROP_STATEMENT_TIMEOUT_MS}"
+        )))
+        .await;
+
+    let outcome = drop_within_budget(rows, SWEEP_BUDGET, &mut SqlDrop(&mut *admin)).await;
+
+    // Hand the connection back as it was: `isolated_db_from` runs
+    // `CREATE DATABASE` and the migration set on it next, and cancelling
+    // either one fails the test that asked for the database. `RESET`
+    // restores the server/role default rather than pinning the session
+    // to unbounded, which would silently widen a deployment that sets
+    // one.
+    let _ = admin
+        .execute(sqlx::AssertSqlSafe(
+            "RESET lock_timeout; RESET statement_timeout",
+        ))
+        .await;
+
+    report_sweep(&outcome, started.elapsed());
 }
 
 fn now_unix_secs() -> u64 {
@@ -121,16 +473,130 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Credential-free description of what a set of connection options
+/// points at, for a panic message that will land in a CI log.
+///
+/// Host and port only. The project redacts `database_url` wholesale in
+/// every `Debug` impl that touches it (`hort-server` / `hort-worker`
+/// `config.rs`); a panic message is no different, and the password is
+/// never diagnostic.
+fn connection_target(opts: &PgConnectOptions) -> String {
+    format!("{}:{}", opts.get_host(), opts.get_port())
+}
+
+/// The panic message a configured-but-unusable `DATABASE_URL` earns,
+/// with `stage` naming the step that failed.
+///
+/// Split out from its call sites so the wording — and, more to the
+/// point, the guarantee that it carries no credential — is exercised
+/// without a database, exactly as [`classify_migrate_failure`] is.
+///
+/// `err` is a sqlx error from a connect, a `CREATE DATABASE`, or a URL
+/// parse. None of those echo the connection string: sqlx's
+/// configuration error wraps a `url`/`ParseInt`/`AddrParse` error whose
+/// `Display` names the defect, not the input, and a connect error names
+/// a host, an OS errno or a SQLSTATE.
+fn unusable_database_message(stage: &str, target: &str, err: &dyn std::fmt::Display) -> String {
+    format!(
+        "DATABASE_URL is set (target {target}) but {stage} failed: {err}\n\
+         This is a hard failure, not a skip. Reaching this point means the \
+         caller read DATABASE_URL and got a value — the operator declaring \
+         that a database exists — so there is no database only in the sense \
+         that the declared one could not be used. Returning a skip here would \
+         report a test that never ran as `ok`, which inverts the gate exactly \
+         when the server is unwell. To run the workspace suite DB-free, unset \
+         DATABASE_URL."
+    )
+}
+
+/// Connect a pool to an explicitly-configured `DATABASE_URL`, panicking
+/// rather than skipping when the connection cannot be made.
+///
+/// The shared entry point for the DB-gated fixtures that need a pool on
+/// the `DATABASE_URL` target itself rather than a per-test database from
+/// [`isolated_db_from`] — the `migrate_*` fixtures in `hort-server`, the
+/// worker's schema-compat boot fixture, and [`shared_migrated_pool`].
+/// Each of those grew its own `PgPool::connect(&url).await.ok()`, which
+/// is the silent skip this module no longer performs: five independent
+/// copies of it, none reachable from [`isolated_db_from`], which is why
+/// the fix needed a second entry point rather than one.
+///
+/// The caller still owns the `DATABASE_URL` read and the `None` that
+/// comes with it; this function is only ever handed a URL that exists.
+pub async fn connect_or_panic(url: &str) -> PgPool {
+    let opts = parse_or_panic(url);
+    let target = connection_target(&opts);
+    match PgPool::connect_with(opts).await {
+        Ok(pool) => pool,
+        Err(err) => panic!(
+            "{}",
+            unusable_database_message("connecting a pool", &target, &err)
+        ),
+    }
+}
+
+/// Parse `url` into connection options, panicking with a message that
+/// withholds the value.
+///
+/// A malformed `DATABASE_URL` is a configuration error the operator has
+/// to see; skipping on it hides a typo behind a green run for as long as
+/// the typo lives.
+fn parse_or_panic(url: &str) -> PgConnectOptions {
+    match url.parse::<PgConnectOptions>() {
+        Ok(opts) => opts,
+        Err(err) => panic!(
+            "{}",
+            unusable_database_message(
+                "parsing it as a Postgres connection URL",
+                "<unparseable, value withheld>",
+                &err
+            )
+        ),
+    }
+}
+
 /// Create a uniquely-named database (derived from `base_url`: same
 /// host/user/password, fresh dbname) and return a pool connected to it.
 /// The DB is **empty** — the caller runs its own
 /// `sqlx::migrate!().run()` on the returned pool.
 ///
-/// Returns `None` on any failure (mirrors the prior
-/// `PgPool::connect(&url).await.ok()?` semantics so the suite stays
-/// green when `DATABASE_URL` is unset / the DB is unreachable).
+/// ## It never returns `None`. It panics instead
+///
+/// Every call site in the workspace is `let url =
+/// env::var("DATABASE_URL").ok()?;` immediately followed by this call,
+/// so "not configured" is decided one level up and this function never
+/// sees it. What is left is a database the operator declared and the
+/// harness could not use — and flattening that into the same `None` the
+/// caller uses for "no database" makes the caller early-return, which
+/// libtest reports as `ok`. A test that did not run then claims it
+/// passed, precisely when the server is unwell and the gate matters
+/// most. Measured on the unfixed code against a closed port: 12,350
+/// passed, 1 failed, 7 ignored — the one failure being the single test
+/// in the workspace that hand-rolled `.expect()` on its own maintenance
+/// connection.
+///
+/// The `Option` in the return type belongs to the caller, not to this
+/// function: it is what keeps the `?` carrying the caller's `env::var`
+/// skip compiling. `crates/hort-app/tests/db_gate_not_silent.rs` pins
+/// the property this doc comment asserts.
+///
+/// ## What a transient blip costs
+///
+/// The per-database `PgPool::connect_with` below inherits sqlx's own
+/// connect retry: `ConnectionRefused`, SQLSTATE `57P03`
+/// (`cannot_connect_now` — the server is starting up or in recovery) and
+/// `53300` (`too_many_connections`) are retried with exponential backoff
+/// until `acquire_timeout`, 30 s by default, so a blip shorter than that
+/// never reaches a panic. The maintenance connection is a bare
+/// `PgConnection` and has no such retry — one refused connection fails
+/// that test. The asymmetry is sqlx's, not this module's, and it is left
+/// alone deliberately: a retry here would be a second retry policy
+/// beside the migration loop below, and in the incident this hard
+/// failure was written for — a seven-minute recovery — no retry length
+/// would have changed the outcome.
 pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
-    let opts: PgConnectOptions = base_url.parse().ok()?;
+    let opts = parse_or_panic(base_url);
+    let target = connection_target(&opts);
     // The epoch segment is load-bearing: `sweep_stale_databases` reads
     // it to age-gate candidates. Keep the `hort_test_<epoch>_<uuid>`
     // shape if you rename this.
@@ -142,20 +608,39 @@ pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
 
     // CREATE DATABASE cannot run in a transaction or target the
     // connected DB — use a maintenance connection to `postgres`.
-    let mut admin = PgConnection::connect_with(&opts.clone().database("postgres"))
-        .await
-        .ok()?;
+    let mut admin = match PgConnection::connect_with(&opts.clone().database("postgres")).await {
+        Ok(admin) => admin,
+        Err(err) => panic!(
+            "{}",
+            unusable_database_message(
+                "opening the `postgres` maintenance connection",
+                &target,
+                &err
+            )
+        ),
+    };
 
     // Once per process, on the connection we already hold.
     sweep_stale_databases(&mut admin).await;
 
-    admin
+    if let Err(err) = admin
         .execute(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{db}\"")))
         .await
-        .ok()?;
+    {
+        panic!(
+            "{}",
+            unusable_database_message("creating the per-test database", &target, &err)
+        );
+    }
     let _ = admin.close().await;
 
-    let pool = PgPool::connect_with(opts.database(&db)).await.ok()?;
+    let pool = match PgPool::connect_with(opts.database(&db)).await {
+        Ok(pool) => pool,
+        Err(err) => panic!(
+            "{}",
+            unusable_database_message("connecting to the per-test database", &target, &err)
+        ),
+    };
 
     // Migrate here, with a bounded retry. Per-test DB isolation means
     // ~80+ test binaries each `CREATE DATABASE` + run the full
@@ -171,10 +656,7 @@ pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
         match sqlx::migrate!("../../migrations").run(&pool).await {
             Ok(()) => break,
             Err(_) if attempt < 3 => {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    150 * u64::from(attempt + 1),
-                ))
-                .await;
+                tokio::time::sleep(Duration::from_millis(150 * u64::from(attempt + 1))).await;
             }
             Err(_) => break,
         }
@@ -193,13 +675,17 @@ pub async fn isolated_db_from(base_url: &str) -> Option<PgPool> {
 /// this database, so no test may assume an earlier-sorting module already
 /// migrated it.
 ///
-/// Returns `None` when `DATABASE_URL` is unset or the target is
-/// unreachable (mirrors [`isolated_db_from`]'s self-skip semantics). A
-/// migration that fails after retries is a real bug, not a skip
-/// condition, and panics rather than handing back an unmigrated pool.
+/// Returns `None` only when `DATABASE_URL` is unset — the one condition
+/// that means "this machine has no database", and the one the workspace
+/// pre-push gate runs under. A target that is set but unreachable panics
+/// through [`connect_or_panic`], as does a migration that fails after
+/// retries: both are a configured database that did not work, and a test
+/// that reports `ok` without having touched it is a false green, not a
+/// skip. Unreachability here used to cost 30 s of `acquire_timeout` per
+/// test and then report `ok` anyway.
 pub async fn shared_migrated_pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPool::connect(&url).await.ok()?;
+    let pool = connect_or_panic(&url).await;
 
     // Bounded retry: the shared target is a migration race between every
     // test binary that reaches this helper concurrently, the same
@@ -211,10 +697,7 @@ pub async fn shared_migrated_pool() -> Option<PgPool> {
             Err(err) => {
                 last_err = Some(err);
                 if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        150 * u64::from(attempt + 1),
-                    ))
-                    .await;
+                    tokio::time::sleep(Duration::from_millis(150 * u64::from(attempt + 1))).await;
                 }
             }
         }
@@ -264,8 +747,9 @@ fn classify_migrate_failure(err: &sqlx::migrate::MigrateError) -> String {
             "connection acquisition timed out before migrations ran — this is \
              contention for a connection, not a broken migration. Check for another \
              `cargo test` run or a sibling DB-backed test target hitting the same \
-             Postgres server concurrently, and whether the server's connection limit \
-             is too low. Underlying error: {err}"
+             Postgres server concurrently. Pool sizing is not the thing to change: \
+             measured peak usage is ~10 concurrent backends against ~97 usable. \
+             Underlying error: {err}"
         )
     } else {
         format!("migrations failed to run cleanly against the test DB: {err}")
@@ -275,6 +759,151 @@ fn classify_migrate_failure(err: &sqlx::migrate::MigrateError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serial_test::serial;
+
+    /// A [`DropCandidate`] whose every drop costs a fixed amount of time.
+    /// Under `tokio::test(start_paused = true)` that time is virtual, so
+    /// the budget loop is exercised against a drop far slower than any real
+    /// one without the test taking any wall clock at all.
+    struct SlowDrop {
+        per_drop: Duration,
+        succeeds: bool,
+        seen: Vec<String>,
+    }
+
+    impl SlowDrop {
+        fn taking(per_drop: Duration) -> Self {
+            Self {
+                per_drop,
+                succeeds: true,
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl DropCandidate for SlowDrop {
+        async fn drop_candidate(&mut self, name: &str) -> bool {
+            self.seen.push(name.to_string());
+            tokio::time::sleep(self.per_drop).await;
+            self.succeeds
+        }
+    }
+
+    fn candidates(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("hort_test_1700000000_{i}"))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_loop_stops_on_the_budget_against_a_slow_drop() {
+        let mut dropper = SlowDrop::taking(Duration::from_millis(400));
+        let started = Instant::now();
+
+        let outcome =
+            drop_within_budget(candidates(100), Duration::from_secs(1), &mut dropper).await;
+
+        // The clock is checked before each drop: 0 ms, 400 ms and 800 ms are
+        // inside the budget, the check at 1200 ms is not.
+        assert_eq!(outcome.attempted, 3, "{outcome:?}");
+        assert_eq!(outcome.dropped, 3, "{outcome:?}");
+        assert_eq!(outcome.candidates, 100, "{outcome:?}");
+        assert!(outcome.exhausted_budget, "{outcome:?}");
+        assert_eq!(
+            dropper.seen.len(),
+            3,
+            "only the attempted candidates are touched"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            (Duration::from_millis(1200)..=Duration::from_millis(1400)).contains(&elapsed),
+            "loop must return at the budget plus at most one drop, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_pathological_drop_overruns_the_budget_and_nothing_follows_it() {
+        // The honest limit of a budget checked between drops: it cannot
+        // interrupt one in flight. `DROP_STATEMENT_TIMEOUT_MS` is what bounds
+        // this tail on the server; the loop's own guarantee stops here, and
+        // this test pins that rather than implying otherwise.
+        let mut dropper = SlowDrop::taking(Duration::from_secs(120));
+        let started = Instant::now();
+
+        let outcome = drop_within_budget(candidates(5), Duration::from_secs(1), &mut dropper).await;
+
+        assert_eq!(outcome.attempted, 1, "{outcome:?}");
+        assert!(outcome.exhausted_budget, "{outcome:?}");
+        assert!(started.elapsed() >= Duration::from_secs(120));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_steady_state_list_is_drained_in_full_inside_the_budget() {
+        // ~437 databases per workspace run over the 36 processes that sweep is
+        // ~12 candidates each, at the 200 ms per drop measured while a run is
+        // in progress (not the 60–80 ms an idle server gives).
+        let mut dropper = SlowDrop::taking(Duration::from_millis(200));
+
+        let outcome = drop_within_budget(candidates(12), SWEEP_BUDGET, &mut dropper).await;
+
+        assert_eq!(outcome.attempted, 12, "{outcome:?}");
+        assert_eq!(outcome.dropped, 12, "{outcome:?}");
+        assert!(!outcome.exhausted_budget, "{outcome:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_drop_is_attempted_but_not_counted_as_dropped() {
+        let mut dropper = SlowDrop::taking(Duration::from_millis(10));
+        dropper.succeeds = false;
+
+        let outcome = drop_within_budget(candidates(3), SWEEP_BUDGET, &mut dropper).await;
+
+        assert_eq!(outcome.attempted, 3, "{outcome:?}");
+        assert_eq!(outcome.dropped, 0, "{outcome:?}");
+        assert!(
+            !outcome.exhausted_budget,
+            "a skipped candidate is not a spent budget"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_candidate_list_is_not_a_budget_exhaustion() {
+        let mut dropper = SlowDrop::taking(Duration::from_secs(600));
+
+        let outcome = drop_within_budget(Vec::new(), SWEEP_BUDGET, &mut dropper).await;
+
+        assert_eq!(outcome, SweepOutcome::default());
+    }
+
+    #[test]
+    fn a_sweep_that_finished_its_list_says_nothing() {
+        let outcome = SweepOutcome {
+            candidates: 12,
+            attempted: 12,
+            dropped: 12,
+            exhausted_budget: false,
+        };
+        assert_eq!(budget_warning(&outcome, Duration::from_millis(900)), None);
+    }
+
+    #[test]
+    fn a_sweep_that_ran_out_of_budget_carries_the_numbers_that_explain_it() {
+        let outcome = SweepOutcome {
+            candidates: 1251,
+            attempted: 37,
+            dropped: 36,
+            exhausted_budget: true,
+        };
+        let warning = budget_warning(&outcome, Duration::from_millis(3040))
+            .expect("an exhausted budget must be reported");
+        for fragment in ["1251", "37", "36", "3040"] {
+            assert!(
+                warning.contains(fragment),
+                "warning must carry {fragment}: {warning}"
+            );
+        }
+    }
 
     #[test]
     fn pool_timed_out_is_classified_as_acquisition_not_migrations() {
@@ -320,5 +949,147 @@ mod tests {
             message.contains('7'),
             "must retain the underlying error: {message}"
         );
+    }
+
+    // ---- The skip contract: unset is a skip, unusable is a failure.
+    //
+    // These run DB-free. The "unusable" side uses a host under the
+    // reserved `.invalid` TLD (RFC 2606 guarantees it never resolves),
+    // which fails at name resolution rather than at TCP connect. That
+    // matters for timing: sqlx's pool retries `ConnectionRefused` with
+    // backoff until its 30 s `acquire_timeout`, but returns any other
+    // connect error immediately — so a closed port would make these
+    // tests cost 30 s each and an unresolvable host costs milliseconds.
+    //
+    // They call `isolated_db_from` and `connect_or_panic`, so they carry
+    // `#[serial(hort_pg_db)]` like every other caller of those. Nothing
+    // about *these four* needs it — name resolution fails before a
+    // socket is opened, so none of the cluster-global work the key
+    // exists for (`CREATE ROLE`, `CREATE`/`DROP DATABASE`,
+    // `pg_stat_activity`) is ever reached. The key is here because the
+    // rule has no exemptions: `crates/hort-app/tests/
+    // db_tests_are_serialized.rs` reports every test that calls one of
+    // these entry points, and an exception carved into it would be an
+    // allow-list the next unkeyed test could hide in. The cost is a
+    // failed DNS lookup's worth of queueing.
+
+    /// The URL shape these tests feed the helpers: syntactically valid,
+    /// unreachable by construction, and carrying a password so the
+    /// redaction assertion below has something to catch.
+    const UNREACHABLE_URL: &str = "postgres://probe:hunter2@hort-db-gate.invalid:5432/hort";
+
+    /// Run `fut` on a fresh current-thread runtime and return the panic
+    /// message it produced.
+    ///
+    /// `#[should_panic(expected = …)]` can only assert a substring is
+    /// present; the credential test has to assert one is *absent*, which
+    /// needs the message itself.
+    fn panic_message_of<F>(make: F) -> String
+    where
+        F: FnOnce() + std::panic::UnwindSafe,
+    {
+        let payload = std::panic::catch_unwind(make).expect_err("expected a panic");
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            .unwrap_or_default()
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(fut)
+    }
+
+    #[test]
+    #[serial(hort_pg_db)]
+    fn isolated_db_from_fails_loudly_when_the_configured_server_is_unreachable() {
+        let message = panic_message_of(|| {
+            let _ = block_on(isolated_db_from(UNREACHABLE_URL));
+        });
+        assert!(
+            message.contains("hard failure, not a skip"),
+            "a configured-but-unreachable target must not be flattened into a \
+             skip; got: {message}"
+        );
+        assert!(
+            message.contains("maintenance connection"),
+            "the message must name the stage that failed: {message}"
+        );
+    }
+
+    #[test]
+    #[serial(hort_pg_db)]
+    fn connect_or_panic_fails_loudly_when_the_configured_server_is_unreachable() {
+        let message = panic_message_of(|| {
+            let _ = block_on(connect_or_panic(UNREACHABLE_URL));
+        });
+        assert!(
+            message.contains("hard failure, not a skip"),
+            "the shared-target connect must not be flattened into a skip; got: {message}"
+        );
+        assert!(
+            message.contains("connecting a pool"),
+            "the message must name the stage that failed: {message}"
+        );
+    }
+
+    #[test]
+    #[serial(hort_pg_db)]
+    fn an_unparseable_database_url_fails_loudly_and_withholds_the_value() {
+        let message = panic_message_of(|| {
+            let _ = block_on(isolated_db_from(
+                "postgres://probe:hunter2@host:notaport/db",
+            ));
+        });
+        assert!(
+            message.contains("parsing it"),
+            "a malformed DATABASE_URL is a configuration error the operator has \
+             to see, not a skip; got: {message}"
+        );
+        assert!(
+            !message.contains("hunter2"),
+            "the panic lands in a CI log and must not carry the password: {message}"
+        );
+    }
+
+    #[test]
+    #[serial(hort_pg_db)]
+    fn the_unreachable_panic_withholds_the_password() {
+        let message = panic_message_of(|| {
+            let _ = block_on(isolated_db_from(UNREACHABLE_URL));
+        });
+        assert!(
+            !message.contains("hunter2"),
+            "the panic lands in a CI log and must not carry the password: {message}"
+        );
+        assert!(
+            message.contains("hort-db-gate.invalid:5432"),
+            "host:port is the diagnostic part and must survive redaction: {message}"
+        );
+    }
+
+    #[test]
+    fn the_failure_message_names_the_stage_the_target_and_the_way_out() {
+        let message = unusable_database_message("opening a connection", "db.example:5432", &"boom");
+        assert!(message.contains("opening a connection"), "{message}");
+        assert!(message.contains("db.example:5432"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(
+            message.contains("unset DATABASE_URL"),
+            "the message must say how to run the suite DB-free: {message}"
+        );
+    }
+
+    #[test]
+    fn the_target_rendering_carries_no_credentials() {
+        let opts: PgConnectOptions = UNREACHABLE_URL.parse().expect("URL parses");
+        let target = connection_target(&opts);
+        assert_eq!(target, "hort-db-gate.invalid:5432");
+        assert!(!target.contains("hunter2"), "{target}");
+        assert!(!target.contains("probe"), "{target}");
     }
 }

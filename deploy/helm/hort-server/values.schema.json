@@ -976,7 +976,7 @@
           }
         },
         "prefetchRowRetentionSweep": {
-          "description": "executionPath: dsn-direct. Periodic prefetch-row retention-sweep CronJob. Inserts a `kind='prefetch-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `PrefetchRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` and `kind = 'oci-index-child-ingest'` rows older than a configurable horizon (default 7 days). Default-enabled, because `oci-index-child-ingest` rows accrue on any OCI proxy repository with no opt-in at all — one terminal row per declared child manifest per image-index pull-through — and are retained permanently without the sweep (the cascade's own `prefetch%` rows are opt-in per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`, so a deployment using neither feature just runs an idle CronJob). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "description": "executionPath: dsn-direct. Periodic prefetch-row retention-sweep CronJob. Inserts a `kind='prefetch-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `PrefetchRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` (minus `prefetch-tick`, whose newest completion carries the prefetch rotation's keyset cursor and which `jobsRowRetentionSweep` retains instead) and `kind = 'oci-index-child-ingest'` rows older than the handler's 7-day `DEFAULT_HORIZON`. The schedule below is a chart value; the horizon is not — no chart value, no CLI flag, and no HTTP invoke route sets it. Default-enabled, because `oci-index-child-ingest` rows accrue on any OCI proxy repository with no opt-in at all — one terminal row per declared child manifest per image-index pull-through — and are retained permanently without the sweep (the cascade's own `prefetch%` rows are opt-in per-repo via `prefetch_policy.triggers.contains(TransitiveDeps)`, so a deployment using neither feature just runs an idle CronJob). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -986,7 +986,17 @@
           }
         },
         "scanRowRetentionSweep": {
-          "description": "executionPath: dsn-direct. Periodic terminal-scan-row retention-sweep CronJob. Inserts a `kind='scan-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `ScanRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind = 'scan'` rows older than a configurable horizon (default 7 days). Default-enabled (unlike the prefetch cascade sweep, every artifact scan — ingest plus every periodic rescan — leaves a terminal row from day one, so a fresh deployment already accumulates rows). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "description": "executionPath: dsn-direct. Periodic terminal-scan-row retention-sweep CronJob. Inserts a `kind='scan-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `ScanRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) `kind = 'scan'` rows older than the handler's 7-day `DEFAULT_HORIZON`. The schedule below is a chart value; the horizon is not — no chart value, no CLI flag, and no HTTP invoke route sets it. Default-enabled (unlike the prefetch cascade sweep, every artifact scan — ingest plus every periodic rescan — leaves a terminal row from day one, so a fresh deployment already accumulates rows). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
+        "jobsRowRetentionSweep": {
+          "description": "executionPath: dsn-direct. General terminal-`jobs`-row retention-sweep CronJob — the horizon for every `jobs.kind` the two kind-specific sweeps do not reach. Inserts a `kind='jobs-row-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `JobsRowRetentionSweepHandler`, which deletes terminal (`status IN ('completed', 'failed')`) rows where `(kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick') AND kind NOT IN ('scan', 'oci-index-child-ingest')` and `updated_at` is older than the handler's 7-day `DEFAULT_HORIZON` (the schedule below is a chart value; the horizon is not), retaining per kind the newest `completed` row and the newest terminal row so the boot-time liveness gauges (`hort_staging_sweep_overdue`, `hort_event_chain_verify_overdue`) and the prefetch rotation cursor keep the rows they read. Default-enabled: the scheduled kinds (`staging-sweep` every five minutes, the daily cron tier) leave terminal rows from day one on any deployment. DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
           "type": "object",
           "additionalProperties": false,
           "properties": {
@@ -1113,7 +1123,7 @@
           }
         },
         "retentionPurge": {
-          "description": "executionPath: admin-task. Destructive storage-GC walk: for every ArtifactExpired with no following ArtifactPurged, decrement content_references, delete the CAS blob iff the cross-kind refcount hit 0, append ArtifactPurged. Refuses to run until the worker boot refcount-reconcile sweep converged. DEFAULT-DISABLED — the most destructive retention task.",
+          "description": "executionPath: admin-task. Destructive storage-GC walk: for every ArtifactExpired with no following ArtifactPurged, decrement content_references, delete the CAS blob iff the cross-kind refcount hit 0, append ArtifactPurged. Refuses to run until the worker boot refcount-reconcile sweep converged (zero repository scan/repair failures, not merely that the sweep ran). DEFAULT-DISABLED — the most destructive retention task.",
           "type": "object",
           "additionalProperties": false,
           "properties": {

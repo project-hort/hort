@@ -36,6 +36,7 @@ use std::env;
 use std::time::Duration;
 
 use hort_server::migrate::{self, harden_events_role, MIGRATOR};
+use serial_test::serial;
 use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
@@ -45,7 +46,7 @@ use uuid::Uuid;
 
 async fn admin_pool() -> Option<PgPool> {
     let url = env::var("DATABASE_URL").ok()?;
-    PgPool::connect(&url).await.ok()
+    Some(hort_adapters_postgres::test_support::connect_or_panic(&url).await)
 }
 
 async fn create_temp_db(admin: &PgPool) -> (String, PgPool) {
@@ -101,6 +102,7 @@ fn temp_db_url(db_name: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn migrate_run_self_heals_after_operator_grant_drift() {
     let Some(admin) = admin_pool().await else {
         return;
@@ -233,6 +235,7 @@ async fn probe_has_priv(admin: &PgPool, role: &str, password: &str, priv_name: &
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn harden_events_role_tolerates_missing_events_table() {
     let Some(admin) = admin_pool().await else {
         return;

@@ -62,11 +62,10 @@
 //!   zero-`tracing`; the warning lives where the YAML is applied).
 //! - `RetentionPurgeHandler` / `TaskHandler` registration → the worker
 //!   composition root.
-//! - Blob-sourced `fixed_versions` precision for `HasFixAvailable`
-//!   (the projection does not carry `fixed_versions`; see
-//!   [`hort_domain::ports::retention_scan_reader`] module docs) → the
-//!   out-of-scope "successor-in-our-repo /
-//!   per-finding first-seen" refinement family.
+//! - Per-finding first-seen refinement: this use case retains the
+//!   projection's existing across-scans read contract. Fix availability
+//!   is already projected; see
+//!   [`hort_domain::ports::retention_scan_reader`] module docs.
 
 use std::sync::Arc;
 
@@ -76,12 +75,11 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::events::{retention_scheduler_actor, DomainEvent, StreamId};
-use hort_domain::ports::event_store::{
-    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
-};
+use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
 use hort_domain::retention::{
-    evaluate, EvaluationInputs, EvaluationOutcome, ExpirationReason, RetentionPolicy,
+    evaluate, EvaluationInputs, EvaluationOutcome, ExpirationReason, RetentionEvaluationMode,
+    RetentionPolicy,
 };
 use hort_domain::types::Finding;
 
@@ -90,12 +88,7 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
     emit_retention_evaluation, emit_retention_expired, RetentionEvaluationResult,
 };
-
-/// Per-artifact-stream read cap. Mirrors the
-/// `quarantine_use_case::STREAM_READ_LIMIT` value — an artifact stream
-/// in v2 is short (ingest → scan(s) → release/reject → maybe expire);
-/// 200 events is far beyond any real stream.
-const STREAM_READ_LIMIT: u64 = 200;
+use crate::use_cases::{read_artifact_stream, STREAM_EVENT_CAP};
 
 /// Default rescan interval (hours) when the caller resolved no policy
 /// interval. Mirrors the policy chain's "default 24 h" tail
@@ -115,10 +108,17 @@ pub struct RetentionCandidate {
     /// The artifact's repository [`RepositoryFormat`] — the
     /// `RetentionScope::Format` input. Resolved by the caller from the
     /// joined `repositories.format` column (the `RetentionCandidateRow`
-    /// port DTO carries it; B6's handler copies it across). `Artifact`
+    /// port DTO carries it; the handler copies it across). `Artifact`
     /// has no `format` field, so the scope gate needs it carried
     /// alongside.
     pub format: RepositoryFormat,
+    /// The artifact's repository key (`repositories.key`) — the
+    /// identifier an operator writes into a policy's `metadata.name`.
+    /// Copied from `RetentionCandidateRow::repository_key`, which the
+    /// candidate query already resolves on its existing
+    /// `JOIN repositories`. It exists so a match can be reported by a
+    /// name the operator can act on rather than by a UUID.
+    pub repository_key: String,
     /// The resolved `rescan_interval_hours` for the artifact's
     /// repository. `0` is meaningful (rescanning disabled) — it still
     /// yields a `2 × 0 = 0`-second freshness window, i.e. a
@@ -126,6 +126,22 @@ pub struct RetentionCandidate {
     /// always stale (fail-safe: it never expires). `None` → the
     /// default 24 h.
     pub resolved_rescan_interval_hours: Option<i64>,
+    /// The `KeepLastN` input: this artifact's 1-based rank among its
+    /// **usable** `(repository, name)` siblings (newest first by
+    /// `created_at`, ties broken by artifact id) plus the
+    /// usable-sibling total. Usable is the candidate set itself — a
+    /// soft-deleted or GC-protected sibling is counted by neither
+    /// number, so `KeepLastN(n)` leaves n artifacts an operator can
+    /// actually download. Resolved by the caller in the same
+    /// enumeration query that produced the candidate; `None` when no
+    /// ranking could be resolved, which the pure evaluator fails safe.
+    /// Mirrors `RetentionCandidateRow::keep_rank` exactly.
+    pub keep_rank: Option<(u32, u32)>,
+    /// `true` iff a mutable ref in this artifact's own repository
+    /// currently resolves to it. A tag target survives `KeepLastN`
+    /// regardless of rank. Mirrors `RetentionCandidateRow::tag_targeted`
+    /// exactly.
+    pub tag_targeted: bool,
 }
 
 /// Outcome summary of one `evaluate_policies` pass — the
@@ -146,6 +162,30 @@ pub struct EvaluateSummary {
     pub skipped_stale_scan: u64,
     /// Pairs where a port read failed (sweep continued).
     pub errors: u64,
+}
+
+/// One predicate hit produced by the shared evaluator path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationMatch {
+    pub policy_id: Uuid,
+    pub policy_name: String,
+    pub artifact_id: Uuid,
+    pub repository_id: Uuid,
+    /// The repository's operator-facing key. Travels **beside**
+    /// `repository_id`, never instead of it: the id is what a machine
+    /// consumer joins on, the key is what a human types into a policy.
+    pub repository_key: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub checksum_sha256: String,
+}
+
+/// Detailed result used by the task handler to build an operator preview.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EvaluationReport {
+    pub summary: EvaluateSummary,
+    pub matches: Vec<EvaluationMatch>,
 }
 
 /// The retention evaluator. Pure orchestration over the
@@ -193,7 +233,27 @@ impl RetentionUseCase {
         policies: &[RetentionPolicy],
         candidates: &[RetentionCandidate],
     ) -> AppResult<EvaluateSummary> {
-        let mut summary = EvaluateSummary::default();
+        Ok(self
+            .evaluate_policies_in_mode(now, policies, candidates, RetentionEvaluationMode::Execute)
+            .await?
+            .summary)
+    }
+
+    /// Evaluate through the same selection and predicate path in execute or
+    /// dry-run mode. Dry-run differs only at the event-append boundary.
+    #[tracing::instrument(skip(self, policies, candidates), fields(
+        policy_count = policies.len(),
+        candidate_count = candidates.len(),
+        mode = mode.as_str(),
+    ))]
+    pub async fn evaluate_policies_in_mode(
+        &self,
+        now: DateTime<Utc>,
+        policies: &[RetentionPolicy],
+        candidates: &[RetentionCandidate],
+        mode: RetentionEvaluationMode,
+    ) -> AppResult<EvaluationReport> {
+        let mut report = EvaluationReport::default();
 
         for policy in policies {
             if policy.archived {
@@ -209,28 +269,39 @@ impl RetentionUseCase {
             let mut expired_count: u32 = 0;
 
             for candidate in candidates {
-                summary.evaluated += 1;
+                report.summary.evaluated += 1;
                 match self
-                    .evaluate_one(now, policy, &policy_id_label, candidate)
+                    .evaluate_one(now, policy, &policy_id_label, candidate, mode)
                     .await
                 {
                     EvalStep::Matched => {
-                        summary.expired += 1;
+                        report.summary.expired += 1;
                         matched_count += 1;
                         expired_count += 1;
+                        report.matches.push(EvaluationMatch {
+                            policy_id: policy.id,
+                            policy_name: policy.name.clone(),
+                            artifact_id: candidate.artifact.id,
+                            repository_id: candidate.artifact.repository_id,
+                            repository_key: candidate.repository_key.clone(),
+                            name: candidate.artifact.name.clone(),
+                            version: candidate.artifact.version.clone(),
+                            created_at: candidate.artifact.created_at,
+                            checksum_sha256: candidate.artifact.sha256_checksum.to_string(),
+                        });
                     }
                     EvalStep::NoMatch => {
                         matched_count += 0;
                     }
                     EvalStep::AlreadyExpired => {
-                        summary.already_expired += 1;
+                        report.summary.already_expired += 1;
                         // An already-expired artifact still counts as a
                         // policy match for the per-policy audit summary.
                         matched_count += 1;
                     }
-                    EvalStep::SkippedProtected => summary.skipped_protected += 1,
-                    EvalStep::SkippedStaleScan => summary.skipped_stale_scan += 1,
-                    EvalStep::Errored => summary.errors += 1,
+                    EvalStep::SkippedProtected => report.summary.skipped_protected += 1,
+                    EvalStep::SkippedStaleScan => report.summary.skipped_stale_scan += 1,
+                    EvalStep::Errored => report.summary.errors += 1,
                 }
             }
 
@@ -244,7 +315,7 @@ impl RetentionUseCase {
             );
         }
 
-        Ok(summary)
+        Ok(report)
     }
 
     /// Evaluate one policy against one candidate. Isolated so a port
@@ -256,6 +327,7 @@ impl RetentionUseCase {
         policy: &RetentionPolicy,
         policy_id_label: &str,
         candidate: &RetentionCandidate,
+        mode: RetentionEvaluationMode,
     ) -> EvalStep {
         let artifact = &candidate.artifact;
 
@@ -289,11 +361,14 @@ impl RetentionUseCase {
 
         // -- idempotency on (policy_id, artifact_id) ----------------------
         let stream_id = StreamId::artifact(artifact.id);
-        let stream = match self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-            .await
-        {
+        // One full read of the artifact stream serves every decision below
+        // (idempotency, the `ArtifactIngested` scope input, the freshness
+        // signal, the `HasFindingDetectedFor` anchor). `read_artifact_stream`
+        // refuses a stream it cannot prove it read to the end, which is what
+        // keeps the idempotency check honest: over a truncated prefix an
+        // `ArtifactExpired` past the cap is invisible and the sweep would
+        // append another one on every pass.
+        let stream = match read_artifact_stream(&*self.events, &stream_id).await {
             Ok(s) => s,
             Err(e) => return self.errored(policy_id_label, policy, artifact, "read_stream", e),
         };
@@ -387,13 +462,21 @@ impl RetentionUseCase {
         let inputs = EvaluationInputs {
             now,
             created_at: artifact.created_at,
-            // `UnusedFor` / `KeepLastN` inputs are not in B3's bounded
-            // scope (no download-timeseries / sibling-rank port); the
-            // pure evaluator fails them safe (never expire) when these
-            // are absent. Security-driven + age predicates — B3's
-            // focus — do not need them.
+            // The `UnusedFor` anchor still has no source (no
+            // download-timeseries reader). The evaluator's `None` arm
+            // does NOT fail safe: it measures the interval from
+            // `created_at`, so `UnusedFor(N)` would decide exactly what
+            // `AgeExceeds(N)` decides — including for an artifact pulled
+            // an hour ago. That is why the gitops apply linter rejects a
+            // retention predicate mentioning `UnusedFor` for as long as
+            // this stays a hard-coded `None`; wiring a real anchor here
+            // is what retires that rejection.
+            // The `KeepLastN` inputs below come from the candidate
+            // enumeration query, which resolves them in the same
+            // statement.
             last_downloaded_at: None,
-            keep_rank: None,
+            keep_rank: candidate.keep_rank,
+            tag_targeted: candidate.tag_targeted,
             findings: &findings,
             first_detected_at,
             latest_scan_at,
@@ -409,8 +492,8 @@ impl RetentionUseCase {
                 EvalStep::NoMatch
             }
             EvaluationOutcome::Matched(reason) => {
-                match self
-                    .append_expired(
+                let append_result = if mode == RetentionEvaluationMode::Execute {
+                    self.append_expired(
                         &stream_id,
                         artifact,
                         policy,
@@ -419,20 +502,32 @@ impl RetentionUseCase {
                         stream.len() as u64,
                     )
                     .await
-                {
+                } else {
+                    Ok(())
+                };
+                match append_result {
                     Ok(()) => {
                         emit_retention_evaluation(
                             policy_id_label,
                             RetentionEvaluationResult::Matched,
                         );
-                        emit_retention_expired(policy_id_label, reason.metric_label());
-                        tracing::info!(
-                            policy_id = %policy.id,
-                            policy_name = %policy.name,
-                            artifact_id = %artifact.id,
-                            reason = reason.metric_label(),
-                            "artifact expired by retention policy"
-                        );
+                        if mode == RetentionEvaluationMode::Execute {
+                            emit_retention_expired(policy_id_label, reason.metric_label());
+                            tracing::info!(
+                                policy_id = %policy.id,
+                                policy_name = %policy.name,
+                                artifact_id = %artifact.id,
+                                reason = reason.metric_label(),
+                                "artifact expired by retention policy"
+                            );
+                        } else {
+                            tracing::debug!(
+                                policy_id = %policy.id,
+                                policy_name = %policy.name,
+                                artifact_id = %artifact.id,
+                                "artifact matched retention policy during dry run"
+                            );
+                        }
                         EvalStep::Matched
                     }
                     Err(e) => self.errored(policy_id_label, policy, artifact, "append_expired", e),
@@ -544,6 +639,23 @@ impl RetentionUseCase {
     /// read-then-check above, not by optimistic concurrency; a
     /// concurrent ingest appending in between is harmless — it cannot
     /// produce a duplicate `ArtifactExpired` for the same policy).
+    ///
+    /// **The cap is enforced here, not by the adapter.**
+    /// `ExpectedVersion::Any` means the adapter performs no version check
+    /// at all, so this append gets none of the bound that
+    /// [`read_expected_version`](crate::use_cases::read_expected_version)
+    /// gives every `ExpectedVersion::Exact` writer. Without a refusal of
+    /// its own, the expiry sweep is the one writer able to push an
+    /// artifact stream past [`STREAM_EVENT_CAP`] — and past the cap every
+    /// capped reader of that stream (the release authorization above all)
+    /// silently decides on the oldest prefix. `stream_len` is the length
+    /// of the same full read the idempotency check above used, so the
+    /// decision to refuse needs no extra I/O.
+    ///
+    /// A refusal returns `DomainError::Conflict`, matching
+    /// `read_expected_version`'s refusal for the same condition; the
+    /// caller folds it into [`EvalStep::Errored`] and keeps sweeping, so
+    /// one frozen artifact does not stall the pass.
     async fn append_expired(
         &self,
         stream_id: &StreamId,
@@ -551,8 +663,16 @@ impl RetentionUseCase {
         policy: &RetentionPolicy,
         reason: ExpirationReason,
         now: DateTime<Utc>,
-        _stream_len: u64,
+        stream_len: u64,
     ) -> AppResult<()> {
+        if stream_len.saturating_add(1) > STREAM_EVENT_CAP {
+            return Err(AppError::Domain(hort_domain::error::DomainError::Conflict(
+                format!(
+                    "stream {stream_id} holds {stream_len} events; appending \
+                     ArtifactExpired would exceed the {STREAM_EVENT_CAP}-event cap"
+                ),
+            )));
+        }
         let event = hort_domain::events::ArtifactExpired {
             artifact_id: artifact.id,
             policy_id: policy.id,

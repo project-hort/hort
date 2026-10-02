@@ -27,6 +27,7 @@
 
 use std::env;
 
+use serial_test::serial;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -105,6 +106,7 @@ fn comp(purl: &str, name: &str, version: Option<&str>, eco: Ecosystem) -> SbomCo
 /// First write `[foo@1, bar@1]`; second write `[foo@2, baz@1]`.
 /// Final state: `{foo@2, baz@1}` — `bar@1` gone, `foo@1` upgraded.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn replace_for_artifact_replaces_prior_rows() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -178,6 +180,7 @@ async fn replace_for_artifact_replaces_prior_rows() {
 /// `replace_for_artifact(_, &[])` — manifest exists but lists no
 /// dependencies. The DELETE still fires, removing prior rows.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn replace_for_artifact_with_empty_components_clears_existing_rows() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -217,6 +220,7 @@ async fn replace_for_artifact_with_empty_components_clears_existing_rows() {
 /// DISTINCT artifact_ids whose SBOM contains a matching `(ecosystem,
 /// name, version ∈ versions)` row.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn list_artifacts_by_match_returns_distinct_artifact_ids() {
     let Some(pool) = admin_pool().await else {
         return;
@@ -319,6 +323,7 @@ async fn list_artifacts_by_match_returns_distinct_artifact_ids() {
 /// the composite PK. We assert the event-store stayed empty by
 /// reading the `events` table count before/after.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn commit_scan_result_constraint_violation_rolls_back_event_append() {
     use std::sync::Arc;
 

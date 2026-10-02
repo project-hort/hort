@@ -35,9 +35,7 @@ use hort_domain::events::{system_actor, DomainEvent};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
-use hort_domain::ports::event_store::{
-    AppendEvents, EventStore, EventToAppend, ExpectedVersion, ReadFrom,
-};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::provenance::SignerIdentity;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::ContentHash;
@@ -53,13 +51,6 @@ use crate::event_store_publisher::EventStorePublisher;
 /// pathological CAS object from buffering unbounded into memory on the
 /// verify path. 16 MiB.
 pub(crate) const MAX_PROVENANCE_READ_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Cap on the number of events read when scanning an artifact stream for an
-/// existing `ProvenanceVerified` (the already-cleared no-op skip and the
-/// cascade's idempotency check). Mirrors `STREAM_READ_LIMIT` in
-/// `release_clearance` (the release gate's own clearance read); every
-/// artifact stream begins well within this bound.
-pub(crate) const STREAM_READ_LIMIT: u64 = 200;
 
 /// A late-joiner clearance that was committed: which subject's signature
 /// cleared the constituent, and under which verifier backend. Returned so
@@ -597,6 +588,16 @@ impl ProvenanceCascade {
     /// verify skip (which inspects the event's `cascaded_from` / signer
     /// for the cascade re-drive), the cascade's idempotency check +
     /// append, and the late-joiner end's subject-authority check.
+    ///
+    /// The read goes through
+    /// [`read_artifact_stream`](crate::use_cases::read_artifact_stream),
+    /// which refuses a stream it cannot prove it read to the end. Both
+    /// halves of the answer need that: over a truncated prefix an
+    /// existing `ProvenanceVerified` past the cap reads as absent (the
+    /// cascade would re-clear an already-cleared artifact), and
+    /// `persisted.last()` is not the tail, so the returned
+    /// `ExpectedVersion::Exact` would be stale and every append derived
+    /// from it would fail `Conflict` permanently.
     pub(crate) async fn read_clearance_state(
         &self,
         artifact_id: Uuid,
@@ -605,10 +606,7 @@ impl ProvenanceCascade {
         ExpectedVersion,
     )> {
         let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
-        let persisted = self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_READ_LIMIT)
-            .await?;
+        let persisted = crate::use_cases::read_artifact_stream(&*self.events, &stream_id).await?;
         let cleared = persisted.iter().find_map(|e| match &e.event {
             DomainEvent::ProvenanceVerified(ev) => Some(ev.clone()),
             _ => None,

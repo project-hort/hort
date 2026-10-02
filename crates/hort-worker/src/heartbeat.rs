@@ -1,5 +1,6 @@
-//! 60-second heartbeat — refreshes `scanner_registry.last_heartbeat`
-//! and emits the `hort_scan_queue_depth` gauge (see `docs/metrics-catalog.md`).
+//! 60-second heartbeat — refreshes `scanner_registry.last_heartbeat`,
+//! emits the `hort_scan_queue_depth` gauge, and restates the
+//! refcount-reconcile purge gate (see `docs/metrics-catalog.md`).
 //!
 //! The first tick fires immediately so a freshly-booted worker
 //! refreshes its heartbeat as soon as the loop spins up; thereafter
@@ -13,7 +14,7 @@ use std::time::Duration;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::scanner_registry_repository::ScannerRegistryRepository;
 
-use crate::composition::WorkerContext;
+use crate::composition::{ReconcileGateState, WorkerContext};
 
 /// Interval between heartbeat ticks. The 60-second cadence matches the
 /// 5-minute liveness window configured in the Helm chart.
@@ -76,6 +77,11 @@ pub(crate) async fn tick_once(ctx: &WorkerContext, first_tick: bool) {
     // bypassed the port boundary and forced the worker to know the SQL
     // shape. The port now owns the query.
     emit_queue_depth(ctx.jobs.as_ref()).await;
+
+    // Restate the purge start-gate. Phase-locked with the two signals
+    // above for the same reason: the tick that proves this worker is
+    // alive is also the tick that says what it is refusing to do.
+    reassert_reconcile_gate(&ctx.reconcile_gate, &ctx.worker_id);
 }
 
 /// Touch the scanner-registry row through the port boundary.
@@ -110,6 +116,67 @@ pub(crate) async fn refresh_registry(
             error = %e,
             "heartbeat refresh failed",
         );
+    }
+}
+
+/// `hort_refcount_reconcile_gate_closed` — `1` while the
+/// `RetentionPurgeHandler` start-gate is closed, `0` while it is open.
+/// Catalogued in `docs/metrics-catalog.md`.
+const GATE_CLOSED_GAUGE: &str = "hort_refcount_reconcile_gate_closed";
+
+/// Restate the refcount-reconcile purge start-gate on every heartbeat
+/// tick: a `warn!` naming the reason and the remediation while it is
+/// closed, and the `hort_refcount_reconcile_gate_closed` gauge either
+/// way.
+///
+/// # Why a per-tick log line is the primary signal, and the gauge the
+/// secondary one
+///
+/// The gate is decided once at boot and never re-decided, so a closed
+/// gate persists for the life of the process while `PurgeUseCase`
+/// refuses every invocation. That failure mode is quiet by nature —
+/// storage simply stops being reclaimed — so the condition has to be
+/// discoverable *while it holds*, not only at the instant it was
+/// decided. A boot-time line is the latter: correct when written, gone
+/// from every bounded retention window long before an operator thinks
+/// to ask why nothing is being purged.
+///
+/// The worker's log stream is the one channel that is always on. Its
+/// `/metrics` listener is off unless an operator enables it *and*
+/// declares who may scrape it, so a gauge alone can be unreadable in a
+/// real deployment; the gauge is therefore additive, for the
+/// deployments that do scrape the worker. Because it is refreshed every
+/// tick rather than set once at boot, it alerts on the instantaneous
+/// value — no `max_over_time` window needed to catch a boot-only
+/// emission.
+///
+/// Emitted on the healthy path too (`0`) so a scrape always sees the
+/// series: absence and "gate open" are not the same fact, and a
+/// dashboard cannot tell them apart.
+///
+/// The durable third channel needs no code here and is worth knowing
+/// about: every refused purge — CronJob or hand-invoked — lands its
+/// refusal in `jobs.last_error`, which the server's always-on admin
+/// task API serves. That says the gate is closed; this line says why.
+pub(crate) fn reassert_reconcile_gate(state: &ReconcileGateState, worker_id: &str) {
+    match state {
+        ReconcileGateState::Open => {
+            metrics::gauge!(GATE_CLOSED_GAUGE).set(0.0);
+        }
+        ReconcileGateState::Closed { reason } => {
+            metrics::gauge!(GATE_CLOSED_GAUGE).set(1.0);
+            tracing::warn!(
+                worker_id = %worker_id,
+                reason = %reason,
+                "RetentionPurgeHandler gate CLOSED — this worker refuses every \
+                 retention-purge invocation, so no storage is being reclaimed \
+                 (neither policy-expired nor caller-deleted artifacts). The gate \
+                 is decided once per boot: clear whatever made the sweep fail, \
+                 then restart this worker to re-run it. The boot sweep logged \
+                 one error line per repository it could not scan and per repair \
+                 it could not apply — those name the cause."
+            );
+        }
     }
 }
 
@@ -377,5 +444,119 @@ mod tests {
         // Returns `()` despite the error — no panic, no propagated
         // failure.
         refresh_registry(&FailingRegistry, "w", &[], true).await;
+    }
+
+    // -----------------------------------------------------------------
+    // Purge start-gate re-assertion.
+    //
+    // The gate is decided once at boot and holds for the life of the
+    // process, so the condition has to be restated while it persists —
+    // the boot log line is gone from every bounded retention window
+    // long before an operator asks why nothing is being purged. The
+    // worker log stream is always on; its `/metrics` listener is not,
+    // which is why the gauge below is the secondary signal and the
+    // per-tick `warn!` the primary one.
+    // -----------------------------------------------------------------
+
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::{CompositeKey, MetricKind};
+    use tracing_test::traced_test;
+
+    /// Walk a `DebuggingRecorder` snapshot for an unlabelled gauge's
+    /// value. `None` when the series is absent — which is itself a
+    /// failure mode worth distinguishing from `Some(0.0)`.
+    #[allow(clippy::type_complexity)]
+    fn gauge_value(
+        snap: &[(
+            CompositeKey,
+            Option<metrics::Unit>,
+            Option<metrics::SharedString>,
+            DebugValue,
+        )],
+        metric_name: &str,
+    ) -> Option<f64> {
+        for (key, _u, _d, value) in snap {
+            if key.kind() != MetricKind::Gauge || key.key().name() != metric_name {
+                continue;
+            }
+            if let DebugValue::Gauge(v) = value {
+                return Some(v.into_inner());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn closed_gate_sets_the_gauge_to_one() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            reassert_reconcile_gate(
+                &ReconcileGateState::Closed {
+                    reason: "the boot sweep failed outright: db down".to_owned(),
+                },
+                "worker-7",
+            );
+        });
+        assert_eq!(
+            gauge_value(&snapshotter.snapshot().into_vec(), GATE_CLOSED_GAUGE),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn open_gate_still_emits_the_gauge_as_zero() {
+        // Absence and "gate open" are different facts; a dashboard
+        // cannot tell them apart, so the healthy path emits too.
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            reassert_reconcile_gate(&ReconcileGateState::Open, "worker-7");
+        });
+        assert_eq!(
+            gauge_value(&snapshotter.snapshot().into_vec(), GATE_CLOSED_GAUGE),
+            Some(0.0),
+            "the series must exist on the healthy path"
+        );
+    }
+
+    /// The discoverability contract: every tick that holds a closed gate
+    /// restates it, with the reason and the worker it belongs to. This is
+    /// what survives the worker `/metrics` listener being off.
+    #[traced_test]
+    #[test]
+    fn closed_gate_is_restated_on_every_tick() {
+        let state = ReconcileGateState::Closed {
+            reason: "the boot sweep recorded 2 repository-scan/repair failure(s)".to_owned(),
+        };
+        for _ in 0..3 {
+            reassert_reconcile_gate(&state, "worker-7");
+        }
+        assert!(
+            logs_contain("gate CLOSED"),
+            "a closed gate must be announced on the tick, not only at boot"
+        );
+        assert!(
+            logs_contain("worker-7"),
+            "the line names the worker holding it"
+        );
+        assert!(
+            logs_contain("repository-scan/repair failure"),
+            "the line carries WHY, so the operator needs no boot log"
+        );
+        assert!(
+            logs_contain("restart this worker"),
+            "the line carries the remediation"
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn open_gate_is_silent() {
+        reassert_reconcile_gate(&ReconcileGateState::Open, "worker-7");
+        assert!(
+            !logs_contain("gate CLOSED"),
+            "a healthy gate must not warn every minute"
+        );
     }
 }

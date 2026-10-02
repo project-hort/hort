@@ -16,7 +16,7 @@ use uuid::Uuid;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::jobs_repository::{
     EnqueueOutcome, JobRow, JobStatus, JobsRepository, KindFields, ListJobsFilter, ListJobsPage,
-    PendingKindBacklog, ScanJob, ScanKindFields, TriggerSource,
+    PendingKindBacklog, RequeueOutcome, RequeuedJob, ScanJob, ScanKindFields, TriggerSource,
 };
 use hort_domain::types::{ContentHash, IdempotencyKey};
 use serde_json::Value as JsonValue;
@@ -165,6 +165,180 @@ const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH oldest AS MATERIALIZED (\n\
                  RETURNING id, kind, status, params, actor_id, priority, trigger_source,\n\
                      attempts, created_at, updated_at, completed_at, last_error, result_summary,\n\
                      artifact_id, repository_id, content_hash, format";
+
+/// Not-before applied to a row the abandoned-lease sweep returns to
+/// `pending`.
+///
+/// The same 30 seconds the dispatcher's `compute_backoff` starts from,
+/// and for the same reason its `return_to_pending` gives an
+/// undispatchable row a backoff at all: the sweeping replica is also a
+/// claiming replica, and a row released with a NULL lease is eligible on
+/// that same replica's very next poll. A worker killed by the task
+/// itself (an OOM on one oversized artifact) would then re-take the row
+/// immediately and die again, spending the whole attempt budget inside
+/// one sweep interval instead of across several.
+///
+/// Flat rather than exponential: the row has already waited a full lease
+/// plus the grace before it gets here, so the purpose of this delay is
+/// only to break the same-replica re-grab, and the attempt cap — not the
+/// spacing — is what bounds a crash loop.
+const REQUEUE_BACKOFF: Duration = Duration::from_secs(30);
+
+/// `last_error` written onto a row the abandoned-lease sweep resolves.
+///
+/// Operator-facing: it is the only record of why a row that no handler
+/// ever reported on changed state, and it has to read as a diagnosis
+/// rather than as a handler's own failure message.
+const REQUEUE_LAST_ERROR: &str =
+    "claim lease expired past the grace window without renewal — the worker holding this row      stopped heartbeating and is presumed dead";
+
+/// `UPDATE` behind [`JobsRepository::renew_lease`].
+///
+/// Three predicates, all load-bearing:
+/// - `id = $1` picks the row.
+/// - `locked_by = $2` is the fence. A renewal from a worker that no
+///   longer holds the claim (the abandoned-lease sweep requeued it and a
+///   sibling re-claimed it) must not extend someone else's lease — and
+///   the zero-rows-updated result is how the losing worker finds out its
+///   execution is no longer the authoritative one.
+/// - `status = 'running'` keeps a renewal that races the outcome write
+///   from resurrecting a lease on an already-terminal row, which would
+///   otherwise leave a `completed` row carrying a future `locked_until`
+///   and make the sweep's own predicate ambiguous.
+const RENEW_LEASE_SQL: &str = "UPDATE public.jobs SET\n\
+                     locked_until = now() + $3,\n\
+                     updated_at = now()\n\
+                 WHERE id = $1\n\
+                   AND locked_by = $2\n\
+                   AND status = 'running'";
+
+/// `UPDATE` behind [`JobsRepository::requeue_abandoned`] — the
+/// abandoned-lease sweep.
+///
+/// Shape notes for anyone editing this string:
+///
+/// - The picking CTE mirrors the claim's `FOR UPDATE SKIP LOCKED` +
+///   `LIMIT`, so two workers sweeping at the same tick take disjoint
+///   rows instead of blocking on each other. The sweep is safe to run on
+///   every replica; it needs no leader election.
+/// - `locked_until IS NOT NULL` is not redundant with the comparison. A
+///   `running` row with a NULL lease cannot have been produced by either
+///   claim statement, and treating "no lease" as "lease long expired"
+///   would sweep a row whose history nobody understands.
+/// - `now() - $2::interval` is the grace on top of the lapse. With lease
+///   renewal running at a third of the lease, a live worker is at most a
+///   third of a lease stale, so a grace of one full lease is the margin
+///   that absorbs a renewal that lost a DB race, a paused container, and
+///   a mixed-version fleet whose older replicas do not renew at all.
+/// - The `CASE` is the retry budget, and this statement is the only
+///   place it can be spent for a row whose handler never returned. Below
+///   the cap the row goes back to `pending` with a short not-before so
+///   the sweeping replica does not immediately re-claim what it just
+///   released; at the cap it goes to `failed`, which for `kind='scan'`
+///   hands the artifact to the stranded-scan recovery sweep — a `failed`
+///   newest scan job is exactly what `select_stranded` re-picks.
+/// - `attempts` is deliberately untouched: the next claim increments it,
+///   so the budget is spent by execution attempts, not by sweeps.
+/// - The row is updated, never deleted. A late `mark_completed` from the
+///   original worker is `WHERE id = $1` with no status predicate, so it
+///   still lands on the surviving row rather than updating nothing.
+const REQUEUE_ABANDONED_SQL: &str = "WITH abandoned AS (\n\
+                     SELECT id FROM public.jobs\n\
+                     WHERE status = 'running'\n\
+                       AND kind = ANY($1::text[])\n\
+                       AND locked_until IS NOT NULL\n\
+                       AND locked_until < now() - $2::interval\n\
+                     ORDER BY locked_until ASC, id ASC\n\
+                     FOR UPDATE SKIP LOCKED\n\
+                     LIMIT $3\n\
+                 )\n\
+                 UPDATE public.jobs j SET\n\
+                     status = CASE WHEN j.attempts >= $4 THEN 'failed' ELSE 'pending' END,\n\
+                     locked_by = NULL,\n\
+                     locked_until = CASE WHEN j.attempts >= $4 THEN NULL\n\
+                                         ELSE now() + $5 END,\n\
+                     last_error = $6,\n\
+                     updated_at = now()\n\
+                 FROM abandoned a\n\
+                 WHERE j.id = a.id\n\
+                 RETURNING j.id, j.kind, j.attempts, j.status";
+
+/// `DELETE` behind [`JobsRepository::delete_terminal_prefetch_rows_older_than`]
+/// — the pull-through ingest cascade's rows, none of which hold durable
+/// state. The port doc carries the full rationale; the load-bearing
+/// details for anyone editing this string:
+///
+/// - **`prefetch-tick` is carved out by name.** It matches
+///   `kind LIKE 'prefetch%'` but is a scheduled tick, not cascade work,
+///   and its newest `completed` row's `result_summary` holds the
+///   rotation's keyset cursor (read back by
+///   [`JobsRepository::last_result_summary_by_kind`]). This sweep has no
+///   keep-newest clause — it does not need one, because with the carve-out
+///   every row it reaches really is stateless — so deleting a
+///   `prefetch-tick` row here would restart the rotation from the
+///   beginning. The kind is swept by
+///   [`JobsRepository::delete_terminal_other_kind_rows_older_than`]
+///   instead, which retains the newest `completed` row per kind.
+/// - The carve-out must stay the exact mirror image of the generic
+///   sweep's `OR kind = 'prefetch-tick'` admission, or the kind is either
+///   swept twice on two horizons or never swept at all. Pinned DB-free by
+///   `the_two_sweeps_partition_the_prefetch_prefix`.
+/// - Kept as a named constant so those DB-free tests can read the
+///   predicate without a database.
+const DELETE_TERMINAL_PREFETCH_ROWS_SQL: &str = "DELETE FROM public.jobs\n\
+                 WHERE ((kind LIKE 'prefetch%' AND kind <> 'prefetch-tick')\n\
+                        OR kind = 'oci-index-child-ingest')\n\
+                   AND status IN ('completed', 'failed')\n\
+                   AND updated_at < now() - $1::interval";
+
+/// `DELETE` behind [`JobsRepository::delete_terminal_other_kind_rows_older_than`]
+/// — the horizon for every `jobs.kind` the two kind-specific sweeps do not
+/// reach. The port doc carries the full rationale; the load-bearing details
+/// for anyone editing this string:
+///
+/// - The kind predicate is the **textual complement** of the two sibling
+///   sweeps (`NOT LIKE 'prefetch%'` with `prefetch-tick` readmitted,
+///   `NOT IN ('scan', 'oci-index-child-ingest')`), so exactly one sweep
+///   is ever in force per kind and a future `prefetch%` kind needs no
+///   edit here.
+/// - `OR kind = 'prefetch-tick'` readmits the one `prefetch%` kind the
+///   cascade sweep carves out. That kind's newest `completed` row carries
+///   the rotation's keyset cursor, so it needs the keep-newest clause
+///   below; the cascade sweep has none. The two predicates must stay
+///   mirror images — pinned DB-free by
+///   `the_two_sweeps_partition_the_prefetch_prefix`.
+/// - The `live` CTE aggregates over **all** terminal rows of a kind, not
+///   only the aged ones. Aggregating over the aged subset instead would
+///   retain "the newest row that happened to be old", which is a
+///   different row that never ages out.
+/// - Two rows per kind survive, not one: the newest `completed` row
+///   (what `max(completed_at)` / `ORDER BY completed_at DESC LIMIT 1`
+///   readers read) and the newest terminal row by `created_at` (what an
+///   `ORDER BY created_at DESC LIMIT 1` reader reads). Dropping the
+///   `completed` half would answer "never ran" for a task whose newest
+///   terminal row is a failure.
+/// - Kept as a named constant so the DB-free
+///   `delete_terminal_other_kind_rows_sql_*` tests can pin those
+///   invariants without a database.
+const DELETE_TERMINAL_OTHER_KIND_ROWS_SQL: &str = "WITH live AS (\n\
+                     SELECT kind,\n\
+                            max(completed_at) FILTER (WHERE status = 'completed')\n\
+                              AS newest_completed_at,\n\
+                            max(created_at) AS newest_created_at\n\
+                     FROM public.jobs\n\
+                     WHERE status IN ('completed', 'failed')\n\
+                       AND (kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick')\n\
+                       AND kind NOT IN ('scan', 'oci-index-child-ingest')\n\
+                     GROUP BY kind\n\
+                 )\n\
+                 DELETE FROM public.jobs j\n\
+                 USING live l\n\
+                 WHERE l.kind = j.kind\n\
+                   AND j.status IN ('completed', 'failed')\n\
+                   AND j.updated_at < now() - $1::interval\n\
+                   AND NOT (j.status = 'completed'\n\
+                            AND j.completed_at IS NOT DISTINCT FROM l.newest_completed_at)\n\
+                   AND j.created_at <> l.newest_created_at";
 
 /// PostgreSQL adapter for [`JobsRepository`].
 pub struct PgJobsRepository {
@@ -1088,11 +1262,14 @@ impl JobsRepository for PgJobsRepository {
             // function *after* the claiming UPDATE had already committed:
             // every row in the batch was `running`, none was returned to
             // the caller, and nothing ever moved them back — the claim
-            // predicate requires `status = 'pending'` and there is no
-            // stale-`running` reaper anywhere in the codebase. One
-            // unmappable row therefore permanently stranded up to
-            // `batch_size` healthy rows (invariant: a claimed-but-not-
-            // dispatched row is never permanently lost). The shape used to
+            // predicate requires `status = 'pending'`. One unmappable row
+            // therefore stranded up to `batch_size` healthy rows
+            // (invariant: a claimed-but-not-dispatched row is never
+            // permanently lost). `requeue_abandoned` would now recover
+            // them a lease plus a grace later, but only for the kinds in
+            // the requeue allow-list and only after half an hour at the
+            // defaults; resolving the unmappable row terminally right
+            // here keeps the rest of the batch moving on this tick. The shape used to
             // be production-reachable: `"scan"` was in
             // `ADMIN_INVOKABLE_TASK_KINDS`, so the admin task-invoke
             // path's `enqueue_task` wrote a `kind='scan'` row with the
@@ -1155,6 +1332,84 @@ impl JobsRepository for PgJobsRepository {
             }
             sort_claimed_jobs(&mut jobs);
             Ok(jobs)
+        })
+    }
+
+    fn renew_lease<'a>(
+        &'a self,
+        job_id: Uuid,
+        worker_id: &'a str,
+        lock_duration: Duration,
+    ) -> BoxFuture<'a, DomainResult<bool>> {
+        let worker_id = worker_id.to_string();
+        let interval = duration_to_pg_interval(lock_duration);
+        Box::pin(async move {
+            tracing::debug!(%job_id, worker_id = %worker_id, "renew_lease");
+            let res = sqlx::query(RENEW_LEASE_SQL)
+                .bind(job_id)
+                .bind(&worker_id)
+                .bind(interval)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Job", "renew_lease"))?;
+            Ok(res.rows_affected() == 1)
+        })
+    }
+
+    fn requeue_abandoned<'a>(
+        &'a self,
+        kinds: &'a [&'a str],
+        grace: Duration,
+        attempt_cap: u32,
+        batch_size: u16,
+    ) -> BoxFuture<'a, DomainResult<Vec<RequeuedJob>>> {
+        let kinds_owned: Vec<String> = kinds.iter().map(ToString::to_string).collect();
+        let grace_interval = duration_to_pg_interval(grace);
+        let backoff_interval = duration_to_pg_interval(REQUEUE_BACKOFF);
+        let cap = i64::from(attempt_cap);
+        let limit = i64::from(batch_size);
+        Box::pin(async move {
+            if kinds_owned.is_empty() {
+                return Ok(Vec::new());
+            }
+            tracing::debug!(
+                kinds = ?kinds_owned,
+                grace_secs = grace.as_secs(),
+                attempt_cap,
+                batch_size,
+                "requeue_abandoned",
+            );
+            let rows = sqlx::query(REQUEUE_ABANDONED_SQL)
+                .bind(&kinds_owned)
+                .bind(grace_interval)
+                .bind(limit)
+                .bind(cap)
+                .bind(backoff_interval)
+                .bind(REQUEUE_LAST_ERROR)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "Job", "requeue_abandoned"))?;
+            rows.iter()
+                .map(|row| {
+                    let status: String = row.try_get("status").map_err(|e| invariant(&e))?;
+                    let attempts: i32 = row.try_get("attempts").map_err(|e| invariant(&e))?;
+                    Ok(RequeuedJob {
+                        id: row.try_get("id").map_err(|e| invariant(&e))?,
+                        kind: row.try_get("kind").map_err(|e| invariant(&e))?,
+                        attempts: u32::try_from(attempts).unwrap_or(u32::MAX),
+                        outcome: match status.as_str() {
+                            "pending" => RequeueOutcome::Requeued,
+                            "failed" => RequeueOutcome::RetriesExhausted,
+                            other => {
+                                return Err(DomainError::Invariant(format!(
+                                    "requeue_abandoned returned status {other:?}; the CASE \
+                                     produces only 'pending' or 'failed'"
+                                )))
+                            }
+                        },
+                    })
+                })
+                .collect()
         })
     }
 
@@ -1368,18 +1623,16 @@ impl JobsRepository for PgJobsRepository {
             // `oci-index-child-ingest` rides this sweep rather than getting
             // its own: it is the same class of work as the cascade — a
             // high-churn, best-effort, per-content unit of pull-through
-            // ingest whose terminal row holds no durable state. See the port
-            // doc for why deleting one is safe.
-            let res = sqlx::query(
-                "DELETE FROM public.jobs \
-                  WHERE (kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest') \
-                    AND status IN ('completed', 'failed') \
-                    AND updated_at < now() - $1::interval",
-            )
-            .bind(interval)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "Job", "delete_terminal_prefetch_rows_older_than"))?;
+            // ingest whose terminal row holds no durable state. `prefetch-tick`
+            // is carved back out for the opposite reason. See the port doc
+            // and the SQL constant for both.
+            let res = sqlx::query(DELETE_TERMINAL_PREFETCH_ROWS_SQL)
+                .bind(interval)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    map_sqlx_error(&e, "Job", "delete_terminal_prefetch_rows_older_than")
+                })?;
             Ok(res.rows_affected())
         })
     }
@@ -1401,6 +1654,24 @@ impl JobsRepository for PgJobsRepository {
             .execute(&self.pool)
             .await
             .map_err(|e| map_sqlx_error(&e, "Job", "delete_terminal_scan_rows_older_than"))?;
+            Ok(res.rows_affected())
+        })
+    }
+
+    fn delete_terminal_other_kind_rows_older_than<'a>(
+        &'a self,
+        horizon: Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        let interval = duration_to_pg_interval(horizon);
+        Box::pin(async move {
+            tracing::debug!(?horizon, "delete_terminal_other_kind_rows_older_than");
+            let res = sqlx::query(DELETE_TERMINAL_OTHER_KIND_ROWS_SQL)
+                .bind(interval)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| {
+                    map_sqlx_error(&e, "Job", "delete_terminal_other_kind_rows_older_than")
+                })?;
             Ok(res.rows_affected())
         })
     }
@@ -1429,6 +1700,102 @@ mod tests {
         let d = Duration::from_secs(u64::MAX / 2);
         let i = duration_to_pg_interval(d);
         assert_eq!(i.microseconds, i64::MAX);
+    }
+
+    // ---- abandoned-lease sweep SQL -----------------------------------------
+
+    /// The sweep must never widen past `status = 'running'`.
+    ///
+    /// A predicate that also matched `pending` would re-drive rows the
+    /// claim already handles correctly; one that matched a terminal row
+    /// would resurrect finished work. The `\n\` continuation hazard the
+    /// `claim_pending_by_kinds_sql_has_no_token_mashing` test documents
+    /// applies verbatim here, so the token-separation check comes along
+    /// with it.
+    #[test]
+    fn requeue_abandoned_sql_targets_only_running_rows_with_a_real_lease() {
+        let sql = REQUEUE_ABANDONED_SQL;
+        for token in [
+            "WHERE status = 'running'",
+            "AND kind = ANY($1::text[])",
+            "AND locked_until IS NOT NULL",
+            "AND locked_until < now() - $2::interval",
+            "FOR UPDATE SKIP LOCKED",
+            "ORDER BY locked_until ASC, id ASC",
+        ] {
+            assert!(
+                sql.contains(token),
+                "requeue_abandoned SQL is missing the token-separated fragment {token:?}; \
+                 a bare `\\` line continuation eats the newline AND the indent and mashes \
+                 adjacent tokens together"
+            );
+        }
+        assert!(
+            !sql.contains("'pending'\n"),
+            "the sweep selects 'running' rows only — the claim already handles 'pending'"
+        );
+        assert!(
+            !sql.contains("DELETE"),
+            "an abandoned row is requeued, never deleted: it may be genuinely running, and \
+             its completion is an unconditional UPDATE by id that must still find a row"
+        );
+    }
+
+    /// The attempt cap is enforced inside the sweep statement.
+    ///
+    /// The sweep is the only code that runs for a row whose handler
+    /// never returned, so a cap applied anywhere else (the scan
+    /// orchestrator's `attempts >= max_attempts`, the dispatcher's
+    /// `TaskOutcome::Failed` arms) is unreachable for exactly the rows
+    /// that need it. A repeatedly-crashing task must terminate.
+    #[test]
+    fn requeue_abandoned_sql_caps_retries_and_leaves_attempts_alone() {
+        let sql = REQUEUE_ABANDONED_SQL;
+        assert!(
+            sql.contains("CASE WHEN j.attempts >= $4 THEN 'failed' ELSE 'pending' END"),
+            "the retry budget has to be spent here or a crash loop is re-driven forever"
+        );
+        assert!(
+            !sql.contains("attempts = attempts + 1") && !sql.contains("attempts = j.attempts"),
+            "the CLAIM increments `attempts`; a sweep that also incremented would charge a \
+             row twice for one execution attempt"
+        );
+        assert!(
+            sql.contains("locked_by = NULL"),
+            "the dead worker's claim must be released or the row reads as still held"
+        );
+    }
+
+    /// The renewal is fenced on both the holder and the status.
+    ///
+    /// `locked_by = $2` stops a worker whose row was swept from
+    /// extending the sibling's lease, and makes the zero-rows result the
+    /// signal that it lost the row. `status = 'running'` stops a renewal
+    /// that races the outcome write from leaving a terminal row with a
+    /// future lease.
+    #[test]
+    fn renew_lease_sql_is_fenced_on_holder_and_status() {
+        let sql = RENEW_LEASE_SQL;
+        for token in [
+            "WHERE id = $1",
+            "AND locked_by = $2",
+            "AND status = 'running'",
+            "locked_until = now() + $3",
+        ] {
+            assert!(sql.contains(token), "renew_lease SQL missing {token:?}");
+        }
+        let (set_clause, _predicate) = sql
+            .split_once("WHERE")
+            .expect("renew_lease SQL has a WHERE clause");
+        assert!(
+            !set_clause.contains("status"),
+            "renewal extends a lease and nothing else; assigning `status` here would let a \
+             renewal tick move a row's lifecycle state behind the handler's back"
+        );
+        assert!(
+            !set_clause.contains("attempts"),
+            "a renewal is not an execution attempt — only the claim charges the budget"
+        );
     }
 
     /// Regression guard for the `claim_pending_by_kinds` SQL. A prior
@@ -1550,6 +1917,199 @@ mod tests {
              materialization is exactly the kind of implicit contract this \
              file pins explicitly. Full SQL:\n{sql}"
         );
+    }
+
+    // ---- DELETE_TERMINAL_OTHER_KIND_ROWS_SQL ------------------------------
+    //
+    // DB-free pins on the generic sweep's query. Each assertion below
+    // stands for a property whose loss is silent: the query still runs,
+    // still reports a plausible deleted count, and quietly takes out
+    // state some other reader depends on.
+
+    /// The kind predicate must stay the exact textual complement of the
+    /// two kind-specific sweeps. Overlap would put two horizon constants
+    /// in force for the same rows and let the shorter one silently win,
+    /// so the kind would age out on a horizon neither of its sweeps
+    /// documents — invisible today only because all three constants read
+    /// 7 days.
+    #[test]
+    fn delete_terminal_other_kind_rows_sql_excludes_the_kind_specific_sweeps() {
+        let sql = DELETE_TERMINAL_OTHER_KIND_ROWS_SQL;
+        assert!(
+            sql.contains("kind NOT LIKE 'prefetch%'"),
+            "the cascade sweep's `kind LIKE 'prefetch%'` must be excluded. \
+             Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("kind NOT IN ('scan', 'oci-index-child-ingest')"),
+            "the scan sweep's `kind = 'scan'` and the cascade sweep's \
+             `oci-index-child-ingest` must be excluded. Full SQL:\n{sql}"
+        );
+    }
+
+    /// The `prefetch%` prefix is **partitioned** between the two sweeps,
+    /// not shared and not dropped: the cascade sweep carves
+    /// `prefetch-tick` out, the generic sweep takes it back. Both halves
+    /// are load-bearing and they fail in opposite directions — lose the
+    /// carve-out and the cascade sweep (which has no keep-newest clause)
+    /// deletes the rotation's keyset cursor, restarting the walk from the
+    /// beginning; lose the readmission and the kind is swept by nothing
+    /// at all and its terminal rows accumulate forever. Neither failure
+    /// is visible in a passing run of either sweep, which is why the pin
+    /// reads both strings in one test.
+    #[test]
+    fn the_two_sweeps_partition_the_prefetch_prefix() {
+        let cascade = DELETE_TERMINAL_PREFETCH_ROWS_SQL;
+        let generic = DELETE_TERMINAL_OTHER_KIND_ROWS_SQL;
+        assert!(
+            cascade.contains("kind LIKE 'prefetch%' AND kind <> 'prefetch-tick'"),
+            "the cascade sweep must carve `prefetch-tick` out of the prefix match — \
+             its newest `completed` row carries the prefetch rotation's keyset cursor \
+             and this sweep has no keep-newest clause. Full SQL:\n{cascade}"
+        );
+        assert!(
+            generic.contains("kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick'"),
+            "the generic sweep must readmit `prefetch-tick`, or the kind is swept by \
+             nothing and its terminal rows accumulate forever. Full SQL:\n{generic}"
+        );
+        assert!(
+            cascade.contains("kind = 'oci-index-child-ingest'")
+                && generic.contains("kind NOT IN ('scan', 'oci-index-child-ingest')"),
+            "`oci-index-child-ingest` stays wholly on the cascade side — it is the \
+             counter-example to the carve-out: high-churn, stateless terminal row. \
+             Cascade SQL:\n{cascade}\nGeneric SQL:\n{generic}"
+        );
+    }
+
+    /// Counter-assertion for the partition pin above: the cascade
+    /// predicate really is a `prefetch%` prefix match plus the one
+    /// `oci-index-child-ingest` literal, restricted to terminal rows on
+    /// the same `$1::interval` horizon as its siblings. A rewrite that
+    /// dropped the prefix match entirely would leave
+    /// `the_two_sweeps_partition_the_prefetch_prefix` asserting about a
+    /// predicate that no longer selects the cascade.
+    #[test]
+    fn delete_terminal_prefetch_rows_sql_is_the_cascade_predicate() {
+        let sql = DELETE_TERMINAL_PREFETCH_ROWS_SQL;
+        assert!(
+            sql.starts_with("DELETE FROM public.jobs\n"),
+            "Full SQL:\n{sql}"
+        );
+        assert_eq!(
+            sql.matches("kind LIKE 'prefetch%'").count(),
+            1,
+            "exactly one prefix match, so a future `prefetch%` kind inherits this sweep \
+             without an edit. Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("status IN ('completed', 'failed')"),
+            "`pending` / `running` rows are never swept. Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("updated_at < now() - $1::interval"),
+            "the horizon is the bound parameter, not a literal. Full SQL:\n{sql}"
+        );
+        assert!(
+            !sql.contains("newest_completed_at"),
+            "this sweep deliberately has NO keep-newest clause — adding one here would \
+             put the rule in two statements. `prefetch-tick` is carved out instead. \
+             Full SQL:\n{sql}"
+        );
+    }
+
+    /// Two rows per kind are retained, not one, and the `completed` half
+    /// is the one a "keep the newest terminal row" reading would drop.
+    /// Dropping it makes `last_completed_at_by_kind` answer `None` —
+    /// "never ran" — for any kind whose newest terminal row is a failure,
+    /// which is exactly the state a stopped-and-failing scheduled task is
+    /// in when its gauge most needs to be right.
+    #[test]
+    fn delete_terminal_other_kind_rows_sql_retains_both_state_rows_per_kind() {
+        let sql = DELETE_TERMINAL_OTHER_KIND_ROWS_SQL;
+        assert!(
+            sql.contains("max(completed_at) FILTER (WHERE status = 'completed')"),
+            "the newest-completion anchor must mirror `last_completed_at_by_kind`'s \
+             `max(completed_at) … WHERE status = 'completed'` exactly. Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("j.completed_at IS NOT DISTINCT FROM l.newest_completed_at"),
+            "the newest `completed` row per kind must be retained, and by equality \
+             (not a ranking window) so a `completed_at` tie retains both tied rows \
+             rather than guessing which one the reader lands on. Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("max(created_at) AS newest_created_at"),
+            "the newest-terminal anchor must be `created_at`, matching the \
+             `ORDER BY created_at DESC LIMIT 1` reader. Full SQL:\n{sql}"
+        );
+        assert!(
+            sql.contains("j.created_at <> l.newest_created_at"),
+            "the newest terminal row per kind must be retained. Full SQL:\n{sql}"
+        );
+    }
+
+    /// The `live` CTE aggregates over ALL terminal rows of a kind, not
+    /// only the aged ones: the horizon belongs in the DELETE. Moving it
+    /// into the CTE would retain "the newest row that happened to be
+    /// old", a different row that then never ages out.
+    #[test]
+    fn delete_terminal_other_kind_rows_sql_applies_the_horizon_only_in_the_delete() {
+        let sql = DELETE_TERMINAL_OTHER_KIND_ROWS_SQL;
+        assert_eq!(
+            sql.matches("updated_at < now() - $1::interval").count(),
+            1,
+            "the horizon predicate appears exactly once, in the DELETE. Full SQL:\n{sql}"
+        );
+        let cte = sql
+            .split_once(")\nDELETE FROM")
+            .map(|(before, _)| before)
+            .expect("the SQL must be a `live` CTE followed by the DELETE");
+        assert!(
+            !cte.contains("$1"),
+            "the `live` CTE must not read the horizon — it anchors on the newest \
+             rows of the kind overall. Full CTE:\n{cte}"
+        );
+        assert_eq!(
+            sql.matches("status IN ('completed', 'failed')").count(),
+            2,
+            "both the CTE and the DELETE restrict to terminal rows; `pending` / \
+             `running` rows are never swept and never anchor. Full SQL:\n{sql}"
+        );
+    }
+
+    /// Same `\n\`-continuation hazard `claim_pending_by_kinds_sql_has_no_token_mashing`
+    /// pins: a continuation that loses its explicit `\n` eats both the
+    /// newline and the following indent, conjoining adjacent SQL tokens
+    /// into a syntax error at runtime rather than at build time.
+    #[test]
+    fn delete_terminal_other_kind_rows_sql_has_no_token_mashing() {
+        let sql = DELETE_TERMINAL_OTHER_KIND_ROWS_SQL;
+        for must_contain in [
+            "WITH live AS (\n",
+            "FROM public.jobs\n",
+            "GROUP BY kind\n",
+            "DELETE FROM public.jobs j\n",
+            "USING live l\n",
+        ] {
+            assert!(
+                sql.contains(must_contain),
+                "expected {must_contain:?} with its newline intact. Full SQL:\n{sql}"
+            );
+        }
+        for mashed in [
+            "public.jobsWHERE",
+            "'failed')AND",
+            "GROUP BY kindDELETE",
+            "public.jobs jUSING",
+            "live lWHERE",
+            "AS newest_created_atFROM",
+        ] {
+            assert!(
+                !sql.contains(mashed),
+                "token mashing detected ({mashed:?}) — a `\\n\\` continuation lost its \
+                 explicit newline. Full SQL:\n{sql}"
+            );
+        }
     }
 
     /// Regression guard for the bug that produced
@@ -2210,6 +2770,14 @@ mod tests {
             // A foreign kind whose newest terminal row IS durable state —
             // widening the predicate must never reach it.
             mk("completed", "verify-event-chain", 1_000_000),
+            // `prefetch-tick` matches the `prefetch%` prefix by name but
+            // is carved out: the rotation's keyset cursor lives in its
+            // newest `completed` row's `result_summary`, and this sweep
+            // has no keep-newest clause to protect it. Both rows must
+            // survive — even the superseded one, because the carve-out is
+            // by kind, not by rank.
+            mk("completed", "prefetch-tick", 1_000_000),
+            mk("failed", "prefetch-tick", 900_000),
         ];
         for (status, kind, key, age_secs) in &fixtures {
             sqlx::query(
@@ -2239,7 +2807,8 @@ mod tests {
         assert_eq!(
             deleted, 4,
             "exactly the four old-terminal in-scope rows are deleted (not pending/running, \
-             not fresh, not a foreign kind's durable state)",
+             not fresh, not a foreign kind's durable state, and not `prefetch-tick` — \
+             which matches the prefix but is swept by the generic sweep instead)",
         );
 
         // Cleanup: drop the remaining seeded rows for isolation.
@@ -2315,6 +2884,506 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup seeded rows");
+    }
+
+    // -----------------------------------------------------------------
+    // Generic (`other kind`) retention sweep — the horizon for every
+    // `jobs.kind` the two kind-specific sweeps do not reach. Carries
+    // `#[serial(hort_pg_db)]` per ADR 0019; note that the per-test
+    // database `maybe_pool()` creates is NOT isolation from
+    // cluster-global work, which is what the serial key covers.
+    // -----------------------------------------------------------------
+
+    /// Seed one `jobs` row with an explicit age, returning its id.
+    ///
+    /// `age_secs` sets `created_at` and `updated_at` to the same instant:
+    /// the horizon predicate reads `updated_at` while the
+    /// newest-terminal-row protection reads `created_at`, and a real row
+    /// written through the port has both advancing together. A
+    /// `'completed'` row also gets `completed_at` at that instant,
+    /// matching what `mark_completed` / `record_run_completion` write —
+    /// that column is what `last_completed_at_by_kind` reads.
+    async fn seed_aged_row(pool: &PgPool, kind: &str, status: &str, age_secs: i32) -> Uuid {
+        seed_aged_row_with_summary(pool, kind, status, age_secs, None).await
+    }
+
+    /// [`seed_aged_row`] plus an explicit `result_summary` — the column
+    /// `last_result_summary_by_kind` reads back as cross-tick state.
+    async fn seed_aged_row_with_summary(
+        pool: &PgPool,
+        kind: &str,
+        status: &str,
+        age_secs: i32,
+        summary: Option<JsonValue>,
+    ) -> Uuid {
+        sqlx::query_scalar(
+            "INSERT INTO public.jobs \
+               (kind, params, priority, trigger_source, status, result_summary, \
+                created_at, updated_at, completed_at) \
+             VALUES ($1, '{}'::jsonb, 0, 'cron', $2::text, $4, \
+                     now() - ($3::int || ' seconds')::interval, \
+                     now() - ($3::int || ' seconds')::interval, \
+                     CASE WHEN $2::text = 'completed' \
+                          THEN now() - ($3::int || ' seconds')::interval END) \
+             RETURNING id",
+        )
+        .bind(kind)
+        .bind(status)
+        .bind(age_secs)
+        .bind(summary.map(sqlx::types::Json))
+        .fetch_one(pool)
+        .await
+        .expect("seed aged jobs row")
+    }
+
+    /// Whether a seeded row is still present.
+    async fn row_present(pool: &PgPool, id: Uuid) -> bool {
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM public.jobs WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("count seeded row");
+        n == 1
+    }
+
+    /// The newest terminal row of `kind` by `created_at` — the
+    /// `ORDER BY created_at DESC LIMIT 1` read shape a
+    /// latest-job-decides-the-predicate consumer uses (the artifact
+    /// rescan-stranding probe is the live example).
+    async fn newest_terminal_row_id(pool: &PgPool, kind: &str) -> Option<Uuid> {
+        sqlx::query_scalar(
+            "SELECT id FROM public.jobs \
+              WHERE kind = $1 AND status IN ('completed', 'failed') \
+              ORDER BY created_at DESC \
+              LIMIT 1",
+        )
+        .bind(kind)
+        .fetch_optional(pool)
+        .await
+        .expect("newest terminal row")
+    }
+
+    /// One day, the horizon every test below sweeps with.
+    const TEST_HORIZON: Duration = Duration::from_secs(86_400);
+
+    /// The generic horizon deletes aged terminal rows of the kinds the
+    /// two kind-specific sweeps do not reach — and only those. Runs
+    /// against a per-test database, so the deleted count is exact.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn other_kind_retention_sweep_deletes_only_aged_terminal_rows_of_unswept_kinds() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        // `noop`: three aged `completed` rows plus a newer aged `failed`
+        // one. The newest `completed` is what `last_completed_at_by_kind`
+        // would read; the `failed` row is the newest terminal row by
+        // `created_at`. Both survive; the two superseded `completed` rows
+        // age out.
+        let noop_oldest = seed_aged_row(&pool, "noop", "completed", 400_000).await;
+        let noop_older = seed_aged_row(&pool, "noop", "completed", 300_000).await;
+        let noop_newest_completed = seed_aged_row(&pool, "noop", "completed", 200_000).await;
+        let noop_newest_terminal = seed_aged_row(&pool, "noop", "failed", 100_000).await;
+
+        // `cron-rescan-tick`: aged `failed` rows only. The kind has never
+        // completed, so `max(completed_at) FILTER (…)` is NULL for it and
+        // only the newest-terminal protection applies — the FILTER-NULL
+        // path.
+        let tick_oldest = seed_aged_row(&pool, "cron-rescan-tick", "failed", 400_000).await;
+        let tick_older = seed_aged_row(&pool, "cron-rescan-tick", "failed", 300_000).await;
+        let tick_newest = seed_aged_row(&pool, "cron-rescan-tick", "failed", 200_000).await;
+
+        // The sweep's own kind is inside its own predicate — it reclaims
+        // its own history the way its two siblings do.
+        let self_old = seed_aged_row(&pool, "jobs-row-retention-sweep", "completed", 400_000).await;
+        let self_newest =
+            seed_aged_row(&pool, "jobs-row-retention-sweep", "completed", 100_000).await;
+
+        // Non-terminal rows are never touched, at any age. A row left
+        // `running` by a crashed worker is deliberately among them: an
+        // expired claim lease does not distinguish a dead worker from a
+        // task slower than its lease.
+        let pending = seed_aged_row(&pool, "seed-import", "pending", 400_000).await;
+        let running = seed_aged_row(&pool, "seed-import", "running", 400_000).await;
+
+        // Fresh terminal rows are inside the horizon.
+        let fresh_completed = seed_aged_row(&pool, "policy-reevaluation", "completed", 0).await;
+        let fresh_failed = seed_aged_row(&pool, "policy-reevaluation", "failed", 10).await;
+
+        // The two kind-specific sweeps own these kinds. This sweep must
+        // not reach them even when a row is aged, terminal AND superseded
+        // by a newer row of its own kind — otherwise two horizons would
+        // be in force per kind and the shorter would silently win.
+        let scan_old = seed_aged_row(&pool, "scan", "completed", 400_000).await;
+        let scan_newer = seed_aged_row(&pool, "scan", "failed", 300_000).await;
+        let prefetch_old = seed_aged_row(&pool, "prefetch", "completed", 400_000).await;
+        let prefetch_newer = seed_aged_row(&pool, "prefetch", "completed", 300_000).await;
+        let prefetch_deps = seed_aged_row(&pool, "prefetch-dependencies", "failed", 400_000).await;
+        let prefetch_sweep =
+            seed_aged_row(&pool, "prefetch-row-retention-sweep", "completed", 400_000).await;
+        let child_old = seed_aged_row(&pool, "oci-index-child-ingest", "completed", 400_000).await;
+        let child_newer =
+            seed_aged_row(&pool, "oci-index-child-ingest", "completed", 300_000).await;
+
+        // `prefetch-tick` is the one `prefetch%` kind this sweep DOES own:
+        // it is a scheduled tick, not cascade work, and its newest
+        // `completed` row carries the rotation's keyset cursor — so it
+        // needs the keep-newest clause the cascade sweep does not have.
+        let prefetch_tick_old = seed_aged_row(&pool, "prefetch-tick", "completed", 400_000).await;
+        let prefetch_tick_newer = seed_aged_row(&pool, "prefetch-tick", "completed", 300_000).await;
+
+        let deleted = repo
+            .delete_terminal_other_kind_rows_older_than(TEST_HORIZON)
+            .await
+            .expect("generic retention sweep");
+        assert_eq!(
+            deleted, 6,
+            "exactly the six superseded, aged, terminal, in-scope rows are deleted: two \
+             `noop` completions, two `cron-rescan-tick` failures, one of the sweep's own, \
+             and the superseded `prefetch-tick` completion",
+        );
+
+        for (id, why) in [
+            (noop_oldest, "superseded aged `noop` completion"),
+            (noop_older, "superseded aged `noop` completion"),
+            (tick_oldest, "superseded aged `cron-rescan-tick` failure"),
+            (tick_older, "superseded aged `cron-rescan-tick` failure"),
+            (self_old, "superseded aged row of the sweep's own kind"),
+            (
+                prefetch_tick_old,
+                "superseded aged `prefetch-tick` completion — the kind is swept here",
+            ),
+        ] {
+            assert!(!row_present(&pool, id).await, "{why} must be deleted");
+        }
+
+        for (id, why) in [
+            (
+                noop_newest_completed,
+                "newest `noop` completion is gauge state",
+            ),
+            (
+                noop_newest_terminal,
+                "newest terminal `noop` row is predicate state",
+            ),
+            (
+                tick_newest,
+                "newest terminal `cron-rescan-tick` row is predicate state",
+            ),
+            (
+                self_newest,
+                "the sweep keeps its own newest row like any other kind",
+            ),
+            (pending, "`pending` rows are claim-pending, never swept"),
+            (
+                running,
+                "`running` rows may be genuinely in flight, never swept",
+            ),
+            (fresh_completed, "inside the horizon"),
+            (fresh_failed, "inside the horizon"),
+            (scan_old, "`scan` belongs to the scan-row sweep"),
+            (scan_newer, "`scan` belongs to the scan-row sweep"),
+            (prefetch_old, "`prefetch%` belongs to the cascade sweep"),
+            (prefetch_newer, "`prefetch%` belongs to the cascade sweep"),
+            (prefetch_deps, "`prefetch%` belongs to the cascade sweep"),
+            (prefetch_sweep, "`prefetch%` belongs to the cascade sweep"),
+            (
+                prefetch_tick_newer,
+                "newest `prefetch-tick` completion carries the rotation cursor",
+            ),
+            (
+                child_old,
+                "`oci-index-child-ingest` belongs to the cascade sweep",
+            ),
+            (
+                child_newer,
+                "`oci-index-child-ingest` belongs to the cascade sweep",
+            ),
+        ] {
+            assert!(row_present(&pool, id).await, "{why} — must survive");
+        }
+    }
+
+    /// **Both** boot-time liveness gauges read the newest `completed` row
+    /// of their kind through `last_completed_at_by_kind`, and the sweep
+    /// must leave that value — and therefore the gauge verdict —
+    /// unchanged. Checked through the consumer, not by row count.
+    ///
+    /// The `staging-sweep` fixture is the case that decides the design:
+    /// the sweep ran, then started failing, so its newest **terminal**
+    /// row is a failure. A sweep that retained only the newest terminal
+    /// row would drop the `completed` row underneath it, and
+    /// `last_completed_at_by_kind` — which filters `status = 'completed'`
+    /// — would answer `None`. That is `NeverRan`, whose operator-facing
+    /// message is "upgraded without enabling the CronJob", for a sweep
+    /// that demonstrably ran.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn other_kind_retention_sweep_leaves_both_liveness_gauges_unchanged() {
+        use hort_domain::policy::{
+            evaluate_event_chain_verify_liveness, evaluate_staging_sweep_liveness,
+            EventChainVerifyLiveness, StagingSweepLiveness,
+        };
+
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        // `hort_staging_sweep_overdue` — expected interval 300 s,
+        // staleness multiplier 3.
+        let ss_superseded = seed_aged_row(&pool, "staging-sweep", "completed", 500_000).await;
+        let ss_breadcrumb = seed_aged_row(&pool, "staging-sweep", "completed", 400_000).await;
+        let ss_newest_terminal = seed_aged_row(&pool, "staging-sweep", "failed", 100_000).await;
+
+        // `hort_event_chain_verify_overdue` — expected interval 86400 s,
+        // staleness multiplier 3. The breadcrumb here is also the newest
+        // terminal row, so one protection covers it twice; the point is
+        // that the superseded completion still ages out.
+        let vec_superseded = seed_aged_row(&pool, "verify-event-chain", "completed", 500_000).await;
+        let vec_breadcrumb = seed_aged_row(&pool, "verify-event-chain", "completed", 300_000).await;
+
+        let before_ss = repo
+            .last_completed_at_by_kind("staging-sweep")
+            .await
+            .expect("staging-sweep last completion (before)");
+        let before_vec = repo
+            .last_completed_at_by_kind("verify-event-chain")
+            .await
+            .expect("verify-event-chain last completion (before)");
+        assert!(
+            before_ss.is_some() && before_vec.is_some(),
+            "fixture precondition: both kinds have a completion on record",
+        );
+
+        let deleted = repo
+            .delete_terminal_other_kind_rows_older_than(TEST_HORIZON)
+            .await
+            .expect("generic retention sweep");
+        assert_eq!(
+            deleted, 2,
+            "only the two superseded completions age out — the fixture is not vacuous, \
+             the sweep really did delete rows of both gauge-bearing kinds",
+        );
+        assert!(!row_present(&pool, ss_superseded).await);
+        assert!(!row_present(&pool, vec_superseded).await);
+        assert!(row_present(&pool, ss_breadcrumb).await);
+        assert!(row_present(&pool, ss_newest_terminal).await);
+        assert!(row_present(&pool, vec_breadcrumb).await);
+
+        let after_ss = repo
+            .last_completed_at_by_kind("staging-sweep")
+            .await
+            .expect("staging-sweep last completion (after)");
+        let after_vec = repo
+            .last_completed_at_by_kind("verify-event-chain")
+            .await
+            .expect("verify-event-chain last completion (after)");
+        assert_eq!(
+            before_ss, after_ss,
+            "the staging-sweep liveness input must survive the sweep verbatim",
+        );
+        assert_eq!(
+            before_vec, after_vec,
+            "the event-chain verify liveness input must survive the sweep verbatim",
+        );
+
+        // The gauge verdicts themselves, not just their input. Same
+        // wall-clock for both sides so only the port read can differ.
+        let now = Utc::now();
+        let ss_interval = Duration::from_secs(300);
+        let vec_interval = Duration::from_secs(86_400);
+        assert_eq!(
+            evaluate_staging_sweep_liveness(before_ss, now, ss_interval, 3),
+            evaluate_staging_sweep_liveness(after_ss, now, ss_interval, 3),
+            "hort_staging_sweep_overdue must read identically across the sweep",
+        );
+        assert_eq!(
+            evaluate_event_chain_verify_liveness(before_vec, now, vec_interval, 3),
+            evaluate_event_chain_verify_liveness(after_vec, now, vec_interval, 3),
+            "hort_event_chain_verify_overdue must read identically across the sweep",
+        );
+
+        // Equality alone would also hold if both sides were `NeverRan`,
+        // which is precisely the failure this test exists to catch. Pin
+        // the surviving verdict as `Overdue` — the outage diagnosis —
+        // rather than `NeverRan`, the never-enabled one.
+        assert!(
+            matches!(
+                evaluate_staging_sweep_liveness(after_ss, now, ss_interval, 3),
+                StagingSweepLiveness::Overdue { .. }
+            ),
+            "the surviving verdict must be Overdue (the sweep stopped), not NeverRan \
+             (the CronJob was never enabled)",
+        );
+        assert!(
+            matches!(
+                evaluate_event_chain_verify_liveness(after_vec, now, vec_interval, 3),
+                EventChainVerifyLiveness::Overdue { .. }
+            ),
+            "the surviving verdict must be Overdue (the verifier stopped), not NeverRan",
+        );
+    }
+
+    /// The latest-terminal-row read shape — `ORDER BY created_at DESC
+    /// LIMIT 1`, which is how a latest-job-decides-the-predicate consumer
+    /// reads `jobs` — resolves to the same row before and after the
+    /// sweep. Deleting the newest row while an older one of a different
+    /// status survived would flip such a predicate silently.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn other_kind_retention_sweep_keeps_the_newest_terminal_row_per_kind() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        let superseded =
+            seed_aged_row(&pool, "quarantine-release-sweep", "completed", 500_000).await;
+        let newest_completed =
+            seed_aged_row(&pool, "quarantine-release-sweep", "completed", 400_000).await;
+        let newest_terminal =
+            seed_aged_row(&pool, "quarantine-release-sweep", "failed", 200_000).await;
+
+        let before = newest_terminal_row_id(&pool, "quarantine-release-sweep").await;
+        assert_eq!(
+            before,
+            Some(newest_terminal),
+            "fixture precondition: the newest terminal row is the failure",
+        );
+
+        let deleted = repo
+            .delete_terminal_other_kind_rows_older_than(TEST_HORIZON)
+            .await
+            .expect("generic retention sweep");
+        assert_eq!(deleted, 1, "only the superseded completion ages out");
+        assert!(!row_present(&pool, superseded).await);
+        assert!(row_present(&pool, newest_completed).await);
+
+        let after = newest_terminal_row_id(&pool, "quarantine-release-sweep").await;
+        assert_eq!(
+            after, before,
+            "the latest-terminal-row predicate must resolve to the same row across the sweep",
+        );
+    }
+
+    /// The cross-tick rotation cursor rides the newest completed row's
+    /// `result_summary` and is read back by
+    /// `last_result_summary_by_kind`. `prefetch-tick` is swept HERE, so
+    /// the cursor's survival rests on this sweep's keep-newest clause
+    /// rather than on an exclusion: the superseded tick row carrying a
+    /// stale cursor must age out while the current one stays readable.
+    /// `eventstore-checkpoint` covers the same shape for a kind whose
+    /// newest completion is NOT its newest terminal row.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn other_kind_retention_sweep_keeps_the_newest_result_summary_readable() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        let stale_cursor = serde_json::json!({"cursor": {"position": "after_repo",
+            "repository_id": "00000000-0000-0000-0000-000000000001"}});
+        let cursor = serde_json::json!({"cursor": {"position": "after_repo",
+            "repository_id": "00000000-0000-0000-0000-000000000002"}});
+        let tick_superseded = seed_aged_row_with_summary(
+            &pool,
+            "prefetch-tick",
+            "completed",
+            500_000,
+            Some(stale_cursor),
+        )
+        .await;
+        let tick_row = seed_aged_row_with_summary(
+            &pool,
+            "prefetch-tick",
+            "completed",
+            400_000,
+            Some(cursor.clone()),
+        )
+        .await;
+
+        let stale = serde_json::json!({"checkpointed_through": 1});
+        let current = serde_json::json!({"checkpointed_through": 2});
+        let ck_superseded = seed_aged_row_with_summary(
+            &pool,
+            "eventstore-checkpoint",
+            "completed",
+            500_000,
+            Some(stale),
+        )
+        .await;
+        let ck_current = seed_aged_row_with_summary(
+            &pool,
+            "eventstore-checkpoint",
+            "completed",
+            300_000,
+            Some(current.clone()),
+        )
+        .await;
+        // A later failure, so `ck_current` is NOT the newest terminal row
+        // of its kind: the newest-completion protection is the only thing
+        // standing between the cursor and the horizon here.
+        let ck_failed = seed_aged_row(&pool, "eventstore-checkpoint", "failed", 200_000).await;
+
+        let deleted = repo
+            .delete_terminal_other_kind_rows_older_than(TEST_HORIZON)
+            .await
+            .expect("generic retention sweep");
+        assert_eq!(
+            deleted, 2,
+            "the two superseded completions age out — one `eventstore-checkpoint`, \
+             one `prefetch-tick` — and nothing else",
+        );
+        assert!(row_present(&pool, ck_failed).await);
+        assert!(!row_present(&pool, ck_superseded).await);
+        assert!(row_present(&pool, ck_current).await);
+        assert!(!row_present(&pool, tick_superseded).await);
+        assert!(row_present(&pool, tick_row).await);
+
+        assert_eq!(
+            repo.last_result_summary_by_kind("prefetch-tick")
+                .await
+                .expect("prefetch-tick summary"),
+            Some(cursor),
+            "the rotation resumes from the cursor it wrote, not from the beginning — \
+             this sweep owns `prefetch-tick` and its keep-newest clause is what \
+             protects the cursor",
+        );
+        assert_eq!(
+            repo.last_result_summary_by_kind("eventstore-checkpoint")
+                .await
+                .expect("eventstore-checkpoint summary"),
+            Some(current),
+            "the newest completion's summary survives its superseded predecessors",
+        );
+    }
+
+    /// A kind with a single aged terminal row keeps it: the row is both
+    /// the newest completion and the newest terminal row, so the horizon
+    /// can never take a kind's last trace of having run.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn other_kind_retention_sweep_never_empties_a_kind() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgJobsRepository::new(pool.clone());
+
+        let lone_completed =
+            seed_aged_row(&pool, "service-account-rotation", "completed", 900_000).await;
+        let lone_failed = seed_aged_row(&pool, "replay-seen-prune", "failed", 900_000).await;
+
+        let deleted = repo
+            .delete_terminal_other_kind_rows_older_than(TEST_HORIZON)
+            .await
+            .expect("generic retention sweep");
+        assert_eq!(deleted, 0, "a kind's only terminal row is never swept");
+        assert!(row_present(&pool, lone_completed).await);
+        assert!(row_present(&pool, lone_failed).await);
     }
 
     // -----------------------------------------------------------------

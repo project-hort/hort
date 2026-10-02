@@ -13,10 +13,12 @@
 //!
 //! ## Enumeration scope
 //!
-//! All artifacts whose `quarantine_status NOT IN ('quarantined',
-//! 'rejected', 'scan_indeterminate')` — i.e. `none` / `released`, the
-//! retention-eligible set (the eligibility filter, pushed SQL-side).
-//! Keyset-paginated by `artifact.id`. Per-policy-scope SQL
+//! All live artifacts whose status is retention-eligible: SQL `NULL`,
+//! `none`, the legacy non-terminal scan spellings (`unscanned`, `clean`,
+//! `flagged`), and `released`. The protected states `quarantined`,
+//! `rejected`, and `scan_indeterminate` and all soft-deleted rows are
+//! excluded SQL-side. The result is keyset-paginated by `artifact.id`.
+//! Per-policy-scope SQL
 //! pre-filtering is **deliberately not** done here: the evaluator
 //! does scope matching via the pure
 //! [`RetentionScope::matches`](crate::retention::RetentionScope::matches),
@@ -27,7 +29,8 @@
 //! (query-on-demand, no premature materialization). The reader still
 //! does no scope SQL pre-filter — it only joins `repositories` to
 //! supply the per-artifact `format` input `RetentionScope::matches`
-//! needs (a single query, no extra round-trip).
+//! needs, plus the `key` the operator-facing preview names the
+//! repository by (a single query, no extra round-trip).
 //!
 //! ## `resolved_rescan_interval_hours`
 //!
@@ -39,6 +42,78 @@
 //! with no resolved scan policy yields `None` (→ the default 24 h)
 //! rather than being dropped — age-based retention applies even
 //! without a scan policy.
+//!
+//! ## `keep_rank` — the `KeepLastN` input
+//!
+//! This artifact's 1-based rank among its usable siblings plus the
+//! usable-sibling total, resolved in the **same** enumeration
+//! statement (a window function — no second port, no extra
+//! round-trip, no second data source).
+//!
+//! **Sibling group.** `(repository_id, artifact name)`.
+//!
+//! **Ordering (contract, not an implementation detail).** Newest first
+//! by `created_at`, ties broken by artifact id descending. Which `n`
+//! versions survive `KeepLastN(n)` is decided entirely by this
+//! ordering, and the tiebreak is what makes it reproducible: two
+//! artifacts stored in the same instant must not be free to swap ranks
+//! between two sweeps and expire alternately.
+//!
+//! **Counted set: usable siblings.** `KeepLastN(n)` means n *usable*
+//! artifacts, not n rows. The rank is computed over exactly the
+//! artifacts this reader's own enumeration admits — `deleted_at IS
+//! NULL` **and** a non-GC-protected quarantine status — so the
+//! counted set and the candidate set are one set:
+//!
+//! - A retired artifact (`deleted_at IS NOT NULL`) occupies no rank
+//!   slot; it would otherwise shield itself and push one extra usable
+//!   artifact over the edge.
+//! - A GC-protected sibling (`quarantined` / `rejected` /
+//!   `scan_indeterminate`) occupies no rank slot either. Counting it
+//!   would let the usable window reach zero: `KeepLastN(3)` over five
+//!   siblings whose three newest are quarantined together would keep
+//!   exactly those three and expire both released ones, leaving the
+//!   operator three artifacts that are neither downloadable
+//!   ([`Artifact::is_downloadable`] is true only for
+//!   [`QuarantineStatus::None`](crate::entities::artifact::QuarantineStatus::None)
+//!   and
+//!   [`Released`](crate::entities::artifact::QuarantineStatus::Released))
+//!   nor collectable. The accepted cost is that a group holds n plus
+//!   its protected siblings rather than n rows — a population
+//!   `KeepLastN` could not collect in any case.
+//! - Releasing a protected sibling re-enters it in the rank and can
+//!   push an older released sibling out of the window. That is the
+//!   rule working: release is what makes an artifact usable, and a
+//!   usable artifact counts.
+//!
+//! **Pagination.** The rank is a property of the whole sibling group,
+//! never of the page. An implementation that lets the keyset cursor
+//! reach the window partition computes a rank relative to the current
+//! page and expires the wrong artifacts; the sibling group can be far
+//! larger than one page.
+//!
+//! ## `tag_targeted` — the tag exemption
+//!
+//! A tag target survives `KeepLastN` regardless of rank, and nothing
+//! in a rank knows about tags. The flag answers "does a mutable ref in
+//! **this** repository resolve to this artifact?" and it has three
+//! ways to look right and be wrong:
+//!
+//! - **Repository-scoped.** Content hashes are shared across
+//!   repositories by construction — that is what CAS is. A
+//!   hash-global lookup would exempt an untagged artifact because
+//!   identical bytes happen to be tagged in another repository, and
+//!   under a name-pattern-scoped policy it would protect nothing when
+//!   the tag lives in a repository the policy does not cover.
+//! - **Both target kinds.** `target_kind = 'hash'` is the OCI tag
+//!   (a pointer at a content hash); `target_kind = 'version'` is how
+//!   an npm dist-tag or any other non-OCI mutable pointer resolves.
+//!   A hash-only exemption silently protects nothing outside OCI.
+//! - **Evaluation is not the last word.** Evaluation and purge are
+//!   separate sweeps, so a tag added between them finds the artifact
+//!   already carrying `ArtifactExpired`. The window is closed on the
+//!   purge side — see
+//!   [`PendingPurge::tag_targeted`](super::purge_gc::PendingPurge::tag_targeted).
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -66,8 +141,19 @@ pub struct RetentionCandidateRow {
     /// joined `repositories.format` column (the existing
     /// `repositories.format text` → `RepositoryFormat` mapping; same
     /// query, no extra round-trip). `Artifact` itself has no `format`
-    /// field, so this is carried alongside it for B3's scope gate.
+    /// field, so this is carried alongside it for the scope gate.
     pub format: RepositoryFormat,
+    /// The artifact's repository **key** — `repositories.key`, the
+    /// unique operator-facing identifier a policy's `metadata.name`
+    /// resolves against (`RepositoryRepository::find_by_key`).
+    ///
+    /// Carried on the same `JOIN repositories` that already supplies
+    /// `format`, so it costs no extra round-trip and no N+1 lookup.
+    /// It exists so an operator-facing retention preview can name the
+    /// repository the operator would actually type; `repository_id` is
+    /// a UUID and nobody writes a UUID into a policy. Both travel
+    /// together — the id stays for machine consumers.
+    pub repository_key: String,
     /// The resolved `rescan_interval_hours` for the artifact's
     /// repository. `Some(0)` is meaningful (rescanning disabled — a
     /// security-driven predicate is then always-stale → fail-safe
@@ -75,6 +161,26 @@ pub struct RetentionCandidateRow {
     /// default 24 h. Mirrors `RetentionCandidate
     /// .resolved_rescan_interval_hours` semantics exactly.
     pub resolved_rescan_interval_hours: Option<i64>,
+    /// The `KeepLastN` input: this artifact's 1-based rank among its
+    /// **usable** siblings (newest = 1) and the number of usable
+    /// siblings in the group. Usable is the candidate set itself —
+    /// live and not GC-protected — so a quarantined, rejected,
+    /// scan-indeterminate or soft-deleted sibling is counted by
+    /// neither number. `None` when no ranking could be resolved — the
+    /// pure evaluator then fails `KeepLastN` safe and never expires
+    /// the artifact.
+    ///
+    /// See the module docs for the ordering contract, the sibling-group
+    /// definition, why the counted set is the usable one, and why the
+    /// rank cannot be computed per page.
+    pub keep_rank: Option<(u32, u32)>,
+    /// `true` iff a mutable ref **in this artifact's own repository**
+    /// currently resolves to this artifact — an OCI tag
+    /// (`target_kind = 'hash'`) pointing at its content hash, or a
+    /// version pointer (`target_kind = 'version'`, the npm dist-tag
+    /// shape) naming its `(name, version)`. See the module docs for
+    /// why both kinds and the repository scope are load-bearing.
+    pub tag_targeted: bool,
 }
 
 /// Outbound port for the retention candidate-enumeration query.

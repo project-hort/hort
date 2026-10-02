@@ -11,8 +11,12 @@
 //! errors — the whole transition must then roll back.
 //!
 //! `DATABASE_URL`-gated; self-skips on hosts without a database (suite
-//! convention). Uses `isolated_db_from` (a per-test throwaway database) for
-//! isolation, so no `#[serial(hort_pg_db)]` key is required.
+//! convention). Uses `isolated_db_from` (a per-test throwaway database),
+//! which isolates the rows but not the server: creating and migrating
+//! that database is cluster-global work (`CREATE DATABASE`, the
+//! migration set's `CREATE ROLE`, the shared catalogs the stale-database
+//! sweeper walks), so each test also carries the workspace-wide
+//! `#[serial(hort_pg_db)]` key.
 //!
 //! ```bash
 //! DATABASE_URL=postgresql://registry:registry@localhost:30432/artifact_registry \
@@ -25,6 +29,7 @@ use std::env;
 use std::sync::Arc;
 
 use chrono::Utc;
+use serial_test::serial;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -159,6 +164,7 @@ async fn count(pool: &PgPool, sql: &'static str, id: Uuid) -> i64 {
 /// artifact row and no jobs row survive. The artifact is never
 /// ingested-but-stranded.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn enqueue_failure_rolls_back_transition_no_strand() {
     let Some((pool, repo_id)) = maybe_setup().await else {
         return;
@@ -210,6 +216,7 @@ async fn enqueue_failure_rolls_back_transition_no_strand() {
 /// Happy path: the scan and provenance-verify enqueues land atomically with
 /// the artifact projection in one transaction.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn commit_lands_artifact_and_scan_and_provenance_jobs() {
     let Some((pool, repo_id)) = maybe_setup().await else {
         return;

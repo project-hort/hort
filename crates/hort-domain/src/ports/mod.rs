@@ -67,6 +67,7 @@ pub mod repository_upstream_mapping_repository;
 pub mod rescan_candidates;
 pub mod retention_candidate_reader;
 pub mod retention_policy_projection_repository;
+pub mod retention_preview;
 pub mod retention_scan_reader;
 pub mod sbom_component_repository;
 pub mod scan_findings_repository;

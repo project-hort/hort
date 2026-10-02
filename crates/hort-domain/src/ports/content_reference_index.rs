@@ -102,12 +102,18 @@
 //!
 //! The manifest `DELETE` handler calls
 //! [`ContentReferenceIndex::delete_by_source`] so subsequent
-//! target-side lookups don't surface tombstoned source artifacts. The
-//! migration's FK cascade on `source_artifact_id → artifacts(id) ON
-//! DELETE CASCADE` means every kind on the source row also disappears
-//! automatically if the underlying artifact row is hard-deleted — the
-//! explicit port method keeps the use-case layer in charge of the
-//! ordering and lets tests assert the behaviour directly.
+//! target-side lookups don't surface tombstoned source artifacts. It
+//! calls it AFTER the artifact's own soft delete has committed, never
+//! before: this sweep takes keepalive edges with it that no reconcile
+//! sweep re-creates, so running it ahead of a state change that then
+//! failed would leave a live, servable artifact whose referenced blobs
+//! are collectable. The soft delete is no obstacle to the sweep —
+//! `delete_by_source` keys on the source id alone. The migration's FK
+//! cascade on `source_artifact_id → artifacts(id) ON DELETE CASCADE`
+//! means every kind on the source row also disappears automatically if
+//! the underlying artifact row is hard-deleted — the explicit port
+//! method keeps the use-case layer in charge of the ordering and lets
+//! tests assert the behaviour directly.
 
 use std::collections::HashMap;
 

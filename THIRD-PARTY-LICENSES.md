@@ -282,7 +282,7 @@ the result instead.
 | hybrid-array | 0.4.14 | MIT | https://github.com/RustCrypto/hybrid-array |
 | rustls-pki-types | 1.15.1 | MIT | https://github.com/rustls/pki-types |
 | powerfmt | 0.2.0 | MIT | https://github.com/jhpratt/powerfmt |
-| hyper-util | 0.1.20 | MIT | https://github.com/hyperium/hyper-util |
+| hyper-util | 0.1.21 | MIT | https://github.com/hyperium/hyper-util |
 | cpubits | 0.1.1 | MIT | https://github.com/RustCrypto/utils |
 | deranged | 0.5.8 | MIT | https://github.com/jhpratt/deranged |
 | rapidhash | 4.4.1 | MIT | https://github.com/hoxxep/rapidhash |
@@ -320,7 +320,7 @@ the result instead.
 | arrayvec | 0.7.6 | MIT | https://github.com/bluss/arrayvec |
 | synstructure | 0.13.2 | MIT | https://github.com/mystor/synstructure |
 | ipnet | 2.12.2 | MIT | https://github.com/krisprice/ipnet |
-| rand | 0.10.2 | MIT | https://github.com/rust-random/rand |
+| rand | 0.10.3 | MIT | https://github.com/rust-random/rand |
 | rand | 0.8.6 | MIT | https://github.com/rust-random/rand |
 | rand | 0.9.4 | MIT | https://github.com/rust-random/rand |
 | rand_chacha | 0.3.1 | MIT | https://github.com/rust-random/rand |
@@ -336,7 +336,7 @@ the result instead.
 | crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.18.4 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.18.5 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -446,9 +446,9 @@ the result instead.
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
 | syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror-impl | 2.0.20 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror-impl | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
-| thiserror | 2.0.20 | MIT | https://github.com/dtolnay/thiserror |
+| thiserror | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
 | typed-path | 0.12.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | unicode-ident | 1.0.24 | MIT | https://github.com/dtolnay/unicode-ident |
 | unsafe-libyaml | 0.2.11 | MIT | https://github.com/dtolnay/unsafe-libyaml |
@@ -11740,7 +11740,7 @@ SOFTWARE.
 
 ```
 
-### hyper-util 0.1.20 — MIT
+### hyper-util 0.1.21 — MIT
 
 Repository: https://github.com/hyperium/hyper-util
 
@@ -12803,7 +12803,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
-### rand 0.10.2 — MIT
+### rand 0.10.3 — MIT
 
 Repository: https://github.com/rust-random/rand
 
@@ -13254,7 +13254,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.18.4 — MIT
+### lru 0.18.5 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
@@ -16416,7 +16416,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror-impl 2.0.20 — MIT
+### thiserror-impl 2.0.21 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 
@@ -16478,7 +16478,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### thiserror 2.0.20 — MIT
+### thiserror 2.0.21 — MIT
 
 Repository: https://github.com/dtolnay/thiserror
 

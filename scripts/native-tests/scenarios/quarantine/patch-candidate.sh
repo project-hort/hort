@@ -233,6 +233,7 @@ seed_finding() {
             'smoke synthetic finding',
             now() - interval '1 hour'
         );")"
+    # Bounded: a single `psql -c INSERT`'s own status line.
     if ! printf '%s\n' "$out" | grep -q 'INSERT 0 1'; then
         log "  INSERT INTO scan_findings failed:"
         printf '%s\n' "$out" | sed 's/^/    /'

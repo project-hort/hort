@@ -112,6 +112,24 @@ pub(crate) const RULE_PREFETCH_TRIGGER_REQUIRES_VERSION_DISCOVERY: &str =
 /// the apply caller's emission site.
 pub(crate) const RULE_SCAN_BACKEND_CAPABILITY: &str = "scan_backend_capability";
 
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `RetentionPolicy`
+/// envelope's predicate uses `UnusedFor` — at the root or nested inside
+/// a `Composite`. No port supplies a last-download anchor, so the
+/// evaluator measures the interval from the artifact's creation time and
+/// `UnusedFor(N)` decides exactly what `AgeExceeds(N)` decides; a
+/// risk-significant field whose runtime meaning is not the one it names
+/// is the ADR 0015 block in its mislabelled (rather than merely inert)
+/// form. One increment per offending `RetentionPolicy`. Retired together
+/// with the rule — see
+/// [`hort_config::desired::validate_retention_unused_for_not_implemented`]
+/// for the exact retirement trigger.
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_RETENTION_UNUSED_FOR_NOT_IMPLEMENTED: &str =
+    "retention_unused_for_not_implemented";
+
 /// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
@@ -164,6 +182,14 @@ pub enum LinterRule {
     /// real port-built desired set, and the CLI is metric-free — so
     /// [`Self::metric_rule`] returns `None` here.
     PermissionGrant,
+    /// Row 9 — a `RetentionPolicy` predicate using `UnusedFor` while no
+    /// last-download signal is implemented (the evaluator falls back to
+    /// the creation time, so the predicate silently means `AgeExceeds`).
+    /// Reject + metric. Appended as the LAST row deliberately: apply
+    /// aborts on the first row with error findings, so appending is the
+    /// only placement that cannot change which message an already-failing
+    /// config rejects with.
+    RetentionUnusedForNotImplemented,
 }
 
 impl LinterRule {
@@ -190,6 +216,9 @@ impl LinterRule {
                 Some(RULE_PREFETCH_TRIGGER_REQUIRES_VERSION_DISCOVERY)
             }
             Self::ScanBackendCapability => Some(RULE_SCAN_BACKEND_CAPABILITY),
+            Self::RetentionUnusedForNotImplemented => {
+                Some(RULE_RETENTION_UNUSED_FOR_NOT_IMPLEMENTED)
+            }
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
             | Self::ProvenanceConfig
@@ -446,6 +475,18 @@ impl StaticConfigValidator {
         // run only when the CLI opted in via `with_grant_lint_base`.
         if let Some(base) = self.grant_lint_base.as_ref() {
             self.collect_permission_grants(base, desired, &mut report);
+        }
+
+        // Row 9 — a RetentionPolicy predicate using `UnusedFor` (root or
+        // nested) while no last-download signal is implemented. Last in
+        // row order on purpose: apply aborts on the first row with error
+        // findings, so appending leaves every existing config's reject
+        // message exactly as it was.
+        for err in hort_config::desired::validate_retention_unused_for_not_implemented(desired) {
+            report.errors.push(LintFinding::error(
+                LinterRule::RetentionUnusedForNotImplemented,
+                err.to_string(),
+            ));
         }
 
         report
@@ -1089,6 +1130,7 @@ mod tests {
     use hort_config::envelope::{ApiVersion, Kind, Metadata};
     use hort_config::oidc_issuer::OidcIssuerSpec;
     use hort_config::repository::{RepositorySpec, StorageSpec};
+    use hort_config::retention_policy::RetentionPolicySpec;
     use hort_config::scan_policy::SignerIdentitySpec;
     use hort_config::scope::RepositoryScope;
     use hort_config::service_account::{FederatedIdentitySpec, ServiceAccountSpec};
@@ -1291,6 +1333,32 @@ mod tests {
             .collect()
     }
 
+    /// A `RetentionPolicy` envelope carrying `predicate` verbatim (the
+    /// wire form is an opaque `serde_json::Value`) over `AllRepos`, so
+    /// nothing but row 9 can fire on it.
+    fn retention_policy_env(
+        name: &str,
+        predicate: serde_json::Value,
+    ) -> Envelope<RetentionPolicySpec> {
+        Envelope {
+            api_version: ApiVersion::V1,
+            kind: Kind::RetentionPolicy,
+            metadata: Metadata { name: name.into() },
+            spec: RetentionPolicySpec {
+                predicate,
+                scope: serde_json::json!("AllRepos"),
+            },
+        }
+    }
+
+    fn unused_for_errors(report: &StaticLintReport) -> Vec<&LintFinding> {
+        report
+            .errors
+            .iter()
+            .filter(|f| f.rule == LinterRule::RetentionUnusedForNotImplemented)
+            .collect()
+    }
+
     // ---- metric_rule() -------------------------------------------------
 
     #[test]
@@ -1313,6 +1381,10 @@ mod tests {
         assert_eq!(
             LinterRule::ScanBackendCapability.metric_rule(),
             Some(RULE_SCAN_BACKEND_CAPABILITY)
+        );
+        assert_eq!(
+            LinterRule::RetentionUnusedForNotImplemented.metric_rule(),
+            Some(RULE_RETENTION_UNUSED_FOR_NOT_IMPLEMENTED)
         );
     }
 
@@ -2094,6 +2166,112 @@ mod tests {
             .warnings
             .iter()
             .any(|f| f.rule == LinterRule::UnderConstrainedFederatedIdentities));
+    }
+
+    // ---- row 9: retention predicate `UnusedFor` ------------------------
+
+    #[test]
+    fn retention_unused_for_at_the_root_is_reported() {
+        let desired = DesiredState {
+            retention_policies: vec![retention_policy_env(
+                "reclaim-cold",
+                serde_json::json!({ "UnusedFor": 7_776_000u64 }),
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let hits = unused_for_errors(&report);
+        assert_eq!(hits.len(), 1, "{:?}", report.errors);
+        assert!(hits[0].message.contains("reclaim-cold"));
+        assert!(
+            hits[0].message.contains("AgeExceeds"),
+            "the message must name the alternative: {}",
+            hits[0].message
+        );
+    }
+
+    /// The hole a root-only rule leaves: a `Composite` child evaluates
+    /// exactly like a root predicate, so it must reject exactly like one.
+    #[test]
+    fn retention_unused_for_nested_in_a_composite_is_reported() {
+        let desired = DesiredState {
+            retention_policies: vec![retention_policy_env(
+                "reclaim-nested",
+                serde_json::json!({
+                    "Composite": [
+                        "Or",
+                        [
+                            { "AgeExceeds": 2_592_000u64 },
+                            { "Composite": ["And", [{ "UnusedFor": 60u64 }]] }
+                        ]
+                    ]
+                }),
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let hits = unused_for_errors(&report);
+        assert_eq!(hits.len(), 1, "{:?}", report.errors);
+        assert!(
+            hits[0].message.contains("Composite"),
+            "a nested hit must say where it is: {}",
+            hits[0].message
+        );
+    }
+
+    /// `AgeExceeds` is the semantics `UnusedFor` accidentally delivers
+    /// today — the one predicate the rule must never touch.
+    #[test]
+    fn retention_age_exceeds_is_not_reported() {
+        let desired = DesiredState {
+            retention_policies: vec![retention_policy_env(
+                "retain-90d",
+                serde_json::json!({ "AgeExceeds": 7_776_000u64 }),
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+    }
+
+    /// An unresolvable predicate is the per-spec validator's error; row 9
+    /// stays silent rather than piling a second one on the same envelope.
+    #[test]
+    fn retention_unparsable_predicate_is_not_reported_by_row_9() {
+        let desired = DesiredState {
+            retention_policies: vec![retention_policy_env(
+                "retain-bogus",
+                serde_json::json!({ "NotAPredicate": 1 }),
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(unused_for_errors(&report).is_empty(), "{:?}", report.errors);
+    }
+
+    /// Row 9 is LAST in row order. A config that trips both row 6 and
+    /// row 9 must still abort on row 6 — appending the row cannot change
+    /// which message an already-failing config rejects with.
+    #[test]
+    fn retention_row_9_is_last_in_row_order() {
+        let mut inert_repo = repo_env("npm-inert", "npm");
+        inert_repo.spec.prefetch_policy.max_age_days = Some(90);
+        let desired = DesiredState {
+            repositories: vec![inert_repo],
+            retention_policies: vec![retention_policy_env(
+                "reclaim-cold",
+                serde_json::json!({ "UnusedFor": 60u64 }),
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let rules: Vec<LinterRule> = report.errors.iter().map(|f| f.rule).collect();
+        let pos = |want: LinterRule| rules.iter().position(|r| *r == want).unwrap();
+        assert!(
+            pos(LinterRule::PrefetchMaxAgeDaysNotImplemented)
+                < pos(LinterRule::RetentionUnusedForNotImplemented),
+            "{rules:?}"
+        );
     }
 
     // ---- row 8: permission-grant linter -------------------------------

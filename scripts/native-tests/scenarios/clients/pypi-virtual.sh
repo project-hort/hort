@@ -157,7 +157,7 @@ ANON_RESP=$(curl -sS --max-time 30 -w $'\n%{http_code}' \
     "${VIRTUAL_BASE}/simple/${PKG}/" 2>/dev/null || true)
 ANON_STATUS=$(printf '%s' "$ANON_RESP" | tail -n1)
 ANON_INDEX=$(printf '%s' "$ANON_RESP" | sed '$d')
-if printf '%s' "$ANON_INDEX" | grep -q "$TEST_VERSION"; then
+if capture_match "$TEST_VERSION" printf '%s' "$ANON_INDEX"; then
   fail "anonymous read leaked the private package" \
        "version $TEST_VERSION present in the anonymous virtual index (status $ANON_STATUS)"
 else

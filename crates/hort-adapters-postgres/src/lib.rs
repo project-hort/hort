@@ -19,6 +19,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::error::DomainError;
 
 pub mod advisory_sync_state;
@@ -29,6 +30,7 @@ pub mod artifact_group_repo;
 pub mod artifact_lifecycle;
 pub mod artifact_metadata_repo;
 pub mod artifact_repo;
+pub(crate) mod blob_lock;
 pub mod claim_mapping_repo;
 // Transient write-contention (serialization failure / deadlock): the
 // sqlstate classifier and the bounded whole-transaction retry over it.
@@ -62,6 +64,7 @@ pub mod event_chain_reader;
 pub mod event_store;
 pub mod jobs_repository;
 pub mod mappers;
+pub(crate) mod merged_category_read;
 pub mod metrics;
 pub mod oidc_issuer_repo;
 pub mod patch_candidate_repo;
@@ -85,6 +88,7 @@ pub mod repository_upstream_mapping_repo;
 pub mod rescan_candidates;
 pub mod retention_candidate_reader;
 pub mod retention_policy_projection_repo;
+pub mod retention_preview;
 pub mod retention_scan_reader;
 pub mod sbom_components;
 pub mod scan_findings_repository;
@@ -99,6 +103,72 @@ pub mod user_repo;
 
 /// Boxed future alias for dyn-compatible async trait methods.
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Persisted quarantine statuses that must never be offered to garbage
+/// collection or refcount repair paths.
+const GC_PROTECTED_QUARANTINE_STATUSES: [(&str, QuarantineStatus); 3] = [
+    ("quarantined", QuarantineStatus::Quarantined),
+    ("rejected", QuarantineStatus::Rejected),
+    ("scan_indeterminate", QuarantineStatus::ScanIndeterminate),
+];
+
+/// Names for binding the shared GC-protected set as a PostgreSQL text array.
+pub(crate) fn gc_protected_quarantine_status_names() -> Vec<&'static str> {
+    GC_PROTECTED_QUARANTINE_STATUSES
+        .iter()
+        .map(|(name, _)| *name)
+        .collect()
+}
+
+/// SQL predicate body deciding whether a mutable ref in an artifact's
+/// **own** repository currently resolves to it — the `KeepLastN` tag
+/// exemption. Expects the artifacts row to be in scope as `a`; binds
+/// nothing.
+///
+/// Both retention sweeps read it: the evaluator, so a tag target never
+/// acquires an `ArtifactExpired` under `KeepLastN`, and the purge, so a
+/// tag set in the hour between the two sweeps still saves the artifact.
+/// The two readings must be the same reading, not two that happen to
+/// agree today — hence one string.
+///
+/// Three things are load-bearing:
+///
+/// - **`mr.repository_id = a.repository_id`.** Content hashes are
+///   shared across repositories by construction; a hash-global lookup
+///   would exempt an untagged artifact because identical bytes are
+///   tagged next door, and under a name-pattern-scoped policy it would
+///   protect nothing when the tag lives outside the policy's scope.
+/// - **Both target kinds.** `'hash'` is the OCI tag, resolving to a
+///   content hash; `'version'` is the npm dist-tag and every other
+///   non-OCI mutable pointer. A hash-only reading silently protects
+///   nothing outside OCI.
+/// - **`mr.namespace = a.name` on the version arm.** A version pointer
+///   names `(namespace, version)`; without the namespace one package's
+///   `latest` would exempt every same-versioned package beside it.
+///
+/// Both arms are served by the repository-scoped partial indexes on
+/// `mutable_refs`: `(repository_id, target_hash)` and
+/// `(repository_id, target_version)`.
+pub(crate) const ARTIFACT_IS_TAG_TARGETED_SQL: &str = r#"
+    EXISTS (
+        SELECT 1 FROM mutable_refs mr
+         WHERE mr.repository_id = a.repository_id
+           AND (
+                 (mr.target_kind = 'hash'
+                   AND mr.target_hash = a.checksum_sha256)
+              OR (mr.target_kind = 'version'
+                   AND mr.namespace = a.name
+                   AND mr.target_version = a.version)
+               )
+    )
+"#;
+
+/// Map a persisted status when it belongs to the shared GC-protected set.
+pub(crate) fn gc_protected_quarantine_status(raw: &str) -> Option<QuarantineStatus> {
+    GC_PROTECTED_QUARANTINE_STATUSES
+        .iter()
+        .find_map(|(name, status)| (*name == raw).then_some(*status))
+}
 
 /// Map sqlx errors to domain errors.
 ///
@@ -148,6 +218,27 @@ pub(crate) fn escape_like_pattern(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gc_protected_status_definition_supplies_names_and_domain_values() {
+        assert_eq!(
+            gc_protected_quarantine_status_names(),
+            ["quarantined", "rejected", "scan_indeterminate"]
+        );
+        assert_eq!(
+            gc_protected_quarantine_status("quarantined"),
+            Some(QuarantineStatus::Quarantined)
+        );
+        assert_eq!(
+            gc_protected_quarantine_status("rejected"),
+            Some(QuarantineStatus::Rejected)
+        );
+        assert_eq!(
+            gc_protected_quarantine_status("scan_indeterminate"),
+            Some(QuarantineStatus::ScanIndeterminate)
+        );
+        assert_eq!(gc_protected_quarantine_status("released"), None);
+    }
 
     #[test]
     fn escape_like_plain_text() {

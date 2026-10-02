@@ -18,8 +18,11 @@ Design rationale for the runtime-DSN delivery: a default-shipped CronJob
 going through the `hort-cli` HTTP admin-task path would drag the whole
 `svc-token-bootstrap` Job chain + a standing `admin_task_invoke` token
 mount to default-on. The runtime DSN is least-privilege — it owns nothing
-identity-wise — and the `hort-http-admin-tasks` HTTP route stays available
-for manual operator invocation. So this CronJob:
+identity-wise. There is **no** HTTP invoke route for this kind either:
+`hort-http-admin-tasks` enumerates its invoke routes one by one and
+`prefetch-tick` is not among them, so `POST
+/api/v1/admin/tasks/prefetch-tick` answers 404. An off-schedule tick is
+`hort-server enqueue-prefetch-tick`. So this CronJob:
 
   - Uses `hort-server.runtimeEnv` (DSN + log/metric tunables only —
     same env block the migrate Job uses, MinimalConfig discipline).

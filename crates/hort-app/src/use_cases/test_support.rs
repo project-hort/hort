@@ -81,7 +81,9 @@ use hort_domain::ports::upstream_resolver::UpstreamResolver;
 use hort_domain::ports::user_repository::UserRepository;
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::sbom::SbomComponent;
-use hort_domain::types::{ArtifactCoords, ByteRange, ContentHash, LimitedList, Page, PageRequest};
+use hort_domain::types::{
+    ArtifactCoords, ByteRange, ContentHash, IdempotencyKey, LimitedList, Page, PageRequest,
+};
 
 use crate::metrics::UpstreamFetchError;
 use crate::use_cases::CallerPrivileges;
@@ -145,6 +147,14 @@ pub struct MockArtifactRepository {
     /// caller's identity actually reaches the port instead of being
     /// dropped on the way — the event attribution depends on it.
     deletions: Mutex<Vec<(Uuid, Actor)>>,
+    /// FIFO of injected errors for [`ArtifactRepository::delete`]. Each
+    /// call pops the front, returns it verbatim, and leaves the artifact
+    /// in the map — the production adapter commits the soft delete and
+    /// its `ArtifactDeleted` append together, so a failure means no state
+    /// changed. Lets a test drive a caller's delete-failed arm while the
+    /// artifact is still live and servable, which is the only way to
+    /// observe what that arm leaves behind.
+    delete_errors: Mutex<std::collections::VecDeque<DomainError>>,
     /// Every
     /// [`find_pypi_wheels_without_kind`](ArtifactRepository::find_pypi_wheels_without_kind)
     /// call, in order, with its full argument set. Lets a test assert the
@@ -178,6 +188,7 @@ impl MockArtifactRepository {
             first_seen_errors: Mutex::new(std::collections::VecDeque::new()),
             find_by_repo_and_checksum_errors: Mutex::new(std::collections::VecDeque::new()),
             deletions: Mutex::new(Vec::new()),
+            delete_errors: Mutex::new(std::collections::VecDeque::new()),
             pypi_calls: Mutex::new(Vec::new()),
             oci_calls: Mutex::new(Vec::new()),
         }
@@ -186,6 +197,13 @@ impl MockArtifactRepository {
     /// Accepted deletions in call order, each with its attributed actor.
     pub fn deletions(&self) -> Vec<(Uuid, Actor)> {
         self.deletions.lock().unwrap().clone()
+    }
+
+    /// Arm the next [`ArtifactRepository::delete`] call to fail with
+    /// `err`, leaving the artifact live. Queued, so a test can arm
+    /// several consecutive failures.
+    pub fn fail_next_delete(&self, err: DomainError) {
+        self.delete_errors.lock().unwrap().push_back(err);
     }
 
     /// Arm the next
@@ -251,8 +269,28 @@ impl MockArtifactRepository {
         self.oci_calls.lock().unwrap().clone()
     }
 
+    /// Store (or replace) a row, **dropping the transient hold pair** the
+    /// way the real projection does.
+    ///
+    /// `quarantine_deadline` / `provenance_hold_indefinite` are not
+    /// columns: the schema keeps only the window anchor and
+    /// `hort-adapters-postgres`'s row mapper yields `None` / `false`
+    /// unconditionally, so nothing a caller stamped on an in-memory
+    /// `Artifact` can survive a write-then-read through Postgres. Keeping
+    /// them here would make this mock the ONE place in the system where a
+    /// use case appears to hand a hydrated row to a later reader, which is
+    /// exactly the difference that lets an un-hydrated read path look
+    /// correct in tests and answer with the consuming handler's
+    /// deadline-unknown fallback in production.
+    ///
+    /// Every write reaches the map through here, including
+    /// `MockArtifactLifecycle`'s `commit_transition*`, so this is the only
+    /// place the clear has to happen.
     pub fn insert(&self, artifact: Artifact) {
-        self.artifacts.lock().unwrap().insert(artifact.id, artifact);
+        let mut row = artifact;
+        row.quarantine_deadline = None;
+        row.provenance_hold_indefinite = false;
+        self.artifacts.lock().unwrap().insert(row.id, row);
     }
 
     /// Friendly alias for [`Self::insert`] for the
@@ -464,6 +502,12 @@ impl ArtifactRepository for MockArtifactRepository {
     }
 
     fn delete(&self, id: Uuid, actor: Actor) -> BoxFut<'_, DomainResult<()>> {
+        // Failure injection fires BEFORE the removal: the adapter commits
+        // the `deleted_at` write and the `ArtifactDeleted` append in one
+        // transaction, so a failed delete leaves the artifact live.
+        if let Some(err) = self.delete_errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
         // Production soft-deletes and keeps the row; the mock drops it,
         // which is observationally the same for every read here — all of
         // them are live reads, and live reads exclude deleted artifacts.
@@ -6191,7 +6235,7 @@ pub struct MockJobsRepository {
     /// in `enqueue_calls`, in lock-step). Handler tests assert that the
     /// destructive-kind path passes `Some(server-derived-key)` while
     /// the non-destructive path passes `None`.
-    enqueue_idem_keys: Mutex<Vec<Option<hort_domain::types::IdempotencyKey>>>,
+    enqueue_idem_keys: Mutex<Vec<Option<IdempotencyKey>>>,
     /// Recorded `priority` arguments from `enqueue_task` calls, in lock-step
     /// with `enqueue_calls`. Lets tests assert the enqueue tier (e.g. the
     /// elevated clearance-gating provenance-verify priority, #44).
@@ -6201,6 +6245,10 @@ pub struct MockJobsRepository {
     /// instead of `Enqueued`. One-shot, mirrors the `fail_next_enqueue`
     /// API shape.
     next_duplicate: Mutex<Option<Uuid>>,
+    /// Rows already claimed by an idempotency key, when
+    /// `enforce_idempotency_keys` has been switched on: `key -> job_id`.
+    /// Empty and unread by default.
+    idempotency_rows: Mutex<Option<HashMap<String, Uuid>>>,
     delete_calls: Mutex<Vec<Uuid>>,
     list_rows: Mutex<Vec<JobRow>>,
     get_rows: Mutex<HashMap<Uuid, JobRow>>,
@@ -6269,6 +6317,13 @@ pub struct MockJobsRepository {
     /// When `Some`, the scan-row retention sweep returns this row
     /// count instead of the default 0.
     scan_retention_deleted_count: Mutex<Option<u64>>,
+    /// Recorded calls to
+    /// `delete_terminal_other_kind_rows_older_than`. Each call appends
+    /// the `Duration` argument.
+    other_kind_retention_calls: Mutex<Vec<std::time::Duration>>,
+    /// When `Some`, the other-kind row retention sweep returns this row
+    /// count instead of the default 0.
+    other_kind_retention_deleted_count: Mutex<Option<u64>>,
     /// Seed map for `last_result_summary_by_kind`, keyed by `kind`. A
     /// cross-tick rotation test drives the handler repeatedly and calls
     /// [`Self::set_last_result_summary_by_kind`] between simulated
@@ -6299,6 +6354,7 @@ impl Default for MockJobsRepository {
             enqueue_idem_keys: Mutex::new(Vec::new()),
             enqueue_priorities: Mutex::new(Vec::new()),
             next_duplicate: Mutex::new(None),
+            idempotency_rows: Mutex::new(None),
             delete_calls: Mutex::new(Vec::new()),
             list_rows: Mutex::new(Vec::new()),
             get_rows: Mutex::new(HashMap::new()),
@@ -6321,6 +6377,8 @@ impl Default for MockJobsRepository {
             prefetch_retention_deleted_count: Mutex::new(None),
             scan_retention_calls: Mutex::new(Vec::new()),
             scan_retention_deleted_count: Mutex::new(None),
+            other_kind_retention_calls: Mutex::new(Vec::new()),
+            other_kind_retention_deleted_count: Mutex::new(None),
             last_result_summary_by_kind: Mutex::new(HashMap::new()),
         }
     }
@@ -6354,6 +6412,28 @@ impl MockJobsRepository {
         *self.next_duplicate.lock().unwrap() = Some(existing_job_id);
     }
 
+    /// Make `enqueue_task` honour `idempotency_key` the way the
+    /// `jobs_idempotency_key_uq` partial unique index does, so a test can
+    /// observe the *operator-visible* outcome (a fresh job versus the
+    /// earlier one) rather than only the argument the handler passed:
+    ///
+    /// - the first call carrying a given key inserts and returns
+    ///   `EnqueueOutcome::Enqueued`;
+    /// - every later call carrying that same key returns
+    ///   `EnqueueOutcome::Duplicate { existing_job_id }` with the first
+    ///   call's id;
+    /// - a `None` key is never deduplicated — the index's partial
+    ///   predicate (`WHERE idempotency_key IS NOT NULL`) excludes those
+    ///   rows, so an unkeyed enqueue always inserts.
+    ///
+    /// Off by default: the enqueue path stays a plain recorder unless a
+    /// test opts in. `fail_next_enqueue` and `seed_next_enqueue_duplicate`
+    /// still take precedence, since they are one-shot overrides — and a
+    /// call they intercept claims no key, because it inserted no row.
+    pub fn enforce_idempotency_keys(&self) {
+        *self.idempotency_rows.lock().unwrap() = Some(HashMap::new());
+    }
+
     /// Recorded `(kind, params, actor_id)` tuples from `enqueue_task` calls.
     pub fn enqueue_calls(&self) -> Vec<(String, serde_json::Value, Option<Uuid>)> {
         self.enqueue_calls.lock().unwrap().clone()
@@ -6363,7 +6443,7 @@ impl MockJobsRepository {
     /// from `enqueue_task` calls, in lock-step with [`enqueue_calls`].
     /// Each entry is `Some(_)` when the caller passed a key (the
     /// destructive-kind path) or `None` for the non-destructive path.
-    pub fn enqueue_idem_keys(&self) -> Vec<Option<hort_domain::types::IdempotencyKey>> {
+    pub fn enqueue_idem_keys(&self) -> Vec<Option<IdempotencyKey>> {
         self.enqueue_idem_keys.lock().unwrap().clone()
     }
 
@@ -6518,6 +6598,18 @@ impl MockJobsRepository {
         *self.scan_retention_deleted_count.lock().unwrap() = Some(count);
     }
 
+    /// Recorded calls to `delete_terminal_other_kind_rows_older_than`.
+    /// Each call appends the horizon argument the sweep ran with.
+    pub fn other_kind_retention_calls(&self) -> Vec<std::time::Duration> {
+        self.other_kind_retention_calls.lock().unwrap().clone()
+    }
+
+    /// Make `delete_terminal_other_kind_rows_older_than`
+    /// return the configured row count on the next call. Default is 0.
+    pub fn set_other_kind_retention_deleted_count(&self, count: u64) {
+        *self.other_kind_retention_deleted_count.lock().unwrap() = Some(count);
+    }
+
     /// Seed the value `last_result_summary_by_kind(kind)` returns.
     /// A cross-tick rotation test calls this between simulated ticks
     /// with the previous tick's `result_summary`, standing in for the
@@ -6648,7 +6740,7 @@ impl JobsRepository for MockJobsRepository {
         actor_id: Option<Uuid>,
         priority: i16,
         _trigger_source: &'a str,
-        idempotency_key: Option<&'a hort_domain::types::IdempotencyKey>,
+        idempotency_key: Option<&'a IdempotencyKey>,
     ) -> BoxFuture<'a, DomainResult<hort_domain::ports::jobs_repository::EnqueueOutcome>> {
         self.enqueue_calls
             .lock()
@@ -6663,6 +6755,34 @@ impl JobsRepository for MockJobsRepository {
             .push(idempotency_key.cloned());
         let maybe_err = self.enqueue_error.lock().unwrap().take();
         let maybe_dup = self.next_duplicate.lock().unwrap().take();
+        // Partial-unique-index emulation, when a test opted in. A `None`
+        // key falls through to the plain insert: the index predicate
+        // excludes unkeyed rows, so they never collide with anything.
+        //
+        // Claimed only after the one-shot overrides have been ruled out,
+        // because claiming a key is a write. A run that returns an error
+        // or a seeded duplicate inserted no row, so the key must stay
+        // free for the retry — the database leaves it free for exactly
+        // the same reason, and a test that combines a failed enqueue with
+        // this emulation would otherwise see the retry deduplicated
+        // against a row that never existed.
+        let claim_key = |idempotency_key: Option<&IdempotencyKey>| {
+            idempotency_key.map(IdempotencyKey::as_str).and_then(|key| {
+                let mut rows = self.idempotency_rows.lock().unwrap();
+                rows.as_mut().map(|rows| match rows.get(key) {
+                    Some(existing) => {
+                        hort_domain::ports::jobs_repository::EnqueueOutcome::Duplicate {
+                            existing_job_id: *existing,
+                        }
+                    }
+                    None => {
+                        let job_id = Uuid::new_v4();
+                        rows.insert(key.to_owned(), job_id);
+                        hort_domain::ports::jobs_repository::EnqueueOutcome::Enqueued { job_id }
+                    }
+                })
+            })
+        };
         if let Some(err) = maybe_err {
             Box::pin(async move { Err(err) })
         } else if let Some(existing) = maybe_dup {
@@ -6673,6 +6793,8 @@ impl JobsRepository for MockJobsRepository {
                     },
                 )
             })
+        } else if let Some(outcome) = claim_key(idempotency_key) {
+            Box::pin(async move { Ok(outcome) })
         } else {
             let id = Uuid::new_v4();
             Box::pin(async move {
@@ -6842,6 +6964,22 @@ impl JobsRepository for MockJobsRepository {
         self.scan_retention_calls.lock().unwrap().push(horizon);
         let count = self
             .scan_retention_deleted_count
+            .lock()
+            .unwrap()
+            .unwrap_or(0);
+        Box::pin(async move { Ok(count) })
+    }
+
+    fn delete_terminal_other_kind_rows_older_than<'a>(
+        &'a self,
+        horizon: std::time::Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        self.other_kind_retention_calls
+            .lock()
+            .unwrap()
+            .push(horizon);
+        let count = self
+            .other_kind_retention_deleted_count
             .lock()
             .unwrap()
             .unwrap_or(0);
@@ -8087,5 +8225,82 @@ mod tests {
             .await
             .expect("unseeded fetch_referrers");
         assert!(empty.is_empty());
+    }
+
+    /// The opt-in partial-unique-index emulation must behave the way the
+    /// `jobs_idempotency_key_uq` index does — otherwise a handler test
+    /// that reads "two distinct jobs" off this mock is reading the mock,
+    /// not the handler.
+    #[tokio::test]
+    async fn mock_jobs_enforce_idempotency_keys_mirrors_the_partial_unique_index() {
+        use hort_domain::ports::jobs_repository::EnqueueOutcome;
+
+        let jobs = MockJobsRepository::new();
+        jobs.enforce_idempotency_keys();
+
+        let params = serde_json::json!({});
+        let key_a = IdempotencyKey::try_from("cron:retention-evaluate:execute:2026-09-25")
+            .expect("valid key");
+        let key_b = IdempotencyKey::try_from("cron:retention-purge:2026-09-25").expect("valid key");
+
+        let first = jobs
+            .enqueue_task(
+                "retention-evaluate",
+                &params,
+                None,
+                0,
+                "manual",
+                Some(&key_a),
+            )
+            .await
+            .expect("first keyed enqueue");
+        let EnqueueOutcome::Enqueued { job_id } = first else {
+            panic!("the first call carrying a key must insert: {first:?}");
+        };
+
+        let second = jobs
+            .enqueue_task(
+                "retention-evaluate",
+                &params,
+                None,
+                0,
+                "manual",
+                Some(&key_a),
+            )
+            .await
+            .expect("second keyed enqueue");
+        assert_eq!(
+            second,
+            EnqueueOutcome::Duplicate {
+                existing_job_id: job_id
+            },
+            "a repeat of the same key resolves to the row the first call inserted",
+        );
+
+        let other_key = jobs
+            .enqueue_task("retention-purge", &params, None, 0, "manual", Some(&key_b))
+            .await
+            .expect("distinct key enqueue");
+        assert!(
+            matches!(other_key, EnqueueOutcome::Enqueued { job_id: id } if id != job_id),
+            "a distinct key claims its own row: {other_key:?}",
+        );
+
+        // The index predicate excludes unkeyed rows, so they never collide
+        // — not with each other and not with a keyed row.
+        let mut unkeyed = Vec::new();
+        for _ in 0..2 {
+            let outcome = jobs
+                .enqueue_task("noop", &params, None, 0, "manual", None)
+                .await
+                .expect("unkeyed enqueue");
+            match outcome {
+                EnqueueOutcome::Enqueued { job_id } => unkeyed.push(job_id),
+                EnqueueOutcome::Duplicate { .. } => {
+                    panic!("an unkeyed enqueue must never deduplicate: {outcome:?}")
+                }
+            }
+        }
+        assert_ne!(unkeyed[0], unkeyed[1]);
     }
 }

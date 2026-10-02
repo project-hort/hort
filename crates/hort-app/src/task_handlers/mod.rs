@@ -6,6 +6,10 @@
 
 pub mod advisory_watch_tick;
 pub mod cron_rescan_tick;
+// Shared `params` → horizon resolution for the three `jobs`-row
+// retention sweeps. Crate-private: it is an implementation detail of
+// those three handlers, not a port or a use case.
+pub(crate) mod sweep_horizon;
 // Async scan-policy re-evaluation pass (kind `policy-reevaluation`,
 // ADR 0041 Item 3). Wraps `PolicyUseCase::run_policy_re_evaluation_pass`;
 // enqueued by `PolicyUseCase` on every gate-affecting scan-policy
@@ -64,16 +68,26 @@ pub mod prefetch_dependencies;
 pub mod prefetch_ingest;
 // `jobs`-row retention sweep
 // (`prefetch-row-retention-sweep`). Periodically deletes terminal
-// `prefetch%` rows older than a configurable horizon (default 7d) so
-// the high-churn `jobs` table does not grow unbounded under cascade
-// load.
+// `prefetch%` rows — minus `prefetch-tick`, whose newest completion
+// carries the rotation cursor — older than the handler's 7-day
+// `DEFAULT_HORIZON`, so the high-churn `jobs` table does not grow
+// unbounded under cascade load.
 pub mod prefetch_row_retention_sweep;
 // `jobs`-row retention sweep
 // (`scan-row-retention-sweep`). Periodically deletes terminal
-// `kind='scan'` rows older than a configurable horizon (default 7d) —
-// every successful and every permanently-failed scan otherwise leaves
+// `kind='scan'` rows older than the handler's 7-day `DEFAULT_HORIZON`
+// — every successful and every permanently-failed scan otherwise leaves
 // a terminal row forever.
 pub mod scan_row_retention_sweep;
+// General `jobs`-row retention sweep (`jobs-row-retention-sweep`).
+// Periodically deletes terminal rows of every kind the two
+// kind-specific sweeps above do not reach — plus `prefetch-tick`, which
+// the cascade sweep carves out — older than the handler's 7-day
+// `DEFAULT_HORIZON`, while retaining the per-kind rows the
+// jobs-row-as-state readers depend on (the newest `completed` row and
+// the newest terminal row). Without it 19 of the 25 allow-listed kinds
+// accumulated terminal rows forever.
+pub mod jobs_row_retention_sweep;
 // Scanner-worker registry housekeeping (kind
 // `scanner-registry-prune`). Deletes `scanner_registry` rows whose
 // `last_heartbeat` is older than the retention horizon so pod churn does
@@ -109,6 +123,7 @@ pub use eventstore_archive::EventStoreArchiveHandler;
 pub use eventstore_checkpoint::{
     CheckpointEmissionHook, CheckpointEmitterHookAdapter, EventstoreCheckpointHandler,
 };
+pub use jobs_row_retention_sweep::JobsRowRetentionSweepHandler;
 pub use noop::NoopTaskHandler;
 pub use oci_index_child_ingest::{OciIndexChildIngestHandler, OCI_INDEX_CHILD_INGEST_KIND};
 pub use oci_membership_edge_backfill::OciMembershipEdgeBackfillHandler;

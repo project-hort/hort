@@ -289,6 +289,11 @@ mod tests {
             h.users.clone(),
             // See `build_harness_with_lint_config` — same default posture.
             Arc::new(["npm".to_string()].into_iter().collect()),
+            // No retention projection in this harness. Explicit,
+            // not inherited: the slot is a required argument so a
+            // composition that skips retention says so, and the
+            // apply warns on every envelope it then drops.
+            None,
         )
         // Permissive linter (see `build_harness`) —
         // the OIDC warm-up tests apply only `oidc_issuers` envelopes,

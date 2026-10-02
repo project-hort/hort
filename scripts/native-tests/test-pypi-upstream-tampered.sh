@@ -239,9 +239,18 @@ fi
 echo ""
 echo "--- Step 4: scanning hort-server logs for ChecksumMismatch"
 if [ -S /var/run/docker.sock ] && command -v docker >/dev/null 2>&1; then
-    if docker logs "$HORT_CONTAINER" --since 2m 2>&1 | grep -q "ChecksumMismatch"; then
+    # Capture once into a file and grep the file, never the pipe: `docker
+    # logs | grep -q` under `set -o pipefail` misreports "no match" when
+    # the match lands before docker has finished writing a body bigger
+    # than the pipe buffer (grep -q exits at its first match, docker
+    # takes SIGPIPE, pipefail promotes that exit to the pipeline status).
+    LOG_SCAN_FILE="$(mktemp)"
+    docker logs "$HORT_CONTAINER" --since 2m >"$LOG_SCAN_FILE" 2>&1 || true
+    if grep -q "ChecksumMismatch" "$LOG_SCAN_FILE"; then
+        rm -f "$LOG_SCAN_FILE"
         pass "hort-server logs contain ChecksumMismatch (audit-trail witness)"
     else
+        rm -f "$LOG_SCAN_FILE"
         fail "hort-server logs do not contain ChecksumMismatch since the install attempt"
         echo "  --- last 60 lines of hort-server logs ---"
         docker logs "$HORT_CONTAINER" --tail 60 2>&1 | sed 's/^/    /' || true

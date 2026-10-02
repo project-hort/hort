@@ -31,6 +31,30 @@ use super::error::OciError;
 /// Default `Retry-After` when the computed `quarantine_deadline` is
 /// absent — 1 hour, matching the pre-refactor open-coded value in
 /// `blobs.rs` / `manifests.rs`.
+///
+/// This is a "the deadline is genuinely unknown" constant, not a guess at
+/// the window, and it is unrelated to any configured
+/// `quarantineDuration`. Every path that resolves an artifact for a read
+/// now hydrates the deadline
+/// (`ArtifactUseCase::find_visible_by_path` / `find_visible_by_id` /
+/// `find_in_repo_by_hash`), and both `IngestUseCase` mint paths stamp it
+/// from the window they just derived, so the two states that still reach
+/// this constant are narrow:
+///
+/// - a `Quarantined` row carrying **no** `quarantine_window_start`. The
+///   schema permits it (the column is nullable and no CHECK ties it to
+///   the status) though no current code path produces it —
+///   `Artifact::quarantine` always stamps an anchor. Such a row is also
+///   outside the release sweep's candidacy filter
+///   (`quarantine_window_start IS NOT NULL`), so "unknown" is the honest
+///   answer rather than a computed one.
+/// - `blobs.rs`'s bounded-await poll loop, which re-reads through
+///   `ArtifactUseCase::get_by_id` — a deliberately plain row read that
+///   does not hydrate — and returns that row when the bound is exhausted.
+///   Only reachable for a window that has ALREADY elapsed, which is the
+///   state whose honest computed header is the useless `Retry-After: 1`
+///   the clamp below produces; the two belong to one fix, not to this
+///   constant.
 const DEFAULT_QUARANTINE_RETRY_AFTER_SECS: i64 = 3600;
 
 /// Build the `Quarantined` 503 response and emit the

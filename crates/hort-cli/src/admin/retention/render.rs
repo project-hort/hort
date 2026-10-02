@@ -1,0 +1,1638 @@
+//! Human-readable rendering of a retention preview, of an execution
+//! result, and of the difference between two previews.
+//!
+//! The text this module produces *is* the safety mechanism: it is the
+//! only place an operator sees what a retention run would remove before
+//! authorising it. Four rules hold everything here together.
+//!
+//! **"Nothing changed" is a claim about artifacts, never about totals.**
+//! Two previews can agree on every figure and still propose different
+//! rows — one artifact stopped matching, an equally sized one started —
+//! and among artifacts of the same kind that is not a rare coincidence.
+//! So the delta decides on the identity the server sends with each
+//! preview, and when no identity is available it says it compared totals
+//! only rather than pronouncing on a question it cannot answer.
+//!
+//! **A count is never allowed to read as a size.** `51,535` artifact
+//! rows and the bytes those rows would free are different quantities
+//! that will not agree, because one stored blob can be referenced by
+//! many artifact rows and is reclaimed only when the last of them goes
+//! away. Every count is labelled as a count at the point it is printed,
+//! and the two never share a column.
+//!
+//! **An unmeasured size is stated, never implied.** When the server did
+//! not measure the reclaimable bytes it says so and why. That renders as
+//! the words "not measured" plus the reason — never `0`, never a blank,
+//! never a dash, each of which reads as "there is nothing to free".
+//!
+//! **Truncation is a header, not a footnote.** A `partial` sweep stopped
+//! before the end of the artifact table, so every total below it
+//! undercounts. That belongs where the operator cannot miss it, above
+//! the numbers it qualifies.
+
+use std::collections::BTreeMap;
+
+use crate::output::format_table_rows;
+
+use super::dto::{
+    compare_proposals, coverage_is_partial, FreedBytes, PreviewBody, PreviewGroup,
+    ProposalComparison, ProposalDigest, RetentionRunSummary,
+};
+
+/// Group a non-negative integer with thousands separators.
+pub fn count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Render a measured byte count as a binary-prefix size plus its exact
+/// value, explicitly marked as measured so it can never be mistaken for
+/// an estimate.
+pub fn measured_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{} {} (measured)", count(bytes), byte_noun(bytes));
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = UNITS[0];
+    for next in &UNITS[1..] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    format!(
+        "{value:.2} {unit} ({} {}, measured)",
+        count(bytes),
+        byte_noun(bytes)
+    )
+}
+
+/// Singular/plural for a byte count, so a one-byte figure does not read
+/// as a typo in an output whose whole job is to be trusted.
+fn byte_noun(n: u64) -> &'static str {
+    if n == 1 {
+        "byte"
+    } else {
+        "bytes"
+    }
+}
+
+/// One line's worth of byte accounting, measured or explicitly not.
+fn bytes_phrase(freed: &FreedBytes) -> String {
+    match freed.measured() {
+        Some(bytes) => measured_bytes(bytes),
+        None => format!(
+            "NOT MEASURED — {}",
+            freed
+                .omission_reason()
+                .unwrap_or("the server gave no reason")
+        ),
+    }
+}
+
+/// A short form for the delta table, where the reason is carried in its
+/// own row rather than inline.
+fn bytes_cell(freed: &FreedBytes) -> String {
+    match freed.measured() {
+        Some(bytes) => format!("{} {}", count(bytes), byte_noun(bytes)),
+        None => "not measured".to_string(),
+    }
+}
+
+/// Everything the preview header needs that is not in the summary
+/// itself.
+#[derive(Debug, Clone)]
+pub struct JobFacts {
+    pub job_id: String,
+    pub job_status: String,
+    pub completed_at: Option<String>,
+    /// The server answered `200 OK` rather than `202 Accepted`: this job
+    /// was **not** created by our request, it is an earlier same-day
+    /// invocation the server's idempotency layer handed back.
+    pub deduplicated: bool,
+}
+
+/// Render the coverage line. `partial` is spelled out in full because an
+/// operator who skims past it is reading undercounted totals as if they
+/// were the whole picture. It says so about *this run* and then says what
+/// happens to the rest, because "still unexamined" on its own reads as a
+/// permanent blind spot: the sweep records the position it stopped at and
+/// later executions resume from there, wrapping to the beginning once a
+/// pass finishes.
+fn coverage_block(summary: &RetentionRunSummary) -> String {
+    if summary.coverage_is_partial() {
+        // Name the server's own word only when it is not the expected
+        // `partial`: "PARTIAL (partial)" is noise, but a coverage word
+        // this CLI does not know is something the operator should see
+        // verbatim rather than have translated for them.
+        let verbatim = match summary.coverage.as_str() {
+            "partial" => String::new(),
+            "" => " (the server reported no coverage at all)".to_string(),
+            other => format!(" (the server said {other:?})"),
+        };
+        format!(
+            "  coverage    PARTIAL{verbatim} — the sweep stopped at its per-run batch cap\n\
+             \x20             with artifacts still unexamined. Every figure below counts\n\
+             \x20             only what it reached; the real totals are larger. Those\n\
+             \x20             artifacts are not skipped for good: the sweep records where\n\
+             \x20             it stopped and later executions resume from there.\n"
+        )
+    } else {
+        "  coverage    complete — this run examined the whole candidate set.\n".to_string()
+    }
+}
+
+fn dedup_block(facts: &JobFacts) -> String {
+    if !facts.deduplicated {
+        return String::new();
+    }
+    "\n  NOTE  The server did not run a new sweep for this request — it answered\n\
+     \x20       with an EARLIER sweep from today, replayed. What is shown below is\n\
+     \x20       not a fresh observation of the current state.\n"
+        .to_string()
+}
+
+/// Render the whole dry-run preview.
+pub fn render_preview(
+    title: &str,
+    facts: &JobFacts,
+    summary: &RetentionRunSummary,
+    sample_rows_to_show: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str(title);
+    out.push('\n');
+    out.push_str(&format!("  task job    {}\n", facts.job_id));
+    out.push_str(&format!("  job status  {}\n", facts.job_status));
+    out.push_str(&format!(
+        "  mode        {}\n",
+        if summary.mode.is_empty() {
+            "(unreported)"
+        } else {
+            summary.mode.as_str()
+        }
+    ));
+    if let Some(ref at) = facts.completed_at {
+        out.push_str(&format!("  finished    {at}\n"));
+    }
+    out.push_str(&coverage_block(summary));
+    out.push_str(&dedup_block(facts));
+
+    let Some(preview) = summary.preview.as_ref() else {
+        out.push_str(
+            "\nThis job carries no preview object. It was not a dry run, so there is\n\
+             nothing here to confirm against.\n",
+        );
+        return out;
+    };
+
+    out.push_str("\nWHAT WOULD BE EXPIRED\n");
+    out.push_str(&format!(
+        "  artifact rows       {:>12}   artifact records — a count, not a size\n",
+        count(preview.rows)
+    ));
+    out.push_str(&format!(
+        "  distinct contents   {:>12}   distinct stored blobs those rows point at\n",
+        count(preview.distinct_contents)
+    ));
+    out.push_str(&format!(
+        "  storage freed       {}\n",
+        bytes_phrase(&preview.freed_bytes)
+    ));
+    out.push_str(
+        "\n  Rows and bytes are different quantities and will not agree. One stored\n\
+         \x20 blob can be referenced by many artifact rows, so expiring the rows above\n\
+         \x20 frees only those blobs that lose their last reference. hort prints a size\n\
+         \x20 only when it has measured one — there is no estimate anywhere in this\n\
+         \x20 output, and a row count is never a storage figure.\n",
+    );
+
+    out.push_str("\nSWEEP\n");
+    for (label, value) in [
+        ("active policies", summary.policies),
+        ("(policy, artifact) pairs evaluated", summary.evaluated),
+        ("pairs that matched", summary.expired),
+        (
+            "already expired by the same policy",
+            summary.already_expired,
+        ),
+        ("skipped — GC-protected", summary.skipped_protected),
+        ("skipped — scan data too stale", summary.skipped_stale_scan),
+        ("pairs that errored", summary.errors),
+    ] {
+        out.push_str(&format!("  {label:<36}{:>12}\n", count(value)));
+    }
+
+    out.push_str("\nBY POLICY AND REPOSITORY\n");
+    out.push_str(&render_groups(&preview.groups));
+    out.push_str(
+        "\n  There is deliberately no byte column here. A blob is freed only when the\n\
+         \x20 last reference to it anywhere goes away, which no single policy or\n\
+         \x20 repository group can decide on its own; the measured figure above is a\n\
+         \x20 whole-run one.\n",
+    );
+
+    out.push_str(&render_sample(preview, sample_rows_to_show));
+    out
+}
+
+fn render_groups(groups: &[PreviewGroup]) -> String {
+    if groups.is_empty() {
+        return "  (no policy matched anything)\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = groups
+        .iter()
+        .map(|g| {
+            vec![
+                g.policy_name.clone(),
+                repository_label(&g.repository_key, &g.repository_id),
+                count(g.rows),
+                count(g.distinct_contents),
+            ]
+        })
+        .collect();
+    indent(&format_table_rows(
+        &["POLICY", "REPOSITORY", "ARTIFACT ROWS", "DISTINCT CONTENTS"],
+        &rows,
+    ))
+}
+
+/// Name a repository the way an operator writes it into a policy.
+///
+/// The key is `repositories.key`, which is what a policy's
+/// `metadata.name` resolves against. A UUID is not an identifier an
+/// operator can act on, so it is shown only as the explicit fallback for
+/// a server too old to send a key — and then it is labelled as such, so
+/// nobody mistakes it for something they could type back.
+pub fn repository_label(key: &str, id: &str) -> String {
+    if key.is_empty() {
+        format!("(no key reported; id {id})")
+    } else {
+        key.to_string()
+    }
+}
+
+fn render_sample(preview: &PreviewBody, show: usize) -> String {
+    let recorded = preview.sample.len();
+    if recorded == 0 || show == 0 {
+        return String::new();
+    }
+    let shown = show.min(recorded);
+    let mut header = format!("\nSAMPLE — {shown} of the {recorded} rows recorded");
+    if let Some(limit) = preview.sample_limit {
+        if recorded as u64 >= limit {
+            header.push_str(&format!(" (the server records at most {})", count(limit)));
+        }
+    }
+    header.push_str(&format!("; {} rows match in total\n", count(preview.rows)));
+
+    let policy_names: BTreeMap<&str, &str> = preview
+        .groups
+        .iter()
+        .map(|g| (g.policy_id.as_str(), g.policy_name.as_str()))
+        .collect();
+
+    let rows: Vec<Vec<String>> = preview
+        .sample
+        .iter()
+        .take(shown)
+        .map(|row| {
+            vec![
+                policy_names
+                    .get(row.policy_id.as_str())
+                    .copied()
+                    .unwrap_or("(unknown policy)")
+                    .to_string(),
+                repository_label(&row.repository_key, &row.repository_id),
+                row.name.clone(),
+                row.version.clone().unwrap_or_else(|| "-".to_string()),
+                age(row.age_seconds),
+            ]
+        })
+        .collect();
+
+    header.push_str(&indent(&format_table_rows(
+        &["POLICY", "REPOSITORY", "NAME", "VERSION", "AGE"],
+        &rows,
+    )));
+    header
+}
+
+/// Render an age in units an operator reads at a glance.
+pub fn age(seconds: i64) -> String {
+    if seconds < 0 {
+        return "(future)".to_string();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else {
+        format!("{}m", seconds / 60)
+    }
+}
+
+fn indent(table: &str) -> String {
+    table
+        .lines()
+        .map(|line| format!("  {line}\n"))
+        .collect::<String>()
+}
+
+// ---------------------------------------------------------------------------
+// Delta between two previews
+// ---------------------------------------------------------------------------
+
+/// One `(policy, repository)` group's movement between two previews.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupDelta {
+    pub policy_id: String,
+    pub policy_name: String,
+    pub repository_id: String,
+    pub repository_key: String,
+    /// `(rows, distinct_contents)` in the baseline, or `None` when the
+    /// group did not exist there.
+    pub baseline: Option<(u64, u64)>,
+    /// The same in the fresh preview, or `None` when it has gone.
+    pub fresh: Option<(u64, u64)>,
+    /// What the two sides' proposal identities said about this group,
+    /// or `None` when the group exists on one side only — there is no
+    /// second set to compare a lone one against, and the row counts
+    /// already say the group appeared or vanished.
+    pub identity: Option<ProposalComparison>,
+}
+
+impl GroupDelta {
+    /// `true` when this group itself moved.
+    ///
+    /// An identity this comparison could not decide is **not** movement:
+    /// on a server that reports no identity every group would light up
+    /// under a heading that says "only the groups that moved", which is
+    /// a false statement about each of them. That case is a run-level
+    /// fact and is stated once, at the top, where it is true.
+    pub fn changed(&self) -> bool {
+        self.baseline != self.fresh || self.identity == Some(ProposalComparison::Different)
+    }
+}
+
+/// The difference between a baseline preview and a fresh one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewDelta {
+    pub baseline_rows: u64,
+    pub fresh_rows: u64,
+    pub baseline_distinct: u64,
+    pub fresh_distinct: u64,
+    pub baseline_bytes: FreedBytes,
+    pub fresh_bytes: FreedBytes,
+    pub baseline_coverage: String,
+    pub fresh_coverage: String,
+    /// Which rows each side proposes to expire, when its server said.
+    pub baseline_proposal: Option<ProposalDigest>,
+    pub fresh_proposal: Option<ProposalDigest>,
+    pub groups: Vec<GroupDelta>,
+}
+
+impl PreviewDelta {
+    /// What this comparison established about the proposed set itself.
+    pub fn identity(&self) -> ProposalComparison {
+        compare_proposals(
+            self.baseline_proposal.as_ref(),
+            self.fresh_proposal.as_ref(),
+        )
+    }
+
+    /// `true` when at least one of the two runs examined only a window
+    /// of the candidate set.
+    ///
+    /// A `partial` run reports what its window held. Two runs can walk
+    /// different windows quite legitimately — an execution between them
+    /// moves the sweep's saved position — so a difference between two
+    /// such proposals may be the window moving rather than the world.
+    /// That is a statement the comparison has to make out loud, because
+    /// presenting it as "the proposal changed" would be a warning that
+    /// fires when nothing moved, and those are trained away.
+    pub fn window_limited(&self) -> bool {
+        coverage_is_partial(&self.baseline_coverage) || coverage_is_partial(&self.fresh_coverage)
+    }
+
+    /// `true` when this comparison did not establish that the same
+    /// artifacts would be expired, or when something else an operator
+    /// acts on moved.
+    ///
+    /// Fail-closed on the identity: "could not tell" counts as changed.
+    /// The confirmation this gates is the last place a human sees what
+    /// disappears, and a comparison that cannot vouch for the proposal
+    /// is not grounds for skipping it.
+    pub fn changed(&self) -> bool {
+        !self.identity().is_same()
+            || self.baseline_rows != self.fresh_rows
+            || self.baseline_distinct != self.fresh_distinct
+            || self.baseline_bytes != self.fresh_bytes
+            || self.baseline_coverage != self.fresh_coverage
+            || self.groups.iter().any(GroupDelta::changed)
+    }
+}
+
+/// Compute the difference between two run summaries.
+///
+/// A summary with no `preview` object contributes zeroes rather than
+/// failing, so comparing against a job that turned out not to be a dry
+/// run still produces a visible difference instead of silence.
+pub fn diff(baseline: &RetentionRunSummary, fresh: &RetentionRunSummary) -> PreviewDelta {
+    let empty = PreviewBody::default();
+    let b = baseline.preview.as_ref().unwrap_or(&empty);
+    let f = fresh.preview.as_ref().unwrap_or(&empty);
+
+    let mut keys: Vec<(String, String)> = Vec::new();
+    let mut baseline_groups: BTreeMap<(String, String), &PreviewGroup> = BTreeMap::new();
+    let mut fresh_groups: BTreeMap<(String, String), &PreviewGroup> = BTreeMap::new();
+    for g in &b.groups {
+        baseline_groups.insert(g.key(), g);
+    }
+    for g in &f.groups {
+        fresh_groups.insert(g.key(), g);
+    }
+    for key in baseline_groups.keys().chain(fresh_groups.keys()) {
+        if !keys.contains(key) {
+            keys.push(key.clone());
+        }
+    }
+    keys.sort();
+
+    let groups = keys
+        .into_iter()
+        .map(|key| {
+            let bg = baseline_groups.get(&key);
+            let fg = fresh_groups.get(&key);
+            // Prefer the fresh naming: it is the newer read of the
+            // repository's key, and a rename between the two previews is
+            // itself something the operator should see stated currently.
+            let named = fg.or(bg).expect("a key comes from one side or the other");
+            GroupDelta {
+                policy_id: named.policy_id.clone(),
+                policy_name: named.policy_name.clone(),
+                repository_id: named.repository_id.clone(),
+                repository_key: named.repository_key.clone(),
+                baseline: bg.map(|g| (g.rows, g.distinct_contents)),
+                fresh: fg.map(|g| (g.rows, g.distinct_contents)),
+                identity: bg.zip(fg).map(|(bg, fg)| {
+                    compare_proposals(bg.proposal_digest.as_ref(), fg.proposal_digest.as_ref())
+                }),
+            }
+        })
+        .collect();
+
+    PreviewDelta {
+        baseline_rows: b.rows,
+        fresh_rows: f.rows,
+        baseline_distinct: b.distinct_contents,
+        fresh_distinct: f.distinct_contents,
+        baseline_bytes: b.freed_bytes.clone(),
+        fresh_bytes: f.freed_bytes.clone(),
+        baseline_coverage: baseline.coverage.clone(),
+        fresh_coverage: fresh.coverage.clone(),
+        baseline_proposal: b.proposal_digest.clone(),
+        fresh_proposal: f.proposal_digest.clone(),
+        groups,
+    }
+}
+
+fn signed(before: u64, after: u64) -> String {
+    match after.cmp(&before) {
+        std::cmp::Ordering::Equal => "unchanged".to_string(),
+        std::cmp::Ordering::Greater => format!("+{}", count(after - before)),
+        std::cmp::Ordering::Less => format!("-{}", count(before - after)),
+    }
+}
+
+/// Render the difference between the named baseline and the fresh
+/// preview.
+pub fn render_delta(delta: &PreviewDelta, baseline_job: &str, fresh_job: &str) -> String {
+    let mut out = String::new();
+    out.push_str(delta_headline(delta));
+    out.push_str(&format!("  baseline preview  {baseline_job}\n"));
+    out.push_str(&format!("  fresh preview     {fresh_job}\n"));
+    out.push_str(&identity_block(delta));
+    out.push('\n');
+
+    let rows = vec![
+        vec![
+            "artifact rows (a count, not a size)".to_string(),
+            count(delta.baseline_rows),
+            count(delta.fresh_rows),
+            signed(delta.baseline_rows, delta.fresh_rows),
+        ],
+        vec![
+            "distinct contents".to_string(),
+            count(delta.baseline_distinct),
+            count(delta.fresh_distinct),
+            signed(delta.baseline_distinct, delta.fresh_distinct),
+        ],
+        vec![
+            "storage freed".to_string(),
+            bytes_cell(&delta.baseline_bytes),
+            bytes_cell(&delta.fresh_bytes),
+            byte_change(&delta.baseline_bytes, &delta.fresh_bytes),
+        ],
+        vec![
+            "coverage".to_string(),
+            coverage_word(&delta.baseline_coverage),
+            coverage_word(&delta.fresh_coverage),
+            if delta.baseline_coverage == delta.fresh_coverage {
+                "unchanged".to_string()
+            } else {
+                "changed".to_string()
+            },
+        ],
+    ];
+    out.push_str(&indent(&format_table_rows(
+        &["FIGURE", "BASELINE", "NOW", "CHANGE"],
+        &rows,
+    )));
+
+    if delta.fresh_bytes.measured().is_none() {
+        out.push_str(&format!(
+            "\n  The fresh preview did not measure a size: {}.\n\
+             \x20 No estimate is substituted.\n",
+            delta
+                .fresh_bytes
+                .omission_reason()
+                .unwrap_or("the server gave no reason")
+        ));
+    }
+
+    let moved: Vec<&GroupDelta> = delta.groups.iter().filter(|g| g.changed()).collect();
+    if !moved.is_empty() {
+        out.push_str("\n  BY POLICY AND REPOSITORY (only the groups that moved)\n");
+        let rows: Vec<Vec<String>> = moved
+            .iter()
+            .map(|g| {
+                vec![
+                    g.policy_name.clone(),
+                    repository_label(&g.repository_key, &g.repository_id),
+                    pair_change(g.baseline.map(|(r, _)| r), g.fresh.map(|(r, _)| r)),
+                    pair_change(g.baseline.map(|(_, d)| d), g.fresh.map(|(_, d)| d)),
+                    group_identity_cell(g.identity),
+                ]
+            })
+            .collect();
+        out.push_str(&indent(&indent(&format_table_rows(
+            &[
+                "POLICY",
+                "REPOSITORY",
+                "ARTIFACT ROWS",
+                "DISTINCT CONTENTS",
+                "PROPOSED ROWS",
+            ],
+            &rows,
+        ))));
+    }
+    out
+}
+
+/// The line the operator reads first.
+///
+/// `NOTHING CHANGED` is earned only by an identity match: the whole
+/// point of this change is that it no longer means "the totals agree".
+/// The two answers that could not decide the question get their own
+/// headline rather than borrowing either of the two that could — a
+/// comparison that did not look must not sound like one that did.
+fn delta_headline(delta: &PreviewDelta) -> &'static str {
+    match delta.identity() {
+        ProposalComparison::Unreported | ProposalComparison::SchemeMismatch => {
+            "THIS COMPARISON COULD NOT CHECK WHICH ARTIFACTS WOULD BE EXPIRED\n"
+        }
+        _ if delta.changed() => "WHAT CHANGED SINCE THE PREVIEW YOU NAMED\n",
+        _ => "NOTHING CHANGED SINCE THE PREVIEW YOU NAMED\n",
+    }
+}
+
+/// State what was compared about the proposed rows themselves, and —
+/// when either run examined only a window — what that comparison was
+/// therefore a statement about.
+fn identity_block(delta: &PreviewDelta) -> String {
+    let verdict = match delta.identity() {
+        ProposalComparison::Same => "\
+            \x20 The SAME artifacts. Both previews reported which rows they propose to\n\
+            \x20 expire, and the two proposals are identical — this compares the proposed\n\
+            \x20 set itself, not the totals over it.\n"
+            .to_string(),
+        ProposalComparison::Different => "\
+            \x20 DIFFERENT artifacts. The two previews propose different rows, so what an\n\
+            \x20 execution would expire now is not what the baseline showed. Totals alone\n\
+            \x20 would not have told you: a row that stopped matching and an equally sized\n\
+            \x20 one that started are indistinguishable in a count.\n"
+            .to_string(),
+        ProposalComparison::Unreported => format!(
+            "\x20 NOT COMPARED — {} which rows it proposes.\n\
+             \x20 Only the totals below were compared, and equal totals are not the same\n\
+             \x20 artifacts: a row that stopped matching and an equally sized one that\n\
+             \x20 started look identical in a count, and the sample is capped\n\
+             \x20 server-side and may be empty.\n",
+            unreported_side(delta),
+        ),
+        ProposalComparison::SchemeMismatch => format!(
+            "\x20 NOT COMPARED — the two previews stated their proposed rows in different\n\
+             \x20 forms, which cannot be compared against each other:\n\
+             {}\
+             \x20 That is what a server upgrade between the two runs looks like; re-run\n\
+             \x20 the baseline preview against the current server for a comparison. Until\n\
+             \x20 then only the totals below were compared, and equal totals are not the\n\
+             \x20 same artifacts.\n",
+            scheme_pair(delta),
+        ),
+    };
+
+    let window = if !delta.window_limited() {
+        String::new()
+    } else if delta.identity().is_same() {
+        "\n\x20 At least one of these two runs examined only a window of the candidate\n\
+         \x20 set (see coverage below). So this says the two proposals are the same —\n\
+         \x20 not that the artifacts neither run reached would be left alone.\n"
+            .to_string()
+    } else {
+        "\n\x20 At least one of these two runs examined only a window of the candidate\n\
+         \x20 set (see coverage below), and two runs can legitimately walk different\n\
+         \x20 windows — an execution between them moves the sweep's saved position. So\n\
+         \x20 what was compared here is two windows, and a difference between them may\n\
+         \x20 be the window moving rather than the world. The fresh preview is still an\n\
+         \x20 accurate statement of what an execution would expire; the baseline is not\n\
+         \x20 a reliable measure of it.\n"
+            .to_string()
+    };
+
+    format!("\nWHICH ARTIFACTS WOULD BE EXPIRED\n{verdict}{window}")
+}
+
+/// Name the side that reported nothing, so the operator knows whether to
+/// re-run the baseline or to look at the server behind the fresh one.
+///
+/// A whole clause rather than a noun, because the negation moves with
+/// the subject: "neither preview did not report" is the sentence a
+/// noun-only substitution produces.
+fn unreported_side(delta: &PreviewDelta) -> &'static str {
+    let has = |d: &Option<ProposalDigest>| d.as_ref().is_some_and(ProposalDigest::is_usable);
+    match (has(&delta.baseline_proposal), has(&delta.fresh_proposal)) {
+        (false, false) => "neither preview reported",
+        (false, true) => "the baseline preview did not report",
+        (true, false) => "the fresh preview did not report",
+        // `Unreported` is only reached when a side is missing, so this
+        // arm is unreachable through `identity_block`. Answer honestly
+        // rather than asserting: a wrong word here is cosmetic, a panic
+        // in the output an operator confirms against is not.
+        (true, true) => "one of the two previews did not report",
+    }
+}
+
+/// Quote each side's form on its own line, so the operator can see the
+/// two servers differ rather than being told only that they do.
+///
+/// One line per side rather than one line for the pair: a scheme tag has
+/// no length bound, and two of them inline would run the sentence off
+/// the terminal exactly where it is being read most carefully.
+fn scheme_pair(delta: &PreviewDelta) -> String {
+    let scheme = |d: &Option<ProposalDigest>| {
+        d.as_ref()
+            .map_or_else(|| "(none)".to_string(), |d| format!("{:?}", d.scheme))
+    };
+    format!(
+        "    baseline {}\n    now      {}\n",
+        scheme(&delta.baseline_proposal),
+        scheme(&delta.fresh_proposal)
+    )
+}
+
+/// One group's answer, for the moved-groups table.
+fn group_identity_cell(identity: Option<ProposalComparison>) -> String {
+    match identity {
+        Some(ProposalComparison::Same) => "same".to_string(),
+        Some(ProposalComparison::Different) => "DIFFERENT".to_string(),
+        Some(ProposalComparison::Unreported) => "not reported".to_string(),
+        Some(ProposalComparison::SchemeMismatch) => "not comparable".to_string(),
+        None => "-".to_string(),
+    }
+}
+
+/// Describe how the byte accounting moved.
+///
+/// A signed figure only when both sides were actually measured: a
+/// difference computed against a run that measured nothing would be an
+/// invented number, which is the one thing this output never produces.
+fn byte_change(before: &FreedBytes, after: &FreedBytes) -> String {
+    match (before.measured(), after.measured()) {
+        (Some(b), Some(a)) if b == a => "unchanged".to_string(),
+        (Some(b), Some(a)) => format!("{} {}", signed(b, a), byte_noun(a.abs_diff(b))),
+        (Some(_), None) => "no longer measured".to_string(),
+        (None, Some(_)) => "now measured".to_string(),
+        (None, None) if before == after => "unchanged".to_string(),
+        (None, None) => "still not measured".to_string(),
+    }
+}
+
+fn coverage_word(raw: &str) -> String {
+    if raw.is_empty() {
+        "(unreported)".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn pair_change(before: Option<u64>, after: Option<u64>) -> String {
+    match (before, after) {
+        (Some(b), Some(a)) if b == a => count(a),
+        (Some(b), Some(a)) => format!("{} -> {} ({})", count(b), count(a), signed(b, a)),
+        (None, Some(a)) => format!("new: {}", count(a)),
+        (Some(b), None) => format!("gone (was {})", count(b)),
+        (None, None) => "-".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Execution result
+// ---------------------------------------------------------------------------
+
+/// Render the outcome of the execute-mode run.
+pub fn render_execution(facts: &JobFacts, summary: &RetentionRunSummary) -> String {
+    let mut out = String::from("RETENTION EXECUTED\n");
+    out.push_str(&format!("  task job    {}\n", facts.job_id));
+    out.push_str(&format!("  job status  {}\n", facts.job_status));
+    if let Some(ref at) = facts.completed_at {
+        out.push_str(&format!("  finished    {at}\n"));
+    }
+    out.push_str(&coverage_block(summary));
+    if facts.deduplicated {
+        out.push_str(
+            "\n  NOTE  The server deduplicated this execution against an earlier one\n\
+             \x20       from the same UTC day: no new sweep was started by your\n\
+             \x20       confirmation, and the figures below belong to that earlier run.\n",
+        );
+    }
+    out.push_str("\nRESULT\n");
+    for (label, value) in [
+        ("active policies", summary.policies),
+        ("(policy, artifact) pairs evaluated", summary.evaluated),
+        ("artifact rows expired now", summary.expired),
+        (
+            "already expired by the same policy",
+            summary.already_expired,
+        ),
+        ("skipped — GC-protected", summary.skipped_protected),
+        ("skipped — scan data too stale", summary.skipped_stale_scan),
+        ("pairs that errored", summary.errors),
+    ] {
+        out.push_str(&format!("  {label:<36}{:>12}\n", count(value)));
+    }
+    out.push_str(
+        "\n  Expiry marks artifact records; it does not itself delete stored bytes.\n\
+         \x20 The separate purge stage reclaims a blob once its last reference is gone.\n",
+    );
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::retention::dto::{PreviewSampleRow, OMITTED_BYTES_REASON};
+
+    /// The scheme the shipped server sends. Two digests are comparable
+    /// only under the same one, so fixtures use the real tag rather than
+    /// a placeholder.
+    const SCHEME: &str = "policy-artifact-pairs-v1";
+
+    /// A stand-in identity. The value is a readable seed rather than 64
+    /// hex characters: this module compares identities for equality and
+    /// never parses one, so a real digest would only make the fixtures
+    /// harder to read.
+    fn digest(seed: &str) -> Option<ProposalDigest> {
+        Some(ProposalDigest {
+            scheme: SCHEME.into(),
+            value: seed.to_string(),
+        })
+    }
+
+    fn group(policy: &str, repo_key: &str, rows: u64, distinct: u64) -> PreviewGroup {
+        PreviewGroup {
+            policy_id: format!("policy-{policy}"),
+            policy_name: policy.to_string(),
+            repository_id: format!("11111111-0000-0000-0000-{repo_key:0>12}"),
+            repository_key: repo_key.to_string(),
+            rows,
+            distinct_contents: distinct,
+            proposal_digest: digest(&format!("{policy}/{repo_key}/{rows}")),
+        }
+    }
+
+    /// The run identity a server would compute over the rows its groups
+    /// partition — derived from the groups here so a fixture that gains
+    /// or loses one stays internally consistent.
+    fn run_digest(groups: &[PreviewGroup]) -> Option<ProposalDigest> {
+        digest(
+            &groups
+                .iter()
+                .map(|g| g.proposal_digest.as_ref().map_or("-", |d| d.value.as_str()))
+                .collect::<Vec<_>>()
+                .join("+"),
+        )
+    }
+
+    /// Re-derive the run identity after a test has edited the groups.
+    fn reseed(summary: &mut RetentionRunSummary) {
+        let preview = summary.preview.as_mut().expect("preview");
+        preview.proposal_digest = run_digest(&preview.groups);
+    }
+
+    fn summary(rows: u64, distinct: u64, freed: FreedBytes, coverage: &str) -> RetentionRunSummary {
+        let groups = vec![group("npm-90d", "npmproxy", rows, distinct)];
+        RetentionRunSummary {
+            mode: "dry_run".into(),
+            coverage: coverage.into(),
+            policies: 1,
+            evaluated: 100,
+            expired: rows,
+            preview: Some(PreviewBody {
+                rows,
+                distinct_contents: distinct,
+                freed_bytes: freed,
+                proposal_digest: run_digest(&groups),
+                groups,
+                sample: vec![PreviewSampleRow {
+                    artifact_id: "aaaa".into(),
+                    policy_id: "policy-npm-90d".into(),
+                    repository_id: "11111111-0000-0000-0000-0000npmproxy".into(),
+                    repository_key: "npmproxy".into(),
+                    name: "left-pad".into(),
+                    version: Some("1.3.0".into()),
+                    age_seconds: 98_765,
+                }],
+                sample_limit: Some(500),
+            }),
+            ..RetentionRunSummary::default()
+        }
+    }
+
+    fn facts() -> JobFacts {
+        JobFacts {
+            job_id: "job-1".into(),
+            job_status: "completed".into(),
+            completed_at: Some("2026-09-25T11:02:14Z".into()),
+            deduplicated: false,
+        }
+    }
+
+    #[test]
+    fn count_groups_thousands() {
+        assert_eq!(count(0), "0");
+        assert_eq!(count(999), "999");
+        assert_eq!(count(1_000), "1,000");
+        assert_eq!(count(51_535), "51,535");
+        assert_eq!(count(1_288_490_188), "1,288,490,188");
+    }
+
+    #[test]
+    fn measured_bytes_carries_the_exact_value_and_says_it_is_measured() {
+        assert_eq!(measured_bytes(512), "512 bytes (measured)");
+        let gib = measured_bytes(1_288_490_188);
+        assert!(gib.contains("GiB"), "{gib}");
+        assert!(gib.contains("1,288,490,188 bytes"), "{gib}");
+        assert!(gib.contains("measured"), "{gib}");
+    }
+
+    #[test]
+    fn an_omitted_size_says_not_measured_with_the_reason() {
+        let rendered = bytes_phrase(&FreedBytes::Omitted {
+            reason: OMITTED_BYTES_REASON.into(),
+        });
+        // The whole phrase is the banner plus the server's reason
+        // verbatim. Stated as an equality rather than as "contains no
+        // `0`": the server's reason legitimately carries the bound and
+        // the observed count, so digits inside it are the explanation,
+        // not a figure hort invented. What must never appear is a byte
+        // figure of our own, and there is no room for one here.
+        assert_eq!(
+            rendered,
+            format!("NOT MEASURED — {OMITTED_BYTES_REASON}"),
+            "the unmeasured phrase is the banner and the reason, nothing else",
+        );
+        let (banner, _reason) = rendered
+            .split_once(" — ")
+            .expect("banner, then the server's reason");
+        assert!(
+            !banner.contains(|c: char| c.is_ascii_digit()),
+            "no number may stand where the byte figure would be: {banner:?}",
+        );
+    }
+
+    #[test]
+    fn partial_coverage_is_in_the_header_above_every_figure() {
+        let s = summary(812, 634, FreedBytes::Exact { bytes: 12_345 }, "partial");
+        let out = render_preview("RETENTION PREVIEW", &facts(), &s, 20);
+        let coverage_at = out.find("PARTIAL").expect("partial is stated");
+        let first_total = out.find("WHAT WOULD BE EXPIRED").expect("totals section");
+        assert!(
+            coverage_at < first_total,
+            "partial coverage must precede the numbers it qualifies:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rows_are_labelled_as_a_count_next_to_their_value() {
+        let s = summary(
+            51_535,
+            34_102,
+            FreedBytes::Exact { bytes: 4_096 },
+            "complete",
+        );
+        let out = render_preview("RETENTION PREVIEW", &facts(), &s, 20);
+        let line = out
+            .lines()
+            .find(|l| l.contains("51,535"))
+            .expect("the row count appears");
+        assert!(
+            line.contains("a count, not a size"),
+            "the row count must be labelled where it is printed: {line}"
+        );
+    }
+
+    #[test]
+    fn an_omitted_size_never_renders_as_zero_blank_or_dash() {
+        let s = summary(
+            10,
+            10,
+            FreedBytes::Omitted {
+                reason: "refcount simulation was unavailable".into(),
+            },
+            "complete",
+        );
+        let out = render_preview("RETENTION PREVIEW", &facts(), &s, 20);
+        let line = out
+            .lines()
+            .find(|l| l.contains("storage freed"))
+            .expect("the storage line exists");
+        assert!(line.contains("NOT MEASURED"), "{line}");
+        assert!(line.contains("refcount simulation"), "{line}");
+        assert!(!line.contains(" 0"), "a zero must not appear: {line}");
+        assert!(!line.contains(" - "), "a dash must not appear: {line}");
+    }
+
+    #[test]
+    fn repositories_are_named_by_key_not_uuid() {
+        let s = summary(5, 5, FreedBytes::Exact { bytes: 1 }, "complete");
+        let out = render_preview("RETENTION PREVIEW", &facts(), &s, 20);
+        assert!(out.contains("npmproxy"), "the key is shown:\n{out}");
+        assert!(
+            !out.contains("11111111-0000-0000-0000"),
+            "no repository UUID in human output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_missing_key_is_labelled_rather_than_silently_shown_as_an_id() {
+        let label = repository_label("", "11111111-2222-3333-4444-555555555555");
+        assert!(label.contains("no key reported"), "{label}");
+    }
+
+    #[test]
+    fn the_group_table_carries_no_byte_column() {
+        let s = summary(5, 5, FreedBytes::Exact { bytes: 1 }, "complete");
+        let out = render_preview("RETENTION PREVIEW", &facts(), &s, 20);
+        let header = out
+            .lines()
+            .find(|l| l.contains("POLICY") && l.contains("ARTIFACT ROWS"))
+            .expect("group header");
+        assert!(!header.to_lowercase().contains("byte"), "{header}");
+        assert!(
+            out.contains("no byte column here"),
+            "and it says why:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_sample_shows_name_version_and_age() {
+        let s = summary(5, 5, FreedBytes::Exact { bytes: 1 }, "complete");
+        let out = render_preview("RETENTION PREVIEW", &facts(), &s, 20);
+        assert!(out.contains("SAMPLE"), "{out}");
+        assert!(out.contains("left-pad"), "{out}");
+        assert!(out.contains("1.3.0"), "{out}");
+        assert!(out.contains("1d 3h"), "age rendered: {out}");
+    }
+
+    #[test]
+    fn a_deduplicated_job_says_it_is_not_a_fresh_observation() {
+        let mut f = facts();
+        f.deduplicated = true;
+        let s = summary(5, 5, FreedBytes::Exact { bytes: 1 }, "complete");
+        let out = render_preview("RETENTION PREVIEW", &f, &s, 20);
+        assert!(out.contains("not a fresh"), "{out}");
+    }
+
+    #[test]
+    fn age_renders_days_hours_and_minutes() {
+        assert_eq!(age(98_765), "1d 3h");
+        assert_eq!(age(7_200), "2h");
+        assert_eq!(age(600), "10m");
+        assert_eq!(age(-1), "(future)");
+    }
+
+    #[test]
+    fn identical_previews_produce_no_change() {
+        let s = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let d = diff(&s, &s);
+        assert!(!d.changed());
+        let rendered = render_delta(&d, "job-a", "job-b");
+        assert!(rendered.starts_with("NOTHING CHANGED"), "{rendered}");
+    }
+
+    #[test]
+    fn a_differing_preview_shows_every_moved_figure() {
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let after = summary(25, 19, FreedBytes::Exact { bytes: 500 }, "partial");
+        let d = diff(&before, &after);
+        assert!(d.changed());
+        let rendered = render_delta(&d, "job-a", "job-b");
+        assert!(rendered.starts_with("WHAT CHANGED"), "{rendered}");
+        assert!(rendered.contains("+15"), "row delta shown: {rendered}");
+        assert!(rendered.contains("+11"), "distinct delta shown: {rendered}");
+        assert!(rendered.contains("changed"), "{rendered}");
+        assert!(
+            rendered.contains("10 -> 25"),
+            "per-group movement shown: {rendered}"
+        );
+    }
+
+    /// The case this whole mechanism exists for, and the one that
+    /// shipped untested: the baseline proposed artifact A, A stopped
+    /// matching and an equally sized B started, and every figure on the
+    /// page is identical. A comparison on totals says nothing changed
+    /// and the apply destroys B.
+    #[test]
+    fn an_equal_sized_substitution_inside_one_group_is_a_change() {
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let mut after = before.clone();
+        {
+            let preview = after.preview.as_mut().expect("preview");
+            preview.proposal_digest = digest("run-after-the-substitution");
+            preview.groups[0].proposal_digest = digest("group-after-the-substitution");
+        }
+
+        let d = diff(&before, &after);
+
+        assert_eq!(
+            (d.baseline_rows, d.fresh_rows),
+            (10, 10),
+            "every total is identical — that is the trap",
+        );
+        assert_eq!((d.baseline_distinct, d.fresh_distinct), (8, 8));
+        assert_eq!(d.baseline_bytes, d.fresh_bytes);
+        assert_eq!(d.baseline_coverage, d.fresh_coverage);
+        assert_eq!(d.identity(), ProposalComparison::Different);
+        assert!(
+            d.changed(),
+            "and the substitution is still detected, so the confirmation is demanded",
+        );
+
+        let rendered = render_delta(&d, "a", "b");
+        assert!(rendered.starts_with("WHAT CHANGED"), "{rendered}");
+        assert!(rendered.contains("DIFFERENT artifacts"), "{rendered}");
+        assert!(
+            rendered.contains("indistinguishable in a count"),
+            "and it says why a count could not have told the operator: {rendered}",
+        );
+        assert!(
+            rendered.contains("DIFFERENT"),
+            "the group that moved is named in the table: {rendered}",
+        );
+        assert!(
+            d.groups.iter().any(GroupDelta::changed),
+            "the group carries the movement, so the table can point at it",
+        );
+    }
+
+    /// `NOTHING CHANGED` is a claim about artifacts. A server that does
+    /// not say which artifacts it proposes must not be able to earn it.
+    #[test]
+    fn totals_that_agree_do_not_earn_nothing_changed_without_an_identity() {
+        let mut s = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        {
+            let preview = s.preview.as_mut().expect("preview");
+            preview.proposal_digest = None;
+            preview.groups[0].proposal_digest = None;
+        }
+
+        let d = diff(&s, &s);
+        assert_eq!(d.identity(), ProposalComparison::Unreported);
+        assert!(
+            d.changed(),
+            "fail closed: a comparison that could not check"
+        );
+
+        let rendered = render_delta(&d, "a", "b");
+        assert!(
+            rendered.starts_with("THIS COMPARISON COULD NOT CHECK"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("NOTHING CHANGED"), "{rendered}");
+        assert!(rendered.contains("neither preview"), "{rendered}");
+        assert!(
+            !rendered.contains("only the groups that moved"),
+            "an undecidable identity is a run-level fact, not every group moving: {rendered}",
+        );
+    }
+
+    #[test]
+    fn the_side_that_reported_no_identity_is_named() {
+        let full = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let mut bare = full.clone();
+        bare.preview.as_mut().expect("preview").proposal_digest = None;
+
+        let missing_fresh = render_delta(&diff(&full, &bare), "a", "b");
+        assert!(
+            missing_fresh.contains("the fresh preview did not report"),
+            "{missing_fresh}"
+        );
+
+        let missing_baseline = render_delta(&diff(&bare, &full), "a", "b");
+        assert!(
+            missing_baseline.contains("the baseline preview did not report"),
+            "{missing_baseline}"
+        );
+    }
+
+    /// Half a digest decides nothing, and two halves must not agree with
+    /// each other.
+    #[test]
+    fn an_identity_missing_its_scheme_is_treated_as_no_identity() {
+        let mut s = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        s.preview.as_mut().expect("preview").proposal_digest = Some(ProposalDigest {
+            scheme: String::new(),
+            value: "aaaa".into(),
+        });
+        let d = diff(&s, &s);
+        assert_eq!(d.identity(), ProposalComparison::Unreported);
+        assert!(d.changed());
+    }
+
+    /// Two servers computing the digest differently is not the world
+    /// moving, and saying so would be the false alarm that trains the
+    /// whole warning away.
+    #[test]
+    fn two_identities_from_different_schemes_are_not_compared_and_not_called_a_change() {
+        let mut before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let after = before.clone();
+        before.preview.as_mut().expect("preview").proposal_digest = Some(ProposalDigest {
+            scheme: "policy-artifact-pairs-v0".into(),
+            value: "aaaa".into(),
+        });
+
+        let d = diff(&before, &after);
+        assert_eq!(d.identity(), ProposalComparison::SchemeMismatch);
+        assert!(d.changed(), "still fail-closed — nothing was established");
+
+        let rendered = render_delta(&d, "a", "b");
+        assert!(
+            rendered.starts_with("THIS COMPARISON COULD NOT CHECK"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("NOT COMPARED") && !rendered.contains("DIFFERENT artifacts"),
+            "not comparable is a different statement from different: {rendered}",
+        );
+        assert!(
+            rendered.contains("policy-artifact-pairs-v0")
+                && rendered.contains("policy-artifact-pairs-v1"),
+            "both forms are quoted so the operator can see the two servers differ: {rendered}",
+        );
+        assert!(rendered.contains("server upgrade"), "{rendered}");
+    }
+
+    /// A partial run reports the window it walked, so a comparison over
+    /// one has to say that is what it compared.
+    #[test]
+    fn a_comparison_across_partial_coverage_says_it_compared_windows() {
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "partial");
+        let mut after = before.clone();
+        {
+            let preview = after.preview.as_mut().expect("preview");
+            preview.proposal_digest = digest("run-a-different-window");
+            preview.groups[0].proposal_digest = digest("group-a-different-window");
+        }
+
+        let d = diff(&before, &after);
+        assert!(d.window_limited());
+        let rendered = render_delta(&d, "a", "b");
+        // Collapse the wrap before matching: the sentence is the
+        // property, its line breaks are not.
+        let flat = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("only a window of the candidate set"),
+            "{rendered}"
+        );
+        assert!(
+            flat.contains("what was compared here is two windows"),
+            "the comparison says what it compared: {rendered}",
+        );
+        assert!(
+            flat.contains("may be the window moving rather than the world"),
+            "the difference is not attributed to the world by a comparison that cannot \
+             attribute it: {rendered}",
+        );
+    }
+
+    /// The same window statement, in the direction that must not read as
+    /// a reassurance about artifacts neither run examined.
+    #[test]
+    fn matching_identities_over_a_window_do_not_vouch_for_what_was_not_examined() {
+        let s = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "partial");
+        let d = diff(&s, &s);
+        assert_eq!(d.identity(), ProposalComparison::Same);
+        assert!(
+            !d.changed(),
+            "the same rows are the same proposal, window or not"
+        );
+
+        let rendered = render_delta(&d, "a", "b");
+        assert!(rendered.starts_with("NOTHING CHANGED"), "{rendered}");
+        assert!(
+            rendered.contains("only a window of the candidate"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("not that the artifacts neither run reached would be left alone"),
+            "{rendered}"
+        );
+    }
+
+    /// A complete-coverage comparison says nothing about windows: a
+    /// caveat that is always printed is a caveat nobody reads.
+    #[test]
+    fn a_complete_comparison_carries_no_window_caveat() {
+        let s = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let rendered = render_delta(&diff(&s, &s), "a", "b");
+        assert!(!rendered.contains("window"), "{rendered}");
+        assert!(rendered.contains("The SAME artifacts"), "{rendered}");
+        assert!(
+            rendered.contains("not the totals over it"),
+            "nothing-changed states what it matched on: {rendered}",
+        );
+    }
+
+    /// Figures can move while the proposed rows do not — a blob losing
+    /// its last other reference changes what a purge reclaims without
+    /// changing what expires. That is a change, and it is not a
+    /// different set of artifacts.
+    #[test]
+    fn the_same_artifacts_with_moved_figures_is_a_change_that_says_which_kind() {
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let mut after = before.clone();
+        after.preview.as_mut().expect("preview").freed_bytes = FreedBytes::Exact { bytes: 4_096 };
+
+        let d = diff(&before, &after);
+        assert_eq!(d.identity(), ProposalComparison::Same);
+        assert!(d.changed());
+        let rendered = render_delta(&d, "a", "b");
+        assert!(rendered.starts_with("WHAT CHANGED"), "{rendered}");
+        assert!(rendered.contains("The SAME artifacts"), "{rendered}");
+    }
+
+    /// A group present on one side only has no second set to compare
+    /// against, and the row cells already say it appeared or vanished.
+    #[test]
+    fn a_group_on_one_side_only_has_no_identity_verdict() {
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let mut after = before.clone();
+        after
+            .preview
+            .as_mut()
+            .expect("preview")
+            .groups
+            .push(group("pypi-30d", "pypiproxy", 3, 3));
+        reseed(&mut after);
+
+        let d = diff(&before, &after);
+        let appeared = d
+            .groups
+            .iter()
+            .find(|g| g.policy_name == "pypi-30d")
+            .expect("the new group");
+        assert_eq!(appeared.identity, None);
+        assert!(appeared.changed(), "appearing is movement");
+        assert_eq!(group_identity_cell(None), "-");
+    }
+
+    /// Both helpers are written to answer whatever they are handed, not
+    /// to assert what `identity_block` can hand them: `Unreported` is
+    /// only reached when a side is missing and `SchemeMismatch` only
+    /// when both are present, so neither degenerate input arises there.
+    /// A wrong word in the output an operator confirms against is
+    /// cosmetic; a panic in it is not.
+    #[test]
+    fn the_identity_phrasing_helpers_answer_inputs_the_verdicts_cannot_produce() {
+        let s = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let mut d = diff(&s, &s);
+        assert_eq!(
+            unreported_side(&d),
+            "one of the two previews did not report",
+            "both sides reported, which `Unreported` never sees",
+        );
+
+        d.baseline_proposal = None;
+        let pair = scheme_pair(&d);
+        assert!(pair.contains("baseline (none)"), "{pair}");
+        assert!(pair.contains("policy-artifact-pairs-v1"), "{pair}");
+    }
+
+    #[test]
+    fn every_group_verdict_has_a_cell_of_its_own() {
+        assert_eq!(group_identity_cell(Some(ProposalComparison::Same)), "same");
+        assert_eq!(
+            group_identity_cell(Some(ProposalComparison::Different)),
+            "DIFFERENT"
+        );
+        assert_eq!(
+            group_identity_cell(Some(ProposalComparison::Unreported)),
+            "not reported"
+        );
+        assert_eq!(
+            group_identity_cell(Some(ProposalComparison::SchemeMismatch)),
+            "not comparable"
+        );
+    }
+
+    /// A group whose identity could not be decided is not a group that
+    /// moved, and must not be listed under a heading that says it did.
+    #[test]
+    fn a_group_with_an_undecidable_identity_is_not_reported_as_having_moved() {
+        let mut s = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        s.preview.as_mut().expect("preview").groups[0].proposal_digest = None;
+        let d = diff(&s, &s);
+        let only = &d.groups[0];
+        assert_eq!(only.identity, Some(ProposalComparison::Unreported));
+        assert!(!only.changed());
+    }
+
+    #[test]
+    fn a_group_that_names_different_rows_moved_even_with_identical_counts() {
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let mut after = before.clone();
+        after.preview.as_mut().expect("preview").groups[0].proposal_digest = digest("moved");
+        let d = diff(&before, &after);
+        assert_eq!(d.groups[0].identity, Some(ProposalComparison::Different));
+        assert!(d.groups[0].changed());
+    }
+
+    #[test]
+    fn a_group_appearing_or_disappearing_is_a_change() {
+        let mut before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let mut after = before.clone();
+        after
+            .preview
+            .as_mut()
+            .expect("preview")
+            .groups
+            .push(group("pypi-30d", "pypiproxy", 3, 3));
+        reseed(&mut after);
+        let d = diff(&before, &after);
+        assert!(d.changed());
+        assert!(render_delta(&d, "a", "b").contains("new: 3"));
+
+        before.preview.as_mut().expect("preview").groups.clear();
+        reseed(&mut before);
+        let d = diff(&after, &before);
+        assert!(d.changed());
+        let rendered = render_delta(&d, "a", "b");
+        assert!(rendered.contains("gone (was"), "{rendered}");
+    }
+
+    #[test]
+    fn one_byte_is_singular() {
+        assert_eq!(measured_bytes(1), "1 byte (measured)");
+        assert_eq!(bytes_cell(&FreedBytes::Exact { bytes: 1 }), "1 byte");
+        assert_eq!(
+            byte_change(
+                &FreedBytes::Exact { bytes: 1 },
+                &FreedBytes::Exact { bytes: 2 }
+            ),
+            "+1 byte"
+        );
+    }
+
+    #[test]
+    fn the_byte_change_is_a_number_only_when_both_sides_were_measured() {
+        assert_eq!(
+            byte_change(
+                &FreedBytes::Exact { bytes: 100 },
+                &FreedBytes::Exact { bytes: 140 }
+            ),
+            "+40 bytes"
+        );
+        assert_eq!(
+            byte_change(
+                &FreedBytes::Exact { bytes: 100 },
+                &FreedBytes::Exact { bytes: 100 }
+            ),
+            "unchanged"
+        );
+        assert_eq!(
+            byte_change(
+                &FreedBytes::Exact { bytes: 100 },
+                &FreedBytes::Omitted {
+                    reason: "bound".into()
+                }
+            ),
+            "no longer measured"
+        );
+        assert_eq!(
+            byte_change(
+                &FreedBytes::Omitted {
+                    reason: "bound".into()
+                },
+                &FreedBytes::Exact { bytes: 100 }
+            ),
+            "now measured"
+        );
+        assert_eq!(
+            byte_change(&FreedBytes::Unrecognised, &FreedBytes::Unrecognised),
+            "unchanged"
+        );
+        assert_eq!(
+            byte_change(
+                &FreedBytes::Omitted { reason: "a".into() },
+                &FreedBytes::Omitted { reason: "b".into() }
+            ),
+            "still not measured"
+        );
+    }
+
+    #[test]
+    fn a_partial_sweep_does_not_repeat_the_word_partial_back_at_the_operator() {
+        let s = summary(1, 1, FreedBytes::Exact { bytes: 1 }, "partial");
+        let out = render_preview("T", &facts(), &s, 0);
+        assert!(out.contains("coverage    PARTIAL —"), "{out}");
+    }
+
+    #[test]
+    fn an_unknown_coverage_word_is_quoted_verbatim() {
+        let s = summary(1, 1, FreedBytes::Exact { bytes: 1 }, "truncated");
+        let out = render_preview("T", &facts(), &s, 0);
+        assert!(out.contains(r#"the server said "truncated""#), "{out}");
+    }
+
+    #[test]
+    fn a_size_that_stops_being_measurable_is_a_change_not_a_zero() {
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let after = summary(
+            10,
+            8,
+            FreedBytes::Omitted {
+                reason: OMITTED_BYTES_REASON.into(),
+            },
+            "complete",
+        );
+        let d = diff(&before, &after);
+        assert!(d.changed(), "the byte status moved");
+        let rendered = render_delta(&d, "a", "b");
+        assert!(rendered.contains("not measured"), "{rendered}");
+        assert!(rendered.contains(OMITTED_BYTES_REASON), "{rendered}");
+    }
+
+    #[test]
+    fn diffing_against_a_summary_with_no_preview_still_shows_a_difference() {
+        let empty = RetentionRunSummary {
+            mode: "execute".into(),
+            coverage: "complete".into(),
+            ..RetentionRunSummary::default()
+        };
+        let real = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let d = diff(&empty, &real);
+        assert!(d.changed());
+    }
+
+    #[test]
+    fn render_preview_on_a_summary_without_a_preview_says_so() {
+        let s = RetentionRunSummary {
+            mode: "execute".into(),
+            coverage: "complete".into(),
+            ..RetentionRunSummary::default()
+        };
+        let out = render_preview("T", &facts(), &s, 5);
+        assert!(out.contains("no preview object"), "{out}");
+    }
+
+    #[test]
+    fn empty_groups_and_sample_render_without_panicking() {
+        let s = RetentionRunSummary {
+            mode: "dry_run".into(),
+            coverage: "complete".into(),
+            preview: Some(PreviewBody::default()),
+            ..RetentionRunSummary::default()
+        };
+        let out = render_preview("T", &facts(), &s, 5);
+        assert!(out.contains("no policy matched anything"), "{out}");
+        assert!(!out.contains("SAMPLE"), "{out}");
+    }
+
+    #[test]
+    fn asking_for_no_sample_rows_prints_none() {
+        let s = summary(5, 5, FreedBytes::Exact { bytes: 1 }, "complete");
+        let out = render_preview("T", &facts(), &s, 0);
+        assert!(!out.contains("SAMPLE"), "{out}");
+    }
+
+    #[test]
+    fn a_sample_row_whose_policy_is_missing_from_the_groups_is_still_rendered() {
+        let mut s = summary(5, 5, FreedBytes::Exact { bytes: 1 }, "complete");
+        s.preview.as_mut().expect("preview").groups.clear();
+        let out = render_preview("T", &facts(), &s, 5);
+        assert!(out.contains("(unknown policy)"), "{out}");
+    }
+
+    #[test]
+    fn a_sample_row_without_a_version_renders_a_placeholder() {
+        let mut s = summary(5, 5, FreedBytes::Exact { bytes: 1 }, "complete");
+        s.preview.as_mut().expect("preview").sample[0].version = None;
+        let out = render_preview("T", &facts(), &s, 5);
+        assert!(out.contains("left-pad"), "{out}");
+    }
+
+    #[test]
+    fn a_sample_at_the_server_cap_says_the_listing_is_capped() {
+        let mut s = summary(5, 5, FreedBytes::Exact { bytes: 1 }, "complete");
+        s.preview.as_mut().expect("preview").sample_limit = Some(1);
+        let out = render_preview("T", &facts(), &s, 5);
+        assert!(out.contains("records at most 1"), "{out}");
+    }
+
+    #[test]
+    fn execution_result_reports_what_expired_and_that_bytes_are_a_later_stage() {
+        let s = RetentionRunSummary {
+            mode: "execute".into(),
+            coverage: "complete".into(),
+            policies: 2,
+            evaluated: 400,
+            expired: 17,
+            ..RetentionRunSummary::default()
+        };
+        let out = render_execution(&facts(), &s);
+        assert!(out.contains("RETENTION EXECUTED"), "{out}");
+        assert!(out.contains("artifact rows expired now"), "{out}");
+        assert!(out.contains("17"), "{out}");
+        assert!(out.contains("does not itself delete stored bytes"), "{out}");
+    }
+
+    #[test]
+    fn a_deduplicated_execution_says_the_confirmation_started_nothing() {
+        let mut f = facts();
+        f.deduplicated = true;
+        let s = RetentionRunSummary {
+            mode: "execute".into(),
+            coverage: "complete".into(),
+            ..RetentionRunSummary::default()
+        };
+        let out = render_execution(&f, &s);
+        assert!(out.contains("no new sweep was started"), "{out}");
+    }
+
+    #[test]
+    fn an_absent_coverage_word_is_reported_as_truncated_and_named() {
+        let s = RetentionRunSummary {
+            mode: "dry_run".into(),
+            coverage: String::new(),
+            preview: Some(PreviewBody::default()),
+            ..RetentionRunSummary::default()
+        };
+        let out = render_preview("T", &facts(), &s, 0);
+        assert!(out.contains("reported no coverage at all"), "{out}");
+    }
+
+    #[test]
+    fn an_unreported_mode_is_labelled() {
+        let s = RetentionRunSummary {
+            coverage: "complete".into(),
+            preview: Some(PreviewBody::default()),
+            ..RetentionRunSummary::default()
+        };
+        let out = render_preview("T", &facts(), &s, 0);
+        assert!(out.contains("(unreported)"), "{out}");
+    }
+
+    #[test]
+    fn an_unreported_coverage_word_shows_as_unreported_in_the_delta() {
+        let a = RetentionRunSummary::default();
+        let b = RetentionRunSummary {
+            coverage: "complete".into(),
+            ..RetentionRunSummary::default()
+        };
+        let rendered = render_delta(&diff(&a, &b), "a", "b");
+        assert!(rendered.contains("(unreported)"), "{rendered}");
+    }
+}

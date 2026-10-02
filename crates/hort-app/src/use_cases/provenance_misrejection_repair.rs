@@ -107,13 +107,13 @@ use hort_domain::events::{
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_queue_repository::{CurationQueueFilter, CurationQueueRepository};
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ReadFrom};
+use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend};
 
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::release_clearance::resolve_provenance_clearance;
-use crate::use_cases::{read_expected_version, STREAM_EVENT_CAP};
+use crate::use_cases::{read_artifact_stream, read_expected_version};
 
 /// Hard cap on how many `Rejected` rows one call examines. Mirrors the
 /// curation queue's own `MAX_QUEUE_LIMIT`, which is the listing this
@@ -300,10 +300,7 @@ impl ProvenanceMisrejectionRepairUseCase {
         }
 
         let stream_id = StreamId::artifact(artifact_id);
-        let persisted = self
-            .events
-            .read_stream(&stream_id, ReadFrom::Start, STREAM_EVENT_CAP + 1)
-            .await?;
+        let persisted = read_artifact_stream(&*self.events, &stream_id).await?;
 
         // Conjunct 2 — cheap and highly selective, so it runs first and
         // short-circuits the clearance read for every genuine rejection.

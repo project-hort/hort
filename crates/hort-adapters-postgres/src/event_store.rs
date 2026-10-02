@@ -146,7 +146,7 @@ pub fn inspect_audit_block(error: &sqlx::Error) -> Option<AuditBlockedOp> {
 /// so the column order matches `EventRow`'s
 /// field order — sqlx's `FromRow` requires positional alignment when
 /// the row type derives `FromRow` without explicit `#[sqlx(rename)]`.
-const EVENT_COLS: &str = r#"
+pub(crate) const EVENT_COLS: &str = r#"
     event_id, stream_id, stream_category, stream_position, global_position,
     event_type, event_version, event_data, correlation_id, causation_id,
     actor_type, actor_id, actor_source_file, actor_spec_digest, stored_at
@@ -542,6 +542,78 @@ impl EventStore for PgEventStore {
                 category = cat_str,
                 result_count = events.len(),
                 "read_category"
+            );
+            Ok(events)
+        })
+    }
+
+    /// One `global_position`-ordered page across several categories, in
+    /// one round trip.
+    ///
+    /// Overrides the port's merge-the-per-category-reads default because
+    /// Postgres can do the merge itself: a `Merge Append` over one keyset
+    /// arm per category reads `max_count` rows in total instead of
+    /// `max_count` per category, and it does so with a plan that does not
+    /// change with the size of the gap. The statement and the measurements
+    /// behind its shape are in
+    /// [`crate::merged_category_read::merged_category_read_sql`].
+    fn read_categories<'a>(
+        &'a self,
+        categories: &[StreamCategory],
+        from: SubscribeFrom,
+        max_count: u64,
+    ) -> BoxFuture<'a, DomainResult<Vec<PersistedEvent>>> {
+        // Deduplicate, and order by wire label so the statement text — and
+        // therefore the cached plan — depends only on which categories were
+        // asked for, not on the order the caller listed them in.
+        let mut labels: Vec<&'static str> = Vec::with_capacity(categories.len());
+        for &cat in categories {
+            let label = category_label(cat);
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
+        }
+        labels.sort_unstable();
+
+        let after_global: i64 = match from {
+            SubscribeFrom::Start => 0,
+            SubscribeFrom::AfterGlobal(n) => n as i64,
+        };
+        let limit = max_count as i64;
+
+        for label in &labels {
+            emit_read_metrics(label, values::OPERATION_READ_CATEGORIES);
+        }
+
+        Box::pin(async move {
+            // A zero-arm `UNION ALL` is not valid SQL, and an empty filter
+            // has no events by definition — answer without a round trip.
+            if labels.is_empty() {
+                return Ok(Vec::new());
+            }
+            let sql = crate::merged_category_read::merged_category_read_sql(labels.len());
+            let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql));
+            for label in &labels {
+                query = query.bind(*label);
+            }
+            let rows: Vec<EventRow> = query
+                .bind(after_global)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    DomainError::Invariant(format!("read_categories query failed: {e}"))
+                })?;
+
+            let events: Vec<PersistedEvent> = rows
+                .into_iter()
+                .map(PersistedEvent::try_from)
+                .collect::<Result<Vec<_>, _>>()?;
+
+            tracing::debug!(
+                categories = ?labels,
+                result_count = events.len(),
+                "read_categories"
             );
             Ok(events)
         })

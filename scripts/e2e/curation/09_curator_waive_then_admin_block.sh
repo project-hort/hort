@@ -158,6 +158,8 @@ DEC_OUT="$(run_hort_cli "$ADMIN_TOKEN" -- curation decisions --since "$SINCE" 2>
     exit 1
 }
 
+# Bounded: hort-cli's own decisions-listing summary JSON for this test's
+# small fixture window, not an unbounded scrape/log.
 if printf '%s' "$DEC_OUT" | grep -q "$QUARANTINED_AID"; then
     assert_pass "decisions listing surfaces the waive+block on $QUARANTINED_AID"
 else

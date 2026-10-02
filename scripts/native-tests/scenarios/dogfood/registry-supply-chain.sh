@@ -571,7 +571,7 @@ EOF
     cd "$VIRTUAL_DIR" || { fail "(g) cd into virtual consumer dir" "$VIRTUAL_DIR"; summary; }
 
     VIRT_BUILD_OUT="$(cargo fetch 2>&1 || true)"
-    if printf '%s' "$VIRT_BUILD_OUT" | grep -qi 'error\|failed'; then
+    if capture_match -i 'error|failed' printf '%s' "$VIRT_BUILD_OUT"; then
         fail "(g) virtual consumer cargo fetch against cargo-virtual" \
             "cargo fetch reported an error: $(printf '%s' "$VIRT_BUILD_OUT" | tail -5)"
     else

@@ -23,7 +23,13 @@ const MAX_PACKAGE_PATTERN_LEN: usize = 512;
 /// supported way to cover "everything" is [`RetentionScope::AllRepos`].
 /// Bounded so a malformed envelope cannot smuggle an unbounded list
 /// into a persisted event.
-const MAX_REPOS_IN_SCOPE: usize = 1024;
+///
+/// `pub` because the gitops operator surface carries the *unresolved*
+/// form of this list (repository `metadata.name`s, resolved to ids by
+/// the apply pipeline) and bounds it pre-write against the same
+/// number. Name→id resolution is 1:1, so a spec list within this bound
+/// can never resolve into a domain scope that exceeds it.
+pub const MAX_REPOS_IN_SCOPE: usize = 1024;
 
 /// Which artifacts a retention policy applies to.
 ///
@@ -43,11 +49,17 @@ const MAX_REPOS_IN_SCOPE: usize = 1024;
 /// `String`). `Repos` carries repository ids as `Uuid` — consistent
 /// with `PolicyScope::Repository(Uuid)` and every `repository_id: Uuid`
 /// in the event vocabulary.
+///
+/// This is the **resolved** form. Operators never author a repository
+/// UUID: the gitops surface carries `metadata.name`s and the apply
+/// pipeline resolves them to ids exactly once, the same split
+/// `ScanPolicy`'s `ScopeSpec` → `PolicyScope` uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RetentionScope {
     /// Every repository in the deployment.
     AllRepos,
-    /// An explicit list of repository ids.
+    /// An explicit list of repository ids (resolved from the
+    /// operator-authored `metadata.name`s at apply time).
     Repos(Vec<Uuid>),
     /// Every repository of a given package format.
     Format(crate::entities::repository::RepositoryFormat),

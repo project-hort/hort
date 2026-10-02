@@ -9,9 +9,11 @@
 #![allow(clippy::expect_used)]
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
+use hort_worker::composition::ScannerUnavailable;
 use hort_worker::config::{LogFormat, StorageConfig, WorkerConfig};
+use serial_test::serial;
 
 /// Shared mutex guarding env-var manipulation across tests in this
 /// integration-test binary. Cargo runs different test binaries
@@ -22,7 +24,22 @@ fn env_lock() -> &'static Mutex<()> {
     &LOCK
 }
 
+/// `DATABASE_URL` as this test process was launched with it.
+///
+/// [`clear_slots`] removes the variable for the config-parsing tests and
+/// never puts it back, and libtest gives no ordering guarantee between
+/// them and the DB-backed test below — so a plain
+/// `env::var("DATABASE_URL")` there reads whatever the last config test
+/// left behind, not what the operator configured, and the test
+/// self-skips for a reason that has nothing to do with the machine
+/// having a database. [`clear_slots`] forces this before it removes
+/// anything, so the captured value is always the launch value.
+static LAUNCH_DATABASE_URL: LazyLock<Option<String>> =
+    LazyLock::new(|| std::env::var("DATABASE_URL").ok());
+
 fn clear_slots() {
+    // Pin the launch value before removing it — see LAUNCH_DATABASE_URL.
+    let _launch = &*LAUNCH_DATABASE_URL;
     for s in [
         "HORT_DATABASE_URL",
         "DATABASE_URL",
@@ -137,10 +154,33 @@ fn worker_config_with_explicit_overrides() {
 ///
 /// Also pins the other always-registered kinds so a regression that
 /// silently drops any of them surfaces here.
+///
+/// **This test has exactly one skip condition, and a dead database is
+/// not it.** `build_app_context` is allowed to fail here for one reason
+/// only: a configured scanner binary missing from `PATH`, which the
+/// composition root reports as a typed [`ScannerUnavailable`]. That is a
+/// property of the developer's machine, not of the wiring this test
+/// asserts. Every other failure — an unreachable pool, a schema behind
+/// the binary, a handler that stopped registering — is the test's
+/// subject and fails it. The branch used to swallow all of them alike,
+/// so the test reported `ok` against a dead `DATABASE_URL`; it is not a
+/// connect-and-discard, so `db_gate_not_silent` never saw it.
+///
+/// It also touches the shared `DATABASE_URL` target rather than an
+/// isolated database (the composition root connects to whatever URL it
+/// is configured with), so it carries `#[serial(hort_pg_db)]` and
+/// migrates that target itself before calling in — `assert_schema_current`
+/// would otherwise pass or fail purely on whether some earlier test
+/// binary happened to have migrated it. The migration goes through
+/// `connect_or_panic` + `migrate_or_panic` rather than
+/// `shared_migrated_pool`, which reads `DATABASE_URL` itself: a sibling
+/// test in this binary clears that variable (see `clear_slots`), so the
+/// URL has to be passed in explicitly rather than re-read here.
 #[tokio::test]
+#[serial(hort_pg_db)]
 async fn build_app_context_registers_seed_import_handler() {
-    let database_url = match std::env::var("DATABASE_URL") {
-        Ok(v) if !v.is_empty() => v,
+    let database_url = match LAUNCH_DATABASE_URL.as_deref() {
+        Some(v) if !v.is_empty() => v.to_string(),
         _ => {
             eprintln!(
                 "DATABASE_URL not set; skipping DB-gated composition smoke \
@@ -149,6 +189,13 @@ async fn build_app_context_registers_seed_import_handler() {
             return;
         }
     };
+    // Establish the precondition `assert_schema_current` checks rather
+    // than inheriting it from whichever test binary happened to migrate
+    // the shared target first. Both helpers panic — not skip — when the
+    // declared database cannot be reached or migrated, which is the
+    // whole point: from here on, a failure means a failure.
+    let pool = hort_adapters_postgres::test_support::connect_or_panic(&database_url).await;
+    hort_adapters_postgres::test_support::migrate_or_panic(&pool).await;
 
     // Build a minimal WorkerConfig — same shape as
     // `build_app_context_signature_compiles` below, but pointing at
@@ -210,19 +257,23 @@ async fn build_app_context_registers_seed_import_handler() {
 
     let output = match hort_worker::composition::build_app_context(&cfg, None, None).await {
         Ok(o) => o,
-        Err(e) => {
-            // Surface the failure clearly. If `trivy` / `osv-scanner`
-            // aren't on PATH the strict fail-fast health-check raises
-            // here — that's the correct behaviour, so we skip rather
-            // than fail (the test asserts wiring shape, not scanner
-            // installation).
+        Err(e) if e.downcast_ref::<ScannerUnavailable>().is_some() => {
+            // The one tolerated failure: the strict fail-fast
+            // health-check found no `trivy` / `osv-scanner` on PATH.
+            // That is the composition root behaving correctly on a
+            // machine without the scanner binaries, and this test
+            // asserts wiring shape, not scanner installation.
             eprintln!(
-                "build_app_context returned an error (likely a missing \
-                 scanner binary on PATH); skipping seed-import \
-                 registration assertion: {e:#}"
+                "skipping the seed-import registration assertion: a configured \
+                 scanner binary is not on PATH: {e:#}"
             );
             return;
         }
+        Err(e) => panic!(
+            "build_app_context failed for a reason other than a missing scanner \
+             binary — that is the wiring this test exists to assert, not an \
+             environment gap: {e:#}"
+        ),
     };
 
     let kinds: std::collections::HashSet<&str> =

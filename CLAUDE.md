@@ -139,7 +139,30 @@ Coverage requirements vary by crate layer. Core crates contain the security-crit
 
 **Enforcement:** `hort-domain` and `hort-app` coverage is checked by the `coverage` CI job. Any new public function or branch in these crates without a corresponding test is a blocking review finding. The 100% target means every match arm, every error path, and every boundary condition — not just happy paths.
 
-**DB-backed test isolation (parallel-safety contract).** The `hort-adapters-postgres` and `hort-adapters-storage` test suites — inline `#[cfg(test)]` `--lib` tests *and* `crates/*/tests/` integration tests — run **in parallel against one shared database/backend with no per-test isolation** (no transaction rollback, no schema-per-test, no truncation). The `cargo test --tests` CI job (`test:integration`) builds the lib as a unittest target, so inline tests run there too. Several adapters do global-scope work (e.g. the `save_managed` gitops-partition full-reconcile, `pg_stat_activity` probes, unfiltered `COUNT`/`list_*` reads). Coverage % is necessary but **not sufficient**: a DB-backed test that is correct serially but interferes with a concurrently-running sibling is a defect, not passing. Production tolerates this because the only writer of these partitions is single-flight by design (gitops apply is single-process per boot lock); tests must honour that same contract. **Therefore: every new `hort-adapters-postgres` test that acquires a real connection (calls `maybe_pool()` / touches the shared DB) MUST carry the crate-wide `#[serial(hort_pg_db)]` key** (or an equivalent per-test isolation mechanism); a DB-gated test without it is a **blocking review finding** — it silently reintroduces the identity-shifting flake fixed in `ed79360a`. There is no compile-time or lint enforcement of this yet, so it is a mandatory review check (see the architect Implementation Review Checklist).
+**DB-backed test isolation (parallel-safety contract).** The DB-backed suites have **three modes**, and a reviewer has to know which one a test is in:
+
+- **`test_support::isolated_db_from`** — creates and migrates a fresh `hort_test_<epoch>_<uuid>` database per call. This is the overwhelming majority of the harness: **61 files** (54 in `hort-adapters-postgres`, 7 in `hort-server`), usually reached through a module-local `maybe_pool()`.
+- **`test_support::shared_migrated_pool`** — connects to and migrates the shared `DATABASE_URL` target, for the few tests that deliberately exercise shared-DB behaviour (isolating them would defeat the point of the test): **4 files**, all in `hort-adapters-postgres`.
+- **A hand-rolled throwaway database on the `DATABASE_URL` target** — an `admin_pool()` (now `test_support::connect_or_panic`) plus the file's own `create_temp_db` / `drop_temp_db`, because these tests drive the migrator itself and so cannot be handed an already-migrated database: **5 files**, `hort-server/tests/migrate_{assert_current,harden_events,schema_compat,fleet_fence}.rs` and `hort-worker/tests/schema_compat_boot.rs`, 35 DB-backed tests. All 35 carry `#[serial(hort_pg_db)]`; until the sweep that added the guard below, only `migrate_fleet_fence.rs`'s 6 did, and the other 29 ran their `CREATE DATABASE` + full migration set (cluster-global `CREATE ROLE` included) unkeyed — they fell through the *wording* of the old rule, which named `hort-adapters-postgres` and so did not reach `hort-server` / `hort-worker`. There is also one test in a sixth file that hand-rolls a throwaway database inside an otherwise `isolated_db_from` file (`hort-adapters-postgres/tests/api_tokens_migration.rs::idempotent_after_rollback`, whose `DROP TABLE … CASCADE` cannot be let near a database anything else will reuse); a mode-by-file listing will not find it, which is why the guard scans functions.
+
+Two tests sit outside all three modes and are worth knowing about as a reviewer: `hort-adapters-postgres/tests/api_tokens_migration.rs::idempotent_after_rollback` (above) and `hort-worker/tests/composition_smoke.rs::build_app_context_registers_seed_import_handler`, which drives the worker's composition root against the configured `DATABASE_URL` itself and so migrates that shared target through `connect_or_panic` + `migrate_or_panic` before calling in. Both carry the key.
+
+Either way every DB-backed test in the workspace runs against **one Postgres server** — inline `#[cfg(test)]` `--lib` tests *and* `crates/*/tests/` integration tests — and within a binary libtest runs tests on many threads at once. The `cargo test --tests` CI job (`test:integration`) builds the lib as a unittest target, so inline tests run there too.
+
+**What the key actually reaches, measured — and what that rests on.** The workspace declares `serial_test = "4"` with default features and `Cargo.lock` contains **no `fslock`**, so the `file_locks` feature is off and `#[serial(key)]` is a **process-local** lock (`once_cell` + `parking_lot`), not a file lock. It therefore orders tests **within one test binary** and nothing else. That is enough today only because cargo runs test binaries **strictly sequentially**: measured on the pinned toolchain (cargo 1.97.1, and again on 1.98.1), three targets sleeping 3 s each ran back to back — binary `a` ended at `…940.077247` and `b` started at `…940.078832`, 1.6 ms later, with no overlap. So the protection against cross-binary collision is a property of **the runner's scheduling**, not of the key: a file-local mutex would reach exactly as far. **`cargo nextest` runs test binaries in parallel by default** — adopting it would void this assumption silently, with every DB-backed test still wearing a key that no longer orders it against the binary next door. Any move to a parallel test runner has to re-establish cross-process serialization first (`serial_test`'s `file_locks` feature is the cheap route) and amend this section.
+
+**Therefore: every test in the workspace that acquires a real Postgres connection — whatever the crate, and whether it reaches the server through `maybe_pool()` / `shared_migrated_pool()` / `connect_or_panic()` or through a hand-rolled `PgPool::connect` — MUST carry the workspace-wide `#[serial(hort_pg_db)]` key.** A DB-gated test without it is a **blocking review finding**: it silently reintroduces the identity-shifting flake fixed in `ed79360a`. The rationale is crate-agnostic, and the old crate-scoped wording is exactly how 29 `hort-server` / `hort-worker` tests ran unkeyed for as long as they did.
+
+**The key is the *only* serialization mechanism — no file-local mutex beside it.** In reach a file-local `Mutex` is the key's equal (see the measurement above), so this is not an argument about coverage; it is about composition. Two independent serializations do not compose into one order: a test holding only the mutex and a test holding only the key run concurrently, and a reviewer cannot rule that out by reading either test alone. Five files carried such a mutex (`jobs_repository`, `rescan_candidates`, `scanner_registry_repository`, `user_deactivation_notify`, `api_tokens_migration`); all five now carry the key alone.
+
+The rule holds on both paths, for two different reasons, and both halves are load-bearing:
+
+- On the **shared** path there is no per-test isolation at all: no transaction rollback, no schema-per-test, no truncation. Several adapters do global-scope work (e.g. the `save_managed` gitops-partition full-reconcile, `pg_stat_activity` probes, unfiltered `COUNT`/`list_*` reads), so a concurrently-running sibling reads and deletes another test's rows. Production tolerates this because the only writer of these partitions is single-flight by design (gitops apply is single-process per boot lock); tests must honour that same contract.
+- On the **isolated** path a per-test database is **not** isolation from cluster-global work. `CREATE ROLE` (the migration set creates roles), `pg_stat_activity` probes, `CREATE`/`DROP DATABASE` and the shared catalogs the stale-database sweeper touches are all **server-wide**: a test in its own database still collides with a sibling through the cluster, and the serial key is what keeps that collision from happening.
+
+Coverage % is necessary but **not sufficient**: a DB-backed test that is correct serially but interferes with a concurrently-running sibling is a defect, not passing.
+
+**Enforcement: `crates/hort-app/tests/db_tests_are_serialized.rs`**, a DB-free sub-second source scan in the same family as `db_gate_not_silent` — so `cargo test --workspace` runs it automatically. It reports every test function (inline `#[cfg(test)]` *and* `crates/*/tests/`) that reaches `test_support::{isolated_db_from, shared_migrated_pool, connect_or_panic}` — directly or through a same-file helper, transitively — or opens a raw `PgPool::connect` / `PgConnection::connect*`, and carries no `#[serial(hort_pg_db)]`. **It has no allow-list, by design**: a site that genuinely should not carry the key is a review conversation, not an exemption entry. Its blind spot is the one every source scan has — a helper in *another* file, or a connection opened through a macro — so the review check survives alongside it (see the architect Implementation Review Checklist).
 
 ### Code comments: state the invariant, never the provenance
 
@@ -299,10 +322,29 @@ cargo deny check                                           # advisories+bans+lic
 
 **`cargo test --workspace` is the default pre-push test command — NOT `--lib`.**
 It runs the full local suite — every crate's `--lib` unit tests AND every
-`tests/` integration target. DB-gated tests self-skip without `DATABASE_URL`
-(they report `ignored, requires DATABASE_URL`), so no database is needed: a bare
-`cargo test --workspace` runs every DB-free test and ignores the rest (a typical
-run is ~9.4k run / ~45 DB-gated ignored / 0 failed). This SUPERSEDES the old
+`tests/` integration target. DB-gated tests self-skip without `DATABASE_URL`,
+so no database is needed: a bare `cargo test --workspace` runs every DB-free
+test and early-returns from the rest (measured: 12,368 passed / 9 ignored /
+0 failed, identical to the same command *with* `DATABASE_URL` set).
+**A self-skipped DB-gated test reports `ok`, not `ignored`** — libtest has no
+dynamic-ignore verdict, so the skip is an early `return` from a test that counts
+as passed. The `ignored` column therefore says nothing about how many DB tests
+ran: none of those 9 is DB-gated (5 slow-seeding, 2 broker test-infra TODOs,
+2 doc-tests). An earlier wording here promised
+`ignored, requires DATABASE_URL`; that described the pre-self-skip `#[ignore]`
+world, which the conversion to runtime self-skip retired.
+
+**A `DATABASE_URL` that is set but unreachable is a hard failure, not a skip.**
+The self-skip is the `env::var` read and nothing else: once a URL is in hand the
+operator has declared a database, so
+`test_support::{isolated_db_from, connect_or_panic, shared_migrated_pool}` panic
+rather than hand back a `None` the caller cannot tell apart from "no database
+configured". Before that, a closed-port `DATABASE_URL` produced 12,350 passed /
+1 failed / 7 ignored — 488 of the 489 tests that touch the database claiming
+`ok` without opening a connection — and burned ten minutes of `acquire_timeout`
+doing it. Never
+reintroduce a `.ok()` on a Postgres connect in a fixture; `db_gate_not_silent`
+rejects it. This SUPERSEDES the old
 `--lib`-only gate, which silently excluded **every** `tests/` integration target
 — including the DB-free mock-based ones (the per-format HTTP-handler tests under
 `hort-http-*/tests/`, *and* the structural guards below). That blind spot let a
@@ -325,13 +367,36 @@ ships only in a release strictly after the last one whose code referenced the
 identifier. Cross-checks every migration's destructive DDL against the
 checked-in manifest `migrations/CONTRACTIONS.toml`, requires the workspace
 version to exceed each entry's `reference_removed_in`, and rejects a
-still-referenced identifier in `crates/*/src`), `retention_registration_guard` (ADR 0030 —
+still-referenced identifier in `crates/*/src`), `capped_stream_reads` (ADR 0007 —
+pins that a **bounded** `EventStore::read_stream` exists in exactly one
+production file: every `.read_stream(` call in `crates/*/src` passes either
+`u64::MAX` (an unbounded category, no budget to truncate), a forwarded
+`max_count` inside a `fn read_stream(` (an `EventStore` decorator delegating),
+or `STREAM_EVENT_CAP + 1` and only in `hort-app/src/use_cases/mod.rs`. Any
+other budget is a read that cannot tell a complete stream from a truncated
+one — a reverse scan over it silently answers about the *oldest* N events, so
+a superseded scan verdict reads as current and the `ArtifactRejected` after it
+is invisible to the release authorization. The correct idiom predated the
+guard and convention alone did not hold it: ten capped-read sites across seven
+files got it wrong, nine of them reading exactly `200` with no overflow
+detection. Carries a counter-assertion that the scan still
+finds both audited reads, so a rename cannot make it vacuously green),
+`retention_registration_guard` (ADR 0030 —
 asserts the code-held eventstore-retention rule set
 (`canonical_retention_rules`) only ever registers the permitted categories
 `{Artifact, AuthAttempts, DownloadAudit, TokenUse}`, with a no-wildcard
 exhaustiveness match over every `StreamCategory` so a future variant — or an
 accidentally-seeded privileged category — cannot silently become eligible for
-automated stream deletion) are pure source-/fixture-scan
+automated stream deletion), `db_tests_are_serialized` (the parallel-safety
+contract above — reports every test function reaching a real Postgres
+connection without `#[serial(hort_pg_db)]`, with no allow-list),
+`db_gate_not_silent` (rejects any
+`PgPool`/`PgConnection` connect whose error is discarded with `.ok()`, and pins
+`hort-adapters-postgres`'s isolation harness to a single `?`-shaped skip — the
+`DATABASE_URL` read. A DB-gated fixture only reaches a connect because the
+variable was set, so a swallowed connect error is a configured database that
+did not work being reported as no database at all, and the test then says `ok`
+without having run) are pure source-/fixture-scan
 guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`

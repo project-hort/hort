@@ -1384,7 +1384,7 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use hort_http_core::context::AppContext;
-    use hort_http_core::test_support::build_mock_ctx;
+    use hort_http_core::test_support::{build_mock_ctx, with_provenance_hold_hydration};
 
     // -- Fixtures -----------------------------------------------------------
 
@@ -2748,6 +2748,143 @@ mod tests {
 
         // Reach unused imports to silence lints when only one test in
         // the module relies on these symbols.
+        let _ = std::any::type_name::<MockUpstreamProxy>();
+        let _ = std::any::type_name::<MockUpstreamResolver>();
+    }
+
+    /// The response that TRIGGERS the quarantine must advertise the window
+    /// that is actually left, computed from the derived anchor.
+    ///
+    /// The anchor here is **inherited**: Hort already holds these exact
+    /// bytes in another repository, first observed eight hours ago, so ADR
+    /// 0054's age-evidence source anchors this repository's window eight
+    /// hours in the past. Against a 48-hour policy the honest remaining
+    /// window is ~40 h.
+    ///
+    /// The bound is what makes this test worth having. Both plausible wrong
+    /// answers sit outside it and neither is visible on a freshly-seen
+    /// artifact: reporting the policy duration (`now + 48 h`) would say
+    /// 172800, and falling back to "deadline unknown" would say 3600. A
+    /// fixture whose anchor is the mint instant cannot tell any of the
+    /// three apart.
+    #[test]
+    fn cache_miss_quarantining_503_reports_the_remaining_inherited_window() {
+        use hort_app::use_cases::test_support::MockUpstreamProxy;
+        use hort_app::use_cases::test_support::MockUpstreamResolver;
+        use hort_domain::ports::repository_upstream_mapping_repository::{
+            RepositoryUpstreamMapping, UpstreamAuth,
+        };
+
+        const WINDOW_SECS: i64 = 48 * 3600;
+        const INHERITED_AGE_SECS: i64 = 8 * 3600;
+
+        let content = b"already-seen-eight-hours-ago".to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (status, retry_after, body) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            // Opt the read-path hydration into the real policy resolution.
+            // Left unwired, `ArtifactUseCase` falls back on
+            // `DefaultPolicy::quarantine_duration_secs` and the configured
+            // window below would never reach the response — see
+            // `with_provenance_hold_hydration`'s own doc for why the
+            // harness default is opt-in.
+            let ctx = with_provenance_hold_hydration(&ctx);
+
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            mocks
+                .policy_projections
+                .insert(quarantining_policy_with_window(repo_id, WINDOW_SECS));
+
+            // The age evidence: the same bytes, already held by SOME OTHER
+            // repository, first observed eight hours ago. The adapter's
+            // `first_seen_for_checksum` is unscoped by repository, which is
+            // exactly why this row shortens the new repository's window.
+            let mut seen_before = sample_artifact(QuarantineStatus::Released);
+            seen_before.repository_id = Uuid::new_v4();
+            seen_before.path = format!("blobs/sha256:{hex}");
+            seen_before.sha256_checksum = hex.parse().unwrap();
+            seen_before.created_at = Utc::now() - chrono::Duration::seconds(INHERITED_AGE_SECS);
+            mocks.artifacts.insert(seen_before);
+
+            let now = Utc::now();
+            mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
+                id: Uuid::new_v4(),
+                repository_id: repo_id,
+                path_prefix: "dockerhub/".into(),
+                upstream_url: "https://registry.example.com".into(),
+                upstream_name_prefix: None,
+                upstream_auth: UpstreamAuth::Anonymous,
+                secret_ref: None,
+                managed_by: hort_domain::entities::managed_by::ManagedBy::Local,
+                managed_by_digest: None,
+                insecure_upstream_url: false,
+                // The inherited anchor comes from Hort's OWN observation,
+                // not from an upstream claim — the publish-time opt-in
+                // stays off so this test cannot pass for the wrong reason.
+                trust_upstream_publish_time: false,
+                mtls_cert_ref: None,
+                mtls_key_ref: None,
+                ca_bundle_ref: None,
+                pinned_cert_sha256: None,
+                created_at: now,
+                updated_at: now,
+            });
+            mocks.upstream_proxy.insert_blob(
+                "dockerhub/",
+                "library/hello-world",
+                &format!("sha256:{hex}"),
+                content.clone(),
+                Some(format!("sha256:{hex}")),
+            );
+
+            let router = blob_router(ctx);
+            let uri = format!("/v2/myrepo/dockerhub/library/hello-world/blobs/sha256:{hex}");
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, retry_after, body)
+        });
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a quarantining pull-through answers 503"
+        );
+        let secs: i64 = retry_after
+            .expect("the quarantining response must carry Retry-After")
+            .parse()
+            .unwrap();
+        let expected = WINDOW_SECS - INHERITED_AGE_SECS;
+        assert!(
+            (expected - 10..=expected).contains(&secs),
+            "Retry-After {secs} must be the window left from the inherited anchor \
+             (~{expected}s), not the full policy duration ({WINDOW_SECS}s) and not the \
+             deadline-unknown fallback (3600s)"
+        );
+        // The body's echo is computed from the same value, so a regression
+        // that fixed only the header would still be caught.
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["retry_after_seconds"].as_i64(),
+            Some(secs),
+            "detail.retry_after_seconds must echo the header"
+        );
+
         let _ = std::any::type_name::<MockUpstreamProxy>();
         let _ = std::any::type_name::<MockUpstreamResolver>();
     }
@@ -4162,13 +4299,24 @@ mod tests {
         PrometheusBuilder::new().build_recorder().handle()
     }
 
-    /// A repo-scoped, quarantining, scanning `ScanPolicy` for `repo_id` —
-    /// repo-scoped wins over `build_mock_ctx`'s pre-seeded permissive-
-    /// global default (`resolve_active_policy_for_repo`'s
-    /// `repo_scoped.or(global)`), so seeding one per repo below does not
-    /// interact with the other repo in the same test.
+    /// A repo-scoped, quarantining, scanning `ScanPolicy` for `repo_id`
+    /// with a one-hour observation window — repo-scoped wins over
+    /// `build_mock_ctx`'s pre-seeded permissive-global default
+    /// (`resolve_active_policy_for_repo`'s `repo_scoped.or(global)`), so
+    /// seeding one per repo below does not interact with the other repo in
+    /// the same test.
     fn quarantining_policy(
         repo_id: Uuid,
+    ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+        quarantining_policy_with_window(repo_id, 3600)
+    }
+
+    /// [`quarantining_policy`] with the observation window as a parameter,
+    /// for a test whose assertion is about the window's length rather than
+    /// about the hold existing.
+    fn quarantining_policy_with_window(
+        repo_id: Uuid,
+        window_secs: i64,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
             NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
@@ -4178,10 +4326,10 @@ mod tests {
         let now = Utc::now();
         ScanPolicyProjection {
             policy_id: Uuid::new_v4(),
-            name: format!("item3-follower-regression-{repo_id}"),
+            name: format!("quarantining-{window_secs}s-{repo_id}"),
             scope: PolicyScope::Repository(repo_id),
             severity_threshold: SeverityThreshold::Critical,
-            quarantine_duration_secs: 3600,
+            quarantine_duration_secs: window_secs,
             require_approval: false,
             provenance_mode: ProvenanceMode::Off,
             provenance_backends: Vec::new(),

@@ -26,12 +26,13 @@ use hort_domain::events::{
     ArtifactBecameVulnerable, DomainEvent, IngestSource, PersistedEvent, ScanAssessment,
     ScanCompleted, SeveritySummary, StreamId,
 };
+use hort_domain::ports::event_store::{EventStore, ReadFrom};
 use hort_domain::ports::repo_security_score_repository::RepoSecurityScore;
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
 use hort_domain::ports::BoxFuture;
 use hort_domain::retention::{
-    BooleanOp, ExpirationReason, PolicyPredicate, RetentionPolicy, RetentionPolicyEvent,
-    RetentionScope,
+    BooleanOp, ExpirationReason, PolicyPredicate, RetentionEvaluationMode, RetentionPolicy,
+    RetentionPolicyEvent, RetentionScope,
 };
 use hort_domain::types::Finding;
 
@@ -245,7 +246,10 @@ fn candidate(status: QuarantineStatus, created_at: DateTime<Utc>) -> RetentionCa
     RetentionCandidate {
         artifact: a,
         format: hort_domain::entities::repository::RepositoryFormat::Generic,
+        repository_key: "npm-proxy".into(),
         resolved_rescan_interval_hours: Some(24),
+        keep_rank: None,
+        tag_targeted: false,
     }
 }
 
@@ -318,6 +322,251 @@ fn seed_fresh_scanned_stream(
     }
     store.set_stream(&stream_id, events);
     stream_id
+}
+
+#[tokio::test]
+async fn dry_run_and_execute_select_identical_candidates_but_only_execute_appends() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let old = candidate(QuarantineStatus::Released, ts(0));
+    let old_id = old.artifact.id;
+    let young = candidate(QuarantineStatus::Released, ts(950));
+    let old_stream = seed_stream(&store, &old, IngestSource::Proxied, vec![]);
+    seed_stream(&store, &young, IngestSource::Proxied, vec![]);
+    let before = store
+        .read_stream(&old_stream, ReadFrom::Start, 200)
+        .await
+        .unwrap();
+
+    let preview = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            std::slice::from_ref(&p),
+            &[old.clone(), young.clone()],
+            RetentionEvaluationMode::DryRun,
+        )
+        .await
+        .unwrap();
+    let after = store
+        .read_stream(&old_stream, ReadFrom::Start, 200)
+        .await
+        .unwrap();
+    assert_eq!(before, after);
+    assert!(store.appended_batches().is_empty());
+
+    let execution = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            &[old, young],
+            RetentionEvaluationMode::Execute,
+        )
+        .await
+        .unwrap();
+    let preview_ids: Vec<_> = preview.matches.iter().map(|hit| hit.artifact_id).collect();
+    let execution_ids: Vec<_> = execution
+        .matches
+        .iter()
+        .map(|hit| hit.artifact_id)
+        .collect();
+    assert_eq!(preview_ids, execution_ids);
+    assert_eq!(preview_ids, vec![old_id]);
+    assert_eq!(store.appended_batches().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Stream-event cap
+//
+// The expiry append is the one artifact-stream writer that appends at
+// `ExpectedVersion::Any`, so the adapter performs no version check on it
+// and it inherits none of the bound `read_expected_version` gives every
+// `Exact` writer. It therefore carries the refusal itself; without it the
+// daily sweep is the only writer able to push an artifact stream past
+// `STREAM_EVENT_CAP`, and past the cap every capped reader of that stream
+// — the quarantine release authorization first — silently decides on the
+// oldest prefix.
+// ---------------------------------------------------------------------------
+
+/// Seed a stream of exactly `total` events: the genesis
+/// `ArtifactIngested` followed by `total - 1` padding events, none of
+/// which is an `ArtifactExpired` (so the idempotency check does not
+/// short-circuit) and none a `ScanCompleted` (so the age predicate below
+/// needs no freshness proof).
+fn seed_stream_of_length(store: &MockEventStore, c: &RetentionCandidate, total: u64) -> StreamId {
+    let stream_id = StreamId::artifact(c.artifact.id);
+    let mut events = vec![persisted(
+        &stream_id,
+        0,
+        c.artifact.created_at,
+        ingested(c.artifact.id, IngestSource::Proxied),
+    )];
+    for pos in 1..total {
+        events.push(persisted(
+            &stream_id,
+            pos,
+            c.artifact.created_at,
+            DomainEvent::ArtifactReleased(hort_domain::events::ArtifactReleased {
+                artifact_id: c.artifact.id,
+                released_by: hort_domain::events::ReleaseReason::Timer,
+                released_by_user_id: None,
+                justification: None,
+            }),
+        ));
+    }
+    store.set_stream(&stream_id, events);
+    stream_id
+}
+
+/// A stream sitting exactly ON the cap still reads completely — so the
+/// predicate matches — but the append that would take it to 201 events is
+/// refused. The pair is reported as an error (the sweep keeps going) and
+/// NOTHING is appended.
+#[tokio::test]
+async fn expiry_append_refuses_a_stream_already_at_the_event_cap() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let c = candidate(QuarantineStatus::Released, ts(0));
+    seed_stream_of_length(&store, &c, 200);
+
+    let report = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            std::slice::from_ref(&c),
+            RetentionEvaluationMode::Execute,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        store.appended_batches().is_empty(),
+        "the expiry append must refuse a stream the cap does not have room for; \
+         appending here is the bypass that lets the sweep grow a stream without bound"
+    );
+    assert_eq!(report.summary.expired, 0);
+    assert_eq!(
+        report.summary.errors, 1,
+        "the refusal is reported as a per-pair error so the sweep continues"
+    );
+}
+
+/// One event short of the cap there IS room, so the same fixture expires
+/// normally. Without this counter-factual the assertion above would also
+/// hold for a fixture that simply never matched.
+#[tokio::test]
+async fn expiry_append_still_lands_one_event_short_of_the_cap() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let c = candidate(QuarantineStatus::Released, ts(0));
+    seed_stream_of_length(&store, &c, 199);
+
+    let report = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            std::slice::from_ref(&c),
+            RetentionEvaluationMode::Execute,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.expired, 1);
+    assert_eq!(report.summary.errors, 0);
+    let batches = store.appended_batches();
+    assert_eq!(batches.len(), 1);
+    assert!(matches!(
+        batches[0].events[0].event,
+        DomainEvent::ArtifactExpired(_)
+    ));
+}
+
+/// The evaluator's own read is the second half of the close, and it is
+/// load-bearing independently of the append guard: the idempotency check
+/// runs over the stream this read returns, so over a truncated prefix an
+/// `ArtifactExpired` for the same policy that sits past the cap is
+/// invisible and the pair reads as "never expired" every pass.
+///
+/// Asserted in **dry-run** mode deliberately — dry run never reaches
+/// `append_expired`, so the only thing that can refuse here is the read.
+/// The existing `ArtifactExpired` is the last event on the stream, i.e.
+/// exactly where a truncated read cannot see it.
+#[tokio::test]
+async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let c = candidate(QuarantineStatus::Released, ts(0));
+    let stream_id = seed_stream_of_length(&store, &c, 201);
+    let mut stream = store
+        .read_stream(&stream_id, ReadFrom::Start, 1_000)
+        .await
+        .unwrap();
+    stream.push(persisted(
+        &stream_id,
+        201,
+        c.artifact.created_at,
+        DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
+            artifact_id: c.artifact.id,
+            policy_id: p.id,
+            policy_name: p.name.clone(),
+            reason: ExpirationReason::AgeExceeded {
+                published_at: ts(0),
+                ttl_secs: 100,
+            },
+            eligible_at: ts(900),
+        }),
+    ));
+    assert_eq!(stream.len(), 202);
+    store.set_stream(&stream_id, stream);
+
+    let report = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            std::slice::from_ref(&c),
+            RetentionEvaluationMode::DryRun,
+        )
+        .await
+        .unwrap();
+
+    assert!(store.appended_batches().is_empty());
+    assert_eq!(report.summary.errors, 1);
+    assert_eq!(
+        report.summary.already_expired, 0,
+        "the pair is reported as an error, not as an idempotent no-op — the read \
+         could not prove either answer"
+    );
+    assert!(
+        report.matches.is_empty(),
+        "a stream that cannot be read completely yields no decision at all, not a \
+         decision derived from its oldest 200 events — which here would be a second \
+         ArtifactExpired for a policy that already expired this artifact"
+    );
+}
+
+/// A match reports the repository by the key the operator writes into a
+/// policy, carried from the candidate the reader supplied — not resolved
+/// afterwards by a per-repository lookup. The UUID stays alongside it.
+#[tokio::test]
+async fn a_match_carries_the_candidates_repository_key_beside_its_id() {
+    let (uc, _store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(100), RetentionScope::AllRepos);
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.repository_key = "cargo-mirror".into();
+    seed_stream(&_store, &c, IngestSource::Proxied, vec![]);
+
+    let report = uc
+        .evaluate_policies_in_mode(
+            ts(1_000),
+            &[p],
+            std::slice::from_ref(&c),
+            RetentionEvaluationMode::DryRun,
+        )
+        .await
+        .unwrap();
+
+    let hit = report.matches.first().expect("one match");
+    assert_eq!(hit.repository_key, "cargo-mirror");
+    assert_eq!(hit.repository_id, c.artifact.repository_id);
 }
 
 // ===========================================================================
@@ -1469,6 +1718,44 @@ mod metrics {
         );
     }
 
+    /// `hort_retention_expired_total{reason="keep_last_n"}` is live
+    /// now that the sibling ranking reaches the evaluator.
+    #[test]
+    fn keep_last_n_reason_label_fires() {
+        let pid = Uuid::new_v4();
+        let snap = run(move || {
+            Box::pin(async move {
+                let store = Arc::new(MockEventStore::new());
+                let uc = RetentionUseCase::new(
+                    wrap_for_test(store.clone()),
+                    Arc::new(MockRetentionScanReader::new()),
+                );
+                let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    id: pid,
+                    name: "keep-last".into(),
+                    predicate: PolicyPredicate::KeepLastN(3),
+                    scope: RetentionScope::AllRepos,
+                    created_at: ts(0),
+                }])
+                .unwrap();
+                let c = ranked_candidate(Some((4, 10)), false);
+                seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+                uc.evaluate_policies(ts(1_000_000), &[p], &[c])
+                    .await
+                    .unwrap();
+            })
+        });
+        let pid_s = pid.to_string();
+        assert_eq!(
+            counter(
+                &snap,
+                "hort_retention_expired_total",
+                &[("policy_id", pid_s.as_str()), ("reason", "keep_last_n")],
+            ),
+            Some(1)
+        );
+    }
+
     #[test]
     fn no_match_and_skipped_quarantined_labels_fire() {
         let pid_nm = Uuid::new_v4();
@@ -1741,4 +2028,115 @@ mod metrics {
             "security-driven expiry must carry reason=\"security_finding\""
         );
     }
+}
+
+// ===========================================================================
+// KeepLastN — sibling rank and the tag exemption
+// ===========================================================================
+
+/// A candidate carrying a resolved sibling ranking (and optionally a
+/// live mutable ref resolving to it).
+fn ranked_candidate(keep_rank: Option<(u32, u32)>, tag_targeted: bool) -> RetentionCandidate {
+    let mut c = candidate(QuarantineStatus::Released, ts(0));
+    c.keep_rank = keep_rank;
+    c.tag_targeted = tag_targeted;
+    c
+}
+
+#[tokio::test]
+async fn keep_last_n_expires_a_candidate_outside_the_keep_window() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::KeepLastN(3), RetentionScope::AllRepos);
+    // 4th-newest of 10 siblings — one past the keep window.
+    let c = ranked_candidate(Some((4, 10)), false);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 1);
+    let batches = store.appended_batches();
+    assert_eq!(batches.len(), 1);
+    match &batches[0].events[0].event {
+        DomainEvent::ArtifactExpired(e) => assert_eq!(
+            e.reason,
+            ExpirationReason::KeepLastN {
+                keep: 3,
+                total: 10,
+                rank: 4
+            }
+        ),
+        other => panic!("expected ArtifactExpired, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn keep_last_n_leaves_a_candidate_inside_the_keep_window() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::KeepLastN(3), RetentionScope::AllRepos);
+    let c = ranked_candidate(Some((3, 10)), false);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 0);
+    assert!(store.appended_batches().is_empty());
+}
+
+#[tokio::test]
+async fn keep_last_n_without_a_resolved_rank_fails_safe() {
+    // The reader could not resolve a ranking: the predicate must not
+    // match, whatever the keep count.
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::KeepLastN(1), RetentionScope::AllRepos);
+    let c = ranked_candidate(None, false);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 0);
+    assert!(store.appended_batches().is_empty());
+}
+
+#[tokio::test]
+async fn keep_last_n_does_not_expire_a_tag_target_however_low_its_rank() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::KeepLastN(3), RetentionScope::AllRepos);
+    // Oldest of 10 — far outside the window, but a live ref names it.
+    let c = ranked_candidate(Some((10, 10)), true);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 0, "a tag target survives KeepLastN");
+    assert!(store.appended_batches().is_empty());
+}
+
+#[tokio::test]
+async fn tag_target_still_expires_under_an_age_policy() {
+    // The exemption is scoped to KeepLastN: an age policy is the
+    // operator's explicit instruction and a tag does not countermand it.
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = policy(PolicyPredicate::AgeExceeds(1), RetentionScope::AllRepos);
+    let c = ranked_candidate(Some((10, 10)), true);
+    seed_stream(&store, &c, IngestSource::Proxied, vec![]);
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .unwrap();
+
+    assert_eq!(s.expired, 1);
+    assert_eq!(store.appended_batches().len(), 1);
 }

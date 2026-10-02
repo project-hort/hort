@@ -80,10 +80,20 @@ pub trait SubscriptionRepository: Send + Sync {
     /// the full `Subscription` row in scope and so the write touches only
     /// two columns. `last_failure = None` clears the row's failure marker
     /// (first success after a failure run).
+    ///
+    /// `position = None` means "record the failure, leave the position
+    /// where it is". The dispatcher needs it because the position it
+    /// persists alongside a failure is the position *before* the event
+    /// that failed — reads have to resume at the failed event, not past
+    /// it — and for a subscription whose first-ever delivery fails there
+    /// is no such position. Implementations MUST leave the stored
+    /// position untouched rather than writing NULL over it: a `None` here
+    /// is the absence of an advance, never a rewind to the start of the
+    /// log.
     fn update_last_delivered(
         &self,
         id: SubscriptionId,
-        position: u64,
+        position: Option<u64>,
         last_failure: Option<&SubscriptionFailure>,
     ) -> BoxFuture<'_, DomainResult<()>>;
 }

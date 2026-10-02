@@ -1191,12 +1191,12 @@ impl SubscriptionRepository for PgSubscriptionRepository {
     fn update_last_delivered(
         &self,
         id: SubscriptionId,
-        position: u64,
+        position: Option<u64>,
         last_failure: Option<&SubscriptionFailure>,
     ) -> BoxFuture<'_, DomainResult<()>> {
         // Encode the failure (if any) eagerly so the future is
         // `'static`-clean.
-        let position_i64 = position as i64;
+        let position_i64 = position.map(|p| p as i64);
         let last_failure_json = last_failure.map(LastFailureDto::to_json);
         Box::pin(async move {
             tracing::debug!(
@@ -1204,9 +1204,15 @@ impl SubscriptionRepository for PgSubscriptionRepository {
                 subscription_id = %id.0,
                 "update_last_delivered"
             );
+            // COALESCE, not a bare assignment: a `None` position means the
+            // caller has no advance to record (it is writing a failure for
+            // an event at or below the stored position), and overwriting
+            // the column with NULL would rewind the cursor to the start of
+            // the log and replay everything.
             sqlx::query(
                 "UPDATE subscriptions SET \
-                 last_delivered_position = $2, last_failure = $3 \
+                 last_delivered_position = COALESCE($2, last_delivered_position), \
+                 last_failure = $3 \
                  WHERE id = $1",
             )
             .bind(id.0)

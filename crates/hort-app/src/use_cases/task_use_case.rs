@@ -54,8 +54,8 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::error::DomainError;
 use hort_domain::events::{
-    task_kind_is_destructive, Actor, ApiActor, DomainEvent, StreamId, TaskInvoked,
-    ADMIN_INVOKABLE_TASK_KINDS, DESTRUCTIVE_TASK_CLAIM,
+    task_invocation_is_destructive, task_kind_is_destructive, Actor, ApiActor, DomainEvent,
+    StreamId, TaskInvoked, ADMIN_INVOKABLE_TASK_KINDS, DESTRUCTIVE_TASK_CLAIM,
 };
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
@@ -96,15 +96,16 @@ impl TaskUseCase {
         Self { jobs, events, rbac }
     }
 
-    /// Authorize `actor` to invoke task `kind`, **before** any param
-    /// parsing, idempotency probe, or port I/O.
+    /// Authorize `actor` to invoke task `kind`, **before** semantic param
+    /// validation, idempotency probe, or port I/O.
     ///
     /// Two-factor, fail-safe-by-AND:
     ///
     /// 1. The existing coarse gate — `Permission::AdminTaskInvoke` via
     ///    [`RbacEvaluator::authorize`] (unchanged for every kind).
-    /// 2. **For destructive kinds only** ([`task_kind_is_destructive`] —
-    ///    `retention-purge` / `eventstore-archive` / `retention-evaluate`):
+    /// 2. **For destructive invocations only**: every
+    ///    `retention-purge` / `eventstore-archive`, plus
+    ///    `retention-evaluate` in execute mode (including the default):
     ///    the caller's resolved `principal.claims` must additionally
     ///    satisfy the [`DESTRUCTIVE_TASK_CLAIM`] requirement, evaluated
     ///    through the **same** `RbacEvaluator` claim subset-match the
@@ -116,6 +117,13 @@ impl TaskUseCase {
     /// Ordinary kinds keep **exactly** today's `AdminTaskInvoke`-only
     /// gate — zero behaviour change for `noop`/`scan`/etc.
     ///
+    /// Factor 2 reads [`task_invocation_is_destructive`], the domain's
+    /// single answer to "will this call destroy anything?". The invoke
+    /// handler's durable per-UTC-day idempotency key (ADR 0028) reads the
+    /// same function, so the authority an invocation needs and the
+    /// single-flight claim it takes cannot come apart. Re-deriving either
+    /// one locally is how they came apart before.
+    ///
     /// Denial is logged at `info!` (audit signal, NOT `err`) naming the
     /// missing authority and returns
     /// `AppError::Domain(DomainError::Forbidden(…))`. Called both at the
@@ -124,7 +132,12 @@ impl TaskUseCase {
     /// [`Self::enqueue`] (defense-in-depth — a direct use-case caller is
     /// still gated).
     #[tracing::instrument(skip(self))]
-    pub fn authorize_kind(&self, actor: &CallerPrincipal, kind: &str) -> AppResult<()> {
+    pub fn authorize_kind(
+        &self,
+        actor: &CallerPrincipal,
+        kind: &str,
+        params: &serde_json::Value,
+    ) -> AppResult<()> {
         let rbac = self.rbac.load();
 
         // Factor 1 — the unchanged coarse `AdminTaskInvoke` gate.
@@ -139,12 +152,14 @@ impl TaskUseCase {
             ))));
         }
 
-        // Factor 2 — destructive kinds need the extra claim. Reuse the
+        // Factor 2 — destructive invocations need the extra claim. Reuse the
         // RbacEvaluator claim subset-match (incl. the synthetic-`admin`
         // short-circuit) by checking a synthetic single-claim requirement
         // against the same evaluator semantics, rather than re-deriving
-        // the subset test here.
-        if task_kind_is_destructive(kind)
+        // the subset test here. The destructive/not answer is likewise the
+        // domain's, shared with the idempotency-key derivation.
+        let requires_destructive_claim = task_invocation_is_destructive(kind, params)?;
+        if requires_destructive_claim
             && !rbac.claims_satisfy(actor, std::slice::from_ref(&DESTRUCTIVE_TASK_CLAIM))
         {
             tracing::info!(
@@ -160,7 +175,7 @@ impl TaskUseCase {
             ))));
         }
 
-        if task_kind_is_destructive(kind) {
+        if requires_destructive_claim {
             tracing::info!(
                 actor_user_id = %actor.user_id,
                 kind,
@@ -197,6 +212,17 @@ impl TaskUseCase {
     /// list (a new classifier here would be the scope-creep regression
     /// `DESTRUCTIVE_TASK_KINDS`'s doc warns against).
     ///
+    /// **Per kind, deliberately — not per invocation.** Unlike the
+    /// `task:destructive` claim gate and the durable idempotency key,
+    /// which both read
+    /// [`task_invocation_is_destructive`](hort_domain::events::task_invocation_is_destructive),
+    /// audit routing asks the coarser question on purpose: a
+    /// `retention-evaluate` dry run's `TaskInvoked` belongs on the
+    /// never-deleted stream with the executions it is deciding about, so
+    /// the two are readable as one trail and neither can be truncated by
+    /// the kind it audits. Narrowing this to the invocation would scatter
+    /// that trail across two streams for no gain.
+    ///
     /// **Split emit-sites (intentional):**
     /// `TaskUseCase` only ever emits `TaskInvoked`; the `TaskFailed`
     /// audit record is emitted by the worker dispatcher (in
@@ -217,8 +243,8 @@ impl TaskUseCase {
     ///
     /// Steps:
     /// 1. Validate `kind` is in the v1 allowlist.
-    /// 2. Per-kind authz via [`Self::authorize_kind`] (coarse
-    ///    `AdminTaskInvoke` AND, for destructive kinds, the
+    /// 2. Per-invocation authz via [`Self::authorize_kind`] (coarse
+    ///    `AdminTaskInvoke` AND, for destructive invocations, the
     ///    `task:destructive` claim).
     /// 3. Insert a `jobs` row with `status='pending'` via `JobsRepository::enqueue_task`.
     /// 4. Append `TaskInvoked` on the kind-routed audit stream
@@ -287,7 +313,7 @@ impl TaskUseCase {
         //    first, before param-validate / idempotency probe; calling it
         //    again here keeps a direct use-case caller independently
         //    gated). Shared logic — no parallel evaluator.
-        self.authorize_kind(actor, kind)?;
+        self.authorize_kind(actor, kind, params)?;
 
         // 3. Insert jobs row. `trigger_source = "manual"` mirrors
         //    `TriggerSource::Manual` — the admin-task POST is operator-
@@ -1124,7 +1150,9 @@ mod tests {
             crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
         let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
         let actor = caller_with_task_admin_role();
-        assert!(use_case.authorize_kind(&actor, "noop").is_ok());
+        assert!(use_case
+            .authorize_kind(&actor, "noop", &serde_json::json!({}))
+            .is_ok());
     }
 
     /// `authorize_kind`: a caller WITHOUT `AdminTaskInvoke` is denied an
@@ -1137,7 +1165,7 @@ mod tests {
         let use_case = TaskUseCase::new(jobs, events, rbac_deny_all());
         let actor = caller_no_roles();
         assert!(matches!(
-            use_case.authorize_kind(&actor, "noop"),
+            use_case.authorize_kind(&actor, "noop", &serde_json::json!({})),
             Err(AppError::Domain(DomainError::Forbidden(_)))
         ));
     }
@@ -1156,7 +1184,7 @@ mod tests {
             "eventstore-archive",
             "retention-evaluate",
         ] {
-            let r = use_case.authorize_kind(&actor, kind);
+            let r = use_case.authorize_kind(&actor, kind, &serde_json::json!({}));
             assert!(
                 matches!(r, Err(AppError::Domain(DomainError::Forbidden(_)))),
                 "destructive kind {kind:?} must be Forbidden without the claim; got {r:?}"
@@ -1179,7 +1207,9 @@ mod tests {
             "retention-evaluate",
         ] {
             assert!(
-                use_case.authorize_kind(&actor, kind).is_ok(),
+                use_case
+                    .authorize_kind(&actor, kind, &serde_json::json!({}))
+                    .is_ok(),
                 "destructive kind {kind:?} must be allowed with the claim"
             );
         }
@@ -1198,8 +1228,55 @@ mod tests {
         let mut actor = caller_no_roles();
         actor.claims = vec!["task:destructive".into()];
         assert!(matches!(
-            use_case.authorize_kind(&actor, "retention-purge"),
+            use_case.authorize_kind(&actor, "retention-purge", &serde_json::json!({}),),
             Err(AppError::Domain(DomainError::Forbidden(_)))
+        ));
+    }
+
+    #[test]
+    fn authorize_kind_retention_dry_run_needs_no_destructive_claim() {
+        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
+        let events: Arc<EventStorePublisher> =
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
+        let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
+        let actor = caller_with_task_admin_role();
+
+        assert!(use_case
+            .authorize_kind(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "dry_run" }),
+            )
+            .is_ok());
+        assert!(matches!(
+            use_case.authorize_kind(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "execute" }),
+            ),
+            Err(AppError::Domain(DomainError::Forbidden(_)))
+        ));
+    }
+
+    #[test]
+    fn authorize_kind_retention_mode_defaults_to_execute_and_rejects_unknown() {
+        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
+        let events: Arc<EventStorePublisher> =
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
+        let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
+        let actor = caller_with_task_admin_role();
+
+        assert!(matches!(
+            use_case.authorize_kind(&actor, "retention-evaluate", &serde_json::json!({})),
+            Err(AppError::Domain(DomainError::Forbidden(_)))
+        ));
+        assert!(matches!(
+            use_case.authorize_kind(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "unknown" }),
+            ),
+            Err(AppError::Domain(DomainError::Validation(_)))
         ));
     }
 
@@ -1220,6 +1297,53 @@ mod tests {
             matches!(result, Err(AppError::Domain(DomainError::Forbidden(_)))),
             "direct enqueue of destructive kind must stay gated; got {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn enqueue_retention_mode_enforces_defense_in_depth() {
+        let preview_job_id = Uuid::new_v4();
+        let preview_jobs = Arc::new(RecordingJobsRepository::new(preview_job_id));
+        let preview_events = Arc::new(RecordingEventStore::new());
+        let preview_use_case = TaskUseCase::new(
+            Arc::clone(&preview_jobs) as _,
+            crate::event_store_publisher::wrap_for_test(Arc::clone(&preview_events)),
+            rbac_with_task_invoke(),
+        );
+        let actor = caller_with_task_admin_role();
+        let result = preview_use_case
+            .enqueue(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "dry_run" }),
+                None,
+            )
+            .await;
+        assert_eq!(
+            result.expect("dry-run enqueue should need no destructive claim"),
+            EnqueueOutcome::Enqueued {
+                job_id: preview_job_id
+            }
+        );
+        assert_eq!(preview_jobs.enqueue_calls().len(), 1);
+        assert_eq!(preview_events.append_calls().len(), 1);
+
+        let denied_use_case = TaskUseCase::new(
+            Arc::new(PanicJobsRepository),
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore)),
+            rbac_with_task_invoke(),
+        );
+        let denied = denied_use_case
+            .enqueue(
+                &actor,
+                "retention-evaluate",
+                &serde_json::json!({ "mode": "execute" }),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            denied,
+            Err(AppError::Domain(DomainError::Forbidden(_)))
+        ));
     }
 
     /// Defense-in-depth: a direct `enqueue` of a destructive kind WITH

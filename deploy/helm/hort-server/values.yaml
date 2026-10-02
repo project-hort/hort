@@ -1564,10 +1564,12 @@ scheduledTasks:
   # default-enabled sweep would otherwise drag the whole
   # `adminTasksEnabled` + `svc-token-bootstrap` Job machinery to
   # default-on. The runtime DSN is least-privilege (it owns nothing
-  # identity-wise). For MANUAL operator invocations, the
-  # `hort-http-admin-tasks` route + `hort-cli admin task invoke
-  # quarantine-release-sweep` still work — this template is the
-  # default scheduled path only.
+  # identity-wise). There is no HTTP invoke route for this kind either:
+  # `hort-http-admin-tasks` enumerates its invoke routes one by one and
+  # `quarantine-release-sweep` is not among them, so
+  # `POST /api/v1/admin/tasks/quarantine-release-sweep` answers 404. An
+  # off-schedule sweep is `hort-server enqueue-quarantine-release-sweep`
+  # on the runtime DSN — the same command this CronJob runs.
   quarantineReleaseSweep:
     executionPath: dsn-direct
     # Render the CronJob. **Default true.** An operator who has not yet
@@ -1599,8 +1601,11 @@ scheduledTasks:
   # the `PrefetchUseCase::plan` planner per tracked package.
   #
   # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
-  # umbrella. Manual operator invocation still works via the
-  # `hort-http-admin-tasks` HTTP route.
+  # umbrella — and no HTTP invoke route either: `hort-http-admin-tasks`
+  # enumerates its invoke routes one by one and `prefetch-tick` is not
+  # among them, so `POST /api/v1/admin/tasks/prefetch-tick` answers 404.
+  # An off-schedule run is `hort-server enqueue-prefetch-tick` on the
+  # runtime DSN — the same command this CronJob runs.
   prefetchTick:
     executionPath: dsn-direct
     # Render the CronJob. **Default false.** Prefetch is opt-in
@@ -1624,10 +1629,17 @@ scheduledTasks:
   # ONE `kind='prefetch-row-retention-sweep'` row into `public.jobs`
   # every tick using the RUNTIME DSN; the worker picks it up and runs
   # `PrefetchRowRetentionSweepHandler`, which deletes terminal
-  # (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'` and
-  # `kind = 'oci-index-child-ingest'` rows older than a configurable
-  # horizon (default 7 days) — the pull-through ingest cascade's rows,
-  # none of which hold durable state.
+  # (`status IN ('completed', 'failed')`) `kind LIKE 'prefetch%'`
+  # (minus `prefetch-tick`) and `kind = 'oci-index-child-ingest'` rows
+  # older than the handler's 7-day `DEFAULT_HORIZON` — the pull-through
+  # ingest cascade's rows, none of which hold durable state.
+  # `prefetch-tick` is carved out because its newest `completed` row
+  # carries the prefetch rotation's keyset cursor; `jobsRowRetentionSweep`
+  # sweeps that kind instead, and retains it.
+  #
+  # The horizon is not a chart value and is not settable at all: the
+  # CronJob runs the subcommand with no arguments and the subcommand
+  # writes `params` unconditionally empty.
   #
   # Pairs with the per-table autovacuum tuning on `public.jobs`
   # (migration 009: `autovacuum_vacuum_scale_factor = 0.02`). The
@@ -1636,8 +1648,13 @@ scheduledTasks:
   # without periodic GC, terminal `prefetch%` rows accumulate unbounded.
   #
   # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
-  # umbrella. Manual operator invocation still works via the
-  # `hort-http-admin-tasks` HTTP route.
+  # umbrella — and no HTTP invoke route either: `hort-http-admin-tasks`
+  # enumerates its invoke routes one by one and
+  # `prefetch-row-retention-sweep` is not among them, so
+  # `POST /api/v1/admin/tasks/prefetch-row-retention-sweep` answers 404.
+  # An off-schedule run is
+  # `hort-server enqueue-prefetch-row-retention-sweep` on the runtime
+  # DSN — the same command this CronJob runs.
   prefetchRowRetentionSweep:
     executionPath: dsn-direct
     # Render the CronJob. **Default true**, because this sweep's rows
@@ -1665,15 +1682,22 @@ scheduledTasks:
   # `kind='scan-row-retention-sweep'` row into `public.jobs` every tick
   # using the RUNTIME DSN; the worker picks it up and dispatches to
   # `ScanRowRetentionSweepHandler`, which deletes terminal
-  # `kind='scan'` rows older than the configured horizon (default 7
-  # days). Pairs with the per-table autovacuum tuning on `public.jobs`
+  # `kind='scan'` rows older than the handler's 7-day `DEFAULT_HORIZON`.
+  # The horizon is not a chart value and is not settable at all: the
+  # CronJob runs the subcommand with no arguments and the subcommand
+  # writes `params` unconditionally empty.
+  # Pairs with the per-table autovacuum tuning on `public.jobs`
   # (migration 009: `autovacuum_vacuum_scale_factor = 0.02`). Every
   # artifact scan — ingest plus every periodic rescan — leaves a
   # terminal row forever without this sweep.
   #
   # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
-  # umbrella. Manual operator invocation still works via the
-  # `hort-http-admin-tasks` HTTP route.
+  # umbrella — and no HTTP invoke route either: `hort-http-admin-tasks`
+  # enumerates its invoke routes one by one and
+  # `scan-row-retention-sweep` is not among them, so
+  # `POST /api/v1/admin/tasks/scan-row-retention-sweep` answers 404. An
+  # off-schedule run is `hort-server enqueue-scan-row-retention-sweep`
+  # on the runtime DSN — the same command this CronJob runs.
   scanRowRetentionSweep:
     executionPath: dsn-direct
     # Render the CronJob. **Default true.** Unlike the prefetch cascade
@@ -1690,6 +1714,50 @@ scheduledTasks:
     # `autovacuum_vacuum_scale_factor` on `public.jobs`.
     schedule: "0 3 * * *"
 
+  # -- General jobs-row retention sweep --------------------
+  # Periodic jobs-row-retention-sweep CronJob — the horizon for every
+  # `jobs.kind` the two sweeps above do NOT reach. Inserts ONE
+  # `kind='jobs-row-retention-sweep'` row into `public.jobs` every tick
+  # using the RUNTIME DSN; the worker picks it up and runs
+  # `JobsRowRetentionSweepHandler`, which deletes terminal
+  # (`status IN ('completed', 'failed')`) rows where
+  # `(kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick') AND kind NOT IN
+  # ('scan', 'oci-index-child-ingest')` and `updated_at` is older than the
+  # handler's 7-day `DEFAULT_HORIZON`. The horizon is not a chart value
+  # and is not settable at all: the CronJob runs the subcommand with no
+  # arguments and the subcommand writes `params` unconditionally empty.
+  # Pairs with the per-table autovacuum tuning on
+  # `public.jobs` (migration 009: `autovacuum_vacuum_scale_factor = 0.02`).
+  #
+  # Retains, per kind, the newest `completed` row AND the newest terminal
+  # row: the boot-time liveness gauges (`hort_staging_sweep_overdue`,
+  # `hort_event_chain_verify_overdue`) read the newest `completed` row of
+  # their kind, so a horizon that collected it would report "never ran"
+  # for a task that demonstrably ran.
+  #
+  # The two kind-specific sweeps' kinds are excluded so exactly one sweep
+  # owns each kind — a kind covered twice would age out on whichever of
+  # the two horizon constants is shorter, which is neither sweep's
+  # documented horizon. `prefetch-tick` is the one readmitted exception:
+  # it matches the `prefetch%` prefix by name but is a scheduled tick, and
+  # its newest `completed` row carries the prefetch rotation's keyset
+  # cursor, so it needs the keep-newest clause the cascade sweep lacks.
+  #
+  # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
+  # umbrella.
+  jobsRowRetentionSweep:
+    executionPath: dsn-direct
+    # Render the CronJob. **Default true.** The scheduled kinds this sweep
+    # covers leave terminal rows on every deployment from day one —
+    # `staging-sweep` alone adds ~288 rows/day at its five-minute cadence
+    # — so there is no opt-in gate that would leave the table empty.
+    enabled: true
+    # Cron schedule. Default: daily at 03:30 UTC (offset from the
+    # scan-row sweep's 03:00 and the prefetch-row sweep's 02:00 so the
+    # three DSN-only CronJobs do not contend for the same minute). The
+    # 7-day horizon gives 6 days of headroom even after a missed run.
+    schedule: "30 3 * * *"
+
   # -- Wheel-metadata backfill -----------------------------
   # Periodic wheel-metadata-backfill CronJob. Inserts ONE
   # `kind='wheel-metadata-backfill'` row into `public.jobs` every tick
@@ -1702,9 +1770,13 @@ scheduledTasks:
   # wheels.
   #
   # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
-  # umbrella. Manual operator invocation still works via the
-  # `hort-http-admin-tasks` HTTP route:
-  # `hort-cli admin task invoke wheel-metadata-backfill`.
+  # umbrella — and no HTTP invoke route either: `hort-http-admin-tasks`
+  # enumerates its invoke routes one by one and `wheel-metadata-backfill`
+  # is not among them, so
+  # `POST /api/v1/admin/tasks/wheel-metadata-backfill` answers 404. An
+  # off-schedule pass is
+  # `hort-server enqueue-wheel-metadata-backfill [--batch-size N]` on the
+  # runtime DSN — the same command this CronJob runs.
   wheelMetadataBackfill:
     executionPath: dsn-direct
     # Render the CronJob. **Default false.** The backfill is a one-shot
@@ -1801,8 +1873,10 @@ scheduledTasks:
     enabled: false
     schedule: "0 3 * * *"
   # retention-purge: the destructive storage-GC walk. Refuses until
-  # the worker boot refcount-reconcile sweep converged. Daily, after
-  # retention-evaluate.
+  # the worker boot refcount-reconcile sweep converged — zero repository
+  # scan/repair failures, not merely "the sweep ran". A refusal lands in
+  # jobs.last_error, and the worker restates a closed gate on its
+  # 60-second heartbeat. Daily, after retention-evaluate.
   #
   # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
   # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`

@@ -60,6 +60,20 @@ const SELF_REFERENTIAL_KINDS: [&str; 2] = ["primary_content", "metadata_blob"];
 ///
 /// Callers must pass the UNFILTERED reference set: filtering to a
 /// single kind at the port would silently narrow the predicate.
+///
+/// That requirement is about `kind` and nothing else — it is the
+/// `kind_filter` argument of
+/// [`ContentReferenceIndex::find_by_target`] that must stay `None`,
+/// because this predicate is defined over the complement of
+/// [`SELF_REFERENTIAL_KINDS`] and a single-kind read makes every other
+/// tree edge unobservable. It says nothing about the LIVENESS of the
+/// row's `source_artifact_id`: restricting the set to edges whose
+/// source is still live would be a different question, compatible with
+/// this one. Nothing restricts it here because no caller has to — the
+/// OCI manifest-DELETE handler sweeps a tombstoned manifest's edges,
+/// the purge transaction sweeps them again, and the refcount-reconcile
+/// sweep drops every edge of a `rejected` source, so a row surfacing
+/// through this read has a live source in the steady state.
 pub(crate) fn is_referenced_tree_descendant(refs: &[ContentReference]) -> bool {
     refs.iter()
         .any(|r| !SELF_REFERENTIAL_KINDS.contains(&r.kind.as_str()))
@@ -90,7 +104,10 @@ pub(crate) async fn resolve_referenced_tree_descendant_fail_safe(
     hash: &ContentHash,
 ) -> bool {
     // The UNFILTERED kind set — `is_referenced_tree_descendant`'s
-    // contract; filtering at the port would silently narrow it.
+    // contract; passing a `kind_filter` here would silently narrow it.
+    // The contract binds the kind argument only; source liveness is kept
+    // out of this set by the writers (see the predicate's docstring),
+    // not by a filter on this read.
     match content_references
         .find_by_target(repository_id, hash, None)
         .await

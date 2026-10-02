@@ -227,7 +227,7 @@ fi
 # Server-generated A-level maven-metadata.xml must list the released version.
 GA_PATH="$(printf '%s' "$GROUP_ID" | tr '.' '/')/${ARTIFACT_ID}"
 META_A="$(curl -sf "${MAVEN_URL}/${GA_PATH}/maven-metadata.xml" 2>/dev/null || true)"
-if printf '%s' "$META_A" | grep -q "<version>${RELEASE_VERSION}</version>"; then
+if capture_match "<version>${RELEASE_VERSION}</version>" printf '%s' "$META_A"; then
   pass "A-level maven-metadata.xml lists $RELEASE_VERSION"
 else
   fail "A-level maven-metadata.xml" "missing <version>${RELEASE_VERSION}</version> in $META_A"
@@ -302,7 +302,7 @@ fi
 
 # Server-generated V-level snapshot metadata must carry a <snapshot> block.
 SNAP_META="$(curl -sf "${MAVEN_URL}/${GA_PATH}/${SNAPSHOT_VERSION}/maven-metadata.xml" 2>/dev/null || true)"
-if printf '%s' "$SNAP_META" | grep -q "<snapshot>"; then
+if capture_match "<snapshot>" printf '%s' "$SNAP_META"; then
   pass "V-level maven-metadata.xml has a <snapshot> block"
 else
   fail "V-level snapshot maven-metadata.xml" "no <snapshot> in $SNAP_META"
@@ -317,6 +317,8 @@ if mvn "${MVN_GLOBAL[@]}" -Dmaven.repo.local="$FRESH_B" \
       -DremoteRepositories="hort-maven-e2e::::${MAVEN_URL}" \
       -Dartifact="${GROUP_ID}:${ARTIFACT_ID}:${SNAPSHOT_VERSION}" \
       -Dtransitive=false 2>&1 | tail -8; then
+  # Bounded: a single freshly-resolved local repo can hold at most a handful
+  # of jars, never near the pipe buffer.
   if find "$FRESH_B" -path "*${ARTIFACT_ID}*" -name '*.jar' | grep -q .; then
     pass "mvn dependency:get resolved the SNAPSHOT (timestamped build) from hort"
   else
@@ -467,6 +469,8 @@ tasks.register('resolveDep') {
 }
 EOF
 
+# Bounded: `tail -10` already caps grep's input to 10 lines before it runs,
+# regardless of how large the gradle output itself is.
 if (cd gradle-consume && gradle --no-daemon -g "$WORK_DIR/.gradle-home" \
       resolveDep) 2>&1 | tail -10 | grep -q "resolved: ${GRADLE_ARTIFACT}-${GRADLE_VERSION}.jar"; then
   pass "gradle resolved the published artifact from hort (Gradle=Maven alias)"
@@ -524,7 +528,7 @@ if [ -n "${METRICS_URL:-}" ] && [ -n "${METRICS_TOKEN:-}" ] \
   # regex) rather than expand at definition time. Mirrors
   # patch-candidate.sh's bounded_poll predicate quoting.
   if bounded_poll "maven ingest metric" 20 \
-      "curl -sf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\" | grep -Eq '^hort_ingest_total\{[^}]*format=\"maven\"[^}]*result=\"success\"[^}]*\}'"; then
+      "capture_match '^hort_ingest_total\{[^}]*format=\"maven\"[^}]*result=\"success\"[^}]*\}' curl -sf \"\${METRICS_AUTH_HEADER[@]}\" \"\$METRICS_URL\""; then
     pass "hort_ingest_total{format=\"maven\",result=\"success\"} present"
   else
     log "  note: hort_ingest_total{format=\"maven\"} not visible to the in-run scrape (soft) — the publish->resolve round-trips above are the authoritative ingest gate"

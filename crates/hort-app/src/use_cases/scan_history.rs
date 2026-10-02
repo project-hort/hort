@@ -23,18 +23,12 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use hort_domain::events::{DomainEvent, RejectionReason, ScanCompleted, SeveritySummary, StreamId};
-use hort_domain::ports::event_store::{EventStore, ReadFrom};
+use hort_domain::ports::event_store::EventStore;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{ContentHash, Finding};
 
 use crate::error::AppResult;
-
-/// Cap on the number of events read when scanning for the most recent
-/// `ScanCompleted`. Mirrors `use_cases::STREAM_EVENT_CAP` (200) — that
-/// constant is `pub(crate)` so duplicating the literal here is cheaper
-/// than re-exporting it. The two values must move together; if the
-/// cap ever changes, update both sites.
-const READ_LIMIT: u64 = 200;
+use crate::use_cases::read_artifact_stream;
 
 /// Snapshot of the artifact's most recent `ScanCompleted` event,
 /// surfaced by [`read_last_scan_completed`]. Carries both the cached
@@ -62,19 +56,22 @@ pub(crate) struct ScanCompletedSnapshot {
 /// [`crate::use_cases::policy_use_case::PolicyUseCase::add_exclusion`]
 /// for the "skip artifact" rule on the re-evaluation pass.
 ///
-/// Performance: reads up to [`READ_LIMIT`] events. For typical artifact
-/// streams (5–15 events) the linear scan is essentially free; the
-/// payload size is small (`ScanCompleted` carries a `SeveritySummary` +
-/// scanner name + an `Option<ContentHash>`) so cumulative
-/// deserialisation cost is bounded.
+/// Reads the artifact stream in full via
+/// [`read_artifact_stream`](crate::use_cases::read_artifact_stream), so
+/// the reverse scan below is over the whole stream and not over an
+/// oldest-prefix of it: a stream that breached
+/// [`STREAM_EVENT_CAP`](crate::use_cases::STREAM_EVENT_CAP) surfaces as
+/// an error rather than as a stale "most recent" scan. For typical
+/// artifact streams (5–15 events) the linear scan is essentially free;
+/// the payload size is small (`ScanCompleted` carries a
+/// `SeveritySummary` + scanner name + an `Option<ContentHash>`) so
+/// cumulative deserialisation cost is bounded.
 pub(crate) async fn read_last_scan_completed(
     events: &dyn EventStore,
     artifact_id: Uuid,
 ) -> AppResult<Option<ScanCompletedSnapshot>> {
     let stream_id = StreamId::artifact(artifact_id);
-    let persisted = events
-        .read_stream(&stream_id, ReadFrom::Start, READ_LIMIT)
-        .await?;
+    let persisted = read_artifact_stream(events, &stream_id).await?;
     // Iterate in reverse — `ScanCompleted` is typically near the end
     // (post-quarantine, pre-rejection on the same stream).
     for event in persisted.iter().rev() {
@@ -95,8 +92,10 @@ pub(crate) async fn read_last_scan_completed(
 
 /// Scan the artifact's stream in reverse and return the most recent
 /// `ArtifactRejected.rejected_by` reason, `Ok(None)` if the artifact has
-/// never been rejected (or the rejecting event fell outside
-/// [`READ_LIMIT`]).
+/// never been rejected. Reads the stream in full via
+/// [`read_artifact_stream`](crate::use_cases::read_artifact_stream) —
+/// there is no "fell outside the read window" answer, because a window
+/// that could not cover the stream is an error instead.
 ///
 /// Shared by every caller that re-derives a `Rejected` artifact's
 /// verdict — the eligibility guard downstream
@@ -110,9 +109,7 @@ pub(crate) async fn read_last_rejection_reason(
     artifact_id: Uuid,
 ) -> AppResult<Option<RejectionReason>> {
     let stream_id = StreamId::artifact(artifact_id);
-    let persisted = events
-        .read_stream(&stream_id, ReadFrom::Start, READ_LIMIT)
-        .await?;
+    let persisted = read_artifact_stream(events, &stream_id).await?;
     Ok(persisted.iter().rev().find_map(|e| match &e.event {
         DomainEvent::ArtifactRejected(r) => Some(r.rejected_by.clone()),
         _ => None,

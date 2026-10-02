@@ -16,6 +16,7 @@ use hort_domain::events::{
     IngestSource, ScanRequested, StreamId,
 };
 use hort_domain::policy::curation::{evaluate_curation, CurationOutcome};
+use hort_domain::policy::effective_quarantine_deadline;
 use hort_domain::policy::quarantine_anchor::{
     derive_quarantine_anchor, AnchorEvidence, AnchorSource, DerivedAnchor,
 };
@@ -47,6 +48,7 @@ use crate::use_cases::multi_hash::{
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
+use crate::use_cases::quarantine_hold::{resolve_transient_hold, TransientHold};
 use crate::use_cases::referenced_descendant::resolve_referenced_tree_descendant_fail_safe;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_expected_version,
@@ -2828,12 +2830,24 @@ impl IngestUseCase {
     /// via `effective_quarantine_deadline(anchor, duration)`, so a later
     /// policy edit of `quarantineDuration` takes effect on the existing
     /// artifact's window without a backfill migration.
+    ///
+    /// That invariant is about what reaches the *store*, and it leaves the
+    /// in-memory row this returns free to carry the derived value: the
+    /// transient `quarantine_deadline` / `provenance_hold_indefinite` pair
+    /// is stamped through the shared
+    /// [`resolve_transient_hold`] — the same expression the read-path
+    /// hydration uses — so the artifact handed back to a caller that renders
+    /// a `503` reports the real remaining window instead of that caller's
+    /// "deadline unknown" fallback. Neither field is a column (both are
+    /// `#[serde(skip)]`, and the artifact UPSERT does not name them), so
+    /// setting them before `commit_transition` persists nothing.
     #[allow(clippy::too_many_arguments)]
     async fn decide_and_apply_quarantine(
         &self,
         artifact: &mut Artifact,
         now: DateTime<Utc>,
         effective_duration_secs: i64,
+        provenance_mode: ProvenanceMode,
         repository_id: Uuid,
         trust_upstream_publish_time: bool,
         upstream_published_at: Option<DateTime<Utc>>,
@@ -2878,8 +2892,68 @@ impl IngestUseCase {
         events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
             quarantine_event,
         )));
+        self.stamp_transient_hold(artifact, anchor, effective_duration_secs, provenance_mode)
+            .await;
 
         Ok(Some(derived))
+    }
+
+    /// Fill in the transient, non-persisted hold pair on a row this ingest
+    /// has just quarantined, from the anchor and duration already in hand.
+    ///
+    /// Shared by both mint paths ([`Self::decide_and_apply_quarantine`] and
+    /// [`Self::register_by_hash_inner`]) and delegating to the same
+    /// [`resolve_transient_hold`] the read-path hydration uses, so one
+    /// artifact cannot be described by two different remaining windows
+    /// depending on which leg of a pull-through returned it.
+    ///
+    /// Costs no policy resolution — the caller already resolved the window
+    /// in order to decide the quarantine. The bounded clearance-stream read
+    /// behind `provenance_hold_indefinite` fires only for a
+    /// `provenance_mode: Required` repo whose freshly-derived deadline is
+    /// already in the past (an inherited anchor older than the window, or
+    /// the referenced-tree-descendant carve-out), which is exactly the state
+    /// where advertising a retry schedule would be a lie.
+    ///
+    /// **Infallible, and deliberately so.** A failed clearance read degrades
+    /// to "the computed deadline is the whole story" — the field's own
+    /// documented safe default — and the ingest continues. Propagating here
+    /// would make a transient event-store read a reason for an otherwise
+    /// complete ingest to fail, which is the posture every other
+    /// non-essential read on this path already declines to take (the
+    /// age-evidence read, the descendant lookup, and the policy resolution
+    /// all warn and continue). The deadline itself needs no I/O and is
+    /// always computed.
+    async fn stamp_transient_hold(
+        &self,
+        artifact: &mut Artifact,
+        anchor: DateTime<Utc>,
+        effective_duration_secs: i64,
+        provenance_mode: ProvenanceMode,
+    ) {
+        let duration = chrono::Duration::seconds(effective_duration_secs);
+        let hold = resolve_transient_hold(
+            artifact.id,
+            anchor,
+            duration,
+            provenance_mode,
+            Some(&*self.events),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                error = %e,
+                "provenance-clearance read failed while stamping the quarantine hold; \
+                 advertising the computed deadline (artifact still registers)"
+            );
+            TransientHold {
+                deadline: effective_quarantine_deadline(anchor, duration),
+                hold_indefinite: false,
+            }
+        });
+        artifact.quarantine_deadline = Some(hold.deadline);
+        artifact.provenance_hold_indefinite = hold.hold_indefinite;
     }
 
     /// Refcount projection writes. Run AFTER `commit_transition` succeeds
@@ -3700,6 +3774,7 @@ impl IngestUseCase {
                 &mut artifact,
                 now,
                 scan_decision.effective_duration_secs,
+                scan_decision.provenance_mode,
                 repository_id,
                 trust_upstream_publish_time,
                 upstream_published_at,
@@ -4673,6 +4748,17 @@ impl IngestUseCase {
             events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
                 quarantine_event,
             )));
+            // Same stamp `ingest_inner`'s mint applies: the follower row
+            // this method returns is rendered straight into a `503` by the
+            // post-coalesce cross-repo branch of every format's
+            // pull-through, so it has to carry the window it just derived.
+            self.stamp_transient_hold(
+                &mut artifact,
+                anchor,
+                effective_duration_secs,
+                provenance_mode,
+            )
+            .await;
         }
         if scan_will_run {
             events.push(EventToAppend {
@@ -6183,6 +6269,247 @@ mod tests {
                 ("result", "success"),
             ],
             1,
+        );
+    }
+
+    // Transient hold pair on the artifact a mint hands back.
+    //
+    // `quarantine_deadline` / `provenance_hold_indefinite` are not columns
+    // — they are derived so a later `quarantineDuration` edit lands without
+    // a backfill — so a caller that renders a `503` off an ingest outcome
+    // has nothing to report unless the mint fills them in. The tests below
+    // pin the value, the inherited-anchor case, the elapsed-window
+    // suppression, and the fail-safe on an unreadable clearance.
+
+    /// A quarantining mint reports the window it just derived, so a caller
+    /// rendering the `503` does not have to fall back on a constant.
+    #[tokio::test]
+    async fn ingest_quarantine_stamps_the_derived_deadline_on_the_returned_artifact() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let (uc, _artifacts, _lifecycle, _storage, repos, policies, _jobs) =
+            make_scan_gated_use_case();
+        repos.insert(repo);
+        let mut strict = global_scan_policy();
+        strict.quarantine_duration_secs = 7200;
+        policies.insert(strict);
+
+        let artifact = uc
+            .ingest_direct(req(repo_id), content_stream(b"x"), &test_handler())
+            .await
+            .unwrap()
+            .artifact;
+
+        let anchor = artifact
+            .quarantine_window_start
+            .expect("a quarantining mint carries the anchor");
+        assert_eq!(
+            artifact.quarantine_deadline,
+            Some(anchor + chrono::Duration::seconds(7200)),
+            "the returned row must carry `anchor + resolved duration`"
+        );
+        assert!(
+            !artifact.provenance_hold_indefinite,
+            "a hold still inside its window has a real deadline to advertise"
+        );
+    }
+
+    /// **The inherited-anchor case.** ADR 0054 anchors the window on the
+    /// earliest applicable age evidence, so content Hort already observed
+    /// two hours ago inherits a two-hour-old anchor and its window is
+    /// correspondingly shorter. The mint must report the window that is
+    /// LEFT, not the policy duration.
+    ///
+    /// A fixture whose anchor is the mint instant cannot distinguish
+    /// `anchor + duration` from `now + duration`; this one can, and the
+    /// difference is the whole defect.
+    #[tokio::test]
+    async fn ingest_quarantine_deadline_is_measured_from_an_inherited_anchor() {
+        const WINDOW_SECS: i64 = 7200;
+        const INHERITED_AGE_SECS: i64 = 3600;
+
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let (uc, artifacts, _lifecycle, _storage, repos, policies, _jobs) =
+            make_scan_gated_use_case();
+        repos.insert(repo);
+        let mut strict = global_scan_policy();
+        strict.quarantine_duration_secs = WINDOW_SECS;
+        policies.insert(strict);
+
+        // The age evidence: the same bytes, already held by another
+        // repository, first observed an hour ago.
+        let content: &[u8] = b"x";
+        let mut seen_before = sample_artifact(QuarantineStatus::Released);
+        seen_before.repository_id = Uuid::new_v4();
+        seen_before.sha256_checksum = sha256_of(content).parse().unwrap();
+        seen_before.created_at = Utc::now() - chrono::Duration::seconds(INHERITED_AGE_SECS);
+        artifacts.insert(seen_before.clone());
+
+        let before = Utc::now();
+        let artifact = uc
+            .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+            .await
+            .unwrap()
+            .artifact;
+
+        assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+        assert_eq!(
+            artifact.quarantine_window_start,
+            Some(seen_before.created_at),
+            "the window must anchor on the inherited age evidence"
+        );
+        let deadline = artifact
+            .quarantine_deadline
+            .expect("a quarantining mint carries the derived deadline");
+        assert_eq!(
+            deadline,
+            seen_before.created_at + chrono::Duration::seconds(WINDOW_SECS)
+        );
+        // The two wrong answers, stated as bounds: the full policy duration
+        // from now (which looks right on freshly-seen content), and the
+        // consuming handler's deadline-unknown constant.
+        assert!(
+            deadline < before + chrono::Duration::seconds(WINDOW_SECS),
+            "reporting `now + duration` would advertise a window that is \
+             already {INHERITED_AGE_SECS}s spent"
+        );
+        let remaining = (deadline - Utc::now()).num_seconds();
+        let expected = WINDOW_SECS - INHERITED_AGE_SECS;
+        assert!(
+            (expected - 5..=expected).contains(&remaining),
+            "remaining window {remaining}s must be ~{expected}s"
+        );
+    }
+
+    /// An already-elapsed window on a `provenance_mode: Required` repo is
+    /// waiting on a signature, not on the clock — ADR 0039 D5 says such a
+    /// hold advertises no retry schedule, and the mint has to say so or the
+    /// `503` will advertise one. The elapsed deadline here comes from the
+    /// referenced-tree-descendant carve-out, which anchors at
+    /// `now - effective_duration`.
+    #[tokio::test]
+    async fn ingest_quarantine_marks_an_elapsed_required_hold_as_indefinite() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let (
+            uc,
+            _artifacts,
+            _lifecycle,
+            _storage,
+            repos,
+            policies,
+            _jobs,
+            content_references,
+            _events,
+        ) = make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        let mut required = global_scan_policy();
+        required.quarantine_duration_secs = 7200;
+        required.provenance_mode = ProvenanceMode::Required;
+        policies.insert(required);
+
+        // A `content_references` row naming these bytes as a member of an
+        // already-ingested parent makes this ingest a referenced-tree
+        // descendant, whose carve-out anchors the window so it is already
+        // over.
+        let content: &[u8] = b"held-descendant-bytes";
+        let target_hash: ContentHash = sha256_of(content).parse().unwrap();
+        content_references
+            .insert(ContentReference {
+                source_artifact_id: Uuid::new_v4(),
+                target_content_hash: target_hash,
+                kind: "oci_index_member".into(),
+                metadata: serde_json::Value::Null,
+                repository_id: repo_id,
+                recorded_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let artifact = uc
+            .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+            .await
+            .unwrap()
+            .artifact;
+
+        assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+        let deadline = artifact
+            .quarantine_deadline
+            .expect("a quarantining mint carries the derived deadline");
+        assert!(
+            deadline <= Utc::now(),
+            "the descendant carve-out's window is already over"
+        );
+        assert!(
+            artifact.provenance_hold_indefinite,
+            "an elapsed window with a Pending Required-mode clearance has no \
+             self-resolving deadline"
+        );
+    }
+
+    /// A failed clearance read must not cost the caller its ingest. The
+    /// deadline needs no I/O and is still reported; only the "no
+    /// self-resolving deadline" marker degrades to its documented safe
+    /// default (`false` — the computed deadline is the whole story). Same
+    /// warn-and-continue posture the age-evidence read, the descendant
+    /// lookup and the policy resolution on this path already take.
+    #[tokio::test]
+    async fn ingest_quarantine_survives_a_failed_clearance_read() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let (uc, _artifacts, _lifecycle, _storage, repos, policies, _jobs, content_refs, events) =
+            make_scan_gated_use_case_with_content_references();
+        repos.insert(repo);
+        let mut required = global_scan_policy();
+        required.quarantine_duration_secs = 7200;
+        required.provenance_mode = ProvenanceMode::Required;
+        policies.insert(required);
+
+        // Descendant carve-out → the derived window is already over, which
+        // is the only state that reaches the clearance read at all.
+        let content: &[u8] = b"descendant-with-a-broken-event-store";
+        content_refs
+            .insert(ContentReference {
+                source_artifact_id: Uuid::new_v4(),
+                target_content_hash: sha256_of(content).parse().unwrap(),
+                kind: "oci_index_member".into(),
+                metadata: serde_json::Value::Null,
+                repository_id: repo_id,
+                recorded_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        // Call 0 is `read_expected_version`'s own read; call 1 is the
+        // clearance lookup. Failing call 0 instead would abort the ingest
+        // before the quarantine decision — a different path.
+        events.fail_read_stream_at(1, DomainError::Invariant("event store down".into()));
+
+        let artifact = uc
+            .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+            .await
+            .expect("a failed clearance read must not fail the ingest")
+            .artifact;
+
+        assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+        assert!(
+            artifact.quarantine_deadline.is_some(),
+            "the deadline needs no I/O and must still be reported"
+        );
+        assert!(
+            !artifact.provenance_hold_indefinite,
+            "an unreadable clearance degrades to the safe default, not to a \
+             suppressed Retry-After"
+        );
+        // Pins the armed index against a future reordering: the same setup
+        // WITHOUT the armed failure yields `true` (see
+        // `ingest_quarantine_marks_an_elapsed_required_hold_as_indefinite`),
+        // so the assertion above is only meaningful if the clearance read
+        // was actually reached and actually failed.
+        assert!(
+            events.read_stream_call_count() >= 2,
+            "the clearance read must have been reached for this to be the \
+             fail-safe arm rather than a path that never asked"
         );
     }
 
@@ -8691,6 +9018,47 @@ mod tests {
                 "same-path-same-hash dedup must not emit a second commit"
             );
         });
+    }
+
+    /// The cross-repo follower's row is the one artifact every format's
+    /// pull-through renders **directly** into its `503` — the post-coalesce
+    /// `find_in_repo_by_hash` returned `None`, so there is no later read to
+    /// hydrate it. It therefore has to leave this method carrying the window
+    /// the gate just derived, or the follower's `503` advertises the
+    /// consuming handler's deadline-unknown constant while the leader's
+    /// `503` for the same bytes advertises the truth.
+    #[tokio::test]
+    async fn register_existing_cas_blob_returns_a_row_carrying_its_derived_deadline() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let hash: ContentHash = ZERO_HASH.parse().unwrap();
+
+        let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs) =
+            make_scan_gated_use_case();
+        repos.insert(repo);
+        let mut strict = global_scan_policy();
+        strict.quarantine_duration_secs = 7200;
+        policies.insert(strict);
+        storage.insert_content(hash.clone(), b"shared upstream bytes".to_vec());
+
+        let outcome = uc
+            .register_existing_cas_blob(recb_req(repo_id, hash), &test_handler())
+            .await
+            .expect("follower registration must succeed");
+
+        assert_eq!(
+            outcome.artifact.quarantine_status,
+            QuarantineStatus::Quarantined
+        );
+        let anchor = outcome
+            .artifact
+            .quarantine_window_start
+            .expect("the follower row carries its own anchor");
+        assert_eq!(
+            outcome.artifact.quarantine_deadline,
+            Some(anchor + chrono::Duration::seconds(7200)),
+            "the follower row must carry `anchor + resolved duration`"
+        );
     }
 
     /// Error path: content NOT present in CAS → `NotFound(ContentHash)`
@@ -11741,8 +12109,17 @@ mod tests {
         let target_hash: ContentHash = hash_hex.parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                artifacts,
+                _lifecycle,
+                _storage,
+                repos,
+                _policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
 
             // An already-ingested parent references this hash — the
@@ -11812,8 +12189,17 @@ mod tests {
         let target_hash: ContentHash = sha256_of(content).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                _artifacts,
+                _lifecycle,
+                _storage,
+                repos,
+                _policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
 
             // Simulate an already-ingested parent (e.g. an OCI index)
@@ -11870,8 +12256,17 @@ mod tests {
         let other_hash: ContentHash = sha256_of(b"someone-elses-child-manifest").parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                _artifacts,
+                _lifecycle,
+                _storage,
+                repos,
+                _policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
 
             content_refs
@@ -11921,8 +12316,17 @@ mod tests {
         let hash: ContentHash = sha256_of(content).parse().unwrap();
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                _artifacts,
+                _lifecycle,
+                _storage,
+                repos,
+                _policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
 
             // Pre-seed ONLY the two self-referencing kinds against this
@@ -11983,8 +12387,17 @@ mod tests {
         let content: &[u8] = b"lookup-failure-bytes";
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, _lifecycle, _storage, repos, _policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                _artifacts,
+                _lifecycle,
+                _storage,
+                repos,
+                _policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
             content_refs.fail_next_find_by_target(DomainError::Invariant(
                 "simulated content_references lookup failure (test fixture)".into(),
@@ -13045,6 +13458,7 @@ mod tests {
             policy_projections,
             jobs,
             _content_references,
+            _events,
         ) = make_scan_gated_use_case_with_content_references();
         (
             uc,
@@ -13072,6 +13486,7 @@ mod tests {
         Arc<MockPolicyProjectionRepository>,
         Arc<MockJobsRepository>,
         Arc<MockContentReferenceIndex>,
+        Arc<MockEventStore>,
     ) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
@@ -13110,6 +13525,7 @@ mod tests {
             policy_projections,
             jobs,
             content_references,
+            events,
         )
     }
 
@@ -13989,8 +14405,17 @@ mod tests {
         let repo_id = repo.id;
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                _artifacts,
+                _lifecycle,
+                storage,
+                repos,
+                policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
             let policy = global_scan_policy(); // duration = 24h
             let duration = chrono::Duration::seconds(policy.quarantine_duration_secs);
@@ -14050,8 +14475,17 @@ mod tests {
         let repo_id = repo.id;
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                _artifacts,
+                _lifecycle,
+                storage,
+                repos,
+                policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
             policies.insert(global_scan_policy());
             let hash: ContentHash = ZERO_HASH.parse().unwrap();
@@ -14100,8 +14534,17 @@ mod tests {
         let repo_id = repo.id;
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                _artifacts,
+                _lifecycle,
+                storage,
+                repos,
+                policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
             policies.insert(global_scan_policy());
             let hash: ContentHash = ZERO_HASH.parse().unwrap();
@@ -14143,8 +14586,17 @@ mod tests {
         let repo_id = repo.id;
 
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let (uc, _artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs) =
-                make_scan_gated_use_case_with_content_references();
+            let (
+                uc,
+                _artifacts,
+                _lifecycle,
+                storage,
+                repos,
+                policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
             policies.insert(global_scan_policy());
             let hash: ContentHash = ZERO_HASH.parse().unwrap();

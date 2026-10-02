@@ -1043,6 +1043,326 @@ prefetch:warm:internal:
         echo "::warning::hort OIDC token exchange against the internal instance failed — see the [hort-auth] lines above for curl's own diagnosis. Most common cause is TLS trust (an internal-PKI endpoint needs PLATFORM_CA_PATH), in which case the request never reached the server; otherwise the federation gitops is not applied there, or the audience does not match."
       fi
 
+# ---------------------------------------------------------------------------
+# warm:base-images — pull the pinned base-image digests through the proxy
+# ---------------------------------------------------------------------------
+#
+# `build-images:*` runs on tags, `main` and `release/*` only, so an MR that
+# re-pins a `FROM …@sha256:` digest builds no image. The first consumer of a
+# new digest is therefore always a release-shaped build — and that build is
+# also the first request that pulls the digest through the dogfood proxy, so
+# ingest and the quarantine window start INSIDE the release build, which then
+# fails for exactly one window (`503`, `artifact is quarantined`). The window
+# is ADR 0007's time gate working as intended; what is missing is the
+# choreography RELEASING.md already documents for crates — the warm has to
+# lead the tag by at least one window. This job is that warm.
+#
+# Deliberately not named `prefetch:*` and deliberately not an API call: the
+# self-service prefetch endpoint rejects OCI outright
+# (`SelfServicePrefetchUseCase` fails validation when the resolved
+# repository's format is `Oci`), so the only way to start an OCI artifact's
+# observation window is to request it through the proxy.
+#
+# Borrowed from `prefetch:warm`: `needs: []`, `allow_failure: true`, the
+# develop-push + schedule rules, and a three-way per-reference outcome
+# report. Also its "whole set every run, never the diff" rule — an
+# already-released digest is a free no-op, while a diff-driven trigger
+# silently misses a digest that arrived by a manual edit, a revert, or a
+# trunk sync.
+#
+# Borrowed from `.docker`: `tags: [platform]` and the buildah image. Both
+# halves are load-bearing. The mapping from `debian:trixie-slim` to a proxy
+# pull lives in the runner's containers-registries configuration, NOT in this
+# repository; running the warm with the same tooling on the same runner
+# against the same reference strings is what makes that mapping apply, and a
+# repository-local copy of it would be a second source of drift. That runner
+# is also the only one that can reach the proxy.
+#
+# Gated on either HORT_* switch, because the two cover different halves of
+# what this job needs and neither implies the other. HORT_PREFETCH_ENABLED is
+# what gates the sibling warms and is what mints the bearer; but the
+# `buildah login` against hort lives in `*hort-auth-steps`' HORT_PROXY_ENABLED
+# branch only, so under prefetch-alone this job logs in itself from the
+# already-minted token (see the script). Conversely the base-image pull
+# reaches the proxy through the runner's registry mirror rather than through
+# anything `*hort-auth-steps` writes, so it happens in a release build whether
+# HORT_PROXY_ENABLED is set or not — gating on that switch alone would let the
+# warm sit inert while the build it protects keeps failing.
+warm:base-images:
+  stage: test
+  image: quay.io/buildah/stable:v1.43
+  tags:
+    - platform
+  needs: []
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && ($HORT_PREFETCH_ENABLED == "true" || $HORT_PROXY_ENABLED == "true")'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && ($HORT_PREFETCH_ENABLED == "true" || $HORT_PROXY_ENABLED == "true")'
+  id_tokens: !reference [.hort-auth, id_tokens]
+  variables:
+    # Why the job retries at all, and why three attempts is the number.
+    #
+    # A config or layer blob is ingested AFTER its parent manifest, which
+    # makes it a referenced-tree descendant: it arrives with its observation
+    # window already elapsed
+    # (`crates/hort-app/src/use_cases/referenced_descendant.rs`) and is
+    # released by its own clean scan rather than by a timer. That is the one
+    # hold a retry inside a single job can outlast — a manifest's own first
+    # window is hours, and the loop never waits on that one.
+    #
+    # Three attempts is the shortest chain that can reach every object from a
+    # released manifest, because a pull fetches them in a fixed order and
+    # stops at the first hold: containers/image reads the config before any
+    # layer (`copy`'s `prepareImageConfigForDest`, fatal for a
+    # containers-storage destination because it must match the runtime OS),
+    # and only then copies the layers — all of them, since a layer failure
+    # does not cancel its siblings. So attempt 1 warms the config, attempt 2
+    # warms every layer, attempt 3 completes the pull.
+    BASE_IMAGE_WARM_ATTEMPTS: "3"
+    BASE_IMAGE_WARM_RETRY_DELAY: "45"
+  before_script:
+    # CA trust precedes the token exchange: an internal-PKI HORT_BUILD_URL
+    # cannot be verified by hort-auth's curl until the anchor is installed.
+    - *platform-ca-rhel
+    - *hort-auth-steps
+  script:
+    - |
+      set -uo pipefail
+
+      # `*hort-auth-steps` runs the `buildah login` against hort only in its
+      # HORT_PROXY_ENABLED branch. Under HORT_PREFETCH_ENABLED alone the
+      # bearer is minted but the OCI client is never logged in, and every pull
+      # below would reach the proxy unauthenticated. Log in here in exactly
+      # that case, from the token the anchor already minted — no second copy
+      # of the exchange, and nothing repointed for any other job.
+      if [ "${HORT_PROXY_ENABLED:-}" != "true" ]; then
+        if [ -n "${HORT_TOKEN:-}" ] && [ -n "${_hort_host:-}" ]; then
+          echo "${HORT_TOKEN}" | buildah login "${_hort_host}" \
+            --username hort-ci --password-stdin \
+            || echo "::warning::buildah login against ${_hort_host} failed — the pulls below are unauthenticated"
+        else
+          echo "::warning::no hort bearer and no proxy host in this job — the pulls below are unauthenticated and warm nothing if the proxy requires a credential"
+        fi
+      fi
+
+      # The pinned set is parsed out of the Dockerfiles a release-shaped
+      # build actually uses. This job must never carry a second,
+      # hand-maintained copy of the digests.
+      dockerfiles="docker/Dockerfile.hort-server docker/Dockerfile.worker deploy/compose/Dockerfile"
+
+      for f in ${dockerfiles}; do
+        [ -f "${f}" ] || echo "::warning::${f} not found — its base images are not being warmed (moved or renamed?)"
+      done
+
+      # Drift guard in the other direction: a digest-pinned FROM in a
+      # Dockerfile this job does not read is a base image nothing warms.
+      for f in $(grep -rlE '^[[:space:]]*FROM[[:space:]]+' --include='Dockerfile*' . 2>/dev/null | sed 's|^\./||'); do
+        grep -qE '^[[:space:]]*FROM[[:space:]].*@sha256:' "${f}" || continue
+        case " ${dockerfiles} " in
+          *" ${f} "*) ;;
+          *) echo "::warning::${f} pins a base-image digest but is not in this job's list — add it there or its base images stay cold until a build asks for them" ;;
+        esac
+      done
+
+      : > /tmp/from-refs.txt
+      for f in ${dockerfiles}; do
+        [ -f "${f}" ] || continue
+        grep -E '^[[:space:]]*FROM[[:space:]]' "${f}" \
+          | grep -oE '[^[:space:]@]+@sha256:[0-9a-f]{64}' >> /tmp/from-refs.txt || true
+      done
+
+      # `name[:tag]@sha256:<hex>` reduces to `name@sha256:<hex>`. Dropping
+      # the tag is lossless for a digest pull — the registry resolves the
+      # manifest by digest and ignores the tag, while the repository NAME is
+      # what selects the upstream and therefore the proxy path. It also
+      # removes the RUST_VERSION build-arg placeholder from the two pinned
+      # lines that carry it, without this job re-implementing Dockerfile ARG
+      # expansion and without the hazard of a CI variable of that name
+      # expanding into a reference. Deduplicating on (name, digest) then
+      # collapses the same image pinned under two different tags into the one
+      # pull it actually is.
+      refs=""
+      count=0
+      while read -r tok; do
+        [ -n "${tok}" ] || continue
+        nametag="${tok%@*}"
+        digest="${tok##*@}"
+        repo="${nametag}"
+        case "${nametag##*/}" in
+          *:*) repo="${nametag%:*}" ;;
+        esac
+        ref="${repo}@${digest}"
+        case " ${refs} " in
+          *" ${ref} "*) continue ;;
+        esac
+        refs="${refs} ${ref}"
+        count=$((count + 1))
+      done < /tmp/from-refs.txt
+
+      if [ "${count}" -eq 0 ]; then
+        echo "::warning::no digest-pinned FROM lines found — nothing warmed. The parse, not the pinning, is the first thing to check."
+        exit 0
+      fi
+
+      echo "Warming ${count} pinned base-image reference(s) through the proxy:"
+      for ref in ${refs}; do echo "  ${ref}"; done
+
+      # The mapping this job depends on, printed from the runner's own
+      # configuration. Read-only, and the quickest way to see whether a pull
+      # went to the proxy or straight upstream — including whether the mirror
+      # is digest-only, which is what makes these digest-pinned references
+      # use it.
+      for c in /etc/containers/registries.conf /etc/containers/registries.conf.d/*.conf; do
+        [ -f "${c}" ] || continue
+        echo ""
+        echo "--- ${c}"
+        sed 's/^/    /' "${c}"
+      done
+
+      released=0
+      warming=0
+      incomplete=0
+
+      for ref in ${refs}; do
+        store=$(mktemp -d)
+        runroot=$(mktemp -d)
+        echo ""
+        echo "=== ${ref}"
+        # The `platform` runner owns a PERSISTENT container store shared
+        # across every project on the node (see `.docker`'s variables
+        # comment). A pull of a digest that store already holds is served
+        # locally and never reaches the proxy: the job would go green
+        # reporting "already present" and warm nothing, putting a reassuring
+        # green job in front of a release build that still fails.
+        #
+        # `--policy always` does not close that. buildah documents the flag
+        # as "always pull the image", i.e. whether the pull is ATTEMPTED;
+        # whether each individual object is fetched is decided by the copy
+        # machinery asking the DESTINATION whether it already holds that
+        # digest (containers/image's `copy` calls `TryReusingBlob` and prints
+        # `skipped: already exists` when it does) — and the destination is
+        # that shared store. So the destination here is a store this job just
+        # created empty: with nothing to reuse, every object (index, child
+        # manifest, config, every layer) has to come from the registry, which
+        # is to say through the proxy.
+        #
+        # vfs is deliberate for this throwaway store: it needs no overlay
+        # support at an arbitrary path, and `.docker`'s driver warning is
+        # about a PERSISTENT store accumulating build-layer cache, which this
+        # is not. Peak cost is one image's extracted rootfs, removed before
+        # the next reference.
+        echo "    store: ${store} (created empty — nothing can be served locally)"
+
+        attempt=0
+        rc=0
+        outcome="incomplete"
+        outcome_detail="no quarantine 503 seen"
+        first_local_hits=0
+        while [ "${attempt}" -lt "${BASE_IMAGE_WARM_ATTEMPTS}" ]; do
+          attempt=$((attempt + 1))
+          log="/tmp/warm-pull.log"
+          rc=0
+          buildah --root "${store}" --runroot "${runroot}" --storage-driver vfs \
+            pull --policy always "${ref}" > "${log}" 2>&1 || rc=$?
+          sed 's/^/      | /' "${log}"
+
+          fetched=$(grep -cE 'Copying (blob|config)' "${log}" || true)
+          local_hits=$(grep -cF 'skipped: already exists' "${log}" || true)
+          echo "    attempt ${attempt}/${BASE_IMAGE_WARM_ATTEMPTS}: exit ${rc}; objects fetched from the registry ${fetched}, served from the job-local store ${local_hits}"
+          if [ "${attempt}" -eq 1 ]; then first_local_hits="${local_hits}"; fi
+          if [ "${local_hits}" -gt 0 ] && [ "${attempt}" -eq 1 ]; then
+            echo "::warning::${ref}: ${local_hits} object(s) were served from a store this job created empty, on its FIRST attempt — either this reference repeats a digest inside its own layer list, or the store root was not fresh. An object served locally never reached the proxy and is therefore NOT warmed."
+          fi
+
+          if [ "${rc}" -eq 0 ]; then
+            outcome="released"
+            break
+          fi
+
+          if grep -qF 'fetching blob: received unexpected HTTP status: 503' "${log}"; then
+            # The hold is on a config or layer blob, and that one can clear
+            # inside this job: a blob ingested after its parent manifest is a
+            # referenced-tree descendant, so its observation window is
+            # already over on arrival and its own clean scan releases it.
+            # Each retry reuses this reference's store, which is the record
+            # of what this job has already pulled through the proxy — a
+            # `skipped: already exists` from attempt 2 onwards is that
+            # record, not a missed warm.
+            outcome="warming"
+            outcome_detail="blob level — config/layer objects ingested, their windows already elapsed, waiting on their own scans"
+            if [ "${attempt}" -lt "${BASE_IMAGE_WARM_ATTEMPTS}" ]; then
+              echo "    503 on a blob: it has been requested, so its window is running. Waiting ${BASE_IMAGE_WARM_RETRY_DELAY}s for its scan to release it, then asking for the rest."
+              sleep "${BASE_IMAGE_WARM_RETRY_DELAY}"
+              continue
+            fi
+            break
+          fi
+
+          if grep -qE 'reading manifest .*received unexpected HTTP status: 503|artifact is quarantined' "${log}"; then
+            # The hold is a manifest's own first observation window — hours,
+            # not seconds — so there is nothing for this job to wait for, and
+            # nothing to poll either: past its deadline `Retry-After` clamps
+            # to 1s, which tells a well-behaved client to come back every
+            # second and learn nothing. The manifest is ingested now, and so
+            # is every child manifest an index declares (the pull-through
+            # enqueues one durable ingest row per declared child in the same
+            # breath as the membership edges), so their windows all run from
+            # here. A later run reaches the blob level.
+            outcome="warming"
+            outcome_detail="manifest level — this manifest and every child manifest an index declares are ingested; their windows start now, and the blob level is a later run's work"
+            break
+          fi
+
+          outcome="incomplete"
+          break
+        done
+
+        case "${outcome}" in
+          released)
+            released=$((released + 1))
+            if [ "${first_local_hits}" -gt 0 ]; then
+              echo "    RELEASED — the pull completed, but read the warning above before trusting it: ${first_local_hits} object(s) never reached the proxy, so they are not warmed by this run."
+            else
+              echo "    RELEASED — the proxy served every object; this reference is build-ready."
+            fi
+            ;;
+          warming)
+            warming=$((warming + 1))
+            echo "    WARMING — quarantine-shaped 503 at the ${outcome_detail}."
+            echo "    A 503 here is this job doing its work, not failing: the objects above have been requested, so they are ingested and their observation windows are running."
+            ;;
+          *)
+            incomplete=$((incomplete + 1))
+            echo "::warning::${ref}: warm did not complete (last exit ${rc}, and the failure is not a quarantine 503) — the buildah output above is the diagnosis; candidates are proxy auth, name resolution, and an upstream that no longer serves the digest."
+            ;;
+        esac
+
+        buildah --root "${store}" --runroot "${runroot}" --storage-driver vfs \
+          rmi --all --force > /dev/null 2>&1 || true
+        if [ -n "${store}" ] && [ -d "${store}" ]; then rm -rf -- "${store}"; fi
+        if [ -n "${runroot}" ] && [ -d "${runroot}" ]; then rm -rf -- "${runroot}"; fi
+      done
+
+      echo ""
+      echo "=== base-image warm summary ==="
+      echo "  references:            ${count}"
+      echo "  released (free no-op): ${released}"
+      echo "  warming (503):         ${warming}"
+      echo "  did not complete:      ${incomplete}"
+      echo ""
+      echo "  A 503 is the PASSING state for a freshly-pinned digest: the object"
+      echo "  has been ingested and its observation window is now running, which"
+      echo "  is the whole point of running this before a release build does it."
+      echo "  The same reference still reporting 503 on run after run means"
+      echo "  something other than a fresh window — an unavailable proxy, or a"
+      echo "  hold that does not resolve with the passage of time."
+      echo "==============================="
+  after_script:
+    - |
+      if [ "${CI_JOB_STATUS:-}" = "failed" ]; then
+        echo "::warning::the base-image warm never reached its pull loop — the hort OIDC token exchange in before_script failed. Same candidate causes as prefetch:warm: the federation gitops is not applied, an audience or jti claim mismatch, or the switch is not actually 'true' in this pipeline context."
+      fi
+
 # Read-only readiness probe: reports the complete cold set ahead of a
 # release, without side effects (no prefetch POST — see
 # scripts/ci/vetted-index-preflight.sh). Scheduled only — this is a
@@ -1417,6 +1737,22 @@ quality:g1-attestation-gate:
   script:
     - bash scripts/check-g1-attestation-gate.sh
 
+# Rejects an unannotated pipe into `grep -q`/`grep -Eq` under scripts/: that
+# shape misreports "no match" under `set -o pipefail` once the match lands
+# before a producer bigger than the pipe buffer has finished writing (see
+# scripts/check-pipe-grep-q.sh's header). Pure bash, no external grep/sed
+# pipeline of its own, sub-second, runs on every pipeline (no rules /
+# no needs:) — same weight class as the pin-sync + g1 gates above.
+quality:pipe-grep-q-guard:
+  stage: quality
+  image: alpine:3.24
+  needs: []
+  <<: *rules-code-changed
+  before_script:
+    - apk add --no-cache bash findutils
+  script:
+    - bash scripts/check-pipe-grep-q.sh
+
 # Chart-template render test. Mirrors .github/workflows/ci.yml's
 # chart-template-tests job so the canonical GitLab pipeline gates chart
 # regressions too (the harness previously ran only on the GitHub mirror
@@ -1459,6 +1795,21 @@ quality:fail2ban-regex-test:
     - apt-get install -y -qq --no-install-recommends fail2ban
   script:
     - bash scripts/test-fail2ban-regex.sh
+
+# capture_match regression test. Mirrors quality:fail2ban-regex-test: plain
+# bash, lightweight image, needs: [], runs on every pipeline (no rules).
+# Pins the >64 KiB-body / match-on-line-1 trap that motivated
+# scripts/native-tests/lib/common.sh's capture_match helper directly
+# against the helper — no compose, no DB, no live stack.
+quality:capture-match-test:
+  stage: quality
+  image: alpine:3.24
+  needs: []
+  <<: *rules-code-changed
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - bash scripts/test-capture-match.sh
 
 # Publish-time registry index check. Same shape as the two jobs above:
 # plain bash, lightweight image, no network. The check decides whether a

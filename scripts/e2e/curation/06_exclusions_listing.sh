@@ -52,6 +52,8 @@ LIST_OUT="$(run_hort_cli "$ADMIN_TOKEN" -- curation exclusions --policy "$POLICY
 }
 assert_pass "exclusions listing HTTP call succeeded"
 
+# Bounded: hort-cli's own exclusions-listing summary JSON for one policy,
+# not an unbounded scrape/log.
 # Listing should contain at least one entry for this (policy, cve) pair.
 if printf '%s' "$LIST_OUT" | grep -q "$CVE_ID"; then
     assert_pass "listing contains expected CVE ($CVE_ID)"
@@ -60,6 +62,7 @@ else
         "payload: $(echo "$LIST_OUT" | head -c 300)"
 fi
 
+# Bounded: same LIST_OUT as above.
 # Listing should expose added_by_actor_id (non-null).
 if printf '%s' "$LIST_OUT" | grep -qE '"added_by_actor_id"\s*:\s*"[0-9a-f-]+"'; then
     assert_pass "listing exposes added_by_actor_id (non-null)"

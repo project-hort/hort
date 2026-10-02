@@ -23,7 +23,10 @@ use std::time::Instant;
 use hort_app::error::AppError;
 use hort_app::event_store_publisher::EventStorePublisher;
 use hort_app::gitops_apply_status::GitopsApplyStatus;
-use hort_app::use_cases::apply_config_use_case::{ApplyConfigUseCase, UpstreamHostAllowlist};
+use hort_app::use_cases::apply_config_use_case::{
+    ApplyConfigUseCase, RetentionApply, UpstreamHostAllowlist,
+};
+use hort_app::use_cases::retention_policy_use_case::RetentionPolicyUseCase;
 use hort_app::use_cases::PolicyUseCase;
 use hort_config::desired::EnvSnapshot;
 use hort_config::{DesiredState, EnvAuthProvider};
@@ -38,6 +41,7 @@ use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
+use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::user_repository::UserRepository;
@@ -266,6 +270,22 @@ async fn apply_inner(
     // the apply path. Same adapter the runtime composition uses.
     let policy_jobs: Arc<dyn hort_domain::ports::jobs_repository::JobsRepository> =
         Arc::new(hort_adapters_postgres::jobs_repository::PgJobsRepository::new(pool.clone()));
+    // The event-sourced `RetentionPolicy` apply pair — the projection
+    // reader the diff compares against, and the `RetentionPolicyUseCase`
+    // that appends `RetentionPolicyChanged` and re-upserts the
+    // projection. Same shape as the `ScanPolicy` pair above
+    // (`policy_projections` + `PolicyUseCase`); shares the same
+    // no-broadcast publisher, since gitops boot runs before any
+    // dispatcher exists.
+    let retention_projections: Arc<dyn RetentionPolicyProjectionRepository> = Arc::new(
+        hort_adapters_postgres::retention_policy_projection_repo::PgRetentionPolicyProjectionRepository::new(
+            pool.clone(),
+        ),
+    );
+    let retention_policies = Arc::new(RetentionPolicyUseCase::new(
+        event_publisher.clone(),
+        retention_projections.clone(),
+    ));
     let policies = Arc::new(PolicyUseCase::new(
         event_publisher.clone(),
         policy_projections.clone(),
@@ -368,6 +388,19 @@ async fn apply_inner(
         // any format the moment its handler starts declaring the
         // capability.
         Arc::new(crate::format_capabilities::version_discovery_capable_formats()),
+        // The event-sourced retention apply slot. A required argument,
+        // not an opt-in builder, for the same reason as the capability
+        // set above: this composition root inherited its way past the
+        // slot for the whole time it was builder-optional, so every
+        // `RetentionPolicy` envelope was parsed, validated, warned about
+        // and dropped. `Some` here is what makes a declared retention
+        // policy reach the projection; a future composition point that
+        // has no projection has to write `None` deliberately, and then
+        // the apply warns loudly on every envelope it skips.
+        Some(RetentionApply::new(
+            retention_projections,
+            retention_policies,
+        )),
     );
     let apply_uc = match federated_jwt_validator {
         Some(v) => apply_uc.with_federated_jwt_validator(v),

@@ -15,7 +15,9 @@ Execution-overlap protection is the worker's per-kind semaphore
 (concurrency=1). Together they cover the single-active invariant.
 
 Idempotency-Key: `--idempotency-key-window=day` computes the key as
-`<UTC date>:retention-evaluate`. A controller-restart double-fire
+`<UTC date>:retention-evaluate:execute` (the CLI puts the evaluator's
+mode in the key so a preview cannot dedup an execution). A
+controller-restart double-fire
 short-circuits at the framework layer (EphemeralStore idempotency
 window).
 

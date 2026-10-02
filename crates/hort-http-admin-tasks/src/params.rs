@@ -6,8 +6,8 @@
 //! Each task `kind` maps to a concrete `TaskParams` impl:
 //!
 //! - `NoopParams` and `StagingSweepParams` ship in this crate (v1).
-//! - The six other v1 kinds (`scan`, `cron-rescan-tick`,
-//!   `advisory-watch-tick`, `retention-evaluate`, `retention-purge`,
+//! - The five other v1 kinds (`scan`, `cron-rescan-tick`,
+//!   `advisory-watch-tick`, `retention-purge`,
 //!   `eventstore-archive`) are handled by a permissive
 //!   [`RawTaskParams`] wrapper that forwards the request body as-is.
 //!   Each consumer crate supersedes the raw handler with a typed
@@ -22,6 +22,9 @@
 //! output is the acceptance criterion.
 
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
+
+use hort_domain::retention::RetentionEvaluationMode;
 
 /// Error returned by [`TaskParams::validate`] when the params are
 /// semantically invalid. Maps to HTTP 422 Unprocessable Content in
@@ -177,7 +180,40 @@ macro_rules! raw_kind {
 
 raw_kind!(CronRescanTickRawParams, "cron-rescan-tick");
 raw_kind!(AdvisoryWatchTickRawParams, "advisory-watch-tick");
-raw_kind!(RetentionEvaluateRawParams, "retention-evaluate");
+
+fn default_retention_evaluate_mode() -> String {
+    RetentionEvaluationMode::Execute.as_str().to_owned()
+}
+
+/// Typed parameters for `retention-evaluate`.
+///
+/// Omitting `mode` preserves the shipped CronJob behavior by selecting
+/// `execute`. `dry_run` follows the same evaluator path without appending
+/// expiry events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetentionEvaluateParams {
+    #[serde(default = "default_retention_evaluate_mode")]
+    pub mode: String,
+}
+
+impl Default for RetentionEvaluateParams {
+    fn default() -> Self {
+        Self {
+            mode: default_retention_evaluate_mode(),
+        }
+    }
+}
+
+impl TaskParams for RetentionEvaluateParams {
+    const KIND: &'static str = "retention-evaluate";
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        RetentionEvaluationMode::from_str(&self.mode)
+            .map(|_| ())
+            .map_err(ValidationError::new)
+    }
+}
+
 raw_kind!(RetentionPurgeRawParams, "retention-purge");
 raw_kind!(EventstoreArchiveRawParams, "eventstore-archive");
 // The worker's `ServiceAccountRotationHandler` (registered in
@@ -257,7 +293,7 @@ mod tests {
     fn raw_kind_constants() {
         assert_eq!(CronRescanTickRawParams::KIND, "cron-rescan-tick");
         assert_eq!(AdvisoryWatchTickRawParams::KIND, "advisory-watch-tick");
-        assert_eq!(RetentionEvaluateRawParams::KIND, "retention-evaluate");
+        assert_eq!(RetentionEvaluateParams::KIND, "retention-evaluate");
         assert_eq!(RetentionPurgeRawParams::KIND, "retention-purge");
         assert_eq!(EventstoreArchiveRawParams::KIND, "eventstore-archive");
         assert_eq!(
@@ -288,5 +324,27 @@ mod tests {
         let json = serde_json::to_string(&p).unwrap();
         let p2: NoopParams = serde_json::from_str(&json).unwrap();
         assert_eq!(p2.label.as_deref(), Some("my-label"));
+    }
+
+    #[test]
+    fn retention_evaluate_mode_defaults_to_execute() {
+        let params: RetentionEvaluateParams =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(params.mode, "execute");
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn retention_evaluate_accepts_dry_run_and_rejects_unknown_mode() {
+        let dry_run: RetentionEvaluateParams =
+            serde_json::from_value(serde_json::json!({ "mode": "dry_run" })).unwrap();
+        assert!(dry_run.validate().is_ok());
+
+        let invalid: RetentionEvaluateParams =
+            serde_json::from_value(serde_json::json!({ "mode": "preview" })).unwrap();
+        assert_eq!(
+            invalid.validate().unwrap_err().0,
+            "mode must be one of: execute, dry_run"
+        );
     }
 }

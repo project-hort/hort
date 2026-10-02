@@ -46,6 +46,7 @@ if any ClaimMapping is declared while `HORT_AUTH_PROVIDER=disabled` (no
 | `base/upstreams/13-cargo-proxy.yaml`   | UpstreamMapping    | Runtime routing for cargo-proxy → crates.io |
 | `base/upstreams/14-oci-proxy.yaml`     | UpstreamMapping    | Runtime routing for oci-proxy → docker.io/library |
 | `base/policies/20-default-scan-policy.yaml` | ScanPolicy    | Global Trivy + OSV at Critical, 60 s quarantine |
+| `base/policies/27-npm-proxy-retention-policy.yaml` | RetentionPolicy | `AgeExceeds: 86400` over `{Repos: [npm-proxy]}` — one re-fetchable proxy cache |
 
 ### `auth/` — Track B (OIDC) only
 
@@ -85,6 +86,39 @@ pull-through fetch returns 404. See
 `crates/hort-http-npm/src/upstream_pull.rs::try_upstream_file_pull` for
 the call site.
 
+## Why the retention policy is sharp
+
+`base/policies/27-npm-proxy-retention-policy.yaml` is deliberately a
+policy that **matches**, not a placeholder that proves the apply path
+runs. An age predicate with a span nothing reaches would show that a
+`RetentionPolicy` arrives and produces a `retention_policy_projections`
+row, and nothing about whether the candidate reader, the scope resolution
+or the dry run work — which is how three independent reasons that nothing
+was ever expired came to be found in code review rather than on a walk.
+
+The two choices are bounded by the same two facts:
+
+- **`{Repos: [npm-proxy]}`** — a proxy repository's artifacts are
+  pull-through cache entries upstream still holds, so an expiry costs one
+  re-fetch of byte-identical content. The hosted repositories hold the
+  only copy of what was published into them. Naming one repository also
+  exercises the `metadata.name` → id resolution the apply pipeline does
+  once (the name-free scope variants skip it).
+- **`AgeExceeds: 86400`** — the anchor is `Artifact.created_at` (ingest
+  time, not upstream publish time). A day is long enough that a walk
+  cannot match what it just ingested, and short enough that anything
+  cached on an earlier day already does.
+
+Reading the proposal is safe and needs no destructive authority:
+
+```bash
+hort-cli admin retention preview            # dry run: appends nothing, deletes nothing
+```
+
+Executing is the separate, destructive step (`hort-cli admin retention
+apply`), and it needs the `task:destructive` claim on a fresh IdP-backed
+admin session.
+
 ## Storage paths
 
 All repos use filesystem CAS under `$HORT_STORAGE_FILESYSTEM_PATH` (set in
@@ -102,7 +136,19 @@ relative to the storage backend root.
   only. To test multi-upstream OCI (`upstream_name_prefix`),
   add additional `UpstreamMapping` rows with distinct `pathPrefix`
   values.
-- **Retention policies** — the alpha pass doesn't exercise
-  retention by default; declare `kind: RetentionPolicy` envelopes
-  here if you want to.
+- **A retention sweep on a schedule** — one `kind: RetentionPolicy` IS
+  declared (see *Why the retention policy is sharp* below), but both
+  retention CronJobs ship `enabled: false` and this tree does not change
+  that. The evaluate/purge pair is run by a person through `hort-cli admin
+  retention preview` / `apply`; `preview` (the dry run) needs only
+  `Permission::AdminTaskInvoke`, while executing additionally needs the
+  `task:destructive` claim, which a claimless bootstrap svc-token cannot
+  carry.
+- **`KeepLastN` / `UnusedFor` retention** — neither predicate is declared.
+  `KeepLastN` ranks siblings and decides nothing over groups of size one,
+  and this tree's own walk publishes exactly one version of each hosted
+  fixture package. `UnusedFor` has no last-use input wired at the
+  evaluator yet (`last_downloaded_at` is passed as `None`), so it would
+  read as "old" rather than "unused" — and the gitops apply linter now
+  rejects the predicate outright, so declaring it would fail the apply.
 - **Curation rules** (`kind: CurationRule`) — out of scope.

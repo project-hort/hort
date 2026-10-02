@@ -160,14 +160,15 @@ impl RefcountReconcilePort for PgRefcountReconcile {
                         AND cr.source_artifact_id = a.id
                         AND cr.kind               = 'primary_content'
                  WHERE a.repository_id = $1
+                   AND a.deleted_at IS NULL
                    AND (a.quarantine_status IS NULL
-                        OR a.quarantine_status NOT IN
-                           ('quarantined','rejected','scan_indeterminate'))
+                        OR a.quarantine_status <> ALL($2::text[]))
                    AND (cr.target_content_hash IS NULL
                         OR cr.target_content_hash <> a.checksum_sha256)
                 "#,
             )
             .bind(repo_id)
+            .bind(crate::gc_protected_quarantine_status_names())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", "scan_primary"))?;
@@ -205,15 +206,16 @@ impl RefcountReconcilePort for PgRefcountReconcile {
                         AND cr.source_artifact_id = a.id
                         AND cr.kind               = 'metadata_blob'
                  WHERE a.repository_id = $1
+                   AND a.deleted_at IS NULL
                    AND am.metadata_blob IS NOT NULL
                    AND (a.quarantine_status IS NULL
-                        OR a.quarantine_status NOT IN
-                           ('quarantined','rejected','scan_indeterminate'))
+                        OR a.quarantine_status <> ALL($2::text[]))
                    AND (cr.target_content_hash IS NULL
                         OR cr.target_content_hash <> trim(am.metadata_blob))
                 "#,
             )
             .bind(repo_id)
+            .bind(crate::gc_protected_quarantine_status_names())
             .fetch_all(&self.pool)
             .await
             .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", "scan_metadata"))?;
@@ -369,6 +371,16 @@ impl PgRefcountReconcile {
             .begin()
             .await
             .map_err(|e| map_sqlx_error(&e, "refcount_reconcile", &ctx()))?;
+
+        // The blob-reclamation lock (`crate::blob_lock`). A repair is a
+        // reference write like any other — it restores a claim on bytes
+        // that already exist — so it takes the same lock the ingest
+        // path takes and the storage-GC walk re-counts under. Taken
+        // first, before the delete below opens the window where the old
+        // row is gone and the new one is not yet there: a sweep that
+        // counted in that window would see one fewer reference than
+        // either state has.
+        crate::blob_lock::lock_blob_in_tx(&mut tx, target).await?;
 
         // Delete any existing row under this single-target `(repo, source,
         // kind)` — whatever its current target — so the re-insert replaces
@@ -859,6 +871,38 @@ mod tests {
             drift.repairs.is_empty(),
             "a quarantined artifact yields no primary_content create and no delete"
         );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Retired rows are historical projections, not live refcount
+    /// sources. Reconcile must not recreate either single-target edge.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn retired_artifact_is_not_reconciled() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let artifact = seed_artifact(&pool, repo, "retired", HASH_A, Some("released")).await;
+        seed_metadata_blob(&pool, artifact, HASH_B).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE artifacts SET deleted_at = now() WHERE id = $1")
+            .bind(artifact)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let drift = PgRefcountReconcile::new(pool.clone())
+            .scan_repo_drift(repo)
+            .await
+            .unwrap();
+        assert!(drift.repairs.is_empty());
+        assert!(cr_rows_for(&pool, artifact).await.is_empty());
 
         cleanup(&pool, repo).await;
     }

@@ -320,6 +320,163 @@ pub struct ScanJob {
     pub priority: u8,
 }
 
+// ---------------------------------------------------------------------------
+// Abandoned-lease requeue policy
+// ---------------------------------------------------------------------------
+
+/// What the abandoned-lease sweep did to one row it found stranded in
+/// `running` with a lapsed lease.
+///
+/// The sweep is the only actor that runs when a handler never returns,
+/// so it is also the only place the retry budget can be enforced for
+/// that row — see [`JobsRepository::requeue_abandoned`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequeueOutcome {
+    /// `running` → `pending`. The row is claimable again.
+    Requeued,
+    /// `running` → `failed`. `attempts` had already reached the cap, so
+    /// requeueing again would loop forever behind a task that kills its
+    /// worker every time. The row is retained (not deleted) so a late
+    /// completion from the original worker still lands somewhere.
+    RetriesExhausted,
+}
+
+/// One row the abandoned-lease sweep resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequeuedJob {
+    pub id: Uuid,
+    pub kind: String,
+    /// `attempts` as it stood when the sweep resolved the row. The sweep
+    /// does NOT touch the counter — the next claim increments it, exactly
+    /// as it does for a `reschedule`d row.
+    pub attempts: u32,
+    pub outcome: RequeueOutcome,
+}
+
+/// Task kinds whose abandoned `running` rows the lease-expiry sweep
+/// returns to `pending`.
+///
+/// A requeue can put two executions of the same row in flight at once:
+/// lease renewal makes that require a worker that stopped renewing and
+/// then resumed (a paused container, a long DB partition), but it does
+/// not make it impossible. Membership here is therefore a statement that
+/// **concurrent self-execution of the kind is absorbed by a mechanism
+/// that already exists**, not that concurrency is unlikely:
+///
+/// - `scan` — the verdict commit is a compare-and-set on the prior
+///   quarantine status (`commit_scan_result_with_score`'s `prior_status`)
+///   inside the event append's expected-version transaction, so the
+///   loser of a race rolls back whole, findings included. Requeue is
+///   load-bearing here and nowhere else as sharply: `jobs_scan_unique`
+///   is `(artifact_id) WHERE kind='scan' AND status IN
+///   ('pending','running')`, so an abandoned row makes its artifact
+///   permanently unscannable AND unrescannable.
+/// - `provenance-verify` — same in-flight trap via
+///   `find_active_provenance_for_artifact`; the verdict application
+///   rides the same optimistic-concurrency transition path.
+/// - `prefetch` / `prefetch-dependencies` — same trap via
+///   `jobs_prefetch_unique` / `jobs_prefetch_dependencies_unique` on
+///   `target_key`. Duplicate work is absorbed by the L2 terminal-ingest
+///   absorb (the `artifacts` path-UNIQUE) and L3 (`ON CONFLICT
+///   (target_key) DO NOTHING`), which the cascade already relies on for
+///   the prefetch-vs-client-pull race.
+/// - `cron-rescan-tick` / `advisory-watch-tick` / `prefetch-tick` —
+///   candidate selection plus an enqueue whose duplicate is rejected by
+///   a partial unique index.
+/// - `quarantine-release-sweep` — re-evaluates the fail-closed release
+///   predicate per artifact and commits through the same
+///   optimistic-concurrency transition.
+/// - `policy-reevaluation` — documented verdict-idempotent with
+///   event-version optimistic concurrency (ADR 0041 Item 3).
+/// - `replay-seen-prune`, `scanner-registry-prune`,
+///   `prefetch-row-retention-sweep`, `scan-row-retention-sweep`,
+///   `jobs-row-retention-sweep`, `staging-sweep` — `DELETE` over a
+///   predicate: running the set operation twice reaches the same set.
+/// - `oci-index-child-ingest`, `oci-membership-edge-backfill`,
+///   `wheel-metadata-backfill` — content-addressed ingest / edge
+///   re-derivation / metadata backfill, all upsert- or CAS-shaped.
+/// - `noop` — a pure function of `params`.
+///
+/// Disjoint from [`NO_REQUEUE_ON_LEASE_EXPIRY_KINDS`], and their union is
+/// exactly `EVENT_TASK_KINDS`. The
+/// [`requeue_policy_is_exhaustive_over_event_task_kinds`] test is what
+/// makes a future `jobs.kind` a compile-and-test failure until someone
+/// classifies it, rather than a kind that silently inherits either
+/// behaviour.
+pub const REQUEUE_ON_LEASE_EXPIRY_KINDS: &[&str] = &[
+    "scan",
+    "provenance-verify",
+    "prefetch",
+    "prefetch-dependencies",
+    "prefetch-tick",
+    "cron-rescan-tick",
+    "advisory-watch-tick",
+    "quarantine-release-sweep",
+    "policy-reevaluation",
+    "replay-seen-prune",
+    "scanner-registry-prune",
+    "prefetch-row-retention-sweep",
+    "scan-row-retention-sweep",
+    "jobs-row-retention-sweep",
+    "staging-sweep",
+    "oci-index-child-ingest",
+    "oci-membership-edge-backfill",
+    "wheel-metadata-backfill",
+    "noop",
+];
+
+/// Task kinds the lease-expiry sweep leaves in `running`.
+///
+/// Every kind here shares two properties, and both are required for the
+/// exclusion to be free:
+///
+/// 1. **A concurrent second execution is not absorbed by anything.**
+/// 2. **An abandoned row blocks nothing.** None of these kinds appears in
+///    an `status IN ('pending','running')` uniqueness index or read, so
+///    the stranded row is one clutter row; the kind's next scheduled tick
+///    enqueues a fresh row and the work happens. Exclusion costs a row,
+///    not a capability — which is exactly why the trade goes this way.
+///
+/// Per kind:
+///
+/// - `eventstore-archive` — `seal_and_remove`'s `StreamSealed` append to
+///   `admin-eventstore-retention` has no internal wait bound and is safe
+///   only because at most one is in flight cluster-wide. The three layers
+///   that deliver that are the CronJob's `concurrencyPolicy: Forbid`, the
+///   worker's per-kind semaphore, and the per-UTC-day idempotency key —
+///   and the semaphore is per *process*. A requeue claimed by a sibling
+///   replica walks around all three. Relaxing this needs a security
+///   co-review, not a sweep (ADR 0020, ADR 0028).
+/// - `retention-purge` — destructive storage GC, and it fires the
+///   pre-purge checkpoint hook before deleting. Two concurrent walks race
+///   on refcounts and emit two checkpoints.
+/// - `retention-evaluate` — drives the two above.
+/// - `eventstore-checkpoint` — derives the next `checkpoint_seq` as
+///   `max(existing) + 1` by reading then writing. Two concurrent
+///   emissions derive the same sequence number.
+/// - `service-account-rotation` — the freshness gate is a read of the k8s
+///   Secret annotation followed by a mint + upsert. Two concurrent ticks
+///   both read stale, both mint, and the losing upsert leaves a live PAT
+///   carrying the account's full declared permissions that no Secret
+///   references. Every 15 minutes, so the next tick recovers.
+/// - `seed-import` — an operator one-shot that bulk-registers with
+///   backdated quarantine anchors; a concurrent second pass can register
+///   past its own already-imported check. The operator re-runs the
+///   subcommand.
+/// - `verify-event-chain` — not worker-dispatched at all. The
+///   `hort-server verify-event-chain` subcommand writes the row as a
+///   completed liveness breadcrumb, so it is never claimed and never
+///   `running`. Listed so the exhaustiveness guard has a home for it.
+pub const NO_REQUEUE_ON_LEASE_EXPIRY_KINDS: &[&str] = &[
+    "eventstore-archive",
+    "retention-purge",
+    "retention-evaluate",
+    "eventstore-checkpoint",
+    "service-account-rotation",
+    "seed-import",
+    "verify-event-chain",
+];
+
 /// Outbound port for the `jobs` table — scan-job subset.
 ///
 /// `claim_scan_jobs` is the leader-electing read: each worker calls it
@@ -466,6 +623,82 @@ pub trait JobsRepository: Send + Sync {
         Box::pin(async { Ok(None) })
     }
 
+    /// Extend the claim lease on a row this worker is currently running.
+    ///
+    /// `UPDATE … SET locked_until = now() + lock_duration WHERE id =
+    /// job_id AND locked_by = worker_id AND status = 'running'`. Returns
+    /// `true` when exactly that row was updated and `false` when it was
+    /// not — the row has already been closed out, or an abandoned-lease
+    /// sweep decided this worker was dead and handed the row on. `false`
+    /// is therefore a **fencing signal**: whatever the caller is running
+    /// against that row is no longer the authoritative execution.
+    ///
+    /// This is what makes [`Self::requeue_abandoned`]'s discriminator
+    /// mean anything. Without renewal, `locked_until < now()` on a
+    /// `running` row says only "the task outlived the claim's nominal
+    /// lease", which is equally true of a dead worker and of a slow one.
+    /// With a renewal every `lock_duration / 3`, a lapsed lease means
+    /// three consecutive renewals failed to land, which a live worker
+    /// with a working database connection does not do.
+    ///
+    /// **Default implementation:** returns `Ok(true)`. A mock has no
+    /// lease to extend, and the honest answer for "is the fixture's row
+    /// still mine" is yes — the additive-default pattern of
+    /// [`Self::find_active_scan_for_artifact`].
+    fn renew_lease<'a>(
+        &'a self,
+        job_id: Uuid,
+        worker_id: &'a str,
+        lock_duration: Duration,
+    ) -> BoxFuture<'a, DomainResult<bool>> {
+        let _ = (job_id, worker_id, lock_duration);
+        Box::pin(async { Ok(true) })
+    }
+
+    /// Resolve up to `batch_size` rows stranded in `running` whose lease
+    /// lapsed more than `grace` ago, restricted to `kinds`.
+    ///
+    /// A row with `attempts < attempt_cap` goes back to `pending` with
+    /// `locked_by` cleared and `locked_until` set to a short not-before
+    /// so the same replica does not re-grab it on the very next tick
+    /// ([`RequeueOutcome::Requeued`]). A row at or above the cap goes to
+    /// `failed` ([`RequeueOutcome::RetriesExhausted`]).
+    ///
+    /// **The cap has to be enforced here, and this is the only place it
+    /// can be.** Every other retry budget in the system is spent by code
+    /// running *after* the handler returns — the scan orchestrator's
+    /// `attempts >= max_attempts` branch in `record_outcome`, the
+    /// dispatcher's `TaskOutcome::Failed { retry }` arms. A task that
+    /// kills its worker never reaches any of them, so a requeue that did
+    /// not carry its own cap would re-drive a crash loop forever while
+    /// `attempts` climbed with nothing reading it.
+    ///
+    /// The row is never deleted. It may be genuinely running, and its
+    /// completion has to land somewhere: `mark_completed` /
+    /// `mark_failed` are unconditional on `id`, so a late write from the
+    /// original worker still updates the surviving row instead of
+    /// silently updating nothing.
+    ///
+    /// `attempts` is left alone. The claim increments it, so a requeued
+    /// row is counted on its next claim exactly like a `reschedule`d
+    /// one — the sweep spends no budget of its own.
+    ///
+    /// `kinds` is expected to be [`REQUEUE_ON_LEASE_EXPIRY_KINDS`]; see
+    /// that constant for why the complement is excluded.
+    ///
+    /// **Default implementation:** returns `Ok(vec![])` — "this
+    /// repository has no abandoned-row recovery", the same additive
+    /// default [`Self::pending_scan_count`] uses.
+    fn requeue_abandoned<'a>(
+        &'a self,
+        kinds: &'a [&'a str],
+        grace: Duration,
+        attempt_cap: u32,
+        batch_size: u16,
+    ) -> BoxFuture<'a, DomainResult<Vec<RequeuedJob>>> {
+        let _ = (kinds, grace, attempt_cap, batch_size);
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Insert a cross-kind `jobs` row with `status='pending'`.
     ///
     /// Used by `TaskUseCase::enqueue` to create
@@ -828,8 +1061,8 @@ pub trait JobsRepository: Send + Sync {
     }
 
     /// Retention sweep for the pull-through ingest cascade — delete
-    /// terminal `kind LIKE 'prefetch%'` and `kind =
-    /// 'oci-index-child-ingest'` rows whose `updated_at < now() -
+    /// terminal `kind LIKE 'prefetch%'` (minus `prefetch-tick`) and
+    /// `kind = 'oci-index-child-ingest'` rows whose `updated_at < now() -
     /// $horizon`. Returns the number of rows deleted.
     ///
     /// The cascade is high-churn (a closure-warm enqueues thousands
@@ -838,10 +1071,28 @@ pub trait JobsRepository: Send + Sync {
     ///
     /// ```sql
     /// DELETE FROM public.jobs
-    ///  WHERE (kind LIKE 'prefetch%' OR kind = 'oci-index-child-ingest')
+    ///  WHERE ((kind LIKE 'prefetch%' AND kind <> 'prefetch-tick')
+    ///         OR kind = 'oci-index-child-ingest')
     ///    AND status IN ('completed', 'failed')
     ///    AND updated_at < now() - $1::interval
     /// ```
+    ///
+    /// **Why `prefetch-tick` is carved out.** This sweep has no
+    /// keep-newest clause, because its premise is that none of the rows
+    /// it reaches hold durable state. `prefetch-tick` breaks that
+    /// premise: it matches the `prefetch%` prefix by name only — it is a
+    /// scheduled tick, not cascade work — and the rotation's keyset
+    /// cursor lives in the `result_summary` of its newest `completed`
+    /// row, read back through [`Self::last_result_summary_by_kind`]. An
+    /// instance whose `prefetch-tick` schedule was off or failing for
+    /// longer than the horizon would lose the cursor here and restart the
+    /// rotation from the beginning, so on a large instance the tail
+    /// packages would come up rarely or never. The kind is swept by
+    /// [`Self::delete_terminal_other_kind_rows_older_than`] instead,
+    /// which retains the newest `completed` row per kind. The carve-out
+    /// and that sweep's matching `OR kind = 'prefetch-tick'` admission
+    /// are mirror images: break one and the kind is either swept twice or
+    /// never swept.
     ///
     /// **Why `oci-index-child-ingest` rides this sweep and not its own.**
     /// It is the same class of work as the cascade: high-churn (one row
@@ -856,7 +1107,8 @@ pub trait JobsRepository: Send + Sync {
     /// a re-fetch and never a re-anchor. Every other `jobs.kind` outside
     /// these two keeps its newest terminal row as durable state (e.g.
     /// `verify-event-chain`'s liveness breadcrumb), which is why widening
-    /// the predicate further is not a free change.
+    /// the predicate further is not a free change — `prefetch-tick` is
+    /// the worked example of exactly that cost.
     ///
     /// `pending`/`running` rows are deliberately excluded — they are
     /// either claim-pending (the worker has not picked them up yet)
@@ -892,8 +1144,8 @@ pub trait JobsRepository: Send + Sync {
     ///
     /// **`kind = 'scan'` exactly** — every other `jobs.kind` keeps its
     /// newest terminal row as durable state (e.g. `verify-event-chain`'s
-    /// liveness breadcrumb; the transitive-cascade `prefetch%` rows have
-    /// their own sweep in [`Self::delete_terminal_prefetch_rows_older_than`]).
+    /// liveness breadcrumb; the transitive-cascade rows have their own
+    /// sweep in [`Self::delete_terminal_prefetch_rows_older_than`]).
     /// Widening the `WHERE kind = 'scan'` predicate would delete another
     /// kind's durable state out from under it.
     ///
@@ -915,6 +1167,108 @@ pub trait JobsRepository: Send + Sync {
         Box::pin(async {
             Err(DomainError::Invariant(
                 "delete_terminal_scan_rows_older_than not implemented".into(),
+            ))
+        })
+    }
+
+    /// Retention sweep for **every kind the two kind-specific sweeps
+    /// above do not reach** — delete terminal
+    /// (`status IN ('completed', 'failed')`) rows whose
+    /// `updated_at < now() - $horizon`, **except** the rows the
+    /// jobs-row-as-state readers depend on. Returns the number of rows
+    /// deleted.
+    ///
+    /// ```sql
+    /// WITH live AS (
+    ///     SELECT kind,
+    ///            max(completed_at) FILTER (WHERE status = 'completed')
+    ///              AS newest_completed_at,
+    ///            max(created_at) AS newest_created_at
+    ///       FROM public.jobs
+    ///      WHERE status IN ('completed', 'failed')
+    ///        AND (kind NOT LIKE 'prefetch%' OR kind = 'prefetch-tick')
+    ///        AND kind NOT IN ('scan', 'oci-index-child-ingest')
+    ///      GROUP BY kind
+    /// )
+    /// DELETE FROM public.jobs j
+    ///  USING live l
+    ///  WHERE l.kind = j.kind
+    ///    AND j.status IN ('completed', 'failed')
+    ///    AND j.updated_at < now() - $1::interval
+    ///    AND NOT (j.status = 'completed'
+    ///             AND j.completed_at IS NOT DISTINCT FROM l.newest_completed_at)
+    ///    AND j.created_at <> l.newest_created_at
+    /// ```
+    ///
+    /// **Why the kind exclusions.** `kind = 'scan'` and the cascade
+    /// predicate already have sweeps of their own, each carrying its own
+    /// horizon constant. A second sweep covering the same rows would let
+    /// the shorter of the two constants silently win, so a kind covered
+    /// twice would age out on a horizon neither of its sweeps documents.
+    /// All three constants read 7 days today, which makes such an overlap
+    /// invisible rather than harmless — it would surface the first time
+    /// one of them moved. The exclusions are therefore expressed as the
+    /// complement of the two sibling predicates — textually, not as a
+    /// list of kinds — so the one-sweep-per-kind property holds by
+    /// construction and a new `prefetch%` kind inherits the cascade sweep
+    /// without a matching edit here.
+    ///
+    /// **Why `prefetch-tick` is readmitted.** It is the single exception
+    /// to the textual complement, and it is written as one: the cascade
+    /// sweep carves the kind out, and `OR kind = 'prefetch-tick'` takes
+    /// it back here. That kind's newest `completed` row carries the
+    /// prefetch rotation's keyset cursor, and this is the sweep with the
+    /// keep-newest clause that protects it. See
+    /// [`Self::delete_terminal_prefetch_rows_older_than`] for the full
+    /// argument.
+    ///
+    /// **Why two rows per kind can survive the horizon.** "Keep the
+    /// newest terminal row" is not sufficient: the two liveness gauges
+    /// read [`Self::last_completed_at_by_kind`] and the prefetch rotation
+    /// reads [`Self::last_result_summary_by_kind`], and **both filter
+    /// `status = 'completed'`**. A kind whose newest terminal row is a
+    /// `failed` one (a sweep that ran, then started failing) would keep
+    /// that `failed` row and lose the older `completed` row underneath
+    /// it — so `last_completed_at_by_kind` would answer `None`, i.e.
+    /// "never ran", for a task that demonstrably ran. The two retained
+    /// rows are therefore:
+    ///
+    /// - the newest `completed` row per kind, matching
+    ///   `max(completed_at)` / `ORDER BY completed_at DESC LIMIT 1`
+    ///   exactly, so the row kept is the row those readers read;
+    /// - the newest terminal row per kind by `created_at`, matching the
+    ///   `ORDER BY created_at DESC LIMIT 1` shape a
+    ///   latest-job-decides-the-predicate reader uses (the artifact
+    ///   rescan-stranding probe is the live example of that shape).
+    ///
+    /// Equality rather than a ranking window is deliberate: on a
+    /// `completed_at` tie the readers pick arbitrarily between the tied
+    /// rows, so the sweep keeps all of them rather than guessing which
+    /// one the reader would land on. `IS NOT DISTINCT FROM` on
+    /// `completed_at` makes a `completed` row with a NULL `completed_at`
+    /// (only reachable by a writer that bypasses this port) retained
+    /// rather than deleted, which is also what `ORDER BY completed_at
+    /// DESC` would read first.
+    ///
+    /// `pending`/`running` rows are excluded for the same reason as in
+    /// the two sibling sweeps — they are claim-pending or in flight.
+    /// Note that this leaves a row abandoned in `running` by a crashed
+    /// worker untouched: an expired lease does not distinguish a dead
+    /// worker from a task that is simply slower than its lease, and no
+    /// lease-renewal exists to make that distinction. Reaping those is a
+    /// requeue problem, not a retention problem.
+    ///
+    /// **Default implementation:** returns
+    /// `Err(DomainError::Invariant("delete_terminal_other_kind_rows_older_than not implemented"))`
+    /// so existing test fixtures compile without modification.
+    fn delete_terminal_other_kind_rows_older_than<'a>(
+        &'a self,
+        horizon: Duration,
+    ) -> BoxFuture<'a, DomainResult<u64>> {
+        let _ = horizon;
+        Box::pin(async {
+            Err(DomainError::Invariant(
+                "delete_terminal_other_kind_rows_older_than not implemented".into(),
             ))
         })
     }
@@ -1070,6 +1424,17 @@ mod tests {
                 .expect("enqueue_scan"),
             Uuid::nil(),
         );
+        assert!(
+            repo.renew_lease(Uuid::nil(), "w", Duration::from_secs(1))
+                .await
+                .expect("renew_lease"),
+            "the default renewal answers 'still yours' — a fixture has no lease to lose"
+        );
+        assert!(repo
+            .requeue_abandoned(&["scan"], Duration::from_secs(1), 5, 10)
+            .await
+            .expect("requeue_abandoned")
+            .is_empty());
     }
 
     /// Compile-time assertion that `JobsRepository` is dyn-compatible.
@@ -1592,6 +1957,24 @@ mod tests {
         );
     }
 
+    /// `delete_terminal_other_kind_rows_older_than` default impl
+    /// surfaces `Invariant` for the same reason as its two siblings — a
+    /// mock that returned `Ok(0)` would let a sweep handler report a
+    /// successful sweep against a repository that cannot sweep.
+    #[tokio::test]
+    async fn delete_terminal_other_kind_rows_older_than_default_impl_returns_invariant_error() {
+        let repo: Box<dyn JobsRepository> = Box::new(Bare);
+        let err = repo
+            .delete_terminal_other_kind_rows_older_than(Duration::from_secs(86_400 * 7))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DomainError::Invariant(_)),
+            "expected Invariant for delete_terminal_other_kind_rows_older_than default impl, \
+             got {err:?}"
+        );
+    }
+
     /// `PrefetchEnqueueRow` round-trips by clone + equality. The struct
     /// is the trait's batch-insert payload; the planner pre-builds the
     /// rows before passing them to the adapter.
@@ -1634,5 +2017,130 @@ mod tests {
         )
         .expect("valid idempotency key");
         assert_ne!(r1, r3);
+    }
+    // -----------------------------------------------------------------
+    // Abandoned-lease requeue policy — exhaustiveness guard
+    // -----------------------------------------------------------------
+
+    /// Every `jobs.kind` is classified exactly once.
+    ///
+    /// The sweep's `kind = ANY(...)` filter is an allow-list, so a kind
+    /// missing from both constants silently inherits "never requeued" —
+    /// the failure mode is a kind whose abandoned rows are stranded
+    /// forever with nobody having decided that. Asserting the union
+    /// against `EVENT_TASK_KINDS` (the mirror of the `jobs.kind` SQL
+    /// CHECK, itself pinned to the migration by
+    /// `task_kind_check_lockstep_guard`) turns adding a kind into a
+    /// failing test until someone takes a position on it. Modelled on
+    /// the no-wildcard exhaustiveness of `retention_registration_guard`.
+    #[test]
+    fn requeue_policy_is_exhaustive_over_event_task_kinds() {
+        use crate::events::EVENT_TASK_KINDS;
+        use std::collections::BTreeSet;
+
+        let requeue: BTreeSet<&str> = REQUEUE_ON_LEASE_EXPIRY_KINDS.iter().copied().collect();
+        let excluded: BTreeSet<&str> = NO_REQUEUE_ON_LEASE_EXPIRY_KINDS.iter().copied().collect();
+        let all: BTreeSet<&str> = EVENT_TASK_KINDS.iter().copied().collect();
+
+        assert_eq!(
+            requeue.len(),
+            REQUEUE_ON_LEASE_EXPIRY_KINDS.len(),
+            "REQUEUE_ON_LEASE_EXPIRY_KINDS contains a duplicate"
+        );
+        assert_eq!(
+            excluded.len(),
+            NO_REQUEUE_ON_LEASE_EXPIRY_KINDS.len(),
+            "NO_REQUEUE_ON_LEASE_EXPIRY_KINDS contains a duplicate"
+        );
+
+        let both: Vec<&&str> = requeue.intersection(&excluded).collect();
+        assert!(
+            both.is_empty(),
+            "a kind cannot be both requeued and excluded: {both:?}"
+        );
+
+        let union: BTreeSet<&str> = requeue.union(&excluded).copied().collect();
+        let unclassified: Vec<&&str> = all.difference(&union).collect();
+        assert!(
+            unclassified.is_empty(),
+            "jobs.kind value(s) {unclassified:?} are in EVENT_TASK_KINDS but classified by \
+             neither REQUEUE_ON_LEASE_EXPIRY_KINDS nor NO_REQUEUE_ON_LEASE_EXPIRY_KINDS — \
+             decide whether a concurrent second execution of the kind is absorbed by \
+             something, and add it to the matching list with the reason"
+        );
+        let unknown: Vec<&&str> = union.difference(&all).collect();
+        assert!(
+            unknown.is_empty(),
+            "{unknown:?} is classified by the requeue policy but is not a valid jobs.kind \
+             (absent from EVENT_TASK_KINDS) — a renamed or removed kind left a stale entry"
+        );
+    }
+
+    /// The destructive tier is never requeued.
+    ///
+    /// `DESTRUCTIVE_TASK_KINDS` is the set whose invocation is
+    /// irreversible; the sweep re-driving one of them without the
+    /// operator asking is exactly the authority the ADR 0028 idempotency
+    /// layer exists to withhold. Pinned separately from the census so a
+    /// future edit to the requeue list cannot quietly pull one in.
+    #[test]
+    fn destructive_kinds_are_never_requeued() {
+        use crate::events::DESTRUCTIVE_TASK_KINDS;
+        for kind in DESTRUCTIVE_TASK_KINDS {
+            assert!(
+                NO_REQUEUE_ON_LEASE_EXPIRY_KINDS.contains(kind),
+                "destructive kind {kind:?} must be excluded from the abandoned-lease requeue"
+            );
+            assert!(
+                !REQUEUE_ON_LEASE_EXPIRY_KINDS.contains(kind),
+                "destructive kind {kind:?} must not be requeued on lease expiry"
+            );
+        }
+    }
+
+    /// Every kind that an `status IN ('pending','running')` uniqueness
+    /// index or read can strand permanently IS requeued.
+    ///
+    /// This is the other half of the exhaustiveness guard and the one
+    /// that carries the cost: for these four kinds an abandoned row is
+    /// not clutter, it is a capability lost for good — no further `scan`
+    /// row for that artifact (`jobs_scan_unique`), no further verify
+    /// (`find_active_provenance_for_artifact`), no further pull of that
+    /// coordinate (`jobs_prefetch_unique` /
+    /// `jobs_prefetch_dependencies_unique`). Excluding one of them would
+    /// be trading a capability away, not a row.
+    #[test]
+    fn kinds_with_an_in_flight_uniqueness_blocker_are_requeued() {
+        for kind in [
+            "scan",
+            "provenance-verify",
+            "prefetch",
+            "prefetch-dependencies",
+        ] {
+            assert!(
+                REQUEUE_ON_LEASE_EXPIRY_KINDS.contains(&kind),
+                "{kind:?} is gated by an in-flight uniqueness predicate, so an abandoned \
+                 running row strands it permanently — it must be requeued"
+            );
+        }
+    }
+
+    /// `RequeuedJob` / `RequeueOutcome` round-trip by clone + equality.
+    #[test]
+    fn requeued_job_clone_and_eq() {
+        let j = RequeuedJob {
+            id: Uuid::nil(),
+            kind: "scan".to_string(),
+            attempts: 2,
+            outcome: RequeueOutcome::Requeued,
+        };
+        assert_eq!(j, j.clone());
+        let mut other = j.clone();
+        other.outcome = RequeueOutcome::RetriesExhausted;
+        assert_ne!(j, other);
+        assert_eq!(
+            format!("{:?}", RequeueOutcome::RetriesExhausted),
+            "RetriesExhausted"
+        );
     }
 }

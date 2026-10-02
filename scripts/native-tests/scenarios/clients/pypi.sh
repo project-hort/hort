@@ -77,7 +77,7 @@ fi
 # ---- Test 2: PEP 503 root index ----
 log "==> [2/6] Verifying PEP 503 root index..."
 ROOT_INDEX=$(curl -sf "$PYPI_URL/simple/")
-if printf '%s' "$ROOT_INDEX" | grep -q "test-package-native"; then
+if capture_match "test-package-native" printf '%s' "$ROOT_INDEX"; then
   pass "Root index contains package"
 else
   fail "Root index contains package" "test-package-native not found in $PYPI_URL/simple/"
@@ -87,13 +87,13 @@ fi
 log "==> [3/6] Verifying PEP 503 package index..."
 PKG_INDEX=$(curl -sf "$PYPI_URL/simple/test-package-native/")
 pkg_ok=1
-printf '%s' "$PKG_INDEX" | grep -q ".whl" \
+capture_match ".whl" printf '%s' "$PKG_INDEX" \
   || { fail "Wheel in package index"           "no .whl link found";              pkg_ok=0; }
-printf '%s' "$PKG_INDEX" | grep -q ".tar.gz" \
+capture_match ".tar.gz" printf '%s' "$PKG_INDEX" \
   || { fail "Sdist in package index"           "no .tar.gz link found";           pkg_ok=0; }
-printf '%s' "$PKG_INDEX" | grep -q "sha256=" \
+capture_match "sha256=" printf '%s' "$PKG_INDEX" \
   || { fail "sha256 hash in package index"     "no sha256= attribute found";      pkg_ok=0; }
-printf '%s' "$PKG_INDEX" | grep -q "data-requires-python" \
+capture_match "data-requires-python" printf '%s' "$PKG_INDEX" \
   || { fail "requires-python in package index" "no data-requires-python found";   pkg_ok=0; }
 if [ "$pkg_ok" = 1 ]; then pass "Package index correct with hashes and requires-python"; fi
 
@@ -136,9 +136,9 @@ log "==> [6/6] Verifying PEP 658 metadata endpoint..."
 WHL_FILE=$(ls dist/*.whl | head -1 | xargs basename)
 METADATA=$(curl -sf "$PYPI_URL/simple/test-package-native/${WHL_FILE}.metadata")
 meta_ok=1
-printf '%s' "$METADATA" | grep -q "Name: test-package-native" \
+capture_match "Name: test-package-native" printf '%s' "$METADATA" \
   || { fail "PEP 658 metadata Name field"    "Name: test-package-native not found"; meta_ok=0; }
-printf '%s' "$METADATA" | grep -q "Version: $TEST_VERSION" \
+capture_match "Version: $TEST_VERSION" printf '%s' "$METADATA" \
   || { fail "PEP 658 metadata Version field" "Version: $TEST_VERSION not found";     meta_ok=0; }
 if [ "$meta_ok" = 1 ]; then pass "PEP 658 metadata extraction works"; fi
 

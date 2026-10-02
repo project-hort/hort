@@ -16,14 +16,11 @@
 //!
 //! ## `HasFixAvailable` precision note
 //!
-//! `HasFixAvailable` is sourced from "a non-empty `fixed_versions`
-//! array on its source advisory". The v1 `scan_findings` projection
-//! does not carry `fixed_versions` (see
-//! [`crate::ports::retention_scan_reader`] module docs), so with the
-//! projection-only adapter every [`Finding::fixed_versions`] is empty
-//! and `HasFixAvailable` never matches. The predicate logic here is
-//! still written against `fixed_versions` so a future blob-sourced
-//! adapter makes it correct unchanged.
+//! `HasFixAvailable` matches a non-empty `fixed_versions` array from
+//! the source advisory. The `scan_findings` projection carries that
+//! array for new or rescanned findings (see
+//! [`crate::ports::retention_scan_reader`] module docs). Findings
+//! written before migration 029 have the empty default until rescan.
 
 use chrono::{DateTime, Utc};
 
@@ -47,10 +44,61 @@ pub struct EvaluationInputs<'a> {
     /// the `UnusedFor` anchor.
     pub last_downloaded_at: Option<DateTime<Utc>>,
     /// `KeepLastN` ranking: this artifact's 1-based position among its
-    /// sibling versions, newest = 1, and the sibling total. `None`
-    /// when the app layer could not resolve a ranking (then
-    /// `KeepLastN` cannot match — fail safe, never expire).
+    /// usable sibling versions, newest = 1, and the usable-sibling
+    /// total. `None` when the app layer could not resolve a ranking
+    /// (then `KeepLastN` cannot match — fail safe, never expire).
+    ///
+    /// ## Ranking contract (part of the retention contract, not an
+    /// implementation detail)
+    ///
+    /// Which versions survive `KeepLastN(n)` is decided entirely by
+    /// this ordering, so it is fixed here rather than left to the
+    /// resolver: **newest first by `created_at`, ties broken by the
+    /// artifact id descending**. The tiebreak is what makes the
+    /// decision reproducible — two artifacts stored in the same
+    /// instant would otherwise be free to swap ranks between two runs
+    /// and expire alternately.
+    ///
+    /// ## Counted set (also contract): `n` means `n` *usable*
+    /// artifacts
+    ///
+    /// The sibling group is `(repository, artifact name)` and contains
+    /// exactly the **usable** siblings — the ones
+    /// [`Artifact::is_downloadable`](crate::entities::artifact::Artifact::is_downloadable)
+    /// admits. Neither a retired artifact nor a quarantined, rejected
+    /// or scan-indeterminate one occupies a rank slot:
+    ///
+    /// - A retired artifact holding a slot would shield itself and
+    ///   push one extra usable artifact over the edge.
+    /// - A quarantine-protected artifact holding a slot lets the
+    ///   usable window reach zero — `KeepLastN(3)` over five siblings
+    ///   whose three newest are quarantined together would keep only
+    ///   those three and expire both released ones, so the operator
+    ///   who asked for three usable artifacts would have none. The
+    ///   accepted counter-cost is that the group holds `n` plus its
+    ///   protected siblings rather than `n` rows.
+    ///
+    /// Releasing a protected sibling therefore re-enters it in the
+    /// rank and can push an older released sibling out of the window.
+    /// That is the rule working: release is what makes an artifact
+    /// usable, and a usable artifact counts.
     pub keep_rank: Option<(u32, u32)>,
+    /// `true` iff a mutable ref (an OCI tag, an npm dist-tag, any
+    /// other mutable pointer) **in this artifact's own repository**
+    /// currently resolves to this artifact.
+    ///
+    /// A tag target survives `KeepLastN` regardless of its rank:
+    /// expiring it would break the pointer that names it, and a rank
+    /// on its own knows nothing about tags. The flag is deliberately
+    /// repository-scoped — content hashes are shared across
+    /// repositories by construction (that is what CAS is), so a
+    /// hash-global reading would exempt an untagged artifact merely
+    /// because identical bytes happen to be tagged elsewhere.
+    ///
+    /// It gates `KeepLastN` only. Age- and security-driven predicates
+    /// are the operator's explicit instruction to expire old or
+    /// vulnerable content and are not softened by a tag.
+    pub tag_targeted: bool,
     /// Current scan findings for the artifact (the `scan_findings`
     /// projection rows mapped to [`Finding`]).
     pub findings: &'a [Finding],
@@ -123,6 +171,11 @@ pub fn matches_bool(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> bool {
         PolicyPredicate::KeepLastN(keep) => match inputs.keep_rank {
             // No ranking resolved → fail safe, never expire.
             None => false,
+            // A live mutable pointer resolves to this artifact:
+            // expiring it would break the tag that names it, whatever
+            // its rank. Checked after the rank so an unresolvable
+            // ranking still fails safe on its own.
+            Some(_) if inputs.tag_targeted => false,
             Some((rank, _total)) => rank > *keep,
         },
         PolicyPredicate::HasFindingAboveSeverity(threshold) => inputs
@@ -296,6 +349,7 @@ mod tests {
             created_at: ts(0),
             last_downloaded_at: None,
             keep_rank: None,
+            tag_targeted: false,
             findings,
             first_detected_at: ts(0),
             latest_scan_at: ts(900_000),
@@ -415,6 +469,48 @@ mod tests {
         i.keep_rank = Some((3, 10)); // rank == keep → inside window
         let p = PolicyPredicate::KeepLastN(3);
         assert_eq!(evaluate(&p, &i), EvaluationOutcome::NoMatch);
+    }
+
+    #[test]
+    fn keep_last_n_tag_target_survives_regardless_of_rank() {
+        let f = vec![];
+        let mut i = inputs(&f);
+        i.keep_rank = Some((9, 12)); // far outside the keep window
+        i.tag_targeted = true;
+        let p = PolicyPredicate::KeepLastN(3);
+        assert_eq!(evaluate(&p, &i), EvaluationOutcome::NoMatch);
+    }
+
+    #[test]
+    fn keep_last_n_tag_target_without_ranking_still_fails_safe() {
+        let f = vec![];
+        let mut i = inputs(&f);
+        i.keep_rank = None;
+        i.tag_targeted = true;
+        let p = PolicyPredicate::KeepLastN(1);
+        assert_eq!(evaluate(&p, &i), EvaluationOutcome::NoMatch);
+    }
+
+    #[test]
+    fn tag_target_does_not_soften_age_or_security_predicates() {
+        // The tag exemption gates `KeepLastN` only: an age policy is
+        // the operator's explicit instruction to expire old content.
+        let f = vec![finding(SeverityThreshold::Critical, Some(9.0), vec![])];
+        let mut i = inputs(&f);
+        i.created_at = ts(0);
+        i.now = ts(10_000);
+        i.tag_targeted = true;
+        assert!(matches!(
+            evaluate(&PolicyPredicate::AgeExceeds(5000), &i),
+            EvaluationOutcome::Matched(ExpirationReason::AgeExceeded { .. })
+        ));
+        assert!(matches!(
+            evaluate(
+                &PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::Critical),
+                &i
+            ),
+            EvaluationOutcome::Matched(ExpirationReason::SecurityFinding { .. })
+        ));
     }
 
     #[test]
