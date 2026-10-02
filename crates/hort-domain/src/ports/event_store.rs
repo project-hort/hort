@@ -238,7 +238,9 @@ pub trait EventStore: Send + Sync {
     /// implement whatever their test needs.
     fn delete_stream(&self, stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>>;
 
-    /// Move an entire stream to a cold-storage target.
+    /// Move an entire stream to a cold-storage target — the **contract**;
+    /// no shipped implementation honours it yet (see the posture note
+    /// below before relying on this).
     ///
     /// Same caller preconditions as [`Self::delete_stream`]. The `target`
     /// string is adapter-defined: e.g. `s3://archive-bucket/<prefix>`
@@ -249,6 +251,16 @@ pub trait EventStore: Send + Sync {
     ///
     /// Implementation posture mirrors
     /// [`Self::delete_stream`].
+    ///
+    /// **No shipped implementation writes to cold storage yet.** The
+    /// Postgres adapter runs the same seal-and-remove as
+    /// [`Self::delete_stream`] and carries `target` no further than a
+    /// `tracing` field; the cold-storage write is deferred post-v1. The
+    /// retention mode that would select this path
+    /// (`HORT_RETENTION_STREAM_MODE=archive`) is therefore refused at
+    /// config parsing in both binaries, so the only callers today are
+    /// tests. An implementation that cannot keep the events must not
+    /// return `Ok` from here once the mode is reachable again.
     fn archive_stream(&self, stream_id: StreamId, target: &str) -> BoxFuture<'_, DomainResult<()>>;
 }
 

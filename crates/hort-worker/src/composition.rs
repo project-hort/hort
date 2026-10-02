@@ -1381,6 +1381,13 @@ pub async fn build_app_context(
             chrono_duration(floors.artifact_downloaded),
             chrono_duration(floors.api_token_used),
         );
+        // `RetentionStreamMode::Archive` cannot reach here: config
+        // parsing refuses `HORT_RETENTION_STREAM_MODE=archive` while the
+        // cold-storage writer is deferred post-v1 (the archive path would
+        // delete the stream and report it archived). The arm is kept so
+        // the mapping does not have to be reconstructed with the writer;
+        // it is unreachable in a shipped deployment, not dead by
+        // accident.
         let mode = match &cfg.retention_stream_mode {
             crate::config::RetentionStreamMode::Delete => StreamRetentionModeRef::Delete,
             crate::config::RetentionStreamMode::Archive { target_prefix } => {

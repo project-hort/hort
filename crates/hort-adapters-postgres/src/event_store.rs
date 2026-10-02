@@ -643,6 +643,20 @@ impl EventStore for PgEventStore {
         Box::pin(async move { self.seal_and_remove(stream_id, SealMode::Delete).await })
     }
 
+    /// **This deletes.** There is no cold-storage write behind it: the
+    /// body runs the same `seal_and_remove` chokepoint as
+    /// [`Self::delete_stream`] — `StreamSealed` tombstone, then
+    /// `DELETE FROM events WHERE stream_id = $1` — and `target` reaches
+    /// nothing but one `tracing` field. Designing the cold-storage write
+    /// (S3 IA / Glacier / EventStoreDB partition) is deferred post-v1.
+    ///
+    /// No shipped deployment calls this: `HORT_RETENTION_STREAM_MODE=archive`
+    /// is refused by both binaries' config parsing until that writer
+    /// exists, so the only remaining callers are this crate's own tests
+    /// (which assert the delete parity deliberately). The method stays
+    /// because `EventStore` declares it and the retention use case's
+    /// `Archive` arm routes to it; it must not grow a success path that
+    /// looks like archiving before a writer backs it.
     fn archive_stream(&self, stream_id: StreamId, target: &str) -> BoxFuture<'_, DomainResult<()>> {
         let target = target.to_owned();
         Box::pin(async move {
@@ -670,9 +684,11 @@ impl EventStore for PgEventStore {
 // rolls back, so a tombstone is never left orphaned without its
 // corresponding deletion. There is exactly one chokepoint
 // (`seal_and_remove`); `archive_stream` is treated identically to
-// `delete_stream` for the live DB — the cold-storage archive *target* is
-// The cold-storage archive target is future work; today both seal the
-// chain head and remove the live rows; only the trace differs.
+// `delete_stream` for the live DB. The cold-storage archive *write* is
+// deferred post-v1: today both modes seal the chain head and remove the
+// live rows, and only the trace differs — which is why
+// `HORT_RETENTION_STREAM_MODE=archive` is refused at config parsing in
+// both binaries rather than reporting a delete as an archive.
 //
 // Row-removal mechanism (decided 2026-05-17): the actual row removal past
 // the `events_immutable` BEFORE-DELETE trigger is NOT done by disabling
@@ -743,13 +759,19 @@ impl EventStore for PgEventStore {
 
 /// Whether the seal+removal chokepoint was reached via `delete_stream`
 /// or `archive_stream`. The live-DB action is identical (seal the chain
-/// head, then remove the rows); only the emitted trace differs. The
-/// cold-storage `target` is carried for the log line and as a forward
-/// hook for the archive-backend follow-on.
+/// head, then remove the rows); only the emitted trace differs — so
+/// `Archive` removes the stream's events exactly as `Delete` does. The
+/// `target` is carried for the log line and as a forward hook for the
+/// post-v1 cold-storage-backend write; it is read by nothing else.
 #[derive(Debug)]
 enum SealMode {
     Delete,
-    Archive { target: String },
+    /// Reached only from `PgEventStore::archive_stream`, which no shipped
+    /// deployment calls — the `archive` retention mode is refused at
+    /// config parsing until the cold-storage writer exists.
+    Archive {
+        target: String,
+    },
 }
 
 impl SealMode {
@@ -2728,8 +2750,10 @@ mod tests {
 
     /// Tier 2 (DB): `archive_stream` is treated identically to
     /// `delete_stream` for the live DB — it also seals (one tombstone)
-    /// and removes the rows. Cold-storage offload is a follow-on item;
-    /// only the trace differs.
+    /// and **removes the rows**. The cold-storage write is deferred
+    /// post-v1; only the trace differs. This test is the pinned evidence
+    /// for that, and is why `HORT_RETENTION_STREAM_MODE=archive` is
+    /// refused at config parsing: nothing here keeps the events.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn b9_db_archive_stream_parity_with_delete() {

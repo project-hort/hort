@@ -186,6 +186,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`HORT_RETENTION_STREAM_MODE=archive` is refused at startup while no
+  cold-storage writer exists** (#333). Both `hort-server` and `hort-worker` now
+  fail config parsing on the value, with a message naming the deferred
+  cold-storage write and `delete` as the way forward.
+  `HORT_RETENTION_ARCHIVE_TARGET` is no longer consulted — no target could have
+  made the mode archive anything, so demanding one first only walked the
+  operator through a fix that changed nothing. `delete` and an unset variable
+  are unchanged.
+
+  The mode was not inert; it was mislabelled, which is the `UnusedFor` fault
+  below rather than the milder `maxAgeDays` one.
+  `PgEventStore::archive_stream` runs the same `DELETE FROM events WHERE
+  stream_id = $1` as the delete path and carries the archive target no further
+  than one `tracing` field — no INSERT, no copy, no cold-storage write — after
+  which the sweep increments its `archived` counter and logs "stream sealed +
+  archived". An operator who selected `archive` to *keep* audit events was
+  having them removed and told they were kept. The existing non-empty-target
+  requirement was justified in-tree as stopping a "silent degradation to delete
+  = data loss"; that degradation was happening anyway, with the target set.
+
+  `hort_event_store_streams_archived_total{result="archived"}` is consequently
+  never emitted by a shipped deployment; the label value and the `Archive`
+  routing stay in place for the change that gives the mode a real writer.
+
 - **Retention policies using `HasFixAvailable` now expire matching artifacts**
   (#323). The scan findings projection now preserves advisory fix versions, so
   policies that previously did nothing can take effect without an operator
