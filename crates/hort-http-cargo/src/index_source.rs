@@ -332,20 +332,17 @@ impl IndexSource for ProxyCargoSource {
             }
         };
 
-        // Per-version status hydration — used by
-        // `NonServableStatusFilter` + `IndexModeFilter`. A status-query
-        // failure degrades to "no status known" (matches the
-        // proxy-cache `fetch_with_cache` semantics).
+        // Per-version status hydration, propagated and never degraded
+        // — see the npm proxy source for the full reasoning: an empty
+        // status map is the claim "hort holds nothing non-servable
+        // here", which under `IncludePending` re-advertises every
+        // version hort is holding back.
         let handler = CargoFormatHandler;
         let normalized = handler.normalize_name(crate_name);
         let pkg_status = ctx
             .artifact_use_case
             .package_version_status(repo.id, &normalized)
-            .await
-            .unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "cargo proxy source: package_version_status failed; degrading to no status");
-                Vec::new()
-            });
+            .await?;
 
         // Fire the prefetch trigger on every successful fetch. The
         // trigger consumes the already-computed projection directly (no

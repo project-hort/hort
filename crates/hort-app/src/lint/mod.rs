@@ -12,14 +12,31 @@
 //! gitops config, itself visible in the apply diff) — never an
 //! env-var and never a global `warn` switch.
 //!
-//! The linter runs inside
-//! [`ApplyConfigUseCase::apply_permission_grants`](crate::use_cases::apply_config_use_case)
-//! over the fully-built desired grant set (envelope grants ∪
-//! SA-owned `User`-subject grants) plus the desired `claim_mappings`,
-//! *before* the whole-partition `save_managed` commit. Any `Reject`
-//! outcome fails the entire apply with
-//! `AppError::Domain(DomainError::Validation(_))` — strict-atomic,
-//! before any audit event lands.
+//! The linter runs at two points on the apply path, and the split is
+//! deliberate:
+//!
+//! - **The pre-write pass** — [`StaticConfigValidator`]'s row 8, reached
+//!   from `ApplyConfigUseCase::run_pre_write_validation` over an
+//!   expansion of the desired state that uses placeholder ids. This is
+//!   where a `Reject` **fails the apply**, with
+//!   `AppError::Domain(DomainError::Validation(_))`, before the first DB
+//!   write of any stage. It has to be here: the grant stage runs after the
+//!   repository, policy and mapping writes, and the apply ships no
+//!   rollback, so a rejection raised only there left a refused tightening
+//!   beside a committed loosening from the same bundle. The rules read
+//!   only the subject shape, the permission and whether a grant is
+//!   repo-scoped — never an id value — which is what makes the
+//!   placeholder expansion's verdict the real one.
+//! - **`ApplyConfigUseCase::apply_permission_grants`** — over the
+//!   fully-built, port-resolved desired grant set (envelope grants ∪
+//!   SA-owned `User`-subject grants) plus the desired `claim_mappings`,
+//!   *before* the whole-partition `save_managed` commit. This is the
+//!   authority on the real set and the single emitter of
+//!   `hort_apply_config_linter_total`; its reject arm is defence-in-depth
+//!   on the expansion above.
+//!
+//! The offline `hort-server validate-config` CLI runs row 8 too, so an
+//! operator's CI reaches the same verdict without a database.
 
 pub mod permission_grants;
 pub mod static_validate;

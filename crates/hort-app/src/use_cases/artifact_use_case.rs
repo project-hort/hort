@@ -701,7 +701,7 @@ impl ArtifactUseCase {
     /// costs one bounded stream read per pull.
     ///
     /// The verdict itself comes from
-    /// [`release_clearance::resolve_provenance_clearance`](crate::use_cases::release_clearance::resolve_provenance_clearance),
+    /// [`release_clearance::read_path_provenance_clearance`](crate::use_cases::release_clearance::read_path_provenance_clearance),
     /// the single source the release sweep and the ADR 0041
     /// re-evaluation callers share, so a read-path answer can never
     /// drift from the gate that actually decides release.

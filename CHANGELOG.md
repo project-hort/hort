@@ -7,6 +7,285 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **A one-hour break-glass credential can no longer compose into a 30-day
+  standing full-admin one** (#334). `admin bootstrap-session` is deliberately
+  short: it demands operator-level Postgres (DSN) access *and*
+  `HORT_TOKEN_ALLOW_ADMIN=true`, reuses the reserved non-service-account
+  `bootstrap-admin` principal, revokes the prior bootstrap token, and clamps
+  the full-cap admin PAT it issues to **one hour**. With the server process
+  carrying the same `HORT_TOKEN_ALLOW_ADMIN=true`, that one-hour credential was
+  accepted by the public authenticated self-mint route
+  (`POST /api/v1/users/me/tokens`), whose admin gate checks only the flag and
+  the admin principal — the break-glass user is deliberately not a service
+  account, so the one refusal on that path did not reach it — and then permits
+  an explicit admin-PAT expiry of **1 to 30 days**. The derived PAT carried an
+  operator-chosen name, while the next bootstrap run looked only for the
+  reserved name `bootstrap-session` in the *first page* of the principal's
+  tokens, so nothing ever revoked it. Possession of the hour-long credential
+  therefore yielded a 30-day full-admin credential needing no further DSN
+  access. Each half was separately accepted and separately tested —
+  `docs/auth-catalog.md` Entry 2 permits the 30-day admin PAT, ADR 0038
+  describes bootstrap as the short-lived path with no standing admin — and the
+  defect was the composition, which is what ADR 0016's cross-opt-in matrix
+  exists to catch; the matrix had never been applied to the auth opt-ins and
+  now carries a second axis for credential-authority gates. **ADR 0038 governs
+  a bootstrap-derived PAT** (decided 2026-10-03): the shared issuance gates now
+  refuse any issuance whose token *owner* is the reserved identity
+  (`403 bootstrap_admin_mint_forbidden`) — a rejection, not a shortened expiry
+  and not a warning, anchored on the owner rather than the route so a future
+  issuance route inherits it, and keyed on the row's `UNIQUE`, unwritable
+  username rather than on a token label. Independently, bootstrap rotation now
+  revokes **every** live token the principal owns, across every page, instead of
+  the one matching the reserved name: a name is operator-chosen and says nothing
+  about ownership. The general admin-PAT feature, its 1-30 day window, and the
+  bootstrap one-hour clamp are unchanged — only the break-glass principal's
+  reach into the self-mint route. The `admin bootstrap-session` CLI mint is the
+  one path that still issues for that identity, and it is the only one that
+  carries both bounds.
+
+- **An `Exclusion` scoped to a repository is now refused by every writer, not
+  silently applied to all of them** (#334). `scope: { repository: <name> }` was
+  accepted by the gitops apply and by
+  `POST /api/v1/admin/policies/:id/exclusions`, recorded on the
+  `ExclusionAdded` event, stored on the projection and rendered by the
+  exclusions listing — and never read. The finding filter matches on
+  `expires_at`, `cve_id` and `package_pattern` only; it could not read the
+  scope, because the artifact coordinates it matches against carry no
+  repository identity. So a CVE waiver an operator narrowed to one repository
+  cleared that CVE for **every** repository the parent policy governed: the
+  edit read as a narrowing and acted as a widening, with the
+  post-exclusion re-evaluation cascade releasing artifacts across all of them.
+  Both writers now refuse it — the gitops path before its first write
+  (`exclusion_scope_not_implemented`, also reported offline by
+  `hort-server validate-config`), and the HTTP path in
+  `PolicyUseCase::add_exclusion`, which every inbound writer passes through.
+  `scope: global` applies exactly as before. To waive a CVE for one repository,
+  scope the parent `ScanPolicy` to it — a policy scope *is* enforced.
+  **Rows stored before this release keep their scope and keep acting
+  globally**; nothing rewrites them. Removing one is refused nowhere — only
+  writing one is: dropping the envelope from the declared tree removes it, and
+  so does the HTTP `DELETE`. The removal is the direction that withdraws an
+  assurance nothing honoured, and it re-rejects findings in every repository
+  the parent policy governs rather than only the one the scope named, which
+  the server logs (policy id, CVE, the stored repository id, the rationale) as
+  it removes the row.
+
+- **A `ScanPolicy.licensePolicy` is now refused at apply instead of accepted
+  and ignored** (#334). The scan path dispatches to the licence evaluator with
+  a hard-coded **empty** licence list — no port surfaces an artifact's
+  licences — so a well-formed `{denied_licenses: [GPL-3.0], action: Block}`
+  compared its denied set against zero licences, produced zero violations, and
+  left the scan clean whatever the artifact was licensed under, while the
+  operator who wrote it believed releases were gated on licence compliance.
+  The field is now rejected unless it is `{}` or omitted (the evaluator's own
+  "no policy declared" short-circuit, and what every shipped example tree
+  writes), with a message that says the control is not implemented so nobody
+  retries with a different value
+  (`scan_policy_license_policy_not_implemented`). A projection stored before
+  this release keeps its value and keeps deciding nothing.
+
+- **A `virtualMembers` entry on another format is now refused at apply**
+  (#334). Nothing compared a member's `format` with its virtual repository's:
+  cross-document validation required each member to be declared and
+  non-virtual, the per-envelope validator checked only the virtual's *own*
+  format, and serve-time `resolve_members` re-checked Read visibility and
+  repository type. So a `pypi` hosted repository could be a member of an `npm`
+  virtual — and because a non-proxy member *owns* the names it holds (ADR 0031
+  name-level pinning), it would suppress the virtual's npm proxy for every name
+  it held while serving nothing an npm client can install. Such a member is now
+  rejected, naming both formats
+  (`virtual_member_format_not_enforced`). A format-homogeneous virtual —
+  every shipped example tree — applies exactly as before; a cross-format
+  aggregate is one virtual per format.
+
+- **A `ScanPolicy.maxArtifactAge` is now refused at apply instead of accepted
+  and never read** (#334). The cap travelled the whole configuration path —
+  parsed, format-validated, converted to `max_artifact_age_secs`, diffed
+  field-by-field, event-sourced onto the policy stream, persisted, and written
+  into both the config snapshot and drift detection — and was read by nothing
+  that decides. The evaluator exists
+  (`hort_domain::policy::evaluate_age_gates`, which turns an exceeded cap into
+  a `Medium` `max-artifact-age` violation) and had **no production caller**:
+  no scan-result evaluation, no release decision and no retention pass ever
+  asked the question. So an operator who wrote `maxArtifactAge: 90d` declared
+  a staleness cap, could read it back from the policy and saw it in the
+  snapshot — while every artifact older than the cap kept passing every gate.
+  Any declared duration is now rejected
+  (`scan_policy_max_artifact_age_not_implemented`); the inert state is the
+  absent field, and unlike `licensePolicy` there is no accepted *value*,
+  because `None` is the only thing the evaluator reads as "no cap". `0s` is
+  refused exactly like `90d` — the rejection is the missing consumer, not the
+  number. The humantime format check stays, so a malformed duration is still a
+  per-envelope error. The evaluator is deliberately **not** deleted: it is the
+  implementation this row is held open for, and the row's retirement trigger
+  names the condition that removes the row again. A projection stored before
+  this release keeps its `max_artifact_age_secs` and keeps deciding nothing.
+  The `max-artifact-age` policy-violation metric key stays in its closed label
+  set — it is the domain's stable rule id — but the catalog no longer claims
+  the promotion gate emits it.
+
+All four are the [ADR 0015](docs/adr/0015-apply-time-linter-inert-fields-and-naming.md)
+accepted-at-apply-inert-at-runtime block, closed the way that ADR prescribes:
+a fail-closed apply-time rejection that points the operator at the missing
+enforcement, rather than removing the operator surface. The full set of named
+lint rows, each row's retirement trigger, and — separately — where the
+surfaces with *no* named row are actually validated is now a reference page:
+[`docs/architecture/reference/apply-time-linter-rows.md`](docs/architecture/reference/apply-time-linter-rows.md).
+`maxArtifactAge` is the surface that page found with neither a row nor a
+consumer, closed as its row 13.
+
+### Fixed
+
+- **A stored quarantine status the domain cannot parse no longer decodes to the
+  most permissive one** (#334). `artifacts.quarantine_status`'s CHECK accepts
+  seven values; `QuarantineStatus` models five, and the adapter stores `None`
+  as SQL `NULL` rather than as a literal — so three prototype-era spellings
+  (`unscanned`, `clean`, `flagged`) were schema-legal and unparsable, and the
+  domain's `none` was unstorable. The row mapper resolved the disagreement by
+  discarding the parse error and substituting `QuarantineStatus::None`: at once
+  the most permissive state in the system — `Artifact::is_downloadable` admits
+  it, and the default `ReleasedOnly` index mode serves it — and a state the
+  column cannot hold. A schema-valid `unscanned` row was therefore **advertised
+  by the index and served on download** with no release authority behind it and
+  no `ArtifactReleased` in its stream, and the mapper's own unit test asserted
+  `'unscanned' -> None` as correct. The same substitution sat on the two hot
+  index-serve reads (`package_version_status`, `package_version_anchors`), and
+  again on the npm / PyPI / cargo **proxy** index sources as
+  `unwrap_or_else(… Vec::new())` — "degrade to no status known", which under
+  `IncludePending` re-advertises every version hort is deliberately holding
+  back, because the filters there drop only what hort *knows* is non-servable.
+
+  The column now has exactly one codec
+  (`hort_adapters_postgres::quarantine_status_sql`), encoder and fail-closed
+  decoder as an inverse pair: `NULL` is the stored spelling of `None` and the
+  only input that decodes to it; anything else that does not round-trip is a
+  `DomainError::Invariant`. A read that cannot classify an artifact no longer
+  produces a classification — the request fails instead of serving. The same
+  decode now backs the purge-GC mapper, which had been collapsing the three
+  legacy spellings to "not GC-protected" on its own. Migration
+  `030_artifacts_quarantine_status_legacy_backfill.sql` replaces the spellings
+  in the data with the **held** state — `'quarantined'` plus a
+  `quarantine_window_start` anchor derived from `created_at` — because a
+  spelling the domain cannot classify means no scan verdict is on record, and
+  the fail-closed reading of that is a hold rather than "nothing holds it".
+  Writing `NULL` would have handed the affected rows back the permissive
+  `QuarantineStatus::None` the new codec exists to deny them. `'quarantined'`
+  rather than a terminal state because nothing incriminating is known about
+  such a row: the stranded-rescan sweep (`select_stranded`) admits a
+  `'quarantined'` artifact with no scan job, so the hold resolves itself once a
+  verdict exists, which `'rejected'` and `'scan_indeterminate'` — both never
+  auto-rescanned (ADR 0007) — would not. The anchor ships in the same statement
+  because the release sweep's candidacy filter requires it; without it the hold
+  would have no exit but an admin override. Affected rows stop being downloadable
+  and stop being advertised, by the old fleet as well as the new one during a
+  rolling upgrade — a deliberate availability change, since a legacy spelling the
+  CHECK happens to accept is not an operator opt-out of the hold. Narrowing the CHECK to
+  the storable set is a contraction under
+  [ADR 0030](docs/adr/0030-sensitive-surface-structural-guards.md) and is
+  scheduled for **0.14.3**, recorded under "Scheduled contractions" in
+  `migrations/CONTRACTIONS.toml`. The structural guard
+  `crates/hort-app/tests/status_decode_fails_closed.rs` — a sibling of
+  `db_gate_not_silent`, which already refuses a discarded error on a Postgres
+  connect for the same reason — rejects a discarded error on any
+  quarantine-status read or decode across `crates/`, and carries a
+  counter-assertion so a rename cannot make it vacuously green.
+
+- **A `ScanPolicy` scoped to a repository no envelope declares is now rejected
+  instead of crashlooping the pod** (#334). The apply pipeline resolves
+  `scope: { repository: <name> }` to a repository id through a map built from
+  the *declared* repositories, and treats a miss as an invariant violation —
+  but nothing rejected an undeclared name: such a bundle passed the whole
+  pre-write validation and then **panicked** in Stage 2. A panic is not a
+  `GitopsBootError`, so the boot path could not park the pod not-ready on it;
+  it crashlooped, and it did so after Stage 1 had already written. The trigger
+  was a typo in a scope name. Cross-document validation carried the sibling
+  rule for a `RetentionPolicy` scope, an `UpstreamMapping`'s repository, an
+  `Exclusion`'s parent policy and a `PermissionGrant`'s repository and service
+  account — and none for a `ScanPolicy`'s own scope. It now rejects the bundle
+  before the first write with a dangling-reference error naming the policy, the
+  field and the missing repository, identically from the boot preflight and
+  from `hort-server validate-config`. A scope naming a declared repository
+  applies exactly as before, including one declared in the same bundle. The
+  panic stays where it is: with the rule in place it asserts an invariant the
+  admission boundary already excludes.
+
+- **A gitops bundle is no longer half-applied when a late check refuses it**
+  (#334). The apply pipeline validates in stages and writes between them, and
+  it ships no rollback, so any rejection raised from a stage left a partial
+  apply behind. The reachable bad state was a refused *tightening* beside a
+  committed *loosening* from the same bundle: a `PermissionGrant` the grant
+  linter rejects, applied together with a `ScanPolicy` that drops
+  `requireApproval` and moves `enforcement` to `record`, failed the apply —
+  with the loosened policy already live and the grant never written. The
+  operator's `apply` looked atomic and was not atomic at exactly the security
+  boundary.
+
+  Two checks were reachable only after a write, for two different reasons.
+  The permission-grant linter (single-claim, wildcard-repo-non-admin,
+  unjustified high-privilege direct-user, reserved-claim-name collision) ran
+  inside the final grant stage, behind the repository, policy and mapping
+  writes — although the rule already existed in the snapshot-free validator
+  the offline `hort-server validate-config` uses, and its verdict is provably
+  invariant to the resolved database ids. It is now consumed in the pre-write
+  pass, so the rejection happens before the first write; the grant stage keeps
+  its gate over the port-resolved set as defence-in-depth, and keeps being the
+  single emitter of `hort_apply_config_linter_total`. The three TLS-material
+  invariants on `kind: UpstreamMapping` (an mTLS pair must be complete, any
+  TLS field requires an `https://` upstream, `pinnedCertSha256` must be 64
+  lowercase hex characters) existed only in the domain constructor, which
+  gitops reaches in its third stage; they are now also per-spec validation
+  rules, which both the boot preflight and `validate-config` run. A custom CA
+  alone, a pin alone and the full https combination stay accepted — the
+  mirror matches the constructor's rejection set exactly.
+
+  Which configurations are rejected is unchanged; only when. On the boot path
+  the earlier rejection is also the difference between parking the pod
+  not-ready (`GitopsBootError::PreflightValidate`) and crashlooping on a tree
+  that has been partly written. The claim that no rejection is reachable only
+  from a write-capable stage is now two tests rather than a comment: an
+  exhaustive, wildcard-free match over every lint rule asserting the
+  pre-write pass consumes each rejecting one, and a per-stage corpus
+  asserting the preflight refuses every bundle a stage would.
+
+- **A lifecycle decision can no longer be committed over a newer verdict**
+  (#334). Several call sites derived an artifact's outcome from stored
+  evidence and committed it behind an optimistic append, reading the
+  expected stream version *after* deriving the decision. A verdict that
+  committed in that window is already contained in the version just read,
+  so the append does not conflict: it succeeds, and the paired projection
+  write puts the stale decision's status over the newer one. In the loosen
+  direction that released an artifact on scan evidence a later scan had
+  already superseded; in the tighten direction it re-held an artifact over
+  a clean verdict that landed after the evidence was read. The window was
+  as long as whatever sat between the two reads — a policy and
+  exclusion-set resolution, a findings-blob fetch from CAS, a
+  signature-bundle round trip to an upstream, an event append on another
+  stream.
+
+  Eight of the fifteen affected sites read the version after the decision;
+  the other seven read it first but through a second, separate read of the
+  same stream. The correction is a primitive rather than a patch per site:
+  `ArtifactAtVersion` returns the artifact, its complete bounded event
+  stream and the `ExpectedVersion` from **one** capped read, so the
+  evidence and the version are the same observation and there is no
+  "before" left to get wrong. Every reader that asked the stream a question
+  — the latest `ScanCompleted`, the latest rejection reason, the
+  per-finding blob, the `ProvenanceVerified` behind the release gate, the
+  prior-scan baseline for the clean → vulnerable delta, the ingest-source
+  label — now takes that paired stream instead of fetching one of its own,
+  which is what makes the wrong order inexpressible rather than merely
+  avoided at the sites that were fixed.
+
+  Reads go down, not up: four stream reads become one in
+  `record_scan_result`, five become one in the curator re-evaluation
+  endpoint and the policy-mutation loosen pass, three become one in the
+  provenance-misrejection repair and in the timer-release sweep per
+  candidate. `read_artifact_stream` and the append-version derivation also
+  collapse onto a single bounded `read_stream`, so the workspace now holds
+  exactly one.
+
 ## [0.14.1] - 2026-10-02
 
 ### Added

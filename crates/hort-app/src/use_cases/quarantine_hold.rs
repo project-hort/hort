@@ -42,7 +42,7 @@ use hort_domain::policy::effective_quarantine_deadline;
 use hort_domain::ports::event_store::EventStore;
 
 use crate::error::AppResult;
-use crate::use_cases::release_clearance::resolve_provenance_clearance;
+use crate::use_cases::release_clearance::read_path_provenance_clearance;
 
 /// The transient hold pair for one artifact, as
 /// [`resolve_transient_hold`] computes it.
@@ -80,7 +80,7 @@ pub(crate) struct TransientHold {
 ///
 /// The provenance read is gated on the deadline having **already elapsed**
 /// — the only state in which the deadline is not the whole story — and
-/// short-circuits inside [`resolve_provenance_clearance`] for every mode
+/// short-circuits inside [`read_path_provenance_clearance`] for every mode
 /// but `Required`. `clearance_events: None` (an unwired event store; a
 /// test-only state in the read path) leaves `hold_indefinite` false, which
 /// is the safe default: the computed deadline is advertised as-is.
@@ -94,7 +94,7 @@ pub(crate) async fn resolve_transient_hold(
     let deadline = effective_quarantine_deadline(anchor, duration);
     let hold_indefinite = match clearance_events {
         Some(events) if deadline <= Utc::now() => matches!(
-            resolve_provenance_clearance(events, artifact_id, provenance_mode).await?,
+            read_path_provenance_clearance(events, artifact_id, provenance_mode).await?,
             ProvenanceClearance::Pending
         ),
         _ => false,

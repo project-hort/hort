@@ -643,7 +643,7 @@ impl RetentionUseCase {
     /// **The cap is enforced here, not by the adapter.**
     /// `ExpectedVersion::Any` means the adapter performs no version check
     /// at all, so this append gets none of the bound that
-    /// [`read_expected_version`](crate::use_cases::read_expected_version)
+    /// [`read_unpaired_append_version`](crate::use_cases::read_unpaired_append_version)
     /// gives every `ExpectedVersion::Exact` writer. Without a refusal of
     /// its own, the expiry sweep is the one writer able to push an
     /// artifact stream past [`STREAM_EVENT_CAP`] — and past the cap every
@@ -653,7 +653,7 @@ impl RetentionUseCase {
     /// decision to refuse needs no extra I/O.
     ///
     /// A refusal returns `DomainError::Conflict`, matching
-    /// `read_expected_version`'s refusal for the same condition; the
+    /// `read_unpaired_append_version`'s refusal for the same condition; the
     /// caller folds it into [`EvalStep::Errored`] and keeps sweeping, so
     /// one frozen artifact does not stall the pass.
     async fn append_expired(

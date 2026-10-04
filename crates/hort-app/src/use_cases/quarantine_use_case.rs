@@ -7,14 +7,14 @@ use hort_domain::entities::artifact::{
     Artifact, ProvenanceClearance, QuarantineStatus, ReleaseAuthorization,
 };
 use hort_domain::entities::scan_policy::{
-    ExclusionProjection, ScanEnforcement, ScanPolicyProjection,
+    ExclusionProjection, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
 };
 use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, timer_actor};
 use hort_domain::events::{
-    Actor, ApiActor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PolicyEvaluated,
-    PolicyResult, PolicyViolation, ReleaseReason, ScanAssessment, ScanCompleted, SeveritySummary,
-    StreamId, NO_POLICY,
+    Actor, ApiActor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PersistedEvent,
+    PolicyEvaluated, PolicyResult, PolicyViolation, ReleaseReason, ScanAssessment, ScanCompleted,
+    SeveritySummary, StreamId, NO_POLICY,
 };
 use hort_domain::policy::scan_delta::compute_added_findings;
 use hort_domain::policy::{
@@ -52,7 +52,8 @@ use crate::metrics::{
     policy_decision_point, values, PolicyEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
-use crate::use_cases::{read_artifact_stream, read_expected_version, CallerPrivileges};
+use crate::use_cases::release_clearance::provenance_clearance_from;
+use crate::use_cases::{ArtifactAtVersion, CallerPrivileges, OverCapStream};
 
 /// The static authority-kind label for the timer-release
 /// `info!` line. Only the three timer-authorities reach this:
@@ -218,6 +219,12 @@ struct ScanResultContext<'a> {
     enforcement: ScanEnforcement,
     policy: Option<ScanPolicyProjection>,
     sbom: Option<&'a Sbom>,
+    /// The provenance leg of the inline fast-path release gate, resolved
+    /// from the SAME paired stream `expected_version` came from. Carried
+    /// here rather than resolved at the point of release so the gate and
+    /// the append that commits it cannot be decided from two different
+    /// observations of the stream.
+    fast_path_provenance: ProvenanceClearance,
 }
 
 impl QuarantineUseCase {
@@ -312,12 +319,20 @@ impl QuarantineUseCase {
         let stream_id = StreamId::artifact(artifact_id);
         let correlation_id = Uuid::new_v4();
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, true).await?;
-
-        // Load and transition artifact
-        let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
-        let repository_id = artifact.repository_id;
-        let event_payload = artifact.quarantine(until)?;
+        // Version paired with the load: `Artifact::quarantine`'s
+        // source-state guard decides from the state this load observed,
+        // so the append has to be ordered against the same observation.
+        let mut paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Refuse,
+        )
+        .await?;
+        let expected_version = paired.expected_version();
+        let repository_id = paired.artifact().repository_id;
+        let event_payload = paired.artifact_mut().quarantine(until)?;
+        let artifact = paired.into_artifact();
 
         // Bump quarantined_count in the same tx.
         let score_delta = RepoSecurityScoreProjector::compute_quarantined_delta();
@@ -498,17 +513,13 @@ impl QuarantineUseCase {
             // Release-predicate invariant preserved (ADR 0007 + ADR
             // 0027): the timer arm carries the SAME provenance
             // AND-precondition the `release_expired` sweep applies.
-            // Resolve the real clearance for this artifact/policy —
-            // `NotRequired` for `provenance_mode ∈ {Off,
-            // VerifyIfPresent}`; under `Required`, `Cleared` iff a
-            // `ProvenanceVerified` event exists on the stream, else
-            // `Pending`. The window-elapsed candidacy check (above) is
+            // The clearance was resolved from the caller's paired stream
+            // (see `ScanResultContext::fast_path_provenance`) rather than
+            // re-read here. The window-elapsed candidacy check (above) is
             // the sweep's filter, never authorization;
             // `Artifact::release`'s deny-by-default predicate
             // re-verifies the (reason, authority, provenance) triple.
-            let provenance = self
-                .resolve_provenance_clearance(ctx.artifact_id, artifact.repository_id)
-                .await?;
+            let provenance = ctx.fast_path_provenance;
             match artifact.release(ReleaseReason::Timer, authority, provenance) {
                 Ok(release_event) => {
                     events_vec.push(EventToAppend::new(DomainEvent::ArtifactReleased(
@@ -905,37 +916,56 @@ impl QuarantineUseCase {
         let severity = severity_summary_from_findings(&findings);
         severity.validate()?;
 
-        // Step 3 — load artifact + resolve policy + exclusions + coords.
-        let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
-
-        // Read the expected stream version HERE — paired with the load
-        // above, BEFORE the policy/exclusion resolution, prior-scan
-        // hydration and findings-blob CAS write below (issue #108 H2a).
-        // It used to be read at step 7, after all of that: a concurrent
-        // verdict committing in that window was already in the version we
-        // then read, so this append did NOT conflict and the paired
-        // projection write happily overwrote the newer status. Anchored
-        // to the load, that append now fails `Conflict` instead.
+        // Step 3 — pair the artifact load with its stream version and
+        // evidence, then resolve policy + exclusions + coords.
         //
-        // Mirrors `policy_use_case.rs`'s early-read shape (warn on read
-        // error), but PROPAGATES rather than skipping: that is a bulk
-        // re-evaluation pass where one artifact is skippable, whereas
-        // this is a single-artifact job — `Err` fails the job so the
-        // dispatcher retries, rather than silently dropping a scan result.
-        let expected_version = read_expected_version(&*self.events, &stream_id, false)
-            .await
-            .inspect_err(|e| {
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    error = %e,
-                    "record_scan_result: expected-version read failed; aborting this artifact \
-                     (job retries)",
-                );
-            })?;
+        // Every answer this method derives from the artifact's stream —
+        // the prior `ScanCompleted` baseline, the ingest source, the
+        // provenance leg of the fast-path release gate — and the version
+        // its append carries come from this ONE observation. See
+        // `ArtifactAtVersion`'s contract: the policy/exclusion
+        // resolution, prior-findings hydration and findings-blob CAS
+        // write below are exactly the window a concurrent verdict
+        // commits in, and a version read after them would already
+        // contain it.
+        //
+        // `Err` PROPAGATES rather than skipping: this is a
+        // single-artifact job, so failing it makes the dispatcher retry
+        // instead of silently dropping a scan result (the bulk
+        // re-evaluation pass, where one artifact is skippable, logs and
+        // continues instead).
+        let paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await
+        .inspect_err(|e| {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "record_scan_result: artifact/expected-version pairing failed; aborting this \
+                 artifact (job retries)",
+            );
+        })?;
+        let expected_version = paired.expected_version();
+        // Bound once: every question this method asks of the stream is
+        // answered from this slice, and an over-cap stream is refused here
+        // rather than at each use.
+        let stream = paired.evidence()?;
 
-        let policy =
-            resolve_active_policy_for_repo(&*self.policy_projections, artifact.repository_id)
-                .await?;
+        // Step 5 (hoisted) — the prior `ScanCompleted` baseline for delta
+        // detection, and the ingest-source metric label, both read off
+        // the paired stream.
+        let prior = Self::prior_scan_completed(stream);
+        let ingest_source = Self::ingest_source_from(stream);
+
+        let policy = resolve_active_policy_for_repo(
+            &*self.policy_projections,
+            paired.artifact().repository_id,
+        )
+        .await?;
         let exclusions: Vec<ExclusionProjection> = match &policy {
             Some(p) => {
                 self.policy_projections
@@ -944,13 +974,31 @@ impl QuarantineUseCase {
             }
             None => Vec::new(),
         };
-        let coords = self.coords_for_artifact(&artifact).await?;
+        let coords = self.coords_for_artifact(paired.artifact()).await?;
+
+        // The provenance leg of the fast-path release gate (ADR 0027),
+        // resolved from the SAME paired stream and the SAME policy the
+        // verdict below uses — not from a second read taken at the point
+        // of release. A `ProvenanceVerified` landing after the pairing
+        // would otherwise clear the gate here while this append still
+        // carried the pre-verification version: the release would commit
+        // without conflicting, on a clearance its own append contradicts.
+        // `NotRequired` for `provenance_mode ∈ {Off, VerifyIfPresent}`;
+        // under `Required`, `Cleared` iff a `ProvenanceVerified` is on
+        // the stream, else `Pending` (fail-closed).
+        let fast_path_provenance = provenance_clearance_from(
+            stream,
+            policy
+                .as_ref()
+                .map(|p| p.provenance_mode)
+                .unwrap_or_default(),
+        );
+
+        let mut artifact = paired.into_artifact();
 
         // Step 4 — evaluate per-finding outcome.
         let outcome = evaluate_scan_result(&coords, &findings, policy.as_ref(), &exclusions, now);
 
-        // Step 5 — read prior ScanCompleted (for delta detection).
-        let prior = self.read_prior_scan_completed(artifact_id).await?;
         let prior_findings: Vec<Finding> = match prior.as_ref() {
             Some((event, _ts)) => self.hydrate_prior_findings(event).await?,
             None => Vec::new(),
@@ -971,21 +1019,15 @@ impl QuarantineUseCase {
         };
         scan_event.validate()?;
 
-        // Step 8 — drive the per-outcome path. (`expected_version` was
-        // read up front at step 3 — issue #108 H2a.)
+        // Step 8 — drive the per-outcome path. (`expected_version` came
+        // from the step-3 pairing; see its contract for why it may not be
+        // re-read here.)
         let scan_id = Uuid::new_v4();
         let scan_findings_rows = build_scan_findings_rows(&findings, artifact_id, scan_id, now);
         // Capture the prior status BEFORE mutation so
         // the projector can compute the (prior → new) bucket delta.
         let prior_status = artifact.quarantine_status;
         let repository_id = artifact.repository_id;
-
-        // Resolve the `IngestSource` from the artifact's
-        // stream ahead of the per-outcome branches so the metric label
-        // is available for either path. Best-effort — a stream that
-        // somehow lacks `ArtifactIngested` lands the `"unknown"`
-        // sentinel rather than blocking the scan-result commit.
-        let ingest_source = self.read_ingest_source(artifact_id).await?;
 
         // Split the verdict into "does it reject?" + the violations it
         // computed. Under `enforcement: record` a BLOCKING verdict takes
@@ -1026,6 +1068,7 @@ impl QuarantineUseCase {
             enforcement,
             policy,
             sbom,
+            fast_path_provenance,
         };
 
         // `became_vulnerable_pushed` mirrors the bool returned by
@@ -1087,26 +1130,21 @@ impl QuarantineUseCase {
         Ok(())
     }
 
-    /// Read the most recent prior `ScanCompleted` from the artifact's
-    /// stream — used by [`record_scan_result`] to detect a clean →
+    /// The most recent prior `ScanCompleted` on an artifact's stream —
+    /// used by [`Self::record_scan_result`] to detect a clean →
     /// vulnerable transition and to anchor the
     /// `ArtifactBecameVulnerable.previously_clean_at` timestamp.
-    async fn read_prior_scan_completed(
-        &self,
-        artifact_id: Uuid,
-    ) -> AppResult<Option<(ScanCompleted, DateTime<Utc>)>> {
-        let stream_id = StreamId::artifact(artifact_id);
-        // Full-stream read: the reverse scan below wants the most recent
-        // `ScanCompleted`, and over an oldest-prefix of the stream that is
-        // a superseded one — the clean → vulnerable delta would then be
-        // computed against the wrong baseline.
-        let persisted = read_artifact_stream(&*self.events, &stream_id).await?;
-        for event in persisted.iter().rev() {
-            if let DomainEvent::ScanCompleted(payload) = &event.event {
-                return Ok(Some((payload.clone(), event.stored_at)));
-            }
-        }
-        Ok(None)
+    ///
+    /// Takes the stream rather than reading it: the reverse scan wants
+    /// the most recent `ScanCompleted`, and over an oldest-prefix of the
+    /// stream that is a superseded one — the clean → vulnerable delta
+    /// would then be computed against the wrong baseline. The caller's
+    /// pairing is what guarantees the slice is the whole stream.
+    fn prior_scan_completed(stream: &[PersistedEvent]) -> Option<(ScanCompleted, DateTime<Utc>)> {
+        stream.iter().rev().find_map(|event| match &event.event {
+            DomainEvent::ScanCompleted(payload) => Some((payload.clone(), event.stored_at)),
+            _ => None,
+        })
     }
 
     /// Hydrate the per-finding `Vec<Finding>` referenced by a prior
@@ -1189,7 +1227,7 @@ impl QuarantineUseCase {
         Ok(true)
     }
 
-    /// Read the artifact's stream and surface its `ArtifactIngested.source`.
+    /// The artifact's `ArtifactIngested.source` from its stream.
     ///
     /// The `hort_artifact_became_vulnerable_total.ingest_source`
     /// label mirrors `IngestSource`. Returns `None` when the stream
@@ -1199,22 +1237,17 @@ impl QuarantineUseCase {
     /// [`values::FORMAT_UNKNOWN`]-equivalent sentinel
     /// (`"unknown"`) on the metric label.
     ///
-    /// This is the one artifact-stream read whose answer truncation
-    /// cannot corrupt — `ArtifactIngested` is the genesis event, so a
-    /// forward scan finds it in the first page of any non-empty stream.
-    /// It still goes through
-    /// [`read_artifact_stream`](crate::use_cases::read_artifact_stream)
-    /// rather than a bare capped read, so the file holds no read that a
-    /// future reverse-scan could be added to unnoticed.
-    async fn read_ingest_source(&self, artifact_id: Uuid) -> AppResult<Option<IngestSource>> {
-        let stream_id = StreamId::artifact(artifact_id);
-        let persisted = read_artifact_stream(&*self.events, &stream_id).await?;
-        for event in persisted.iter() {
-            if let DomainEvent::ArtifactIngested(payload) = &event.event {
-                return Ok(Some(payload.source));
-            }
-        }
-        Ok(None)
+    /// This is the one question about an artifact stream whose answer
+    /// truncation cannot corrupt — `ArtifactIngested` is the genesis
+    /// event, so a forward scan finds it in the first page of any
+    /// non-empty stream. It is still answered from the caller's paired
+    /// full stream rather than a read of its own, so the file holds no
+    /// read that a future reverse-scan could be added to unnoticed.
+    fn ingest_source_from(stream: &[PersistedEvent]) -> Option<IngestSource> {
+        stream.iter().find_map(|event| match &event.event {
+            DomainEvent::ArtifactIngested(payload) => Some(payload.source),
+            _ => None,
+        })
     }
 
     /// Drive the lifecycle port's `commit_scan_result_with_score`
@@ -1331,13 +1364,13 @@ impl QuarantineUseCase {
     /// release on provenance (`Required`) AND the artifact's provenance
     /// clearance is still `Pending` — i.e. a release-authority-satisfied
     /// `Quarantined` artifact would STILL be denied release purely on the
-    /// provenance leg. Delegates to [`Self::resolve_provenance_clearance`],
+    /// provenance leg. Delegates to [`Self::read_path_provenance_clearance`],
     /// the SAME resolution the inline fast-path release suppression in
     /// `record_scan_result` (the `"fast-path release suppressed:
     /// provenance gate not cleared"` arm) and the `release_expired` sweep
     /// both call, so this answer and theirs can never drift — `Pending`
     /// can only ever be produced by `Required` mode (see
-    /// [`crate::use_cases::release_clearance::resolve_provenance_clearance`]),
+    /// [`crate::use_cases::release_clearance::read_path_provenance_clearance`]),
     /// so checking the clearance alone is equivalent to the mode+clearance
     /// conjunction.
     ///
@@ -1350,7 +1383,7 @@ impl QuarantineUseCase {
     /// it.
     pub async fn release_blocked_on_provenance(&self, artifact: &Artifact) -> AppResult<bool> {
         let clearance = self
-            .resolve_provenance_clearance(artifact.id, artifact.repository_id)
+            .read_path_provenance_clearance(artifact.id, artifact.repository_id)
             .await?;
         Ok(matches!(clearance, ProvenanceClearance::Pending))
     }
@@ -1413,7 +1446,7 @@ impl QuarantineUseCase {
     ///    artifact).
     async fn resolve_release_authority(
         &self,
-        persisted: &[hort_domain::events::PersistedEvent],
+        persisted: &[PersistedEvent],
         repository_id: Uuid,
     ) -> AppResult<Option<ReleaseAuthorization>> {
         // The LATEST ScanCompleted's index (stream order — `read_stream`
@@ -1491,29 +1524,52 @@ impl QuarantineUseCase {
     /// (`VerifyIfPresent`) ⇒ `NotRequired` — provenance never blocks an
     /// unconfigured repo's timer release (the scan gate still applies via
     /// `resolve_release_authority`).
-    async fn resolve_provenance_clearance(
+    async fn read_path_provenance_clearance(
         &self,
         artifact_id: Uuid,
         repository_id: Uuid,
     ) -> AppResult<ProvenanceClearance> {
-        let policy =
-            resolve_active_policy_for_repo(&*self.policy_projections, repository_id).await?;
-        let mode = policy
-            .as_ref()
-            .map(|p| p.provenance_mode)
-            .unwrap_or_default();
-
         // Single-source the verdict mapping (ADR 0027 + 0041): the
         // post-exclusion scan re-evaluation pass in `PolicyUseCase` calls
-        // the SAME helper, so the two release-gating provenance
+        // the SAME predicate, so the two release-gating provenance
         // computations cannot drift (the MR !39 `negligible_action`
         // drift). This use case owns only the policy-mode resolution.
-        crate::use_cases::release_clearance::resolve_provenance_clearance(
+        crate::use_cases::release_clearance::read_path_provenance_clearance(
             &*self.events,
             artifact_id,
-            mode,
+            self.provenance_mode_for(repository_id).await?,
         )
         .await
+    }
+
+    /// Same clearance, decided over a stream the caller already paired
+    /// with the version its append will carry.
+    ///
+    /// This is the form every release-gating caller in this use case
+    /// uses; [`Self::read_path_provenance_clearance`] keeps the read in
+    /// front of it for the read-path candidacy check, which appends
+    /// nothing and so has no version to be consistent with.
+    async fn provenance_clearance_for(
+        &self,
+        stream: &[PersistedEvent],
+        repository_id: Uuid,
+    ) -> AppResult<ProvenanceClearance> {
+        Ok(provenance_clearance_from(
+            stream,
+            self.provenance_mode_for(repository_id).await?,
+        ))
+    }
+
+    /// The repository's effective [`ProvenanceMode`] — the resolved
+    /// active policy's, or the default when no policy applies.
+    async fn provenance_mode_for(&self, repository_id: Uuid) -> AppResult<ProvenanceMode> {
+        Ok(
+            resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
+                .await?
+                .as_ref()
+                .map(|p| p.provenance_mode)
+                .unwrap_or_default(),
+        )
     }
 
     /// Admin override: release a quarantined artifact regardless of scan results.
@@ -1544,19 +1600,28 @@ impl QuarantineUseCase {
         let correlation_id = Uuid::new_v4();
         let user_id = actor.user_id;
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
-
-        let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
+        // Version paired with the load: `Artifact::release`'s
+        // deny-by-default predicate decides from the state this load
+        // observed, so the append has to be ordered against the same
+        // observation.
+        let mut paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await?;
+        let expected_version = paired.expected_version();
         // Capture the prior status BEFORE mutation so
         // the projector can compute the (prior → released) delta.
-        let prior_status = artifact.quarantine_status;
-        let repository_id = artifact.repository_id;
+        let prior_status = paired.artifact().quarantine_status;
+        let repository_id = paired.artifact().repository_id;
         // Admin override is the AdminOverride authority;
         // it pairs with ReleaseReason::Admin in the deny-by-default
         // release predicate. The source-state guard now also accepts
         // ScanIndeterminate so an admin can clear a stuck-scanner
         // artifact directly.
-        let mut event_payload = artifact.release(
+        let mut event_payload = paired.artifact_mut().release(
             ReleaseReason::Admin,
             ReleaseAuthorization::AdminOverride,
             // Admin overrides ignore the provenance param
@@ -1573,6 +1638,7 @@ impl QuarantineUseCase {
         event_payload.justification = Some(justification);
 
         let score_delta = RepoSecurityScoreProjector::compute_released_delta(prior_status);
+        let artifact = paired.into_artifact();
 
         self.lifecycle
             .commit_transition_with_score(
@@ -1663,16 +1729,48 @@ impl QuarantineUseCase {
             let stream_id = StreamId::artifact(artifact_id);
             let correlation_id = Uuid::new_v4();
 
-            // The candidate's complete event stream, read once and handed
-            // to the release-authority gate below. A stream that breached
-            // `STREAM_EVENT_CAP` cannot be read to its tail, so no gate can
-            // be decided from it: skip this candidate — it stays
-            // quarantined, which is the fail-closed answer — and keep
-            // sweeping, because one unreadable stream must not stop every
-            // other candidate from releasing. `error!`, not `warn!`: the
-            // artifact is frozen until an operator intervenes, and nothing
-            // else in the system will say so.
-            let persisted = match read_artifact_stream(&*self.events, &stream_id).await {
+            // The candidate's artifact row, its complete event stream and
+            // the version this sweep's append will carry — one
+            // observation. The release-authority gate below is decided
+            // from that stream, so a verdict committing between the two
+            // would have been contained in a version read afterwards and
+            // this append would not have conflicted with it.
+            //
+            // A stream that breached `STREAM_EVENT_CAP` cannot be read to
+            // its tail, so no gate can be decided from it: skip this
+            // candidate — it stays quarantined, which is the fail-closed
+            // answer — and keep sweeping, because one unreadable stream
+            // must not stop every other candidate from releasing.
+            // `error!`, not `warn!`: the artifact is frozen until an
+            // operator intervenes, and nothing else in the system will
+            // say so.
+            let paired = match ArtifactAtVersion::load(
+                &*self.artifacts,
+                &*self.events,
+                artifact_id,
+                OverCapStream::Tolerate,
+            )
+            .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        artifact_id = %artifact_id,
+                        error = %e,
+                        "skipping: the candidate's artifact row and stream version \
+                         could not be paired, so no release authority can be derived \
+                         from them — artifact stays quarantined"
+                    );
+                    continue;
+                }
+            };
+            let expected_version = paired.expected_version();
+            // Bound once, used by both gates below. An over-cap stream is
+            // refused here — not at each use — because every gate in this
+            // loop body is decided from these events, and the oldest
+            // prefix of a breached stream is not an answer about any of
+            // them.
+            let persisted = match paired.evidence() {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::error!(
@@ -1686,12 +1784,9 @@ impl QuarantineUseCase {
                 }
             };
 
-            let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
-
-            let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
             // Capture prior status BEFORE mutation.
-            let prior_status = artifact.quarantine_status;
-            let repository_id = artifact.repository_id;
+            let prior_status = paired.artifact().quarantine_status;
+            let repository_id = paired.artifact().repository_id;
 
             // Compute the provenance side of
             // the gate per candidate (ADR 0027), BEFORE the release-authority
@@ -1700,7 +1795,7 @@ impl QuarantineUseCase {
             // `Pending` (fail-closed — denies the timer arm). This
             // computation does not depend on release authority.
             let provenance = self
-                .resolve_provenance_clearance(artifact_id, repository_id)
+                .provenance_clearance_for(persisted, repository_id)
                 .await?;
 
             // S4 — terminal decision at window expiry (design §2 S4).
@@ -1772,7 +1867,7 @@ impl QuarantineUseCase {
                 // re-driven on the next one.
                 let refs = self
                     .content_references
-                    .find_by_target(repository_id, &artifact.sha256_checksum, None)
+                    .find_by_target(repository_id, &paired.artifact().sha256_checksum, None)
                     .await?;
 
                 // Attribute the hold to the provenance side here, before
@@ -1807,7 +1902,7 @@ impl QuarantineUseCase {
             // artifact stays quarantined. quarantine_until is
             // candidacy-only and is never consulted here.
             let Some(authz) = self
-                .resolve_release_authority(&persisted, repository_id)
+                .resolve_release_authority(persisted, repository_id)
                 .await?
             else {
                 // Counted only when provenance already cleared — one of
@@ -1820,13 +1915,14 @@ impl QuarantineUseCase {
                 }
                 tracing::debug!(
                     artifact_id = %artifact_id,
-                    status = %artifact.quarantine_status,
+                    status = %paired.artifact().quarantine_status,
                     "skipping: no release authority (no successful scan, scanning not waived)"
                 );
                 continue;
             };
             let authority_kind = release_authority_label(authz);
 
+            let mut artifact = paired.into_artifact();
             match artifact.release(ReleaseReason::Timer, authz, provenance) {
                 Ok(event_payload) => {
                     let score_delta =
@@ -1992,37 +2088,50 @@ impl QuarantineUseCase {
         let stream_id = StreamId::artifact(artifact_id);
         let correlation_id = Uuid::new_v4();
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
+        // Version paired with the load: `fail_scan_indeterminate`'s
+        // already-terminal guard decides from the state this load
+        // observed, so the append has to be ordered against the same
+        // observation.
+        let mut paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await?;
+        let expected_version = paired.expected_version();
+        let prior_status = paired.artifact().quarantine_status;
+        let repository_id = paired.artifact().repository_id;
 
-        let mut artifact = self.artifacts.find_by_id(artifact_id).await?;
-        let prior_status = artifact.quarantine_status;
-        let repository_id = artifact.repository_id;
-
-        let event_payload =
-            match artifact.fail_scan_indeterminate(scanner.clone(), reason.clone(), attempts) {
-                Ok(ev) => ev,
-                // Already-terminal (ScanIndeterminate / Rejected / Released)
-                // is an idempotent, recoverable skip — do not append a
-                // duplicate event. Mirrors the corruption path's
-                // already-rejected branch and the sweep's Err(_) skip arm.
-                Err(DomainError::Invariant(msg)) => {
-                    tracing::debug!(
-                        artifact_id = %artifact_id,
-                        status = %artifact.quarantine_status,
-                        reason = %msg,
-                        "skipping scan-indeterminate: artifact already terminal"
-                    );
-                    return Ok(());
-                }
-                // Any other domain error (e.g. oversized scanner/reason
-                // failing the event invariant) is a real failure.
-                Err(e) => return Err(AppError::Domain(e)),
-            };
+        let event_payload = match paired.artifact_mut().fail_scan_indeterminate(
+            scanner.clone(),
+            reason.clone(),
+            attempts,
+        ) {
+            Ok(ev) => ev,
+            // Already-terminal (ScanIndeterminate / Rejected / Released)
+            // is an idempotent, recoverable skip — do not append a
+            // duplicate event. Mirrors the corruption path's
+            // already-rejected branch and the sweep's Err(_) skip arm.
+            Err(DomainError::Invariant(msg)) => {
+                tracing::debug!(
+                    artifact_id = %artifact_id,
+                    status = %paired.artifact().quarantine_status,
+                    reason = %msg,
+                    "skipping scan-indeterminate: artifact already terminal"
+                );
+                return Ok(());
+            }
+            // Any other domain error (e.g. oversized scanner/reason
+            // failing the event invariant) is a real failure.
+            Err(e) => return Err(AppError::Domain(e)),
+        };
 
         // quarantined/none → scan_indeterminate score
         // delta (released/rejected buckets untouched).
         let score_delta =
             RepoSecurityScoreProjector::compute_scan_indeterminate_delta(prior_status);
+        let artifact = paired.into_artifact();
 
         // Atomic: ScanIndeterminate event + the quarantine_status
         // transition (+ score) in one transaction via the EXISTING
@@ -2478,7 +2587,7 @@ mod tests {
     /// invariant for a finding-free scan). `release_expired` reads
     /// the stream and, finding any `ScanCompleted`, constructs
     /// `ReleaseAuthorization::ScanSucceeded`. A position-0
-    /// `ArtifactQuarantined` precedes it so `read_expected_version`
+    /// `ArtifactQuarantined` precedes it so `read_unpaired_append_version`
     /// resolves a non-`NoStream` version, mirroring a real lifecycle.
     fn seed_stream_with_scan_completed(events: &Arc<MockEventStore>, artifact_id: Uuid) {
         let stream_id = StreamId::artifact(artifact_id);
@@ -3086,6 +3195,46 @@ mod tests {
             saved_artifact.quarantine_status,
             QuarantineStatus::Quarantined,
             "the artifact's status must be untouched by a recorded verdict"
+        );
+    }
+
+    /// An over-cap stream refuses the whole call. Every answer
+    /// `record_scan_result` derives from the artifact's stream — the
+    /// prior-scan baseline for the clean → vulnerable delta, the ingest
+    /// source, the provenance leg of the inline release gate — comes off
+    /// the paired evidence, and the oldest prefix of a breached stream is
+    /// an answer about none of them. Nothing is committed.
+    #[tokio::test]
+    async fn record_scan_result_refuses_a_stream_past_the_event_cap() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::High,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(&stream_id, filler_events(&stream_id, artifact_id, 0..201));
+
+        let err = uc
+            .record_scan_result(
+                artifact_id,
+                "trivy".into(),
+                Vec::new(),
+                ScanAssessment::Analysed,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("200-event cap"),
+            "the refusal must name the cap it is enforcing; got {err}"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no scan result is committed from evidence that cannot be read to its tail"
         );
     }
 
@@ -3755,25 +3904,72 @@ mod tests {
         assert_eq!(saved.quarantine_status, QuarantineStatus::Quarantined);
     }
 
-    /// License policy alone with empty SBOM input (v1 has no SBOM port)
-    /// produces zero license-content violations; the accumulator stays at
-    /// Allow → ScanOutcome::Clean. This documents the current behavior
-    /// (`evaluate_scan_result` is called with `&[]` for licenses in v1)
-    /// — license-content violations become reachable when a follow-on
-    /// change wires the SBOM port. The `license-policy-shape`
-    /// `Warn` case (operator typo in YAML) is covered by `scan.rs` tests
-    /// at the domain layer; in the scan path it does NOT block.
+    /// A `licensePolicy` that declares licence rules is **refused at
+    /// apply**, and this test asserts that refusal first.
+    ///
+    /// It used to assert only the second half below — that a Block
+    /// policy over an empty licence list produces a clean
+    /// `ScanCompleted` — and called that the documented v1 behaviour.
+    /// It is not: the licence list the scan path passes is hard-coded
+    /// empty, so every rule in such a policy matches nothing and the
+    /// artifact releases whatever it is licensed under, while the
+    /// operator who wrote `action: Block` believes the opposite. That
+    /// is the ADR 0015 accepted-but-inert block, and
+    /// `validate_scan_policy_license_policy_not_implemented` closes it.
+    ///
+    /// The runtime leg stays, with its claim inverted: it is what the
+    /// refused configuration *would* do, which is why the refusal
+    /// exists — and it is still reachable for a projection stored
+    /// before the rule shipped, since nothing rewrites those rows.
     #[tokio::test]
-    async fn record_scan_result_license_policy_no_sbom_input_returns_clean() {
+    async fn record_scan_result_license_policy_without_licence_input_is_refused_at_apply() {
+        let declared = serde_json::json!({
+            "denied_licenses": ["GPL-3.0"],
+            "action": "Block",
+        });
+
+        // The apply-time half: a ScanPolicy carrying exactly this value
+        // does not reach a projection at all.
+        let mut env = hort_config::scan_policy::parse_scan_policy(
+            std::path::Path::new("p.yaml"),
+            b"apiVersion: project-hort.de/v1
+kind: ScanPolicy
+metadata:
+  name: block-gpl
+spec:
+  scope: global
+  severityThreshold: critical
+  quarantineDuration: 24h
+  requireApproval: false
+",
+        )
+        .expect("the fixture policy must parse");
+        env.spec.license_policy = declared.clone();
+        let desired = hort_config::DesiredState {
+            scan_policies: vec![env],
+            ..Default::default()
+        };
+        let rejections =
+            hort_config::desired::validate_scan_policy_license_policy_not_implemented(&desired);
+        assert_eq!(
+            rejections.len(),
+            1,
+            "a declared licensePolicy must be refused at apply: {rejections:?}"
+        );
+        assert!(
+            rejections[0].to_string().contains("block-gpl")
+                && rejections[0].to_string().contains("licensePolicy"),
+            "the refusal must name the policy and the field: {}",
+            rejections[0]
+        );
+
+        // The runtime half: what that refused policy would have decided.
         let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
 
         let mut policy = projection(PolicyScope::Global, SeverityThreshold::Critical);
-        policy.license_policy = serde_json::json!({
-            "denied_licenses": ["GPL-3.0"],
-            "action": "Block",
-        });
+        policy.license_policy = declared;
         projections.insert(policy);
 
         let severity = SeveritySummary {
@@ -3795,10 +3991,11 @@ mod tests {
 
         let batches = events.appended_batches();
         assert_eq!(batches.len(), 1);
-        assert!(matches!(
-            &batches[0].events[0].event,
-            DomainEvent::ScanCompleted(_)
-        ));
+        assert!(
+            matches!(&batches[0].events[0].event, DomainEvent::ScanCompleted(_)),
+            "a Block licence policy over no licence input decides nothing — which is \
+             what the apply-time refusal above exists to stop an operator relying on"
+        );
         assert_eq!(
             lifecycle.committed_transitions().len(),
             1,
@@ -5795,7 +5992,7 @@ mod tests {
 
     // =====================================================================
     // `release_blocked_on_provenance` (backlog 094) — the bounded-await
-    // guard's predicate. Reuses `resolve_provenance_clearance`, so these
+    // guard's predicate. Reuses `read_path_provenance_clearance`, so these
     // tests pin the same arms the `release_expired` Required-mode tests
     // above already cover, but through the new public entry point.
     // =====================================================================

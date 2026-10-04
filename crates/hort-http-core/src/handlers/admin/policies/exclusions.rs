@@ -28,17 +28,48 @@
 //! `Validation(policy not exist)` 400 (from the use case) that would
 //! fire if a caller URL-encoded a stale policy id.
 //!
+//! ## Repository scope is refused on the way in, not on the way out
+//!
+//! A `scope` naming a repository cannot be **written**.
+//! `hort_domain::policy::SCOPE_NOT_ENFORCED` is the rationale: the
+//! finding filter never reads the scope, so such an exclusion clears
+//! its CVE for every repository the parent policy governs rather than
+//! the one it names. The refusal lives in
+//! `PolicyUseCase::add_exclusion` — the application-layer write seam
+//! every inbound writer (this handler, the gitops apply pipeline)
+//! passes through, so the rule cannot be bypassed by a future caller.
+//! Surfaces here as `400`.
+//!
+//! **Removing** such a row is not refused, by this handler or by
+//! `PolicyUseCase::remove_exclusion`. The two directions are not
+//! symmetric: creating one records an assurance nothing honours,
+//! removing it withdraws that assurance. A removal only ever stops
+//! suppressing a finding — it releases nothing, so there is no
+//! fail-closed reading under which refusing it is the safe choice. It
+//! would also be a control the neighbour lifts: the same use-case
+//! method is the gitops applier's removal path and stays open, so
+//! refusing here would leave only the operator without a declared tree
+//! stuck with a row that keeps clearing its CVE globally. What the
+//! operator does need is the removal's real reach, which the handler
+//! writes to the log (`policy_id`, `cve_id`, the stored
+//! `repository_id`, and the rationale verbatim).
+//!
+//! Only a row written before the add-side refusal shipped can carry
+//! such a scope; nothing rewrites those rows.
+//!
 //! Status-code mapping:
 //! - **POST** — `201 Created` with `{ "exclusion_id": "<uuid>" }` on
 //!   success; `400` (validation — empty reason / oversize / bad
-//!   cve_id format / policy id mis-parsed); `403` (extractor); `404`
+//!   cve_id format / policy id mis-parsed / repository-scoped request);
+//!   `403` (extractor); `404`
 //!   (policy not found — note: the use case currently emits this as
 //!   `Validation` so it would surface as 400; the handler runs a
 //!   `policy_projections.find_by_id` pre-check that promotes the
 //!   missing-policy case to 404 BEFORE the use case is touched);
 //!   `409` (event-store conflict); `500` (infrastructure)
 //! - **DELETE** — `204 No Content` on success; `400` / `403` / `404`
-//!   / `409` / `500` (same shape)
+//!   / `409` / `500` (same shape). A *stored* repository scope is not
+//!   among the `400`s — see above.
 //!
 //! **`#[tracing::instrument]` deliberately WITHOUT `err`** — denial
 //! and validation outcomes are info-level events (architect rule);
@@ -86,6 +117,13 @@ use super::MAX_JUSTIFICATION_BYTES;
 /// Mirrors the `scope` projection in handlers/admin/curation/exclusions.rs
 /// (`CurationExclusionEntryDto`), so the read and write surfaces are
 /// byte-symmetric.
+///
+/// The `Repository` arm stays on the wire — the read surface renders it
+/// for rows stored before the add-side refusal, and dropping the arm
+/// would turn an operator's repository-scoped request into an
+/// unexplained deserialisation failure instead of the refusal that
+/// names what is missing. Writing such a scope is refused: see
+/// [`hort_domain::policy::SCOPE_NOT_ENFORCED`].
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ScopeDto {
@@ -234,6 +272,10 @@ pub async fn post_exclusion(
 /// matching exclusion's `policy_id` lookup confirms the policy
 /// exists).
 ///
+/// A *stored* repository scope does not block the removal — it is
+/// logged, not refused (see the module docs for why the add side and
+/// the removal side are deliberately asymmetric).
+///
 /// See module docs for the full status-code map.
 #[tracing::instrument(skip(ctx, principal, body))]
 pub async fn delete_exclusion(
@@ -287,6 +329,33 @@ pub async fn delete_exclusion(
         })));
     };
 
+    // A stored repository scope is reported, not refused. Writing one is
+    // refused (`PolicyUseCase::add_exclusion`) because it records an
+    // assurance the finding filter cannot honour; removing the row is
+    // what withdraws that assurance, and a removal only ever stops
+    // suppressing a finding. Refusing it would make such a row
+    // unremovable through the API while the same use-case method keeps
+    // draining it for the gitops applier — a control the neighbour lifts,
+    // paid for only by the operator without a declared tree.
+    //
+    // The removal's reach is still not the one the row advertises: the
+    // scope never narrowed anything, so the exclusion was live for every
+    // repository the parent policy governs and the removal re-rejects
+    // artifacts across all of them, not just the one named. That is real
+    // information about what is about to happen, so it goes to the log
+    // with the same rationale every other surface states.
+    if let PolicyScope::Repository(repo_id) = &found.scope {
+        tracing::info!(
+            policy_id = %policy_id,
+            cve_id = %cve_id,
+            repository_id = %repo_id,
+            rationale = hort_domain::policy::SCOPE_NOT_ENFORCED,
+            "delete_exclusion removing an exclusion that carries a repository scope: \
+             its reach is every repository the parent policy governs, not the one the \
+             scope names",
+        );
+    }
+
     let cmd = RemoveExclusionCommand {
         policy_id,
         exclusion_id: found.exclusion_id,
@@ -328,12 +397,16 @@ mod tests {
     use hort_domain::entities::caller::CallerPrincipal;
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+    use hort_domain::entities::repository::RepositoryFormat;
     use hort_domain::entities::scan_policy::{
         ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
         ScanPolicyProjection, SeverityThreshold,
     };
+    use hort_domain::policy::filter_excluded_findings;
     use hort_domain::ports::identity_provider::IdentityProvider;
+    use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
     use hort_domain::ports::user_repository::UserRepository;
+    use hort_domain::types::{ArtifactCoords, Finding, SeverityBasis};
 
     use crate::context::AuthContext;
     use crate::test_support::{build_mock_ctx, with_auth, MockPorts};
@@ -426,6 +499,17 @@ mod tests {
     /// Seed an exclusion for the given policy → returns
     /// (exclusion_id, cve_id). Used by the DELETE tests.
     fn seed_exclusion(mocks: &MockPorts, policy_id: Uuid, cve: &str) -> (Uuid, String) {
+        seed_exclusion_with_scope(mocks, policy_id, cve, PolicyScope::Global)
+    }
+
+    /// Seed an exclusion carrying `scope`. A `Repository` scope models a
+    /// row stored before the refusal shipped — nothing writes one now.
+    fn seed_exclusion_with_scope(
+        mocks: &MockPorts,
+        policy_id: Uuid,
+        cve: &str,
+        scope: PolicyScope,
+    ) -> (Uuid, String) {
         let exclusion_id = Uuid::new_v4();
         mocks
             .policy_projections
@@ -434,12 +518,65 @@ mod tests {
                 policy_id,
                 cve_id: cve.to_string(),
                 package_pattern: None,
-                scope: PolicyScope::Global,
+                scope,
                 reason: "seeded".into(),
                 added_by_actor_id: None,
                 expires_at: None,
             });
         (exclusion_id, cve.to_string())
+    }
+
+    /// One scan finding for `cve`, severity-assessed so nothing routes
+    /// it onto the non-enforcing negligible lane. Feeds
+    /// [`filter_excluded_findings`] in the end-to-end removal test.
+    fn finding_for(cve: &str) -> Finding {
+        Finding {
+            purl: "pkg:npm/left-pad@1.0.0".into(),
+            vulnerability_id: cve.to_string(),
+            severity: SeverityThreshold::Critical,
+            cvss_score: Some(9.8),
+            title: "seeded for the exclusion filter".into(),
+            fixed_versions: Vec::new(),
+            source_scanner: "trivy".into(),
+            references: Vec::new(),
+            aliases: Vec::new(),
+            informational_class: None,
+            severity_basis: SeverityBasis::Assessed,
+        }
+    }
+
+    /// Coordinates for the artifact the filter is asked about. They
+    /// carry no repository identity — which is exactly why a stored
+    /// repository scope cannot narrow anything.
+    fn any_coords() -> ArtifactCoords {
+        ArtifactCoords {
+            name: "left-pad".into(),
+            name_as_published: "left-pad".into(),
+            version: Some("1.0.0".into()),
+            path: "left-pad/-/left-pad-1.0.0.tgz".into(),
+            format: RepositoryFormat::Npm,
+            metadata: serde_json::Value::Null,
+        }
+    }
+
+    /// Drive a future to completion on a fresh current-thread runtime.
+    /// `#[tracing_test::traced_test]` installs its subscriber for the
+    /// scope of a sync test function, so a log-asserting test cannot be
+    /// a `#[tokio::test]`. Mirrors `authz::extractors::tests`.
+    fn run_async<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// The response body as a string — the refusal tests read the
+    /// rationale out of it, because "a 400 happened" is not evidence the
+    /// operator was told what is missing.
+    async fn body_text(resp: Response) -> String {
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     fn post_req(policy_id: Uuid, body: &str, p: Option<CallerPrincipal>) -> Request<Body> {
@@ -775,12 +912,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// Scope `kind: repository` round-trips through the DTO mapping
-    /// and reaches the use case with the expected
-    /// `PolicyScope::Repository(uuid)`. Pins the alternate scope
-    /// projection so a regression that loses the variant trips here.
+    /// Scope `kind: repository` still round-trips through the DTO
+    /// mapping — and is then **refused** with the same rationale the
+    /// gitops apply path states: the finding filter never reads the
+    /// scope, so the waiver would clear its CVE for every repository the
+    /// policy governs.
+    ///
+    /// The DTO arm is deliberately still there (the read surface renders
+    /// it for rows stored before the refusal), so this test is what pins
+    /// that accepting the shape does not mean accepting the write.
     #[tokio::test]
-    async fn post_exclusion_repository_scope_threads_through() {
+    async fn post_exclusion_repository_scope_returns_400() {
         let (router, mocks) = harness();
         let policy_id = seed_policy(&mocks);
         let repo_id = Uuid::new_v4();
@@ -798,10 +940,20 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-        let upserts = mocks.policy_projections.exclusion_upserts();
-        assert_eq!(upserts.len(), 1);
-        assert_eq!(upserts[0].scope, PolicyScope::Repository(repo_id));
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_text(resp).await;
+        assert!(
+            body.contains("not enforced") && body.contains("never reads"),
+            "the refusal must carry the apply path's rationale: {body}"
+        );
+        assert!(
+            body.contains(&repo_id.to_string()),
+            "the refusal must name the repository the caller asked for: {body}"
+        );
+        assert!(
+            mocks.policy_projections.exclusion_upserts().is_empty(),
+            "a refused exclusion must write no projection row",
+        );
     }
 
     // -----------------------------------------------------------------
@@ -853,6 +1005,191 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// A stored repository scope → 204, and the row is gone.
+    ///
+    /// Only a row written before the add-side refusal can be in this
+    /// shape; nothing rewrites those rows, so the removal path is the
+    /// only way an operator without a declared gitops tree gets rid of
+    /// one. Refusing the removal would make a row that keeps clearing
+    /// its CVE for every repository the parent policy governs
+    /// unremovable through the API, while the same use-case method
+    /// stays open for the gitops applier — so this asserts the removal
+    /// succeeds, not that it is gated.
+    #[tokio::test]
+    async fn delete_exclusion_with_a_stored_repository_scope_returns_204() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let repo_id = Uuid::new_v4();
+        let (eid, cve) = seed_exclusion_with_scope(
+            &mocks,
+            policy_id,
+            "CVE-2026-9090",
+            PolicyScope::Repository(repo_id),
+        );
+
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                &cve,
+                r#"{"reason":"cleaning up a legacy row"}"#,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            mocks.policy_projections.exclusion_deletes(),
+            vec![eid],
+            "the removal must reach the use case with the resolved exclusion id",
+        );
+        assert!(
+            mocks
+                .policy_projections
+                .list_exclusions_for_policy(policy_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the stored row must be gone after the removal",
+        );
+    }
+
+    /// The whole way through, on the shape that made this endpoint
+    /// matter: a repository-scoped row exists (seeded past the add-side
+    /// refusal, which is how the stored ones came about), the finding
+    /// filter is suppressing its CVE, the API removes it, and the CVE
+    /// is enforced again.
+    ///
+    /// The *before* half is the defect itself — the filter drops the
+    /// finding although the artifact's coordinates belong to no
+    /// particular repository, which is what
+    /// [`hort_domain::policy::SCOPE_NOT_ENFORCED`] says and why the
+    /// write is refused. The *after* half is what this endpoint owes
+    /// the operator: one `DELETE` and the suppression is gone. An
+    /// assertion on the 204 alone would not have shown the second half.
+    #[tokio::test]
+    async fn removing_a_stored_repository_scoped_exclusion_re_enforces_the_cve() {
+        let (router, mocks) = harness();
+        let policy_id = seed_policy(&mocks);
+        let (_eid, cve) = seed_exclusion_with_scope(
+            &mocks,
+            policy_id,
+            "CVE-2026-7070",
+            PolicyScope::Repository(Uuid::new_v4()),
+        );
+        let findings = vec![finding_for(&cve)];
+        let coords = any_coords();
+        let now = Utc::now();
+
+        // Before: the stored row suppresses the CVE — for this
+        // artifact, and for every other one the policy governs.
+        let before = mocks
+            .policy_projections
+            .list_exclusions_for_policy(policy_id)
+            .await
+            .unwrap();
+        let filtered = filter_excluded_findings(&findings, &before, &coords, now);
+        assert_eq!(
+            filtered.excluded_count, 1,
+            "the seeded row must be suppressing the CVE before the removal",
+        );
+
+        let resp = router
+            .oneshot(delete_req(
+                policy_id,
+                &cve,
+                r#"{"reason":"the scope never narrowed anything"}"#,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // After: nothing excludes the CVE any more.
+        let after = mocks
+            .policy_projections
+            .list_exclusions_for_policy(policy_id)
+            .await
+            .unwrap();
+        let filtered = filter_excluded_findings(&findings, &after, &coords, now);
+        assert_eq!(
+            filtered.excluded_count, 0,
+            "the CVE must no longer be excluded after the removal",
+        );
+        assert_eq!(
+            filtered.remaining_findings, findings,
+            "the finding must survive the filter unchanged",
+        );
+    }
+
+    /// The removal states its real reach. The stored scope narrowed
+    /// nothing, so the row was live for every repository the parent
+    /// policy governs and the removal lands in all of them — that is
+    /// information the operator acts on, and the only place a `204 No
+    /// Content` can carry it is the log.
+    ///
+    /// Pins, on a single line, the three identifiers an operator
+    /// correlates on (`policy_id`, `cve_id`, the stored
+    /// `repository_id`) plus the shared rationale, so the line cannot
+    /// decay into a bare "removed an exclusion" while still looking
+    /// deliberate.
+    #[tracing_test::traced_test]
+    #[test]
+    fn delete_exclusion_logs_the_real_reach_of_a_stored_repository_scope() {
+        // `harness()` wires an in-memory `EphemeralStore` that spawns
+        // its reaper on construction, so the whole fixture has to be
+        // built inside the runtime.
+        let repo_id = Uuid::new_v4();
+        let (policy_id, cve, status) = run_async(async {
+            let (router, mocks) = harness();
+            let policy_id = seed_policy(&mocks);
+            let (_eid, cve) = seed_exclusion_with_scope(
+                &mocks,
+                policy_id,
+                "CVE-2026-6060",
+                PolicyScope::Repository(repo_id),
+            );
+            let status = router
+                .oneshot(delete_req(
+                    policy_id,
+                    &cve,
+                    r#"{"reason":"legacy row"}"#,
+                    Some(principal_with_claims(&["curate"])),
+                ))
+                .await
+                .unwrap()
+                .status();
+            (policy_id, cve, status)
+        });
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        // On *one* line, not scattered across the span and the record:
+        // a correlation that needs two log lines joined is not the one
+        // an operator gets out of a log search.
+        logs_assert(|lines: &[&str]| {
+            let hits: Vec<&&str> = lines
+                .iter()
+                .filter(|l| l.contains("carries a repository scope"))
+                .collect();
+            let [line] = hits[..] else {
+                return Err(format!("expected exactly one reach line, got {hits:?}"));
+            };
+            for needle in [
+                policy_id.to_string().as_str(),
+                cve.as_str(),
+                repo_id.to_string().as_str(),
+                // The rationale every other surface states verbatim.
+                "never reads",
+                // Not a denial: the row is on its way out.
+                "INFO",
+            ] {
+                if !line.contains(needle) {
+                    return Err(format!("reach line is missing {needle:?}: {line}"));
+                }
+            }
+            Ok(())
+        });
     }
 
     /// Empty `reason` → 400.

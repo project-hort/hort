@@ -51,8 +51,8 @@ use crate::use_cases::provenance_cascade::ProvenanceCascade;
 use crate::use_cases::quarantine_hold::{resolve_transient_hold, TransientHold};
 use crate::use_cases::referenced_descendant::resolve_referenced_tree_descendant_fail_safe;
 use crate::use_cases::{
-    append_any_with_conflict_retry, event_append_backoff, read_expected_version,
-    EVENT_APPEND_RETRY_ATTEMPTS,
+    append_any_with_conflict_retry, event_append_backoff, read_unpaired_append_version,
+    UnpairedAppend, EVENT_APPEND_RETRY_ATTEMPTS,
 };
 
 /// Enqueue priority for **clearance-gating** `provenance-verify` jobs — the
@@ -1558,7 +1558,13 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, true).await?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            true,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await?;
 
         self.lifecycle
             .commit_transition(
@@ -2286,7 +2292,7 @@ impl IngestUseCase {
         // requires uncapped emission on the repository aggregate.
         //
         // Issue #88: this unbounded stream must NOT derive its append
-        // version from `read_expected_version`'s capped forward-scan —
+        // version from `read_unpaired_append_version`'s capped forward-scan —
         // past 201 accumulated events (exactly the "sustained tampering"
         // case above) that read returns a STALE position and every
         // subsequent append fails `Conflict` deterministically and
@@ -3717,9 +3723,14 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, true)
-            .await
-            .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            true,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await
+        .map_err(|e| (InnerIngestError::Other(e), Some(repo_key.clone()), None))?;
 
         let mut events = vec![EventToAppend {
             event_id: artifact_ingested_event_id,
@@ -4513,12 +4524,17 @@ impl IngestUseCase {
             properties: serde_json::Value::Object(Default::default()),
         };
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, true)
-            .await
-            .map_err(|e| RegisterError::Other {
-                err: e,
-                repo_key: Some(repo_key.clone()),
-            })?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            true,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await
+        .map_err(|e| RegisterError::Other {
+            err: e,
+            repo_key: Some(repo_key.clone()),
+        })?;
 
         self.lifecycle
             .commit_transition(
@@ -4789,12 +4805,17 @@ impl IngestUseCase {
         }
 
         if !events.is_empty() || !enqueues.is_empty() {
-            let expected_version = read_expected_version(&*self.events, &stream_id, true)
-                .await
-                .map_err(|e| RegisterError::Other {
-                    err: e,
-                    repo_key: Some(repo_key.clone()),
-                })?;
+            let expected_version = read_unpaired_append_version(
+                &*self.events,
+                &stream_id,
+                true,
+                UnpairedAppend::SameCallFollowUp,
+            )
+            .await
+            .map_err(|e| RegisterError::Other {
+                err: e,
+                repo_key: Some(repo_key.clone()),
+            })?;
 
             self.lifecycle
                 .commit_transition_with_enqueues(
@@ -6480,7 +6501,7 @@ mod tests {
             })
             .await
             .unwrap();
-        // Call 0 is `read_expected_version`'s own read; call 1 is the
+        // Call 0 is `read_unpaired_append_version`'s own read; call 1 is the
         // clearance lookup. Failing call 0 instead would abort the ingest
         // before the quarantine decision — a different path.
         events.fail_read_stream_at(1, DomainError::Invariant("event store down".into()));
@@ -13259,7 +13280,7 @@ mod tests {
     /// audit trail matters most (sustained tampering = many events).
     ///
     /// Issue #88 revised the mechanism entirely: `append_repository_event`
-    /// no longer calls `read_expected_version` (whose capped forward-scan
+    /// no longer calls `read_unpaired_append_version` (whose capped forward-scan
     /// is only correct for a *bounded* stream) at all — it appends at
     /// `ExpectedVersion::Any` with bounded conflict-retry. This test
     /// drives 250 (`STREAM_EVENT_CAP + 50`) consecutive `ChecksumMismatch`
@@ -13270,7 +13291,7 @@ mod tests {
     /// append past #201 fail `Conflict` under the pre-#88 mechanism, since
     /// that mechanism's version-number read was a truncated,
     /// increasingly-stale scan-from-start — see the mod.rs doc on
-    /// `read_expected_version` for the full mechanism).
+    /// `read_unpaired_append_version` for the full mechanism).
     #[tokio::test]
     async fn repository_audit_stream_accepts_more_than_stream_event_cap_events() {
         use crate::use_cases::STREAM_EVENT_CAP;

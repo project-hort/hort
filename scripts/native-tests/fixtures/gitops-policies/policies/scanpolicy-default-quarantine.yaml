@@ -9,10 +9,15 @@ spec:
   requireApproval: true
   # Provenance off for permissive e2e (no per-ingest verify job).
   provenanceMode: off
-  maxArtifactAge: 90d
-  licensePolicy:
-    allowed: [Apache-2.0, MIT]
-    denied: [GPL-3.0]
+  # No `maxArtifactAge`: the staleness cap is not evaluated (the age
+  # evaluator has no caller on any scan, release or retention path), so
+  # declaring one is an apply-time rejection and would park the whole
+  # smoke stack at boot.
+  # `{}` is the only non-omitted value apply accepts: licence enforcement
+  # is not implemented (the scan path evaluates the policy against an
+  # empty licence list), so declaring rules here is an apply-time
+  # rejection and would park the whole smoke stack at boot.
+  licensePolicy: {}
   # Explicit `[]` rather than omitted: omitting defaults to
   # `["trivy"]` (the default), which the cross-spec validator
   # checks against the live `scanner_registry`. The compose stack used

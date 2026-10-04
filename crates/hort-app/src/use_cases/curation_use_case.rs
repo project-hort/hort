@@ -65,12 +65,10 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{emit_curation_decision, CurationDecisionLabel, CurationDecisionResult};
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
-use crate::use_cases::release_clearance::{
-    resolve_curation_clearance, resolve_provenance_clearance,
-};
+use crate::use_cases::release_clearance::resolve_curation_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
-use crate::use_cases::{read_expected_version, rejected_reevaluation, CallerPrivileges};
+use crate::use_cases::{rejected_reevaluation, ArtifactAtVersion, CallerPrivileges, OverCapStream};
 
 /// Maximum justification length in BYTES.
 /// Mirrors `MAX_JUSTIFICATION_LEN` semantics on `ArtifactReleased::validate`.
@@ -604,26 +602,24 @@ impl CurationUseCase {
         let correlation_id = Uuid::new_v4();
         let user_id = actor.user_id;
 
-        let expected_version = match read_expected_version(&*self.events, &stream_id, false).await {
-            Ok(v) => v,
+        let mut paired = match ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await
+        {
+            Ok(p) => p,
             Err(e) => {
                 let result = classify_append_error(&e);
                 emit_curation_decision(CurationDecisionLabel::Waive, None, result);
                 return Err(e);
             }
         };
-
-        let mut artifact = match self.artifacts.find_by_id(artifact_id).await {
-            Ok(a) => a,
-            Err(e) => {
-                let app_err = AppError::Domain(e);
-                let result = classify_append_error(&app_err);
-                emit_curation_decision(CurationDecisionLabel::Waive, None, result);
-                return Err(app_err);
-            }
-        };
-        let prior_status = artifact.quarantine_status;
-        let repository_id = artifact.repository_id;
+        let expected_version = paired.expected_version();
+        let prior_status = paired.artifact().quarantine_status;
+        let repository_id = paired.artifact().repository_id;
         // Resolve `repository_id → key` for the
         // metric label using the existing `RepositoryAccessUseCase`
         // helper. The helper handles the `METRICS_INCLUDE_REPOSITORY_LABEL`
@@ -637,7 +633,7 @@ impl CurationUseCase {
         //    state. The deny-by-default release
         //    predicate (ADR 0007) accepts only
         //    `(Curator, CuratorWaiver)` for this authority.
-        let mut event_payload = match artifact.release(
+        let mut event_payload = match paired.artifact_mut().release(
             ReleaseReason::Curator,
             ReleaseAuthorization::CuratorWaiver,
             // Curator waivers ignore the
@@ -668,6 +664,7 @@ impl CurationUseCase {
         event_payload.justification = Some(justification);
 
         let score_delta = RepoSecurityScoreProjector::compute_released_delta(prior_status);
+        let artifact = paired.into_artifact();
 
         if let Err(e) = self
             .lifecycle
@@ -761,31 +758,37 @@ impl CurationUseCase {
             return Err(e);
         }
 
-        let mut artifact = match self.artifacts.find_by_id(artifact_id).await {
-            Ok(a) => a,
+        let mut paired = match ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await
+        {
+            Ok(p) => p,
             Err(e) => {
-                let app_err = AppError::Domain(e);
-                let result = classify_append_error(&app_err);
+                let result = classify_append_error(&e);
                 emit_curation_decision(CurationDecisionLabel::Reevaluate, None, result);
-                return Err(app_err);
+                return Err(e);
             }
         };
-        let repository_id = artifact.repository_id;
+        let repository_id = paired.artifact().repository_id;
         let repo_label = self.repository_access.metric_label(repository_id).await;
 
         // 2) Source-state guard — Rejected only (ADR 0025: a
         //    caller-reachable state precondition is InvalidState/409,
         //    never an opaque 500).
-        if artifact.quarantine_status != QuarantineStatus::Rejected {
+        if paired.artifact().quarantine_status != QuarantineStatus::Rejected {
             let app_err = AppError::Domain(DomainError::InvalidState(format!(
                 "cannot re-evaluate artifact in state {}",
-                artifact.quarantine_status
+                paired.artifact().quarantine_status
             )));
             let result = classify_append_error(&app_err);
             tracing::info!(
                 artifact_id = %artifact_id,
                 actor_id = %actor.user_id,
-                status = %artifact.quarantine_status,
+                status = %paired.artifact().quarantine_status,
                 outcome = result.as_str(),
                 "curation reevaluate rejected: source-state guard"
             );
@@ -829,9 +832,8 @@ impl CurationUseCase {
         // 4) Load evidence + derive the verdict — shared path.
         let now = Utc::now();
         let derivation = match rejected_reevaluation::derive_rejected_outcome(
-            &*self.events,
+            &paired,
             &self.storage,
-            &artifact,
             policy.as_ref(),
             &exclusions,
             now,
@@ -856,7 +858,7 @@ impl CurationUseCase {
             new_status: QuarantineStatus::Rejected,
         };
 
-        let (outcome, quarantine_deadline, reason) = match derivation {
+        let (outcome, quarantine_deadline, reason, derived_provenance) = match derivation {
             // Not scan-clearable: the verdict, from a scan-evidence
             // perspective, is unchanged. No event; no state churn.
             rejected_reevaluation::RejectedDerivation::Ineligible { reason } => {
@@ -891,7 +893,8 @@ impl CurationUseCase {
                 outcome,
                 quarantine_deadline,
                 rejection_reason,
-            } => (outcome, quarantine_deadline, rejection_reason),
+                provenance,
+            } => (outcome, quarantine_deadline, rejection_reason, provenance),
         };
 
         if matches!(outcome, ReEvaluationOutcome::StillRejected) {
@@ -909,11 +912,11 @@ impl CurationUseCase {
             return Ok(still_rejected_noop());
         }
 
-        artifact.rejection_reason = reason;
+        paired.artifact_mut().rejection_reason = reason;
         // Hydrate the transient computed deadline so `Artifact::re_evaluate`
         // below branches on the same computed deadline the pure helper
         // decided against — the two MUST agree on boundary semantics.
-        artifact.quarantine_deadline = quarantine_deadline;
+        paired.artifact_mut().quarantine_deadline = quarantine_deadline;
 
         // 5) Resolve the cross-axis release clearances. Only the release
         //    arm consults them (`re_evaluate`'s still-in-window branch
@@ -921,29 +924,16 @@ impl CurationUseCase {
         //    resolves them ONLY on the `ResetToReleased` arm to avoid an
         //    unnecessary read on the re-quarantine arm.
         let (provenance, curation) = if matches!(outcome, ReEvaluationOutcome::ResetToReleased) {
-            let provenance_mode = policy
-                .as_ref()
-                .map(|p| p.provenance_mode)
-                .unwrap_or_default();
-            let provenance =
-                match resolve_provenance_clearance(&*self.events, artifact_id, provenance_mode)
-                    .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let result = classify_append_error(&e);
-                        emit_curation_decision(
-                            CurationDecisionLabel::Reevaluate,
-                            Some(&repo_label),
-                            result,
-                        );
-                        return Err(e);
-                    }
-                };
+            // The provenance leg came out of the derivation above, off the
+            // SAME stream read the append's version came from. Resolving
+            // it here from a second read would let a `ProvenanceVerified`
+            // that landed after the pairing clear the gate while the
+            // append still carried the pre-verification version.
+            let provenance = derived_provenance;
             let curation = match resolve_curation_clearance(
                 &*self.curation_rules,
                 &self.repository_access,
-                &artifact,
+                paired.artifact(),
             )
             .await
             {
@@ -990,22 +980,11 @@ impl CurationUseCase {
         // 6) Commit: `Artifact::re_evaluate` re-derives the same
         //    eligibility + boundary decision as a defence-in-depth
         //    re-check and produces the companion transition event.
-        let stream_id = StreamId::artifact(artifact_id);
-        let expected_version = match read_expected_version(&*self.events, &stream_id, false).await {
-            Ok(v) => v,
-            Err(e) => {
-                let result = classify_append_error(&e);
-                emit_curation_decision(
-                    CurationDecisionLabel::Reevaluate,
-                    Some(&repo_label),
-                    result,
-                );
-                return Err(e);
-            }
-        };
+        let stream_id = paired.stream_id().clone();
+        let expected_version = paired.expected_version();
 
-        let previous_status = artifact.quarantine_status;
-        let companion_event = match artifact.re_evaluate(now, provenance, curation) {
+        let previous_status = paired.artifact().quarantine_status;
+        let companion_event = match paired.artifact_mut().re_evaluate(now, provenance, curation) {
             Ok(ev) => ev,
             Err(e) => {
                 let app_err = AppError::Domain(e);
@@ -1024,7 +1003,8 @@ impl CurationUseCase {
                 return Err(app_err);
             }
         };
-        let new_status = artifact.quarantine_status;
+        let new_status = paired.artifact().quarantine_status;
+        let artifact = paired.into_artifact();
 
         let re_evaluated = ArtifactReEvaluated {
             artifact_id,
@@ -1367,8 +1347,15 @@ impl CurationUseCase {
     ) {
         let stream_id = StreamId::artifact(artifact_id);
 
-        let expected_version = match read_expected_version(&*self.events, &stream_id, false).await {
-            Ok(v) => v,
+        let mut paired = match ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await
+        {
+            Ok(p) => p,
             Err(e) => {
                 let result = classify_append_error(&e);
                 emit_curation_decision(CurationDecisionLabel::Block, None, result);
@@ -1376,17 +1363,7 @@ impl CurationUseCase {
                 return;
             }
         };
-
-        let mut artifact = match self.artifacts.find_by_id(artifact_id).await {
-            Ok(a) => a,
-            Err(e) => {
-                let app_err = AppError::Domain(e);
-                let result = classify_append_error(&app_err);
-                emit_curation_decision(CurationDecisionLabel::Block, None, result);
-                outcome.failed.push((artifact_id, app_err));
-                return;
-            }
-        };
+        let expected_version = paired.expected_version();
         // Resolve `repository_id → key` once
         // per attempted append (single bounded query). For
         // `BlockTarget::VersionList` this is one lookup per resolved
@@ -1394,12 +1371,12 @@ impl CurationUseCase {
         // `METRICS_INCLUDE_REPOSITORY_LABEL=false` short-circuits every
         // call to the `_all` sentinel without touching the DB, so
         // operators at scale pay no cost.
-        let repository_id = artifact.repository_id;
+        let repository_id = paired.artifact().repository_id;
         let repo_label = self.repository_access.metric_label(repository_id).await;
 
         // Idempotent no-op: already-Rejected short-circuits with NO
         // event appended.
-        if artifact.quarantine_status == QuarantineStatus::Rejected {
+        if paired.artifact().quarantine_status == QuarantineStatus::Rejected {
             outcome.already_rejected_ids.push(artifact_id);
             emit_curation_decision(
                 CurationDecisionLabel::Block,
@@ -1409,9 +1386,12 @@ impl CurationUseCase {
             return;
         }
 
-        let prior_status = artifact.quarantine_status;
+        let prior_status = paired.artifact().quarantine_status;
 
-        let event_payload = match artifact.block_by_curator(user_id, justification.to_owned()) {
+        let event_payload = match paired
+            .artifact_mut()
+            .block_by_curator(user_id, justification.to_owned())
+        {
             Ok(e) => e,
             Err(e) => {
                 let app_err = AppError::Domain(e);
@@ -1426,6 +1406,7 @@ impl CurationUseCase {
             prior_status,
             QuarantineStatus::Rejected,
         );
+        let artifact = paired.into_artifact();
 
         if let Err(e) = self
             .lifecycle
@@ -1809,7 +1790,7 @@ mod tests {
 
     /// Seed an artifact in a specific quarantine state and pre-populate
     /// the event stream with a position-0 placeholder so
-    /// `read_expected_version` resolves a non-`NoStream` version
+    /// `read_unpaired_append_version` resolves a non-`NoStream` version
     /// (mirrors a real lifecycle that landed `ArtifactIngested`/
     /// `ArtifactQuarantined` before the curator decision).
     fn seed_artifact_with_stream(
@@ -3467,6 +3448,36 @@ mod tests {
             );
             artifacts.insert(artifact);
             artifact_id
+        }
+
+        /// An over-cap stream refuses the re-evaluation. The verdict rests
+        /// on the latest `ScanCompleted` and the latest `ArtifactRejected`
+        /// reason, both read off the paired evidence — over the oldest
+        /// prefix of a breached stream "the latest" is whichever one the
+        /// read happened to reach, so no verdict is derived from it.
+        #[tokio::test]
+        async fn reevaluate_refuses_a_stream_past_the_event_cap() {
+            let (uc, artifacts, events, lifecycle, _policies, _rules) =
+                make_use_case_for_reevaluate();
+            let artifact = sample_artifact(QuarantineStatus::Rejected);
+            let artifact_id = artifact.id;
+            let stream_id = StreamId::artifact(artifact_id);
+            let over_cap: Vec<_> = (0..201)
+                .map(|i| persisted_scan_completed(artifact_id, 0, i))
+                .collect();
+            events.set_stream(&stream_id, over_cap);
+            artifacts.insert(artifact);
+
+            let err = uc
+                .reevaluate(artifact_id, api_actor(), curator_privileges())
+                .await
+                .unwrap_err();
+
+            assert!(
+                err.to_string().contains("200-event cap"),
+                "the refusal must name the cap it is enforcing; got {err}"
+            );
+            assert!(lifecycle.committed_transitions().is_empty());
         }
 
         /// Caller lacking both `curate` and `admin` → `Forbidden`, no

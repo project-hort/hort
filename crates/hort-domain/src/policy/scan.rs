@@ -288,11 +288,17 @@ pub fn evaluate_scan_result(
     // dispatches to the license evaluator.
     if let Some(policy) = policy {
         if has_license_policy(&policy.license_policy) {
-            // v1: no SBOM port wired here, so license input is empty.
-            // A non-empty list becomes meaningful when a follow-on item
-            // surfaces SBOM data through a port; the call still goes
-            // through today so license-policy-shape violations
-            // (operator typos in YAML) surface even with zero licenses.
+            // No SBOM port is wired here, so the license input is empty
+            // and every rule in the policy matches nothing. That is why
+            // a `licensePolicy` this branch would act on is refused at
+            // apply (`has_license_policy` is the shared predicate): the
+            // only projections that still reach here are rows stored
+            // before that rule, which nothing rewrites. A non-empty list
+            // becomes meaningful when a follow-on item surfaces SBOM
+            // data through a port — at which point the apply-time
+            // rejection goes away with it. The call still goes through
+            // today so license-policy-shape violations (operator typos
+            // in a stored row) surface even with zero licenses.
             let (license_violations, license_action) =
                 evaluate_license_policy(&[], &policy.license_policy);
             accumulator.collect_with_policy_action(license_violations, license_action);
@@ -389,7 +395,17 @@ pub(crate) fn collect_negligible_action(
 /// return true so the license evaluator surfaces a
 /// `license-policy-shape` violation against the operator's malformed
 /// input rather than silently swallowing it.
-fn has_license_policy(value: &serde_json::Value) -> bool {
+///
+/// `pub` because this predicate is also the apply-time linter's
+/// definition of a *declared* `licensePolicy`
+/// (`hort_config::desired::validate_scan_policy_license_policy_not_implemented`):
+/// a policy this function answers `true` for is one whose licence
+/// decision the operator expects to be load-bearing, and no licence
+/// input reaches [`evaluate_license_policy`] for it to decide on. The two
+/// callers share the predicate rather than each carrying its own copy,
+/// so the set the linter rejects cannot drift from the set that would
+/// dispatch here.
+pub fn has_license_policy(value: &serde_json::Value) -> bool {
     if value.is_null() {
         return false;
     }

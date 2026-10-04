@@ -36,6 +36,7 @@
 //! |---|---|---|
 //! | `CapExceedsAuthority { failed }` | 403 | `{"error":"cap_exceeds_authority","failed":[…]}` |
 //! | `ServiceAccountSelfMint` | 403 | `{"error":"service_account_must_use_admin_mint"}` |
+//! | `BootstrapAdminMintForbidden` | 403 | `{"error":"bootstrap_admin_mint_forbidden"}` |
 //! | `AdminTokenDisallowed` | 400 | `{"error":"admin_tokens_disabled"}` |
 //! | `AdminAuthorityRequired` | 403 | `{"error":"admin_authority_required"}` |
 //! | `AdminTokenExceedsThirtyDays` | 400 | `{"error":"admin_token_max_30_days"}` |
@@ -480,6 +481,13 @@ fn map_use_case_error(err: ApiTokenError) -> Response {
         E::ServiceAccountSelfMint => {
             err_body(StatusCode::FORBIDDEN, "service_account_must_use_admin_mint")
         }
+        // The reserved break-glass identity has exactly one mint path,
+        // the DSN-gated `admin bootstrap-session` CLI; no request-path
+        // route mints for it. 403 rather than 400 — the refusal is
+        // about who the token would belong to, not about the body.
+        E::BootstrapAdminMintForbidden => {
+            err_body(StatusCode::FORBIDDEN, "bootstrap_admin_mint_forbidden")
+        }
         E::AdminTokenDisallowed => err_body(StatusCode::BAD_REQUEST, "admin_tokens_disabled"),
         E::AdminAuthorityRequired => err_body(StatusCode::FORBIDDEN, "admin_authority_required"),
         E::AdminTokenExceedsThirtyDays => {
@@ -557,7 +565,9 @@ mod tests {
     use tower::ServiceExt;
 
     use hort_app::rbac::RbacEvaluator;
-    use hort_app::use_cases::api_token_use_case::{ApiTokenIssuanceConfig, ApiTokenUseCase};
+    use hort_app::use_cases::api_token_use_case::{
+        ApiTokenIssuanceConfig, ApiTokenUseCase, BOOTSTRAP_ADMIN_USERNAME,
+    };
     use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
     use hort_app::use_cases::test_support::MockIdentityProvider;
     use hort_domain::entities::api_token::ApiToken;
@@ -589,6 +599,17 @@ mod tests {
     }
 
     fn router_with_principal(principal: &CallerPrincipal) -> (Router, MockPorts, Arc<AppContext>) {
+        router_with_principal_and_config(principal, ApiTokenIssuanceConfig::default())
+    }
+
+    /// Same wiring as [`router_with_principal`], with the composition-root
+    /// issuance flags under the test's control. The default is both flags
+    /// off; a test that needs `HORT_TOKEN_ALLOW_ADMIN=true` on the server
+    /// process passes it here.
+    fn router_with_principal_and_config(
+        principal: &CallerPrincipal,
+        issuance_config: ApiTokenIssuanceConfig,
+    ) -> (Router, MockPorts, Arc<AppContext>) {
         let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
         let (base, mocks) = build_mock_ctx(metrics_handle);
 
@@ -658,7 +679,7 @@ mod tests {
             mocks.users.clone(),
             base.event_store.clone(),
             rbac_swap.clone(),
-            ApiTokenIssuanceConfig::default(),
+            issuance_config,
         ));
         let ctx_with_auth = with_auth(
             &base,
@@ -943,6 +964,42 @@ mod tests {
             assert!(item.get("token_hash").is_none());
             assert!(item.get("token").is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn post_self_token_from_bootstrap_principal_returns_403_with_both_optins_on() {
+        // The composition, at the wire: `HORT_TOKEN_ALLOW_ADMIN` is on for
+        // the server process (`allow_admin_tokens: true`) AND the caller is
+        // the break-glass identity the `admin bootstrap-session` CLI mints
+        // for — which requires the same variable on the CLI process. Each
+        // half alone is accepted; together they used to hand back a 30-day
+        // full-admin PAT under an operator-chosen name that the next
+        // bootstrap rotation never matched.
+        let user_id = Uuid::new_v4();
+        let mut principal = principal_with_claims(user_id, &["admin"]);
+        principal.username = BOOTSTRAP_ADMIN_USERNAME.to_string();
+        let (router, mocks, _) = router_with_principal_and_config(
+            &principal,
+            ApiTokenIssuanceConfig {
+                allow_admin_tokens: true,
+                allow_unbounded_svc_tokens: false,
+            },
+        );
+        let mut req = Request::post("/users/me/tokens")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"name":"ci-automation","declared_permissions":["admin"],"expires_in_days":30}"#,
+            ))
+            .unwrap();
+        inject(&mut req, &principal);
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"], "bootstrap_admin_mint_forbidden");
+        // Rejection, not a shortened expiry: no row, no plaintext.
+        assert!(mocks.api_tokens.inserted().is_empty());
+        assert!(v.get("token").is_none());
     }
 
     // -- POST /admin/users/:user_id/tokens ---------------------------------

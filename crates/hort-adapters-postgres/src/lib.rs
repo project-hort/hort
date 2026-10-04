@@ -77,6 +77,11 @@ pub mod purge_gc;
 // `rescan_candidates`'s file layout; consumed by
 // `QuarantineReleaseSweepHandler`.
 pub mod quarantine_release_candidates;
+// The `artifacts.quarantine_status` codec: the column's stored
+// vocabulary, its encoder and its fail-closed decoder, as one inverse
+// pair. Crate-internal — the stored spelling of a domain state must not
+// cross the port boundary (ADR 0008).
+pub(crate) mod quarantine_status_sql;
 pub mod ref_lifecycle;
 pub mod ref_registry_repo;
 pub mod refcount_reconcile;
@@ -163,13 +168,6 @@ pub(crate) const ARTIFACT_IS_TAG_TARGETED_SQL: &str = r#"
     )
 "#;
 
-/// Map a persisted status when it belongs to the shared GC-protected set.
-pub(crate) fn gc_protected_quarantine_status(raw: &str) -> Option<QuarantineStatus> {
-    GC_PROTECTED_QUARANTINE_STATUSES
-        .iter()
-        .find_map(|(name, status)| (*name == raw).then_some(*status))
-}
-
 /// Map sqlx errors to domain errors.
 ///
 /// Order matters. The contention arm sits ahead of the catch-all because a
@@ -219,25 +217,30 @@ pub(crate) fn escape_like_pattern(input: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The SQL literals bound into the GC / retention protection
+    /// filters and the domain variants they stand for are two halves of
+    /// one pairing, and the halves must not drift: a literal that no
+    /// longer matches what the column actually holds would silently
+    /// stop protecting that state, and the filters are what keep a
+    /// quarantined blob out of a destructive sweep. The names are
+    /// checked against the crate's one status encoder — the same
+    /// function every writer binds through — so a renamed `Display`
+    /// spelling fails here rather than in a purge.
     #[test]
-    fn gc_protected_status_definition_supplies_names_and_domain_values() {
+    fn gc_protected_status_names_match_what_the_writers_store() {
+        use crate::quarantine_status_sql::quarantine_status_to_sql;
+
         assert_eq!(
             gc_protected_quarantine_status_names(),
             ["quarantined", "rejected", "scan_indeterminate"]
         );
-        assert_eq!(
-            gc_protected_quarantine_status("quarantined"),
-            Some(QuarantineStatus::Quarantined)
-        );
-        assert_eq!(
-            gc_protected_quarantine_status("rejected"),
-            Some(QuarantineStatus::Rejected)
-        );
-        assert_eq!(
-            gc_protected_quarantine_status("scan_indeterminate"),
-            Some(QuarantineStatus::ScanIndeterminate)
-        );
-        assert_eq!(gc_protected_quarantine_status("released"), None);
+        for (name, status) in GC_PROTECTED_QUARANTINE_STATUSES {
+            assert_eq!(
+                quarantine_status_to_sql(status).as_deref(),
+                Some(name),
+                "the bound literal for {status} is not what a writer stores"
+            );
+        }
     }
 
     #[test]

@@ -28,7 +28,9 @@ many at once. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
 A `ScanPolicy` field (`enforcement: reject | record`) deciding what a
 **blocking scan verdict does** to the artifact — as distinct from the
 knobs that decide *which* findings are blocking (`severityThreshold`,
-`licensePolicy`, `negligibleAction`). Under `reject` (the default, and
+`negligibleAction`; **not** `licensePolicy`, which decides nothing and
+is refused at apply — see
+[the linter-row matrix](architecture/reference/apply-time-linter-rows.md)). Under `reject` (the default, and
 the behaviour of any policy that omits the field) a blocking verdict
 transitions the artifact to `Rejected`. Under `record` the scan still
 runs and the findings, the per-finding rows and the

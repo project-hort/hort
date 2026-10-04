@@ -74,7 +74,9 @@ use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
-use crate::use_cases::read_expected_version;
+use crate::use_cases::{
+    read_unpaired_append_version, ArtifactAtVersion, OverCapStream, UnpairedAppend,
+};
 
 /// The `kind` filter used to read cosign attestation bundles off the
 /// content-reference / OCI Referrers surface. A cosign signature manifest
@@ -315,43 +317,44 @@ impl ProvenanceOrchestrationUseCase {
     /// the verifier(s), and threads the folded verdict through
     /// [`Artifact::complete_provenance`], persisting the event (if any).
     pub async fn verify_artifact(&self, artifact_id: Uuid) -> AppResult<ProvenanceRunOutcome> {
-        let artifact = self.artifacts.find_by_id(artifact_id).await?;
-
-        // Read the expected stream version HERE — paired with the load
-        // above, BEFORE the bundle-fetch / CAS-preimage / verifier round
-        // trip below (issue #108 H2a). Reading it late (at commit time,
-        // where it used to live) meant a scan verdict that committed
-        // `ArtifactRejected` during that round trip was ALREADY in the
-        // version we then read, so the provenance append did not conflict
-        // — and `complete_provenance(Verified)`, working from the
-        // stale-loaded `Quarantined`, wrote that status back over
+        // Pair the artifact load with the version this verify's append
+        // will carry, BEFORE the bundle-fetch / CAS-preimage / verifier
+        // round trip below. See `ArtifactAtVersion`'s contract: read the
+        // version at commit time instead, and a scan verdict that
+        // committed `ArtifactRejected` during that round trip is ALREADY
+        // in the version read — so the provenance append does not
+        // conflict, and `complete_provenance(Verified)`, working from the
+        // stale-loaded `Quarantined`, writes that status back over
         // `Rejected`, resurrecting a rejected artifact into a
-        // timer-releasable state. Anchored to the load, a concurrent
-        // verdict's append now makes THIS append fail `Conflict` and the
-        // paired projection write never runs.
+        // timer-releasable state.
         //
         // Nothing between here and the commit appends to THIS stream:
         // the referrer-landing path (`commit_referrer_manifest`) mints a
         // NEW artifact id and appends to its own stream, and the cascade
         // runs only after this artifact's own verdict has committed.
         //
-        // Mirrors `policy_use_case.rs`'s early-read shape (warn on read
-        // error), but PROPAGATES instead of skipping: that is a bulk
-        // re-evaluation pass where one artifact is skippable, whereas
-        // this is a single-artifact job — returning `Err` fails the job
-        // so the dispatcher retries it, rather than silently reporting a
-        // verify that never happened.
-        let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
-        let expected_version = read_expected_version(&*self.events, &stream_id, false)
-            .await
-            .inspect_err(|e| {
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    error = %e,
-                    "provenance verify: expected-version read failed; aborting this artifact \
-                     (job retries)",
-                );
-            })?;
+        // `Err` PROPAGATES instead of skipping: this is a
+        // single-artifact job, so failing it makes the dispatcher retry
+        // rather than silently report a verify that never happened (the
+        // bulk re-evaluation pass, where one artifact is skippable, logs
+        // and continues instead).
+        let paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await
+        .inspect_err(|e| {
+            tracing::warn!(
+                artifact_id = %artifact_id,
+                error = %e,
+                "provenance verify: artifact/expected-version pairing failed; aborting this \
+                 artifact (job retries)",
+            );
+        })?;
+        let expected_version = paired.expected_version();
+        let artifact = paired.into_artifact();
 
         let repo = self.repositories.find_by_id(artifact.repository_id).await?;
         let format = repo.format.to_string();
@@ -1017,7 +1020,13 @@ impl ProvenanceOrchestrationUseCase {
         };
 
         let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
-        let expected_version = read_expected_version(&*self.events, &stream_id, true).await?;
+        let expected_version = read_unpaired_append_version(
+            &*self.events,
+            &stream_id,
+            true,
+            UnpairedAppend::GenesisAppend,
+        )
+        .await?;
 
         self.lifecycle
             .commit_transition(
@@ -1306,21 +1315,20 @@ impl ProvenanceOrchestrationUseCase {
         let stream_id = hort_domain::events::StreamId::artifact(artifact.id);
         let correlation_id = Uuid::new_v4();
 
-        // Column-scoped, prior-status-guarded verdict commit (issues #90
-        // and #108). `artifact` was loaded at the top of
-        // `verify_artifact`, before the bundle fetch / CAS preimage read /
-        // verifier dispatch round trip — by now its snapshot of every
-        // column can be stale. Three things keep that from clobbering a
-        // concurrent verdict:
+        // Column-scoped, prior-status-guarded verdict commit.
+        // `artifact` was loaded at the top of `verify_artifact`, before
+        // the bundle fetch / CAS preimage read / verifier dispatch round
+        // trip — by now its snapshot of every column can be stale. Three
+        // things keep that from clobbering a concurrent verdict:
         //
-        // 1. `expected_version` was read at that same load (#108 H2a, see
-        //    `verify_artifact`), so an intervening append fails this one
+        // 1. `expected_version` came from the `ArtifactAtVersion` pairing
+        //    at that same load, so an intervening append fails this one
         //    `Conflict` before any projection write happens.
         // 2. `commit_provenance_verdict` writes only `quarantine_status`,
         //    so a concurrent transition's `quarantine_window_start` (the
-        //    quarantine anchor) survives regardless (#90).
+        //    quarantine anchor) survives regardless.
         // 3. `prior_status` makes even that one column's write
-        //    skip-if-unchanged and conditional-if-changed (#108 H2b).
+        //    skip-if-unchanged and conditional-if-changed.
         self.lifecycle
             .commit_provenance_verdict(
                 &artifact,

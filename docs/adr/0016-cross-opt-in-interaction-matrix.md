@@ -32,6 +32,12 @@ The canonical matrix table is maintained in the architect skill (`.claude/comman
 
   No apply-time rejection rule: the combination grants no release authority in either direction (a held constituent serves nothing, and clearance authority is unchanged), so there is nothing to fail-closed-reject. An apply-time floor on `quarantine_duration_secs` was considered and rejected — it moves the race rather than removing it, since no floor can be guaranteed longer than an arbitrary client's push.
 
+### Amendment — second axis: credential-authority gates (2026-10-03)
+
+The matrix as adopted covered the **release gate**. The reasoning above is about *gates*, and the auth opt-ins had never been run through it. The first registered row on that axis:
+
+- **`HORT_TOKEN_ALLOW_ADMIN` on the `admin bootstrap-session` CLI process** × **`HORT_TOKEN_ALLOW_ADMIN` on the server process** — **closed fail-closed at the issuance gate.** Each half is individually accepted: `docs/auth-catalog.md` Entry 2 permits an admin PAT up to 30 days, and ADR 0038 describes bootstrap as the short-lived break-glass path with no standing admin authority. Together, the ≤ 1 h full-cap break-glass PAT is accepted by `POST /users/me/tokens`, whose admin gate permits an explicit 1–30 day admin PAT under an operator-chosen name that bootstrap rotation never matched — so possession of a one-hour break-glass credential yielded a 30-day standing full-admin credential, needing no further DSN access and surviving every later rotation. **Resolved 2026-10-03 (Tom): ADR 0038 governs a bootstrap-derived PAT** (*"Ja, ADR 38 sollte auch fuer ein aus dem Bootstrap abgeleitetes PAT gelten."*). The close is a rejection in the shared issuance gates (`run_issuance_gates` → `ApiTokenError::BootstrapAdminMintForbidden`) of any issuance whose token *owner* is the reserved `bootstrap-admin` identity — not a shortened derived expiry and not a warning. Unlike the release-gate rows this is **not apply-time rejectable**: the two surfaces are two processes reading one environment variable, so there is no single apply-time document in which the combination appears; where that holds, the structural close moves to the gate the combination reaches. The general admin-PAT feature and its 1–30 day window are unchanged — only its reachability from the bootstrap principal.
+
 ## Consequences
 
 - A new release-gate-influencing knob cannot be added without analysing it against every existing one — the interaction is enumerated, not discovered in production.

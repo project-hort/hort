@@ -130,6 +130,70 @@ pub(crate) const RULE_SCAN_BACKEND_CAPABILITY: &str = "scan_backend_capability";
 pub(crate) const RULE_RETENTION_UNUSED_FOR_NOT_IMPLEMENTED: &str =
     "retention_unused_for_not_implemented";
 
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `ScanPolicy`
+/// envelope declares a `licensePolicy` the scan path cannot apply —
+/// the evaluator is handed an empty licence list, so every rule in the
+/// policy matches nothing. The same accepted-but-inert anti-pattern
+/// [`RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED`] closes for
+/// `maxAgeDays`, on the licence axis (ADR 0015). One increment per
+/// offending `ScanPolicy`. Retired together with the rule — see
+/// [`hort_config::desired::validate_scan_policy_license_policy_not_implemented`]
+/// for the exact retirement trigger.
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_SCAN_POLICY_LICENSE_POLICY_NOT_IMPLEMENTED: &str =
+    "scan_policy_license_policy_not_implemented";
+
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when an `Exclusion`
+/// envelope's `scope` names a repository. The finding filter never
+/// reads the scope, so the waiver clears its CVE for every repository
+/// the parent policy governs — the ADR 0015 block in the form where
+/// the operator's edit looks like a narrowing and acts like a
+/// widening. One increment per offending `Exclusion`. Retired together
+/// with the rule — see
+/// [`hort_config::desired::validate_exclusion_scope_not_implemented`].
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_EXCLUSION_SCOPE_NOT_IMPLEMENTED: &str = "exclusion_scope_not_implemented";
+
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `virtualMembers`
+/// entry's format differs from its virtual repository's. Nothing
+/// compares the two — not apply, not serve-time member resolution — so
+/// the member is resolved for the virtual's format anyway and owns the
+/// names it holds there (ADR 0031 name-level pinning). The same
+/// ADR 0015 block on the virtual-aggregation axis. One increment per
+/// offending (virtual, member) pair. Retired together with the rule —
+/// see
+/// [`hort_config::desired::validate_virtual_member_formats_not_enforced`].
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_VIRTUAL_MEMBER_FORMAT_NOT_ENFORCED: &str =
+    "virtual_member_format_not_enforced";
+
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `ScanPolicy`
+/// envelope declares a `maxArtifactAge`. The cap is parsed, projected,
+/// event-sourced and persisted, and the age evaluator that would act on
+/// it has no caller on any scan, release or retention path — so no
+/// artifact is ever flagged for age. The same accepted-but-inert
+/// anti-pattern [`RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED`] closes
+/// for `maxAgeDays`, on the staleness axis one policy kind over
+/// (ADR 0015). One increment per offending `ScanPolicy`. Retired
+/// together with the rule — see
+/// [`hort_config::desired::validate_scan_policy_max_artifact_age_not_implemented`]
+/// for the exact retirement trigger.
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED: &str =
+    "scan_policy_max_artifact_age_not_implemented";
+
 /// The snapshot-free apply-config lint rules.
 ///
 /// The discriminant is carried on every [`LintFinding`] so the apply
@@ -190,6 +254,24 @@ pub enum LinterRule {
     /// only placement that cannot change which message an already-failing
     /// config rejects with.
     RetentionUnusedForNotImplemented,
+    /// Row 10 — a `ScanPolicy.licensePolicy` declaring licence rules the
+    /// scan path evaluates against an empty licence list. Reject +
+    /// metric. Appended after row 9 for row 9's own reason: a row
+    /// inserted anywhere earlier changes which message an
+    /// already-failing config rejects with.
+    ScanPolicyLicensePolicyNotImplemented,
+    /// Row 11 — an `Exclusion.scope` naming a repository while the
+    /// finding filter never reads the scope. Reject + metric. Appended
+    /// after row 10, same reason.
+    ExclusionScopeNotImplemented,
+    /// Row 12 — a `virtualMembers` entry whose format differs from its
+    /// virtual repository's, with no format-compatibility check
+    /// anywhere. Reject + metric. Appended after row 11, same reason.
+    VirtualMemberFormatNotEnforced,
+    /// Row 13 — a `ScanPolicy.maxArtifactAge` declaring a staleness cap
+    /// the age evaluator never applies (it has no production caller).
+    /// Reject + metric. Appended after row 12, same reason.
+    ScanPolicyMaxArtifactAgeNotImplemented,
 }
 
 impl LinterRule {
@@ -219,12 +301,24 @@ impl LinterRule {
             Self::RetentionUnusedForNotImplemented => {
                 Some(RULE_RETENTION_UNUSED_FOR_NOT_IMPLEMENTED)
             }
+            Self::ScanPolicyLicensePolicyNotImplemented => {
+                Some(RULE_SCAN_POLICY_LICENSE_POLICY_NOT_IMPLEMENTED)
+            }
+            Self::ExclusionScopeNotImplemented => Some(RULE_EXCLUSION_SCOPE_NOT_IMPLEMENTED),
+            Self::VirtualMemberFormatNotEnforced => {
+                Some(RULE_VIRTUAL_MEMBER_FORMAT_NOT_ENFORCED)
+            }
+            Self::ScanPolicyMaxArtifactAgeNotImplemented => {
+                Some(RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED)
+            }
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
             | Self::ProvenanceConfig
             | Self::RepoStorageBackendMismatch
-            // Row 8 — the offline grant linter emits no validator metric
-            // (apply keeps its :2772 emission; the CLI is metric-free).
+            // Row 8 — the grant linter emits no metric from the validator.
+            // `apply_permission_grants` keeps its own emission over the
+            // port-built desired set, and the offline `validate-config`
+            // path must invent no series at all.
             | Self::PermissionGrant => None,
         }
     }
@@ -337,16 +431,22 @@ pub struct StaticConfigValidator {
     /// did not opt in); the CLI always supplies `Some`.
     effective_storage_backend: Option<EffectiveStorageBackend>,
     /// Row 8 — opt-in permission-grant linter. `None`
-    /// (the [`Self::new`] default) ⇒ row 8 is **skipped**, so the apply
-    /// path's `validate()` call never runs it (apply keeps its own
-    /// load-bearing grant-lint gate + metric on the real port-built
-    /// desired set). `Some(base)` ⇒ row 8 runs offline (the CLI path,
-    /// via [`Self::with_grant_lint_base`]), with `base` the
+    /// (the [`Self::new`] default) ⇒ row 8 is **skipped**. `Some(base)` ⇒
+    /// row 8 runs (via [`Self::with_grant_lint_base`]), with `base` the
     /// composition-root `LintConfig` (the secure default unless the root
     /// opted out) that the desired state's `PermissionGrantLintConfig`
     /// resolves on top of — identical to apply's resolution. The grant
     /// linter emits **no** metric from here (a [`metrics::NoopRecorder`]
     /// swallows them — validator purity; the CLI is metric-free).
+    ///
+    /// **Both** production callers opt in: the offline `validate-config`
+    /// CLI, and the apply pre-write pass. The latter is what makes the
+    /// grant lint's rejection reachable before the apply's first write —
+    /// its own grant stage runs after the repository, policy and mapping
+    /// writes, so a rejection that only happened there left a refused
+    /// tightening beside a committed loosening. The stage keeps its gate
+    /// (over the port-built set) and keeps the metric; this row carries
+    /// the rejection, and carries no metric.
     grant_lint_base: Option<LintConfig>,
 }
 
@@ -356,11 +456,11 @@ impl StaticConfigValidator {
     /// the apply path does when the builder was never called.
     ///
     /// Row 8 (the permission-grant linter) is **off** by default
-    /// (`grant_lint_base = None`) — the apply path constructs through
-    /// this `new` and so its `validate()` does **not** run row 8 (apply
-    /// owns its own grant-lint gate + metric on the real port-built
-    /// desired set; running it twice would double-lint). The offline CLI
-    /// opts in via [`Self::with_grant_lint_base`].
+    /// (`grant_lint_base = None`), so a composition that has no
+    /// `LintConfig` to resolve against — a test harness, say — gets a
+    /// validator that cannot answer the row rather than one that answers
+    /// it from an invented default. Both production callers opt in via
+    /// [`Self::with_grant_lint_base`]; see that field's doc.
     pub fn new(
         provenance_capable_formats: Arc<HashSet<String>>,
         version_discovery_capable_formats: Arc<HashSet<String>>,
@@ -374,16 +474,21 @@ impl StaticConfigValidator {
         }
     }
 
-    /// Enable row 8 (the offline permission-grant linter)
-    /// with `base` as the composition-root `LintConfig` (the
-    /// secure [`LintConfig::default`] unless the root opted out via
-    /// `with_lint_config`). The offline CLI calls this so
-    /// [`Self::validate`] reproduces apply's row-8 verdict without a DB;
-    /// the apply path never calls it (its own gate stays the authority).
+    /// Enable row 8 (the permission-grant linter) with `base` as the
+    /// composition-root `LintConfig` (the secure [`LintConfig::default`]
+    /// unless the root opted out via `with_lint_config`).
     ///
-    /// Builder, not a `new` argument, so the apply call site
-    /// (`StaticConfigValidator::new(..)`) is unchanged and keeps row 8
-    /// disabled by construction.
+    /// Both production callers call this, for the same reason and with the
+    /// same `base`: [`Self::validate`] reproduces the grant verdict without
+    /// a DB, so the offline `validate-config` CLI can report it and the
+    /// apply pre-write pass can *reject* on it before entering a stage that
+    /// writes. What licenses the offline reproduction is that the grant
+    /// rules read only the subject shape, the permission and whether the
+    /// grant is repo-scoped — never a resolved id value (see
+    /// [`Self::collect_permission_grants`]).
+    ///
+    /// Builder, not a `new` argument, so a caller with no `LintConfig` in
+    /// hand gets row 8 disabled by construction rather than defaulted.
     pub fn with_grant_lint_base(mut self, base: LintConfig) -> Self {
         self.grant_lint_base = Some(base);
         self
@@ -470,9 +575,10 @@ impl StaticConfigValidator {
             ));
         }
 
-        // Row 8 — the offline permission-grant linter.
-        // Skipped entirely on the apply path (`grant_lint_base = None`);
-        // run only when the CLI opted in via `with_grant_lint_base`.
+        // Row 8 — the permission-grant linter. Runs for both callers that
+        // opted in via `with_grant_lint_base` (the offline CLI, and the
+        // apply pre-write pass — which rejects on it before any stage
+        // writes); skipped when no `LintConfig` was supplied.
         if let Some(base) = self.grant_lint_base.as_ref() {
             self.collect_permission_grants(base, desired, &mut report);
         }
@@ -485,6 +591,51 @@ impl StaticConfigValidator {
         for err in hort_config::desired::validate_retention_unused_for_not_implemented(desired) {
             report.errors.push(LintFinding::error(
                 LinterRule::RetentionUnusedForNotImplemented,
+                err.to_string(),
+            ));
+        }
+
+        // Rows 10, 11 and 12 — the three further accepted-but-inert
+        // operator surfaces (ADR 0015): a `licensePolicy` the scan path
+        // evaluates against no licences, an `Exclusion.scope` the
+        // finding filter never reads, and a `virtualMembers` entry whose
+        // format nothing compares against the virtual's. Appended after
+        // row 9, in that order, for row 9's own reason — apply aborts on
+        // the first row with error findings, so appending is the only
+        // placement that leaves every existing config's reject message
+        // exactly as it was.
+        for err in
+            hort_config::desired::validate_scan_policy_license_policy_not_implemented(desired)
+        {
+            report.errors.push(LintFinding::error(
+                LinterRule::ScanPolicyLicensePolicyNotImplemented,
+                err.to_string(),
+            ));
+        }
+        for err in hort_config::desired::validate_exclusion_scope_not_implemented(desired) {
+            report.errors.push(LintFinding::error(
+                LinterRule::ExclusionScopeNotImplemented,
+                err.to_string(),
+            ));
+        }
+        for err in hort_config::desired::validate_virtual_member_formats_not_enforced(desired) {
+            report.errors.push(LintFinding::error(
+                LinterRule::VirtualMemberFormatNotEnforced,
+                err.to_string(),
+            ));
+        }
+
+        // Row 13 — a `ScanPolicy.maxArtifactAge` declaring a staleness
+        // cap the age evaluator never applies (ADR 0015). Appended after
+        // row 12 for row 9's own reason — apply aborts on the first row
+        // with error findings, so appending is the only placement that
+        // leaves every existing config's reject message exactly as it
+        // was.
+        for err in
+            hort_config::desired::validate_scan_policy_max_artifact_age_not_implemented(desired)
+        {
+            report.errors.push(LintFinding::error(
+                LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
                 err.to_string(),
             ));
         }
@@ -620,7 +771,8 @@ impl StaticConfigValidator {
         //    (b) leak this row's synthetic placeholder `repository_id` —
         //    meaningless to an operator. The CLI surfaces every finding via
         //    the returned `outcome`, so suppressing the linter's own logging
-        //    loses nothing. (Apply's own :2772 gate keeps both — untouched.)
+        //    loses nothing. (`apply_permission_grants`' own gate keeps both
+        //    — untouched.)
         let outcome =
             tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
                 metrics::with_local_recorder(&metrics::NoopRecorder, || {
@@ -649,9 +801,12 @@ impl StaticConfigValidator {
                     RuleAction::Pass => "passed",
                 }
             );
-            // Row-8 grant-lint findings carry no structured warn fields (the
-            // CLI prints `message`; apply never surfaces them — its own :2772
-            // gate is the authority), so `warn_context` is `None`.
+            // Row-8 grant-lint findings carry no structured warn fields: the
+            // CLI prints `message`, and the apply pre-write pass renders the
+            // error findings into its abort message. The *warn* findings are
+            // not surfaced on the apply path at all —
+            // `apply_permission_grants`' own gate logs those. So
+            // `warn_context` is `None`.
             match violation.action {
                 RuleAction::Reject => report
                     .errors
@@ -1289,8 +1444,12 @@ mod tests {
                     .map(str::to_string)
                     .collect(),
                 provenance_identities,
-                max_artifact_age: Some("90d".into()),
-                license_policy: serde_json::json!({"allowed": ["MIT"]}),
+                // Absent, like `license_policy`'s `Null`: both are
+                // apply-time rejections when declared, so a fixture that
+                // is expected to lint cleanly on the dimension under
+                // test must leave them inert.
+                max_artifact_age: None,
+                license_policy: serde_json::Value::Null,
                 scan_backends: scan_backends.into_iter().map(str::to_string).collect(),
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
@@ -1714,8 +1873,8 @@ mod tests {
                     provenance_mode: "required".into(),
                     provenance_backends: vec!["cosign".into()],
                     provenance_identities: vec![sample_identity_spec()],
-                    max_artifact_age: Some("90d".into()),
-                    license_policy: serde_json::json!({"allowed": ["MIT"]}),
+                    max_artifact_age: None,
+                    license_policy: serde_json::Value::Null,
                     scan_backends: vec!["trivy".into()],
                     rescan_interval_hours: 24,
                     negligible_action: "ignore".into(),
@@ -2512,9 +2671,10 @@ mod tests {
         );
     }
 
-    /// With `grant_lint_base = None` (the apply / `new` default), row 8
-    /// produces NO findings even for a grant set that WOULD reject — proving
-    /// the apply path's `validate()` never double-lints grants.
+    /// With `grant_lint_base = None` (the `new` default), row 8 produces NO
+    /// findings even for a grant set that WOULD reject — the row is opt-in
+    /// by construction, so a composition with no `LintConfig` in hand gets
+    /// silence rather than a verdict derived from an invented default.
     #[test]
     fn row8_disabled_by_default_produces_no_findings() {
         let desired = DesiredState {

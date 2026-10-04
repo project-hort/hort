@@ -69,11 +69,18 @@ hort-server admin bootstrap-session --ttl 1h
 ```
 
 It mints a **short-lived (≤1 h)**, **full-cap** admin PAT for the reserved
-non-service-account user `bootstrap-admin`, revoking any prior bootstrap token
-first (single active token). Paste it into the CLI
+non-service-account user `bootstrap-admin`, revoking **every** live token that
+principal owns first (single active credential). Paste it into the CLI
 (`hort-cli auth login --paste`) and use it only to apply the IdP +
 `ClaimMapping` gitops config, then switch to Recipe A. Do not treat it as a
 standing admin credential.
+
+> You could not turn it into one even deliberately: no request-path route issues
+> a token owned by `bootstrap-admin`. `POST /api/v1/users/me/tokens` answers
+> `403 bootstrap_admin_mint_forbidden` for that principal even with
+> `HORT_TOKEN_ALLOW_ADMIN=true` on the server, so the ≤1 h credential cannot
+> self-mint the 1–30 day admin PAT that flag otherwise permits
+> (ADR 0038; `docs/auth-catalog.md` Entry 2).
 
 > The full cap is mandatory: the ADR 0036 B1 backstop denies an admin-claim PAT
 > that carries no cap, so a cap-less bootstrap token would fail closed.

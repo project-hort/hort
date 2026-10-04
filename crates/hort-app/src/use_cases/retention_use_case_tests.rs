@@ -379,7 +379,7 @@ async fn dry_run_and_execute_select_identical_candidates_but_only_execute_append
 //
 // The expiry append is the one artifact-stream writer that appends at
 // `ExpectedVersion::Any`, so the adapter performs no version check on it
-// and it inherits none of the bound `read_expected_version` gives every
+// and it inherits none of the bound `read_unpaired_append_version` gives every
 // `Exact` writer. It therefore carries the refusal itself; without it the
 // daily sweep is the only writer able to push an artifact stream past
 // `STREAM_EVENT_CAP`, and past the cap every capped reader of that stream

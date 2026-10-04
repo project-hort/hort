@@ -490,6 +490,17 @@ pub struct ScanPolicyProjection {
     /// warn (tampering-only detection) — both surfaced via
     /// [`ScanPolicyProjection::validate_provenance_config`].
     pub provenance_identities: Vec<SignerIdentityPattern>,
+    /// Staleness cap in seconds, or `None` for "no cap".
+    ///
+    /// **Persisted and read by nothing that decides.**
+    /// [`evaluate_age_gates`](crate::policy::evaluate_age_gates) would
+    /// turn an exceeded cap into a `Medium` violation but has no caller
+    /// on any scan, release or retention path, so a `Some` here does
+    /// not gate anything. Which is why gitops apply refuses to accept a
+    /// new one (the `scan_policy_max_artifact_age_not_implemented`
+    /// linter row, ADR 0015); a row written before that rejection
+    /// shipped keeps its value and keeps deciding nothing. Wiring a
+    /// consumer is what retires the row.
     pub max_artifact_age_secs: Option<i64>,
     pub license_policy: serde_json::Value,
     pub archived: bool,
