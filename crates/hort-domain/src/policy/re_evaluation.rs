@@ -155,7 +155,7 @@ pub fn decide_rejected_transition(
     // hydrated the findings_blob from CAS. Falls back to the
     // aggregate-summary path when `last_findings` is `None` (clean
     // scan, missing CAS object, or deserialise failure — the helper
-    // `read_last_findings` already logged a warn for the corruption
+    // `scan_history::last_findings` already logged a warn for the corruption
     // cases).
     let post_exclusion_summary = match last_findings {
         Some(findings) => {

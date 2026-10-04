@@ -330,16 +330,23 @@ into a released one. Three event-sourced or CRUD kinds compose into
 that gate:
 
 - **`ScanPolicy`** defines the gate itself. Per policy: severity
-  threshold, license policy (allow/deny lists), quarantine duration,
-  signature requirement, approval requirement, and max-artifact-age.
-  Scoped globally or per-repository.
+  threshold, quarantine duration, provenance mode, and approval
+  requirement. Scoped globally or per-repository. (Neither
+  `licensePolicy` nor `maxArtifactAge` is part of the gate: no port
+  surfaces an artifact's licences, and the age evaluator has no caller
+  on any scan, release or retention path, so declaring either is an
+  apply-time rejection rather than a control — see
+  [the linter-row matrix](../reference/apply-time-linter-rows.md).)
 - **`Exclusion`** is an auditable override on a `ScanPolicy`. A
   whitelisted CVE for a specific package pattern, recorded with a
   free-text `reason` and an optional `expires_at`. Each exclusion is
   identified by `(policy_name, cve_id, package_pattern_or_null)`;
-  changing an exclusion's scope or expiry is modelled as
+  changing an exclusion's reason or expiry is modelled as
   `ExclusionRemoved` + `ExclusionAdded` so the lifecycle is fully
-  recoverable from the event log.
+  recoverable from the event log. Its reach is the **parent policy's**
+  scope: an exclusion's own `scope` must be `global`, because the
+  finding filter never reads it — a repository-scoped one would clear
+  its CVE everywhere the policy governs, so every writer refuses it.
 - **`CurationRule`** is a per-package allow/deny/warn ruling that
   runs alongside scan-result evaluation — for example, a blanket
   block on a known-malicious package family irrespective of any CVE

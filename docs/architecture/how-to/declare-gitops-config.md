@@ -168,6 +168,17 @@ members is rejected — keep the gitops surface self-contained, or keep the
 virtual itself `Local`. A member that is itself `type: virtual` is rejected
 (no nested virtuals in v1).
 
+**Every member must declare the virtual's own `format`.** A member on
+another format is an apply-time rejection
+(`virtual_member_format_not_enforced`): there is no
+format-compatibility model — neither apply nor serve-time member
+resolution compared the two — so such a member is resolved for the
+virtual's format regardless, and a non-proxy one additionally **owns**
+the names it holds there (the pinning rule below), suppressing the
+virtual's other members for every one of them while serving nothing the
+client can install. A cross-format aggregate is one virtual per format,
+not one virtual over several.
+
 > **⚠️ Member order is load-bearing — and repo type is the ownership
 > signal.** `virtualMembers` is an **ordered priority list** (index 0 =
 > highest priority). Two security-critical rules follow, both designed to
@@ -579,11 +590,19 @@ spec:
   provenanceMode: verify_if_present   # optional; off | verify_if_present | required
   negligibleAction: ignore      # optional; ignore | warn | block — informational (unmaintained/unsound) advisory handling; default ignore
   enforcement: reject           # optional; reject | record — what a blocking verdict DOES; default reject
-  maxArtifactAge: 90d           # optional humantime
-  licensePolicy:                # optional JSON; defaults to no license policy when omitted
-    allowed: [Apache-2.0, MIT]
-    denied: [GPL-3.0]
+  # maxArtifactAge: omit it — declaring any cap is an apply-time rejection (not evaluated)
+  licensePolicy: {}             # optional; `{}` or omitted are the only accepted values
 ```
+
+**`scope: { repository: … }` names a repository; it never carries an id.**
+The name is an `ArtifactRepository.metadata.name`, resolved to a UUID by
+the apply pipeline through the same map the `RetentionPolicy` scope
+resolves through — so the same two consequences hold: the repository must
+be declared in the same `$HORT_CONFIG_DIR` (one declared in the *same*
+apply is fine, resolution happens after the repository rows are written),
+and a name that resolves to nothing is a pre-write rejection naming the
+offending value, not a half-applied bundle. A repository UUID is read as
+a name, matches nothing and is rejected.
 
 **What apply emits:**
 - First apply: one `PolicyCreated` event; one row inserted into
@@ -603,6 +622,71 @@ spec:
 
 **Idempotency:** reapply with no YAML change emits zero events and
 no projection writes. The `unchanged` counter ticks instead.
+
+#### `licensePolicy` — apply rejects any declared licence rule
+
+**Licence enforcement is not implemented, and declaring it is now an
+apply-time rejection** (`scan_policy_license_policy_not_implemented`).
+No port surfaces an artifact's licences, so the scan path evaluates the
+policy against an **empty** licence list: a well-formed
+`{denied_licenses: [GPL-3.0], action: Block}` compares its denied set
+against zero licences, produces zero violations, and leaves the scan
+clean whatever the artifact is licensed under. The only thing such a
+value can still produce is a non-blocking `license-policy-shape`
+advisory against a malformed one.
+
+The two accepted values are `{}` and omitting the field — both are the
+evaluator's own "no policy declared" short-circuit, so a tree that never
+claimed licence enforcement applies exactly as before. A different
+*value* does not help; the rejection is about the missing control, not
+the shape:
+
+```text
+ScanPolicy `block-gpl` is invalid: `licensePolicy` enforcement is not implemented
+(the scan path evaluates the policy against an empty licence list, so every rule
+in it matches nothing and the scan stays clean whatever the artifact is licensed
+under). Remove the field — or write `licensePolicy: {}` — to apply; a different
+value does not change this. (scan policy: `block-gpl`)
+```
+
+A projection stored before this rule shipped keeps its value — nothing
+rewrites those rows — and keeps deciding nothing. `hort-server
+validate-config` catches the declaration offline.
+
+#### `maxArtifactAge` — apply rejects any declared staleness cap
+
+**Age enforcement is not implemented, and declaring a cap is an
+apply-time rejection** (`scan_policy_max_artifact_age_not_implemented`).
+The duration is parsed, converted to `max_artifact_age_secs`, diffed
+field-by-field, event-sourced onto the policy stream, persisted and
+written into the config snapshot — and read by nothing that decides. The
+evaluator exists (`hort_domain::policy::evaluate_age_gates`, which would
+raise a `Medium` `max-artifact-age` violation) and has **no production
+caller**: no scan-result evaluation, no release decision and no retention
+pass ever asks the question, so no artifact is ever flagged for age.
+
+Unlike `licensePolicy` there is no accepted *value*: the field is an
+optional duration whose absence the evaluator reads as "no cap", so
+omitting it is the only inert state, and `0s` is refused exactly like
+`90d` — the rejection is about the missing consumer, not the number:
+
+```text
+ScanPolicy `stale-cap` is invalid: `maxArtifactAge` enforcement is not implemented:
+the cap is stored on the policy and never evaluated (the age evaluator has no
+caller on any scan, release or retention path), so no artifact is ever flagged for
+age however old it is. Remove the field to apply; a different duration does not
+change this. (scan policy: `stale-cap`, declared cap: `90d`)
+```
+
+The humantime format check stays beside the row, so a malformed duration
+is still a row-0 error naming the parse failure. There is no equivalent
+control to reach for instead — the nearest *enforced* age mechanism is a
+`RetentionPolicy` with an `AgeExceeds` predicate, which **deletes** the
+artifact rather than raising a policy violation against it, so it is a
+different decision and not a substitute. A projection stored before this
+rule shipped keeps its `max_artifact_age_secs` and keeps deciding
+nothing. `hort-server validate-config` catches the declaration
+offline.
 
 #### `scanBackends` — apply rejects a backend that cannot analyse the format
 
@@ -652,9 +736,10 @@ validate-config` catches both shapes offline.
 
 #### `enforcement: reject | record` — what a blocking verdict *does*
 
-`severityThreshold`, `licensePolicy` and `negligibleAction` decide
-**which** findings are enforcement-worthy. `enforcement` decides what
-the resulting verdict is allowed to **do**:
+`severityThreshold` and `negligibleAction` decide **which** findings are
+enforcement-worthy. (`licensePolicy` does not: it decides nothing, which
+is why declaring it is an apply-time rejection — see above.)
+`enforcement` decides what the resulting verdict is allowed to **do**:
 
 | Value | The scan | The findings | The verdict | The artifact |
 |---|---|---|---|---|
@@ -762,14 +847,48 @@ spec:
   expiresAt: "2026-12-31T23:59:59Z"   # optional RFC3339
 ```
 
+**`scope: global` is the only accepted value.** A
+`scope: { repository: <name> }` is an apply-time rejection
+(`exclusion_scope_not_implemented`), and so is the same shape issued
+through `POST /api/v1/admin/policies/:id/exclusions`. The reason is not
+the reference but the field: the finding filter never reads an
+exclusion's scope — the artifact coordinates it matches against carry no
+repository identity — so an exclusion narrowed to one repository
+suppresses its CVE for **every** repository the parent policy governs.
+The operator's edit looks like a narrowing and acts like a widening,
+which is why it fails closed rather than warning:
+
+```text
+Exclusion `cve-on-one-repo` is invalid: `spec.scope` names repository `npm-internal`,
+but a repository-scoped exclusion is not enforced: … Write `scope: global` if clearing
+this CVE everywhere the policy governs is what was meant, or drop the exclusion until
+per-repository scoping is implemented.
+```
+
+To waive a CVE for one repository only, scope the **parent
+`ScanPolicy`** to that repository and hang the exclusion off it — the
+policy scope *is* enforced.
+
+A row stored before this rule shipped keeps its scope; nothing rewrites
+it, and it keeps acting globally. Removing it is not refused anywhere —
+only writing one is. Drop its envelope from the tree and the apply
+removes it as usual; so does
+`DELETE /api/v1/admin/policies/:id/exclusions/:cve`. The removal is the
+direction that *withdraws* an assurance nothing honoured, so there is
+nothing to fail closed about. What it does do is re-reject findings in
+every repository the parent policy governs rather than only the one the
+scope named, and the server logs exactly that — the policy id, the CVE,
+the stored repository id and the rationale — as it removes the row.
+
 **What apply emits:**
 - First apply: one `ExclusionAdded` event on the parent policy's
   stream; one row inserted into `exclusion_projections`. Counters:
   `hort_gitops_events_emitted_total{kind=exclusion,event_type=ExclusionAdded}`.
-- Field edit (scope, reason, expiry): one `ExclusionRemoved` +
+- Field edit (reason, expiry): one `ExclusionRemoved` +
   one `ExclusionAdded` on the same stream — the events crate has
   no `ExclusionUpdated`, and remove-and-add is the canonical update
-  form.
+  form. (The scope is not among the editable fields: only `global` is
+  accepted, so there is nothing to change it to.)
 - YAML removed: one `ExclusionRemoved` event with
   `reason = "removed by gitops apply"`; the projection row is
   deleted.

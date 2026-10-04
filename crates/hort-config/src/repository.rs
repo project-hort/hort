@@ -67,7 +67,17 @@ pub struct RepositorySpec {
     pub proxy: Option<ProxySpec>,
     /// Required iff `type == virtual`; forbidden otherwise. Each entry
     /// is the `metadata.name` of another `ArtifactRepository`. The
-    /// The cross-spec validator resolves these to UUIDs.
+    /// cross-spec validator resolves these to UUIDs.
+    ///
+    /// Every entry must declare the **virtual's own `format`**. Nothing
+    /// in apply or in serve-time member resolution compared the two, so
+    /// a member on another format would be resolved for the virtual's
+    /// format anyway and — as a non-proxy name owner (ADR 0031's
+    /// name-level pinning) — would suppress the virtual's other members
+    /// for every name it holds while serving nothing the client can
+    /// install.
+    /// [`validate_virtual_member_formats_not_enforced`](crate::desired::validate_virtual_member_formats_not_enforced)
+    /// rejects such a member at apply (ADR 0015).
     pub virtual_members: Option<Vec<String>>,
     pub is_public: bool,
     /// Opt-in per-repository download auditing (`downloadAuditEnabled`

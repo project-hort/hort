@@ -4762,7 +4762,7 @@ mod tests {
 
     /// Seed a single `ProvenanceVerified` event on `artifact_id`'s stream
     /// — the shape [`QuarantineUseCase::release_blocked_on_provenance`]'s
-    /// underlying resolution (`resolve_provenance_clearance`) reads to
+    /// underlying resolution (`read_path_provenance_clearance`) reads to
     /// compute `Cleared` under `Required` mode. Mirrors the `hort-app`
     /// suite's `seed_stream_scanned_and_provenance_verified` fixture; only
     /// the provenance leg matters to the guard, so no `ScanCompleted` is
@@ -4828,7 +4828,7 @@ mod tests {
                 .policy_projections
                 .insert(required_provenance_policy(repo_id));
             // No `ProvenanceVerified` event seeded — the artifact stream
-            // reads empty, so `resolve_provenance_clearance` computes
+            // reads empty, so `read_path_provenance_clearance` computes
             // `Pending` under `Required` mode.
             seed_blob_with_deadline(
                 &mocks.artifacts,

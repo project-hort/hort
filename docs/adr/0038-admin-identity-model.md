@@ -97,9 +97,22 @@ path:
   `HORT_TOKEN_ALLOW_ADMIN=true` (refuses otherwise).
 - Mints a **short-lived (≤1 h)**, **full-cap** admin `Pat` for the reserved
   **non-service-account** user `bootstrap-admin` (`is_admin=true`,
-  `is_service_account=false`), revoking any prior bootstrap token first (single
-  active token). The explicit full cap is required because the ADR 0036 B1
-  backstop denies an admin-claim `Pat` carrying a `None`/admin-less cap.
+  `is_service_account=false`), revoking **every** live token that principal owns
+  first (single active credential — by principal, not by token name, and across
+  every page of its tokens). The explicit full cap is required because the
+  ADR 0036 B1 backstop denies an admin-claim `Pat` carrying a `None`/admin-less
+  cap.
+- **No standing credential derives from it** (2026-10-03): this decision governs a
+  bootstrap-*derived* PAT too, so no request-path route issues a token owned by
+  `bootstrap-admin`. The shared issuance gates refuse it
+  (`ApiTokenUseCase::run_issuance_gates` →
+  `ApiTokenError::BootstrapAdminMintForbidden`, `403`). Without that, the
+  `HORT_TOKEN_ALLOW_ADMIN` opt-in on this CLI and the same variable on the server
+  process composed: the ≤1 h credential self-minted a 1–30 day standing
+  full-admin PAT (Entry 2) under a name the rotation above never matched. Recorded
+  on the credential-authority axis of ADR 0016's cross-opt-in matrix. The ≤1 h
+  clamp bounds the blast radius only if it bounds what the credential can
+  *reach*, so the two halves are inseparable.
 - **Bootstrap / break-glass only** — used once to wire the IdP (Dex / SSO) + the
   group → `admin` `ClaimMapping`, or when the IdP is down. Steady-state admin is
   IdP-backed.

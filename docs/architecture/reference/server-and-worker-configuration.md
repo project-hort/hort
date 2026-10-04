@@ -129,7 +129,9 @@ linter rows via the same `StaticConfigValidator`
 to. Row 0 is literally the apply path's own function — `validate_against`
 delegates to it before adding its snapshot/env rules — so the offline
 verdict on those rules cannot drift from apply's. Implementation:
-`crates/hort-server/src/cli/validate_config.rs`. The CI-recipe
+`crates/hort-server/src/cli/validate_config.rs`. Every named lint row
+and what it rejects:
+[apply-time-linter-rows.md](apply-time-linter-rows.md). The CI-recipe
 walkthrough (deriving the env from Helm values) is in
 [declare-gitops-config.md §5a](../how-to/declare-gitops-config.md#5a-validate-your-config-before-applying-hort-server-validate-config).
 

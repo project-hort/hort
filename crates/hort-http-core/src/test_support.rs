@@ -2144,6 +2144,51 @@ pub fn with_storage(
     })
 }
 
+/// Swap the wired [`ArtifactRepository`] on a mock context AND rebuild
+/// [`ArtifactUseCase`] over it, so the **read** paths — download, the
+/// hosted index sources, the per-version status hydration — go through
+/// the supplied repository.
+///
+/// The counterpart to [`with_storage`], and used the same way: to drive
+/// a *real* adapter through the production handler stack. Its reason to
+/// exist is the one thing a mock artifact repository structurally cannot
+/// model — the column the real adapter decodes. `MockArtifactRepository`
+/// stores a typed [`hort_domain::entities::artifact::QuarantineStatus`],
+/// so a test built on it can only ever assert what the system does with
+/// a status that already parsed. A row whose stored
+/// `quarantine_status` the domain *cannot* classify is reachable only
+/// with `hort_adapters_postgres::artifact_repo::PgArtifactRepository`
+/// over a real database.
+///
+/// **Read-path only, deliberately.** `IngestUseCase` keeps the mock
+/// artifact repository (and `ctx.artifacts` is swapped, so the two
+/// disagree). Rebuilding ingest would need the lifecycle port, whose
+/// Postgres implementation wants its own event store and unit of work —
+/// a composition root, not a handler fixture. A test that needs to
+/// *publish* through a real adapter should drive the real composition
+/// root instead of reaching for this helper.
+pub fn with_artifacts(
+    base: &Arc<AppContext>,
+    artifacts: Arc<dyn hort_domain::ports::artifact_repository::ArtifactRepository>,
+) -> Arc<AppContext> {
+    rebuild(base, |ctx| {
+        ctx.artifacts = artifacts.clone();
+        // Mirror the composition shape `build_mock_ctx_with_label_flag`
+        // uses, so the rebuilt use case differs from the default in
+        // exactly one port.
+        ctx.artifact_use_case = Arc::new(
+            ArtifactUseCase::new(
+                artifacts,
+                ctx.storage.clone(),
+                ctx.repositories.clone(),
+                ctx.include_repository_label,
+            )
+            .with_repository_access(ctx.repository_access_use_case.clone())
+            .with_artifact_metadata(ctx.artifact_metadata.clone()),
+        );
+    })
+}
+
 #[cfg(test)]
 mod guard_tests {
     //! Regression guard.

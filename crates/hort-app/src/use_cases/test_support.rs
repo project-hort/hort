@@ -47,7 +47,7 @@ use hort_domain::ports::curation_queue_repository::{
 };
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{
-    AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
+    AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom, SubscribeFrom,
 };
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership, MetadataStrategy};
 use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims, OidcValidationError};
@@ -165,6 +165,14 @@ pub struct MockArtifactRepository {
     /// Mirrors [`Self::pypi_calls`] for
     /// [`find_oci_image_manifests_without_kind`](ArtifactRepository::find_oci_image_manifests_without_kind).
     oci_calls: Mutex<Vec<CandidacyCall>>,
+    /// FIFO of injected errors for
+    /// [`package_version_status`](ArtifactRepository::package_version_status).
+    /// Each call pops the front and returns it verbatim. Lets a test
+    /// drive the per-format index sources' behaviour when the hold-state
+    /// read fails: an empty status map is the claim "hort holds nothing
+    /// non-servable here", so a source that substituted one would
+    /// re-advertise every version hort is holding back.
+    package_version_status_errors: Mutex<std::collections::VecDeque<DomainError>>,
 }
 
 /// One recorded call to either backfill-candidacy query. See
@@ -191,6 +199,7 @@ impl MockArtifactRepository {
             delete_errors: Mutex::new(std::collections::VecDeque::new()),
             pypi_calls: Mutex::new(Vec::new()),
             oci_calls: Mutex::new(Vec::new()),
+            package_version_status_errors: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -220,6 +229,17 @@ impl MockArtifactRepository {
     /// failures.
     pub fn fail_next_find_by_repo_and_checksum(&self, err: DomainError) {
         self.find_by_repo_and_checksum_errors
+            .lock()
+            .unwrap()
+            .push_back(err);
+    }
+
+    /// Arm the next
+    /// [`package_version_status`](ArtifactRepository::package_version_status)
+    /// call to fail with `err`. Queued, so a test can arm several
+    /// consecutive failures.
+    pub fn fail_next_package_version_status(&self, err: DomainError) {
+        self.package_version_status_errors
             .lock()
             .unwrap()
             .push_back(err);
@@ -781,6 +801,14 @@ impl ArtifactRepository for MockArtifactRepository {
         // `artifact.quarantine_deadline`; the SQL adapter projects the
         // same column. Discovery uses it to discriminate `Quarantined`
         // from `QuarantinedAwaitingRelease`.
+        if let Some(err) = self
+            .package_version_status_errors
+            .lock()
+            .unwrap()
+            .pop_front()
+        {
+            return Box::pin(async move { Err(err) });
+        }
         let pkg = package.to_owned();
         let mut triples: Vec<(String, QuarantineStatus, Option<DateTime<Utc>>)> = self
             .artifacts
@@ -2377,6 +2405,41 @@ impl MockEventStore {
     }
 }
 
+/// An event-store mock that can report a stream's current tail without
+/// going through [`EventStore::read_stream`].
+///
+/// Exists so [`MockArtifactLifecycle::with_optimistic_concurrency`] can
+/// check an append's `ExpectedVersion` against whichever event-store mock
+/// a test is using — this crate has more than one, and the use cases whose
+/// interleaving behaviour needs pinning are reached through harnesses
+/// built on a file-local mock.
+///
+/// Answering off the seeded state rather than through `read_stream` is the
+/// point: the probe consumes no one-shot injection and does not move the
+/// read counter, so a test asserting "this path observed the stream
+/// exactly once" stays meaningful while the harness checks versions behind
+/// its back.
+pub trait StreamTail: Send + Sync {
+    /// The `ExpectedVersion` an append against `stream_id` must carry to
+    /// be ordered immediately after the stream's current content.
+    fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion;
+}
+
+impl StreamTail for MockEventStore {
+    fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion {
+        match self
+            .streams
+            .lock()
+            .unwrap()
+            .get(&stream_id.to_string())
+            .and_then(|events| events.last())
+        {
+            Some(last) => ExpectedVersion::Exact(last.stream_position),
+            None => ExpectedVersion::NoStream,
+        }
+    }
+}
+
 impl EventStore for MockEventStore {
     fn append(&self, batch: AppendEvents) -> BoxFut<'_, DomainResult<AppendResult>> {
         if let Some(err) = self.fail_all_appends.lock().unwrap().clone() {
@@ -2560,6 +2623,17 @@ pub struct MockArtifactLifecycle {
     /// use this snapshot — the enqueues no longer flow through the `jobs`
     /// mock, they ride the lifecycle call so they commit atomically.
     ingest_enqueues: Mutex<Vec<(Uuid, Vec<IngestEnqueue>)>>,
+    /// When `Some`, every commit method checks its `AppendEvents`'
+    /// `expected_version` against the paired event store's CURRENT stream
+    /// state and returns `DomainError::Conflict` on a mismatch — the
+    /// optimistic-concurrency check the Postgres adapter gets for free
+    /// from the event-store append inside its transaction.
+    ///
+    /// Opt-in via [`with_optimistic_concurrency`](Self::with_optimistic_concurrency):
+    /// the default mock accepts any version, which is what every test
+    /// that is not about interleaving wants (most seed a stream and
+    /// append with a version they never computed from it).
+    optimistic_concurrency: Mutex<Option<Arc<dyn StreamTail>>>,
     /// FIFO of injected errors: each `commit_transition` call pops the
     /// front and returns it verbatim without recording the transition.
     /// Used by tests exercising error-path metric emission (e.g.
@@ -2583,8 +2657,44 @@ impl MockArtifactLifecycle {
             score_deltas: Mutex::new(Vec::new()),
             sbom_replace_calls: Mutex::new(Vec::new()),
             ingest_enqueues: Mutex::new(Vec::new()),
+            optimistic_concurrency: Mutex::new(None),
             next_error: Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Make every commit method honour its batch's `ExpectedVersion`
+    /// against `events`' current stream state, returning
+    /// `DomainError::Conflict` on a mismatch.
+    ///
+    /// This is what lets a test construct the interleaving the
+    /// `ArtifactAtVersion` contract is about: pair a decision with a
+    /// version, let a concurrent verdict land on the stream (e.g. via
+    /// [`MockEventStore::set_stream_after_next_read`]), and watch the
+    /// stale decision's append lose. Without it the mock accepts any
+    /// version and every such test would pass vacuously.
+    pub fn with_optimistic_concurrency(self, events: Arc<dyn StreamTail>) -> Self {
+        *self.optimistic_concurrency.lock().unwrap() = Some(events);
+        self
+    }
+
+    /// `Err(Conflict)` when optimistic concurrency is armed and `batch`'s
+    /// `expected_version` does not match the paired store's current tail.
+    /// `ExpectedVersion::Any` is no check by definition and always passes.
+    fn check_expected_version(&self, batch: &AppendEvents) -> DomainResult<()> {
+        let Some(events) = self.optimistic_concurrency.lock().unwrap().clone() else {
+            return Ok(());
+        };
+        if batch.expected_version == ExpectedVersion::Any {
+            return Ok(());
+        }
+        let current = events.current_expected_version(&batch.stream_id);
+        if current == batch.expected_version {
+            return Ok(());
+        }
+        Err(DomainError::Conflict(format!(
+            "stream {} is at {:?}, append expected {:?}",
+            batch.stream_id, current, batch.expected_version
+        )))
     }
 
     /// Wire the mock lifecycle to a [`MockArtifactMetadataRepository`]
@@ -2772,6 +2882,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
+        if let Err(e) = self.check_expected_version(&events) {
+            return Box::pin(async move { Err(e) });
+        }
         let count = events.events.len() as u64;
         // Propagate the metadata into the paired metadata repo (when
         // wired). Done before recording the transition so the
@@ -2816,6 +2929,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
+        if let Err(e) = self.check_expected_version(&events) {
+            return Box::pin(async move { Err(e) });
+        }
         // The conditional status write is resolved BEFORE the transition
         // is recorded, so a `Conflict` leaves no stray entry behind —
         // same ordering as the failure-injection guard above, and same
@@ -2857,6 +2973,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }
+            self.check_expected_version(&events)?;
             self.ingest_enqueues
                 .lock()
                 .unwrap()
@@ -2899,6 +3016,7 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
             if let Some(err) = self.next_error.lock().unwrap().pop_front() {
                 return Err(err);
             }
+            self.check_expected_version(&events)?;
             if let Some((repo_id, delta)) = score_delta {
                 self.score_deltas.lock().unwrap().push((repo_id, delta));
             }
@@ -2947,6 +3065,9 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
         // forced error doesn't leave a stray entry in the snapshot.
         if let Some(err) = self.next_error.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
+        }
+        if let Err(e) = self.check_expected_version(&events_clone) {
+            return Box::pin(async move { Err(e) });
         }
 
         // Conditional status write resolved before ANY state is recorded
@@ -3729,7 +3850,7 @@ pub fn dummy_persisted_event(
 /// (placeholder) blob hash, a zero count gets `None`. Shared by every
 /// `Rejected`-artifact re-evaluation test — the policy-mutation pass and
 /// the curator-invoked `CurationUseCase::reevaluate` both read this
-/// event shape via `scan_history::read_last_scan_completed`.
+/// event shape via `scan_history::last_scan_completed`.
 pub fn persisted_scan_completed(
     artifact_id: Uuid,
     critical: u32,
@@ -3770,7 +3891,7 @@ pub fn persisted_scan_completed(
 /// Build an `ArtifactRejected` `PersistedEvent` carrying `rejected_by`.
 /// Every `Rejected`-artifact re-evaluation caller re-hydrates the
 /// rejection reason from this event shape (ADR 0041 invariant #6(a)) via
-/// `scan_history::read_last_rejection_reason`.
+/// `scan_history::last_rejection_reason`.
 pub fn persisted_artifact_rejected(
     artifact_id: Uuid,
     rejected_by: RejectionReason,
@@ -3789,6 +3910,37 @@ pub fn persisted_artifact_rejected(
         correlation_id: Uuid::new_v4(),
         causation_id: None,
         actor: Actor::Api(api_actor()),
+        event_version: 1,
+        stored_at: Utc::now(),
+    }
+}
+
+/// Build a `ProvenanceVerified` `PersistedEvent`. The provenance leg of
+/// the release gate (ADR 0027) is `Cleared` iff one of these is anywhere
+/// on the artifact's stream, so every test that needs the gate to clear
+/// seeds this shape.
+pub fn persisted_provenance_verified(artifact_id: Uuid, stream_position: u64) -> PersistedEvent {
+    use hort_domain::events::ProvenanceVerified;
+    use hort_domain::ports::provenance::SignerIdentity;
+    PersistedEvent {
+        event_id: Uuid::new_v4(),
+        stream_id: StreamId::artifact(artifact_id),
+        stream_position,
+        global_position: stream_position,
+        event: DomainEvent::ProvenanceVerified(ProvenanceVerified {
+            artifact_id,
+            content_hash: VALID_SHA256.parse().unwrap(),
+            backend: "cosign".into(),
+            signer: SignerIdentity {
+                issuer: "iss".into(),
+                san: "san".into(),
+            },
+            predicate_type: None,
+            cascaded_from: None,
+        }),
+        correlation_id: Uuid::new_v4(),
+        causation_id: None,
+        actor: hort_domain::events::system_actor(),
         event_version: 1,
         stored_at: Utc::now(),
     }

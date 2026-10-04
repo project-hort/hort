@@ -68,7 +68,7 @@
 //!    verified-then-corrupted artifacts through and hand corrupt bytes
 //!    back to the release sweep.
 //! 3. a `ProvenanceVerified` on the stream — resolved via
-//!    [`resolve_provenance_clearance`], the single-source release-gate
+//!    [`read_path_provenance_clearance`], the single-source release-gate
 //!    helper. Called with `ProvenanceMode::Required` **literally**, not
 //!    with the repository's currently-active mode: the question is "does
 //!    this artifact's stream contradict its rejection?", which is a fact
@@ -89,7 +89,7 @@
 //! `ArtifactQuarantined`, so the artifact lands back in front of the
 //! ordinary release sweep with an already-elapsed window, and the sweep
 //! applies the live scan / curation / provenance gates. For this
-//! population `resolve_provenance_clearance` already answers `Cleared`
+//! population `read_path_provenance_clearance` already answers `Cleared`
 //! (conjunct 3 is exactly its input), so the next sweep tick releases it.
 
 use std::sync::Arc;
@@ -102,7 +102,7 @@ use hort_domain::entities::artifact::{
 };
 use hort_domain::entities::scan_policy::ProvenanceMode;
 use hort_domain::events::{
-    Actor, ApiActor, ArtifactReEvaluated, DomainEvent, ReEvaluationTrigger, StreamId, NO_POLICY,
+    Actor, ApiActor, ArtifactReEvaluated, DomainEvent, ReEvaluationTrigger, NO_POLICY,
 };
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -112,8 +112,8 @@ use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend};
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
-use crate::use_cases::release_clearance::resolve_provenance_clearance;
-use crate::use_cases::{read_artifact_stream, read_expected_version};
+use crate::use_cases::release_clearance::provenance_clearance_from;
+use crate::use_cases::{ArtifactAtVersion, OverCapStream};
 
 /// Hard cap on how many `Rejected` rows one call examines. Mirrors the
 /// curation queue's own `MAX_QUEUE_LIMIT`, which is the listing this
@@ -283,11 +283,18 @@ impl ProvenanceMisrejectionRepairUseCase {
         dry_run: bool,
         actor: &ApiActor,
     ) -> AppResult<bool> {
-        let mut artifact = self
-            .artifacts
-            .find_by_id(artifact_id)
-            .await
-            .map_err(AppError::Domain)?;
+        // The artifact, its stream and the version the repair's append
+        // will carry — one observation. Both conjuncts below are decided
+        // from that stream; a version read after them would already
+        // contain whatever committed in between, so the repair would not
+        // conflict with it.
+        let mut paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Tolerate,
+        )
+        .await?;
 
         // Conjunct 1. Checked here, not left to the domain guard, so that
         // "this artifact is not in the illegal state" is one uniform
@@ -295,15 +302,14 @@ impl ProvenanceMisrejectionRepairUseCase {
         // of them and an error for the third. The domain's source-state
         // guard stays as defence-in-depth and, reached through this path,
         // can no longer fire.
-        if artifact.quarantine_status != QuarantineStatus::Rejected {
+        if paired.artifact().quarantine_status != QuarantineStatus::Rejected {
             return Ok(false);
         }
 
-        let stream_id = StreamId::artifact(artifact_id);
-        let persisted = read_artifact_stream(&*self.events, &stream_id).await?;
+        let persisted = paired.evidence()?;
 
         // Conjunct 2 — cheap and highly selective, so it runs first and
-        // short-circuits the clearance read for every genuine rejection.
+        // short-circuits the clearance check for every genuine rejection.
         // Only `Absent` continues: `Present` is a recorded verdict and
         // `CorruptionTombstone` is a CAS integrity failure recorded before
         // that axis wrote its companion — both genuine.
@@ -315,9 +321,7 @@ impl ProvenanceMisrejectionRepairUseCase {
 
         // Conjunct 3 — see the module docs on why `Required` is passed
         // literally rather than resolved from the repository's policy.
-        let provenance =
-            resolve_provenance_clearance(&*self.events, artifact_id, ProvenanceMode::Required)
-                .await?;
+        let provenance = provenance_clearance_from(persisted, ProvenanceMode::Required);
         if provenance != ProvenanceClearance::Cleared {
             return Ok(false);
         }
@@ -328,17 +332,20 @@ impl ProvenanceMisrejectionRepairUseCase {
             // report. `repair_provenance_misrejection` takes `&mut self`,
             // so this runs against a throwaway clone and the loaded
             // artifact is discarded either way.
-            let mut probe = artifact.clone();
+            let mut probe = paired.artifact().clone();
             probe.repair_provenance_misrejection(terminal_record, provenance, Utc::now())?;
             return Ok(true);
         }
 
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
-        let previous_status = artifact.quarantine_status;
-        let quarantined = artifact
+        let stream_id = paired.stream_id().clone();
+        let expected_version = paired.expected_version();
+        let previous_status = paired.artifact().quarantine_status;
+        let quarantined = paired
+            .artifact_mut()
             .repair_provenance_misrejection(terminal_record, provenance, Utc::now())
             .map_err(AppError::Domain)?;
-        let new_status = artifact.quarantine_status;
+        let new_status = paired.artifact().quarantine_status;
+        let artifact = paired.into_artifact();
 
         let re_evaluated = ArtifactReEvaluated {
             artifact_id,

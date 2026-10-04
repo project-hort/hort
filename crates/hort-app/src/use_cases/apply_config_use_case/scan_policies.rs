@@ -259,7 +259,10 @@ mod tests {
         desired.scan_policies.push(scan_policy_env("p1"));
         // Distinct scope from p1 — only one ScanPolicy may be active per
         // scope; scope has no bearing on what this test exercises
-        // (append-conflict abort), so any distinct scope will do.
+        // (append-conflict abort), so any distinct scope will do. The
+        // scoped repository is declared because a scope naming an
+        // undeclared one is refused before the first write.
+        desired.repositories.push(repo_env("other-repo", "hosted"));
         let mut p2 = scan_policy_env("p2");
         p2.spec.scope = ScopeSpec::Repository(hort_config::scope::RepositoryScope {
             repository: "other-repo".into(),
@@ -279,5 +282,124 @@ mod tests {
             "stage 2 must not continue past concurrent-modification abort: got {} appends",
             appends.len()
         );
+    }
+
+    /// The acceptance shape: a `ScanPolicy` whose scope names a
+    /// repository no envelope declares, in the same bundle as a
+    /// loosening global policy. Nothing is written.
+    ///
+    /// What makes this worth its own test rather than one more pre-write
+    /// row: the stage does not *refuse* such a bundle, it panics in
+    /// `resolve_scope` — the undeclared name has no id to resolve to. A
+    /// panic is not a `GitopsBootError`, so `is_park_eligible` never sees it —
+    /// the pod crashloops, and it does so with Stage 1 already written.
+    /// The trigger is a typo in a scope name.
+    #[tokio::test]
+    async fn a_scan_policy_scope_naming_an_undeclared_repository_writes_nothing() {
+        // Loosened on all three axes an operator would notice: findings
+        // are recorded instead of blocking, approval is no longer
+        // required, and only `critical` counts.
+        let mut loosened = scan_policy_env("relaxed");
+        loosened.spec.enforcement = "record".into();
+        loosened.spec.require_approval = false;
+        loosened.spec.severity_threshold = "critical".into();
+
+        // Positive control: on its own the loosening policy DOES land, so
+        // the "nothing written" assertions below cannot pass vacuously.
+        let control = build_harness();
+        control
+            .uc
+            .apply(
+                DesiredState {
+                    scan_policies: vec![loosened.clone()],
+                    ..Default::default()
+                },
+                env_oidc(),
+            )
+            .await
+            .expect("the loosening policy alone must apply cleanly");
+        assert!(
+            !control.events.appended().is_empty(),
+            "positive control: applying the loosening policy must append the \
+             ScanPolicy event that creates its projection"
+        );
+
+        // Same policy, now beside one scoped at a repository the bundle
+        // never declares. Distinct scopes, so the duplicate-scope rule is
+        // not what refuses this.
+        let mut ghost = scan_policy_env("scoped-at-a-ghost");
+        ghost.spec.scope = ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+            repository: "not-declared".into(),
+        });
+        let desired = DesiredState {
+            scan_policies: vec![loosened, ghost],
+            ..Default::default()
+        };
+
+        let h = build_harness();
+        let err =
+            h.uc.apply(desired.clone(), env_oidc())
+                .await
+                .expect_err("a scope naming an undeclared repository must fail the apply");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("scoped-at-a-ghost")
+                        && msg.contains("not-declared")
+                        && msg.contains("spec.scope.repository"),
+                    "the abort must name the policy, the field and the missing \
+                     repository, got: {msg}"
+                );
+            }
+            other => panic!("expected a park-eligible Validation error, got {other:?}"),
+        }
+        assert!(
+            h.events.appended().is_empty(),
+            "the loosening scan policy must NOT have been written — {} event \
+             batch(es) landed",
+            h.events.appended().len()
+        );
+        assert!(
+            h.repos.calls().is_empty(),
+            "no repository row may be written either: {:?}",
+            h.repos.calls()
+        );
+
+        // And the boot preflight reaches the same verdict, so the pod
+        // parks not-ready instead of crashlooping on a half-applied tree.
+        h.uc.preflight_validate(&desired, &env_oidc())
+            .await
+            .expect_err("the boot preflight must refuse the same bundle");
+    }
+
+    /// The same scope with the repository declared applies unchanged and
+    /// resolves to that repository's id: the rule rejects the dangling
+    /// reference, not the repository scope.
+    #[tokio::test]
+    async fn a_scan_policy_scope_naming_a_declared_repository_still_applies() {
+        let mut scoped = scan_policy_env("scoped-at-npm");
+        scoped.spec.scope = ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+            repository: "npm-internal".into(),
+        });
+        let desired = DesiredState {
+            repositories: vec![repo_env("npm-internal", "hosted")],
+            scan_policies: vec![scoped],
+            ..Default::default()
+        };
+
+        let h = build_harness();
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect("a scope naming a declared repository must apply");
+        let appends = h.events.appended();
+        assert_eq!(appends.len(), 1, "expected the PolicyCreated append");
+        match &appends[0].events[0].event {
+            DomainEvent::PolicyCreated(payload) => assert!(
+                matches!(payload.scope, PolicyScope::Repository(_)),
+                "the declared name must resolve to that repository's id, got {:?}",
+                payload.scope
+            ),
+            other => panic!("expected PolicyCreated, got {}", other.event_type()),
+        }
     }
 }

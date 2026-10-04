@@ -134,9 +134,14 @@ impl ScanPolicyApplier {
     /// Translate a YAML-side `ScopeSpec` into the domain-side `PolicyScope`.
     ///
     /// `ScopeSpec::Repository(name)` requires the name to be present in
-    /// `repo_id_by_name`; absence indicates the cross-spec validator was
-    /// bypassed (a programming error) and panics with the workspace's
-    /// `INVARIANT:` prefix.
+    /// `repo_id_by_name`; absence indicates
+    /// `push_scan_policy_scope_reference_errors` (`hort-config`'s
+    /// `desired` module, run by `DesiredState::validate` before the
+    /// apply's first write) was bypassed — a programming error, and
+    /// panics with the workspace's `INVARIANT:` prefix. That rule
+    /// rejects a scope naming a repository no envelope declares, which
+    /// is what makes an unmapped name here unreachable from operator
+    /// config.
     fn resolve_scope(&self, scope: &ScopeSpec) -> PolicyScope {
         match scope {
             ScopeSpec::Global => PolicyScope::Global,
@@ -428,6 +433,10 @@ const REASON_CHANGED_BY_GITOPS: &str = "changed by gitops apply";
 ///
 /// Like [`ScanPolicyApplier`], the applier carries a `repo_id_by_name`
 /// map for translating `ScopeSpec::Repository(name)` → `PolicyScope::Repository(uuid)`.
+/// That translation is now unreachable from operator config — see
+/// [`Self::resolve_scope`] — and the map stays only because the
+/// resolver's shape is shared with [`ScanPolicyApplier`], whose scope
+/// is still a live surface.
 #[derive(Debug, Clone)]
 pub struct ExclusionsApplier {
     /// The parent policy's id. Every emitted event carries this id;
@@ -447,6 +456,24 @@ impl ExclusionsApplier {
         }
     }
 
+    /// Translate a YAML-side `ScopeSpec` into the domain-side `PolicyScope`.
+    ///
+    /// The `Repository` arm is **unreachable from operator config**, and
+    /// what makes it so is `validate_exclusion_scope_not_implemented`
+    /// (`hort-config`'s `desired` module, collected by the apply's
+    /// pre-write lint pass): it rejects *every* `Exclusion` whose scope
+    /// names a repository, because the finding filter never reads the
+    /// scope (`hort_domain::policy::SCOPE_NOT_ENFORCED`). So no
+    /// repository scope reaches this resolver at all, and the panic
+    /// below asserts a state the admission boundary excludes twice over
+    /// — the name would have to be both accepted and absent from a map
+    /// the pipeline fills from the same `DesiredState`.
+    ///
+    /// That rejection is strictly stronger than a dangling-reference
+    /// rule, which is why this kind has none (unlike
+    /// `ScanPolicy`'s `push_scan_policy_scope_reference_errors`): a rule
+    /// that only caught the *undeclared* names would be dead code
+    /// beside a rule that catches all of them.
     fn resolve_scope(&self, scope: &ScopeSpec) -> PolicyScope {
         match scope {
             ScopeSpec::Global => PolicyScope::Global,
@@ -1560,6 +1587,10 @@ mod tests {
         }
     }
 
+    /// The applier's scope-change diff, exercised directly. The scope is
+    /// no longer an operator-reachable value — every repository scope is
+    /// refused before the apply's first write — so this pins the
+    /// resolver and the remove-then-add shape, not a live surface.
     #[test]
     fn exclusions_scope_changed_emits_remove_then_add() {
         let pid = Uuid::from_u128(1);
@@ -1755,6 +1786,15 @@ mod tests {
         );
     }
 
+    /// The resolver's panic branch, reached by constructing the applier
+    /// directly. It is **not** reachable from operator config — the
+    /// pre-write row `validate_exclusion_scope_not_implemented` refuses
+    /// every repository scope before any applier is built, which
+    /// `apply_config_use_case::exclusions`'s
+    /// `the_exclusion_scope_resolver_panic_is_unreachable_from_operator_config`
+    /// is the standing proof of. This test keeps the branch itself
+    /// pinned so a future loosening of that row cannot quietly change
+    /// what the unmapped case does.
     #[test]
     #[should_panic(expected = "INVARIANT")]
     fn exclusions_unmapped_repository_name_panics_with_invariant_prefix() {

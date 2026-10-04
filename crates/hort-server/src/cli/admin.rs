@@ -50,7 +50,8 @@ use hort_adapters_postgres::{
 use hort_app::event_store_publisher::EventStorePublisher;
 use hort_app::rbac::RbacEvaluator;
 use hort_app::use_cases::api_token_use_case::{
-    ApiTokenIssuanceConfig, ApiTokenUseCase, IssueTokenRequest, DEFAULT_SVC_EXPIRY_DAYS,
+    ApiTokenIssuanceConfig, ApiTokenUseCase, IssueTokenRequest, BOOTSTRAP_ADMIN_USERNAME,
+    DEFAULT_SVC_EXPIRY_DAYS,
 };
 use hort_app::use_cases::user_use_case::{CreateUser, UserPrivileges, UserUseCase};
 use hort_domain::entities::api_token::ApiToken;
@@ -730,12 +731,29 @@ fn write_plaintext(output_path: &Option<String>, plaintext: &str) -> anyhow::Res
     Ok(())
 }
 
+/// Page size for the `list_for_user` walks below. The port exposes no
+/// `find_by_name` and no "all rows" read, so every enumeration pages.
+const TOKEN_PAGE_LIMIT: u64 = 100;
+
+/// Upper bound on pages walked by [`live_token_ids_for_user`].
+///
+/// The walk stops on a short page; this budget only exists so a
+/// repository that ignored `offset` could not spin the CLI forever —
+/// headless, a non-terminating loop is indistinguishable from a hang.
+/// Exhausting it is reported as an error, never silently truncated: a
+/// truncated enumeration would leave tokens un-revoked while the
+/// command reported success.
+const MAX_TOKEN_PAGES: usize = 1_000;
+
 /// Scan the first page of tokens for a user and return the one whose
 /// `name` matches `token_name`, if any.
 ///
 /// The port only exposes `list_for_user` (no `find_by_name`). For the
-/// CLI bootstrap path this is acceptable: service accounts have at most
-/// a handful of tokens, so a single page (100 items) is always enough.
+/// service-account rotation path this is acceptable: the operator names
+/// the token, and a service account holds at most a handful, so a single
+/// page (100 items) is always enough. The bootstrap rotation does NOT
+/// use this — it revokes by principal, see
+/// [`live_token_ids_for_user`].
 async fn find_token_by_name(
     repo: &dyn ApiTokenRepository,
     user_id: Uuid,
@@ -746,12 +764,86 @@ async fn find_token_by_name(
             user_id,
             PageRequest {
                 offset: 0,
-                limit: 100,
+                limit: TOKEN_PAGE_LIMIT,
             },
         )
         .await
         .context("listing tokens for service-account user")?;
     Ok(page.items.into_iter().find(|t| t.name == token_name))
+}
+
+/// Collect the ids of every not-yet-revoked token owned by `user_id`,
+/// walking **all** pages.
+///
+/// Identity, not label, is the selector: the owner is the whole
+/// predicate and the token's `name` is never read. A caller-chosen name
+/// says nothing about who owns a credential, so a name-matched sweep
+/// leaves every differently-named token of the same principal in place —
+/// and the first page only compounds it.
+///
+/// Already-revoked rows are skipped: `ApiTokenRepository::revoke` is
+/// idempotent, so including them would be harmless but would emit a
+/// second `ApiTokenRevoked` event per row and inflate the count the
+/// caller logs.
+async fn live_token_ids_for_user(
+    repo: &dyn ApiTokenRepository,
+    user_id: Uuid,
+) -> anyhow::Result<Vec<Uuid>> {
+    let mut ids = Vec::new();
+    let mut offset = 0u64;
+    for _ in 0..MAX_TOKEN_PAGES {
+        let page = repo
+            .list_for_user(
+                user_id,
+                PageRequest {
+                    offset,
+                    limit: TOKEN_PAGE_LIMIT,
+                },
+            )
+            .await
+            .with_context(|| format!("listing tokens for user {user_id}"))?;
+        let fetched = page.items.len() as u64;
+        ids.extend(
+            page.items
+                .iter()
+                .filter(|t| t.revoked_at.is_none())
+                .map(|t| t.id),
+        );
+        // A short page is the end of the list. Deliberately not keyed on
+        // `page.total`: revocation is an UPDATE, not a DELETE, so the row
+        // count cannot shrink underneath the walk, but a `total` computed
+        // by a separate count query is still the weaker signal of the two.
+        if fetched < TOKEN_PAGE_LIMIT {
+            return Ok(ids);
+        }
+        offset += fetched;
+    }
+    anyhow::bail!(
+        "listing tokens for user {user_id} did not terminate within \
+         {MAX_TOKEN_PAGES} pages of {TOKEN_PAGE_LIMIT}; refusing to proceed on a \
+         partial enumeration — a truncated sweep would leave live tokens behind"
+    )
+}
+
+/// Revoke each token id in `ids` through the use case, so every
+/// revocation lands its `ApiTokenRevoked` audit event.
+///
+/// Fails on the first error rather than continuing: a partially-revoked
+/// rotation that reported success would leave a live full-admin
+/// credential behind with nothing recording it.
+async fn revoke_bootstrap_admin_tokens(
+    token_uc: &ApiTokenUseCase,
+    actor: ApiActor,
+    ids: &[Uuid],
+) -> anyhow::Result<()> {
+    for id in ids {
+        info!(token_id = %id, "revoking prior bootstrap-admin token");
+        token_uc
+            .revoke(actor.clone(), *id, true)
+            .await
+            .with_context(|| format!("revoking prior bootstrap-admin token {id}"))?;
+    }
+    Ok(())
 }
 
 /// Build an [`ApiTokenUseCase`] used by the admin CLI bootstrap path.
@@ -783,14 +875,13 @@ fn build_token_use_case(
 // bootstrap-session
 // ---------------------------------------------------------------------------
 
-/// Reserved username for the first-admin / break-glass admin identity.
-///
-/// This is the ONE deliberate admin-identity creation in the CLI. It is
-/// a NON-service-account user (`is_admin = true`,
-/// `is_service_account = false`) — service accounts are strictly
-/// non-admin (Entry 4 / ADR 0012), so the bootstrap admin is
-/// intentionally not one.
-const BOOTSTRAP_ADMIN_USERNAME: &str = "bootstrap-admin";
+// The reserved username of the first-admin / break-glass admin identity is
+// `hort_app::use_cases::api_token_use_case::BOOTSTRAP_ADMIN_USERNAME`,
+// imported above rather than declared here. It belongs to the use-case
+// layer because the issuance gates refuse request-path tokens for that
+// identity and must name the same user this command reserves; a second
+// copy here could drift and leave the gate guarding a row the CLI does
+// not create.
 
 /// Token row name (and audit label) for the bootstrap-admin token.
 const BOOTSTRAP_ADMIN_TOKEN_NAME: &str = "bootstrap-session";
@@ -939,30 +1030,29 @@ async fn bootstrap_session_async(args: BootstrapSessionArgs) -> anyhow::Result<(
         }
     };
 
-    // Single active bootstrap token: revoke any prior one before minting.
-    if let Some(prev) = find_token_by_name(
-        token_repo.as_ref(),
-        admin_user.id,
-        BOOTSTRAP_ADMIN_TOKEN_NAME,
-    )
-    .await?
-    {
-        info!(token_id = %prev.id, "revoking prior bootstrap-admin token");
+    // Single active credential for the break-glass identity: revoke
+    // every live token the principal owns before minting the next one.
+    //
+    // By principal, not by name. The reserved name is what this command
+    // mints under, but it is not what the identity is, and a token the
+    // principal owns under any other name is exactly as powerful — so
+    // matching the name left such a token live through every subsequent
+    // rotation. The walk also covers every page, not just the first.
+    let stale = live_token_ids_for_user(token_repo.as_ref(), admin_user.id).await?;
+    if !stale.is_empty() {
         let token_uc = build_token_use_case(
             token_repo.clone(),
             user_repo.clone(),
             event_publisher.clone(),
         );
-        token_uc
-            .revoke(
-                ApiActor {
-                    user_id: admin_user.id,
-                },
-                prev.id,
-                true,
-            )
-            .await
-            .context("revoking prior bootstrap-admin token")?;
+        revoke_bootstrap_admin_tokens(
+            &token_uc,
+            ApiActor {
+                user_id: admin_user.id,
+            },
+            &stale,
+        )
+        .await?;
     }
 
     // System-mint a short-lived (≤ 1 h) full-cap admin Pat. The use case
@@ -1741,6 +1831,282 @@ mod tests {
         };
         assert_eq!(args.ttl, "30m");
         assert_eq!(args.output, "file:/tmp/admin.txt");
+    }
+
+    // -- bootstrap rotation: revoke by principal, every page ---------------
+
+    /// Shorthand for the `ApiTokenRepository` port's return type. The fully
+    /// qualified form is wider than the 100-char line budget in every method
+    /// signature below.
+    type Fut<'a, T> = hort_domain::ports::BoxFuture<'a, hort_domain::error::DomainResult<T>>;
+
+    /// `ApiTokenRepository` fixture that honours `PageRequest`.
+    ///
+    /// The shared `hort_app::use_cases::test_support::MockApiTokenRepository`
+    /// returns its whole canned list on every call regardless of offset, so
+    /// it cannot tell a one-page walk from an all-pages walk — which is the
+    /// property under test here.
+    struct PagingTokenRepo {
+        rows: Vec<ApiToken>,
+        revokes: std::sync::Mutex<Vec<Uuid>>,
+    }
+
+    impl PagingTokenRepo {
+        fn new(rows: Vec<ApiToken>) -> Self {
+            Self {
+                rows,
+                revokes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn revoked(&self) -> Vec<Uuid> {
+            self.revokes.lock().unwrap().clone()
+        }
+    }
+
+    impl ApiTokenRepository for PagingTokenRepo {
+        fn insert(&self, _token: &ApiToken) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn find_by_prefix(&self, _prefix: &str) -> Fut<'_, Option<ApiToken>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn find_by_id(&self, id: Uuid) -> Fut<'_, ApiToken> {
+            let found = self.rows.iter().find(|t| t.id == id).cloned().ok_or(
+                hort_domain::error::DomainError::NotFound {
+                    entity: "ApiToken",
+                    id: id.to_string(),
+                },
+            );
+            Box::pin(async move { found })
+        }
+
+        fn list_for_user(
+            &self,
+            user_id: Uuid,
+            page: PageRequest,
+        ) -> Fut<'_, hort_domain::types::Page<ApiToken>> {
+            let owned: Vec<ApiToken> = self
+                .rows
+                .iter()
+                .filter(|t| t.user_id == user_id)
+                .cloned()
+                .collect();
+            let total = owned.len() as u64;
+            let items = owned
+                .into_iter()
+                .skip(page.offset as usize)
+                .take(page.limit as usize)
+                .collect();
+            Box::pin(async move { Ok(hort_domain::types::Page { items, total }) })
+        }
+
+        fn update_last_used(
+            &self,
+            _token_id: Uuid,
+            _at: chrono::DateTime<chrono::Utc>,
+            _client_ip: Option<&str>,
+            _user_agent: Option<&str>,
+        ) -> Fut<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn revoke(&self, token_id: Uuid) -> Fut<'_, ()> {
+            self.revokes.lock().unwrap().push(token_id);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    const BOOTSTRAP_USER_ID: Uuid = Uuid::from_u128(0xB0075);
+
+    fn token_row(name: &str, user_id: Uuid, revoked: bool) -> ApiToken {
+        ApiToken {
+            id: Uuid::new_v4(),
+            user_id,
+            name: name.to_owned(),
+            description: None,
+            kind: hort_domain::entities::api_token::TokenKind::Pat,
+            token_hash: "$argon2id$dummy".to_owned(),
+            token_prefix: "abcdefgh".to_owned(),
+            declared_permissions: vec![Permission::Admin],
+            repository_ids: None,
+            expires_at: None,
+            revoked_at: revoked.then(chrono::Utc::now),
+            last_used_at: None,
+            last_used_ip: None,
+            last_used_user_agent: None,
+            created_by_user_id: user_id,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// An `ApiTokenUseCase` over the paging repo, wired the way
+    /// `bootstrap_session_async` wires it.
+    fn token_use_case_over(repo: Arc<PagingTokenRepo>) -> ApiTokenUseCase {
+        use hort_app::use_cases::test_support::{MockEventStore, MockUserRepository};
+        let users = Arc::new(MockUserRepository::new());
+        let events = Arc::new(EventStorePublisher::without_broadcast(
+            Arc::new(MockEventStore::new()) as Arc<dyn EventStore>,
+        ));
+        build_token_use_case(repo as Arc<dyn ApiTokenRepository>, users, events)
+    }
+
+    #[tokio::test]
+    async fn rotation_revokes_a_bootstrap_token_under_a_non_reserved_name() {
+        // The finding: a token the break-glass principal owns under an
+        // operator-chosen name is exactly as powerful as the reserved one,
+        // and the name-matched sweep left it live through every subsequent
+        // rotation. Ownership is the whole predicate.
+        let reserved = token_row(BOOTSTRAP_ADMIN_TOKEN_NAME, BOOTSTRAP_USER_ID, false);
+        let renamed = token_row("ci-automation", BOOTSTRAP_USER_ID, false);
+        let already_revoked = token_row("stale", BOOTSTRAP_USER_ID, true);
+        let someone_else = token_row("other-user-token", Uuid::new_v4(), false);
+        let repo = Arc::new(PagingTokenRepo::new(vec![
+            reserved.clone(),
+            renamed.clone(),
+            already_revoked.clone(),
+            someone_else.clone(),
+        ]));
+
+        let ids = live_token_ids_for_user(repo.as_ref(), BOOTSTRAP_USER_ID)
+            .await
+            .unwrap();
+        let uc = token_use_case_over(repo.clone());
+        revoke_bootstrap_admin_tokens(
+            &uc,
+            ApiActor {
+                user_id: BOOTSTRAP_USER_ID,
+            },
+            &ids,
+        )
+        .await
+        .unwrap();
+
+        let revoked = repo.revoked();
+        assert!(
+            revoked.contains(&renamed.id),
+            "a non-reserved-name token of the bootstrap principal must be revoked"
+        );
+        assert!(revoked.contains(&reserved.id));
+        // Already-revoked rows are skipped, and another user's token is not
+        // this principal's to revoke.
+        assert!(!revoked.contains(&already_revoked.id));
+        assert!(!revoked.contains(&someone_else.id));
+        assert_eq!(revoked.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rotation_revokes_tokens_beyond_the_first_page() {
+        // The second half of the same finding: the sweep read one page.
+        // Seed more rows than `TOKEN_PAGE_LIMIT` and require the last one —
+        // which only a multi-page walk reaches — to be revoked.
+        let rows: Vec<ApiToken> = (0..(TOKEN_PAGE_LIMIT as usize * 2 + 7))
+            .map(|i| token_row(&format!("token-{i}"), BOOTSTRAP_USER_ID, false))
+            .collect();
+        let last_id = rows.last().unwrap().id;
+        let repo = Arc::new(PagingTokenRepo::new(rows.clone()));
+
+        let ids = live_token_ids_for_user(repo.as_ref(), BOOTSTRAP_USER_ID)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), rows.len());
+        let uc = token_use_case_over(repo.clone());
+        revoke_bootstrap_admin_tokens(
+            &uc,
+            ApiActor {
+                user_id: BOOTSTRAP_USER_ID,
+            },
+            &ids,
+        )
+        .await
+        .unwrap();
+
+        let revoked = repo.revoked();
+        assert_eq!(revoked.len(), rows.len());
+        assert!(
+            revoked.contains(&last_id),
+            "a token past the first page must be revoked"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_token_ids_for_user_is_empty_for_a_principal_with_no_tokens() {
+        // First bootstrap run on a fresh database: nothing to revoke, and
+        // the walk must not bail.
+        let repo = PagingTokenRepo::new(Vec::new());
+        let ids = live_token_ids_for_user(&repo, BOOTSTRAP_USER_ID)
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_token_ids_for_user_bails_when_the_walk_does_not_terminate() {
+        // A repository that ignores `offset` would otherwise spin the CLI
+        // forever — headless, indistinguishable from a hang. The budget
+        // reports an error rather than silently truncating the sweep, which
+        // would leave live full-admin tokens behind while the command
+        // claimed success.
+        struct OffsetIgnoringRepo {
+            page: Vec<ApiToken>,
+        }
+
+        impl ApiTokenRepository for OffsetIgnoringRepo {
+            fn insert(&self, _token: &ApiToken) -> Fut<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn find_by_prefix(&self, _prefix: &str) -> Fut<'_, Option<ApiToken>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn find_by_id(&self, id: Uuid) -> Fut<'_, ApiToken> {
+                Box::pin(async move {
+                    Err(hort_domain::error::DomainError::NotFound {
+                        entity: "ApiToken",
+                        id: id.to_string(),
+                    })
+                })
+            }
+            fn list_for_user(
+                &self,
+                _user_id: Uuid,
+                _page: PageRequest,
+            ) -> Fut<'_, hort_domain::types::Page<ApiToken>> {
+                let items = self.page.clone();
+                Box::pin(async move {
+                    Ok(hort_domain::types::Page {
+                        items,
+                        total: u64::MAX,
+                    })
+                })
+            }
+            fn update_last_used(
+                &self,
+                _token_id: Uuid,
+                _at: chrono::DateTime<chrono::Utc>,
+                _client_ip: Option<&str>,
+                _user_agent: Option<&str>,
+            ) -> Fut<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn revoke(&self, _token_id: Uuid) -> Fut<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let repo = OffsetIgnoringRepo {
+            page: (0..TOKEN_PAGE_LIMIT)
+                .map(|i| token_row(&format!("t{i}"), BOOTSTRAP_USER_ID, false))
+                .collect(),
+        };
+        let err = live_token_ids_for_user(&repo, BOOTSTRAP_USER_ID)
+            .await
+            .expect_err("a non-terminating walk must be reported, not truncated");
+        assert!(
+            err.to_string().contains("did not terminate"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

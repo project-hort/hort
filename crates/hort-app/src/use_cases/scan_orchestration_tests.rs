@@ -3692,8 +3692,8 @@ mod metrics_emission_tests {
 
                     // Seed the artifact's stream with ArtifactIngested
                     // (source=Direct) + prior clean ScanCompleted, so
-                    // both `read_ingest_source` and
-                    // `read_prior_scan_completed` find what they need.
+                    // both `ingest_source_from` and
+                    // `prior_scan_completed` find what they need.
                     let stream_id = StreamId::artifact(artifact_id);
                     events.set_stream(
                         &stream_id,

@@ -347,10 +347,14 @@ covers 11 kinds (see `crates/hort-config/src/envelope.rs` `Kind` enum):
 - `ClaimMapping` — CRUD; IdP-group → claim resolution (no `GroupMapping` or `Role` kinds exist — see ADR 0012).
 - `PermissionGrant` — CRUD; rows in `permission_grants`, with a sum-typed subject (`claims` / `user`).
 - `CurationRule` — CRUD; standalone per-package allow/deny/warn rule.
-- `ScanPolicy` — event-sourced; severity threshold, license policy,
-  quarantine duration, signature/approval requirements.
+- `ScanPolicy` — event-sourced; severity threshold, quarantine
+  duration, provenance mode, approval requirement. (`licensePolicy` is
+  carried but refused at apply — no port surfaces an artifact's
+  licences, so it decides nothing.)
 - `Exclusion` — event-sourced sub-state of a parent `ScanPolicy`
-  (auditable CVE override on a package pattern).
+  (auditable CVE override on a package pattern). Its reach is the
+  parent policy's scope; its own `scope` must be `global`, because the
+  finding filter never reads it.
 - `UpstreamMapping` — CRUD; maps a repository to an upstream proxy source.
 - `OidcIssuer` — CRUD; trusted OIDC issuer for workload identity federation.
 - `ServiceAccount` — CRUD; service-account declaration (ADR 0018).

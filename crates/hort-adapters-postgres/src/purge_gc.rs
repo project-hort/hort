@@ -217,23 +217,26 @@ struct WorklistRow {
 /// any value the use case re-checks must round-trip; an unknown value
 /// is a data-integrity error rather than a silent mis-classification of
 /// a destructive decision.
+///
+/// Delegates to the crate's one
+/// [`quarantine_status_from_sql`](crate::quarantine_status_sql::quarantine_status_from_sql)
+/// codec, so this mapper is not a second author of the column's
+/// vocabulary. It used to collapse the legacy scan-state spellings
+/// (`unscanned` / `clean` / `flagged`) to [`QuarantineStatus::None`] on
+/// its own — on this path, "not GC-protected" — which is a destructive
+/// decision taken from a value the domain cannot classify.
+///
+/// The error surfaces through `list_pending`, so an unclassifiable row
+/// fails that whole page rather than only its own artifact. That is the
+/// fail-closed direction for a purge (nothing is deleted), and the
+/// condition is not one a migrated database can be in:
+/// `030_artifacts_quarantine_status_legacy_backfill.sql` replaces the
+/// legacy spellings with the held state (`'quarantined'` plus a window
+/// anchor), which this mapper classifies as GC-protected.
 pub(crate) fn map_status(raw: Option<&str>) -> DomainResult<QuarantineStatus> {
-    match raw {
-        // `unscanned` / `clean` / `flagged` are non-terminal scan
-        // states the schema allows but the artifact aggregate models
-        // as `None` (no quarantine gate) — same collapse the rest of
-        // the v2 read path uses. They are NOT protected; only
-        // quarantined / rejected / scan_indeterminate are.
-        None | Some("unscanned") | Some("clean") | Some("flagged") | Some("none") => {
-            Ok(QuarantineStatus::None)
-        }
-        Some("released") => Ok(QuarantineStatus::Released),
-        Some(other) => crate::gc_protected_quarantine_status(other).ok_or_else(|| {
-            DomainError::Invariant(format!(
-                "purge_gc: unknown quarantine_status {other:?} on a pending-purge artifact"
-            ))
-        }),
-    }
+    crate::quarantine_status_sql::quarantine_status_from_sql(raw, || {
+        "purge_gc: pending-purge artifact".to_string()
+    })
 }
 
 /// Parse a DB hash column into a [`ContentHash`], trimming the
@@ -857,15 +860,8 @@ mod tests {
     }
 
     #[test]
-    fn map_status_maps_known_values_and_collapses_scan_states() {
+    fn map_status_maps_every_stored_value() {
         assert_eq!(map_status(None).unwrap(), QuarantineStatus::None);
-        assert_eq!(map_status(Some("none")).unwrap(), QuarantineStatus::None);
-        assert_eq!(
-            map_status(Some("unscanned")).unwrap(),
-            QuarantineStatus::None
-        );
-        assert_eq!(map_status(Some("clean")).unwrap(), QuarantineStatus::None);
-        assert_eq!(map_status(Some("flagged")).unwrap(), QuarantineStatus::None);
         assert_eq!(
             map_status(Some("released")).unwrap(),
             QuarantineStatus::Released
@@ -884,11 +880,31 @@ mod tests {
         );
     }
 
+    /// The legacy scan-state spellings used to collapse to
+    /// `QuarantineStatus::None` here, which on this path reads as "this
+    /// blob is not GC-protected" — a destructive decision taken from a
+    /// value the domain cannot classify. They now stop the purge for
+    /// that artifact instead.
+    #[test]
+    fn map_status_no_longer_collapses_the_legacy_scan_states() {
+        for raw in ["unscanned", "clean", "flagged"] {
+            let err = map_status(Some(raw)).unwrap_err();
+            assert!(
+                matches!(err, DomainError::Invariant(_)),
+                "{raw} must not classify"
+            );
+            assert!(
+                err.to_string().contains(raw),
+                "the error must name the value; got {err}"
+            );
+        }
+    }
+
     #[test]
     fn map_status_rejects_unknown() {
         let err = map_status(Some("bogus")).unwrap_err();
         assert!(matches!(err, DomainError::Invariant(_)));
-        assert!(err.to_string().contains("unknown quarantine_status"));
+        assert!(err.to_string().contains("unclassifiable quarantine_status"));
     }
 
     #[test]

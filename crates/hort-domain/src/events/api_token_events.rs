@@ -98,6 +98,13 @@ pub enum DenialReason {
     AdminTokenExceedsThirtyDays,
     /// Admin-mint target user is not `is_service_account = true`.
     NotServiceAccount,
+    /// The token's owner would be the reserved `bootstrap-admin`
+    /// break-glass identity. That identity's only mint path is the
+    /// DSN-gated `admin bootstrap-session` CLI, which clamps to one
+    /// hour and revokes on rotation; a credential minted through the
+    /// request-path gates carries neither bound, so a one-hour
+    /// break-glass credential would compose into a standing one.
+    BootstrapAdminMintForbidden,
 }
 
 // ---------------------------------------------------------------------------
@@ -663,7 +670,24 @@ mod tests {
             DenialReason::InvalidRepositorySet,
             DenialReason::AdminTokenExceedsThirtyDays,
             DenialReason::NotServiceAccount,
+            DenialReason::BootstrapAdminMintForbidden,
         ];
+        // The list above is hand-maintained, so a wildcard-free match
+        // forces whoever adds a variant to come here. It proves the enum
+        // has no arm this function has not seen; it does not by itself
+        // prove the list is complete, so add the variant to BOTH.
+        for r in variants {
+            match r {
+                DenialReason::CapExceedsAuthority
+                | DenialReason::ServiceAccountSelfMint
+                | DenialReason::AdminTokenDisallowed
+                | DenialReason::UnboundedSvcTokenDisallowed
+                | DenialReason::InvalidRepositorySet
+                | DenialReason::AdminTokenExceedsThirtyDays
+                | DenialReason::NotServiceAccount
+                | DenialReason::BootstrapAdminMintForbidden => {}
+            }
+        }
         for r in variants {
             let original = ApiTokenIssuanceDenied {
                 denial_reason: r,

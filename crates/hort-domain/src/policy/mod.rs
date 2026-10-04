@@ -45,6 +45,7 @@ pub use event_chain_verify_liveness::{
 };
 pub use exclusion::{
     filter_excluded_findings, filter_excluded_summary, FilteredFindings, FilteredSummary,
+    SCOPE_NOT_ENFORCED,
 };
 pub use license::evaluate_license_policy;
 pub use primitives::{
@@ -55,7 +56,10 @@ pub use quarantine_anchor::{
     derive_quarantine_anchor, AnchorEvidence, AnchorSource, DerivedAnchor,
 };
 pub use re_evaluation::{decide_rejected_transition, ReEvaluationOutcome};
-pub use scan::{effective_quarantine_deadline, evaluate_scan_result, DefaultPolicy, ScanOutcome};
+pub use scan::{
+    effective_quarantine_deadline, evaluate_scan_result, has_license_policy, DefaultPolicy,
+    ScanOutcome,
+};
 pub use scan_delta::compute_added_findings;
 pub use staging_sweep_liveness::{evaluate_staging_sweep_liveness, StagingSweepLiveness};
 pub use threshold::{count_findings_above_threshold, finding_exceeds_threshold};

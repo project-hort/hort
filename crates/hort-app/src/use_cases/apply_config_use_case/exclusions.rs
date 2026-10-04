@@ -180,7 +180,7 @@ mod tests {
             provenance_backends: vec!["cosign".to_string()],
             provenance_identities: Vec::new(),
             max_artifact_age_secs: Some(90 * 24 * 3600),
-            license_policy: serde_json::json!({"allowed": ["MIT"]}),
+            license_policy: serde_json::Value::Null,
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
@@ -221,8 +221,12 @@ mod tests {
         assert_eq!(removed_count, 1);
     }
 
+    /// Any mutable-field edit is a remove-then-add: the events crate has
+    /// no `ExclusionUpdated`. This exercises `reason`; the scope is not
+    /// among the editable fields any more, since every repository scope
+    /// is refused before the first write.
     #[tokio::test]
-    async fn change_exclusion_scope_emits_remove_then_add() {
+    async fn change_exclusion_field_emits_remove_then_add() {
         let h = build_harness();
         let policy_id = Uuid::new_v4();
         let now = Utc::now();
@@ -237,7 +241,7 @@ mod tests {
             provenance_backends: vec!["cosign".to_string()],
             provenance_identities: Vec::new(),
             max_artifact_age_secs: Some(90 * 24 * 3600),
-            license_policy: serde_json::json!({"allowed": ["MIT"]}),
+            license_policy: serde_json::Value::Null,
             archived: false,
             scan_backends: vec!["trivy".to_string()],
             rescan_interval_hours: 24,
@@ -322,6 +326,225 @@ mod tests {
                 &[("kind", "exclusion"), ("result", "created")],
             ),
             1,
+        );
+    }
+
+    // ===================================================================
+    // Repository scope: refused before the first write
+    // ===================================================================
+
+    /// A `ScanPolicyProjection` fixture for a global policy named
+    /// `name`, carrying no stored licence rules.
+    fn active_global_policy(policy_id: Uuid, name: &str) -> ScanPolicyProjection {
+        let now = Utc::now();
+        ScanPolicyProjection {
+            policy_id,
+            name: name.into(),
+            scope: PolicyScope::Global,
+            severity_threshold: SeverityThreshold::High,
+            quarantine_duration_secs: 24 * 3600,
+            require_approval: true,
+            provenance_mode: ProvenanceMode::VerifyIfPresent,
+            provenance_backends: vec!["cosign".to_string()],
+            provenance_identities: Vec::new(),
+            max_artifact_age_secs: Some(90 * 24 * 3600),
+            license_policy: serde_json::Value::Null,
+            archived: false,
+            scan_backends: vec!["trivy".to_string()],
+            rescan_interval_hours: 24,
+            negligible_action: NegligibleAction::Ignore,
+            enforcement: ScanEnforcement::Reject,
+            stream_version: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The acceptance shape: a repository-scoped `Exclusion` in the same
+    /// bundle as a loosening global policy. Nothing is written, and the
+    /// boot preflight reaches the same verdict so the pod parks
+    /// not-ready instead of crashlooping on a half-applied tree.
+    #[tokio::test]
+    async fn an_exclusion_scoped_to_a_repository_writes_nothing() {
+        // Loosened on all three axes an operator would notice: findings
+        // are recorded instead of blocking, approval is no longer
+        // required, and only `critical` counts.
+        let mut loosened = scan_policy_env("relaxed");
+        loosened.spec.enforcement = "record".into();
+        loosened.spec.require_approval = false;
+        loosened.spec.severity_threshold = "critical".into();
+
+        // Positive control: on its own the loosening policy DOES land, so
+        // the "nothing written" assertions below cannot pass vacuously.
+        let control = build_harness();
+        control
+            .uc
+            .apply(
+                DesiredState {
+                    scan_policies: vec![loosened.clone()],
+                    ..Default::default()
+                },
+                env_oidc(),
+            )
+            .await
+            .expect("the loosening policy alone must apply cleanly");
+        assert!(
+            !control.events.appended().is_empty(),
+            "positive control: applying the loosening policy must append the \
+             ScanPolicy event that creates its projection"
+        );
+
+        // The repository IS declared, so the refusal is the scope itself
+        // and not a dangling reference.
+        let mut scoped = exclusion_env("cve-on-one-repo", "relaxed", "CVE-2026-0101");
+        scoped.spec.scope = ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+            repository: "npm-internal".into(),
+        });
+        let desired = DesiredState {
+            repositories: vec![repo_env("npm-internal", "hosted")],
+            scan_policies: vec![loosened],
+            exclusions: vec![scoped],
+            ..Default::default()
+        };
+
+        let h = build_harness();
+        let err =
+            h.uc.apply(desired.clone(), env_oidc())
+                .await
+                .expect_err("a repository-scoped exclusion must fail the apply");
+        match err {
+            AppError::Domain(DomainError::Validation(msg)) => assert!(
+                msg.contains("cve-on-one-repo")
+                    && msg.contains("npm-internal")
+                    && msg.contains("not enforced"),
+                "the abort must name the exclusion, the repository and why the scope \
+                 cannot be honoured, got: {msg}"
+            ),
+            other => panic!("expected a park-eligible Validation error, got {other:?}"),
+        }
+        assert!(
+            h.events.appended().is_empty(),
+            "the loosening scan policy must NOT have been written — {} event \
+             batch(es) landed",
+            h.events.appended().len()
+        );
+        assert!(
+            h.repos.calls().is_empty(),
+            "no repository row may be written either: {:?}",
+            h.repos.calls()
+        );
+
+        h.uc.preflight_validate(&desired, &env_oidc())
+            .await
+            .expect_err("the boot preflight must refuse the same bundle");
+    }
+
+    /// `ExclusionsApplier::resolve_scope` panics on a repository name it
+    /// cannot resolve — a Stage-3 abort that is not a `GitopsBootError`,
+    /// so `is_park_eligible` never sees it and the pod crashloops with
+    /// Stages 1 and 2 already written, on a one-character typo in a
+    /// scope name. **This test says that panic is unreachable from
+    /// operator config**: the pre-write row refuses every repository
+    /// scope, so neither an undeclared name (which would panic) nor a
+    /// declared one (which would resolve, and then be refused by
+    /// `PolicyUseCase::add_exclusion` from inside the write-capable
+    /// stage) reaches the resolver.
+    ///
+    /// Both halves matter and the test would notice either going away:
+    /// delete the pre-write row and the undeclared case turns this
+    /// `apply` call into the `INVARIANT:` panic rather than the
+    /// `Validation` error asserted below.
+    #[tokio::test]
+    async fn the_exclusion_scope_resolver_panic_is_unreachable_from_operator_config() {
+        for (what, repository, declared) in [
+            ("a name the bundle never declares", "not-declared", false),
+            ("a name the bundle does declare", "npm-internal", true),
+        ] {
+            let mut scoped = exclusion_env("scoped", "p-parent", "CVE-2026-0102");
+            scoped.spec.scope = ScopeSpec::Repository(hort_config::scope::RepositoryScope {
+                repository: repository.into(),
+            });
+            let desired = DesiredState {
+                repositories: if declared {
+                    vec![repo_env("npm-internal", "hosted")]
+                } else {
+                    Vec::new()
+                },
+                scan_policies: vec![scan_policy_env("p-parent")],
+                exclusions: vec![scoped],
+                ..Default::default()
+            };
+
+            let h = build_harness();
+            let Err(err) = h.uc.apply(desired.clone(), env_oidc()).await else {
+                panic!("{what}: the apply must refuse a repository-scoped exclusion")
+            };
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Validation(_))),
+                "{what}: must surface as a park-eligible Validation error — a panic \
+                 is not a GitopsBootError and cannot park the pod — got {err:?}"
+            );
+            assert!(
+                h.events.appended().is_empty() && h.repos.calls().is_empty(),
+                "{what}: the refusal must land before the first write; events {}, \
+                 repo calls {:?}",
+                h.events.appended().len(),
+                h.repos.calls(),
+            );
+
+            // And the boot preflight agrees, which is what makes the
+            // refusal park-eligible rather than crashloop-shaped.
+            h.uc.preflight_validate(&desired, &env_oidc())
+                .await
+                .unwrap_err();
+        }
+    }
+
+    /// An exclusion stored with a repository scope before the refusal
+    /// shipped is still removable through gitops: drop its envelope and
+    /// the applier emits the `ExclusionRemoved`.
+    ///
+    /// Nothing refuses a removal — not here, not
+    /// `PolicyUseCase::remove_exclusion`, not the HTTP `DELETE`.
+    /// Removing such a row withdraws an assurance the finding filter
+    /// never honoured, which is the safe direction; and refusing it in
+    /// this method specifically would turn dropping the envelope into a
+    /// post-write apply failure, because the applier emits removals
+    /// from a write-capable stage — the partial-apply defect the
+    /// pre-write validation pass exists to prevent.
+    #[tokio::test]
+    async fn a_stored_repository_scoped_exclusion_is_still_removable_by_gitops() {
+        let h = build_harness();
+        let policy_id = Uuid::new_v4();
+        h.proj.insert_active(active_global_policy(policy_id, "p1"));
+        h.proj.insert_exclusion(ExclusionProjection {
+            exclusion_id: Uuid::new_v4(),
+            policy_id,
+            cve_id: "CVE-2024-0001".into(),
+            package_pattern: None,
+            // The shape no writer accepts any more.
+            scope: PolicyScope::Repository(Uuid::new_v4()),
+            reason: "stored before the scope was refused".into(),
+            added_by_actor_id: None,
+            expires_at: None,
+        });
+
+        // Parent policy still declared; the exclusion envelope dropped.
+        let desired = DesiredState {
+            scan_policies: vec![scan_policy_env("p1")],
+            ..Default::default()
+        };
+        let report = h.uc.apply(desired, env_oidc()).await.expect(
+            "dropping the envelope of a stored repository-scoped exclusion must still apply",
+        );
+        assert_eq!(report.deleted, 1, "the stored row must be removed");
+        assert!(
+            h.events.appended().iter().any(|b| b
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ExclusionRemoved(_)))),
+            "the removal must reach the event store: {:?}",
+            h.events.appended()
         );
     }
 }

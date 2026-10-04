@@ -589,13 +589,15 @@ impl ProvenanceCascade {
     /// for the cascade re-drive), the cascade's idempotency check +
     /// append, and the late-joiner end's subject-authority check.
     ///
-    /// The read goes through
-    /// [`read_artifact_stream`](crate::use_cases::read_artifact_stream),
-    /// which refuses a stream it cannot prove it read to the end. Both
-    /// halves of the answer need that: over a truncated prefix an
-    /// existing `ProvenanceVerified` past the cap reads as absent (the
-    /// cascade would re-clear an already-cleared artifact), and
-    /// `persisted.last()` is not the tail, so the returned
+    /// Both halves come from
+    /// [`read_artifact_stream_at_version`](crate::use_cases::read_artifact_stream_at_version)
+    /// — `ArtifactAtVersion`'s shape for a caller that needs no artifact
+    /// row — so the version cannot be derived from a different read than
+    /// the evidence, and a stream the read cannot prove it reached the end
+    /// of is refused. Both halves need that refusal: over a truncated
+    /// prefix an existing `ProvenanceVerified` past the cap reads as
+    /// absent (the cascade would re-clear an already-cleared artifact),
+    /// and the prefix's last position is not the tail, so the returned
     /// `ExpectedVersion::Exact` would be stale and every append derived
     /// from it would fail `Conflict` permanently.
     pub(crate) async fn read_clearance_state(
@@ -606,15 +608,12 @@ impl ProvenanceCascade {
         ExpectedVersion,
     )> {
         let stream_id = hort_domain::events::StreamId::artifact(artifact_id);
-        let persisted = crate::use_cases::read_artifact_stream(&*self.events, &stream_id).await?;
+        let (persisted, expected) =
+            crate::use_cases::read_artifact_stream_at_version(&*self.events, &stream_id).await?;
         let cleared = persisted.iter().find_map(|e| match &e.event {
             DomainEvent::ProvenanceVerified(ev) => Some(ev.clone()),
             _ => None,
         });
-        let expected = match persisted.last() {
-            Some(last) => ExpectedVersion::Exact(last.stream_position),
-            None => ExpectedVersion::NoStream,
-        };
         Ok((cleared, expected))
     }
 

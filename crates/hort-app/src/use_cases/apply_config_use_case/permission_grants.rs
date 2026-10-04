@@ -157,11 +157,23 @@ impl ApplyConfigUseCase {
         // "every grant has both legs". It runs over the fully-built
         // desired set AND the desired `claim_mappings`,
         // BEFORE the whole-partition `save_managed` commit and BEFORE
-        // any audit event is constructed — a `Reject` aborts the
-        // apply strict-atomic so no row and no `PermissionGrantApplied`
-        // / `ClaimMappingApplied` event lands. The metric
+        // any audit event is constructed. The metric
         // (`hort_apply_config_linter_total{rule,result}`) is emitted
-        // per (grant|row, rule) evaluation inside the linter.
+        // per (grant|row, rule) evaluation inside the linter, and this is
+        // its only emission site: the port-built desired set is the real
+        // one, so it is the one the series describes.
+        //
+        // The REJECTION, however, is not this stage's to raise first. This
+        // stage runs after the repository, policy and mapping writes, and
+        // the apply ships no rollback — so a grant refused here used to
+        // leave a loosening from the same bundle committed. The pre-write
+        // pass therefore rejects on the same rules (its row 8), over an
+        // expansion with placeholder ids whose verdict is provably the same
+        // because no rule reads an id value. What survives here is the
+        // gate over the real set: reaching a `Reject` at this point would
+        // mean the two expansions disagreed, which is a contract violation
+        // rather than operator error — and the strict-atomic abort below
+        // still holds the line if it ever happens.
         let desired_claim_mappings: Vec<ClaimMapping> = desired
             .claim_mappings
             .iter()

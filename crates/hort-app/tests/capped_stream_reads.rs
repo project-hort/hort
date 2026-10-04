@@ -11,12 +11,13 @@
 //! how the rejection that superseded it becomes invisible to the release
 //! authorization.
 //!
-//! `read_artifact_stream` is the one correct way to do it — read
-//! `STREAM_EVENT_CAP + 1` events, return the stream when at most
-//! `STREAM_EVENT_CAP` came back (the budget was not exhausted, so the tail was
-//! reached), refuse otherwise. The idiom existed before this guard did, in
-//! `read_expected_version`, and **convention alone did not hold it**: ten
-//! capped-read sites across seven files got it wrong — nine read exactly
+//! `capped_artifact_read` is the one correct way to do it — read
+//! `STREAM_EVENT_CAP + 1` events and carry the "was the budget exhausted?"
+//! bit out with them, so each of its three consumers
+//! (`read_artifact_stream`, `read_unpaired_append_version`, `ArtifactAtVersion`)
+//! refuses or tolerates deliberately rather than by accident. The idiom
+//! existed before this guard did, and **convention alone did not hold it**:
+//! ten capped-read sites across seven files got it wrong — nine read exactly
 //! `200` with no overflow detection at all, each of six files carrying its own
 //! copy of the constant, and the tenth read `cap + 1` correctly but discarded
 //! the overflow signal. This guard is what makes the single reader durable
@@ -32,11 +33,12 @@
 //!    `repository` streams this way). No budget, so no truncation: allowed
 //!    anywhere.
 //! 2. **`STREAM_EVENT_CAP + 1`** — the audited bounded read, allowed *only*
-//!    in [`ALLOWED_CAPPED_READ_FILE`]. Both readers there consume the `+ 1`
-//!    as overflow detection. A second copy of this expression elsewhere would
-//!    be a second reader that has to get the refusal right on its own, which
-//!    is the situation this guard exists to end — so the location is part of
-//!    the property, not an exemption.
+//!    in [`ALLOWED_CAPPED_READ_FILE`], where it is spelled exactly **once**.
+//!    That single read consumes the `+ 1` as overflow detection and hands the
+//!    result on. A second copy of this expression anywhere would be a second
+//!    reader that has to get the refusal right on its own, which is the
+//!    situation this guard exists to end — so the location is part of the
+//!    property, not an exemption.
 //! 3. **a forwarded `max_count` parameter**, and only inside a
 //!    `fn read_stream(` — i.e. an `EventStore` decorator implementing the
 //!    trait by delegation (`EventStorePublisher`). Forwarding adds no policy:
@@ -71,10 +73,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The one file allowed to spell a bounded artifact-stream read:
-/// `read_artifact_stream` (the full read every consumer of an artifact's
-/// history goes through) and `read_expected_version` (the append-version
-/// derivation, which refuses over-cap streams for its capping callers).
+/// The one file allowed to spell a bounded artifact-stream read, and the one
+/// function in it that does: `capped_artifact_read`. Everything that asks a
+/// question of an artifact's stream goes through it —
+/// `read_artifact_stream` (the full read), `read_unpaired_append_version` (the
+/// append-version derivation) and `ArtifactAtVersion` (the two together, as
+/// one observation).
 const ALLOWED_CAPPED_READ_FILE: &str = "crates/hort-app/src/use_cases/mod.rs";
 
 /// The audited bounded budget, as written at the call site. Compared
@@ -329,16 +333,25 @@ fn bounded_stream_reads_live_only_in_the_audited_reader() {
         violations.join("\n  ")
     );
 
-    // Counter-assertion: the scan must actually be finding the two audited
-    // reads. Without it, a rename of `read_stream` or a change to the
-    // truncation heuristic would make this test vacuously green — the way a
-    // source-scan guard usually dies.
+    // Counter-assertion: the scan must actually be finding the audited read.
+    // Without it, a rename of `read_stream` or a change to the truncation
+    // heuristic would make this test vacuously green — the way a source-scan
+    // guard usually dies.
+    //
+    // The count is **one**, not two: `read_artifact_stream` and
+    // `read_unpaired_append_version` used to spell the read each, which is also why
+    // a caller needing both paid for two round trips and could observe the
+    // stream at two different moments. They now share
+    // `capped_artifact_read`, and `ArtifactAtVersion` is the third consumer
+    // of that single read.
     assert_eq!(
-        audited_capped_reads, 2,
-        "expected exactly the two audited bounded reads in \
-         {ALLOWED_CAPPED_READ_FILE} (`read_artifact_stream` and \
-         `read_expected_version`); found {audited_capped_reads}. If a reader \
-         was legitimately added or removed there, update this count \
-         deliberately — a drifting count means the scan stopped seeing them"
+        audited_capped_reads, 1,
+        "expected exactly one audited bounded read in \
+         {ALLOWED_CAPPED_READ_FILE} (`capped_artifact_read`, which \
+         `read_artifact_stream`, `read_unpaired_append_version` and \
+         `ArtifactAtVersion` all go through); found {audited_capped_reads}. \
+         If a reader was legitimately added or removed there, update this \
+         count deliberately — a drifting count means the scan stopped \
+         seeing it"
     );
 }

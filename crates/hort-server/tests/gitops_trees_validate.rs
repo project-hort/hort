@@ -209,6 +209,64 @@ spec:
     );
 }
 
+/// The third host-test smoke (`scripts/host-tests/test-gitops-policies.sh`)
+/// stages the same way, but from a **checked-in** overlay:
+/// `scripts/native-tests/fixtures/gitops-policies` copied on top of
+/// `deploy/compose/example-config`. So that overlay is a shipped gitops
+/// tree in every sense that matters — a rule rejecting it parks the
+/// smoke stack at boot — while being invisible to
+/// `every_shipped_gitops_tree_passes_the_static_linter`, which walks
+/// standalone roots and would judge this one without the repositories
+/// and policies it is layered onto.
+///
+/// It is read from disk rather than inlined (unlike the overlay above,
+/// which the two scripts generate at runtime), so an edit to the fixture
+/// reaches this assertion with no edit here. The licence-policy row is
+/// how the gap was found: the fixture declared `allowed`/`denied` lists
+/// and nothing in the workspace would have noticed the boot refusal.
+#[test]
+fn the_checked_in_gitops_policies_overlay_still_validates_against_the_compose_tree() {
+    let mut files = Vec::new();
+    collect_yaml_files(
+        &workspace_root().join("deploy/compose/example-config"),
+        &mut files,
+    );
+    let overlay_root = workspace_root().join("scripts/native-tests/fixtures/gitops-policies");
+    let mut overlay = Vec::new();
+    collect_yaml_files(&overlay_root, &mut overlay);
+    assert!(
+        !overlay.is_empty(),
+        "the gitops-policies fixture overlay should not be empty — if it moved,          follow it here rather than deleting this guard"
+    );
+    // `cp -R fixture/. stage/` replaces a same-named file; mirror that so
+    // the corpus is the tree the smoke actually boots.
+    for (path, bytes) in overlay {
+        let rel = path
+            .strip_prefix(&overlay_root)
+            .expect("overlay path under its root")
+            .to_path_buf();
+        files.retain(|(p, _)| !p.ends_with(&rel));
+        files.push((path, bytes));
+    }
+
+    let desired = DesiredState::parse_files(files).expect("staged overlay tree parses");
+    if let Err(errs) = desired.validate() {
+        panic!("the staged gitops-policies tree must clear row 0:\n{errs}");
+    }
+    let report = cli_validator(EffectiveStorageBackend::Filesystem).validate(&desired);
+    assert!(
+        report.errors.is_empty(),
+        "the checked-in gitops-policies overlay must still apply cleanly — fix the \
+         fixture, never the rule. Findings:\n{}",
+        report
+            .errors
+            .iter()
+            .map(|f| format!("  [{:?}] {}", f.rule, f.message))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+}
+
 /// The guard above is only meaningful if the row it exists for can
 /// actually fire on a tree of this shape. Re-run the alpha-fixture tree
 /// with its global policy pushed back to the pre-split `[trivy, osv]`

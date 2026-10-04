@@ -21,11 +21,14 @@
 //!
 //! The server-side request DTO carries a tagged-union `scope` field
 //! (`{ "kind": "global" }` or `{ "kind": "repository", "repository_id":
-//! "<uuid>" }`). The CLI v1 surface targets the global-scope case
-//! (operator policies are typically global); a future revision can add
-//! `--repo` to mint a repository-scoped exclusion. The global-scope
-//! path ships the curator-most-common case; repository-scoped exclusion
-//! is deferred.
+//! "<uuid>" }`). This CLI emits the `Global` arm only — and that is now
+//! the only arm the server accepts: a repository-scoped exclusion is
+//! refused with `400`, because the finding filter never reads the scope
+//! and such an exclusion would clear its CVE for every repository the
+//! parent policy governs. So a `--repo` flag here is **not** a missing
+//! CLI feature; it would need per-repository scoping to be implemented
+//! server-side first. To waive a CVE for one repository, scope the
+//! parent `ScanPolicy` to it and exclude against that policy.
 
 use std::io::Write;
 
@@ -45,9 +48,9 @@ use super::{encode_path_segment, validate_justification};
 /// Tagged-union scope discriminator on the wire.
 ///
 /// **Sync-required**: mirrors `ScopeDto` in
-/// `hort-http-core::handlers::admin::policies::exclusions`. v1 emits the
-/// `Global` arm only; the `Repository { repository_id }` arm is the
-/// server's other variant.
+/// `hort-http-core::handlers::admin::policies::exclusions`. Only the
+/// `Global` arm exists here because it is the only arm the server
+/// accepts on a write — see the module docs.
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ScopeBody {

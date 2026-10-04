@@ -98,6 +98,7 @@ use hort_domain::ports::curation_queue_repository::{
     CurationQueueEntry, CurationQueueFilter, CurationQueueRepository,
 };
 
+use crate::quarantine_status_sql::quarantine_status_from_sql;
 use crate::BoxFuture;
 
 /// `limit` hard cap — capped at 500 defensively. The use case is
@@ -316,24 +317,31 @@ struct CurationQueueRow {
 
 impl CurationQueueRow {
     fn into_domain(self) -> DomainResult<CurationQueueEntry> {
-        // The outer status filter pins this to a non-NULL set, but the
-        // schema permits NULL — so the `None` arm exists as
-        // defence-in-depth (mirrors `patch_candidate_repo` strict
-        // mapping). Drift in the SQL WHERE clause surfaces as
-        // `DomainError::Invariant`.
-        let quarantine_status = match self.quarantine_status.as_deref() {
-            Some(s) => s.parse::<QuarantineStatus>().map_err(|_| {
-                DomainError::Invariant(format!(
-                    "unknown quarantine_status in curation_queue_repo row: {s}"
-                ))
-            })?,
-            None => {
-                return Err(DomainError::Invariant(format!(
-                    "curation_queue_repo row {} has NULL quarantine_status",
-                    self.artifact_id
-                )));
-            }
-        };
+        // Decoded through the crate's one codec
+        // (`quarantine_status_sql`), so this reader cannot drift from
+        // the column's stored vocabulary: an unclassifiable value is a
+        // `DomainError::Invariant` there.
+        //
+        // The `None` arm on top of it is defence-in-depth (mirrors
+        // `patch_candidate_repo`'s strict mapping). The codec maps SQL
+        // NULL to `QuarantineStatus::None`, which is correct for the
+        // column in general — but this query's outer filter pins the
+        // rows to a non-NULL set, so a `None` here is drift in the
+        // WHERE clause rather than a state. It is also the only way to
+        // reach `None`: a literal `'none'` is not a stored spelling and
+        // the codec refuses it.
+        let quarantine_status =
+            match quarantine_status_from_sql(self.quarantine_status.as_deref(), || {
+                format!("curation_queue_repo row {}", self.artifact_id)
+            })? {
+                QuarantineStatus::None => {
+                    return Err(DomainError::Invariant(format!(
+                        "curation_queue_repo row {} has NULL quarantine_status",
+                        self.artifact_id
+                    )));
+                }
+                other => other,
+            };
 
         // `RepositoryFormat::from_str` is infallible — unknown literals
         // round-trip as `Other(s)`. Mirrors `mappers.rs:67` /

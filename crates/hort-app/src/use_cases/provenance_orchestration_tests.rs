@@ -2021,7 +2021,7 @@ async fn provenance_verdict_commit_conflicts_when_status_moved_under_it() {
 // early-version-read code, and `ExpectedVersion::Any` means no OCC check is
 // even attempted. This test is the composed end-to-end proof: it drives the
 // REAL `verify_artifact` entry point (issue #108's actual production code
-// path, including Item 1's early `read_expected_version` call and #115
+// path, including Item 1's early `read_unpaired_append_version` call and #115
 // Item 3's descendant resolution — nothing here is hand-rolled), and injects
 // a concurrent scan-verdict commit exactly inside the H2a race window: after
 // `verify_artifact`'s own artifact load + early version read (both happen
@@ -2200,7 +2200,7 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
     // applicable port regardless of mode — only `complete_provenance`'s
     // INTERPRETATION of the verdict is mode-dependent), so this does not
     // weaken assertion (a) at all. It matters for assertion (b): under
-    // `Required`, `resolve_provenance_clearance` independently resolves
+    // `Required`, `read_path_provenance_clearance` independently resolves
     // `Pending` whenever no REAL `ProvenanceVerified` event exists on the
     // stream (ADR 0027) — and the mock `commit_provenance_verdict` never
     // actually appends one to `events` (documented above), so a `Required`

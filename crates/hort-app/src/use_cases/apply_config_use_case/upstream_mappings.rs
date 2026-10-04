@@ -712,4 +712,338 @@ mod tests {
             "managed mapping must be removed"
         );
     }
+    // ----------------------------------------------------------------------
+    // Pre-write TLS-material rejection (mirror of the domain constructor)
+    // ----------------------------------------------------------------------
+    //
+    // mTLS pair completeness, TLS material on a plaintext upstream, and the
+    // pin's hex shape are invariants of `RepositoryUpstreamMapping::new`,
+    // which gitops reaches only in Stage 3 — after the Stage-1 and Stage-2
+    // writes of the same bundle. Per-spec validation now carries the same
+    // three rules (`hort_config::upstream_mapping::validate_upstream_mapping`),
+    // so the verdict is reachable before the first write. These tests pin the
+    // two halves that make that safe: the pre-write row rejects everything the
+    // constructor rejects, and accepts everything it accepts.
+
+    /// One TLS field combination, with the YAML-side spec mutation and
+    /// the matching constructor-arg mutation, so a single corpus entry
+    /// drives both ends of the mirror.
+    struct TlsCase {
+        name: &'static str,
+        /// `true` ⇒ the upstream is plaintext (`http://` + opt-in).
+        plaintext: bool,
+        mtls_cert: bool,
+        mtls_key: bool,
+        ca_bundle: bool,
+        pin: Option<&'static str>,
+    }
+
+    fn secret_ref(location: &str) -> SecretRef {
+        SecretRef {
+            source: hort_domain::ports::secret_port::SecretSource::EnvVar,
+            location: location.into(),
+        }
+    }
+
+    const VALID_PIN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    impl TlsCase {
+        fn mapping_env(&self) -> Envelope<UpstreamMappingSpec> {
+            let url = if self.plaintext {
+                "http://mirror.internal"
+            } else {
+                "https://mirror.internal"
+            };
+            let mut env = upstream_mapping_env("m-tls", "oci-mirror-e2e", "dockerhub/", url);
+            env.spec.insecure_upstream_url = self.plaintext;
+            if self.mtls_cert {
+                env.spec.mtls_cert_ref = Some(secret_ref("CLIENT_CERT"));
+            }
+            if self.mtls_key {
+                env.spec.mtls_key_ref = Some(secret_ref("CLIENT_KEY"));
+            }
+            if self.ca_bundle {
+                env.spec.ca_bundle_ref = Some(secret_ref("CA_PEM"));
+            }
+            env.spec.pinned_cert_sha256 = self.pin.map(str::to_owned);
+            env
+        }
+
+        /// The Stage-3 authority: the same combination handed to the
+        /// value-object constructor the apply funnels through.
+        fn constructor_result(&self) -> Result<RepositoryUpstreamMapping, AppError> {
+            let spec = self.mapping_env().spec;
+            let now = Utc::now();
+            let mapping = RepositoryUpstreamMapping::new(RepositoryUpstreamMappingArgs {
+                id: Uuid::new_v4(),
+                repository_id: Uuid::new_v4(),
+                path_prefix: spec.path_prefix,
+                upstream_url: spec.upstream_url,
+                upstream_name_prefix: None,
+                upstream_auth: UpstreamAuth::Anonymous,
+                secret_ref: None,
+                managed_by: ManagedBy::GitOps,
+                managed_by_digest: Some([7u8; 32]),
+                insecure_upstream_url: spec.insecure_upstream_url,
+                trust_upstream_publish_time: false,
+                mtls_cert_ref: spec.mtls_cert_ref,
+                mtls_key_ref: spec.mtls_key_ref,
+                ca_bundle_ref: spec.ca_bundle_ref,
+                pinned_cert_sha256: spec.pinned_cert_sha256,
+                created_at: now,
+                updated_at: now,
+            })?;
+            Ok(mapping)
+        }
+
+        fn bundle(&self) -> DesiredState {
+            DesiredState {
+                repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+                upstream_mappings: vec![self.mapping_env()],
+                ..Default::default()
+            }
+        }
+    }
+
+    /// Every combination the Stage-3 constructor rejects is rejected by the
+    /// pre-write pass, which therefore never reaches a write.
+    #[tokio::test]
+    async fn preflight_rejects_every_tls_combination_the_constructor_rejects() {
+        let cases = [
+            TlsCase {
+                name: "cert without key",
+                plaintext: false,
+                mtls_cert: true,
+                mtls_key: false,
+                ca_bundle: false,
+                pin: None,
+            },
+            TlsCase {
+                name: "key without cert",
+                plaintext: false,
+                mtls_cert: false,
+                mtls_key: true,
+                ca_bundle: false,
+                pin: None,
+            },
+            TlsCase {
+                name: "mTLS pair on a plaintext upstream",
+                plaintext: true,
+                mtls_cert: true,
+                mtls_key: true,
+                ca_bundle: false,
+                pin: None,
+            },
+            TlsCase {
+                name: "CA bundle on a plaintext upstream",
+                plaintext: true,
+                mtls_cert: false,
+                mtls_key: false,
+                ca_bundle: true,
+                pin: None,
+            },
+            TlsCase {
+                name: "pin on a plaintext upstream",
+                plaintext: true,
+                mtls_cert: false,
+                mtls_key: false,
+                ca_bundle: false,
+                pin: Some(VALID_PIN),
+            },
+            TlsCase {
+                name: "pin that is not 64 hex chars",
+                plaintext: false,
+                mtls_cert: false,
+                mtls_key: false,
+                ca_bundle: false,
+                pin: Some("deadbeef"),
+            },
+            TlsCase {
+                name: "pin with an uppercase hex digit",
+                plaintext: false,
+                mtls_cert: false,
+                mtls_key: false,
+                ca_bundle: false,
+                pin: Some("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"),
+            },
+        ];
+
+        for case in cases {
+            // The Stage-3 authority still rejects — the pre-write row is a
+            // mirror, not a replacement.
+            assert!(
+                case.constructor_result().is_err(),
+                "`{}` must be rejected by RepositoryUpstreamMapping::new — if the \
+                 constructor accepts it, this corpus entry no longer describes a \
+                 late rejection",
+                case.name
+            );
+            let h = build_harness();
+            let Err(err) = h.uc.preflight_validate(&case.bundle(), &env_oidc()).await else {
+                panic!(
+                    "`{}` reaches the apply's third stage and is refused there, so the \
+                     pre-write pass must refuse it too — otherwise the Stage-1 and \
+                     Stage-2 rows of the same bundle are already written when it does",
+                    case.name
+                )
+            };
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Validation(_))),
+                "`{}` must surface as a park-eligible Validation error, got {err:?}",
+                case.name
+            );
+        }
+    }
+
+    /// And every combination the constructor accepts stays accepted: a
+    /// mirror that over-rejects would refuse configurations the apply would
+    /// have taken, which is as much a defect as the gap it closes.
+    #[tokio::test]
+    async fn preflight_accepts_every_tls_combination_the_constructor_accepts() {
+        let cases = [
+            TlsCase {
+                name: "no TLS material at all",
+                plaintext: false,
+                mtls_cert: false,
+                mtls_key: false,
+                ca_bundle: false,
+                pin: None,
+            },
+            TlsCase {
+                name: "custom CA alone",
+                plaintext: false,
+                mtls_cert: false,
+                mtls_key: false,
+                ca_bundle: true,
+                pin: None,
+            },
+            TlsCase {
+                name: "pin alone",
+                plaintext: false,
+                mtls_cert: false,
+                mtls_key: false,
+                ca_bundle: false,
+                pin: Some(VALID_PIN),
+            },
+            TlsCase {
+                name: "complete mTLS pair",
+                plaintext: false,
+                mtls_cert: true,
+                mtls_key: true,
+                ca_bundle: false,
+                pin: None,
+            },
+            TlsCase {
+                name: "full https combination",
+                plaintext: false,
+                mtls_cert: true,
+                mtls_key: true,
+                ca_bundle: true,
+                pin: Some(VALID_PIN),
+            },
+            TlsCase {
+                name: "plaintext upstream with no TLS material",
+                plaintext: true,
+                mtls_cert: false,
+                mtls_key: false,
+                ca_bundle: false,
+                pin: None,
+            },
+        ];
+
+        for case in cases {
+            assert!(
+                case.constructor_result().is_ok(),
+                "`{}` must be accepted by RepositoryUpstreamMapping::new",
+                case.name
+            );
+            let h = build_harness();
+            h.uc.preflight_validate(&case.bundle(), &env_oidc())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "`{}` is accepted by the Stage-3 constructor, so the pre-write \
+                         mirror must accept it too; got {e:?}",
+                        case.name
+                    )
+                });
+        }
+    }
+
+    /// The acceptance shape: an invalid TLS combination on a changed
+    /// upstream mapping, in the same bundle as a loosening scan policy.
+    /// Nothing is written — the policy projection is untouched, so the
+    /// operator is never left with the loosening committed and the rest
+    /// refused.
+    #[tokio::test]
+    async fn invalid_upstream_tls_beside_a_loosening_scan_policy_writes_nothing() {
+        // Loosened on all three axes an operator would notice: findings are
+        // recorded instead of blocking, approval is no longer required, and
+        // only `critical` counts.
+        let mut loosened = scan_policy_env("relaxed");
+        loosened.spec.enforcement = "record".into();
+        loosened.spec.require_approval = false;
+        loosened.spec.severity_threshold = "critical".into();
+
+        // Positive control: on its own the loosening policy DOES land, so
+        // the "nothing written" assertions below cannot pass vacuously.
+        let control = build_harness();
+        control
+            .uc
+            .apply(
+                DesiredState {
+                    repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+                    scan_policies: vec![loosened.clone()],
+                    ..Default::default()
+                },
+                env_oidc(),
+            )
+            .await
+            .expect("the loosening policy alone must apply cleanly");
+        assert!(
+            !control.events.appended().is_empty(),
+            "positive control: applying the loosening policy must append policy events"
+        );
+        assert!(!control.repos.calls().is_empty());
+
+        // Same policy, now beside a mapping the Stage-3 constructor would
+        // refuse (half an mTLS pair).
+        let mut bad_mapping = upstream_mapping_env(
+            "oci-mirror-dockerhub",
+            "oci-mirror-e2e",
+            "dockerhub/",
+            "https://registry-1.docker.io",
+        );
+        bad_mapping.spec.mtls_cert_ref = Some(secret_ref("CLIENT_CERT"));
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+            upstream_mappings: vec![bad_mapping],
+            scan_policies: vec![loosened],
+            ..Default::default()
+        };
+
+        let h = build_harness();
+        let err =
+            h.uc.apply(desired.clone(), env_oidc())
+                .await
+                .expect_err("a half mTLS pair must fail the apply");
+        assert!(matches!(err, AppError::Domain(DomainError::Validation(_))));
+        assert!(
+            h.events.appended().is_empty(),
+            "the loosening scan policy must NOT have been written: {:?}",
+            h.events.appended().len()
+        );
+        assert!(
+            h.repos.calls().is_empty(),
+            "no repository row may be written either: {:?}",
+            h.repos.calls()
+        );
+        assert_eq!(h.upstream.entry_count(), 0);
+
+        // And the boot preflight reaches the same verdict, so the pod parks
+        // not-ready instead of crashlooping on a half-applied bundle.
+        h.uc.preflight_validate(&desired, &env_oidc())
+            .await
+            .expect_err("the boot preflight must refuse the same bundle");
+    }
 }

@@ -28,4 +28,5 @@ A new field on `PrefetchPolicy` / `ScanPolicy` / `RetentionPolicy` / `Repository
 ## References
 
 - `crates/hort-app/src/use_cases/` — `ApplyConfigUseCase` linter.
+- `docs/architecture/reference/apply-time-linter-rows.md` — every named row this decision produced, each missing-control row's retirement trigger, and (separately) where the surfaces with no named row are validated. The second half is load-bearing: "no rule key" must not be read as "no check", or the next field placed in neither bucket passes review unseen.
 - The architect skill → anti-patterns *policy field accepted at apply, inert at runtime* and *operator-config naming hazard*.

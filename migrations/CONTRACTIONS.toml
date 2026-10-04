@@ -89,3 +89,52 @@ itself for roughly 22 minutes and could not roll forward or back on its own.
 Waiting one release — dropping the column in 0.12.1 — would have cost nothing
 and prevented all of it.
 """
+
+# ---------------------------------------------------------------------------
+# Scheduled contractions — declared here in prose, not as `[[contraction]]`
+# entries, because the guard's checks are about migrations that EXIST.
+#
+# An entry naming a migration that is not in the tree yet fails check (a)
+# ("entry names migration X, which does not exist under migrations/"), and so
+# does an entry whose migration carries no destructive DDL the scanner
+# recognises. So a contraction that is correctly deferred to a later release
+# cannot be recorded as an entry — it is recorded as a comment, and becomes an
+# entry in the same diff as the migration that performs it.
+#
+# Keep each item here until its migration lands. Dropping one silently is how
+# a deferred contraction becomes a forgotten one.
+# ---------------------------------------------------------------------------
+#
+# ## artifacts.quarantine_status — narrow the CHECK to the storable set
+#
+#   target release:  0.14.3   (reference_removed_in = "0.14.2")
+#   shape:           ALTER TABLE public.artifacts
+#                        DROP CONSTRAINT artifacts_quarantine_status_check;
+#                    ALTER TABLE public.artifacts
+#                        ADD CONSTRAINT artifacts_quarantine_status_check CHECK (
+#                            quarantine_status IN ('quarantined', 'released',
+#                                                  'rejected', 'scan_indeterminate')
+#                        );
+#
+# The CHECK declared inline in `003_artifacts_cas.sql` admits three
+# prototype-era scan states — `unscanned`, `clean`, `flagged` — that
+# `QuarantineStatus` cannot parse and no writer in this tree produces (the
+# stored spelling of `QuarantineStatus::None` is SQL NULL, not a literal).
+# `030_artifacts_quarantine_status_legacy_backfill.sql` replaces them in the
+# data with the held state (`'quarantined'` plus a window anchor) in 0.14.2;
+# this narrowing stops the column from accepting them again.
+#
+# Why 0.14.3 and not 0.14.2: `purge_gc::map_status` named all three literals
+# up to and including 0.14.2, so by the policy's own arithmetic the narrowing
+# ships one release later. `003`'s inline CHECK cannot be edited in place —
+# `sqlx::migrate!` validates the checksum of every applied migration, so any
+# edit makes a migrated database refuse to boot (see
+# `018_jobs_kind_oci_edge_backfill.sql` for the same constraint and the same
+# DROP + re-ADD shape).
+#
+# Note for whoever lands it: `expand_contract_guard`'s scanner does NOT treat
+# `DROP CONSTRAINT` as destructive DDL (deliberately — a constraint is not an
+# identifier old code names), and `no_sensitive_drops` exempts a same-name
+# `_check` DROP + re-ADD, so neither guard will ask for a manifest entry. That
+# is why this note exists: the guard cannot be the reminder, and this file is
+# where a reader looks.

@@ -396,8 +396,24 @@ connection without `#[serial(hort_pg_db)]`, with no allow-list),
 `DATABASE_URL` read. A DB-gated fixture only reaches a connect because the
 variable was set, so a swallowed connect error is a configured database that
 did not work being reported as no database at all, and the test then says `ok`
-without having run) are pure source-/fixture-scan
-guards — no database, sub-second — enforcing structural invariants that a
+without having run), `status_decode_fails_closed` (the same hazard class
+carried from a discarded Postgres *connect* to a discarded
+quarantine-**status** read or decode: rejects `.ok()` / `unwrap_or*` wherever
+the receiver it throws away or the fallback it substitutes names the
+quarantine status. `QuarantineStatus::None` is the most permissive state in
+the system — `Artifact::is_downloadable` admits it and the default
+`ReleasedOnly` index mode serves it — AND the state a swallowed decode
+naturally defaults to, so a discarded error there does not degrade a serving
+decision, it inverts it. The predicate is receiver-scoped rather than
+statement-scoped, which is what lets it run with **no allow-list**: a
+discarded *artifact load* beside a status read, or a fallback on the field
+next to a status cell, are not hits. Carries a counter-assertion that the
+corpus is real, that the one codec
+(`hort_adapters_postgres::quarantine_status_sql`) still defines both halves of
+its encode/decode pair, and that the read paths still decode through it — so a
+rename cannot make the scan vacuously green. Same blind spot as its siblings:
+a decode reached through a differently-named local helper) are pure
+source-/fixture-scan guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`
 now runs every `tests/` target automatically, a new DB-free structural guard

@@ -129,7 +129,8 @@ pub struct UpstreamMappingSpec {
     /// Reference to a SecretPort-resolved PEM-encoded mTLS client
     /// certificate the proxy adapter presents on the outbound TLS
     /// handshake. Pairs with [`Self::mtls_key_ref`]: both must be set
-    /// together or neither.
+    /// together or neither, and either requires an `https://`
+    /// [`Self::upstream_url`] — see [`validate_upstream_mapping`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtls_cert_ref: Option<SecretRef>,
     /// Reference to a SecretPort-resolved PEM-encoded mTLS client
@@ -142,9 +143,10 @@ pub struct UpstreamMappingSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_bundle_ref: Option<SecretRef>,
     /// Pinned SHA-256 thumbprint of the upstream's leaf certificate
-    /// (DER bytes), as a 64-character lowercase hex string. Validated
-    /// at value-object construction time; schema CHECK mirrors the same
-    /// regex.
+    /// (DER bytes), as a 64-character lowercase hex string. Checked by
+    /// [`validate_upstream_mapping`] (pre-write, so the apply refuses the
+    /// bundle before writing anything) and again at value-object
+    /// construction time; the schema CHECK mirrors the same regex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_cert_sha256: Option<String>,
 }
@@ -252,6 +254,94 @@ fn validate_upstream_name_prefix(prefix: &str) -> Option<String> {
     None
 }
 
+/// Gitops-side mirror of the TLS-field invariants enforced by
+/// `RepositoryUpstreamMapping::new`
+/// (`crates/hort-domain/src/ports/repository_upstream_mapping_repository.rs`).
+/// Returns one error per violated invariant (collect-all, like the rest of
+/// this validator).
+///
+/// The rejection set is exactly the constructor's: half an mTLS pair, any
+/// TLS field on a non-`https://` upstream, and a `pinnedCertSha256` that is
+/// not 64 lowercase hex characters. A custom CA alone, a pin alone and the
+/// full https combination stay **accepted** — the constructor accepts them,
+/// and a mirror that rejected more would refuse configurations the apply
+/// would have taken. The constructor keeps enforcing all three at the
+/// value-object boundary; this row only makes the same verdict reachable
+/// before the first write.
+///
+/// `https`-ness is decided by the same `https://` prefix test the
+/// `upstreamUrl` rule uses, not by a URL parse: on the set of URLs this
+/// validator admits (one of the two prefixes — checked above) the prefix
+/// and the parsed scheme agree, and `hort-config` deliberately carries no
+/// `url` dependency.
+///
+/// Like [`validate_upstream_name_prefix`], this is a hand-maintained
+/// mirror, so the drift it can suffer is a YAML that validates clean and
+/// then fails inside the constructor — the very failure mode the mirror
+/// exists to remove. What holds the two in sync is a corpus that drives
+/// both ends from one case list:
+/// `preflight_rejects_every_tls_combination_the_constructor_rejects` and
+/// `preflight_accepts_every_tls_combination_the_constructor_accepts` in
+/// `hort-app`'s `apply_config_use_case::upstream_mappings` tests assert
+/// agreement in both directions, so a rule changed on one side alone
+/// fails them.
+fn validate_tls_material(spec: &UpstreamMappingSpec, name: &str) -> Vec<ValidationError> {
+    let kind = Kind::UpstreamMapping;
+    let mut errors = Vec::new();
+
+    // 1. The mTLS pair is all-or-nothing: no usable rustls client config
+    //    can be built from half of it.
+    if spec.mtls_cert_ref.is_some() != spec.mtls_key_ref.is_some() {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: "spec.mtlsCertRef and spec.mtlsKeyRef must be set together: supply \
+                     both PEM references for outbound mTLS, or neither."
+                .into(),
+        });
+    }
+
+    // 2. TLS material on a plaintext upstream is incoherent — a pinned
+    //    certificate is never presented and a private CA is never consulted
+    //    on a connection that performs no TLS handshake, so the operator
+    //    believes a control is in force that cannot be.
+    let any_tls_field = spec.mtls_cert_ref.is_some()
+        || spec.mtls_key_ref.is_some()
+        || spec.ca_bundle_ref.is_some()
+        || spec.pinned_cert_sha256.is_some();
+    if any_tls_field && !spec.upstream_url.starts_with("https://") {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "spec carries mTLS / CA-bundle / cert-pinning material but \
+                 spec.upstreamUrl `{}` is not https — these fields require https. \
+                 Switch the upstream to https:// or drop the TLS fields.",
+                spec.upstream_url
+            ),
+        });
+    }
+
+    // 3. A pin is the raw SHA-256 of the leaf certificate's DER bytes:
+    //    exactly 64 lowercase hex characters. The schema CHECK mirrors the
+    //    same shape as defence-in-depth.
+    if let Some(pin) = spec.pinned_cert_sha256.as_deref() {
+        if pin.len() != 64 || !pin.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) {
+            errors.push(ValidationError::Invalid {
+                kind,
+                name: name.to_string(),
+                detail: format!(
+                    "spec.pinnedCertSha256 must be exactly 64 lowercase hex characters \
+                     (SHA-256 of the leaf certificate's DER bytes); got `{pin}` ({} chars)",
+                    pin.len()
+                ),
+            });
+        }
+    }
+
+    errors
+}
+
 /// Per-spec validation. Returns every violation rather than first-wins.
 pub fn validate_upstream_mapping(env: &Envelope<UpstreamMappingSpec>) -> Vec<ValidationError> {
     let mut errors = Vec::new();
@@ -334,6 +424,17 @@ pub fn validate_upstream_mapping(env: &Envelope<UpstreamMappingSpec>) -> Vec<Val
             });
         }
     }
+
+    // TLS-material coherence — mirrors the three TLS invariants in the
+    // domain constructor `RepositoryUpstreamMapping::new`, for the same
+    // reason `validate_upstream_name_prefix` is mirrored above: the
+    // constructor runs in the apply's third stage, *after* the repository
+    // and policy rows of the same bundle have been written, so a rejection
+    // reachable only there leaves a partial apply behind — a refused
+    // tightening next to a committed loosening. All three rules are
+    // decidable from one envelope, so per-spec validation is the earliest
+    // place the verdict exists and the only one that is provably pre-write.
+    errors.extend(validate_tls_material(&env.spec, &name));
 
     let auth_type = env.spec.auth.r#type.as_str();
     if !AUTH_VARIANTS.contains(&auth_type) {
@@ -968,5 +1069,213 @@ spec:
         // Wrong kind fails at deserialize because the spec shape doesn't
         // fit. The exact variant is not pinned; what matters is rejection.
         assert!(matches!(err, ParseError::Yaml(_)));
+    }
+
+    // -- TLS material (mirror of `RepositoryUpstreamMapping::new`) ------
+    //
+    // The three invariants the domain constructor enforces, mirrored at
+    // per-spec validation so the verdict is reachable before the apply's
+    // first write. The accept cases are as load-bearing as the rejects: a
+    // mirror that rejected more than the constructor would refuse
+    // configurations the apply would have taken.
+
+    /// Half an mTLS pair (cert without key) is rejected.
+    #[test]
+    fn validate_rejects_mtls_cert_without_key() {
+        let body = "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  mtlsCertRef:
+    source: env_var
+    location: CLIENT_CERT
+";
+        let env = parse_upstream_mapping(&p(), yaml("u", body).as_bytes()).unwrap();
+        let errs = validate_upstream_mapping(&env);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("mtlsCertRef and spec.mtlsKeyRef")),
+            "got: {errs:?}"
+        );
+    }
+
+    /// The other half of the pair (key without cert) is rejected too.
+    #[test]
+    fn validate_rejects_mtls_key_without_cert() {
+        let body = "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  mtlsKeyRef:
+    source: env_var
+    location: CLIENT_KEY
+";
+        let env = parse_upstream_mapping(&p(), yaml("u", body).as_bytes()).unwrap();
+        let errs = validate_upstream_mapping(&env);
+        assert!(
+            errs.iter()
+                .any(|e| e.to_string().contains("mtlsCertRef and spec.mtlsKeyRef")),
+            "got: {errs:?}"
+        );
+    }
+
+    /// The complete pair on an https upstream validates clean.
+    #[test]
+    fn validate_accepts_complete_mtls_pair_on_https() {
+        let body = "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  mtlsCertRef:
+    source: env_var
+    location: CLIENT_CERT
+  mtlsKeyRef:
+    source: env_var
+    location: CLIENT_KEY
+";
+        let env = parse_upstream_mapping(&p(), yaml("u", body).as_bytes()).unwrap();
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "a complete mTLS pair on https is exactly what the field is for"
+        );
+    }
+
+    /// Every TLS field is rejected on an opted-in plaintext upstream —
+    /// one case per field, because "any TLS field" is the rule and a
+    /// single-field test would not pin the others.
+    #[test]
+    fn validate_rejects_every_tls_field_on_plaintext_upstream() {
+        let pin = "a".repeat(64);
+        let tls_blocks = [
+            "  mtlsCertRef:\n    source: env_var\n    location: CLIENT_CERT\n  \
+             mtlsKeyRef:\n    source: env_var\n    location: CLIENT_KEY\n"
+                .to_string(),
+            "  caBundleRef:\n    source: env_var\n    location: CA_PEM\n".to_string(),
+            format!("  pinnedCertSha256: {pin}\n"),
+        ];
+        for tls in tls_blocks {
+            let body = format!(
+                "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: http://x.example.com
+  insecureUpstreamUrl: true
+  auth:
+    type: anonymous
+{tls}"
+            );
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let errs = validate_upstream_mapping(&env);
+            assert!(
+                errs.iter().any(|e| e.to_string().contains("require https")),
+                "TLS material on a plaintext upstream must be rejected; block:\n{tls}\ngot: {errs:?}"
+            );
+        }
+    }
+
+    /// A CA bundle alone, and a pin alone, are both legitimate on an
+    /// https upstream: neither needs mTLS.
+    #[test]
+    fn validate_accepts_ca_bundle_alone_and_pin_alone_on_https() {
+        let body_ca = "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  caBundleRef:
+    source: env_var
+    location: CA_PEM
+";
+        let env = parse_upstream_mapping(&p(), yaml("u", body_ca).as_bytes()).unwrap();
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "a private CA without a client cert is the common operator shape"
+        );
+
+        let pin = "0123456789abcdef".repeat(4);
+        let body_pin = format!(
+            "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  pinnedCertSha256: {pin}
+"
+        );
+        let env = parse_upstream_mapping(&p(), yaml("u", &body_pin).as_bytes()).unwrap();
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "pinning without mTLS is defence-in-depth on CA trust, not an error"
+        );
+    }
+
+    /// A pin that is not exactly 64 lowercase hex characters is rejected:
+    /// too short, too long, uppercase, and a non-hex character.
+    #[test]
+    fn validate_rejects_malformed_pin() {
+        let cases = [
+            "deadbeef",
+            &"a".repeat(65),
+            &"A".repeat(64),
+            &format!("{}z", "a".repeat(63)),
+        ];
+        for pin in cases {
+            let body = format!(
+                "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  pinnedCertSha256: {pin}
+"
+            );
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let errs = validate_upstream_mapping(&env);
+            assert!(
+                errs.iter()
+                    .any(|e| e.to_string().contains("pinnedCertSha256")),
+                "pin `{pin}` must be rejected; got: {errs:?}"
+            );
+        }
+    }
+
+    /// The full https combination — mTLS pair + custom CA + pin — is the
+    /// documented maximal shape and must validate clean.
+    #[test]
+    fn validate_accepts_full_https_tls_combination() {
+        let pin = "0123456789abcdef".repeat(4);
+        let body = format!(
+            "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: anonymous
+  mtlsCertRef:
+    source: env_var
+    location: CLIENT_CERT
+  mtlsKeyRef:
+    source: env_var
+    location: CLIENT_KEY
+  caBundleRef:
+    source: env_var
+    location: CA_PEM
+  pinnedCertSha256: {pin}
+"
+        );
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "the maximal https TLS combination must stay accepted"
+        );
     }
 }

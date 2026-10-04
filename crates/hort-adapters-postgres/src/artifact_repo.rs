@@ -14,6 +14,7 @@ use hort_domain::types::{ContentHash, LimitedList, Page, PageRequest, LIMIT_LIST
 
 use crate::event_store::{PgEventStore, PgUnitOfWork};
 use crate::mappers::ArtifactRow;
+use crate::quarantine_status_sql::{quarantine_status_from_sql, quarantine_status_to_sql};
 use crate::{map_sqlx_error, BoxFuture};
 
 /// PostgreSQL implementation of [`ArtifactRepository`].
@@ -706,10 +707,14 @@ impl ArtifactRepository for PgArtifactRepository {
             let mut triples: Vec<(String, QuarantineStatus, Option<DateTime<Utc>>)> =
                 Vec::with_capacity(rows.len());
             for (version, status_str) in rows {
-                let status = status_str
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(QuarantineStatus::None);
+                // Fail closed. This is the read the index-serve filter
+                // decides on, so a substituted status is a serving
+                // decision the data did not authorise: the whole
+                // response fails rather than advertise a version whose
+                // state could not be read.
+                let status = quarantine_status_from_sql(status_str.as_deref(), || {
+                    format!("package_version_status({repository_id}, {pkg:?}, {version:?})")
+                })?;
                 triples.push((version, status, None));
             }
             Ok(triples)
@@ -754,10 +759,13 @@ impl ArtifactRepository for PgArtifactRepository {
             let mut triples: Vec<(String, QuarantineStatus, Option<DateTime<Utc>>)> =
                 Vec::with_capacity(rows.len());
             for (version, status_str, anchor) in rows {
-                let status = status_str
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(QuarantineStatus::None);
+                // Fail closed, same reasoning as
+                // `package_version_status` above: Discovery renders a
+                // per-version availability verdict from this read, and
+                // a substituted status renders the permissive one.
+                let status = quarantine_status_from_sql(status_str.as_deref(), || {
+                    format!("package_version_anchors({repository_id}, {pkg:?}, {version:?})")
+                })?;
                 triples.push((version, status, anchor));
             }
             Ok(triples)
@@ -1135,10 +1143,7 @@ impl PgArtifactRepository {
         artifact: &Artifact,
     ) -> DomainResult<()> {
         tracing::debug!(entity = "Artifact", id = %artifact.id, "save_in_tx");
-        let quarantine_str = match artifact.quarantine_status {
-            QuarantineStatus::None => None,
-            other => Some(other.to_string()),
-        };
+        let quarantine_str = quarantine_status_to_sql(artifact.quarantine_status);
         let storage_key = artifact.sha256_checksum.as_ref();
 
         bind_artifact_params(
@@ -1202,12 +1207,8 @@ impl PgArtifactRepository {
             id = %artifact_id,
             "save_verdict_status_in_tx"
         );
-        let to_sql = |s: QuarantineStatus| match s {
-            QuarantineStatus::None => None,
-            other => Some(other.to_string()),
-        };
-        let quarantine_str = to_sql(quarantine_status);
-        let prior_str = to_sql(prior_status);
+        let quarantine_str = quarantine_status_to_sql(quarantine_status);
+        let prior_str = quarantine_status_to_sql(prior_status);
 
         let (existed, updated): (bool, bool) = sqlx::query_as(
             "WITH existing AS (

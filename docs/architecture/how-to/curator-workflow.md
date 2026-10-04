@@ -325,6 +325,15 @@ When you exclude a CVE:
 So a single `exclude-finding` call can release **multiple artifacts**
 across multiple repositories in one cascade.
 
+**An exclusion cannot be narrowed to one repository.** `scope` takes
+only `global`; a repository scope is refused by both writers (the
+`POST` and the gitops apply), because the finding filter never reads it
+— so such an exclusion would act globally while reading as narrowed.
+The two ways to bound the blast radius are real: `package_pattern`
+(§3.3), and scoping the **parent `ScanPolicy`** to the repository you
+mean and hanging the exclusion off that policy. A policy scope *is*
+enforced.
+
 ### 3.2 The audit chain
 
 The cascade is **fully reconstructable** after the fact. The event

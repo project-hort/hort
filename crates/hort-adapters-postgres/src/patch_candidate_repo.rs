@@ -19,6 +19,7 @@ use hort_domain::ports::patch_candidate_repository::{
     PatchCandidate, PatchCandidateFilter, PatchCandidateRepository,
 };
 
+use crate::quarantine_status_sql::quarantine_status_from_sql;
 use crate::BoxFuture;
 
 /// PostgreSQL adapter for the patch-candidate surface.
@@ -110,10 +111,10 @@ impl PatchCandidateRepository for PgPatchCandidateRepository {
 /// `quarantined_status` is read as `Option<String>` because the
 /// underlying column is `varchar(20) NULL` per migration 003. The
 /// outer filter pins it to the literal `'quarantined'`, but the
-/// adapter still parses through [`QuarantineStatus::from_str`] to keep
-/// the mapping semantically honest — a future migration that loosens
-/// the outer filter would otherwise silently hardcode `Quarantined`
-/// here.
+/// adapter still decodes through the crate's one status codec
+/// (`quarantine_status_sql`) to keep the mapping semantically honest —
+/// a future migration that loosens the outer filter would otherwise
+/// silently hardcode `Quarantined` here.
 #[derive(sqlx::FromRow)]
 struct PatchCandidateRow {
     quarantined_artifact_id: Uuid,
@@ -147,19 +148,18 @@ impl PatchCandidateRow {
         // we want the mapper to fail loudly rather than silently
         // produce a misleading status. Do not remove this arm without
         // first making the SQL predicate enforce non-NULL another way.
-        let quarantined_status = match self.quarantined_status.as_deref() {
-            Some(s) => s.parse::<QuarantineStatus>().map_err(|_| {
-                DomainError::Invariant(format!(
-                    "unknown quarantine_status in patch_candidate_repo row: {s}"
-                ))
-            })?,
-            None => {
-                return Err(DomainError::Invariant(format!(
-                    "patch_candidate_repo row {} has NULL quarantine_status",
-                    self.quarantined_artifact_id
-                )));
-            }
-        };
+        let quarantined_status =
+            match quarantine_status_from_sql(self.quarantined_status.as_deref(), || {
+                format!("patch_candidate_repo row {}", self.quarantined_artifact_id)
+            })? {
+                QuarantineStatus::None => {
+                    return Err(DomainError::Invariant(format!(
+                        "patch_candidate_repo row {} has NULL quarantine_status",
+                        self.quarantined_artifact_id
+                    )));
+                }
+                other => other,
+            };
 
         // `RepositoryFormat::from_str` is infallible — unknown literals
         // round-trip as `Other(s)`. The SQL filter excludes `'oci'`,

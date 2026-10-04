@@ -188,23 +188,37 @@ impl ApplyConfigUseCase {
             }
             let artifacts = active_list.items;
 
+            // The curation format gate needs the repository's format on
+            // the coords. `list_active_for_repo(repo_id)` returns only
+            // this repository's artifacts, so every row in the loop below
+            // resolves the same format — read it once per repository
+            // rather than once per artifact.
+            let repo_format = self.repositories.find_by_id(repo_id).await?.format;
+
             let mut retro_warn = 0usize;
             let mut retro_block = 0usize;
 
             for artifact in artifacts {
+                // Pair the page's artifact row with the version a
+                // `RetroBlock` would append under, before the per-repo
+                // `CurationApplied` append below — that append is a round
+                // trip during which a verdict can commit to THIS
+                // artifact's stream. See `ArtifactAtVersion`'s contract.
+                //
+                // The row itself is as old as the page it came from and
+                // the pairing does not refresh it: refreshing would change
+                // what the retroactive pass decides.
+                let paired =
+                    ArtifactAtVersion::pair(&*self.events, artifact, OverCapStream::Tolerate)
+                        .await
+                        .map_err(map_concurrent_modification)?;
+                let artifact = paired.artifact();
                 let coords = hort_domain::types::ArtifactCoords {
                     name: artifact.name.clone(),
                     name_as_published: artifact.name_as_published.clone(),
                     version: artifact.version.clone(),
                     path: artifact.path.clone(),
-                    // `Artifact` carries the repository's format, but we
-                    // need it on the coords for the format-gate; resolve
-                    // via the repository row.
-                    format: self
-                        .repositories
-                        .find_by_id(artifact.repository_id)
-                        .await?
-                        .format,
+                    format: repo_format.clone(),
                     metadata: serde_json::Value::Null,
                 };
 
@@ -272,7 +286,7 @@ impl ApplyConfigUseCase {
                         .await
                         .map_err(map_concurrent_modification)?;
                         self.commit_retroactive_block(
-                            artifact,
+                            paired,
                             rule_id,
                             reason.clone(),
                             actor.clone(),
@@ -335,7 +349,7 @@ impl ApplyConfigUseCase {
         // aggregate — both ingest-time `Warn` decisions and every
         // retroactive-evaluation hit over the repository's whole
         // lifetime land here, so it is NOT bounded like a per-artifact
-        // stream. `read_expected_version`'s capped forward-scan is only
+        // stream. `read_unpaired_append_version`'s capped forward-scan is only
         // correct for a bounded stream (see its doc); this append also
         // protects no decision made from the stream's content (a
         // generic single-event audit append), so it uses
@@ -374,17 +388,29 @@ impl ApplyConfigUseCase {
     /// Commit the artifact-stream side of a `RetroBlock`. Atomic —
     /// `commit_transition` writes the artifact-state mutation AND the
     /// `ArtifactRejected` event in one transaction.
+    ///
+    /// Takes the pairing rather than a bare artifact: the
+    /// `ExpectedVersion` has to be the one fixed when this artifact
+    /// entered the pass, not one read here. The per-repo
+    /// `CurationApplied` append the caller makes in between is a round
+    /// trip during which a verdict can commit to the artifact stream —
+    /// and `reject_from_retroactive_curation` decides from the status the
+    /// page load observed, so a version read here would already contain
+    /// that verdict and the re-hold would commit over it.
     async fn commit_retroactive_block(
         &self,
-        mut artifact: hort_domain::entities::artifact::Artifact,
+        mut paired: ArtifactAtVersion,
         rule_id: Uuid,
         reason: String,
         actor: Actor,
     ) -> AppResult<()> {
-        let stream_id = StreamId::artifact(artifact.id);
-        let expected_version = read_expected_version(&*self.events, &stream_id, false).await?;
-        let artifact_id = artifact.id;
-        let reject_event = artifact.reject_from_retroactive_curation(rule_id, reason)?;
+        let stream_id = paired.stream_id().clone();
+        let expected_version = paired.expected_version();
+        let artifact_id = paired.artifact().id;
+        let reject_event = paired
+            .artifact_mut()
+            .reject_from_retroactive_curation(rule_id, reason)?;
+        let artifact = paired.into_artifact();
         self.artifact_lifecycle
             .commit_transition(
                 &artifact,

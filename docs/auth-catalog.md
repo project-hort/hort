@@ -81,7 +81,7 @@ Part II(3) effectiveness into the catalog's done-criteria.
 
 - **Credential form:** `hort_pat_*` bearer; Argon2id-hashed at rest.
 - **Purpose / allowed use:** long-lived static automation credential for human-owned tooling.
-- **Restrictions & caps:** under-privileged — never consults `claim_mappings` (ADR 0012); admin only under `HORT_TOKEN_ALLOW_ADMIN=true` + global Admin grant + ≤30 d clamp (`crates/hort-app/src/use_cases/api_token_use_case.rs`); effective authority = `user_grants AND cap`. Excluded from amplification surfaces — see the CliSession `Restrictions` row below.
+- **Restrictions & caps:** under-privileged — never consults `claim_mappings` (ADR 0012); admin only under `HORT_TOKEN_ALLOW_ADMIN=true` + global Admin grant + ≤30 d clamp (`crates/hort-app/src/use_cases/api_token_use_case.rs`); effective authority = `user_grants AND cap`. Excluded from amplification surfaces — see the CliSession `Restrictions` row below. **Exception — the reserved `bootstrap-admin` identity is outside this entry entirely.** The ≤30 d window above is for a steady-state human-owned credential; the break-glass identity is not one. No request-path route issues a token owned by `bootstrap-admin`: the shared issuance gates refuse it (`run_issuance_gates` → `ApiTokenError::BootstrapAdminMintForbidden`, `403 bootstrap_admin_mint_forbidden`), so self-mint cannot turn the ≤1 h break-glass PAT into a 1–30 day standing full-admin PAT. Its only mint path is the DSN-gated `admin bootstrap-session` CLI (see the bootstrap-session note under Entry 9), which clamps to ≤1 h and revokes **every** live token of that principal on the next run. Decided 2026-10-03 (Tom): ADR 0038 governs a bootstrap-derived PAT. The composition is registered on the credential-authority axis of the cross-opt-in interaction matrix (ADR 0016).
 - **Protection:** at rest — Argon2id; in transit — TLS, plaintext shown once; blast-radius — cap-leg AND; no `users.claims`/`api_tokens.claims`.
 - **Allowed call paths / surfaces:** all API surfaces via `Authorization: Bearer` or as a Basic carrier (Entry 8).
 - **Enforcement owner:** `Hort-enforced`.
@@ -198,7 +198,35 @@ group→`admin` `ClaimMapping`, or when the IdP is down; steady-state
 human admin is IdP-backed (OIDC → CliSession, Entries 1/3). It is the
 **only** no-IdP / first-admin admin path; service accounts are strictly
 non-admin (Entry 4). Canonical decision: **ADR 0038** (admin-identity
-model). This is the only admin-identity *creation* in the CLI; it is
+model).
+
+Two properties of this path are **load-bearing together**, and neither
+may be relaxed on its own — the ≤1 h clamp only bounds anything if it
+bounds what the credential can *reach*:
+
+1. **The break-glass identity cannot be issued a request-path token.**
+   The shared issuance gates
+   (`ApiTokenUseCase::run_issuance_gates`) refuse any issuance whose
+   token owner is the reserved `bootstrap-admin` user —
+   `ApiTokenError::BootstrapAdminMintForbidden` → `403
+   bootstrap_admin_mint_forbidden`. Without it, `HORT_TOKEN_ALLOW_ADMIN`
+   on this CLI plus the same variable on the server process composed into
+   a 30-day standing full-admin PAT minted from a one-hour break-glass
+   credential (Entry 2's exception; ADR 0016's credential-authority
+   axis). The refusal is anchored on the token's **owner**, not on the
+   route, so a future issuance route inherits it. The gate keys on
+   `users.username` — `UNIQUE`, and not writable by any application
+   surface — via
+   `hort_app::use_cases::api_token_use_case::BOOTSTRAP_ADMIN_USERNAME`,
+   the same constant this CLI reserves.
+2. **Rotation revokes by principal, across every page.** Each run
+   revokes *every* live token owned by `bootstrap-admin`, not the one
+   matching the reserved name `bootstrap-session`. A token name is
+   operator-chosen and says nothing about ownership, so the earlier
+   name-and-first-page match left any differently-named token of the same
+   principal live through every subsequent rotation.
+
+This is the only admin-identity *creation* in the CLI; it is
 deliberately not a full Entry of its own (it is not a steady-state
 inbound mechanism but a DSN-gated provisioning/break-glass primitive),
 catalogued here so an audit sweep finds it.

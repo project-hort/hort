@@ -58,9 +58,9 @@ use crate::metrics::{
     PolicyEvaluationResult, PolicyReEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
-use crate::use_cases::release_clearance::{self, resolve_provenance_clearance};
+use crate::use_cases::release_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
-use crate::use_cases::{read_expected_version, rejected_reevaluation, scan_history};
+use crate::use_cases::{rejected_reevaluation, scan_history, ArtifactAtVersion, OverCapStream};
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -989,6 +989,15 @@ impl PolicyUseCase {
     /// append).
     ///
     /// Validation:
+    /// - A `PolicyScope::Repository` scope →
+    ///   [`DomainError::Validation`], before the policy projection is
+    ///   read (the curation-metric repo label is resolved first, so the
+    ///   counter names the repository the refused request asked for).
+    ///   The finding filter never reads the scope
+    ///   ([`hort_domain::policy::SCOPE_NOT_ENFORCED`]), so accepting
+    ///   one would store a waiver that looks narrowed and acts
+    ///   widened. Refused here rather than only in the gitops linter
+    ///   because the HTTP write surface reaches this method directly.
     /// - Non-existent parent → [`DomainError::Validation`] (NOT
     ///   `NotFound` — exclusion management is a sub-operation of the
     ///   parent policy, and the gitops-apply caller treats both
@@ -1011,6 +1020,48 @@ impl PolicyUseCase {
             PolicyScope::Global => None,
         };
         let repo_label_ref = repo_label_owned.as_deref();
+
+        // A repository scope is refused here, at the application-layer
+        // write seam every inbound writer passes through, and not only on
+        // the declared path: the HTTP write surface reaches this method
+        // directly, outside the desired-tree lint, so a gitops linter row
+        // alone would close the declared path and leave the API path open.
+        // See `hort_domain::policy::SCOPE_NOT_ENFORCED` for why the scope
+        // cannot be honoured.
+        //
+        // The refusal is on the *add* only — no writer carries a
+        // removal-side half, by design. The two directions are not
+        // symmetric: storing such a scope records an assurance nothing
+        // honours, removing the row withdraws it. A removal only ever
+        // stops suppressing a finding, so there is no fail-closed
+        // reading under which refusing it is the safe choice; refusing
+        // it would instead make a row stored before this rule existed
+        // unremovable, while it went on clearing its CVE everywhere.
+        // `remove_exclusion` must also stay able to drain such a row
+        // for the gitops applier, which emits `ExclusionRemoved` from a
+        // write-capable stage: refusing there would turn dropping the
+        // envelope into a post-write apply failure, the partial-apply
+        // defect the pre-write validation pass exists to prevent.
+        if let PolicyScope::Repository(repo_id) = &cmd.scope {
+            tracing::info!(
+                policy_id = %policy_id,
+                repository_id = %repo_id,
+                "add_exclusion rejected: repository-scoped exclusions are not enforced",
+            );
+            emit_curation_decision(
+                CurationDecisionLabel::ExcludeFinding,
+                repo_label_ref,
+                CurationDecisionResult::Invalid,
+            );
+            return Err(DomainError::Validation(format!(
+                "{rationale}. Re-issue the exclusion with a global scope if clearing \
+                 this CVE everywhere the policy governs is what was meant, or drop \
+                 it until per-repository scoping is implemented. (policy: \
+                 {policy_id}, requested repository scope: {repo_id})",
+                rationale = hort_domain::policy::SCOPE_NOT_ENFORCED,
+            ))
+            .into());
+        }
 
         let Some(parent) = self.projections.find_by_id(policy_id).await? else {
             tracing::info!(
@@ -1440,7 +1491,7 @@ impl PolicyUseCase {
     #[allow(clippy::too_many_arguments)]
     async fn re_evaluate_one_active(
         &self,
-        mut artifact: Artifact,
+        artifact: Artifact,
         policy_id: Uuid,
         trigger: ReEvaluationTrigger,
         policy: &ScanPolicyProjection,
@@ -1450,27 +1501,50 @@ impl PolicyUseCase {
     ) {
         let artifact_id = artifact.id;
 
-        // Re-derive the verdict from the artifact's stored findings. A
-        // genuine event-store read failure surfaces as `Err` (skip); a
-        // missing/clean scan yields `None` (an empty finding set → Clean →
-        // no-op, invariant #4).
-        let last_findings =
-            match scan_history::read_last_findings(&*self.events, &self.storage, artifact_id).await
-            {
-                Ok(f) => f,
+        // Pair the page's artifact row with the stream version and the
+        // evidence BEFORE deriving anything from either. The tighten
+        // direction is where getting this backwards costs the most: a
+        // clean verdict committing while the stored findings are being
+        // hydrated would be contained in a version read afterwards, so
+        // the re-hold would not conflict and would overwrite a NEWER
+        // clean verdict with an older failing one. A read failure skips
+        // this artifact — best-effort, one bad row never aborts the pass.
+        let mut paired =
+            match ArtifactAtVersion::pair(&*self.events, artifact, OverCapStream::Tolerate).await {
+                Ok(p) => p,
                 Err(e) => {
                     tracing::error!(
                         artifact_id = %artifact_id,
                         policy_id = %policy_id,
                         trigger = ?trigger,
                         error = %e,
-                        "re-evaluation (tighten): failed to hydrate findings_blob; \
-                         skipping artifact",
+                        "re-evaluation (tighten): failed to pair the artifact with its \
+                         stream version and evidence; skipping artifact",
                     );
                     return;
                 }
             };
-        let findings = last_findings.unwrap_or_default();
+
+        // Re-derive the verdict from the paired evidence's stored
+        // findings. A missing/clean scan yields `None` (an empty finding
+        // set → Clean → no-op, invariant #4); an over-cap stream is the
+        // only error left here, and it skips.
+        let findings = match paired.evidence() {
+            Ok(stream) => scan_history::last_findings(stream, &self.storage, artifact_id)
+                .await
+                .unwrap_or_default(),
+            Err(e) => {
+                tracing::error!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    trigger = ?trigger,
+                    error = %e,
+                    "re-evaluation (tighten): paired stream cannot be read to its tail; \
+                     skipping artifact",
+                );
+                return;
+            }
+        };
 
         // The curation format gate input needs the repository's format;
         // resolve it (an absent repo row defaults to `Generic`, matching
@@ -1478,7 +1552,7 @@ impl PolicyUseCase {
         // artifact (best-effort).
         let format = match self
             .repository_access
-            .repository_format(artifact.repository_id)
+            .repository_format(paired.artifact().repository_id)
             .await
         {
             Ok(f) => f.unwrap_or(hort_domain::entities::repository::RepositoryFormat::Generic),
@@ -1495,10 +1569,10 @@ impl PolicyUseCase {
             }
         };
         let coords = ArtifactCoords {
-            name: artifact.name.clone(),
-            name_as_published: artifact.name_as_published.clone(),
-            version: artifact.version.clone(),
-            path: artifact.path.clone(),
+            name: paired.artifact().name.clone(),
+            name_as_published: paired.artifact().name_as_published.clone(),
+            version: paired.artifact().version.clone(),
+            path: paired.artifact().path.clone(),
             format,
             metadata: serde_json::Value::Null,
         };
@@ -1507,9 +1581,12 @@ impl PolicyUseCase {
         // over the stored findings under the bumped policy (invariant #2 —
         // loosen and tighten cannot diverge).
         let outcome = evaluate_scan_result(&coords, &findings, Some(policy), exclusions, now);
-        let previous_status = artifact.quarantine_status;
+        let previous_status = paired.artifact().quarantine_status;
 
-        match artifact.reject_from_scan_policy_retroactive(&outcome, "scan-policy tighten".into()) {
+        match paired
+            .artifact_mut()
+            .reject_from_scan_policy_retroactive(&outcome, "scan-policy tighten".into())
+        {
             // No-op: still-clean verdict (`ScanOutcome::Clean`) — no
             // transition, no `ArtifactReEvaluated` (the threaded
             // `Ok(None)` contract from Item 1).
@@ -1524,7 +1601,7 @@ impl PolicyUseCase {
             // `ArtifactRejected` companion atomically.
             Ok(Some(rejected)) => {
                 if self
-                    .commit_tighten(artifact, policy_id, trigger, previous_status, rejected)
+                    .commit_tighten(paired, policy_id, trigger, previous_status, rejected)
                     .await
                 {
                     tallies.re_held += 1;
@@ -1568,32 +1645,24 @@ impl PolicyUseCase {
     ///
     /// Returns `true` on success, `false` on best-effort skip (a
     /// `DomainError::Conflict` from a parallel transition that bumped the
-    /// stream between the read and the append, or any other commit failure).
+    /// stream after the pairing, or any other commit failure).
+    ///
+    /// The `ExpectedVersion` comes from `paired` — fixed by the one read
+    /// the verdict was derived from, not by a read taken here, which is
+    /// the whole point: a clean verdict that committed in between loses
+    /// this append instead of being overwritten by it.
     async fn commit_tighten(
         &self,
-        artifact: Artifact,
+        paired: ArtifactAtVersion,
         policy_id: Uuid,
         trigger: ReEvaluationTrigger,
         previous_status: QuarantineStatus,
         rejected: ArtifactRejected,
     ) -> bool {
+        let stream_id = paired.stream_id().clone();
+        let expected_version = paired.expected_version();
+        let artifact = paired.into_artifact();
         let artifact_id = artifact.id;
-        let stream_id = StreamId::artifact(artifact_id);
-
-        let expected_version = match read_expected_version(&*self.events, &stream_id, false).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    policy_id = %policy_id,
-                    trigger = ?trigger,
-                    error = %e,
-                    "concurrent modification during re-evaluation pass (tighten); \
-                     skipping artifact",
-                );
-                return false;
-            }
-        };
 
         let re_evaluated = ArtifactReEvaluated {
             artifact_id,
@@ -1669,7 +1738,7 @@ impl PolicyUseCase {
     #[allow(clippy::too_many_arguments)]
     async fn re_evaluate_one_rejected(
         &self,
-        mut artifact: Artifact,
+        artifact: Artifact,
         policy_id: Uuid,
         trigger: ReEvaluationTrigger,
         policy: &ScanPolicyProjection,
@@ -1679,10 +1748,31 @@ impl PolicyUseCase {
     ) {
         let artifact_id = artifact.id;
 
+        // Pair the page's artifact row with the stream version and the
+        // evidence BEFORE deriving the verdict from either — a rejection
+        // committed while the findings blob is being fetched would
+        // otherwise be contained in a version read afterwards, so the
+        // release would not conflict and would commit over it. A read
+        // failure skips this artifact (best-effort pass).
+        let mut paired =
+            match ArtifactAtVersion::pair(&*self.events, artifact, OverCapStream::Tolerate).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        artifact_id = %artifact_id,
+                        policy_id = %policy_id,
+                        trigger = ?trigger,
+                        error = %e,
+                        "re-evaluation (loosen): failed to pair the artifact with its \
+                         stream version and evidence; skipping artifact",
+                    );
+                    return;
+                }
+            };
+
         let derivation = match rejected_reevaluation::derive_rejected_outcome(
-            &*self.events,
+            &paired,
             &self.storage,
-            &artifact,
             Some(policy),
             updated_exclusions,
             now,
@@ -1696,14 +1786,14 @@ impl PolicyUseCase {
                     policy_id = %policy_id,
                     trigger = ?trigger,
                     error = %e,
-                    "re-evaluation (loosen): failed to load re-evaluation evidence; \
-                     skipping artifact",
+                    "re-evaluation (loosen): failed to derive the verdict from the \
+                     paired evidence; skipping artifact",
                 );
                 return;
             }
         };
 
-        let (outcome, quarantine_deadline, reason) = match derivation {
+        let (outcome, quarantine_deadline, reason, derived_provenance) = match derivation {
             // (a) Eligibility guard: a provenance- / curation- / admin-
             // rejected artifact is NOT a candidate for a scan
             // re-judgement (the pre-ADR-0041 pass released it
@@ -1738,14 +1828,15 @@ impl PolicyUseCase {
                 outcome,
                 quarantine_deadline,
                 rejection_reason,
-            } => (outcome, quarantine_deadline, rejection_reason),
+                provenance,
+            } => (outcome, quarantine_deadline, rejection_reason, provenance),
         };
-        artifact.rejection_reason = reason;
+        paired.artifact_mut().rejection_reason = reason;
         // Hydrate the transient computed deadline onto the artifact so
         // `Artifact::re_evaluate` (invoked inside `commit_re_evaluation`)
         // branches on the same computed deadline the pure helper decided
         // against — the two MUST agree on boundary semantics.
-        artifact.quarantine_deadline = quarantine_deadline;
+        paired.artifact_mut().quarantine_deadline = quarantine_deadline;
 
         match outcome {
             ReEvaluationOutcome::StillRejected => {
@@ -1769,7 +1860,7 @@ impl PolicyUseCase {
                 // this arm.
                 if self
                     .commit_re_evaluation(
-                        artifact,
+                        paired,
                         policy_id,
                         trigger,
                         QuarantineStatus::Rejected,
@@ -1798,29 +1889,17 @@ impl PolicyUseCase {
                 // #6). Compute the two cross-axis clearances; if either
                 // currently denies, hold the artifact `Rejected`
                 // (fail-closed) and count it as held — NOT released.
-                let provenance = match resolve_provenance_clearance(
-                    &*self.events,
-                    artifact_id,
-                    policy.provenance_mode,
-                )
-                .await
-                {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::error!(
-                            artifact_id = %artifact_id,
-                            policy_id = %policy_id,
-                            error = %e,
-                            "re-evaluation (loosen): failed to resolve provenance \
-                             clearance; skipping artifact",
-                        );
-                        return;
-                    }
-                };
+                // The provenance leg came out of the derivation above, off
+                // the SAME stream read the verdict and the append's
+                // version came from. Resolving it here from a second read
+                // would let a `ProvenanceVerified` that landed after the
+                // pairing clear the gate while the append still carried
+                // the pre-verification version.
+                let provenance = derived_provenance;
                 let curation = match release_clearance::resolve_curation_clearance(
                     &*self.curation_rules,
                     &self.repository_access,
-                    &artifact,
+                    paired.artifact(),
                 )
                 .await
                 {
@@ -1863,7 +1942,7 @@ impl PolicyUseCase {
 
                 if self
                     .commit_re_evaluation(
-                        artifact,
+                        paired,
                         policy_id,
                         trigger,
                         QuarantineStatus::Rejected,
@@ -1904,14 +1983,19 @@ impl PolicyUseCase {
     ///
     /// Returns `true` on success, `false` on best-effort skip
     /// (typically `DomainError::Conflict` from a parallel scan or
-    /// admin operation that bumped the artifact stream between the
-    /// read and the append, or the domain re-check denying the release).
+    /// admin operation that bumped the artifact stream after the
+    /// pairing, or the domain re-check denying the release).
     /// The caller logs the warn and increments the appropriate counter
     /// only on `true`.
+    ///
+    /// The `ExpectedVersion` comes from `paired` — fixed by the one read
+    /// the verdict was derived from, not by a read taken here. A
+    /// rejection or release that committed in between therefore fails
+    /// this append instead of being overwritten by it.
     #[allow(clippy::too_many_arguments)]
     async fn commit_re_evaluation(
         &self,
-        mut artifact: Artifact,
+        mut paired: ArtifactAtVersion,
         policy_id: Uuid,
         trigger: ReEvaluationTrigger,
         previous_status: QuarantineStatus,
@@ -1919,26 +2003,9 @@ impl PolicyUseCase {
         provenance: ProvenanceClearance,
         curation: CurationClearance,
     ) -> bool {
-        let artifact_id = artifact.id;
-        let stream_id = StreamId::artifact(artifact_id);
-
-        // Read the expected version up-front so the optimistic-
-        // concurrency check fires on the append rather than at
-        // `commit_transition` time. `read_expected_version` errors
-        // surface as best-effort skips below (warn + continue).
-        let expected_version = match read_expected_version(&*self.events, &stream_id, false).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    policy_id = %policy_id,
-                    trigger = ?trigger,
-                    error = %e,
-                    "concurrent modification during re-evaluation pass; skipping artifact",
-                );
-                return false;
-            }
-        };
+        let artifact_id = paired.artifact().id;
+        let stream_id = paired.stream_id().clone();
+        let expected_version = paired.expected_version();
 
         // The artifact entity's `re_evaluate(now)` mutates state and
         // returns the companion transition event (`ArtifactQuarantined`
@@ -1950,19 +2017,23 @@ impl PolicyUseCase {
         // because `re_evaluate` is on the entity, not the pure
         // helper. Boundary precision is per-second; the pass usually
         // completes inside that window.
-        let companion_event = match artifact.re_evaluate(Utc::now(), provenance, curation) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(
-                    artifact_id = %artifact_id,
-                    policy_id = %policy_id,
-                    trigger = ?trigger,
-                    error = %e,
-                    "artifact state machine rejected re-evaluation; skipping artifact",
-                );
-                return false;
-            }
-        };
+        let companion_event =
+            match paired
+                .artifact_mut()
+                .re_evaluate(Utc::now(), provenance, curation)
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        artifact_id = %artifact_id,
+                        policy_id = %policy_id,
+                        trigger = ?trigger,
+                        error = %e,
+                        "artifact state machine rejected re-evaluation; skipping artifact",
+                    );
+                    return false;
+                }
+            };
 
         let re_evaluated = ArtifactReEvaluated {
             artifact_id,
@@ -1984,6 +2055,7 @@ impl PolicyUseCase {
         // Rejected → Quarantined and Rejected → Released.
         let score_delta =
             RepoSecurityScoreProjector::compute_re_evaluated_delta(previous_status, new_status);
+        let artifact = paired.into_artifact();
         let repository_id = artifact.repository_id;
 
         match self
@@ -2049,6 +2121,16 @@ impl PolicyUseCase {
     ///   already filters, but the use case re-checks rather than
     ///   trusting the adapter).
     /// - Stale `ExpectedVersion::Exact` → [`DomainError::Conflict`].
+    ///
+    /// A stored `PolicyScope::Repository` is **not** among the
+    /// validations, on this method or on any caller. [`Self::add_exclusion`]
+    /// refuses *writing* one because it records an assurance the finding
+    /// filter cannot honour
+    /// ([`hort_domain::policy::SCOPE_NOT_ENFORCED`]); removing the row
+    /// is what withdraws that assurance, and a removal only ever stops
+    /// suppressing a finding. Gating it would leave such a row
+    /// unremovable through the API while the gitops applier — which
+    /// reaches this same method — kept draining it.
     #[tracing::instrument(skip(self, cmd))]
     pub async fn remove_exclusion(
         &self,
@@ -2360,7 +2442,9 @@ mod tests {
     use hort_domain::ports::event_store::{AppendResult, ReadFrom, SubscribeFrom};
     use hort_domain::ports::BoxFuture;
 
-    use crate::use_cases::test_support::{persisted_artifact_rejected, persisted_scan_completed};
+    use crate::use_cases::test_support::{
+        persisted_artifact_rejected, persisted_provenance_verified, persisted_scan_completed,
+    };
 
     use super::*;
 
@@ -2444,11 +2528,17 @@ mod tests {
         /// infrastructure-error skip branches (ADR 0041).
         next_read_error: Mutex<Option<DomainError>>,
         /// Running `read_stream` call count + an optional `(nth, err)` to
-        /// fail a SPECIFIC read (1-based). Lets a test fail only the
-        /// provenance read (the 4th stream read in the release arm) while
-        /// the earlier reads succeed.
+        /// fail a SPECIFIC read (1-based). A test arms a read index it
+        /// expects NOT to exist to pin that a path observes a stream only
+        /// once — see `re_eval_provenance_is_answered_from_the_paired_stream`.
         read_count: Mutex<usize>,
         fail_read_at: Mutex<Option<(usize, DomainError)>>,
+        /// Per-stream one-shot replacement installed AFTER the next
+        /// `read_stream` of that stream serves the current content —
+        /// models a concurrent append landing immediately after the
+        /// `ArtifactAtVersion` pairing read. Seeded via
+        /// [`set_stream_after_next_read`](Self::set_stream_after_next_read).
+        stream_after_next_read: Mutex<std::collections::HashMap<StreamId, Vec<PersistedEvent>>>,
     }
 
     enum DomainResultAppend {
@@ -2465,7 +2555,29 @@ mod tests {
                 next_read_error: Mutex::new(None),
                 read_count: Mutex::new(0),
                 fail_read_at: Mutex::new(None),
+                stream_after_next_read: Mutex::new(Default::default()),
             }
+        }
+
+        /// Total `read_stream` invocations so far (including failed ones).
+        /// Lets a test pin "this path observed the artifact stream exactly
+        /// once" — the property that makes one observation of evidence and
+        /// append version the same observation.
+        fn read_stream_call_count(&self) -> usize {
+            *self.read_count.lock().unwrap()
+        }
+
+        /// Arm a one-shot stream replacement: the NEXT `read_stream` of
+        /// `stream_id` serves the CURRENT content, then `events` replaces
+        /// it so every subsequent read — and every version probe — sees
+        /// the new state. This is how the interleaving tests land a
+        /// concurrent verdict in the window between a pairing and the
+        /// append it fixed the version for.
+        fn set_stream_after_next_read(&self, stream_id: StreamId, events: Vec<PersistedEvent>) {
+            self.stream_after_next_read
+                .lock()
+                .unwrap()
+                .insert(stream_id, events);
         }
 
         /// Arm the NEXT `read_stream` to fail once with `err`. Consumed
@@ -2510,6 +2622,21 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(stream_id, events);
+        }
+    }
+
+    impl crate::use_cases::test_support::StreamTail for MockEventStore {
+        fn current_expected_version(&self, stream_id: &StreamId) -> ExpectedVersion {
+            match self
+                .seeded_streams
+                .lock()
+                .unwrap()
+                .get(stream_id)
+                .and_then(|events| events.last())
+            {
+                Some(last) => ExpectedVersion::Exact(last.stream_position),
+                None => ExpectedVersion::NoStream,
+            }
         }
     }
 
@@ -2560,6 +2687,20 @@ mod tests {
                 .get(stream_id)
                 .cloned()
                 .unwrap_or_default();
+            // One-shot post-read swap (see `set_stream_after_next_read`):
+            // this read serves the current content; everything afterwards
+            // sees the armed replacement.
+            if let Some(next) = self
+                .stream_after_next_read
+                .lock()
+                .unwrap()
+                .remove(stream_id)
+            {
+                self.seeded_streams
+                    .lock()
+                    .unwrap()
+                    .insert(stream_id.clone(), next);
+            }
             Box::pin(async move { Ok(res) })
         }
 
@@ -4647,8 +4788,6 @@ mod tests {
     /// provenance state, not a blanket Required-mode block.
     #[tokio::test]
     async fn re_eval_provenance_verified_under_required_is_released() {
-        use hort_domain::events::ProvenanceVerified;
-        use hort_domain::ports::provenance::SignerIdentity;
         let (uc, events, projections, artifacts, lifecycle, _cur, _repos) =
             make_cross_axis_harness();
         let policy_id = Uuid::new_v4();
@@ -4666,28 +4805,7 @@ mod tests {
             vec![
                 persisted_scan_completed(artifact_id, 1, 0),
                 persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
-                PersistedEvent {
-                    event_id: Uuid::new_v4(),
-                    stream_id: StreamId::artifact(artifact_id),
-                    stream_position: 2,
-                    global_position: 2,
-                    event: DomainEvent::ProvenanceVerified(ProvenanceVerified {
-                        artifact_id,
-                        content_hash: VALID_SHA256.parse().unwrap(),
-                        backend: "cosign".into(),
-                        signer: SignerIdentity {
-                            issuer: "iss".into(),
-                            san: "san".into(),
-                        },
-                        predicate_type: None,
-                        cascaded_from: None,
-                    }),
-                    correlation_id: Uuid::new_v4(),
-                    causation_id: None,
-                    actor: hort_domain::events::system_actor(),
-                    event_version: 1,
-                    stored_at: Utc::now(),
-                },
+                persisted_provenance_verified(artifact_id, 2),
             ],
         );
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
@@ -4856,9 +4974,9 @@ mod tests {
         );
     }
 
-    /// Infrastructure-error skip (a): the rejection-reason hydrate read
-    /// fails → the pass logs + skips the artifact (no transition), it does
-    /// NOT abort the pass nor release the artifact.
+    /// Infrastructure-error skip (a): the pairing's stream read fails →
+    /// the pass logs + skips the artifact (no transition), it does NOT
+    /// abort the pass nor release the artifact.
     #[tokio::test]
     async fn re_eval_hydrate_reason_read_error_skips_artifact() {
         let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
@@ -4870,7 +4988,10 @@ mod tests {
 
         seed_rejected_with_scan(&artifacts, &events, repo_id, 1);
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
-        // The FIRST read_stream in the loop is `hydrate_rejection_reason`.
+        // The one read_stream in the loop is the `ArtifactAtVersion`
+        // pairing's — the single observation the whole derivation and the
+        // append's version come from, so its failure is the only read
+        // failure this path has.
         events.fail_next_read_stream(DomainError::Invariant("stream read down".into()));
 
         // The pass must not abort: add_exclusion still returns Ok.
@@ -4882,12 +5003,23 @@ mod tests {
         );
     }
 
-    /// Infrastructure-error skip (b): the provenance-clearance read fails
-    /// on the release arm → skip. `Required` mode makes the provenance
-    /// resolver read the stream (the 4th stream read in the release path:
-    /// hydrate, read_last_scan_completed, read_last_findings, provenance).
+    /// The release arm's provenance clearance is answered from the
+    /// **paired** stream, not a read of its own.
+    ///
+    /// `Required` mode is the only mode whose clearance depends on stream
+    /// content, so this is where a second read would show up. There is
+    /// exactly one read of the artifact stream per candidate: a failure
+    /// armed at read 2 never fires, and the `ProvenanceVerified` seeded on
+    /// that one stream is what clears the gate and lets the release
+    /// commit.
+    ///
+    /// The ordering this closes: with a read of its own, a
+    /// `ProvenanceVerified` landing after the verdict was derived would
+    /// clear the gate on evidence the verdict never saw, while the append
+    /// still carried the earlier version — so the release would commit
+    /// without conflicting.
     #[tokio::test]
-    async fn re_eval_provenance_resolve_read_error_skips_artifact() {
+    async fn re_eval_provenance_is_answered_from_the_paired_stream() {
         let (uc, events, projections, artifacts, lifecycle) = make_use_case_with_re_eval_harness();
         let policy_id = Uuid::new_v4();
         let repo_id = Uuid::new_v4();
@@ -4896,11 +5028,8 @@ mod tests {
         p.provenance_mode = ProvenanceMode::Required;
         projections.insert(p);
 
-        // critical = 0 so there is no findings_blob → `read_last_findings`
-        // still issues ONE stream read (for the ScanCompleted) but no CAS
-        // fetch. Reads in the release arm: hydrate(1),
-        // read_last_scan_completed(2), read_last_findings(3),
-        // provenance(4). Fail the 4th.
+        // critical = 0 ⇒ clean verdict, no findings blob. The
+        // `ProvenanceVerified` rides the same stream the pairing reads.
         let artifact = rejected_artifact_for_repo(repo_id, "xz-utils");
         let artifact_id = artifact.id;
         artifacts.insert(artifact);
@@ -4909,16 +5038,33 @@ mod tests {
             vec![
                 persisted_scan_completed(artifact_id, 0, 0),
                 persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+                persisted_provenance_verified(artifact_id, 2),
             ],
         );
         artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
-        events.fail_read_stream_at(4, DomainError::Invariant("provenance read down".into()));
+        artifacts.seed_active_for_policy(policy_id, vec![]);
+        // Armed at a read index that must not exist.
+        events.fail_read_stream_at(2, DomainError::Invariant("there is no second read".into()));
 
-        add_exclusion_then_run_pass(&uc, policy_id).await;
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
 
-        assert!(
-            lifecycle.committed_transitions().is_empty(),
-            "a provenance-resolution read error skips the artifact"
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "the paired stream's ProvenanceVerified clears the gate and the \
+             release commits"
+        );
+        assert_eq!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Released
+        );
+        assert_eq!(
+            events.read_stream_call_count(),
+            1,
+            "the verdict and the provenance clearance come from one \
+             observation of the stream"
         );
     }
 
@@ -5449,11 +5595,19 @@ mod tests {
         assert_eq!(*n, 1);
     }
 
-    /// `add_exclusion` with `PolicyScope::Repository(id)` resolves
-    /// the repo key via the threaded `RepositoryAccessUseCase`.
-    /// `{decision=exclude_finding, repository=<key>, result=ok}`.
+    /// `add_exclusion` with `PolicyScope::Repository(id)` is REFUSED,
+    /// and the refusal still carries the repo key resolved via the
+    /// threaded `RepositoryAccessUseCase`:
+    /// `{decision=exclude_finding, repository=<key>, result=invalid}`.
+    ///
+    /// The label is resolved before the scope is judged on purpose — an
+    /// operator reading the counter needs to see *which* repository the
+    /// refused request named, and `_all` would say the opposite of what
+    /// happened. The event store is never reached: `events` is handed no
+    /// append result below and the assertion would fail if one were
+    /// consumed.
     #[test]
-    fn add_exclusion_repository_scope_emits_resolved_repo_key() {
+    fn add_exclusion_repository_scope_is_refused_with_the_resolved_repo_key() {
         use metrics_util::debugging::DebuggingRecorder;
 
         let repo_id = Uuid::new_v4();
@@ -5461,37 +5615,50 @@ mod tests {
         let (uc, events, projections) = make_use_case_with_repo_access(repo_access);
         let policy_id = Uuid::new_v4();
         projections.insert(sample_projection(policy_id, 4));
-        events.push_append_result(AppendResult {
-            stream_position: 5,
-            global_positions: vec![100],
-        });
 
         let mut cmd = sample_add_exclusion_command(policy_id);
         cmd.scope = PolicyScope::Repository(repo_id);
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
+        let mut captured: Option<crate::error::AppError> = None;
         metrics::with_local_recorder(&recorder, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(uc.add_exclusion(cmd, api_actor()))
-                .expect("add_exclusion should succeed");
+            captured = Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(uc.add_exclusion(cmd, api_actor()))
+                    .expect_err("a repository-scoped exclusion must be refused"),
+            );
         });
+
+        match captured.expect("add_exclusion must have errored") {
+            crate::error::AppError::Domain(DomainError::Validation(msg)) => assert!(
+                msg.contains("not enforced") && msg.contains(&repo_id.to_string()),
+                "the refusal must state why the scope cannot be honoured and name the \
+                 requested repository, got: {msg}"
+            ),
+            other => panic!("expected a Validation refusal, got {other:?}"),
+        }
+        assert!(
+            events.appended_batches().is_empty(),
+            "a refused exclusion must append no event: {:?}",
+            events.appended_batches()
+        );
 
         let hits = read_curation_decisions(snapshotter.snapshot());
         assert_eq!(hits.len(), 1);
         let (d, r, res, _) = &hits[0];
         assert_eq!(d, "exclude_finding");
         assert_eq!(r, "scoped-repo");
-        assert_eq!(res, "ok");
+        assert_eq!(res, "invalid");
     }
 
-    /// `add_exclusion` with the cardinality knob off
-    /// (`include_repository_label = false`) collapses every
-    /// repository-scoped exclusion's label to `_all`, regardless of
-    /// scope. Mirrors the curation_use_case knob-off test.
+    /// The cardinality knob still governs the label on that refusal:
+    /// with `include_repository_label = false`, `metric_label` collapses
+    /// to `_all` regardless of scope. Mirrors the curation_use_case
+    /// knob-off test.
     #[test]
     fn add_exclusion_with_cardinality_knob_off_emits_all_sentinel() {
         use metrics_util::debugging::DebuggingRecorder;
@@ -5499,13 +5666,9 @@ mod tests {
         let repo_id = Uuid::new_v4();
         // include_label = false → metric_label always returns `_all`.
         let repo_access = repository_access_with_key(repo_id, "scoped-repo", false);
-        let (uc, events, projections) = make_use_case_with_repo_access(repo_access);
+        let (uc, _events, projections) = make_use_case_with_repo_access(repo_access);
         let policy_id = Uuid::new_v4();
         projections.insert(sample_projection(policy_id, 4));
-        events.push_append_result(AppendResult {
-            stream_position: 5,
-            global_positions: vec![100],
-        });
 
         let mut cmd = sample_add_exclusion_command(policy_id);
         cmd.scope = PolicyScope::Repository(repo_id);
@@ -5518,7 +5681,7 @@ mod tests {
                 .build()
                 .unwrap()
                 .block_on(uc.add_exclusion(cmd, api_actor()))
-                .expect("add_exclusion should succeed");
+                .expect_err("a repository-scoped exclusion must be refused");
         });
 
         let hits = read_curation_decisions(snapshotter.snapshot());
@@ -6889,5 +7052,288 @@ mod tests {
             DebugValue::Gauge(v) => assert_eq!(*v, 1.0, "population = 1 tighten candidate"),
             _ => panic!("expected Gauge"),
         }
+    }
+
+    // ---- The pairing contract, under an actual interleaving ------------
+    //
+    // These two are the only tests in the file that construct the race the
+    // `ArtifactAtVersion` contract exists for, in both directions. Every
+    // other re-evaluation test here is serial: the stream never changes
+    // between the evidence read and the append, so a site that read the
+    // version late would pass them all. That is exactly how the wrong
+    // order survived at four call sites.
+    //
+    // The mechanism is two mock capabilities acting together:
+    //
+    // - `MockEventStore::set_stream_after_next_read` — the pairing's read
+    //   serves the OLD stream, and the concurrent verdict is installed
+    //   immediately afterwards. There is exactly one read of the artifact
+    //   stream per candidate now (asserted below), so "after the next
+    //   read" is precisely "after the pairing".
+    // - `MockArtifactLifecycle::with_optimistic_concurrency` — the commit
+    //   checks its `ExpectedVersion` against the store's current tail, the
+    //   way the Postgres adapter's in-transaction append does. Without it
+    //   the mock accepts any version and both tests would pass vacuously.
+    //
+    // Each test runs the SAME fixture twice: once serially, to prove the
+    // derivation really does decide to transition (otherwise "nothing
+    // committed" would prove nothing), and once with the interleaving
+    // armed, where the stale decision's append must lose.
+
+    /// Harness with the optimistic-concurrency check armed — see the
+    /// block comment above. Mirrors `make_full_re_eval_harness`
+    /// otherwise.
+    #[allow(clippy::type_complexity)]
+    fn make_interleaving_harness() -> (
+        PolicyUseCase,
+        Arc<MockEventStore>,
+        Arc<MockPolicyProjections>,
+        Arc<crate::use_cases::test_support::MockArtifactRepository>,
+        Arc<crate::use_cases::test_support::MockArtifactLifecycle>,
+        Arc<crate::use_cases::test_support::MockStoragePort>,
+    ) {
+        let events = Arc::new(MockEventStore::new());
+        let projections = Arc::new(MockPolicyProjections::new());
+        let artifacts = Arc::new(crate::use_cases::test_support::MockArtifactRepository::new());
+        let lifecycle = Arc::new(
+            crate::use_cases::test_support::MockArtifactLifecycle::new(artifacts.clone())
+                .with_optimistic_concurrency(events.clone()),
+        );
+        let storage = Arc::new(crate::use_cases::test_support::MockStoragePort::new());
+        let curation_rules =
+            Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new());
+        let jobs = Arc::new(crate::use_cases::test_support::MockJobsRepository::default());
+        let uc = PolicyUseCase::new(
+            crate::event_store_publisher::wrap_for_test(events.clone()),
+            projections.clone(),
+            artifacts.clone(),
+            lifecycle.clone(),
+            storage.clone(),
+            default_repository_access(),
+            curation_rules,
+            jobs,
+        );
+        (uc, events, projections, artifacts, lifecycle, storage)
+    }
+
+    /// Both directions skip a candidate whose stream breached the event
+    /// cap, rather than deriving a verdict from its oldest prefix. The
+    /// tighten direction is the one worth pinning: its verdict comes from
+    /// the latest `ScanCompleted`'s findings blob, and over a truncated
+    /// prefix "the latest" is a superseded scan — which, in this
+    /// direction, would re-hold an artifact on findings a later clean scan
+    /// already replaced.
+    #[tokio::test]
+    async fn tighten_skips_a_candidate_whose_stream_breached_the_event_cap() {
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        let findings = vec![sample_finding("CVE-2024-0001", SeverityThreshold::Critical)];
+        let artifact_id = seed_active_with_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            &findings,
+        );
+        // Push the same stream past the cap. The failing `ScanCompleted`
+        // stays at position 0, inside any capped read.
+        let stream_id = StreamId::artifact(artifact_id);
+        let mut over_cap = vec![persisted_scan_completed(artifact_id, 1, 0)];
+        over_cap.extend((1..201).map(|i| persisted_scan_completed(artifact_id, 1, i)));
+        events.seed_stream(stream_id, over_cap);
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no re-hold from evidence the read cannot prove it saw the tail of"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Released,
+            "the candidate is skipped, not transitioned"
+        );
+    }
+
+    /// Loosen direction (`re_evaluate_one_rejected` → `commit_re_evaluation`):
+    /// a release decided from evidence that a blocking scan superseded
+    /// must NOT commit.
+    ///
+    /// The artifact is `Rejected` with a clean scan on its stream and an
+    /// elapsed observation window, so the pass derives `ResetToReleased`.
+    /// A blocking `ScanCompleted` + `ArtifactRejected` then commits
+    /// between the evidence read and the release append. Because the
+    /// version came from the same read as the evidence, the append carries
+    /// the pre-verdict version and loses — the artifact stays `Rejected`.
+    ///
+    /// With the version read at commit time instead, it would already
+    /// contain the blocking verdict, the append would succeed, and the
+    /// paired projection write would put `Released` over a `Rejected` the
+    /// scanner had just decided.
+    #[tokio::test]
+    async fn loosen_release_does_not_commit_over_a_scan_verdict_that_landed_mid_derivation() {
+        // -- Serial control: the derivation does decide to release.
+        let (uc, events, projections, artifacts, lifecycle, _storage) = make_interleaving_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        artifacts.seed_active_for_policy(policy_id, vec![]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let control = lifecycle.committed_transitions();
+        assert_eq!(control.len(), 1, "control: the release commits");
+        assert_eq!(control[0].0.quarantine_status, QuarantineStatus::Released);
+
+        // -- Same fixture, with a blocking verdict committing between the
+        //    pairing's read and the release append.
+        let (uc, events, projections, artifacts, lifecycle, _storage) = make_interleaving_harness();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+        let artifact_id_2 = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        artifacts.seed_active_for_policy(policy_id, vec![]);
+
+        // The concurrent writer: a blocking scan and the rejection it
+        // drove, landing at positions 2 and 3. Installed right after the
+        // pairing's read, so the derivation runs on the clean evidence the
+        // read returned while the stream has already moved on.
+        events.set_stream_after_next_read(
+            StreamId::artifact(artifact_id_2),
+            vec![
+                persisted_scan_completed(artifact_id_2, 0, 0),
+                persisted_artifact_rejected(artifact_id_2, RejectionReason::Scanner, 1),
+                persisted_scan_completed(artifact_id_2, 9, 2),
+                persisted_artifact_rejected(artifact_id_2, RejectionReason::Scanner, 3),
+            ],
+        );
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a release derived from superseded evidence must lose the append, \
+             not overwrite the newer verdict"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id_2).unwrap().quarantine_status,
+            QuarantineStatus::Rejected,
+            "the artifact stays Rejected"
+        );
+        assert_eq!(
+            events.read_stream_call_count(),
+            1,
+            "one observation per candidate: the evidence and the append's \
+             version must come from the same read, or the interleaving above \
+             has nowhere to land"
+        );
+        // Both runs used the same fixture shape; the ids differ only
+        // because each harness mints its own artifact.
+        assert_ne!(artifact_id, artifact_id_2);
+    }
+
+    /// Tighten direction (`re_evaluate_one_active` → `commit_tighten`):
+    /// a re-hold decided from evidence that a NEWER clean scan superseded
+    /// must NOT commit. Same defect, the other direction — here the stale
+    /// decision would overwrite a newer clean verdict rather than release
+    /// on a stale clean one.
+    ///
+    /// The artifact is `Released` with failing findings on its stream, so
+    /// the pass derives a re-hold. A clean `ScanCompleted` then commits
+    /// between the evidence read and the re-hold append; the append
+    /// carries the pre-verdict version and loses, so the artifact stays
+    /// `Released`.
+    #[tokio::test]
+    async fn tighten_re_hold_does_not_commit_over_a_clean_verdict_that_landed_mid_derivation() {
+        let findings = vec![sample_finding("CVE-2024-0001", SeverityThreshold::Critical)];
+
+        // -- Serial control: the derivation does decide to re-hold.
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_interleaving_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+        seed_active_with_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            &findings,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let control = lifecycle.committed_transitions();
+        assert_eq!(control.len(), 1, "control: the re-hold commits");
+        assert_eq!(control[0].0.quarantine_status, QuarantineStatus::Rejected);
+
+        // -- Same fixture, with a clean verdict committing between the
+        //    pairing's read and the re-hold append.
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_interleaving_harness();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+        let artifact_id = seed_active_with_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            &findings,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        // The concurrent writer: a clean re-scan at position 1, landing
+        // right after the pairing's read. The pass's verdict was derived
+        // from the failing findings at position 0.
+        events.set_stream_after_next_read(
+            StreamId::artifact(artifact_id),
+            vec![
+                persisted_scan_completed(artifact_id, 1, 0),
+                persisted_scan_completed(artifact_id, 0, 1),
+            ],
+        );
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "a re-hold derived from superseded evidence must lose the append, \
+             not overwrite the newer clean verdict"
+        );
+        assert_eq!(
+            artifacts.get(artifact_id).unwrap().quarantine_status,
+            QuarantineStatus::Released,
+            "the artifact stays Released"
+        );
+        assert_eq!(
+            events.read_stream_call_count(),
+            1,
+            "one observation per candidate: the stored findings and the \
+             append's version must come from the same read"
+        );
     }
 }

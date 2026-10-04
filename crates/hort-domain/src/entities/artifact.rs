@@ -886,7 +886,7 @@ impl Artifact {
         //
         // The column is not persisted (`mappers.rs` hydrates it `None`;
         // callers re-derive it from the stream via
-        // `scan_history::read_last_rejection_reason`), so what this
+        // `scan_history::last_rejection_reason`), so what this
         // assignment buys is agreement between the just-transitioned
         // entity and the value a later stream re-derivation reconstructs —
         // which, now that the companion event exists, is exactly
@@ -1123,7 +1123,7 @@ impl Artifact {
     /// **not** set to `Provenance`: the column feeds the *scan*-clearability
     /// guard, `None` already fails it, and the callers that re-derive a
     /// rejection reason read it from the stream
-    /// (`scan_history::read_last_rejection_reason`), where the companion
+    /// (`scan_history::last_rejection_reason`), where the companion
     /// event now carries it.
     ///
     /// `backend` is the id of the verifier that produced the verdict
