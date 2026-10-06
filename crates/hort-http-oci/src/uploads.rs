@@ -348,6 +348,10 @@ async fn handle_cross_mount(
         legacy_md5: None,
         declared_sha256: None,
         payload_metadata: serde_json::json!({ "oci_mount_from": from }),
+        // A mounted blob claims only its own content in the target
+        // repository; the manifest that references it carries the
+        // `oci_config` / `oci_layer` claims.
+        claimed_edges: Vec::new(),
     };
 
     match ctx
@@ -441,7 +445,14 @@ async fn handle_monolithic(
 
     match ctx
         .ingest_use_case
-        .ingest_verified(req, stream, &OciFormatHandler)
+        .ingest_verified(
+            req,
+            // A blob claims only its own content; the manifest that
+            // references it carries the `oci_config` / `oci_layer` claims.
+            &[],
+            stream,
+            &OciFormatHandler,
+        )
         .await
     {
         Ok(_outcome) => created_blob_response(repo_key, name, &hash),

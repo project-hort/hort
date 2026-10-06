@@ -53,7 +53,9 @@ use hort_domain::entities::scan_policy::ProvenanceMode;
 use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
+use hort_domain::ports::content_reference_index::{
+    ContentReference, ContentReferenceClaim, ContentReferenceIndex,
+};
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
@@ -939,46 +941,67 @@ impl ProvenanceOrchestrationUseCase {
             return Ok(false);
         }
 
-        // e. Narrow create — the referrer-manifest `artifacts` row. Built with
-        //    the already-held `lifecycle` port (NOT `IngestUseCase`):
+        // e. Narrow create — the referrer-manifest `artifacts` row plus the
+        //    content-reference edges it claims, in ONE transaction. Built
+        //    with the already-held `lifecycle` port (NOT `IngestUseCase`):
         //    `quarantine_status = None` (an internal provenance-bookkeeping
         //    artifact, outside the scan/quarantine/provenance lifecycle) and
         //    NO `jobs.enqueue_*` — the whole point of the narrow create.
-        let manifest_artifact = self
-            .commit_referrer_manifest(artifact, manifest_put.hash, manifest_put.size_bytes)
-            .await?;
-
-        // f. The `oci_subject` content-reference row — source is the referrer
-        //    manifest artifact, target is the proxied image's content hash
-        //    (mirrors the push-path row shape in manifests_write.rs). Upsert
-        //    on PK → idempotent re-run.
-        self.content_references
-            .insert(ContentReference {
-                source_artifact_id: manifest_artifact.id,
-                target_content_hash: artifact.sha256_checksum.clone(),
-                kind: OCI_SUBJECT_KIND.to_string(),
-                metadata: serde_json::json!({
-                    "artifact_type": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
-                    "media_type": "application/vnd.oci.image.manifest.v1+json",
-                }),
-                repository_id: artifact.repository_id,
-                recorded_at: chrono::Utc::now(),
-            })
+        //
+        //    The `oci_subject` claim — source the referrer manifest, target
+        //    the proxied image's content hash, mirroring the push-path row
+        //    shape in `manifests_write.rs` — rides that transaction rather
+        //    than following it. A `content_references` row is the claim that
+        //    keeps bytes alive: the storage GC deletes a CAS blob exactly
+        //    when no row targets its hash, and this row claims the IMAGE's
+        //    bytes, not the referrer's. Written afterwards it left a window
+        //    in which the referrer was live and the image it attests had one
+        //    fewer claim, with nothing to repair it — the refcount-reconcile
+        //    sweep converges `primary_content` / `metadata_blob` from the
+        //    artifact row, and no relational row records what a manifest
+        //    references. Upsert on the full PK, so a re-run is idempotent.
+        let _manifest_artifact = self
+            .commit_referrer_manifest(
+                artifact,
+                manifest_put.hash,
+                manifest_put.size_bytes,
+                &[ContentReferenceClaim {
+                    target_content_hash: artifact.sha256_checksum.clone(),
+                    kind: OCI_SUBJECT_KIND.to_string(),
+                    metadata: serde_json::json!({
+                        "artifact_type": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+                        "media_type": "application/vnd.oci.image.manifest.v1+json",
+                    }),
+                }],
+            )
             .await?;
 
         Ok(true)
     }
 
-    /// Commit the status-`None` referrer-manifest artifact via
-    /// `commit_transition` + a single `ArtifactIngested` event — the same
-    /// create primitive `IngestUseCase::ingest_signature_manifest` uses,
-    /// inlined here against the already-held ports. NO scan / provenance
-    /// enqueue. Returns the created `Artifact`.
+    /// Commit the status-`None` referrer-manifest artifact, a single
+    /// `ArtifactIngested` event and the manifest's content-reference edges
+    /// via `commit_transition_with_enqueues` — the same create primitive
+    /// `IngestUseCase::ingest_signature_manifest` uses, inlined here against
+    /// the already-held ports. NO scan / provenance enqueue. Returns the
+    /// created `Artifact`.
+    ///
+    /// The edge set is the manifest's own `primary_content` plus whatever the
+    /// caller claims. Both are claims on bytes against the storage GC, which
+    /// deletes a CAS blob exactly when no `content_references` row targets
+    /// its hash, so they belong in the transaction that makes the claiming
+    /// artifact live. `primary_content` matters here in particular because
+    /// this artifact commits at `quarantine_status = None` — outside the
+    /// scan/quarantine lifecycle, and therefore outside the GC's
+    /// protected-evidence rule — so with no row claiming its own content it
+    /// counted zero against itself until the next reconcile sweep converged
+    /// it.
     async fn commit_referrer_manifest(
         &self,
         image: &Artifact,
         manifest_hash: ContentHash,
         size_bytes: u64,
+        claimed_edges: &[ContentReferenceClaim],
     ) -> AppResult<Artifact> {
         let artifact_id = Uuid::new_v4();
         let now = chrono::Utc::now();
@@ -1028,8 +1051,22 @@ impl ProvenanceOrchestrationUseCase {
         )
         .await?;
 
+        let mut edges = vec![ContentReference {
+            source_artifact_id: artifact_id,
+            target_content_hash: artifact.sha256_checksum.clone(),
+            kind: "primary_content".to_string(),
+            metadata: serde_json::Value::Object(serde_json::Map::new()),
+            repository_id: artifact.repository_id,
+            recorded_at: now,
+        }];
+        edges.extend(
+            claimed_edges
+                .iter()
+                .map(|c| c.resolve(artifact_id, artifact.repository_id, now)),
+        );
+
         self.lifecycle
-            .commit_transition(
+            .commit_transition_with_enqueues(
                 &artifact,
                 AppendEvents {
                     stream_id,
@@ -1042,6 +1079,9 @@ impl ProvenanceOrchestrationUseCase {
                     actor: system_actor(),
                 },
                 None,
+                // No ingest-time jobs — see this method's docstring.
+                &[],
+                &edges,
             )
             .await?;
 

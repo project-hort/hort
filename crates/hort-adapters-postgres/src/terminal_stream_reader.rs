@@ -7,7 +7,8 @@
 //! audit-retention floor: the rendered `stream_id`, its
 //! [`StreamCategory`], the oldest event's `stored_at` (the floor
 //! anchor), the newest event's `stored_at`, and the tail (max
-//! `stream_position`) event's `event_type`.
+//! `stream_position`) event's `event_type` and that tail's
+//! `stream_position`.
 //!
 //! Purely additive: a brand-new adapter for a brand-new (additive)
 //! port. No existing adapter or port signature is touched — the frozen
@@ -21,11 +22,15 @@
 //!
 //! - `min(stored_at)` / `max(stored_at)` per `stream_id` — the floor
 //!   anchor + the newest-event timestamp.
-//! - The `event_type` of the row with the **maximum** `stream_position`
-//!   per `stream_id` — the terminal-gate input. `DISTINCT ON
-//!   (stream_id) … ORDER BY stream_id, stream_position DESC` gives the
-//!   tail row directly (the same shape `seal_and_remove`'s tail read
-//!   uses, lifted to a set).
+//! - The `event_type` **and `stream_position`** of the row with the
+//!   **maximum** `stream_position` per `stream_id` — the terminal-gate
+//!   input and the version the candidate's facts were read at.
+//!   `DISTINCT ON (stream_id) … ORDER BY stream_id, stream_position
+//!   DESC` gives the tail row directly (the same shape
+//!   `seal_and_remove`'s tail read uses, lifted to a set), so both come
+//!   from one row of one scan — the event type and the position an
+//!   age-gated seal is authorized against can never describe different
+//!   observations.
 //! - The meta-stream `StreamId::eventstore_retention()` is excluded in
 //!   SQL (`WHERE stream_id <> $1`) — double defence-in-depth: the use
 //!   case re-asserts the guard. Sealing it would truncate the audit
@@ -73,6 +78,7 @@ struct CandidateRow {
     first_event_at: DateTime<Utc>,
     last_event_at: DateTime<Utc>,
     last_event_type: String,
+    last_stream_position: i64,
 }
 
 impl TerminalStreamReader for PgTerminalStreamReader {
@@ -89,10 +95,11 @@ impl TerminalStreamReader for PgTerminalStreamReader {
             // (double defence-in-depth with the use case's guard).
             let rows: Vec<CandidateRow> = sqlx::query_as(
                 r#"
-                SELECT agg.stream_id        AS stream_id,
-                       agg.first_event_at   AS first_event_at,
-                       agg.last_event_at    AS last_event_at,
-                       tail.last_event_type AS last_event_type
+                SELECT agg.stream_id             AS stream_id,
+                       agg.first_event_at        AS first_event_at,
+                       agg.last_event_at         AS last_event_at,
+                       tail.last_event_type      AS last_event_type,
+                       tail.last_stream_position AS last_stream_position
                 FROM (
                     SELECT stream_id,
                            min(stored_at) AS first_event_at,
@@ -104,7 +111,8 @@ impl TerminalStreamReader for PgTerminalStreamReader {
                 JOIN (
                     SELECT DISTINCT ON (stream_id)
                            stream_id,
-                           event_type AS last_event_type
+                           event_type      AS last_event_type,
+                           stream_position AS last_stream_position
                     FROM events
                     WHERE stream_id <> $1
                     ORDER BY stream_id, stream_position DESC
@@ -136,12 +144,20 @@ impl TerminalStreamReader for PgTerminalStreamReader {
                         continue;
                     }
                 };
+                // `stream_position` is a non-negative 0-based counter the
+                // append path only ever advances, and the schema CHECKs
+                // it; a negative value here would mean the column no
+                // longer means what every reader of it assumes, so saturate
+                // rather than wrap into a huge seal authority that would
+                // match no stream.
+                let last_stream_position = row.last_stream_position.max(0) as u64;
                 out.push(TerminalStreamCandidate {
                     stream_id: row.stream_id,
                     category: stream.category,
                     first_event_at: row.first_event_at,
                     last_event_at: row.last_event_at,
                     last_event_type: row.last_event_type,
+                    last_stream_position,
                 });
             }
             Ok(out)
@@ -263,6 +279,11 @@ mod tests {
         assert_eq!(c.first_event_at, ts(100));
         assert_eq!(c.last_event_at, ts(300));
         assert_eq!(c.last_event_type, "ArtifactPurged");
+        assert_eq!(
+            c.last_stream_position, 2,
+            "the tail position comes from the same row as the tail event \
+             type — it is what an age-gated seal is authorized against"
+        );
 
         purge_stream(&pool, &sid).await;
     }
@@ -311,6 +332,12 @@ mod tests {
         assert_eq!(
             c.last_event_type, "ArtifactPurged",
             "tail is the max-stream_position row, not the max-stored_at row"
+        );
+        assert_eq!(
+            c.last_stream_position, 1,
+            "and the tail position is that same row's — picking it by \
+             stored_at would hand an age-gated seal an authority behind \
+             the real tail, which the chokepoint then refuses forever"
         );
         // first_event_at is min(stored_at) = 100 (the floor anchor is
         // the OLDEST stored_at regardless of position).

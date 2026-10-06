@@ -1123,7 +1123,15 @@ async fn finalize_core(
 
     let ingest_result = ctx
         .ingest_use_case
-        .ingest_verified(req, staging_reader, &OciFormatHandler)
+        .ingest_verified(
+            req,
+            // A blob claims only its own content. The manifest that will
+            // reference it carries the `oci_config` / `oci_layer` claims,
+            // and it is the manifest that has to keep these bytes alive.
+            &[],
+            staging_reader,
+            &OciFormatHandler,
+        )
         .await;
 
     // --- Branch on the ingest outcome. Cleanup is best-effort in

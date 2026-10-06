@@ -215,7 +215,13 @@ fn build_inner(
     let content_references = Arc::new(MockContentReferenceIndex::new());
     let storage = Arc::new(MockStoragePort::new());
     let events = Arc::new(MockEventStore::new());
-    let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+    // Wired to the reference index so the edges a referrer-manifest landing
+    // commits with its transition actually reach it — the mock's stand-in for
+    // the Postgres adapter writing them in the same transaction.
+    let lifecycle = Arc::new(
+        MockArtifactLifecycle::new(artifacts.clone())
+            .with_content_references(content_references.clone()),
+    );
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
     let upstream_resolver = Arc::new(MockUpstreamResolver::new());
 
@@ -2175,7 +2181,13 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
     let content_references = Arc::new(MockContentReferenceIndex::new());
     let storage = Arc::new(MockStoragePort::new());
     let events = Arc::new(MockEventStore::new());
-    let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+    // Wired to the reference index so the edges a referrer-manifest landing
+    // commits with its transition actually reach it — the mock's stand-in for
+    // the Postgres adapter writing them in the same transaction.
+    let lifecycle = Arc::new(
+        MockArtifactLifecycle::new(artifacts.clone())
+            .with_content_references(content_references.clone()),
+    );
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
     let upstream_resolver = Arc::new(MockUpstreamResolver::new());
 
@@ -3860,6 +3872,135 @@ async fn proxy_fetches_upstream_referrer_writes_oci_subject_and_reaches_verdict(
     assert_eq!(
         ingested, 1,
         "the proxy narrow-create commits exactly one ArtifactIngested"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The landed referrer manifest's edges commit with it.
+// ---------------------------------------------------------------------------
+
+/// **The acceptance.** The proxy narrow-create commits the referrer manifest,
+/// its own `primary_content` edge and the `oci_subject` claim on the image in
+/// ONE lifecycle call.
+///
+/// The `oci_subject` row claims the **image's** bytes, not the referrer's, so
+/// an insert that followed the commit left a live referrer over an image with
+/// one fewer claim against the storage GC — and no sweep re-derives a tree
+/// edge, because no relational row records what a manifest references. The
+/// referrer's own `primary_content` edge is the one this inlined narrow create
+/// never wrote at all: it commits at `quarantine_status = None`, outside the
+/// scan/quarantine lifecycle and so outside the GC's protected-evidence rule,
+/// which left its bytes counting zero against themselves.
+#[tokio::test]
+async fn proxy_narrow_create_commits_both_edges_with_the_referrer_transition() {
+    let port = Arc::new(CapturingBundleAwarePort::new());
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::VerifyIfPresent),
+        vec![sample_pattern()],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    let (manifest_digest, _blob_hash) = seed_upstream_referrer(&f, COSIGN_BUNDLE_V03_FIXTURE);
+    // The manifest's own content hash — `seed_upstream_referrer` hands back
+    // the `sha256:<hex>` reference form.
+    let manifest_hex = manifest_digest.trim_start_matches("sha256:").to_string();
+
+    f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+
+    let rows = f
+        .content_references
+        .find_by_target(f.repository_id, &f.content_hash, Some("oci_subject"))
+        .await
+        .expect("find_by_target");
+    assert_eq!(rows.len(), 1, "one oci_subject row");
+    let referrer_id = rows[0].source_artifact_id;
+
+    // One call, carrying the referrer's claim on its own bytes and its claim
+    // on the image's.
+    let carried: Vec<(String, String)> = f
+        .lifecycle
+        .ingest_edge_kinds()
+        .into_iter()
+        .filter(|(id, _, _)| *id == referrer_id)
+        .map(|(_, kind, target)| (kind, target))
+        .collect();
+    assert_eq!(
+        carried,
+        vec![
+            ("primary_content".to_string(), manifest_hex),
+            (
+                "oci_subject".to_string(),
+                f.content_hash.as_ref().to_owned()
+            ),
+        ],
+        "the referrer manifest's own content claim and its subject claim"
+    );
+    assert_eq!(
+        f.lifecycle
+            .ingest_edges()
+            .into_iter()
+            .filter(|(id, _)| *id == referrer_id)
+            .count(),
+        1,
+        "one transition carries the whole set"
+    );
+}
+
+/// The rollback half: a failed `oci_subject` edge aborts the landing, so no
+/// referrer manifest artifact is left behind claiming nothing.
+///
+/// The landing's error does not surface as an `Err` — it takes the same
+/// `apply_fetch_failure` arm an upstream fetch error does, which under
+/// `VerifyIfPresent` degrades to `NoAttestation`. That degradation is the
+/// pre-existing posture for a failed referrer landing and is unchanged here;
+/// what this test is about is the state it degrades *from*: nothing committed.
+/// Under `Required` the same degradation holds the artifact, so neither mode
+/// releases on the strength of a referrer that failed to land.
+#[tokio::test]
+async fn proxy_narrow_create_failing_edge_lands_no_referrer_manifest() {
+    let port = Arc::new(CapturingBundleAwarePort::new());
+    let f = build(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::VerifyIfPresent),
+        vec![sample_pattern()],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_upstream_referrer(&f, COSIGN_BUNDLE_V03_FIXTURE);
+    f.content_references.fail_next_insert_for_kind(
+        "oci_subject",
+        DomainError::Invariant("synthetic failure: oci_subject insert".into()),
+    );
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::NoAttestation,
+        },
+        "a failed landing degrades the verdict; it never yields an attestation"
+    );
+
+    assert_eq!(
+        f.content_references
+            .find_by_target(f.repository_id, &f.content_hash, Some("oci_subject"))
+            .await
+            .expect("find_by_target")
+            .len(),
+        0,
+        "no oci_subject row landed",
+    );
+    assert_eq!(
+        f.content_references.entry_count(),
+        0,
+        "the referrer's own primary_content edge, applied first, rolls back too"
+    );
+    assert!(
+        f.lifecycle
+            .committed_transitions()
+            .into_iter()
+            .all(|(_, ev, _)| !matches!(ev.events[0].event, DomainEvent::ArtifactIngested(_))),
+        "no referrer-manifest ArtifactIngested may commit"
     );
 }
 

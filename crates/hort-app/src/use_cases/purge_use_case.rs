@@ -9,7 +9,9 @@
 //! stage two: for every pending **byte-release work item** with no
 //! following [`ArtifactPurged`](hort_domain::events::ArtifactPurged) it
 //! runs the GC algorithm (decrement `content_references`, delete the CAS
-//! blob iff the cross-`kind` refcount hit `0`, then append all
+//! blob iff nothing claims it any more — no cross-`kind`
+//! `content_references` row and no GC-protected artifact holding the
+//! hash without one — then append all
 //! `ArtifactPurged` events and retire the projection atomically). It is
 //! NOT a scheduler — that is the `RetentionPurgeHandler`
 //! `TaskHandler`; this is the pure orchestration the handler calls.
@@ -37,7 +39,7 @@
 //! without a line of new transaction code.
 //!
 //! A delete does **not** inherit the `KeepLastN` tag exemption: see
-//! [`PurgeUseCase::process_one`]'s tag-exemption block.
+//! [`PendingPurge::is_tag_exempt`].
 //!
 //! # Reconcile-converged start-gate (binding constraint)
 //!
@@ -73,15 +75,23 @@
 //! # GC algorithm (faithful, crash-safe)
 //!
 //! For each pending work item:
-//! 1. Lock the artifact row `FOR UPDATE`.
+//! 1. Lock the artifact row `FOR UPDATE` and re-read the two
+//!    protection rules under that lock
+//!    ([`PendingPurge::is_gc_protected`],
+//!    [`PendingPurge::is_tag_exempt`]). Either one holding stops the
+//!    item here with nothing deleted — see *The page is a snapshot*
+//!    below.
 //! 2. Delete every `content_references` source edge for the artifact,
 //!    returning each distinct target hash.
 //! 3. Persist each returned hash and its post-delete count in the purge
 //!    worklist, in the same transaction as the edge deletion.
 //! 4. For each hash `H` the worklist recorded at count `0`, take the
-//!    **hash-scoped reclamation lock** and re-read the cross-kind count
-//!    under it (including `oci_subject` and every other kind). Still
-//!    `0` ⇒ `StoragePort::delete(H)` **while the lock is held**; emit no
+//!    **hash-scoped reclamation lock** and re-ask, under it, whether
+//!    anything claims `H`: the cross-kind `content_references` count
+//!    (including `oci_subject` and every other kind), and — only once
+//!    that count comes back `0` — whether a GC-protected artifact
+//!    holds `H` without an edge. Nothing claims it ⇒
+//!    `StoragePort::delete(H)` **while the lock is held**; emit no
 //!    event yet. Checkpoint the successful storage decision.
 //!
 //!    The lock is the same one every `content_references` write takes
@@ -91,12 +101,14 @@
 //!    deduplicates precisely so that one blob may belong to many
 //!    artifacts.
 //!
-//!    Two outcomes decline to delete. The lock held elsewhere is a
+//!    Three outcomes decline to delete. The lock held elsewhere is a
 //!    deferral — nothing is emitted, the worklist row stands, the next
 //!    sweep asks again (`blobs_deferred`). A count that is no longer
 //!    zero is a *keep* — the bytes were re-claimed, the worklist row is
 //!    corrected to the observed count, and the purge finishes normally
-//!    with the blob intact (`blobs_kept`).
+//!    with the blob intact (`blobs_kept`). A protected claimant is the
+//!    same keep for a claim the count structurally cannot show (see
+//!    *Evidence is never purged* below).
 //! 5. Once every hash is checkpointed, append one `ArtifactPurged` per
 //!    hash and set `artifacts.deleted_at` in one adapter transaction.
 //!
@@ -115,15 +127,49 @@
 //! success-on-missing). The terminal event batch and retirement happen
 //! only after every hash is complete.
 //!
+//! ## The page is a snapshot; the lock is where the rules decide
+//!
+//! Two rules keep content out of the destructive path — retained scan
+//! evidence is never collected, and a `KeepLastN` tag target is exempt
+//! — and both are computed from facts that move while this sweep runs:
+//! a scan verdict lands, a tag is set.
+//!
+//! [`Self::process_one`] evaluates both rules on the **page row** it
+//! was handed, and that is a pre-exit: it saves opening a transaction
+//! for an artifact that is already visibly protected, and the
+//! permanently-skipped prefix this sweep carries by design is exactly
+//! that shape. It cannot be the interval defence. The page was read
+//! before the sweep touched a single item of it, so between that read
+//! and a given item's destructive step lies the complete processing of
+//! every preceding item — storage deletes included. It is the longest
+//! interval in the whole walk, not the shortest.
+//!
+//! The decision therefore sits in step 1, inside the transaction that
+//! does the deleting: [`PurgeGcPort::purge_artifact_refs`] re-reads
+//! the four facts under the artifact lock and answers
+//! [`PurgePreparation::Protected`] / [`PurgePreparation::TagExempt`]
+//! instead of preparing a worklist. Nothing is deleted on either path
+//! — no edge, no byte, no event — so the work item stays pending and
+//! the next sweep re-reads everything.
+//!
+//! The two readers are counted apart
+//! ([`PurgeSummary::skipped_protected`] vs
+//! [`PurgeSummary::skipped_protected_under_lock`], and likewise for
+//! the tag exemption): the first is the steady state, where a
+//! protected artifact is skipped on every sweep until its status or
+//! tag changes, and the second is this sweep's own window closing on
+//! something — a signal worth seeing rather than one to lose in the
+//! first number.
+//!
 //! ## Evidence is never purged (defence-in-depth)
 //!
 //! Quarantined / rejected / scan-indeterminate artifacts are evidence
 //! and must never be purged. Stage one already filters them before appending
 //! `ArtifactExpired`, so a pending purge for one of them should not
-//! exist; the adapter's `list_pending_purge` excludes them anyway and
-//! this use case asserts the invariant a second time and **skips +
-//! `warn!`s** rather than trusting the upstream filter (a destructive
-//! item is conservative by construction).
+//! exist; the adapter's `list_pending_purge` excludes them anyway, the
+//! page-row check asserts the invariant a second time and the re-read
+//! under the lock a third, rather than trusting the upstream filter (a
+//! destructive item is conservative by construction).
 //!
 //! This holds for the delete work item too, and there stage one does
 //! NOT pre-filter: an artifact is deletable whatever its quarantine
@@ -131,16 +177,35 @@
 //! a rejected artifact really can acquire an `ArtifactDeleted`. The
 //! adapter's status filter and this re-assertion are what keep its
 //! evidence bytes: the row retires, the blob stays.
+//!
+//! ### …and protecting the artifact does not protect the bytes
+//!
+//! Both protections above are about the *artifact*: they keep it out of
+//! the work set. Reclamation happens at the level of the **bytes**, and
+//! CAS deduplicates them across artifacts, so a released sibling with
+//! the same content hash carries the protected artifact's bytes into
+//! step 4 while the protected artifact was never a candidate for
+//! anything.
+//!
+//! The refcount cannot close that gap on its own: protected evidence is
+//! deliberately given no `content_references` edge (the refcount repair
+//! mints none, so that a repaired refcount cannot make a quarantined
+//! blob look GC-protected for the wrong reason), so its claim on its
+//! own hash counts zero. Step 4's second question is what closes it —
+//! and because the answer is a count, the `ArtifactPurged` the sibling
+//! emits carries it, so `refs_remaining > 0` still means "the blob
+//! stays".
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::events::{retention_scheduler_actor, ArtifactPurged, DomainEvent, StreamId};
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
-use hort_domain::ports::purge_gc::{BlobReclaim, PendingPurge, PurgeGcPort, PurgedRef};
+use hort_domain::ports::purge_gc::{
+    BlobReclaim, PendingPurge, PurgeGcPort, PurgePreparation, PurgedRef,
+};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::ContentHash;
 
@@ -214,11 +279,13 @@ pub trait RefcountReconcileGate: Send + Sync {
 pub struct PurgeSummary {
     /// Pending `ArtifactExpired` artifacts the sweep visited.
     pub artifacts_visited: u64,
-    /// CAS blobs deleted (cross-`kind` refcount hit `0`).
+    /// CAS blobs deleted (nothing claimed the hash under the lock).
     pub blobs_deleted: u64,
-    /// References removed whose blob stays (a live ref remains).
+    /// References removed whose blob stays, because a claim on the
+    /// hash held under the lock: a live `content_references` row, or a
+    /// GC-protected artifact that holds the bytes without one.
     pub blobs_kept: u64,
-    /// Refcount-0 blobs left standing because the hash-scoped
+    /// Unclaimed blobs left standing because the hash-scoped
     /// reclamation lock was held by someone else — a concurrent
     /// reference write on exactly these bytes, or a second sweep. No
     /// terminal event was emitted and the worklist row is retained, so
@@ -232,12 +299,31 @@ pub struct PurgeSummary {
     pub blobs_deferred: u64,
     /// `ArtifactPurged` events appended (one per processed hash).
     pub purged_events: u64,
-    /// Artifacts skipped by the evidence-protection re-assertion.
+    /// Artifacts the page row already showed as GC-protected evidence
+    /// — the pre-exit, before the artifact lock was taken. This is the
+    /// steady-state number: a protected artifact stays in the pending
+    /// set and is skipped on every sweep until its status changes.
     pub skipped_protected: u64,
-    /// Artifacts skipped because a mutable ref in their own repository
-    /// resolves to them and every pending expiry decision was
-    /// `KeepLastN` — the tag exemption, re-asked at purge time.
+    /// Artifacts the page row already showed as tag-exempt
+    /// ([`PendingPurge::is_tag_exempt`]) — the pre-exit, and the
+    /// steady-state number for the same reason as
+    /// [`Self::skipped_protected`].
     pub skipped_tag_exempt: u64,
+    /// Artifacts refused by the **re-read under the artifact lock**
+    /// because they had become GC-protected evidence since the page
+    /// row was taken. Disjoint from [`Self::skipped_protected`]: this
+    /// one counts a scan verdict landing inside the sweep's own window,
+    /// which is a far rarer and far more interesting event than a
+    /// protected artifact being skipped again.
+    ///
+    /// Nothing was deleted for these artifacts — no edge, no byte, no
+    /// event — and the work item is still pending.
+    pub skipped_protected_under_lock: u64,
+    /// Artifacts refused by the re-read under the artifact lock because
+    /// a mutable ref came to resolve to them since the page row was
+    /// taken. Disjoint from [`Self::skipped_tag_exempt`], same
+    /// reasoning as the field above.
+    pub skipped_tag_exempt_under_lock: u64,
     /// Visited artifacts whose work item was a caller-facing delete
     /// (`ArtifactDeleted`) rather than a policy expiry. Reported because
     /// this sweep collects both and a deployment with no retention
@@ -370,6 +456,8 @@ impl PurgeUseCase {
             purged_events = summary.purged_events,
             skipped_protected = summary.skipped_protected,
             skipped_tag_exempt = summary.skipped_tag_exempt,
+            skipped_protected_under_lock = summary.skipped_protected_under_lock,
+            skipped_tag_exempt_under_lock = summary.skipped_tag_exempt_under_lock,
             user_deletes_visited = summary.user_deletes_visited,
             errors = summary.errors,
             "storage-GC purge sweep complete"
@@ -385,55 +473,40 @@ impl PurgeUseCase {
         item: &PendingPurge,
         summary: &mut PurgeSummary,
     ) {
-        // -- evidence-protection re-assertion (defence-in-depth) ---------
-        match item.quarantine_status {
-            QuarantineStatus::Quarantined
-            | QuarantineStatus::Rejected
-            | QuarantineStatus::ScanIndeterminate => {
-                summary.skipped_protected += 1;
-                tracing::warn!(
-                    artifact_id = %item.artifact_id,
-                    status = %item.quarantine_status,
-                    "inv1: pending-purge artifact is quarantined/rejected/\
-                     indeterminate (evidence) — skipped, NOT purged. This \
-                     should have been filtered before ArtifactExpired; \
-                     re-asserted here because purge is destructive."
-                );
-                return;
-            }
-            QuarantineStatus::None | QuarantineStatus::Released => {}
+        // -- cheap pre-exits over the page row ---------------------------
+        //
+        // Both protection rules are re-read under the artifact lock by
+        // `purge_artifact_refs`, which is where the decision is
+        // actually taken (see the match on its outcome below). What
+        // these two checks buy is the lock: an artifact that is already
+        // visibly protected on the page row is skipped without opening
+        // a transaction for it, and the permanently-skipped prefix this
+        // sweep carries by design is exactly that shape.
+        //
+        // They are not the interval defence and must not be read as
+        // one. `item` is the page row, and between it and *this*
+        // artifact's destructive step lies the complete processing of
+        // every preceding item of the page, storage deletes included.
+        if item.is_gc_protected() {
+            summary.skipped_protected += 1;
+            tracing::warn!(
+                artifact_id = %item.artifact_id,
+                status = %item.quarantine_status,
+                "inv1: pending-purge artifact is quarantined/rejected/\
+                 indeterminate (evidence) — skipped, NOT purged. This \
+                 should have been filtered before ArtifactExpired; \
+                 re-asserted here because purge is destructive."
+            );
+            return;
         }
 
-        // -- tag exemption, re-asked immediately before deleting ---------
-        // The evaluator already refuses to expire a tag target under
-        // `KeepLastN`, but it decided an hour ago: evaluation and purge
-        // are separate sweeps, and a tag set in between arrives after
-        // the `ArtifactExpired` is already on the stream, where nothing
-        // re-runs the predicate. Re-reading the fact here is what makes
-        // the *interval* correct and not merely the steady state — the
-        // last reader before the destructive step is the one that
-        // decides.
-        //
-        // Scoped to `KeepLastN`, exactly as the exemption is: an age-
-        // or security-driven policy is the operator's explicit
-        // instruction to remove the content, and a tag does not
-        // countermand it. An artifact some other policy also expired is
-        // therefore purged even while tagged.
-        //
-        // A caller-facing delete is that same class of explicit
-        // instruction, and `expired_only_by_keep_last_n` is vacuously
-        // true for an artifact carrying no expiry decision at all — so
-        // without the `user_deleted` conjunct a tagged artifact's delete
-        // would be exempted by the rule for a policy that never ran, and
-        // its bytes would be held by a mutable ref pointing at a row no
-        // read path resolves.
-        if item.tag_targeted && item.expired_only_by_keep_last_n && !item.user_deleted {
+        if item.is_tag_exempt() {
             summary.skipped_tag_exempt += 1;
             tracing::info!(
                 artifact_id = %item.artifact_id,
                 "a mutable ref in this artifact's repository resolves to it, \
                  every pending expiry was KeepLastN and no delete was \
-                 requested — tag exemption re-asserted at purge time, NOT \
+                 requested — tag exemption asserted on the page row, NOT \
                  purged. The ArtifactExpired is retained; the artifact is \
                  purged once the tag moves."
             );
@@ -441,7 +514,13 @@ impl PurgeUseCase {
         }
 
         // -- durable worklist preparation (committed, idempotent) --------
-        let mut purged_refs = match self.gc.purge_artifact_refs(item.artifact_id).await {
+        //
+        // Both protection rules are re-read here under the artifact
+        // lock, in the transaction that deletes the edges, and a
+        // refusal arrives as its own outcome rather than as an empty
+        // worklist — the three non-`Prepared` answers mean different
+        // things and are counted and logged apart.
+        let prepared = match self.gc.purge_artifact_refs(item.artifact_id).await {
             Ok(r) => r,
             Err(e) => {
                 summary.errors += 1;
@@ -455,6 +534,61 @@ impl PurgeUseCase {
             }
         };
 
+        let mut purged_refs = match prepared {
+            PurgePreparation::Prepared(refs) => refs,
+            PurgePreparation::Protected { status } => {
+                // The page row said this artifact was collectable and
+                // the read under the lock disagreed: a scan verdict
+                // landed while the sweep worked through the items
+                // before it. Nothing was deleted.
+                summary.skipped_protected_under_lock += 1;
+                tracing::warn!(
+                    artifact_id = %item.artifact_id,
+                    status = %status,
+                    page_status = %item.quarantine_status,
+                    "the artifact became GC-protected evidence after this \
+                     sweep read its page row — refused under the artifact \
+                     lock, nothing deleted. No edge, no byte and no event; \
+                     the work item stays pending and the next sweep \
+                     re-reads it."
+                );
+                return;
+            }
+            PurgePreparation::TagExempt => {
+                // Same shape, the other rule: a mutable ref landed on a
+                // KeepLastN target inside this sweep's own window.
+                summary.skipped_tag_exempt_under_lock += 1;
+                tracing::info!(
+                    artifact_id = %item.artifact_id,
+                    "a mutable ref came to resolve to this artifact after \
+                     this sweep read its page row — tag exemption applied \
+                     under the artifact lock, nothing deleted. The \
+                     ArtifactExpired is retained; the artifact is purged \
+                     once the tag moves."
+                );
+                return;
+            }
+            PurgePreparation::NoArtifact => {
+                // The row the page offered is gone — a repository
+                // hard-delete cascade, since the artifact verbs only
+                // ever soft-delete. Nothing was locked, read or
+                // deleted, there are no bytes left to release through
+                // it, and it will not be offered again. Distinct from
+                // the two refusals above on purpose: those are
+                // protections holding, this is work that evaporated.
+                tracing::warn!(
+                    artifact_id = %item.artifact_id,
+                    "the artifact row vanished between the page read and \
+                     the purge preparation — nothing to release, work item \
+                     dropped with it"
+                );
+                return;
+            }
+        };
+
+        // A port that hands back an empty worklist has nothing to
+        // checkpoint and nothing to emit; `NoArtifact` is the answer
+        // for the case this used to stand in for.
         if purged_refs.is_empty() {
             return;
         }
@@ -548,10 +682,22 @@ impl PurgeUseCase {
     /// lease ends, by which time the answer it will get from CAS is the
     /// truth.
     ///
-    /// Two of the three outcomes decline to delete, and that is the
+    /// Three of the four outcomes decline to delete, and that is the
     /// design. Reclaiming storage is housekeeping the human's event
     /// model explicitly detached from external behaviour; being wrong
     /// once about a live blob is not recoverable, and being late is.
+    ///
+    /// # The claim the refcount cannot see
+    ///
+    /// A `content_references` row is not the only hold on a blob. An
+    /// artifact in a GC-protected quarantine state is retained scan
+    /// evidence, and the refcount repair deliberately mints no edge for
+    /// it — so its claim on its own bytes counts zero, while CAS shares
+    /// those bytes with every sibling of the same content. The lease
+    /// therefore also answers
+    /// [`BlobReclaim::ProtectedClaim`](hort_domain::ports::purge_gc::BlobReclaim::ProtectedClaim),
+    /// which this method treats exactly like `Referenced`: a keep, not
+    /// a deferral.
     async fn finish_one_ref(
         &self,
         now: DateTime<Utc>,
@@ -613,6 +759,29 @@ impl PurgeUseCase {
                          Blob kept; ArtifactPurged carries the observed count."
                     );
                     pr.refs_remaining = refs_now;
+                }
+                BlobReclaim::ProtectedClaim { claimants } => {
+                    // The refcount was genuinely zero and these bytes
+                    // are still held: a quarantined / rejected /
+                    // scan_indeterminate artifact carries this hash as
+                    // its primary content or its metadata blob, and
+                    // protected evidence is deliberately given no
+                    // reference edge to count. Keep the blob and state
+                    // the claim count, same as the branch above — and
+                    // terminal for a stronger reason: a rejected
+                    // artifact is permanent, so re-asking would never
+                    // get a different answer and this sibling's purge
+                    // would never finish.
+                    tracing::info!(
+                        %artifact_id,
+                        content_hash = %hash_short,
+                        claimants,
+                        "the bytes are claimed by GC-protected evidence that \
+                         holds no reference edge — refcount 0 was true and \
+                         not the whole answer. Blob kept; ArtifactPurged \
+                         carries the claim count."
+                    );
+                    pr.refs_remaining = claimants;
                 }
                 BlobReclaim::Granted(guard) => {
                     // GC-eligible and still so under the lock: delete

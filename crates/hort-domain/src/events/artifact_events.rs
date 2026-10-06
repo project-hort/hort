@@ -1419,12 +1419,12 @@ impl ArtifactExpired {
 /// release its `content_references` source edges through the one
 /// storage-GC sweep.
 ///
-/// `refs_remaining` is the GC algorithm's post-decrement
-/// cross-`kind` refcount for `content_hash` (tied to
-/// `content_references`): `0` means the blob itself was deleted;
-/// `> 0` means a still-live reference (e.g. a promoted ref or an OCI
-/// `oci_subject` row) keeps the blob alive and only **this** artifact's
-/// reference was removed.
+/// `refs_remaining` is the **claims on `content_hash`** the sweep
+/// observed under the hash-scoped blob-reclamation lock, immediately
+/// before the storage decision: `0` means the blob itself was deleted;
+/// `> 0` means something still holds those bytes and only **this**
+/// artifact's reference was removed. See the field's own
+/// documentation for which claims count.
 ///
 /// # Idempotency
 ///
@@ -1445,9 +1445,30 @@ pub struct ArtifactPurged {
     /// [`ContentHash`] is 64 lowercase hex chars by construction, so no
     /// extra string bound is needed.
     pub content_hash: ContentHash,
-    /// Cross-`kind` `content_references` count for `content_hash`
-    /// **after** this artifact's reference was removed. `0`
-    /// ⇒ the blob was deleted; `> 0` ⇒ the blob stays, this ref is gone.
+    /// **Claims on `content_hash`** observed under the hash-scoped
+    /// blob-reclamation lock after this artifact's reference was
+    /// removed. `0` ⇒ the blob was deleted; `> 0` ⇒ the blob stays,
+    /// this ref is gone.
+    ///
+    /// A claim is either of:
+    ///
+    /// - a cross-`kind` `content_references` row still targeting the
+    ///   hash (a promoted ref, an OCI `oci_subject`/`oci_layer` edge, a
+    ///   sibling artifact's `primary_content`), or
+    /// - when there is **no** such row, a non-deleted artifact in a
+    ///   GC-protected quarantine state (`quarantined` / `rejected` /
+    ///   `scan_indeterminate`) whose primary content or metadata blob
+    ///   is this hash.
+    ///
+    /// The second kind exists because protected evidence deliberately
+    /// carries no `content_references` edge — the refcount repair mints
+    /// none for it, so that a repaired refcount cannot make a
+    /// quarantined blob look GC-protected for the wrong reason — while
+    /// CAS shares the bytes with every other artifact of the same
+    /// content. A row count alone would read `0` for bytes that are
+    /// being kept, which is the one thing this field may not say: it is
+    /// a single number with no second field to qualify it, so `0` has
+    /// to mean "deleted" on every path that emits it.
     pub refs_remaining: u32,
     /// Wall-clock at which the purge (or already-absent confirmation)
     /// completed. Distinct from the event store's `stored_at`, same

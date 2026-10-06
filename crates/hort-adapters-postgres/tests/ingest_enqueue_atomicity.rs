@@ -184,6 +184,7 @@ async fn enqueue_failure_rolls_back_transition_no_strand() {
                 // in-tx scan insert errors, which must abort the transition.
                 trigger_source: "bogus-not-in-check".into(),
             }],
+            &[],
         )
         .await;
     assert!(
@@ -239,6 +240,7 @@ async fn commit_lands_artifact_and_scan_and_provenance_jobs() {
                 trigger_source: "ingest".into(),
             },
         ],
+        &[],
     )
     .await
     .expect("a valid commit must succeed");

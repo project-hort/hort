@@ -62,6 +62,22 @@
 //!    event is at-or-after it); never a payload timestamp, never the
 //!    chain head.
 //!
+//! # The proofs are paired with the version that authorizes them
+//!
+//! Proving a stream terminal and past its floor, and removing it, are
+//! two observations of a stream nothing holds still — the append path
+//! takes no row lock, so there is none a seal could take either. The
+//! sweep therefore hands the chokepoint the tail its proof read
+//! ([`SealAuthority`]), and the chokepoint removes nothing unless the
+//! stream is still there. A refusal comes back as
+//! [`SealOutcome::NotAtProvenVersion`] and is counted as a *skip*, not
+//! an error: an event landing in that window is the check working.
+//!
+//! For a `TerminalGated` category the authority is the tail of the
+//! terminal-proof read — the same row the verdict came from. For an
+//! `AgeGated` category there is no proof read, so it is the tail of the
+//! enumeration row the floor facts came from.
+//!
 //! Only when every applicable precondition passes does the use case
 //! call the retention chokepoint per the one global [`StreamRetentionModeRef`]
 //! (`Delete` → `delete_stream`, `Archive` → `archive_stream` with a
@@ -82,7 +98,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use hort_domain::events::StreamId;
-use hort_domain::ports::event_store::EventStore;
+use hort_domain::ports::event_store::{EventStore, SealAuthority, SealOutcome};
 use hort_domain::ports::terminal_stream_reader::{TerminalStreamCandidate, TerminalStreamReader};
 
 use crate::error::{AppError, AppResult};
@@ -284,6 +300,16 @@ pub struct RetentionArchiveSummary {
     pub skipped_already_sealed: u64,
     /// Candidate whose category has no registered retention rule.
     pub skipped_unregistered_category: u64,
+    /// Candidates the chokepoint refused because the stream had moved
+    /// past the tail the sweep proved it at — an event landed between
+    /// the proof and the seal. Nothing was removed and no tombstone was
+    /// written; the next sweep re-evaluates from a fresh proof.
+    ///
+    /// Deliberately **not** [`Self::errors`]: nothing failed. A stream
+    /// that receives a late event is the optimistic check doing its job,
+    /// and counting it as an error would make a healthy sweep read as a
+    /// broken one.
+    pub skipped_stream_changed: u64,
     /// Per-stream failures (terminal-proof read / seal chokepoint). The
     /// stream is NOT sealed; the next sweep retries it (fail-safe).
     pub errors: u64,
@@ -363,6 +389,7 @@ impl EventStoreRetentionUseCase {
             skipped_meta_stream = summary.skipped_meta_stream,
             skipped_already_sealed = summary.skipped_already_sealed,
             skipped_unregistered_category = summary.skipped_unregistered_category,
+            skipped_stream_changed = summary.skipped_stream_changed,
             errors = summary.errors,
             "audit-retention stream sweep complete"
         );
@@ -406,6 +433,14 @@ impl EventStoreRetentionUseCase {
         };
 
         // -- (3) terminal proof (TerminalGated only) -------------------
+        //
+        // The tail position the proof read is kept, not just the verdict:
+        // it is what authorizes the seal. For an `AgeGated` category
+        // there is no proof read at all (rotated audit streams have no
+        // terminal), so the authority is the enumeration's own tail —
+        // the observation the floor facts came from.
+        let mut proven_final_position = candidate.last_stream_position;
+
         if let SealMode::TerminalGated {
             terminal_event_type,
         } = rule.mode
@@ -441,7 +476,17 @@ impl EventStoreRetentionUseCase {
                     // sealed) and the next sweep retries.
                     return;
                 }
-                TerminalProof::Terminal => { /* fall through to floor */ }
+                TerminalProof::Terminal {
+                    final_stream_position,
+                } => {
+                    // The authority is this read's tail, not the
+                    // enumeration's: the proof that the tail is the
+                    // category terminal and the position it was read at
+                    // come from the same row of the same read, so there
+                    // is no second observation for a late event to hide
+                    // between.
+                    proven_final_position = final_stream_position;
+                }
             }
         }
 
@@ -461,7 +506,14 @@ impl EventStoreRetentionUseCase {
         }
 
         // -- all preconditions passed: route through the seal chokepoint -
-        self.seal_one(candidate, summary).await;
+        //
+        // The floor proof reads nothing new, so the tail carried here is
+        // still the one both proofs rest on. The chokepoint refuses if
+        // the stream has moved since.
+        let authority = SealAuthority {
+            final_stream_position: proven_final_position,
+        };
+        self.seal_one(candidate, authority, summary).await;
     }
 
     /// Prove a `TerminalGated` stream's tail via a bounded
@@ -509,7 +561,12 @@ impl EventStoreRetentionUseCase {
         };
         let last_event_type = tail.event.event_type();
         if last_event_type == terminal_event_type {
-            TerminalProof::Terminal
+            // The verdict and the version it holds for are the same row
+            // of the same read — the pairing the seal needs, with no
+            // second read for an append to slip between.
+            TerminalProof::Terminal {
+                final_stream_position: tail.stream_position,
+            }
         } else {
             TerminalProof::NotTerminal {
                 last_event_type: last_event_type.to_owned(),
@@ -518,14 +575,23 @@ impl EventStoreRetentionUseCase {
     }
 
     /// Route the proven candidate through the seal chokepoint per the
-    /// one global retention mode. A chokepoint `Err` is per-stream:
+    /// one global retention mode, carrying the `authority` its proofs
+    /// were read at. A chokepoint `Err` is per-stream:
     /// `errors += 1`, `error!`, continue (fail-safe — covers the
     /// unprivileged-role DELETE block when the retention role is not
     /// configured). The `StreamSealed` tombstone is emitted by the
     /// adapter's `seal_and_remove`, not here.
+    ///
+    /// [`SealOutcome::NotAtProvenVersion`] is a third answer and is
+    /// neither counted nor logged as the other two: the stream received
+    /// an event after the sweep proved it, so nothing was removed and
+    /// nothing failed. It lands in
+    /// [`RetentionArchiveSummary::skipped_stream_changed`] beside the
+    /// other skips.
     async fn seal_one(
         &self,
         candidate: &TerminalStreamCandidate,
+        authority: SealAuthority,
         summary: &mut RetentionArchiveSummary,
     ) {
         let stream_id: StreamId = match candidate.stream_id.parse() {
@@ -542,43 +608,52 @@ impl EventStoreRetentionUseCase {
         };
 
         match &self.mode {
-            StreamRetentionModeRef::Delete => match self.events.delete_stream(stream_id).await {
-                Ok(()) => {
-                    summary.deleted += 1;
-                    emit_streams_archived(StreamsArchivedResult::Deleted);
-                    tracing::info!(
-                        stream_id = %candidate.stream_id,
-                        target = "delete",
-                        "stream sealed + deleted (adapter emitted \
-                         the StreamSealed tombstone)"
-                    );
+            StreamRetentionModeRef::Delete => {
+                match self.events.delete_stream(stream_id, authority).await {
+                    Ok(SealOutcome::Sealed) => {
+                        summary.deleted += 1;
+                        emit_streams_archived(StreamsArchivedResult::Deleted);
+                        tracing::info!(
+                            stream_id = %candidate.stream_id,
+                            target = "delete",
+                            "stream sealed + deleted (adapter emitted \
+                             the StreamSealed tombstone)"
+                        );
+                    }
+                    Ok(SealOutcome::NotAtProvenVersion) => {
+                        self.record_stream_changed(candidate, authority, summary);
+                    }
+                    Err(e) => {
+                        summary.errors += 1;
+                        tracing::error!(
+                            stream_id = %candidate.stream_id,
+                            error = %e,
+                            "delete_stream failed — stream NOT sealed, retried \
+                             next sweep. Expected & \
+                             fail-safe when the retention role is not \
+                             configured (the events_immutable trigger blocks \
+                             the unprivileged-role DELETE; zero rows removed, \
+                             no orphan tombstone)."
+                        );
+                    }
                 }
-                Err(e) => {
-                    summary.errors += 1;
-                    tracing::error!(
-                        stream_id = %candidate.stream_id,
-                        error = %e,
-                        "delete_stream failed — stream NOT sealed, retried \
-                         next sweep. Expected & \
-                         fail-safe when the retention role is not \
-                         configured (the events_immutable trigger blocks \
-                         the unprivileged-role DELETE; zero rows removed, \
-                         no orphan tombstone)."
-                    );
-                }
-            },
+            }
             // Unreachable in a shipped deployment: both binaries refuse
             // `HORT_RETENTION_STREAM_MODE=archive` at config parsing while
             // the cold-storage writer is deferred post-v1, because
             // `archive_stream` deletes the stream exactly as
-            // `delete_stream` does. The `Ok` arm below therefore counts
-            // and logs an archive that did not happen — do not make this
-            // path reachable before an `EventStore` implementation
-            // actually writes the stream somewhere.
+            // `delete_stream` does. The `Sealed` arm below therefore
+            // counts and logs an archive that did not happen — do not
+            // make this path reachable before an `EventStore`
+            // implementation actually writes the stream somewhere.
             StreamRetentionModeRef::Archive { target_prefix } => {
                 let target = format!("{target_prefix}/{}", candidate.stream_id);
-                match self.events.archive_stream(stream_id, &target).await {
-                    Ok(()) => {
+                match self
+                    .events
+                    .archive_stream(stream_id, &target, authority)
+                    .await
+                {
+                    Ok(SealOutcome::Sealed) => {
                         summary.archived += 1;
                         emit_streams_archived(StreamsArchivedResult::Archived);
                         tracing::info!(
@@ -587,6 +662,9 @@ impl EventStoreRetentionUseCase {
                             "stream sealed + archived (adapter emitted \
                              the StreamSealed tombstone)"
                         );
+                    }
+                    Ok(SealOutcome::NotAtProvenVersion) => {
+                        self.record_stream_changed(candidate, authority, summary);
                     }
                     Err(e) => {
                         summary.errors += 1;
@@ -603,13 +681,38 @@ impl EventStoreRetentionUseCase {
             }
         }
     }
+
+    /// The chokepoint refused because the stream moved past the tail
+    /// this sweep proved it at. Shared by both retention modes: the
+    /// outcome does not depend on which verb was called, and recording
+    /// it twice would let the two drift.
+    fn record_stream_changed(
+        &self,
+        candidate: &TerminalStreamCandidate,
+        authority: SealAuthority,
+        summary: &mut RetentionArchiveSummary,
+    ) {
+        summary.skipped_stream_changed += 1;
+        emit_streams_archived(StreamsArchivedResult::Skipped);
+        tracing::warn!(
+            stream_id = %candidate.stream_id,
+            proven_final_stream_position = authority.final_stream_position,
+            "seal refused: an event landed on the stream after this sweep \
+             proved it terminal and past its retention floor — nothing \
+             removed, no tombstone written (not an error; the next sweep \
+             re-evaluates from a fresh proof)"
+        );
+    }
 }
 
 /// Outcome of [`EventStoreRetentionUseCase::prove_terminal`].
 enum TerminalProof {
     /// Tail event type equals the category terminal — proceed to the
-    /// floor proof.
-    Terminal,
+    /// floor proof. Carries the `stream_position` of that same tail
+    /// event, which is what authorizes the seal: the proof and the
+    /// version it holds for must be one observation, or an event landing
+    /// between them is removed by a seal that never saw it.
+    Terminal { final_stream_position: u64 },
     /// Tail event type is not the category terminal — skip (not an
     /// error).
     NotTerminal { last_event_type: String },

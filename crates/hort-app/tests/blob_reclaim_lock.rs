@@ -25,8 +25,12 @@
 //! ## The properties
 //!
 //! 1. Every `INSERT INTO content_references` in production Rust under
-//!    `crates/*/src` sits in a function that calls `lock_blob_in_tx`
-//!    **before** the insert.
+//!    `crates/*/src` sits in a function that calls `lock_blob_in_tx` or
+//!    `lock_blobs_in_tx` **before** the insert. The plural form is the
+//!    multi-blob acquisition one transaction needs when it claims several
+//!    hashes at once (an ingest's own content plus its CAS-resident metadata
+//!    blob) — same lock, same keyspace, taken in a total order so two
+//!    overlapping writers cannot each hold the other's next one.
 //! 2. The advisory-lock SQL is spelled in exactly one file. One
 //!    keyspace, one derivation: two spellings is how two processes come
 //!    to lock different keys for the same blob.
@@ -61,8 +65,12 @@ use std::path::{Path, PathBuf};
 /// The table whose every production insert must be locked.
 const GUARDED_INSERT: &str = "INSERT INTO content_references";
 
-/// The waiting lock helper, taken by reference writers.
-const LOCK_HELPER: &str = "lock_blob_in_tx(";
+/// The waiting lock helpers, taken by reference writers: the single-hash
+/// form and the multi-hash form. Both end in `lock_blob…_in_tx(` so the
+/// `try_` exclusion in the sweep check below applies to each.
+/// `try_lock_blob_in_tx(` contains the first of them as a substring, which
+/// is why the sweep check excludes the `try_` prefix explicitly.
+const LOCK_HELPERS: [&str; 2] = ["lock_blob_in_tx(", "lock_blobs_in_tx("];
 
 /// The non-waiting lock helper, taken by the destructive sweep.
 const TRY_LOCK_HELPER: &str = "try_lock_blob_in_tx(";
@@ -242,10 +250,12 @@ fn every_content_reference_write_takes_the_blob_lock_first() {
             // The lock has to be taken *before* the insert: taking it
             // afterwards leaves the row visible to a sweep that counted
             // in between, which is the whole window being closed.
-            if !text[body_start..at].contains(LOCK_HELPER) {
+            let prefix = &text[body_start..at];
+            if !LOCK_HELPERS.iter().any(|h| prefix.contains(h)) {
                 violations.push(format!(
                     "{rel}:{line} — writes `content_references` without \
-                     first calling `{LOCK_HELPER})` on the target hash. A \
+                     first calling one of {LOCK_HELPERS:?} on the target \
+                     hash(es). A \
                      reference recorded outside the blob-reclamation lock \
                      can be written between the storage-GC sweep's \
                      refcount-zero re-check and its delete, leaving this \
@@ -315,11 +325,18 @@ fn the_destructive_sweep_never_waits_on_the_blob_lock() {
 
     // `try_lock_blob_in_tx(` contains `lock_blob_in_tx(`, so the waiting
     // form is only genuinely present where it is not preceded by `try_`.
-    let waiting = text
-        .match_indices(LOCK_HELPER)
-        .filter(|(at, _)| !text[..*at].ends_with("try_"))
-        .map(|(at, _)| line_of(&text, at))
+    // Both waiting forms are checked — the plural one would block the sweep
+    // just as thoroughly as the singular.
+    let mut waiting = LOCK_HELPERS
+        .iter()
+        .flat_map(|helper| {
+            text.match_indices(helper)
+                .filter(|(at, _)| !text[..*at].ends_with("try_"))
+                .map(|(at, _)| line_of(&text, at))
+                .collect::<Vec<_>>()
+        })
         .collect::<Vec<_>>();
+    waiting.sort_unstable();
     assert!(
         waiting.is_empty(),
         "{SWEEP_FILE} takes the WAITING form of the blob lock at line(s) \

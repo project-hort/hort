@@ -2102,7 +2102,11 @@ mod tests {
 
         // Retention stubs: authenticate-test capture; retention paths
         // are unreachable from auth flow, panic on call.
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             Box::pin(async { unimplemented!("retention path unreachable from auth flow") })
         }
 
@@ -2110,7 +2114,8 @@ mod tests {
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             Box::pin(async { unimplemented!("retention path unreachable from auth flow") })
         }
     }

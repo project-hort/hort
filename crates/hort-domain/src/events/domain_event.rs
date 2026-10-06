@@ -110,7 +110,9 @@ pub enum DomainEvent {
     /// The storage delete completed
     /// (or the blob was confirmed already absent). Terminal event for an
     /// `ArtifactExpired` work item; `refs_remaining` carries the
-    /// post-decrement cross-`kind` refcount. Idempotent (ADR 0028).
+    /// post-decrement claim count for the hash — `content_references`
+    /// rows, or the GC-protected artifacts holding it without one.
+    /// Idempotent (ADR 0028).
     /// Additive on this `#[non_exhaustive]` enum.
     ArtifactPurged(ArtifactPurged),
     /// The artifact was deleted from its repository — the terminal

@@ -43,7 +43,7 @@ use tokio::sync::broadcast;
 use hort_domain::error::DomainResult;
 use hort_domain::events::{PersistedEvent, StreamCategory, StreamId};
 use hort_domain::ports::event_store::{
-    AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
+    AppendEvents, AppendResult, EventStore, ReadFrom, SealAuthority, SealOutcome, SubscribeFrom,
 };
 use hort_domain::ports::BoxFuture;
 
@@ -211,12 +211,21 @@ impl EventStore for EventStorePublisher {
         self.inner.health_check()
     }
 
-    fn delete_stream(&self, stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
-        self.inner.delete_stream(stream_id)
+    fn delete_stream(
+        &self,
+        stream_id: StreamId,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+        self.inner.delete_stream(stream_id, authority)
     }
 
-    fn archive_stream(&self, stream_id: StreamId, target: &str) -> BoxFuture<'_, DomainResult<()>> {
-        self.inner.archive_stream(stream_id, target)
+    fn archive_stream(
+        &self,
+        stream_id: StreamId,
+        target: &str,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+        self.inner.archive_stream(stream_id, target, authority)
     }
 }
 
@@ -309,16 +318,21 @@ mod tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+            Box::pin(async { Ok(SealOutcome::Sealed) })
         }
 
         fn archive_stream(
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+            _authority: SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
+            Box::pin(async { Ok(SealOutcome::Sealed) })
         }
     }
 

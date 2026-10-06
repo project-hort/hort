@@ -91,16 +91,16 @@ use hort_http_core::context::AppContext;
 /// Docker clients expect for single-image manifests.
 const DEFAULT_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
-/// Ceiling on the CAS re-read that re-derives a coalesced follower's
-/// membership edges (see [`register_follower_membership_edges`]).
+/// Ceiling on the CAS read that derives a coalesced follower's
+/// membership claims (see [`follower_manifest_bytes`]).
 ///
 /// Matches the default upstream manifest-body cap
 /// (`HORT_UPSTREAM_MANIFEST_CACHE_MAX_SIZE`, 16 MiB), so every manifest
 /// hort accepted through pull-through under the default configuration
-/// can be re-read here. An operator who raises that cap above this
-/// ceiling does not get an unbounded buffer: the re-read is refused and
-/// the edges are logged as skipped, the same fail-safe posture the rest
-/// of this best-effort registration takes.
+/// can be read here. An operator who raises that cap above this
+/// ceiling does not get an unbounded buffer: the read is refused and
+/// the claims are logged as skipped, the same fail-safe posture the rest
+/// of the derivation takes.
 const MANIFEST_PROJECTION_READ_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Serve an OCI manifest by `(repo_key, name, reference)`.
@@ -840,9 +840,12 @@ async fn try_upstream_manifest_pull_by_digest(
     // consumes `mapping`. Threaded into `VerifiedIngestRequest` so
     // `ingest_inner` can gate the publish-anchored quarantine resolution.
     let blob_trust_publish_time = mapping.trust_upstream_publish_time;
-    // Captured for the LEADER-side membership-edge registration (#46
-    // Item 4) below — the only path that (briefly) holds the manifest
-    // bytes after the stream-to-CAS retirement of the bytes-broadcast.
+    // Captured for the LEADER-side post-commit side effects below (the
+    // eager child-ingest enqueue and the blob warm) — this is the only
+    // path that (briefly) holds the manifest bytes after the
+    // stream-to-CAS retirement of the bytes-broadcast. The membership
+    // edges that used to be registered here no longer need a context:
+    // they are derived from the bytes and committed by the ingest.
     let blob_ctx = ctx.clone();
     // Captured for the LEADER-side prefetch warming (#51) below —
     // mirrors `blob_ctx` above; the digest path needs its own
@@ -888,15 +891,50 @@ async fn try_upstream_manifest_pull_by_digest(
                         .to_string(),
                 ))
             })?;
-            let file = tokio::fs::File::open(&cache_handle.path)
-                .await
-                .map_err(|e| {
-                    AppError::from(DomainError::Validation(format!(
-                        "failed to open cached manifest body at {}: {e}",
+            // Read the cached body ONCE, into memory, BEFORE the ingest, and
+            // let every consumer of these bytes share that copy — the ingest
+            // stream, the membership-claim derivation, the eager child-ingest
+            // enqueue and the blob warm. Bounded work, not an unbounded
+            // buffer: the upstream adapter already refused anything over its
+            // `manifest_cache_max_bytes` cap when it wrote this tempfile, and
+            // the body has to be parsed on this path regardless.
+            //
+            // The read moved AHEAD of the ingest because the membership edges
+            // this manifest claims are derivable from nothing but these bytes
+            // and the digest the ingest is keyed on, and a
+            // `content_references` row is the claim that keeps the claimed
+            // bytes alive under the storage GC. Derived afterwards they were
+            // inserted beside the manifest's transition rather than inside
+            // it — a window in which the manifest is live and its blobs carry
+            // no claim, which no reconcile sweep repairs for a tree edge.
+            // `oci_index_child_ingest` reads its body up front for the same
+            // reason.
+            let manifest_bytes = match tokio::fs::read(&cache_handle.path).await {
+                Ok(b) => Bytes::from(b),
+                Err(e) => {
+                    hort_app::project::remove_cached_body(cache_handle).await;
+                    return Err(AppError::from(DomainError::Validation(format!(
+                        "failed to read cached manifest body at {}: {e}",
                         cache_handle.path.display()
-                    )))
-                })?;
-            let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(file);
+                    ))));
+                }
+            };
+            // The tempfile's lifecycle ends here: nothing downstream reaches
+            // for the path again, so dropping it now also stops an ingest
+            // failure from leaving it behind.
+            hort_app::project::remove_cached_body(cache_handle).await;
+            let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
+                Box::new(std::io::Cursor::new(manifest_bytes.clone()));
+            // Derived before the mint so the claims ride the manifest's own
+            // transition. `blob_upstream_digest` is the digest the ingest
+            // verifies against and mints under, so it is the right identity
+            // for the derivation's diagnostics.
+            let claims = crate::manifests_write::pull_membership_claims(
+                blob_repo_id,
+                &blob_upstream_digest,
+                &media_type,
+                &manifest_bytes,
+            );
             let request = VerifiedIngestRequest::ProtocolNative {
                 repository_id: blob_repo_id,
                 coords: oci_manifest_coords(name, &blob_upstream_digest),
@@ -916,25 +954,23 @@ async fn try_upstream_manifest_pull_by_digest(
                 trust_upstream_publish_time: blob_trust_publish_time,
             };
             let outcome = blob_ingest
-                .ingest_verified(request, async_read, &OciFormatHandler)
+                .ingest_verified(request, &claims, async_read, &OciFormatHandler)
                 .await?;
 
-            // Register-only content_references membership edges (#46
-            // Item 4 — the pull-through re-fix). Read the manifest body
-            // back from the still-live tempfile (best-effort; a read
-            // failure here is non-fatal — the manifest is already in
-            // CAS) and write the SAME edges the hosted PUT path writes,
-            // without fetching the referenced children/blobs.
+            // The membership edges committed with the manifest above. What
+            // stays here are the two consumers of the same bytes that are
+            // NOT claims on bytes, and so stay post-commit and best-effort:
             //
             // The children of an index ARE fetched, but by the worker,
             // off this request: one durable `oci-index-child-ingest` row
-            // per declared child, enqueued in the same breath as the
-            // membership edges that enumerate them. Each child's
+            // per declared child. Each child's
             // quarantine window therefore starts at index ingest rather
             // than at the first client GET for it, so the index's window
             // and its children's run concurrently. No window is
             // shortened — the child's anchor still comes from
-            // `first_seen_for_checksum` (ADR 0054).
+            // `first_seen_for_checksum` (ADR 0054). These are `jobs` rows:
+            // a lost one leaves its child on the lazy pull path, which is
+            // where it was before the kind existed.
             //
             // Also warm this manifest's own config + layer blobs (#51):
             // a digest-ref pull IS the client naming a specific child
@@ -943,46 +979,20 @@ async fn try_upstream_manifest_pull_by_digest(
             // `prefetch_policy.enabled` only (design doc §4/§5). An
             // OCI index has no config/layers, so `warm_manifest_blobs`
             // is a safe no-op for the index-by-digest case.
-            match tokio::fs::read(&cache_handle.path).await {
-                Ok(manifest_bytes) => {
-                    crate::manifests_write::register_membership_edges_from_pull(
-                        &blob_ctx,
-                        blob_repo_id,
-                        outcome.artifact.id,
-                        &media_type,
-                        &manifest_bytes,
-                    )
-                    .await;
-                    blob_ctx
-                        .oci_index_child_enqueue_use_case
-                        .enqueue_declared_children(blob_repo_id, name, &manifest_bytes)
-                        .await;
-                    if blob_repo.prefetch_policy.enabled {
-                        crate::prefetch::warm_manifest_blobs(
-                            &blob_ctx,
-                            &blob_repo,
-                            name,
-                            reference,
-                            "child_digest",
-                            &Bytes::from(manifest_bytes),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        %blob_repo_id,
-                        artifact_id = %outcome.artifact.id,
-                        error = %e,
-                        "OCI pull-through: failed to re-read manifest tempfile for \
-                         membership-edge registration / prefetch; skipping both \
-                         (non-fatal, manifest is in CAS)"
-                    );
-                }
+            blob_ctx
+                .oci_index_child_enqueue_use_case
+                .enqueue_declared_children(blob_repo_id, name, &manifest_bytes)
+                .await;
+            if blob_repo.prefetch_policy.enabled {
+                crate::prefetch::warm_manifest_blobs(
+                    &blob_ctx,
+                    &blob_repo,
+                    name,
+                    reference,
+                    "child_digest",
+                    &manifest_bytes,
+                );
             }
-
-            // Tempfile is in CAS now — drop it (the lifecycle
-            // `manifest_body_bytes` used to own).
-            hort_app::project::remove_cached_body(cache_handle).await;
             Ok(outcome.artifact.sha256_checksum)
         })
         .await;
@@ -1019,10 +1029,11 @@ async fn try_upstream_manifest_pull_by_digest(
 /// coalesce via `finalise_manifest_pull`.
 ///
 /// The prefetch-on-tag-move trigger fires LEADER-SIDE inside the closure
-/// (it is the only path that holds the manifest bytes — read once from
-/// the just-ingested tempfile before cleanup — and it is gated on the
-/// leader's successful ingest). Coalesced followers do not re-plan the
-/// same prefetch.
+/// (it is the only path that holds the manifest bytes — read once from the
+/// cached tempfile BEFORE the ingest, because the membership claims derived
+/// from the same copy have to ride the ingest's transition — and it is
+/// gated on the leader's successful ingest). Coalesced followers do not
+/// re-plan the same prefetch.
 async fn try_upstream_manifest_pull_by_tag(
     ctx: &Arc<AppContext>,
     repo: &Repository,
@@ -1186,15 +1197,38 @@ async fn try_upstream_manifest_pull_by_tag(
                         .to_string(),
                 ))
             })?;
-            let file = tokio::fs::File::open(&cache_handle.path)
-                .await
-                .map_err(|e| {
-                    AppError::from(DomainError::Validation(format!(
-                        "failed to open cached manifest body at {}: {e}",
+            // Read the cached body ONCE, into memory, BEFORE the ingest —
+            // see the digest-ref leg for the reasoning in full. In short:
+            // the membership edges this manifest claims are derivable from
+            // these bytes plus the digest the ingest is keyed on, and a
+            // `content_references` row is the claim that keeps the claimed
+            // bytes alive under the storage GC, so the manifest's own
+            // transaction is the only place to record one. The ingest, the
+            // claim derivation, the eager child-ingest enqueue and the
+            // prefetch trigger all share this one copy; the upstream
+            // adapter's `manifest_cache_max_bytes` cap is what bounds it.
+            let manifest_bytes = match tokio::fs::read(&cache_handle.path).await {
+                Ok(b) => Bytes::from(b),
+                Err(e) => {
+                    hort_app::project::remove_cached_body(cache_handle).await;
+                    return Err(AppError::from(DomainError::Validation(format!(
+                        "failed to read cached manifest body at {}: {e}",
                         cache_handle.path.display()
-                    )))
-                })?;
-            let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(file);
+                    ))));
+                }
+            };
+            // The tempfile's lifecycle ends here: nothing downstream reaches
+            // for the path again, so dropping it now also stops an ingest
+            // failure from leaving it behind.
+            hort_app::project::remove_cached_body(cache_handle).await;
+            let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
+                Box::new(std::io::Cursor::new(manifest_bytes.clone()));
+            let claims = crate::manifests_write::pull_membership_claims(
+                meta_repo_id,
+                &upstream_digest,
+                &media_type,
+                &manifest_bytes,
+            );
             let request = VerifiedIngestRequest::ProtocolNative {
                 repository_id: meta_repo_id,
                 coords: oci_manifest_coords(&meta_name, &upstream_digest),
@@ -1214,7 +1248,7 @@ async fn try_upstream_manifest_pull_by_tag(
                 trust_upstream_publish_time: meta_trust_publish_time,
             };
             let ingest_outcome = meta_ingest
-                .ingest_verified(request, async_read, &OciFormatHandler)
+                .ingest_verified(request, &claims, async_read, &OciFormatHandler)
                 .await?;
             let actual_hash = ingest_outcome.artifact.sha256_checksum.clone();
 
@@ -1255,69 +1289,35 @@ async fn try_upstream_manifest_pull_by_tag(
                 "OCI upstream manifest pull-through succeeded"
             );
 
-            // LEADER-SIDE re-read of the manifest tempfile. The
-            // bytes-broadcast retirement (ADR 0026) means this is the only
-            // path that (briefly) holds the manifest bytes; read them once
-            // BEFORE the cleanup below and reuse for all three consumers:
-            // - Register-only content_references membership edges (#46
-            //   Item 4 — the pull-through re-fix), UNCONDITIONALLY (not
-            //   gated on prefetch, unlike the trigger below) — mirrors the
-            //   hosted PUT path's edges, without fetching children/blobs.
-            // - The eager index-child ingest enqueue, likewise
-            //   unconditional: an index's children are the declared
-            //   membership of the artifact a client just requested, not
-            //   speculation, so it carries no policy gate (the blob warm
-            //   beside it keeps its own — the asymmetry is deliberate).
+            // The membership edges committed with the manifest above. The
+            // two remaining consumers of the body stay post-commit and
+            // best-effort, because neither is a claim on bytes:
+            // - The eager index-child ingest enqueue, unconditional: an
+            //   index's children are the declared membership of the
+            //   artifact a client just requested, not speculation, so it
+            //   carries no policy gate (the prefetch trigger beside it
+            //   keeps its own — the asymmetry is deliberate). A tag pull of
+            //   a multi-arch image resolves to an index too, so the same
+            //   enqueue rides here; see the digest arm for why.
             // - The prefetch-on-tag-move trigger (only when prefetch is
             //   enabled and the tag moved — `fire_prefetch_trigger_oci`
             //   gates internally).
-            // All three are best-effort and non-fatal — a tempfile read
-            // failure here never affects the live response; the manifest is
-            // already in CAS.
-            match tokio::fs::read(&cache_handle.path).await {
-                Ok(manifest_bytes) => {
-                    crate::manifests_write::register_membership_edges_from_pull(
-                        &meta_ctx,
-                        meta_repo_id,
-                        ingest_outcome.artifact.id,
-                        &media_type,
-                        &manifest_bytes,
-                    )
-                    .await;
-                    // A tag pull of a multi-arch image resolves to an
-                    // index too, so the same eager child-ingest enqueue
-                    // rides here. See the digest arm for why.
-                    meta_ctx
-                        .oci_index_child_enqueue_use_case
-                        .enqueue_declared_children(meta_repo_id, &meta_name, &manifest_bytes)
-                        .await;
-                    if meta_repo.prefetch_policy.enabled {
-                        crate::prefetch::fire_prefetch_trigger_oci(
-                            &meta_ctx,
-                            &meta_repo,
-                            &meta_name,
-                            &meta_tag,
-                            &actual_hash,
-                            meta_prior_held_digest.as_ref(),
-                            &Bytes::from(manifest_bytes),
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        repo_key = %meta_repo_key,
-                        tag = %meta_tag,
-                        error = %e,
-                        "OCI pull-through: failed to re-read manifest tempfile for \
-                         membership-edge registration / prefetch; skipping both \
-                         (non-fatal, manifest is in CAS)"
-                    );
-                }
+            // Both read the one in-memory copy taken before the ingest.
+            meta_ctx
+                .oci_index_child_enqueue_use_case
+                .enqueue_declared_children(meta_repo_id, &meta_name, &manifest_bytes)
+                .await;
+            if meta_repo.prefetch_policy.enabled {
+                crate::prefetch::fire_prefetch_trigger_oci(
+                    &meta_ctx,
+                    &meta_repo,
+                    &meta_name,
+                    &meta_tag,
+                    &actual_hash,
+                    meta_prior_held_digest.as_ref(),
+                    &manifest_bytes,
+                );
             }
-
-            // Tempfile is in CAS now — drop it (the lifecycle
-            // `manifest_body_bytes` used to own).
-            hort_app::project::remove_cached_body(cache_handle).await;
             Ok(actual_hash)
         })
         .await;
@@ -1513,10 +1513,10 @@ async fn follower_media_type_for_hash(ctx: &Arc<AppContext>, content_hash: &Cont
 /// `register_existing_cas_blob` rather than failing closed. Coords are
 /// reconstructed deterministically from `(name, content_hash)` —
 /// `oci_manifest_coords` is exactly what the leader's closure used, and
-/// [`register_follower_membership_edges`] then gives that row the same
-/// `content_references` membership edges the ingesting leg writes, so a
-/// row minted here is never structurally weaker than one minted by the
-/// leg that fetched the bytes.
+/// the claims derived by [`follower_manifest_bytes`] ride that row's own
+/// transition, so a row minted here carries the same `content_references`
+/// membership edges the ingesting leg's does and is never structurally
+/// weaker than it.
 ///
 /// The follower's content_type is resolved via
 /// [`follower_media_type_for_hash`] — the leader's cross-repo row carries
@@ -1546,6 +1546,24 @@ async fn finalise_manifest_pull(
         },
         Ok(None) => {
             let media_type = follower_media_type_for_hash(ctx, &content_hash).await;
+            // Read the manifest out of CAS BEFORE the row that will claim
+            // its constituents exists, and derive that row's membership
+            // claims from it — see [`follower_manifest_bytes`]. An absent
+            // or over-ceiling read yields no claims and no enqueue; the
+            // register below then fails its own `storage.exists` gate if
+            // the bytes genuinely are not there.
+            let manifest_bytes = follower_manifest_bytes(ctx, repo, reference, &content_hash).await;
+            let claims = manifest_bytes
+                .as_deref()
+                .map(|body| {
+                    crate::manifests_write::pull_membership_claims(
+                        repo.id,
+                        &content_hash,
+                        &media_type,
+                        body,
+                    )
+                })
+                .unwrap_or_default();
             match ctx
                 .ingest_use_case
                 .register_existing_cas_blob(
@@ -1573,21 +1591,32 @@ async fn finalise_manifest_pull(
                         // `None`/immediately-downloadable with no gate at
                         // all.
                         seed_import_quarantine_anchor: None,
+                        // The follower's manifest claims its config / layer
+                        // / index-member bytes exactly as the ingesting
+                        // leg's row does, and they ride this row's own
+                        // transition.
+                        claimed_edges: claims,
                     },
                     &OciFormatHandler,
                 )
                 .await
             {
                 Ok(outcome) => {
-                    register_follower_membership_edges(
-                        ctx,
-                        repo,
-                        name,
-                        reference,
-                        outcome.artifact.id,
-                        &media_type,
-                    )
-                    .await;
+                    // The eager child-ingest enqueue stays post-commit and
+                    // best-effort: `jobs` rows, not claims on bytes. A
+                    // follower's repository needs its index's children as
+                    // much as the leader's does — more so, because the
+                    // leader's enqueue targeted the LEADER's repository and
+                    // the dedupe key is per-repository (the quarantine
+                    // anchor is per row, ADR 0054). `name` is the
+                    // follower's own client-facing requested name, so each
+                    // child resolves through the mapping a client pull
+                    // against THIS repository would use.
+                    if let Some(body) = manifest_bytes.as_deref() {
+                        ctx.oci_index_child_enqueue_use_case
+                            .enqueue_declared_children(repo.id, name, body)
+                            .await;
+                    }
                     UpstreamManifestPullOutcome::Ingested {
                         hash: outcome.artifact.sha256_checksum.clone(),
                         artifact: Box::new(outcome.artifact),
@@ -1618,9 +1647,8 @@ async fn finalise_manifest_pull(
     }
 }
 
-/// Register the `content_references` membership edges for a manifest row
-/// that a **coalesced follower** just minted from an already-CAS-resident
-/// hash, re-deriving them from the CAS bytes.
+/// The CAS bytes of the manifest a **coalesced follower** is about to mint
+/// its own per-repo row for, read bounded and ahead of that mint.
 ///
 /// # The invariant this closes
 ///
@@ -1635,65 +1663,59 @@ async fn finalise_manifest_pull(
 /// The pull-through's fetch closure runs at most once per coalescing
 /// window, and that window is keyed by content hash alone — it is
 /// cross-repository by design, so the closure (and with it the leader's
-/// edge registration) runs against the LEADER's repository. Every other
-/// caller in the window is a follower, and a follower whose target
-/// repository differs from the leader's has no row to inherit: it mints
-/// its own via `register_existing_cas_blob`. Without this call that row
-/// is structurally incomplete — the artifact is served 200 and its
-/// membership edges never exist. Registration is idempotent (upsert on
-/// the `content_references` PK), so re-deriving here can only converge
-/// on what the ingesting leg would have written for identical bytes.
+/// claim set) runs against the LEADER's repository. Every other caller in
+/// the window is a follower, and a follower whose target repository
+/// differs from the leader's has no row to inherit: it mints its own via
+/// `register_existing_cas_blob`. Without these claims that row is
+/// structurally incomplete — the artifact is served 200 and its membership
+/// edges never exist. Re-deriving from CAS can only converge on what the
+/// ingesting leg wrote for identical bytes, and the upsert PK makes the
+/// convergence idempotent.
 ///
-/// **Non-fatal**, exactly like the ingesting leg's own registration: the
-/// row is already committed and the manifest is already serveable by the
-/// time this runs, so a CAS re-read or parse failure is logged and
-/// skipped rather than failing the pull.
+/// # Why the read is here and not after the mint
 ///
-/// # The eager child-ingest enqueue rides here too
+/// It used to run after `register_existing_cas_blob` returned, keyed on
+/// the artifact id that call produced, and insert the edges beside the
+/// committed row. That is a window in which the follower's manifest is
+/// live and servable while the blobs it references carry one fewer claim
+/// against the storage GC — and no sweep repairs a tree edge, because the
+/// refcount reconcile derives `primary_content` / `metadata_blob` from the
+/// artifact row and nothing relational records what a manifest
+/// references. A claim has to travel INTO the minting transaction, so the
+/// read has to precede it, so it is keyed on the content hash instead of
+/// an id — which is all it ever needed: the bytes are CAS-resident and
+/// upstream-verified (ADR 0006) by the leg that fetched them.
 ///
-/// A follower's repository needs its index's children as much as the
-/// leader's does — more so, because the leader's enqueue targeted the
-/// LEADER's repository and the dedupe key is per-repository (the
-/// quarantine anchor is per row, ADR 0054). The enqueue therefore fires
-/// from every leg that mints an index row, and `name` is the follower's
-/// own client-facing requested name so each child resolves through the
-/// mapping a client pull against THIS repository would use.
-async fn register_follower_membership_edges(
+/// `None` on a read failure, and the caller then mints with no membership
+/// claims and skips the child enqueue. That is the same warn-and-continue
+/// posture the derivation itself takes, for the same reason: the bytes
+/// match their digest and the manifest is legitimately servable, so a
+/// failure to re-derive its projection must not refuse the pull. What is
+/// no longer warn-and-continue is the edge *write* — that rides the
+/// transition now and a failure takes the whole register with it.
+async fn follower_manifest_bytes(
     ctx: &Arc<AppContext>,
     repo: &Repository,
-    name: &str,
     reference: &str,
-    manifest_artifact_id: Uuid,
-    media_type: &str,
-) {
+    content_hash: &ContentHash,
+) -> Option<Vec<u8>> {
     match ctx
         .artifact_use_case
-        .read_content_for_projection(manifest_artifact_id, MANIFEST_PROJECTION_READ_CAP_BYTES)
+        .read_content_for_projection(content_hash, MANIFEST_PROJECTION_READ_CAP_BYTES)
         .await
     {
-        Ok(manifest_bytes) => {
-            crate::manifests_write::register_membership_edges_from_pull(
-                ctx,
-                repo.id,
-                manifest_artifact_id,
-                media_type,
-                &manifest_bytes,
-            )
-            .await;
-            ctx.oci_index_child_enqueue_use_case
-                .enqueue_declared_children(repo.id, name, &manifest_bytes)
-                .await;
-        }
+        Ok(bytes) => Some(bytes),
         Err(e) => {
             tracing::warn!(
                 repo_key = %repo.key,
                 reference = %reference,
-                artifact_id = %manifest_artifact_id,
+                hash = %content_hash,
                 error = %e,
-                "OCI pull-through: CAS re-read for the coalesced follower's membership-edge \
-                 registration failed; edges not registered (non-fatal, the row is committed \
-                 and serveable)"
+                "OCI pull-through: CAS read for the coalesced follower's membership-edge \
+                 derivation failed; the row is minted without membership edges and no \
+                 child-ingest rows are enqueued"
             );
+            None
         }
     }
 }
@@ -3769,8 +3791,8 @@ mod tests {
     }
 
     // ================================================================
-    // Two things ride alongside `register_membership_edges_from_pull` on
-    // the digest-ref pull-through, and the tests below separate them:
+    // Two things ride alongside the membership-claim derivation on the
+    // digest-ref pull-through, and the tests below separate them:
     //
     // - The blob warm (`crate::prefetch::warm_manifest_blobs`). A
     //   digest-ref pull IS the client naming a specific architecture, so
@@ -4514,6 +4536,553 @@ mod tests {
         );
         assert_eq!(config_rows[0].source_artifact_id, manifest_artifact_id);
         assert_eq!(layer_rows[0].source_artifact_id, manifest_artifact_id);
+    }
+
+    // =================================================================
+    // Atomicity acceptance for the pull-through legs. All three legs that
+    // mint a manifest row now carry their membership claims INTO that
+    // row's transition rather than inserting them beside it: the two
+    // leader legs (digest-ref and tag-ref) and the coalesced follower.
+    //
+    // Each injected-failure test is paired with a success pin. The pins
+    // matter as much as the failures: a rollback assertion passes equally
+    // well against a leg that claimed nothing at all, so the pin is what
+    // proves the claim set is non-empty and rides ONE lifecycle call.
+    // =================================================================
+
+    /// **Acceptance, digest-ref leader leg.** A failed `oci_index_member`
+    /// claim fails the pull: no index artifact, no event on its stream, no
+    /// row.
+    ///
+    /// This leg used to read the manifest body back from its tempfile
+    /// AFTER the ingest and insert the edges with a `warn!`-and-continue
+    /// arm per edge, so a failure left a live, servable index whose child
+    /// manifests carried one fewer claim against the storage GC — and no
+    /// sweep repairs a tree edge (the refcount reconcile derives
+    /// `primary_content` / `metadata_blob` from the artifact row, and
+    /// nothing relational records what a manifest references). A failed GET
+    /// is retriable; a committed index with no claim was not.
+    #[test]
+    fn pull_through_by_digest_with_failing_member_edge_fails_the_pull() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, member_rows, index_present, event_batches) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+            let batches_before = mocks.events.appended_batches().len();
+            mocks.content_references.fail_next_insert_for_kind(
+                "oci_index_member",
+                DomainError::Invariant("simulated oci_index_member insert failure".into()),
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            let index_present = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = mocks.events.appended_batches().len() - batches_before;
+            (status, member_rows, index_present, event_batches)
+        });
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a failed claim on a child manifest's bytes must fail the pull, not serve 200 \
+             over an index that never recorded it"
+        );
+        assert_eq!(member_rows, 0, "no oci_index_member row landed");
+        assert!(
+            !index_present,
+            "no index artifact may survive the rolled-back pull"
+        );
+        assert_eq!(
+            event_batches, 0,
+            "no event may survive the rolled-back pull — not even ArtifactIngested"
+        );
+    }
+
+    /// The counter-assertion for the digest-ref leg: ONE lifecycle call
+    /// carries the index artifact AND its `oci_index_member` claim.
+    #[test]
+    fn pull_through_by_digest_commits_member_claims_with_the_index_transition() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, index_edges, carrying) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let index = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .expect("pulled-through index must be committed as an artifact");
+            let index_edges: Vec<(String, String)> = mocks
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == index.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            let carrying = mocks
+                .lifecycle
+                .ingest_edges()
+                .into_iter()
+                .filter(|(id, _)| *id == index.id)
+                .count();
+            (status, index_edges, carrying)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            index_edges,
+            vec![
+                ("primary_content".to_string(), hex.clone()),
+                ("oci_index_member".to_string(), child_hex.to_string()),
+            ],
+            "the index's claim on its own bytes and on its child's, in one call"
+        );
+        assert_eq!(
+            carrying, 1,
+            "one transition carries the index's whole edge set"
+        );
+    }
+
+    /// **Acceptance, tag-ref leader leg.** The same rollback for the other
+    /// leader leg. Separate test rather than a parameterisation because the
+    /// two legs are separate closures with separately-captured state — the
+    /// tag leg additionally resolves its digest from the upstream's
+    /// `Docker-Content-Digest` and writes a tag→digest ref — and a
+    /// conversion applied to one and missed on the other is exactly the
+    /// drift this audit keeps finding.
+    #[test]
+    fn pull_through_by_tag_with_failing_member_edge_fails_the_pull() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (status, member_rows, index_present, event_batches) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                "latest",
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(format!("sha256:{hex}")),
+                    last_modified: None,
+                },
+            );
+            let batches_before = mocks.events.appended_batches().len();
+            mocks.content_references.fail_next_insert_for_kind(
+                "oci_index_member",
+                DomainError::Invariant("simulated oci_index_member insert failure".into()),
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/latest");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(repo_id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            let index_present = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = mocks.events.appended_batches().len() - batches_before;
+            (status, member_rows, index_present, event_batches)
+        });
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a failed claim on a child manifest's bytes must fail the tag pull too"
+        );
+        assert_eq!(member_rows, 0, "no oci_index_member row landed");
+        assert!(
+            !index_present,
+            "no index artifact may survive the rolled-back tag pull"
+        );
+        assert_eq!(
+            event_batches, 0,
+            "no event may survive the rolled-back tag pull"
+        );
+    }
+
+    /// The counter-assertion for the tag-ref leg.
+    #[test]
+    fn pull_through_by_tag_commits_member_claims_with_the_index_transition() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (status, index_edges, carrying) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                "latest",
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: INDEX_MEDIA.into(),
+                    declared_digest: Some(format!("sha256:{hex}")),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/latest");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, INDEX_MEDIA)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let index = mocks
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .expect("pulled-through index must be committed as an artifact");
+            let index_edges: Vec<(String, String)> = mocks
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == index.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            let carrying = mocks
+                .lifecycle
+                .ingest_edges()
+                .into_iter()
+                .filter(|(id, _)| *id == index.id)
+                .count();
+            (status, index_edges, carrying)
+        });
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            index_edges,
+            vec![
+                ("primary_content".to_string(), hex.clone()),
+                ("oci_index_member".to_string(), child_hex.to_string()),
+            ],
+            "the index's claim on its own bytes and on its child's, in one call"
+        );
+        assert_eq!(
+            carrying, 1,
+            "one transition carries the index's whole edge set"
+        );
+    }
+
+    /// **Acceptance, coalesced follower.** A failed `oci_index_member`
+    /// claim fails the follower's own registration: no row in the
+    /// follower's repository, no event, no edge — and `Internal` rather
+    /// than `Ingested`.
+    ///
+    /// The follower is the leg with no row to inherit: `DedupKey` is
+    /// cross-repository by design, so a follower whose target repository
+    /// differs from the leader's mints its own row from the
+    /// already-CAS-resident bytes. It used to insert its membership edges
+    /// after that row committed, keyed on the id the register returned, with
+    /// a `warn!`-and-continue arm — a 200 over a row whose constituents
+    /// nothing was keeping alive. The read now precedes the mint (keyed on
+    /// the content hash, which is all it ever needed) and the claims ride
+    /// the transition.
+    #[test]
+    fn coalesced_follower_with_failing_member_edge_registers_nothing() {
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (variant, member_rows, follower_rows, event_batches) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            assert_ne!(leader_repo.id, follower_repo.id);
+            mocks.repositories.insert(leader_repo.clone());
+            mocks.repositories.insert(follower_repo.clone());
+
+            // Only the LEADER's row exists, so `finalise_manifest_pull`
+            // takes its cross-repo follower branch for `follower_repo`.
+            seed_manifest(
+                &mocks.artifacts,
+                &mocks.storage,
+                &mocks.artifact_metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+            let batches_before = mocks.events.appended_batches().len();
+            mocks.content_references.fail_next_insert_for_kind(
+                "oci_index_member",
+                DomainError::Invariant("simulated oci_index_member insert failure".into()),
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_manifest_pull(
+                &ctx,
+                &follower_repo,
+                "dockerhub/library/nginx",
+                &format!("sha256:{hex}"),
+                content_hash.clone(),
+                /*write_tag=*/ false,
+            )
+            .await;
+
+            let child_hash: ContentHash = child_hex.parse().unwrap();
+            let member_rows = mocks
+                .content_references
+                .find_by_target(follower_repo.id, &child_hash, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            let follower_rows = mocks
+                .artifacts
+                .find_by_path(follower_repo.id, &format!("manifests/sha256:{hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = mocks.events.appended_batches().len() - batches_before;
+            (
+                manifest_outcome_variant_name(&outcome),
+                member_rows,
+                follower_rows,
+                event_batches,
+            )
+        });
+        assert_eq!(
+            variant, "Internal",
+            "a failed claim on a child manifest's bytes must fail the follower's \
+             registration, not serve 200 over a row that never recorded it"
+        );
+        assert_eq!(member_rows, 0, "no oci_index_member row landed");
+        assert!(
+            !follower_rows,
+            "no follower artifact row may survive the rolled-back registration"
+        );
+        assert_eq!(
+            event_batches, 0,
+            "no event may survive the rolled-back registration"
+        );
+    }
+
+    /// The counter-assertion for the follower: ONE lifecycle call carries
+    /// the follower's own row AND its `oci_index_member` claim, with the
+    /// claim scoped to the FOLLOWER's repository (the leader's row is a
+    /// different unit of work with its own edges).
+    #[test]
+    fn coalesced_follower_commits_member_claims_with_its_own_transition() {
+        let child_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let content = sample_index_body(child_hex);
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let leader_repo = oci_repo("leader-mirror");
+            let follower_repo = oci_repo("follower-mirror");
+            assert_ne!(leader_repo.id, follower_repo.id);
+            mocks.repositories.insert(leader_repo.clone());
+            mocks.repositories.insert(follower_repo.clone());
+
+            seed_manifest(
+                &mocks.artifacts,
+                &mocks.storage,
+                &mocks.artifact_metadata,
+                leader_repo.id,
+                &hex,
+                &content,
+                Some(INDEX_MEDIA),
+                QuarantineStatus::None,
+            );
+
+            let content_hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_manifest_pull(
+                &ctx,
+                &follower_repo,
+                "dockerhub/library/nginx",
+                &format!("sha256:{hex}"),
+                content_hash,
+                /*write_tag=*/ false,
+            )
+            .await;
+            let follower_artifact = match outcome {
+                UpstreamManifestPullOutcome::Ingested { artifact, .. } => {
+                    assert_eq!(artifact.repository_id, follower_repo.id);
+                    artifact
+                }
+                other => panic!(
+                    "expected Ingested from cross-repo follower re-register; got {}",
+                    manifest_outcome_variant_name(&other)
+                ),
+            };
+
+            let follower_edges: Vec<(String, String)> = mocks
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == follower_artifact.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            assert_eq!(
+                follower_edges,
+                vec![
+                    ("primary_content".to_string(), hex.clone()),
+                    ("oci_index_member".to_string(), child_hex.to_string()),
+                ],
+                "the follower's own row claims its bytes and its child's, in one call"
+            );
+            // `register_by_hash_inner` commits twice for this row — the
+            // genesis commit that mints it, then the quarantine gate's
+            // follow-on commit, which carries enqueues and no edges. Exactly
+            // ONE of the two carries edges, and it carries all of them: the
+            // row and its claims are a single atomic unit, not a mint
+            // followed by a top-up.
+            let edge_carrying: Vec<usize> = mocks
+                .lifecycle
+                .ingest_edges()
+                .into_iter()
+                .filter(|(id, edges)| *id == follower_artifact.id && !edges.is_empty())
+                .map(|(_, edges)| edges.len())
+                .collect();
+            assert_eq!(
+                edge_carrying,
+                vec![2],
+                "exactly one transition carries the follower row's whole edge set"
+            );
+        });
     }
 
     /// The membership edges of a digest-ref manifest pull must exist for

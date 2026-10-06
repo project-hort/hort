@@ -44,25 +44,18 @@
 //!   because a hash-only reading protects nothing outside OCI; the
 //!   `namespace` conjunct matters because otherwise one package's
 //!   `latest` would exempt every same-versioned package beside it.
-//!   This is re-read here, not inherited from the evaluation sweep:
-//!   the two sweeps are an hour apart and a tag set in between arrives
-//!   after the `ArtifactExpired` is already on the stream.
+//!   This is read at sweep time, not inherited from the evaluation
+//!   sweep: the two sweeps are an hour apart and a tag set in between
+//!   arrives after the `ArtifactExpired` is already on the stream. It
+//!   is nonetheless a page snapshot — `purge_artifact_refs` reads the
+//!   same predicate again under the artifact lock, and that reading is
+//!   the one the destructive step turns on.
 //! - `expired_only_by_keep_last_n` — no pending `ArtifactExpired` on
-//!   the stream carries a readable non-`KeepLastN` reason.
-//!   `ExpirationReason` is an externally-tagged enum, so the stored
-//!   payload of a count-based expiry is `{"KeepLastN": {…}}` under
-//!   `event_data->'data'->'reason'`. The exemption belongs to
-//!   `KeepLastN` alone — an age- or security-driven decision is not
-//!   countermanded by a tag.
-//!
-//!   The `jsonb_typeof(…) = 'object'` guard is the fail-safe
-//!   direction: only a payload that positively reads as *some other*
-//!   reason clears the exemption. An absent or non-object reason
-//!   leaves the flag set, which at worst withholds a destructive step
-//!   on an artifact a tag currently names — visible in the sweep
-//!   summary and released as soon as the tag moves. The opposite
-//!   default would let an unreadable payload delete content a live
-//!   tag resolves to, and deletion does not come back.
+//!   the stream carries a readable non-`KeepLastN` reason; the
+//!   exemption belongs to `KeepLastN` alone, because an age- or
+//!   security-driven decision is not countermanded by a tag. See
+//!   `ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL` for the predicate and
+//!   its fail-safe direction.
 //! - `user_deleted` — an `ArtifactDeleted` is on the stream. A
 //!   delete-driven work item must not inherit the `KeepLastN` tag
 //!   exemption (a delete is the caller's explicit instruction, like an
@@ -82,6 +75,26 @@
 //!    about *this artifact's* bookkeeping and says nothing about the
 //!    blobs it points at — see `begin_blob_reclaim` below, which is the
 //!    lock the destructive step runs under.
+//!
+//!    The same statement reads the four protection facts
+//!    (`quarantine_status`, `tag_targeted`,
+//!    `expired_only_by_keep_last_n`, `user_deleted`), and the two port
+//!    predicates (`PendingPurge::is_gc_protected` /
+//!    `::is_tag_exempt`) are applied to them. Either one holding ends
+//!    the transaction here — `PurgePreparation::Protected` /
+//!    `::TagExempt`, no `DELETE`, no worklist row, no event, work item
+//!    still pending.
+//!
+//!    This is where the protection decision belongs, because step 2 is
+//!    the first irreversible one and the facts move while the sweep
+//!    runs. The caller checks the same two rules on its page row
+//!    first, which saves taking this lock in the ordinary case and is
+//!    the whole of what it does: between that page read and *this*
+//!    artifact's step 2 lies the complete processing of every
+//!    preceding item of the page, storage deletes included. Same
+//!    division of labour as `mutable_refs`'s `set` — the
+//!    in-transaction `FOR UPDATE` re-read is the race defence, the
+//!    earlier read is the optimisation.
 //! 2. `DELETE FROM content_references WHERE source_artifact_id = $1
 //!    RETURNING target_content_hash` — remove **every** kind of this
 //!    artifact's own source-edges: the `primary_content` /
@@ -115,16 +128,35 @@
 //! `begin_blob_reclaim` is where that is corrected: it takes the
 //! hash-scoped [`blob_lock`](crate::blob_lock) with `try` (never
 //! waiting — see that module) and re-reads the cross-`kind` count under
-//! it. Zero still ⇒ a `BlobReclaim::Granted` guard the caller holds
-//! across `StoragePort::delete`. Non-zero ⇒ `Referenced`, with the
-//! worklist row corrected in place so the terminal event states the
-//! count that held. Lock busy ⇒ `Contended`, and nothing is read or
-//! changed.
+//! it. Non-zero ⇒ `Referenced`, with the worklist row corrected in
+//! place so the terminal event states the count that held. Lock busy ⇒
+//! `Contended`, and nothing is read or changed.
 //!
 //! Every production `content_references` write takes the same lock
 //! (`pg_content_reference_repo::insert`, `refcount_reconcile`'s repair
 //! upsert), which is what makes the re-read conclusive rather than just
 //! fresher.
+//!
+//! ### Zero references is not the same as nothing claiming the bytes
+//!
+//! A refcount of zero authorises the delete only once the second
+//! question has been asked: does a non-deleted **GC-protected**
+//! artifact hold this hash? `refcount_reconcile` deliberately mints no
+//! `content_references` edge for `quarantined` / `rejected` /
+//! `scan_indeterminate` artifacts, so such an artifact's claim on its
+//! own bytes counts zero and will keep counting zero. The two
+//! protections that exist — `list_pending_purge` never offering it,
+//! `retention_candidate_reader` never expiring it — keep the
+//! *artifact* out of the sweeps; the reclamation decision is about the
+//! *bytes*, which CAS shares with every artifact of the same content.
+//! Without the second question a released sibling's purge deletes
+//! retained evidence whose artifact was never a candidate for
+//! anything. So: zero refs **and** zero protected claimants ⇒
+//! `Granted`, a guard the caller holds across `StoragePort::delete`;
+//! zero refs with claimants ⇒ `ProtectedClaim`, the worklist row
+//! corrected to the claimant count exactly as the `Referenced` path
+//! corrects it. `protected_claimants` carries the query and the
+//! reasoning.
 //!
 //! After storage decisions have been checkpointed per worklist row,
 //! `complete_artifact_purge` appends the whole per-hash terminal event
@@ -153,7 +185,7 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{DomainEvent, StreamId};
 use hort_domain::ports::event_store::AppendEvents;
 use hort_domain::ports::purge_gc::{
-    BlobReclaim, BlobReclaimGuard, PendingPurge, PurgeGcPort, PurgedRef,
+    BlobReclaim, BlobReclaimGuard, PendingPurge, PurgeGcPort, PurgePreparation, PurgedRef,
 };
 use hort_domain::types::ContentHash;
 
@@ -191,6 +223,61 @@ impl PgPurgeGcPort {
 #[derive(Debug, FromRow)]
 struct PendingRow {
     artifact_id: Uuid,
+    quarantine_status: Option<String>,
+    tag_targeted: bool,
+    expired_only_by_keep_last_n: bool,
+    user_deleted: bool,
+}
+
+/// SQL for `expired_only_by_keep_last_n`: no pending `ArtifactExpired`
+/// on the artifact's stream carries a readable **non**-`KeepLastN`
+/// reason. Expects the artifacts row in scope as `a`; binds nothing.
+///
+/// `ExpirationReason` is an externally-tagged enum, so a count-based
+/// expiry stores `{"KeepLastN": {…}}` under
+/// `event_data->'data'->'reason'`.
+///
+/// The `jsonb_typeof(…) = 'object'` guard is the fail-safe direction:
+/// only a payload that positively reads as *some other* reason clears
+/// the exemption. An absent or non-object reason leaves the flag set,
+/// which at worst withholds a destructive step on an artifact a tag
+/// currently names — visible in the sweep summary and released as soon
+/// as the tag moves. The opposite default would let an unreadable
+/// payload delete content a live tag resolves to, and deletion does
+/// not come back.
+///
+/// One string because two readers ask: the page query and the re-read
+/// under the artifact lock. Two spellings of a fail-safe predicate is
+/// one spelling that is fail-safe and one that was, once.
+const ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL: &str = r#"
+    NOT EXISTS (
+        SELECT 1 FROM events e
+         WHERE e.stream_id  = 'artifact-' || a.id::text
+           AND e.event_type = 'ArtifactExpired'
+           AND jsonb_typeof(e.event_data->'data'->'reason') = 'object'
+           AND NOT (e.event_data->'data'->'reason' ? 'KeepLastN')
+    )
+"#;
+
+/// SQL for `user_deleted`: an `ArtifactDeleted` is on the artifact's
+/// stream. Expects the artifacts row in scope as `a`; binds nothing.
+/// Shared by the same two readers, for the same reason as the
+/// predicate above.
+const ARTIFACT_USER_DELETED_SQL: &str = r#"
+    EXISTS (
+        SELECT 1 FROM events e
+         WHERE e.stream_id  = 'artifact-' || a.id::text
+           AND e.event_type = 'ArtifactDeleted'
+    )
+"#;
+
+/// The artifact row as read under the `FOR UPDATE` lock that opens the
+/// worklist preparation: the authoritative `checksum_sha256` for the
+/// idempotent-retry path, plus the four facts the two protection rules
+/// are computed from.
+#[derive(Debug, FromRow)]
+struct LockedArtifactRow {
+    checksum_sha256: String,
     quarantine_status: Option<String>,
     tag_targeted: bool,
     expired_only_by_keep_last_n: bool,
@@ -301,6 +388,106 @@ impl PgPurgeGcPort {
         Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
     }
 
+    /// How many non-deleted **GC-protected** artifacts claim `hash` —
+    /// run inside the blob-lock transaction, on the path that would
+    /// otherwise delete.
+    ///
+    /// `remaining_refs` above counts `content_references` rows, and
+    /// protected evidence has none to count: `refcount_reconcile`
+    /// deliberately mints no edge for a `quarantined` / `rejected` /
+    /// `scan_indeterminate` artifact, so that a repaired refcount
+    /// cannot make a quarantined blob look GC-protected for the wrong
+    /// reason. The two protections that do exist — `list_pending_purge`
+    /// never offering such an artifact, and
+    /// `retention_candidate_reader` never expiring one — protect the
+    /// *artifact*. Nothing in them protects the *bytes*, and CAS shares
+    /// bytes across artifacts: a released sibling with the same hash
+    /// reaches this delete with the protected artifact never having
+    /// been a candidate. This count is what keeps the bytes.
+    ///
+    /// **Two hashes per artifact, not one.** A protected artifact
+    /// claims its primary content (`artifacts.checksum_sha256`) *and*
+    /// its metadata blob (`artifact_metadata.metadata_blob`, a
+    /// different table). Asking only the first leaves half the hole
+    /// open. Both columns are `character(64)` and are compared trimmed,
+    /// matching `parse_hash` here and `refcount_reconcile`'s
+    /// `trim(am.metadata_blob)`.
+    ///
+    /// The protected status list is bound from
+    /// [`crate::gc_protected_quarantine_status_names`] — the same
+    /// function the other three filters bind — because a second literal
+    /// list is exactly the drift that opened this hole.
+    ///
+    /// `UNION` rather than `UNION ALL`: an artifact whose primary
+    /// content and metadata blob are the same hash is one claimant, not
+    /// two, which is what makes the returned number a count of
+    /// artifacts holding the bytes.
+    async fn protected_claimants(
+        tx: &mut Transaction<'_, Postgres>,
+        hash: &ContentHash,
+    ) -> DomainResult<u32> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*) FROM (
+                SELECT a.id
+                  FROM artifacts a
+                 WHERE a.deleted_at IS NULL
+                   AND a.quarantine_status = ANY($1::text[])
+                   AND trim(a.checksum_sha256) = $2
+                UNION
+                SELECT a.id
+                  FROM artifacts a
+                  JOIN artifact_metadata am
+                    ON am.artifact_id = a.id
+                 WHERE a.deleted_at IS NULL
+                   AND a.quarantine_status = ANY($1::text[])
+                   AND am.metadata_blob IS NOT NULL
+                   AND trim(am.metadata_blob) = $2
+            ) claimants
+            "#,
+        )
+        .bind(crate::gc_protected_quarantine_status_names())
+        .bind(hash.as_ref())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| map_sqlx_error(&e, "purge_gc", "count_protected_claimants"))?;
+        Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+    }
+
+    /// Correct a worklist row's `refs_remaining` to the claim count
+    /// observed under the blob lock, so the terminal `ArtifactPurged`
+    /// states what actually held and a later retry reads the same
+    /// thing.
+    ///
+    /// Not optional bookkeeping: `validate_terminal_batch` refuses a
+    /// terminal batch whose events disagree with the worklist, so a
+    /// keep that skipped this would make the artifact's purge
+    /// permanently unfinishable. A missing row is loud for the same
+    /// reason — there is nowhere for the corrected count to land.
+    async fn refresh_worklist_refs(
+        tx: &mut Transaction<'_, Postgres>,
+        artifact_id: Uuid,
+        hash: &ContentHash,
+        claims: u32,
+    ) -> DomainResult<()> {
+        let updated = sqlx::query(
+            "UPDATE artifact_purge_worklist SET refs_remaining = $3 \
+             WHERE artifact_id = $1 AND content_hash = $2",
+        )
+        .bind(artifact_id)
+        .bind(hash.as_ref())
+        .bind(i64::from(claims))
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| map_sqlx_error(&e, "purge_gc", "refresh_worklist_refs"))?;
+        if updated.rows_affected() != 1 {
+            return Err(DomainError::Invariant(format!(
+                "purge_gc: no worklist row for artifact {artifact_id} hash {hash}"
+            )));
+        }
+        Ok(())
+    }
+
     async fn load_worklist(
         tx: &mut Transaction<'_, Postgres>,
         artifact_id: Uuid,
@@ -399,7 +586,11 @@ impl PurgeGcPort for PgPurgeGcPort {
             // `ArtifactPurged`. Protected quarantine states are
             // excluded here (GC-protected invariant) — the destructive
             // path is never even offered an evidence artifact; the use
-            // case re-asserts the same filter defence-in-depth. A
+            // case re-asserts the same filter defence-in-depth, and
+            // `purge_artifact_refs` asks a third time under the
+            // artifact lock, because what this query returns is a page
+            // snapshot and the states it reads keep moving while the
+            // sweep works through that page. A
             // soft-deleted row is deliberately NOT excluded: `deleted_at`
             // marks an artifact out of service, which is the condition
             // for collecting its bytes, not against it.
@@ -414,20 +605,8 @@ impl PurgeGcPort for PgPurgeGcPort {
                 SELECT a.id                AS artifact_id,
                        a.quarantine_status AS quarantine_status,
                        {tag_targeted}      AS tag_targeted,
-                       NOT EXISTS (
-                         SELECT 1 FROM events e
-                          WHERE e.stream_id  = 'artifact-' || a.id::text
-                            AND e.event_type = 'ArtifactExpired'
-                            AND jsonb_typeof(e.event_data->'data'->'reason')
-                                  = 'object'
-                            AND NOT (e.event_data->'data'->'reason'
-                                       ? 'KeepLastN')
-                       )                   AS expired_only_by_keep_last_n,
-                       EXISTS (
-                         SELECT 1 FROM events e
-                          WHERE e.stream_id  = 'artifact-' || a.id::text
-                            AND e.event_type = 'ArtifactDeleted'
-                       )                   AS user_deleted
+                       {keep_last_n_only}  AS expired_only_by_keep_last_n,
+                       {user_deleted}      AS user_deleted
                   FROM artifacts a
                  WHERE EXISTS (
                          SELECT 1 FROM events e
@@ -447,7 +626,17 @@ impl PurgeGcPort for PgPurgeGcPort {
                  LIMIT $3
                 "#,
                 tag_targeted = crate::ARTIFACT_IS_TAG_TARGETED_SQL,
+                keep_last_n_only = ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL,
+                user_deleted = ARTIFACT_USER_DELETED_SQL,
             );
+            // Injection audit: every interpolated fragment is a crate
+            // `const` (`ARTIFACT_IS_TAG_TARGETED_SQL`,
+            // `ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL`,
+            // `ARTIFACT_USER_DELETED_SQL`) — compile-time literals, not
+            // runtime values. Every runtime value this statement uses is
+            // bound ($1..$3). The assertion is sound as long as that stays
+            // true: a fragment built from anything a caller supplies
+            // must be bound instead, never formatted in.
             let rows: Vec<PendingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(crate::gc_protected_quarantine_status_names())
                 .bind(after_artifact_id)
@@ -473,7 +662,7 @@ impl PurgeGcPort for PgPurgeGcPort {
     fn purge_artifact_refs(
         &self,
         artifact_id: Uuid,
-    ) -> BoxFuture<'_, DomainResult<Vec<PurgedRef>>> {
+    ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
         Box::pin(async move {
             let mut tx = self.pool.begin().await.map_err(|e| {
                 DomainError::Invariant(format!("purge_gc purge_artifact_refs begin: {e}"))
@@ -484,7 +673,7 @@ impl PurgeGcPort for PgPurgeGcPort {
                 tx.commit().await.map_err(|e| {
                     DomainError::Invariant(format!("purge_gc worklist-read commit: {e}"))
                 })?;
-                return Self::map_worklist(existing);
+                return Self::map_worklist(existing).map(PurgePreparation::Prepared);
             }
 
             // Locking serializes first-time preparation. Once a
@@ -493,27 +682,107 @@ impl PurgeGcPort for PgPurgeGcPort {
             // worklist read happens before this artifact lock so a
             // normal retry cannot invert the final transition's
             // worklist -> events -> artifact lock order.
-            let locked: Option<(String,)> =
-                sqlx::query_as("SELECT checksum_sha256 FROM artifacts WHERE id = $1 FOR UPDATE")
-                    .bind(artifact_id)
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|e| map_sqlx_error(&e, "purge_gc", "lock_artifact"))?;
-            let Some((checksum_sha256,)) = locked else {
+            //
+            // The lock also carries the protection facts, and that is
+            // the point of reading them here rather than trusting the
+            // page row the caller holds: this statement runs in the
+            // transaction that is about to delete the edges, and the
+            // page row was taken before the sweep processed a single
+            // item of its page.
+            //
+            // For `quarantine_status` the lock makes the read
+            // conclusive — a scan writing that column takes the same
+            // row lock, so this either waits for it and then observes
+            // the committed value (`FOR UPDATE` re-fetches the latest
+            // row version) or the write was already committed and is
+            // read. The tag fact lives in `mutable_refs` and a ref
+            // write takes no artifact lock, so what this cannot see is
+            // a tag committing after it — which is what "after the
+            // purge" means anywhere. What it does close is the page.
+            let sql = format!(
+                r#"
+                SELECT a.checksum_sha256   AS checksum_sha256,
+                       a.quarantine_status AS quarantine_status,
+                       {tag_targeted}      AS tag_targeted,
+                       {keep_last_n_only}  AS expired_only_by_keep_last_n,
+                       {user_deleted}      AS user_deleted
+                  FROM artifacts a
+                 WHERE a.id = $1
+                   FOR UPDATE
+                "#,
+                tag_targeted = crate::ARTIFACT_IS_TAG_TARGETED_SQL,
+                keep_last_n_only = ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL,
+                user_deleted = ARTIFACT_USER_DELETED_SQL,
+            );
+            // Injection audit: same shape as `list_pending_purge`'s — the
+            // three interpolated fragments are crate `const`s, so the
+            // statement text is fixed at compile time, and the only
+            // runtime value (`artifact_id`) is bound ($1).
+            let locked: Option<LockedArtifactRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                .bind(artifact_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| map_sqlx_error(&e, "purge_gc", "lock_artifact"))?;
+            let Some(locked) = locked else {
                 tx.commit().await.map_err(|e| {
                     DomainError::Invariant(format!("purge_gc commit (no-artifact): {e}"))
                 })?;
-                return Ok(Vec::new());
+                return Ok(PurgePreparation::NoArtifact);
             };
+            let checksum_sha256 = locked.checksum_sha256;
 
             // Another first-time preparer may have committed while this
             // transaction waited for the artifact lock.
+            //
+            // Answered before the protection facts are consulted, and
+            // in that order on purpose: a committed worklist means the
+            // edges are already gone, so refusing now would strand an
+            // artifact whose terminal event can never be appended and
+            // whose purge therefore never finishes. From here the claim
+            // check in `begin_blob_reclaim` is what protects the bytes,
+            // and it asks about the hash rather than the artifact.
             let existing = Self::load_worklist(&mut tx, artifact_id).await?;
             if !existing.is_empty() {
                 tx.commit().await.map_err(|e| {
                     DomainError::Invariant(format!("purge_gc worklist-read commit: {e}"))
                 })?;
-                return Self::map_worklist(existing);
+                return Self::map_worklist(existing).map(PurgePreparation::Prepared);
+            }
+
+            // The two protection rules, computed by the port's own
+            // predicates from the facts just read under the lock — one
+            // author for a rule the page reader also asks, so the two
+            // readings cannot drift into two rules.
+            //
+            // An unclassifiable `quarantine_status` fails the whole
+            // preparation here (`map_status` is fail-closed) rather
+            // than reading as "not protected": the next statement
+            // deletes.
+            let fresh = PendingPurge {
+                artifact_id,
+                quarantine_status: map_status(locked.quarantine_status.as_deref())?,
+                tag_targeted: locked.tag_targeted,
+                expired_only_by_keep_last_n: locked.expired_only_by_keep_last_n,
+                user_deleted: locked.user_deleted,
+            };
+            let refusal = if fresh.is_gc_protected() {
+                Some(PurgePreparation::Protected {
+                    status: fresh.quarantine_status,
+                })
+            } else if fresh.is_tag_exempt() {
+                Some(PurgePreparation::TagExempt)
+            } else {
+                None
+            };
+            if let Some(outcome) = refusal {
+                // Nothing was written, so commit and rollback are the
+                // same in effect; commit is the one that says the
+                // transaction ended normally. Either way the lock ends
+                // here and the work item is left pending.
+                tx.commit().await.map_err(|e| {
+                    DomainError::Invariant(format!("purge_gc commit (protection re-read): {e}"))
+                })?;
+                return Ok(outcome);
             }
 
             // Remove every source-edge kind. A purge retains its
@@ -587,7 +856,7 @@ impl PurgeGcPort for PgPurgeGcPort {
             tx.commit().await.map_err(|e| {
                 DomainError::Invariant(format!("purge_gc purge_artifact_refs commit: {e}"))
             })?;
-            Self::map_worklist(worklist)
+            Self::map_worklist(worklist).map(PurgePreparation::Prepared)
         })
     }
 
@@ -624,25 +893,25 @@ impl PurgeGcPort for PgPurgeGcPort {
                 // alive; correct the worklist so the `ArtifactPurged`
                 // the caller emits carries the count that actually
                 // held rather than the stale zero, then let go.
-                let updated = sqlx::query(
-                    "UPDATE artifact_purge_worklist SET refs_remaining = $3 \
-                     WHERE artifact_id = $1 AND content_hash = $2",
-                )
-                .bind(artifact_id)
-                .bind(hash.as_ref())
-                .bind(i64::from(refs_now))
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| map_sqlx_error(&e, "purge_gc", "refresh_worklist_refs"))?;
-                if updated.rows_affected() != 1 {
-                    return Err(DomainError::Invariant(format!(
-                        "purge_gc: no worklist row for artifact {artifact_id} hash {hash}"
-                    )));
-                }
+                Self::refresh_worklist_refs(&mut tx, artifact_id, &hash, refs_now).await?;
                 tx.commit().await.map_err(|e| {
                     DomainError::Invariant(format!("purge_gc blob-lock refresh commit: {e}"))
                 })?;
                 return Ok(BlobReclaim::Referenced { refs_now });
+            }
+
+            // The refcount is genuinely zero — and a `content_references`
+            // row is not the only claim on a blob. Ask the second
+            // question only here, on the path that would otherwise
+            // delete: a non-zero count above already keeps the bytes,
+            // so there would be nothing for the answer to decide.
+            let claimants = Self::protected_claimants(&mut tx, &hash).await?;
+            if claimants > 0 {
+                Self::refresh_worklist_refs(&mut tx, artifact_id, &hash, claimants).await?;
+                tx.commit().await.map_err(|e| {
+                    DomainError::Invariant(format!("purge_gc protected-claim commit: {e}"))
+                })?;
+                return Ok(BlobReclaim::ProtectedClaim { claimants });
             }
 
             Ok(BlobReclaim::Granted(Box::new(PgBlobReclaimGuard { tx })))
@@ -942,6 +1211,17 @@ mod tests {
     async fn adapter(pool: &PgPool) -> PgPurgeGcPort {
         let event_store = Arc::new(PgEventStore::new(pool.clone()).await.unwrap());
         PgPurgeGcPort::new(pool.clone(), event_store)
+    }
+
+    /// Unwrap the prepared worklist, failing loudly on any of the
+    /// three refusals. A test that is about the worklist wants to know
+    /// that it got one — a refusal silently read as "no rows" is the
+    /// shape this whole outcome type exists to prevent.
+    fn prepared(outcome: PurgePreparation) -> Vec<PurgedRef> {
+        match outcome {
+            PurgePreparation::Prepared(refs) => refs,
+            other => panic!("expected a prepared worklist, got {other:?}"),
+        }
     }
 
     fn terminal_batch(
@@ -1328,7 +1608,7 @@ mod tests {
         append_event(&pool, art, "ArtifactExpired", 0).await;
 
         let adapter = adapter(&pool).await;
-        let mut refs = adapter.purge_artifact_refs(art).await.unwrap();
+        let mut refs = prepared(adapter.purge_artifact_refs(art).await.unwrap());
         refs.sort_by(|a, b| a.content_hash.as_ref().cmp(b.content_hash.as_ref()));
 
         assert_eq!(
@@ -1367,7 +1647,7 @@ mod tests {
         append_event(&pool, art, "ArtifactExpired", 0).await;
 
         let adapter = adapter(&pool).await;
-        let refs = adapter.purge_artifact_refs(art).await.unwrap();
+        let refs = prepared(adapter.purge_artifact_refs(art).await.unwrap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].content_hash.as_ref(), HASH_A);
         assert_eq!(refs[0].refs_remaining, 0, "no other ref → blob GC-eligible");
@@ -1400,7 +1680,7 @@ mod tests {
         append_event(&pool, purged, "ArtifactExpired", 0).await;
 
         let adapter = adapter(&pool).await;
-        let refs = adapter.purge_artifact_refs(purged).await.unwrap();
+        let refs = prepared(adapter.purge_artifact_refs(purged).await.unwrap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].content_hash.as_ref(), HASH_A);
         assert_eq!(
@@ -1442,7 +1722,7 @@ mod tests {
         let adapter = adapter(&pool).await;
 
         // First invocation deletes the rows and returns both decisions.
-        let first = adapter.purge_artifact_refs(art).await.unwrap();
+        let first = prepared(adapter.purge_artifact_refs(art).await.unwrap());
         assert_eq!(first.len(), 2);
         assert!(cr_rows_for(&pool, art).await.is_empty());
 
@@ -1450,7 +1730,7 @@ mod tests {
         // from artifacts.checksum_sha256 + artifact_metadata.metadata_blob
         // and the count (stable at 0) is recomputed — the retry still
         // yields the decisions needed to finish the purge.
-        let mut second = adapter.purge_artifact_refs(art).await.unwrap();
+        let mut second = prepared(adapter.purge_artifact_refs(art).await.unwrap());
         second.sort_by(|a, b| a.content_hash.as_ref().cmp(b.content_hash.as_ref()));
         assert_eq!(second.len(), 2, "idempotent retry recovers both hashes");
         let by_hash: std::collections::HashMap<_, _> = second
@@ -1520,7 +1800,7 @@ mod tests {
         let adapter = adapter(&pool).await;
 
         // -- Phase 1: index is live → purging child_a keeps its blob ----
-        let refs = adapter.purge_artifact_refs(child_a).await.unwrap();
+        let refs = prepared(adapter.purge_artifact_refs(child_a).await.unwrap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].content_hash.as_ref(), HASH_A);
         assert_eq!(
@@ -1551,7 +1831,7 @@ mod tests {
         let later_child =
             seed_artifact(&pool, repo, "child-a-later", HASH_A, Some("released")).await;
         insert_cr(&pool, repo, later_child, "primary_content", HASH_A).await;
-        let refs_after = adapter.purge_artifact_refs(later_child).await.unwrap();
+        let refs_after = prepared(adapter.purge_artifact_refs(later_child).await.unwrap());
         assert_eq!(refs_after.len(), 1);
         assert_eq!(refs_after[0].content_hash.as_ref(), HASH_A);
         assert_eq!(
@@ -1613,14 +1893,14 @@ mod tests {
         let adapter = adapter(&pool).await;
 
         // -- Phase 1: manifest is live → purging config/layer keeps them -
-        let config_refs = adapter.purge_artifact_refs(config).await.unwrap();
+        let config_refs = prepared(adapter.purge_artifact_refs(config).await.unwrap());
         assert_eq!(config_refs.len(), 1);
         assert_eq!(config_refs[0].content_hash.as_ref(), HASH_A);
         assert_eq!(
             config_refs[0].refs_remaining, 1,
             "a live manifest keeps its config blob (cross-kind count)"
         );
-        let layer_refs = adapter.purge_artifact_refs(layer).await.unwrap();
+        let layer_refs = prepared(adapter.purge_artifact_refs(layer).await.unwrap());
         assert_eq!(layer_refs.len(), 1);
         assert_eq!(layer_refs[0].content_hash.as_ref(), HASH_C);
         assert_eq!(
@@ -1654,14 +1934,14 @@ mod tests {
         let later_layer = seed_artifact(&pool, repo, "layer-later", HASH_C, Some("released")).await;
         insert_cr(&pool, repo, later_config, "primary_content", HASH_A).await;
         insert_cr(&pool, repo, later_layer, "primary_content", HASH_C).await;
-        let config_refs_after = adapter.purge_artifact_refs(later_config).await.unwrap();
+        let config_refs_after = prepared(adapter.purge_artifact_refs(later_config).await.unwrap());
         assert_eq!(config_refs_after.len(), 1);
         assert_eq!(config_refs_after[0].content_hash.as_ref(), HASH_A);
         assert_eq!(
             config_refs_after[0].refs_remaining, 0,
             "once the manifest is deleted, its config blob is GC-eligible"
         );
-        let layer_refs_after = adapter.purge_artifact_refs(later_layer).await.unwrap();
+        let layer_refs_after = prepared(adapter.purge_artifact_refs(later_layer).await.unwrap());
         assert_eq!(layer_refs_after.len(), 1);
         assert_eq!(layer_refs_after[0].content_hash.as_ref(), HASH_C);
         assert_eq!(
@@ -1764,7 +2044,7 @@ mod tests {
             append_event(&pool, manifest_2, "ArtifactExpired", 0).await;
 
             // -- Purge manifest_1: manifest_2's edge keeps the target alive --
-            let refs_1 = adapter.purge_artifact_refs(manifest_1).await.unwrap();
+            let refs_1 = prepared(adapter.purge_artifact_refs(manifest_1).await.unwrap());
             let target_ref_1 = refs_1
                 .iter()
                 .find(|r| r.content_hash.as_ref() == target_hash)
@@ -1794,7 +2074,7 @@ mod tests {
             );
 
             // -- Purge manifest_2: no live source-edge remains → freed --
-            let refs_2 = adapter.purge_artifact_refs(manifest_2).await.unwrap();
+            let refs_2 = prepared(adapter.purge_artifact_refs(manifest_2).await.unwrap());
             let target_ref_2 = refs_2
                 .iter()
                 .find(|r| r.content_hash.as_ref() == target_hash)
@@ -1832,15 +2112,15 @@ mod tests {
         append_event(&pool, artifact, "ArtifactExpired", 0).await;
 
         let adapter = adapter(&pool).await;
-        let prepared = adapter.purge_artifact_refs(artifact).await.unwrap();
-        assert_eq!(prepared.len(), 2);
+        let worklist = prepared(adapter.purge_artifact_refs(artifact).await.unwrap());
+        assert_eq!(worklist.len(), 2);
         assert!(cr_rows_for(&pool, artifact).await.is_empty());
 
         adapter
             .mark_purge_ref_complete(artifact, &HASH_A.parse().unwrap(), Utc::now())
             .await
             .unwrap();
-        let retry = adapter.purge_artifact_refs(artifact).await.unwrap();
+        let retry = prepared(adapter.purge_artifact_refs(artifact).await.unwrap());
         let primary = retry
             .iter()
             .find(|item| item.content_hash.as_ref() == HASH_A)
@@ -1957,7 +2237,7 @@ mod tests {
         append_event(&pool, artifact, "ArtifactExpired", 0).await;
 
         let adapter = adapter(&pool).await;
-        let refs = adapter.purge_artifact_refs(artifact).await.unwrap();
+        let refs = prepared(adapter.purge_artifact_refs(artifact).await.unwrap());
         let retired_at = Utc::now();
         let error = adapter
             .complete_artifact_purge(
@@ -2005,7 +2285,7 @@ mod tests {
         append_event(&pool, artifact, "ArtifactExpired", 0).await;
 
         let adapter = adapter(&pool).await;
-        let refs = adapter.purge_artifact_refs(artifact).await.unwrap();
+        let refs = prepared(adapter.purge_artifact_refs(artifact).await.unwrap());
         adapter
             .mark_purge_ref_complete(artifact, &refs[0].content_hash, Utc::now())
             .await
@@ -2064,7 +2344,7 @@ mod tests {
         append_event(&pool, expired, "ArtifactExpired", 0).await;
 
         let adapter = adapter(&pool).await;
-        let refs = adapter.purge_artifact_refs(expired).await.unwrap();
+        let refs = prepared(adapter.purge_artifact_refs(expired).await.unwrap());
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].refs_remaining, 1);
         adapter
@@ -2213,7 +2493,7 @@ mod tests {
             .iter()
             .any(|p| p.artifact_id == art));
 
-        let refs = adapter.purge_artifact_refs(art).await.unwrap();
+        let refs = prepared(adapter.purge_artifact_refs(art).await.unwrap());
         assert_eq!(refs.len(), 1);
         adapter
             .mark_purge_ref_complete(art, &refs[0].content_hash, Utc::now())
@@ -2299,7 +2579,7 @@ mod tests {
         append_event(&pool, old, "ArtifactExpired", 0).await;
 
         let adapter = adapter(&pool).await;
-        let refs = adapter.purge_artifact_refs(old).await.unwrap();
+        let refs = prepared(adapter.purge_artifact_refs(old).await.unwrap());
         storage.delete(&refs[0].content_hash).await.unwrap();
         adapter
             .mark_purge_ref_complete(old, &refs[0].content_hash, Utc::now())
@@ -2381,16 +2661,23 @@ mod tests {
             return;
         };
         let adapter = adapter(&pool).await;
-        let refs = adapter.purge_artifact_refs(Uuid::new_v4()).await.unwrap();
-        assert!(refs.is_empty(), "no artifact row → nothing to purge");
+        assert_eq!(
+            adapter.purge_artifact_refs(Uuid::new_v4()).await.unwrap(),
+            PurgePreparation::NoArtifact,
+            "no artifact row → nothing to purge, and it says so in its own \
+             value: an empty worklist is a different fact and the sweep \
+             logs it differently"
+        );
     }
 
-    // -- tag exemption, re-asked at purge time ---------------------------
+    // -- tag exemption: the facts the purge sweep reports ----------------
 
     /// Walk the interval the two cron sweeps leave open. At 03:00 the
     /// evaluator expired an untagged artifact under `KeepLastN`; at
     /// 03:30 an operator tagged it; the purge runs at 04:00 and nothing
-    /// re-ran the predicate. The work-set read is what has to notice.
+    /// re-ran the predicate. The work-set read is what has to notice —
+    /// the page row covers the gap between the two *sweeps*, and the
+    /// re-read under the artifact lock covers the gap inside this one.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn a_tag_set_after_expiry_flips_the_pending_row() {
@@ -2418,7 +2705,7 @@ mod tests {
         )
         .await;
 
-        // 04:00 — the purge sweep re-reads the work set.
+        // 04:00 — the purge sweep reads the work set.
         let after = pending_for(&pool, art).await;
         assert!(
             after.tag_targeted,
@@ -3048,6 +3335,7 @@ mod tests {
             .purge_artifact_refs(art)
             .await
             .expect("worklist prepared");
+        let refs = prepared(refs);
         assert_eq!(refs.len(), 1);
         assert_eq!(
             refs[0].refs_remaining, 0,
@@ -3383,10 +3671,386 @@ mod tests {
         cleanup(&pool, repo).await;
     }
 
-    /// The lease's three answers, straight from the adapter: granted on
-    /// a free lock over an unreferenced hash, `Referenced` (with the
-    /// worklist row corrected in place) once a reference exists, and
-    /// `Contended` while someone else holds the lock.
+    // -----------------------------------------------------------------
+    // GC-protected evidence claims its bytes — with no reference edge
+    // to claim them with
+    // -----------------------------------------------------------------
+
+    /// Seed one GC-protected artifact in `repo` whose **primary
+    /// content** is `hash`, and assert the structural precondition this
+    /// whole hazard rests on: it holds **no** `content_references` row,
+    /// so no refcount can see its claim. `refcount_reconcile` is what
+    /// keeps it that way (it mints no edge for a protected artifact),
+    /// and that exclusion is deliberate — so the predicate under test
+    /// cannot be replaced by "mint the edge after all".
+    async fn seed_protected_primary_claimant(
+        pool: &PgPool,
+        repo: Uuid,
+        name: &str,
+        hash: &str,
+        status: &str,
+    ) -> Uuid {
+        let art = seed_artifact(pool, repo, name, hash, Some(status)).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            cr_rows_for(pool, art).await,
+            Vec::<(String, String)>::new(),
+            "a protected claimant holds no reference edge — that is the \
+             premise, not an accident of this fixture"
+        );
+        art
+    }
+
+    /// Read the `refs_remaining` of every `ArtifactPurged` on an
+    /// artifact's stream.
+    async fn purged_refs_remaining(pool: &PgPool, artifact: Uuid) -> Vec<i64> {
+        sqlx::query_scalar(
+            "SELECT (event_data->'data'->>'refs_remaining')::bigint FROM events \
+             WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(StreamId::artifact(artifact).to_string())
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// **The finding.** A quarantined / rejected / scan-indeterminate
+    /// artifact shares its content hash with a released sibling. The
+    /// sibling expires and is purged; the protected artifact was never
+    /// a purge candidate and never acquired an `ArtifactExpired`.
+    ///
+    /// Both of those protections are about the *artifact*. Reclamation
+    /// is about the *bytes*, which CAS shares — and the protected
+    /// artifact contributes **zero** to the refcount of its own hash,
+    /// because the refcount repair deliberately mints no edge for
+    /// retained evidence. So the sibling's purge read `0` under the
+    /// lock and deleted the evidence's bytes with nothing anywhere
+    /// having made a wrong decision.
+    ///
+    /// Now the zero is not the whole answer: the bytes stay, the
+    /// sibling's purge still completes, and its `ArtifactPurged`
+    /// carries the claim count so "the blob stays" is readable from the
+    /// stream rather than contradicted by it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_protected_sibling_keeps_the_shared_primary_content_bytes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+
+        for status in ["quarantined", "rejected", "scan_indeterminate"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+                tmp.path().to_path_buf(),
+            ));
+            let put = storage
+                .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+                .await
+                .unwrap();
+            assert_eq!(put.hash.as_ref(), HASH_B);
+
+            let adapter = Arc::new(adapter(&pool).await);
+            let (repo, expiring) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+            let evidence =
+                seed_protected_primary_claimant(&pool, repo, "evidence", HASH_B, status).await;
+
+            // The protected artifact really is invisible to the
+            // refcount: this is the count the lease re-reads, and it is
+            // zero with the evidence row sitting right there.
+            let refs: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM content_references WHERE target_content_hash = $1",
+            )
+            .bind(HASH_B)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(refs, 0, "{status}: the refcount cannot see the claim");
+
+            let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+            let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+            assert!(
+                storage.exists(&put.hash).await.unwrap(),
+                "{status}: the evidence's bytes must survive its sibling's purge"
+            );
+            assert_eq!(summary.blobs_deleted, 0, "{status}");
+            assert_eq!(summary.blobs_kept, 1, "{status}");
+            assert_eq!(
+                summary.blobs_deferred, 0,
+                "{status}: a protected claim is terminal, not a deferral — a \
+                 rejected artifact is permanent and re-asking would never \
+                 finish the sibling's purge"
+            );
+            assert_eq!(summary.errors, 0, "{status}");
+            assert_eq!(
+                purged_refs_remaining(&pool, expiring).await,
+                vec![1],
+                "{status}: the terminal event states the claim that held, so \
+                 `0 ⇒ deleted` still reads true"
+            );
+
+            // The evidence itself is untouched: still live, still
+            // protected, still not a purge candidate.
+            let still_there: Option<Option<DateTime<Utc>>> =
+                sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+                    .bind(evidence)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                still_there,
+                Some(None),
+                "{status}: the evidence row is untouched by its sibling's purge"
+            );
+
+            cleanup(&pool, repo).await;
+        }
+    }
+
+    /// **The other half of the same claim, and the easy one to miss.**
+    /// A protected artifact claims *two* hashes: its primary content
+    /// (`artifacts.checksum_sha256`) and its metadata blob
+    /// (`artifact_metadata.metadata_blob`) — a different table. Here
+    /// the protected artifact's primary content is a *different* hash
+    /// entirely, so a predicate that asked only `artifacts` would see
+    /// no claimant and delete the evidence's metadata bytes.
+    ///
+    /// Deliberately its own test rather than a second status on the
+    /// one above: the two claims come from two tables, and a single
+    /// test that happened to satisfy both with the same hash would go
+    /// green with half the predicate missing.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_protected_metadata_blob_keeps_the_shared_bytes_too() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let put = storage
+            .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+            .await
+            .unwrap();
+        assert_eq!(put.hash.as_ref(), HASH_B);
+
+        let adapter = Arc::new(adapter(&pool).await);
+        let (repo, expiring) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+
+        // The evidence's own content is HASH_C; only its metadata blob
+        // is the hash under reclamation. Nothing in `artifacts` names
+        // HASH_B for this artifact.
+        let evidence =
+            seed_protected_primary_claimant(&pool, repo, "meta-evidence", HASH_C, "quarantined")
+                .await;
+        seed_metadata_blob(&pool, evidence, HASH_B).await;
+        let primary_claim: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM artifacts WHERE trim(checksum_sha256) = $1 \
+             AND quarantine_status = 'quarantined'",
+        )
+        .bind(HASH_B)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            primary_claim, 0,
+            "the claim must come from artifact_metadata alone, or this test \
+             would pass with the metadata branch missing"
+        );
+
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert!(
+            storage.exists(&put.hash).await.unwrap(),
+            "the bytes a protected artifact's metadata blob names must survive"
+        );
+        assert_eq!(summary.blobs_deleted, 0);
+        assert_eq!(summary.blobs_kept, 1);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(purged_refs_remaining(&pool, expiring).await, vec![1]);
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The counter-assertion that keeps the two tests above from being
+    /// satisfied by a predicate that simply never grants: with no
+    /// protected claimant and no reference row the bytes still go, and
+    /// the terminal event still says `refs_remaining = 0`.
+    ///
+    /// The two near-misses are what make this worth its own test: a
+    /// claimant in a **non**-protected state (`released`) and a
+    /// claimant that is **soft-deleted** both name the same hash here,
+    /// and neither may keep the blob. The first would turn every
+    /// deduplicated sibling into a permanent hold; the second would
+    /// make a delete unreclaimable forever, since a soft-deleted row is
+    /// retained for audit and never goes away.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_unprotected_or_deleted_claimant_does_not_keep_the_bytes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        let put = storage
+            .put(Box::new(std::io::Cursor::new(b"hello world".to_vec())))
+            .await
+            .unwrap();
+
+        let adapter = Arc::new(adapter(&pool).await);
+        let (repo, expiring) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+
+        // Edgeless, same hash, not protected.
+        seed_protected_primary_claimant(&pool, repo, "released-twin", HASH_B, "released").await;
+        // Edgeless, same hash, protected status — but soft-deleted, so
+        // it is a retained audit row and not evidence anything may read.
+        let gone =
+            seed_protected_primary_claimant(&pool, repo, "retired-evidence", HASH_B, "rejected")
+                .await;
+        sqlx::query("UPDATE artifacts SET deleted_at = now() WHERE id = $1")
+            .bind(gone)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let uc = PurgeUseCase::new(adapter.clone(), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert!(
+            !storage.exists(&put.hash).await.unwrap(),
+            "with nothing protected claiming the hash, the bytes go"
+        );
+        assert_eq!(summary.blobs_deleted, 1);
+        assert_eq!(summary.blobs_kept, 0);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(
+            purged_refs_remaining(&pool, expiring).await,
+            vec![0],
+            "`0` still means the blob was deleted"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The lease's answer, read straight off the adapter rather than
+    /// through a whole sweep: `ProtectedClaim`, carrying the number of
+    /// claimants, with the durable worklist row corrected in place so a
+    /// retry and the terminal event agree with it.
+    ///
+    /// Also pins the counting rule: one artifact claiming the hash
+    /// twice — as its primary content *and* as its metadata blob — is
+    /// **one** claimant, because the number is a count of artifacts
+    /// holding the bytes.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn the_lease_reports_protected_claims_and_counts_claimants_once() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = adapter(&pool).await;
+        let (repo, art) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+        let target: ContentHash = HASH_B.parse().unwrap();
+
+        // One claimant, claiming through both columns at once.
+        let both =
+            seed_protected_primary_claimant(&pool, repo, "both-columns", HASH_B, "quarantined")
+                .await;
+        seed_metadata_blob(&pool, both, HASH_B).await;
+
+        assert!(
+            matches!(
+                adapter
+                    .begin_blob_reclaim(art, &target)
+                    .await
+                    .expect("lease"),
+                BlobReclaim::ProtectedClaim { claimants: 1 }
+            ),
+            "an artifact claiming the hash through both columns is one \
+             claimant, not two"
+        );
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT refs_remaining FROM artifact_purge_worklist \
+             WHERE artifact_id = $1 AND content_hash = $2",
+        )
+        .bind(art)
+        .bind(HASH_B)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted, 1,
+            "the worklist's zero is corrected to the claim count, exactly as \
+             the Referenced path corrects it — the terminal batch is \
+             validated against this row"
+        );
+
+        // A second, distinct claimant is a second claim.
+        seed_protected_primary_claimant(&pool, repo, "second-evidence", HASH_B, "rejected").await;
+        assert!(matches!(
+            adapter
+                .begin_blob_reclaim(art, &target)
+                .await
+                .expect("lease"),
+            BlobReclaim::ProtectedClaim { claimants: 2 }
+        ));
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// A reference row and a protected claimant at the same time: the
+    /// refcount answers first and the protected-claim query never runs.
+    /// That ordering is the point — a non-zero refcount already keeps
+    /// the blob, so the second question has nothing left to decide, and
+    /// asking it anyway would put a second query on every kept blob.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_live_reference_answers_before_the_protected_claim_query() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let adapter = adapter(&pool).await;
+        let (repo, art) = worklist_prepared_at_zero(&pool, &adapter, HASH_B).await;
+        let target: ContentHash = HASH_B.parse().unwrap();
+
+        let newcomer = seed_artifact(&pool, repo, "live-ref", HASH_B, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(newcomer)
+            .execute(&pool)
+            .await
+            .unwrap();
+        ingest_dedup_reference(&pool, repo, newcomer, &target).await;
+        seed_protected_primary_claimant(&pool, repo, "also-evidence", HASH_B, "quarantined").await;
+
+        assert!(
+            matches!(
+                adapter
+                    .begin_blob_reclaim(art, &target)
+                    .await
+                    .expect("lease"),
+                BlobReclaim::Referenced { refs_now: 1 }
+            ),
+            "a live reference row is reported as `Referenced` — the variant \
+             whose value is defined as a `content_references` count"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// Three of the lease's four answers, straight from the adapter:
+    /// granted on a free lock over an unclaimed hash, `Referenced`
+    /// (with the worklist row corrected in place) once a reference
+    /// exists, and `Contended` while someone else holds the lock. The
+    /// fourth, `ProtectedClaim`, has its own tests above — it is
+    /// reached only when the refcount is zero, so it cannot be
+    /// scripted into this sequence.
     #[tokio::test]
     #[serial(hort_pg_db)]
     async fn the_lease_reports_granted_referenced_and_contended() {
@@ -3529,6 +4193,488 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "past the last row the page is empty, which ends the walk"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    // -----------------------------------------------------------------
+    // The page is a snapshot: the protection rules are re-read under
+    // the artifact lock
+    // -----------------------------------------------------------------
+
+    /// What the mutation a window test injects does. Boxed and
+    /// `FnOnce` so it can capture a pool and fire exactly once.
+    type Mutation =
+        Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>;
+
+    /// A [`PurgeGcPort`] that runs one mutation the first time the
+    /// sweep prepares an artifact — so the mutation lands **after** the
+    /// page was read and **before** the next artifact's destructive
+    /// step. That is the window under test, and it is the sweep's
+    /// longest one: everything done to the items ahead of an artifact,
+    /// storage deletes included, happens inside it.
+    ///
+    /// A decorator rather than a mutation performed inline before the
+    /// call, because inline would prove only that the fresh read sees a
+    /// value written before the sweep started. The point is that the
+    /// page row the sweep is carrying says something else.
+    struct MutateAfterFirstPrepare {
+        inner: PgPurgeGcPort,
+        mutation: Mutex<Option<Mutation>>,
+    }
+
+    impl MutateAfterFirstPrepare {
+        fn new(inner: PgPurgeGcPort, mutation: Mutation) -> Self {
+            Self {
+                inner,
+                mutation: Mutex::new(Some(mutation)),
+            }
+        }
+    }
+
+    impl PurgeGcPort for MutateAfterFirstPrepare {
+        fn list_pending_purge(
+            &self,
+            limit: u32,
+            after_artifact_id: Option<Uuid>,
+        ) -> BoxFuture<'_, DomainResult<Vec<PendingPurge>>> {
+            self.inner.list_pending_purge(limit, after_artifact_id)
+        }
+
+        fn purge_artifact_refs(
+            &self,
+            artifact_id: Uuid,
+        ) -> BoxFuture<'_, DomainResult<PurgePreparation>> {
+            let fire = self.mutation.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(fire) = fire {
+                    fire().await;
+                }
+                self.inner.purge_artifact_refs(artifact_id).await
+            })
+        }
+
+        fn begin_blob_reclaim(
+            &self,
+            artifact_id: Uuid,
+            content_hash: &ContentHash,
+        ) -> BoxFuture<'_, DomainResult<BlobReclaim>> {
+            self.inner.begin_blob_reclaim(artifact_id, content_hash)
+        }
+
+        fn mark_purge_ref_complete(
+            &self,
+            artifact_id: Uuid,
+            content_hash: &ContentHash,
+            completed_at: DateTime<Utc>,
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            self.inner
+                .mark_purge_ref_complete(artifact_id, content_hash, completed_at)
+        }
+
+        fn complete_artifact_purge(
+            &self,
+            artifact_id: Uuid,
+            retired_at: DateTime<Utc>,
+            events: AppendEvents,
+        ) -> BoxFuture<'_, DomainResult<()>> {
+            self.inner
+                .complete_artifact_purge(artifact_id, retired_at, events)
+        }
+    }
+
+    /// Two released artifacts, each with its own bytes in CAS, each
+    /// with its own `primary_content` edge and a pending
+    /// `ArtifactExpired` carrying `reason`. Returns
+    /// `(repo, storage, tmp, leader, leader_hash, victim, victim_hash)`
+    /// with `leader` the one the page serves first — so a mutation
+    /// fired during the leader's preparation is inside the victim's
+    /// window.
+    async fn two_artifacts_one_window(
+        pool: &PgPool,
+        reason: serde_json::Value,
+    ) -> (
+        Uuid,
+        Arc<hort_adapters_storage::FilesystemStorage>,
+        tempfile::TempDir,
+        Uuid,
+        &'static str,
+        Uuid,
+        &'static str,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(hort_adapters_storage::FilesystemStorage::new(
+            tmp.path().to_path_buf(),
+        ));
+        for (bytes, expected) in [(b"hello world".to_vec(), HASH_B), (b"foo".to_vec(), HASH_C)] {
+            let put = storage
+                .put(Box::new(std::io::Cursor::new(bytes)))
+                .await
+                .expect("seed CAS");
+            assert_eq!(put.hash.as_ref(), expected, "fixture bytes pin the hash");
+        }
+
+        let repo = seed_repo(pool).await;
+        let art_b = seed_artifact(pool, repo, "window-b", HASH_B, Some("released")).await;
+        let art_c = seed_artifact(pool, repo, "window-c", HASH_C, Some("released")).await;
+        for (art, hash) in [(art_b, HASH_B), (art_c, HASH_C)] {
+            sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+                .bind(art)
+                .execute(pool)
+                .await
+                .unwrap();
+            insert_cr(pool, repo, art, "primary_content", hash).await;
+            append_expired_with_reason(pool, art, 0, reason.clone()).await;
+        }
+
+        // The page comes back ordered by `artifact_id`, so which of the
+        // two is the leader is decided by the ids the fixture happened
+        // to get.
+        let (leader, victim) = if art_b < art_c {
+            (art_b, art_c)
+        } else {
+            (art_c, art_b)
+        };
+        let hash_of = |art: Uuid| if art == art_b { HASH_B } else { HASH_C };
+        (
+            repo,
+            storage,
+            tmp,
+            leader,
+            hash_of(leader),
+            victim,
+            hash_of(victim),
+        )
+    }
+
+    /// Whether an artifact's stream carries an `ArtifactPurged`, and
+    /// whether its `ArtifactExpired` work item is still on it.
+    async fn stream_shape(pool: &PgPool, artifact: Uuid) -> (bool, bool) {
+        let stream = StreamId::artifact(artifact).to_string();
+        let purged: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE stream_id = $1 AND event_type = 'ArtifactPurged'",
+        )
+        .bind(&stream)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let expired: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE stream_id = $1 AND event_type = 'ArtifactExpired'",
+        )
+        .bind(&stream)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        (purged > 0, expired > 0)
+    }
+
+    async fn deleted_at_of(pool: &PgPool, artifact: Uuid) -> Option<DateTime<Utc>> {
+        sqlx::query_scalar("SELECT deleted_at FROM artifacts WHERE id = $1")
+            .bind(artifact)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// **The finding, half one.** A released artifact is read into the
+    /// page as a purge candidate; a scan verdict moves it to a
+    /// GC-protected state while the sweep is still working through the
+    /// items ahead of it. The page row the sweep carries says
+    /// `released`, so every check that reads it agrees the artifact is
+    /// collectable — and the preparation transaction deletes its
+    /// `content_references` edges, which is the step that cannot be
+    /// taken back: the refcount repair mints no edge for protected
+    /// evidence, so nothing will ever put it back.
+    ///
+    /// Now the facts are re-read under the artifact lock, in the
+    /// transaction that would have done the deleting, and the
+    /// preparation refuses: no edge, no byte, no event, work item still
+    /// pending.
+    ///
+    /// Removing that re-read turns this red on **"the edges are
+    /// gone"** rather than on the bytes — the hash-level claim check
+    /// keeps the bytes here, because a freshly-`rejected` artifact is a
+    /// protected claimant of its own content. Keeping the artifact's
+    /// own record intact is this check's job, and the bytes assertion
+    /// is here because the acceptance for "nothing happened" includes
+    /// them.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_status_that_turns_protected_inside_the_window_is_refused_under_the_lock() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+
+        for status in ["rejected", "scan_indeterminate", "quarantined"] {
+            let (repo, storage, _tmp, leader, leader_hash, victim, victim_hash) =
+                two_artifacts_one_window(&pool, keep_last_n_reason()).await;
+
+            // Fires during the leader's preparation — after the page
+            // read, before the victim's.
+            let mutating_pool = pool.clone();
+            let gc = MutateAfterFirstPrepare::new(
+                adapter(&pool).await,
+                Box::new(move || {
+                    Box::pin(async move {
+                        sqlx::query("UPDATE artifacts SET quarantine_status = $2 WHERE id = $1")
+                            .bind(victim)
+                            .bind(status)
+                            .execute(&mutating_pool)
+                            .await
+                            .expect("scan verdict lands mid-sweep");
+                    })
+                }),
+            );
+
+            let uc = PurgeUseCase::new(Arc::new(gc), storage.clone(), Arc::new(ConvergedGate));
+            let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+            // Nothing happened to the victim. Asserted before the
+            // counters on purpose: with the re-read removed this is
+            // the assertion that fails, and "the edges are gone" is
+            // the damage — a counter that did not move is only its
+            // symptom.
+            assert_eq!(
+                cr_rows_for(&pool, victim).await,
+                vec![("primary_content".to_owned(), victim_hash.to_owned())],
+                "{status}: the evidence keeps its reference edge — nothing \
+                 re-mints one for a protected artifact"
+            );
+            assert!(
+                storage.exists(&victim_hash.parse().unwrap()).await.unwrap(),
+                "{status}: the evidence keeps its bytes"
+            );
+            assert_eq!(
+                deleted_at_of(&pool, victim).await,
+                None,
+                "{status}: the evidence row stays live"
+            );
+            assert_eq!(
+                stream_shape(&pool, victim).await,
+                (false, true),
+                "{status}: no ArtifactPurged, and the work item is retained \
+                 so the next sweep asks again"
+            );
+
+            assert_eq!(
+                summary.skipped_protected_under_lock, 1,
+                "{status}: the re-read under the lock is what caught it"
+            );
+            assert_eq!(
+                summary.skipped_protected, 0,
+                "{status}: the page row said released, so the pre-exit \
+                 could not have caught it — if this moved, the fixture is \
+                 not testing the window"
+            );
+            assert_eq!(summary.errors, 0, "{status}: a refusal is not an error");
+
+            // And the leader — whose facts did not move — was purged
+            // normally, so the refusal is about this artifact and not
+            // about the sweep losing its nerve.
+            assert!(
+                cr_rows_for(&pool, leader).await.is_empty(),
+                "{status}: the unchanged sibling released its edge"
+            );
+            assert!(
+                !storage.exists(&leader_hash.parse().unwrap()).await.unwrap(),
+                "{status}: the unchanged sibling's bytes were collected"
+            );
+            assert_eq!(summary.blobs_deleted, 1, "{status}");
+
+            cleanup(&pool, repo).await;
+        }
+    }
+
+    /// **The finding, half two.** Same window, the other rule: a
+    /// mutable ref comes to resolve to a `KeepLastN`-expired artifact
+    /// while the sweep is working through the items ahead of it. Here
+    /// the page row's staleness costs the **bytes** — the artifact is
+    /// `released`, so the hash-level claim check finds no protected
+    /// claimant, grants the lease and deletes the CAS object the live
+    /// tag resolves to.
+    ///
+    /// Removing the re-read turns this red on "the bytes are gone".
+    /// The rule applied is `PendingPurge::is_tag_exempt` — the same
+    /// predicate the page-row pre-exit uses, not a second copy of it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_tag_that_lands_inside_the_window_is_refused_under_the_lock() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let (repo, storage, _tmp, leader, leader_hash, victim, victim_hash) =
+            two_artifacts_one_window(&pool, keep_last_n_reason()).await;
+
+        let mutating_pool = pool.clone();
+        let gc = MutateAfterFirstPrepare::new(
+            adapter(&pool).await,
+            Box::new(move || {
+                Box::pin(async move {
+                    sqlx::query(
+                        r#"INSERT INTO mutable_refs (
+                               repository_id, namespace, ref_name, target_kind, target_hash
+                           ) VALUES ($1, 'window-tag', 'latest', 'hash', $2)"#,
+                    )
+                    .bind(repo)
+                    .bind(victim_hash)
+                    .execute(&mutating_pool)
+                    .await
+                    .expect("a tag is set mid-sweep");
+                })
+            }),
+        );
+
+        let uc = PurgeUseCase::new(Arc::new(gc), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        // The bytes first, for the same reason as in the status test:
+        // with the re-read removed this is the assertion that fails,
+        // and here the damage really is the CAS object — nothing holds
+        // these bytes but a live tag, and the sweep granted itself a
+        // lease over them.
+        assert!(
+            storage.exists(&victim_hash.parse().unwrap()).await.unwrap(),
+            "the bytes the live tag resolves to must survive"
+        );
+        assert_eq!(
+            cr_rows_for(&pool, victim).await,
+            vec![("primary_content".to_owned(), victim_hash.to_owned())],
+            "and its reference edge with them"
+        );
+        assert_eq!(
+            deleted_at_of(&pool, victim).await,
+            None,
+            "the tag target stays live"
+        );
+        assert_eq!(
+            stream_shape(&pool, victim).await,
+            (false, true),
+            "no ArtifactPurged; the ArtifactExpired is retained and the \
+             artifact is purged once the tag moves"
+        );
+
+        assert_eq!(
+            summary.skipped_tag_exempt_under_lock, 1,
+            "the re-read under the lock is what caught it"
+        );
+        assert_eq!(
+            summary.skipped_tag_exempt, 0,
+            "the page row carried no ref, so the pre-exit could not have \
+             caught it — if this moved, the fixture is not testing the window"
+        );
+        assert_eq!(summary.errors, 0, "a refusal is not an error");
+
+        assert!(
+            cr_rows_for(&pool, leader).await.is_empty(),
+            "the untagged sibling released its edge"
+        );
+        assert!(
+            !storage.exists(&leader_hash.parse().unwrap()).await.unwrap(),
+            "the untagged sibling's bytes were collected"
+        );
+        assert_eq!(summary.blobs_deleted, 1);
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The counter-test to both of the above: a status write inside the
+    /// same window that is **not** protective leaves the purge alone.
+    /// Without this, a re-read that refused unconditionally — or one
+    /// that could not classify `released` — would pass the two tests
+    /// above and brake the whole sweep.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_artifact_whose_window_changes_nothing_relevant_is_purged_normally() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let (repo, storage, _tmp, leader, leader_hash, victim, victim_hash) =
+            two_artifacts_one_window(&pool, keep_last_n_reason()).await;
+
+        let mutating_pool = pool.clone();
+        let gc = MutateAfterFirstPrepare::new(
+            adapter(&pool).await,
+            Box::new(move || {
+                Box::pin(async move {
+                    // A real write to the very column the re-read
+                    // consults, landing in the window, that does not
+                    // protect anything.
+                    sqlx::query(
+                        "UPDATE artifacts SET quarantine_status = 'released' WHERE id = $1",
+                    )
+                    .bind(victim)
+                    .execute(&mutating_pool)
+                    .await
+                    .expect("a benign status write lands mid-sweep");
+                })
+            }),
+        );
+
+        let uc = PurgeUseCase::new(Arc::new(gc), storage.clone(), Arc::new(ConvergedGate));
+        let summary = uc.process_expired(Utc::now()).await.expect("sweep runs");
+
+        assert_eq!(summary.artifacts_visited, 2);
+        assert_eq!(summary.blobs_deleted, 2, "both artifacts were collected");
+        assert_eq!(summary.skipped_protected_under_lock, 0);
+        assert_eq!(summary.skipped_tag_exempt_under_lock, 0);
+        assert_eq!(summary.skipped_protected, 0);
+        assert_eq!(summary.skipped_tag_exempt, 0);
+        assert_eq!(summary.errors, 0);
+
+        for (art, hash) in [(leader, leader_hash), (victim, victim_hash)] {
+            assert!(cr_rows_for(&pool, art).await.is_empty(), "{art}: edge gone");
+            assert!(
+                !storage.exists(&hash.parse().unwrap()).await.unwrap(),
+                "{art}: bytes collected"
+            );
+            assert!(deleted_at_of(&pool, art).await.is_some(), "{art}: retired");
+            assert_eq!(stream_shape(&pool, art).await, (true, true), "{art}");
+        }
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The re-read guards the **first** destructive step, and a retry
+    /// is past it: once a worklist exists the edges are already gone,
+    /// so the facts are deliberately not consulted again.
+    ///
+    /// Declining there would strand the artifact — edges deleted, no
+    /// terminal event appendable, purge never finishable — and what
+    /// protects the bytes from this point on is `begin_blob_reclaim`'s
+    /// claim check, which asks about the hash rather than the artifact
+    /// and so sees the freshly-protected row as a claimant.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_retry_reads_the_worklist_and_not_the_facts_again() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "already-prepared", HASH_A, Some("released")).await;
+        sqlx::query("DELETE FROM content_references WHERE source_artifact_id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .unwrap();
+        insert_cr(&pool, repo, art, "primary_content", HASH_A).await;
+        append_event(&pool, art, "ArtifactExpired", 0).await;
+
+        let adapter = adapter(&pool).await;
+        let first = prepared(adapter.purge_artifact_refs(art).await.unwrap());
+        assert_eq!(first.len(), 1);
+
+        sqlx::query("UPDATE artifacts SET quarantine_status = 'rejected' WHERE id = $1")
+            .bind(art)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            prepared(adapter.purge_artifact_refs(art).await.unwrap()),
+            first,
+            "the committed worklist is the authoritative target set; a \
+             refusal here would leave a purge that can never finish"
         );
 
         cleanup(&pool, repo).await;

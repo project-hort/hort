@@ -1521,7 +1521,11 @@ FtBmFfStik03XAfEPVCRWBMc
         fn delete_stream(
             &self,
             _stream_id: StreamId,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<hort_domain::ports::event_store::SealOutcome>,
+        > {
             unimplemented!("CapturingEventStore::delete_stream — not on this test path")
         }
 
@@ -1529,7 +1533,11 @@ FtBmFfStik03XAfEPVCRWBMc
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<hort_domain::ports::event_store::SealOutcome>,
+        > {
             unimplemented!("CapturingEventStore::archive_stream — not on this test path")
         }
     }

@@ -2530,7 +2530,11 @@ mod tests {
 
         // Retention stubs: apply-config mock; retention paths are
         // unreachable from policy-driven apply, panic on call.
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             Box::pin(async { unimplemented!("retention path unused by apply-config tests") })
         }
 
@@ -2538,7 +2542,8 @@ mod tests {
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             Box::pin(async { unimplemented!("retention path unused by apply-config tests") })
         }
     }

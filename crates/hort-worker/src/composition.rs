@@ -1564,7 +1564,6 @@ pub async fn build_app_context(
             artifacts.clone(),
             upstream_proxy_for_index_child,
             caching_resolver.clone(),
-            content_references.clone(),
             jobs.clone(),
             oci_handler_for_index_child,
             ingest_use_case_for_index_child,

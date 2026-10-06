@@ -107,6 +107,60 @@ pub enum SubscribeFrom {
 }
 
 // ---------------------------------------------------------------------------
+// SealAuthority / SealOutcome
+// ---------------------------------------------------------------------------
+
+/// The stream tail a seal decision was proven against — the version
+/// that authorizes [`EventStore::delete_stream`] /
+/// [`EventStore::archive_stream`] to remove a whole stream.
+///
+/// # Why a seal carries a version at all
+///
+/// Sealing is decided *outside* the removal: a caller reads the stream,
+/// proves its tail is the category terminal and that the retention floor
+/// has elapsed, and only then calls the chokepoint. Those are two
+/// observations of a stream that nothing holds still — the append path
+/// takes no row lock (it relies on the `UNIQUE (stream_id,
+/// stream_position)` index for optimistic concurrency), so no lock the
+/// seal could take would exclude an appender either. An event that lands
+/// in between invalidates both proofs at once: the tail is no longer the
+/// terminal, and the stream now holds an event younger than the floor.
+///
+/// Carrying the proven tail is what makes the two one decision. The
+/// position is a complete proxy for both proofs, because an append is
+/// the only thing that can change either: a stream still at
+/// `final_stream_position` has the tail the caller read and no event the
+/// floor proof did not cover.
+///
+/// A seal is **not** an append, so this is deliberately not
+/// [`ExpectedVersion`]: there is no `NoStream` to express (a stream with
+/// no rows is nothing to seal) and, above all, no `Any` — "remove this
+/// stream whatever it looks like now" is exactly the authority a seal
+/// must not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealAuthority {
+    /// `stream_position` of the tail event the caller's proof read. The
+    /// chokepoint removes the stream only while this is still the
+    /// stream's last position.
+    pub final_stream_position: u64,
+}
+
+/// What a seal chokepoint call did — the refusal is a **result**, not a
+/// failure, so a caller cannot count it as either success or error by
+/// accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealOutcome {
+    /// The tombstone was appended and every row of the stream removed,
+    /// in one transaction.
+    Sealed,
+    /// The stream is no longer the one the caller proved: its tail has
+    /// moved past [`SealAuthority::final_stream_position`], or its rows
+    /// are already gone. Nothing was appended and nothing was removed —
+    /// the stream is left whole for the next sweep to re-evaluate.
+    NotAtProvenVersion,
+}
+
+// ---------------------------------------------------------------------------
 // EventStore trait
 // ---------------------------------------------------------------------------
 
@@ -218,7 +272,8 @@ pub trait EventStore: Send + Sync {
         Box::pin(async { Ok(()) })
     }
 
-    /// Delete an entire stream.
+    /// Delete an entire stream — but only while it is still at the tail
+    /// the caller proved its decision against.
     ///
     /// **Caller preconditions** (NOT enforced by the adapter — the
     /// eventstore-retention use case is responsible for proving them
@@ -229,6 +284,19 @@ pub trait EventStore: Send + Sync {
     ///    `crate::ports::terminal_stream_reader`).
     /// 2. The audit-retention floor has elapsed for
     ///    every event in the stream.
+    /// 3. `authority` names the `stream_position` of the tail event that
+    ///    very proof read — not a position read afterwards. Deriving it
+    ///    from a second read reopens the window the pairing closes,
+    ///    because the second read already contains whatever landed in
+    ///    between.
+    ///
+    /// The adapter is what makes (3) load-bearing: it removes nothing
+    /// unless the stream is still at that position, and reports
+    /// [`SealOutcome::NotAtProvenVersion`] when it is not. That is the
+    /// only mechanism available — the append path takes no row lock
+    /// (optimistic concurrency on `UNIQUE (stream_id,
+    /// stream_position)`), so there is nothing a seal could lock to
+    /// exclude an appender. See [`SealAuthority`].
     ///
     /// Implementations MAY refuse if the stream is still subscribed to
     /// by an active projection.
@@ -236,7 +304,11 @@ pub trait EventStore: Send + Sync {
     /// The Postgres adapter implements this as a seal-and-remove
     /// (single-flight via the seal pool, ADR 0020); in-memory mocks
     /// implement whatever their test needs.
-    fn delete_stream(&self, stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>>;
+    fn delete_stream(
+        &self,
+        stream_id: StreamId,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>>;
 
     /// Move an entire stream to a cold-storage target — the **contract**;
     /// no shipped implementation honours it yet (see the posture note
@@ -261,7 +333,12 @@ pub trait EventStore: Send + Sync {
     /// config parsing in both binaries, so the only callers today are
     /// tests. An implementation that cannot keep the events must not
     /// return `Ok` from here once the mode is reachable again.
-    fn archive_stream(&self, stream_id: StreamId, target: &str) -> BoxFuture<'_, DomainResult<()>>;
+    fn archive_stream(
+        &self,
+        stream_id: StreamId,
+        target: &str,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +437,11 @@ mod tests {
             Box::pin(async move { Ok(events) })
         }
 
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
             Box::pin(async { Err(out_of_scope()) })
         }
 
@@ -368,7 +449,8 @@ mod tests {
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
+            _authority: SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
             Box::pin(async { Err(out_of_scope()) })
         }
     }
@@ -505,14 +587,39 @@ mod tests {
             .read_stream(&StreamId::artifact(Uuid::nil()), ReadFrom::Start, 1)
             .await
             .is_err());
+        let authority = SealAuthority {
+            final_stream_position: 0,
+        };
         assert!(store
-            .delete_stream(StreamId::artifact(Uuid::nil()))
+            .delete_stream(StreamId::artifact(Uuid::nil()), authority)
             .await
             .is_err());
         assert!(store
-            .archive_stream(StreamId::artifact(Uuid::nil()), "s3://nowhere")
+            .archive_stream(StreamId::artifact(Uuid::nil()), "s3://nowhere", authority)
             .await
             .is_err());
+    }
+
+    /// The seal vocabulary is plain data; the two shapes it admits are
+    /// exactly "sealed" and "the stream moved", with no third answer a
+    /// caller could read as a partial removal.
+    #[test]
+    fn seal_authority_and_outcome_round_trip() {
+        let a = SealAuthority {
+            final_stream_position: 7,
+        };
+        assert_eq!(a, a);
+        assert_eq!(a.final_stream_position, 7);
+        assert_ne!(
+            a,
+            SealAuthority {
+                final_stream_position: 8
+            }
+        );
+        assert_ne!(SealOutcome::Sealed, SealOutcome::NotAtProvenVersion);
+        // `Copy`, so a chokepoint call cannot consume the caller's proof.
+        let copied = a;
+        assert_eq!(copied, a);
     }
 
     #[tokio::test]

@@ -41,7 +41,7 @@
 //!
 //! # Scope discipline
 //!
-//! Both helpers take a `&mut Transaction`, never a pool: an advisory
+//! Every helper takes a `&mut Transaction`, never a pool: an advisory
 //! lock taken with `pg_advisory_xact_lock` is released at the end of
 //! *that* transaction, whether it commits, rolls back, or the
 //! connection dies. A session-scoped lock (`pg_advisory_lock`) would
@@ -91,11 +91,57 @@ pub(crate) async fn lock_blob_in_tx(
     tx: &mut Transaction<'_, Postgres>,
     hash: &ContentHash,
 ) -> DomainResult<()> {
+    lock_key_in_tx(tx, blob_lock_key(hash)).await
+}
+
+/// Take one advisory lock by key, **waiting**. The single spelling of the
+/// waiting acquisition, so the singular and plural forms cannot drift into
+/// two statements against two keyspaces.
+async fn lock_key_in_tx(tx: &mut Transaction<'_, Postgres>, key: i64) -> DomainResult<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(blob_lock_key(hash))
+        .bind(key)
         .execute(&mut **tx)
         .await
         .map_err(|e| map_sqlx_error(&e, "blob_lock", "acquire"))?;
+    Ok(())
+}
+
+/// The lock keys for `hashes`, deduplicated and in ascending order — the
+/// order several blob locks must be taken in within one transaction.
+///
+/// A transaction that claims more than one blob (an ingest records its
+/// artifact's own content *and* a CAS-resident metadata blob) takes more than
+/// one of these locks and holds them all to its end, which is what makes the
+/// acquisition order matter: two such transactions whose target sets overlap
+/// and whose orders disagree can each hold what the other is waiting for.
+/// Postgres breaks that by aborting one of them — recoverable, since the
+/// abort classifies as `DomainError::Contended` (see `crate::contention`) and
+/// the caller's retry re-runs the whole transaction — but a total order over
+/// the keys means the cycle cannot form in the first place, which is cheaper
+/// than detecting it.
+///
+/// Deduplication is by *key*, not by hash: two hashes that collide on a key
+/// (see [`blob_lock_key`]) need the lock taken once, and taking it twice
+/// would spend a round trip on a lock the transaction already holds.
+pub(crate) fn blob_lock_order(hashes: impl IntoIterator<Item = ContentHash>) -> Vec<i64> {
+    let mut keys: Vec<i64> = hashes.into_iter().map(|h| blob_lock_key(&h)).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// Take the blob lock for every hash in `hashes`, **waiting** on each, in the
+/// deadlock-free order [`blob_lock_order`] defines.
+///
+/// The multi-blob form of [`lock_blob_in_tx`], with the same waiting posture
+/// and for the same reason.
+pub(crate) async fn lock_blobs_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    hashes: impl IntoIterator<Item = ContentHash>,
+) -> DomainResult<()> {
+    for key in blob_lock_order(hashes) {
+        lock_key_in_tx(tx, key).await?;
+    }
     Ok(())
 }
 
@@ -155,5 +201,45 @@ mod tests {
     #[test]
     fn distinct_digests_key_distinctly() {
         assert_ne!(blob_lock_key(&h(HASH_A)), blob_lock_key(&h(HASH_B)));
+    }
+
+    /// The multi-lock order is ascending by key and independent of the order
+    /// the caller supplied — the whole point of it, since two transactions
+    /// that disagree on the order of two shared blobs can hold each other's
+    /// next lock.
+    #[test]
+    fn lock_order_is_ascending_and_caller_order_independent() {
+        let forward = blob_lock_order([h(HASH_A), h(HASH_B)]);
+        let reversed = blob_lock_order([h(HASH_B), h(HASH_A)]);
+        assert_eq!(forward, reversed, "the order is a property of the keys");
+        assert!(
+            forward.windows(2).all(|w| w[0] < w[1]),
+            "ascending: {forward:?}"
+        );
+        // 0xb9… has the high bit set, so it is the *negative* key and sorts
+        // first — the assertion is about the signed `bigint` Postgres takes,
+        // not about the hex spelling.
+        assert_eq!(
+            forward,
+            vec![blob_lock_key(&h(HASH_B)), blob_lock_key(&h(HASH_A))]
+        );
+    }
+
+    /// A repeated hash yields one lock acquisition: an ingest whose metadata
+    /// blob happens to be its own content would otherwise spend a round trip
+    /// re-taking a lock the transaction already holds.
+    #[test]
+    fn lock_order_deduplicates() {
+        assert_eq!(
+            blob_lock_order([h(HASH_A), h(HASH_A), h(HASH_A)]),
+            vec![blob_lock_key(&h(HASH_A))]
+        );
+    }
+
+    /// No hashes, no locks — the common ingest shape (one primary edge) must
+    /// not be the only one that works.
+    #[test]
+    fn lock_order_of_nothing_is_empty() {
+        assert!(blob_lock_order([]).is_empty());
     }
 }

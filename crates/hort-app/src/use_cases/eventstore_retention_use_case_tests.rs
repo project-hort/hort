@@ -22,6 +22,13 @@
 //! - mixed batch full-tally.
 //! - `list_terminal_candidates` port error → `Err` (whole sweep
 //!   aborts, vs per-stream errors which continue).
+//! - the seal authority: a `TerminalGated` seal carries the tail of its
+//!   terminal-proof read (not the enumeration's, which may be stale), an
+//!   `AgeGated` seal carries the enumeration row's tail, and `Archive`
+//!   mode carries the same value as `Delete`.
+//! - `SealOutcome::NotAtProvenVersion` → `skipped_stream_changed`, with
+//!   `deleted`/`archived` and `errors` both left at zero, and the sweep
+//!   continuing to the next candidate.
 //! - a `DebuggingRecorder` assertion that
 //!   `hort_event_store_streams_archived_total{result=…}` fires with the
 //!   documented `{archived, deleted, skipped}` label values.
@@ -38,7 +45,7 @@ use hort_domain::events::{
     IngestSource, PersistedEvent, StreamCategory, StreamId,
 };
 use hort_domain::ports::event_store::{
-    AppendEvents, AppendResult, EventStore, ReadFrom, SubscribeFrom,
+    AppendEvents, AppendResult, EventStore, ReadFrom, SealAuthority, SealOutcome, SubscribeFrom,
 };
 use hort_domain::ports::terminal_stream_reader::{TerminalStreamCandidate, TerminalStreamReader};
 use hort_domain::ports::BoxFuture;
@@ -195,10 +202,19 @@ struct MockEventStore {
     streams: Mutex<std::collections::HashMap<String, Vec<PersistedEvent>>>,
     /// stream_id strings whose `read_stream` returns an error.
     read_err_for: Mutex<Vec<String>>,
-    deleted: Mutex<Vec<String>>,
-    archived: Mutex<Vec<(String, String)>>,
+    /// `(stream_id, authority.final_stream_position)` per `delete_stream`
+    /// call — the position is recorded so a test can pin *which* proof
+    /// authorized the seal, not merely that one was attempted.
+    deleted: Mutex<Vec<(String, u64)>>,
+    /// `(stream_id, target, authority.final_stream_position)` per
+    /// `archive_stream` call.
+    archived: Mutex<Vec<(String, String, u64)>>,
     /// stream_id strings whose chokepoint call returns an error.
     seal_err_for: Mutex<Vec<String>>,
+    /// stream_id strings whose chokepoint reports
+    /// `SealOutcome::NotAtProvenVersion` — the real adapter's answer when
+    /// an event landed after the sweep proved the stream.
+    stream_moved_for: Mutex<Vec<String>>,
 }
 
 impl MockEventStore {
@@ -220,10 +236,33 @@ impl MockEventStore {
         self.seal_err_for.lock().unwrap().push(stream_id.to_owned());
         self
     }
+    fn stream_moved_for(self, stream_id: &str) -> Self {
+        self.stream_moved_for
+            .lock()
+            .unwrap()
+            .push(stream_id.to_owned());
+        self
+    }
     fn deleted_streams(&self) -> Vec<String> {
+        self.deleted
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+    fn deleted_with_authority(&self) -> Vec<(String, u64)> {
         self.deleted.lock().unwrap().clone()
     }
     fn archived_streams(&self) -> Vec<(String, String)> {
+        self.archived
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(s, t, _)| (s.clone(), t.clone()))
+            .collect()
+    }
+    fn archived_with_authority(&self) -> Vec<(String, String, u64)> {
         self.archived.lock().unwrap().clone()
     }
 }
@@ -265,35 +304,54 @@ impl EventStore for MockEventStore {
     ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
         Box::pin(async { Ok(vec![]) })
     }
-    fn delete_stream(&self, stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+    fn delete_stream(
+        &self,
+        stream_id: StreamId,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
         let key = stream_id.to_string();
         let fail = self.seal_err_for.lock().unwrap().contains(&key);
-        self.deleted.lock().unwrap().push(key.clone());
+        let moved = self.stream_moved_for.lock().unwrap().contains(&key);
+        self.deleted
+            .lock()
+            .unwrap()
+            .push((key.clone(), authority.final_stream_position));
         Box::pin(async move {
             if fail {
                 Err(DomainError::Invariant(format!(
                     "delete_stream chokepoint blocked (hort_retention_role \
                      not yet wired): {key}"
                 )))
+            } else if moved {
+                Ok(SealOutcome::NotAtProvenVersion)
             } else {
-                Ok(())
+                Ok(SealOutcome::Sealed)
             }
         })
     }
-    fn archive_stream(&self, stream_id: StreamId, target: &str) -> BoxFuture<'_, DomainResult<()>> {
+    fn archive_stream(
+        &self,
+        stream_id: StreamId,
+        target: &str,
+        authority: SealAuthority,
+    ) -> BoxFuture<'_, DomainResult<SealOutcome>> {
         let key = stream_id.to_string();
         let fail = self.seal_err_for.lock().unwrap().contains(&key);
-        self.archived
-            .lock()
-            .unwrap()
-            .push((key.clone(), target.to_owned()));
+        let moved = self.stream_moved_for.lock().unwrap().contains(&key);
+        self.archived.lock().unwrap().push((
+            key.clone(),
+            target.to_owned(),
+            authority.final_stream_position,
+        ));
         Box::pin(async move {
             if fail {
                 Err(DomainError::Invariant(format!(
                     "archive_stream chokepoint blocked: {key}"
                 )))
+            } else if moved {
+                Ok(SealOutcome::NotAtProvenVersion)
             } else {
-                Ok(())
+                Ok(SealOutcome::Sealed)
             }
         })
     }
@@ -344,12 +402,26 @@ fn candidate(
     first_event_at: DateTime<Utc>,
     last_event_type: &str,
 ) -> TerminalStreamCandidate {
+    candidate_at(stream_id, category, first_event_at, last_event_type, 0)
+}
+
+/// A candidate whose enumeration tail sits at an explicit position —
+/// the seal authority for an `AgeGated` category, where no proof read
+/// supersedes it.
+fn candidate_at(
+    stream_id: String,
+    category: StreamCategory,
+    first_event_at: DateTime<Utc>,
+    last_event_type: &str,
+    last_stream_position: u64,
+) -> TerminalStreamCandidate {
     TerminalStreamCandidate {
         stream_id,
         category,
         first_event_at,
         last_event_at: first_event_at,
         last_event_type: last_event_type.to_owned(),
+        last_stream_position,
     }
 }
 
@@ -893,6 +965,190 @@ async fn mixed_batch_tallies_every_outcome() {
     assert_eq!(s.skipped_unregistered_category, 1);
     assert_eq!(s.errors, 1, "blocked_sid chokepoint Err");
     assert!(!h.store.deleted_streams().contains(&meta));
+}
+
+// ---------------------------------------------------------------------------
+// The seal carries the version the proof was read at
+// ---------------------------------------------------------------------------
+
+/// A `TerminalGated` seal is authorized by the tail of the *terminal
+/// proof* read, not by the enumeration row — the proof read is the
+/// fresher observation and the one the verdict came from. The candidate
+/// here deliberately claims a stale tail so the two cannot be confused.
+#[tokio::test]
+async fn terminal_gated_authority_is_the_proof_reads_tail() {
+    let aid = Uuid::new_v4();
+    let sid = artifact_stream(aid);
+    let h = build(
+        MockReader::new().with(vec![candidate_at(
+            sid.clone(),
+            StreamCategory::Artifact,
+            ts(1_000),
+            "ArtifactPurged",
+            3,
+        )]),
+        MockEventStore::new().seed_stream(&sid, vec![purged_persisted(aid, 7)]),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Delete,
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.deleted, 1);
+    assert_eq!(
+        h.store.deleted_with_authority(),
+        vec![(sid, 7)],
+        "the authority must be the proof read's tail (7), not the \
+         enumeration's stale 3"
+    );
+}
+
+/// The terminal proof reads the whole stream, so the authority is the
+/// *largest* position in it — not the first event the mock happens to
+/// return.
+#[tokio::test]
+async fn terminal_gated_authority_is_the_largest_position_in_the_stream() {
+    let aid = Uuid::new_v4();
+    let sid = artifact_stream(aid);
+    let h = build(
+        MockReader::new().with(vec![candidate(
+            sid.clone(),
+            StreamCategory::Artifact,
+            ts(1_000),
+            "ArtifactPurged",
+        )]),
+        MockEventStore::new().seed_stream(
+            &sid,
+            vec![ingested_persisted(aid, 0), purged_persisted(aid, 1)],
+        ),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Delete,
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.deleted, 1);
+    assert_eq!(h.store.deleted_with_authority(), vec![(sid, 1)]);
+}
+
+/// An `AgeGated` category performs no proof read at all, so its seal is
+/// authorized by the enumeration row's own tail — the observation the
+/// floor facts came from.
+#[tokio::test]
+async fn age_gated_authority_is_the_enumeration_tail() {
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 4, 4).unwrap();
+    let sid = auth_stream(date);
+    let h = build(
+        MockReader::new().with(vec![candidate_at(
+            sid.clone(),
+            StreamCategory::AuthAttempts,
+            ts(1_000),
+            "AuthenticationAttempted",
+            12,
+        )]),
+        // Reading this stream would be a bug (AgeGated has no terminal
+        // proof), so the read is seeded to fail.
+        MockEventStore::new().fail_read_for(&sid),
+        vec![auth_rule(floor_secs(100))],
+        StreamRetentionModeRef::Delete,
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.deleted, 1);
+    assert_eq!(s.errors, 0, "no proof read is performed for AgeGated");
+    assert_eq!(h.store.deleted_with_authority(), vec![(sid, 12)]);
+}
+
+/// `Archive` mode routes the same authority through `archive_stream` —
+/// the two verbs must not differ in what authorizes them.
+#[tokio::test]
+async fn archive_mode_carries_the_same_authority() {
+    let aid = Uuid::new_v4();
+    let sid = artifact_stream(aid);
+    let h = build(
+        MockReader::new().with(vec![candidate(
+            sid.clone(),
+            StreamCategory::Artifact,
+            ts(1_000),
+            "ArtifactPurged",
+        )]),
+        MockEventStore::new().seed_stream(&sid, vec![purged_persisted(aid, 4)]),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Archive {
+            target_prefix: "s3://a".into(),
+        },
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.archived, 1);
+    assert_eq!(
+        h.store.archived_with_authority(),
+        vec![(sid.clone(), format!("s3://a/{sid}"), 4)]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The chokepoint's refusal is a skip, not an error and not a deletion
+// ---------------------------------------------------------------------------
+
+/// `SealOutcome::NotAtProvenVersion` — an event landed on the stream
+/// after this sweep proved it. Nothing was removed, so it must not be
+/// counted as `deleted`; nothing failed, so it must not be counted as
+/// an `error` either (the sweep would read as broken on a healthy
+/// system every time a late event arrives).
+#[tokio::test]
+async fn stream_changed_refusal_is_a_skip_not_a_delete_and_not_an_error() {
+    let aid = Uuid::new_v4();
+    let sid = artifact_stream(aid);
+    let h = build(
+        MockReader::new().with(vec![candidate(
+            sid.clone(),
+            StreamCategory::Artifact,
+            ts(1_000),
+            "ArtifactPurged",
+        )]),
+        MockEventStore::new()
+            .seed_stream(&sid, vec![purged_persisted(aid, 0)])
+            .stream_moved_for(&sid),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Delete,
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.skipped_stream_changed, 1);
+    assert_eq!(s.deleted, 0, "nothing was removed");
+    assert_eq!(s.errors, 0, "a late event is not a failure");
+}
+
+/// Same for `Archive` mode, and the refusal does not abort the sweep:
+/// the next candidate is still processed.
+#[tokio::test]
+async fn archive_mode_stream_changed_refusal_skips_and_sweep_continues() {
+    let moved_id = Uuid::new_v4();
+    let ok_id = Uuid::new_v4();
+    let moved_sid = artifact_stream(moved_id);
+    let ok_sid = artifact_stream(ok_id);
+    let h = build(
+        MockReader::new().with(vec![
+            candidate(
+                moved_sid.clone(),
+                StreamCategory::Artifact,
+                ts(1_000),
+                "ArtifactPurged",
+            ),
+            candidate(
+                ok_sid.clone(),
+                StreamCategory::Artifact,
+                ts(1_000),
+                "ArtifactPurged",
+            ),
+        ]),
+        MockEventStore::new()
+            .seed_stream(&moved_sid, vec![purged_persisted(moved_id, 0)])
+            .seed_stream(&ok_sid, vec![purged_persisted(ok_id, 0)])
+            .stream_moved_for(&moved_sid),
+        vec![artifact_rule(floor_secs(100))],
+        StreamRetentionModeRef::Archive {
+            target_prefix: "s3://a".into(),
+        },
+    );
+    let s = h.uc.archive_terminal_streams(ts(10_000)).await.unwrap();
+    assert_eq!(s.skipped_stream_changed, 1);
+    assert_eq!(s.archived, 1, "the untouched candidate still seals");
+    assert_eq!(s.errors, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -111,6 +111,19 @@ pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Persisted quarantine statuses that must never be offered to garbage
 /// collection or refcount repair paths.
+///
+/// Four sites bind this list, and they protect two different things.
+/// Three are about the **artifact**: `purge_gc::list_pending_purge`
+/// never offers it as a purge candidate,
+/// `retention_candidate_reader` never lets it acquire an
+/// `ArtifactExpired`, and `refcount_reconcile` mints it no reference
+/// edge (deliberately — a repaired refcount must not make a
+/// quarantined blob look GC-protected for the wrong reason). The
+/// fourth, `purge_gc::protected_claimants`, is about the **bytes**:
+/// CAS shares a content hash across artifacts, and the third site's
+/// missing edge means such an artifact's claim on its own content
+/// counts zero, so without that query a released sibling's purge
+/// deletes the evidence's bytes.
 const GC_PROTECTED_QUARANTINE_STATUSES: [(&str, QuarantineStatus); 3] = [
     ("quarantined", QuarantineStatus::Quarantined),
     ("rejected", QuarantineStatus::Rejected),

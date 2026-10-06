@@ -64,6 +64,7 @@ impl TaskHandler for EventStoreArchiveHandler {
                         skipped_meta_stream = s.skipped_meta_stream,
                         skipped_already_sealed = s.skipped_already_sealed,
                         skipped_unregistered_category = s.skipped_unregistered_category,
+                        skipped_stream_changed = s.skipped_stream_changed,
                         errors = s.errors,
                         "eventstore-archive sweep complete"
                     );
@@ -77,6 +78,7 @@ impl TaskHandler for EventStoreArchiveHandler {
                             "skipped_meta_stream": s.skipped_meta_stream,
                             "skipped_already_sealed": s.skipped_already_sealed,
                             "skipped_unregistered_category": s.skipped_unregistered_category,
+                            "skipped_stream_changed": s.skipped_stream_changed,
                             "errors": s.errors,
                         }),
                     })
