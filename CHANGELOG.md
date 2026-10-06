@@ -9,6 +9,254 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **No path that mints an artifact writes a content-reference edge after the
+  fact any more** (#335). The last three writers — the OCI manifest PUT's
+  `oci_config` / `oci_layer` / `oci_index_member` membership edges, both
+  pull-through leader legs, and the coalesced follower — now carry their edges
+  into the minting transaction as claims. A `content_references` row is what
+  keeps bytes out of the storage GC (it deletes a CAS blob exactly when no row
+  targets its hash), and for a manifest's *tree* edges the target is another
+  artifact's content, which nothing re-derives: the refcount-reconcile sweep
+  converges `primary_content` / `metadata_blob` from the artifact row, and no
+  relational row records what a manifest references. Every one of these was
+  `warn!`-and-continue, so a failure served a live, servable manifest whose
+  config, layers or children had one fewer claim.
+  - **The manifest PUT** resolves its declared references **before** the mint
+    and builds the membership claims only from a complete resolution. That
+    answers the ordering question in full rather than trading one risk for
+    another: an edge can never name a blob the repository does not hold (those
+    kinds feed the referenced-tree-descendant predicate, so one that did would
+    hand the blob's own later ingest a zero-window quarantine carve-out it did
+    not earn), and the unknown-blob 400 still answers *after* the mint, so a
+    manifest referencing blobs the client has not pushed yet stays committed
+    for the retry exactly as ADR 0043 requires — it simply claims nothing.
+  - **The two pull-through leader legs** read the cached manifest body once,
+    into memory, **before** the ingest instead of re-reading the tempfile
+    after it, derive the claims from that copy and hand them to
+    `ingest_verified`. The eager child-ingest enqueue and the prefetch trigger
+    read the same copy and stay post-commit — they are `jobs` rows and
+    scheduling hints, not claims on bytes.
+  - **The coalesced follower** reads the manifest out of CAS before minting
+    its own per-repo row, keyed on the content hash rather than on an artifact
+    id it does not have yet, and passes the claims on
+    `RegisterExistingCasBlobRequest`.
+  - Pull-through deliberately keeps claiming **by digest with no existence
+    check**: that edge is the mechanism behind the zero-window anchor for a
+    proxy descendant (ADR 0007), and a proxied constituent legitimately is not
+    present yet. Only the atomicity changed, not when an edge is written.
+  - One **observable change on an error path**: a manifest body whose
+    reference parse fails (a malformed `config.digest`, an over-cap index) is
+    no longer minted. The parse has to precede the mint for its claims to ride
+    the transaction, and the client sees the same 400 `MANIFEST_INVALID`
+    either way — what it no longer leaves behind is an artifact row for a body
+    hort refused. The *unknown-blob* contract is untouched.
+  Evidence per site is the rollback: an injected insert failure asserting that
+  neither the referrer nor its events survive, each paired with a success pin
+  showing one lifecycle call carries the referrer and its whole edge set. The
+  two backfill handlers are now the only production callers that insert an edge
+  after its referrer committed, which is their purpose — they repair referrers
+  that committed edgeless in an earlier release. No backfill, no migration, no
+  repair of existing edgeless rows.
+
+- **The three remaining content-reference writers now commit their edge in the
+  transaction that makes the claiming artifact live** (#335), completing the
+  work the ingest-mint path started. A `content_references` row is not a
+  projection that may lag: the storage GC deletes a CAS blob exactly when no
+  row targets its hash, so an edge written after its referrer committed is a
+  window in which the claim does not exist and the bytes are collectable, with
+  the referrer already live and unable to re-assert it.
+  - `register_by_hash_inner` (the OCI cross-repo blob mount, the coalesced
+    pull-through follower, and the seed-import cutover) wrote its
+    `primary_content` edge after a plain `commit_transition`, warn-and-continue
+    on failure. It mints a per-repo row over a CAS blob the source
+    repository's artifact already holds, so without that edge the new artifact
+    counted **zero** against bytes CAS shares with the source: release and
+    purge that sibling and the count reached zero with the new row still live
+    and servable. The genesis commit now carries the edge.
+  - The OCI manifest PUT's `oci_subject` edge is derived from the parsed body
+    before the mint and handed to the ingest as a claim, so the referrer and
+    the row that keeps its subject's bytes alive commit together. This one is
+    sharper than `primary_content`: the target is **another** artifact's
+    content, and the refcount-reconcile sweep cannot repair it — it converges
+    `primary_content` / `metadata_blob` from the artifact row, and no
+    relational row records what a manifest references.
+  - The eager index-child ingest (`oci-index-child-ingest`) derived its
+    `oci_config` / `oci_layer` / `oci_index_member` edges after the child
+    manifest was committed and inserted them one at a time, non-fatally. The
+    derivation moved ahead of the ingest — it only ever needed the fetched body
+    and the digest the ingest is keyed on — and the edges now ride the child's
+    transition. The handler no longer holds a content-reference port at all, so
+    there is nothing there that could write one afterwards. A failed edge fails
+    the unit; the `jobs` row is retried, where a committed manifest with a
+    missing claim was only repairable by re-reading manifest bodies out of CAS.
+  - `ingest_signature_manifest` also gains the `primary_content` edge it never
+    wrote: a pushed cosign signature manifest commits status-`None`, outside
+    the scan/quarantine lifecycle and therefore outside the GC's
+    protected-evidence rule, so its own bytes counted zero against themselves
+    until the next reconcile sweep converged them.
+  - A fourth writer the sweep for this change turned up: the provenance
+    orchestrator's upstream-referrer landing
+    (`ProvenanceOrchestrationUseCase::commit_referrer_manifest`, the inlined
+    twin of the primitive above) likewise minted its referrer manifest with no
+    edge at all and inserted the `oci_subject` row afterwards. Both now ride
+    its transition. It had no obstacle of its own, and leaving the inlined
+    copy unconverted while converting the primitive it mirrors is exactly the
+    drift this audit keeps finding.
+  Evidence is the rollback, not the end state: per edge, a test injects an
+  insert failure and asserts that **neither** the referrer **nor** its events
+  survive, each paired with a success pin showing one lifecycle call carries
+  both. No backfill, no migration, no repair of existing edgeless rows; the
+  refcount reconcile and its in-process gate are untouched. **Still open and
+  carrying the same hazard**: the OCI manifest PUT's membership edges
+  (`oci_config` / `oci_layer` / `oci_index_member`) and the pull-through leg's
+  post-ingest registration of the same. The manifest-PUT pair is blocked on a
+  decision, not on mechanism: claiming those edges before the manifest's
+  blob-existence gate would let an edge name a blob the repository does not
+  hold, and those kinds feed the referenced-tree-descendant predicate, so the
+  blob's own later ingest would take the zero-window quarantine carve-out —
+  while moving the gate ahead of the mint reverses the deliberate contract that
+  an unknown-blob manifest stays committed for the client's retry. Both
+  functions now document that trade-off in place.
+
+- **An ingested artifact's claim on its own bytes now commits in the same
+  transaction as the artifact** (#335). The storage GC deletes a CAS blob
+  exactly when no `content_references` row targets its hash, so the
+  `primary_content` edge is not a projection that may lag — it is the claim
+  that keeps the bytes alive. The ingest committed the artifact and wrote the
+  edge **afterwards**, in a step allowed to fail without failing the ingest,
+  and the comment over `write_ingest_refcounts` justified that with a claim
+  that reads backwards: "a missing refcount row only delays GC, it doesn't
+  break correctness". It delays nothing. The artifact counted **zero** against
+  its own content, and because CAS deduplicates, a released sibling carrying
+  the same bytes drove the observed count to zero — leaving a live, servable
+  artifact pointing at bytes the sweep was authorised to delete. The bracket
+  already existed: `commit_transition_with_enqueues` was writing four things
+  atomically (events, artifact row, metadata, job-queue rows) behind the port
+  boundary, with the edge standing just outside it. All three ingest-mint
+  edges now ride it — `primary_content`, `metadata_blob`, and the PEP 658
+  `wheel_metadata`, whose extraction moved **ahead** of the commit because it
+  only ever needed the bytes the primary `storage.put` had already placed in
+  CAS, so its edge belongs in the transition that creates the artifact
+  claiming them rather than in a second one. A failed edge now fails the
+  ingest: the upload is retriable, an edgeless committed artifact is not. The
+  edge upsert is idempotent on the full primary key, which is what keeps the
+  adapter's existing contention retry re-runnable, and the blob-reclamation
+  locks for a transition's several targets are taken up front in one total
+  order, so two overlapping ingests sharing targets cannot each hold the
+  other's next lock. No backfill and no migration: existing edgeless rows stay
+  the operator reconcile's business, and the reconcile and its in-process gate
+  are untouched. **Still open, deliberately out of this change**:
+  `register_by_hash_inner`'s own `primary_content` edge (the OCI cross-repo
+  mount and pull-dedup follower path) and the two OCI manifest-write edges
+  (`oci_subject`, `oci_index_member`) still write beside their transitions and
+  carry the same hazard. The `register_by_hash_inner` comment, which deferred
+  to the inverted rationale above, now states the hazard instead, so nothing
+  in the tree claims a missing edge merely postpones collection.
+
+- **An event-stream seal now carries the version its own proof was read at**
+  (#335). `EventStoreRetentionUseCase` proves an artifact stream's tail is
+  `ArtifactPurged` and that the retention floor has elapsed, then calls
+  `delete_stream`, which opened a **new** transaction, re-read the head without
+  `FOR UPDATE`, wrote the `StreamSealed` tombstone to the audit-meta stream and
+  deleted every row of the target stream — without re-checking terminality or
+  the floor at any point. A late `ArtifactExpired` (the retention evaluation
+  appends with `ExpectedVersion::Any` against a candidate it read earlier) had
+  two windows: landing before the seal's head read, a stream that was no longer
+  terminal was deleted under a tombstone that described it perfectly; landing
+  between that read and the `DELETE`, the tombstone recorded the old head while
+  the new event was removed with the rest. ADR 0020 does not cover this — its
+  single-flight serializes seal jobs against each other, not a seal against an
+  append — and no lock could: the append path takes none either, relying on the
+  `(stream_id, stream_position)` unique index that `004_events.sql` calls
+  "Optimistic concurrency". Closed the way #334 closed the same shape one layer
+  up, by pairing the decision with the version that authorizes it:
+  `delete_stream` / `archive_stream` now take a `SealAuthority` — the
+  `stream_position` of the tail the caller's proof read — and answer
+  `SealOutcome::NotAtProvenVersion` instead of removing anything when the
+  stream has moved. The `DELETE` itself carries the condition as a predicate,
+  because a re-check phrased as its own statement cannot see an append that
+  commits before it (read-committed gives every statement a fresh snapshot),
+  and its row count is compared against the count the tombstone claims — the
+  predicate stops the removal, the comparison is what turns the stop into a
+  rolled-back refusal rather than a committed tombstone over an intact stream.
+  The authority is one observation with the verdict it belongs to: the
+  terminal-proof read's own tail row for `TerminalGated`, and the enumeration
+  row's new `last_stream_position` for `AgeGated` categories, which perform no
+  proof read and whose rotated audit streams were open to the same defect from
+  the other end. The refusal is a skip (`skipped_stream_changed`), never an
+  error: nothing failed and nothing was removed, so a late event must not make
+  a healthy sweep read as broken. Deliberately still open and documented at the
+  `seal_and_remove` chokepoint: an append committing *after* the `DELETE`'s
+  snapshot survives as a live event following a `SealedGap`, because no
+  mechanism inside one transaction reaches past its own commit.
+
+- **The purge no longer decides from a page row it read before it started
+  deleting** (#335). The storage-GC sweep reads a page of pending work items
+  and then walks it, and both protection rules — retained scan evidence is
+  never collected, a `KeepLastN` tag target is exempt — were evaluated against
+  that page row. Between the page read and a given item's destructive step lies
+  the complete processing of every item ahead of it, storage deletes included:
+  the longest interval in the sweep, not the shortest. A scan verdict moving an
+  artifact to `rejected` inside that window, or a tag landing on a `KeepLastN`
+  target, was not seen. `purge_artifact_refs` already locked the artifact row
+  (`SELECT … FOR UPDATE`) but read only `checksum_sha256` under it and deleted
+  the `content_references` edges unconditionally — the lock was there, nothing
+  load-bearing was read under it. Worse, the comment at the tag check claimed
+  the fact was re-read "immediately before deleting" and that "the last reader
+  before the destructive step is the one that decides"; neither was true, and a
+  false assurance in a comment is the same defect as one in code with a longer
+  half-life. Closed by reading all four facts in that same `FOR UPDATE`
+  statement — `quarantine_status` against the one shared
+  `gc_protected_quarantine_status_names`, the tag fact through the one shared
+  `ARTIFACT_IS_TAG_TARGETED_SQL` the page query and the evaluator already use,
+  and the two expiry-stream facts through predicates now likewise spelled once
+  — and refusing there: the transaction ends with no `DELETE`, no worklist row
+  and no event, so the work item stays pending and the next sweep re-reads
+  everything. The composite rule is unchanged and now has exactly one author
+  (`PendingPurge::is_gc_protected` / `::is_tag_exempt`, which both readers
+  call). A refusal arrives as its own value on the new `PurgePreparation`
+  outcome rather than as the empty worklist that already meant "there is no
+  such artifact row", and the sweep counts the two readers apart
+  (`skipped_protected_under_lock` / `skipped_tag_exempt_under_lock` beside the
+  existing steady-state counters) because a protection holding inside the
+  sweep's own window is a far rarer signal than a protected artifact being
+  skipped again. The use case's checks over the page row stay, as what they
+  always were: a pre-exit that saves taking the lock. Unchanged by design: once
+  a worklist exists the edges are already gone, so a retry returns it without
+  consulting the facts — declining then would strand a purge that can never
+  finish, and from that point the hash-level claim check protects the bytes.
+
+- **Garbage collection no longer deletes quarantined evidence's bytes through a
+  released sibling** (#335). GC protection was a property of the *artifact* and
+  reclamation a property of the *bytes*, with nothing joining the two.
+  `GC_PROTECTED_QUARANTINE_STATUSES` (`quarantined` / `rejected` /
+  `scan_indeterminate`) is bound at three sites and protected at only two:
+  `list_pending_purge` never offers such an artifact as a purge candidate and
+  the retention candidate reader never expires one — but `refcount_reconcile`
+  deliberately mints it **no** `content_references` edge, precisely so a
+  repaired refcount cannot make a quarantined blob look GC-protected for the
+  wrong reason. Reclamation decides on hashes: `begin_blob_reclaim` counted
+  `content_references` rows for the target hash, so a protected artifact
+  contributed **zero** to the count of its own content. When a released sibling
+  sharing that hash expired, the sweep read `0` under the blob lock, took a
+  `Granted` lease and deleted the shared CAS object. The protected artifact was
+  never a candidate for anything and its bytes were gone — retained scan
+  evidence destroyed with every filter working as written. Closed by asking,
+  under the already-held blob lock and only on the path that would otherwise
+  delete, whether any non-deleted GC-protected artifact claims the hash — as
+  its primary content (`artifacts.checksum_sha256`) **or** as its metadata blob
+  (`artifact_metadata.metadata_blob`, a different table, trimmed the same way
+  `refcount_reconcile` trims it), with the status list bound from the one
+  shared `gc_protected_quarantine_status_names` rather than a second literal.
+  A claim yields the new terminal `BlobReclaim::ProtectedClaim { claimants }`
+  — a *keep*, not a deferral: a `rejected` artifact is permanent, so re-asking
+  would never answer differently and the sibling's purge would never finish.
+  The reconcile exclusion is untouched. `ArtifactPurged.refs_remaining`
+  consequently means **claims on these bytes observed under the lock** —
+  `content_references` rows, or, when there are none, the protected artifacts
+  holding the hash — so `0 ⇒ the blob was deleted` stays true on every path
+  that emits it; no event field was added.
+
 - **A one-hour break-glass credential can no longer compose into a 30-day
   standing full-admin one** (#334). `admin bootstrap-session` is deliberately
   short: it demands operator-level Postgres (DSN) access *and*

@@ -1312,16 +1312,21 @@ mod tests {
             Box::pin(async { Ok(Vec::new()) })
         }
 
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
         }
 
         fn archive_stream(
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
         }
     }
 

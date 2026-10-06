@@ -47,7 +47,8 @@ use hort_domain::ports::curation_queue_repository::{
 };
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
 use hort_domain::ports::event_store::{
-    AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom, SubscribeFrom,
+    AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom, SealAuthority, SealOutcome,
+    SubscribeFrom,
 };
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership, MetadataStrategy};
 use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims, OidcValidationError};
@@ -2547,11 +2548,20 @@ impl EventStore for MockEventStore {
     // Retention stubs: this is the workhorse mock for hort-app tests. No
     // current test reaches the retention paths, so a panic flags
     // accidental misuse rather than silently masking a coverage hole.
-    fn delete_stream(&self, _stream_id: StreamId) -> BoxFut<'_, DomainResult<()>> {
+    fn delete_stream(
+        &self,
+        _stream_id: StreamId,
+        _authority: SealAuthority,
+    ) -> BoxFut<'_, DomainResult<SealOutcome>> {
         Box::pin(async { unimplemented!("retention path not exercised by these tests") })
     }
 
-    fn archive_stream(&self, _stream_id: StreamId, _target: &str) -> BoxFut<'_, DomainResult<()>> {
+    fn archive_stream(
+        &self,
+        _stream_id: StreamId,
+        _target: &str,
+        _authority: SealAuthority,
+    ) -> BoxFut<'_, DomainResult<SealOutcome>> {
         Box::pin(async { unimplemented!("retention path not exercised by these tests") })
     }
 }
@@ -2623,6 +2633,20 @@ pub struct MockArtifactLifecycle {
     /// use this snapshot — the enqueues no longer flow through the `jobs`
     /// mock, they ride the lifecycle call so they commit atomically.
     ingest_enqueues: Mutex<Vec<(Uuid, Vec<IngestEnqueue>)>>,
+    /// Every `(artifact_id, edges)` passed to
+    /// `commit_transition_with_enqueues`, in call order. Tests asserting the
+    /// ingest path committed the right refcount edges use this snapshot —
+    /// the use case no longer calls `ContentReferenceIndex::insert` for them
+    /// itself; they ride the lifecycle call so they commit atomically with
+    /// the artifact.
+    ingest_edges: Mutex<Vec<(Uuid, Vec<ContentReference>)>>,
+    /// Optional handle to the paired [`MockContentReferenceIndex`] so the
+    /// `commit_transition_with_enqueues` override actually applies the edges
+    /// it was handed — mirroring the Postgres adapter, which writes them in
+    /// the same transaction as the artifact. Wired, it also means an armed
+    /// insert failure on that mock fails the commit, which is how the
+    /// app-layer pins assert the whole transition rolls back.
+    content_references: Mutex<Option<Arc<MockContentReferenceIndex>>>,
     /// When `Some`, every commit method checks its `AppendEvents`'
     /// `expected_version` against the paired event store's CURRENT stream
     /// state and returns `DomainError::Conflict` on a mismatch — the
@@ -2657,6 +2681,8 @@ impl MockArtifactLifecycle {
             score_deltas: Mutex::new(Vec::new()),
             sbom_replace_calls: Mutex::new(Vec::new()),
             ingest_enqueues: Mutex::new(Vec::new()),
+            ingest_edges: Mutex::new(Vec::new()),
+            content_references: Mutex::new(None),
             optimistic_concurrency: Mutex::new(None),
             next_error: Mutex::new(std::collections::VecDeque::new()),
         }
@@ -2704,6 +2730,16 @@ impl MockArtifactLifecycle {
     /// stay one expression.
     pub fn with_metadata_repo(self, repo: Arc<MockArtifactMetadataRepository>) -> Self {
         *self.artifact_metadata.lock().unwrap() = Some(repo);
+        self
+    }
+
+    /// Wire the mock lifecycle to a [`MockContentReferenceIndex`] so
+    /// `commit_transition_with_enqueues`' `edges` argument lands in the
+    /// index — matching the real Postgres adapter, which upserts those rows
+    /// in the same transaction as the artifact and rolls the whole
+    /// transition back when one of them fails. Builder-style.
+    pub fn with_content_references(self, refs: Arc<MockContentReferenceIndex>) -> Self {
+        *self.content_references.lock().unwrap() = Some(refs);
         self
     }
 
@@ -2759,6 +2795,36 @@ impl MockArtifactLifecycle {
     /// (these no longer flow through the `jobs` mock).
     pub fn ingest_enqueues(&self) -> Vec<(Uuid, Vec<IngestEnqueue>)> {
         self.ingest_enqueues.lock().unwrap().clone()
+    }
+
+    /// Every `(artifact_id, edges)` passed to
+    /// `commit_transition_with_enqueues`, in call order. Tests assert the
+    /// ingest path committed the right refcount edges atomically with the
+    /// artifact — rather than asserting on the index's contents, which say
+    /// nothing about *which* write put them there.
+    pub fn ingest_edges(&self) -> Vec<(Uuid, Vec<ContentReference>)> {
+        self.ingest_edges.lock().unwrap().clone()
+    }
+
+    /// Flattened `(artifact_id, kind, target_content_hash)` for every
+    /// recorded edge — the shape most assertions want, since the per-edge
+    /// `metadata` is an empty object on every ingest edge and
+    /// `recorded_at` is a wall-clock value no test pins.
+    pub fn ingest_edge_kinds(&self) -> Vec<(Uuid, String, String)> {
+        self.ingest_edges
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|(aid, edges)| {
+                edges.iter().map(move |e| {
+                    (
+                        *aid,
+                        e.kind.clone(),
+                        e.target_content_hash.as_ref().to_owned(),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Flattened `(artifact_id, format, priority, trigger_source)` for every
@@ -2957,16 +3023,26 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
     }
 
     /// Override the lossy default so the mock records the atomic enqueues
-    /// (and still performs the transition work) — mirrors the real Postgres
-    /// adapter committing the `jobs` rows in the same transaction.
+    /// and edges (and still performs the transition work) — mirrors the real
+    /// Postgres adapter committing the `jobs` rows and the
+    /// `content_references` rows in the same transaction.
+    ///
+    /// The edges go through the paired [`MockContentReferenceIndex`] when one
+    /// is wired, **before** anything is recorded and all-or-nothing: that
+    /// mock's armed insert failures therefore fail the whole call and leave
+    /// no transition, no enqueue, no artifact and no earlier edge behind —
+    /// which is the property the adapter gets from the transaction and the
+    /// app-layer pins assert here.
     fn commit_transition_with_enqueues<'a>(
         &'a self,
         artifact: &'a Artifact,
         events: AppendEvents,
         metadata: Option<ArtifactMetadata>,
         enqueues: &'a [IngestEnqueue],
+        edges: &'a [ContentReference],
     ) -> BoxFut<'a, DomainResult<AppendResult>> {
         let recorded = enqueues.to_vec();
+        let recorded_edges = edges.to_vec();
         Box::pin(async move {
             // Failure-injection up front (mirrors `commit_transition`), before
             // recording anything, so a forced error leaves no stray enqueue.
@@ -2974,10 +3050,23 @@ impl ArtifactLifecyclePort for MockArtifactLifecycle {
                 return Err(err);
             }
             self.check_expected_version(&events)?;
+            // The edges first, so a failing one aborts before any of the
+            // transition's other effects are visible. The real adapter
+            // applies them last (the FK needs the artifact row) and gets the
+            // same all-or-nothing from the rollback; the mock has no
+            // rollback, so it orders the fallible part first instead.
+            let paired_refs = self.content_references.lock().unwrap().clone();
+            if let Some(refs) = paired_refs {
+                refs.insert_all_or_nothing(&recorded_edges).await?;
+            }
             self.ingest_enqueues
                 .lock()
                 .unwrap()
                 .push((artifact.id, recorded));
+            self.ingest_edges
+                .lock()
+                .unwrap()
+                .push((artifact.id, recorded_edges));
             let count = events.events.len() as u64;
             if let (Some(meta), Some(repo)) = (
                 metadata.as_ref(),
@@ -5065,20 +5154,37 @@ impl StatefulUploadStagingPort for MockStatefulUploadStagingPort {
 /// target.
 ///
 /// Failure-injection hooks (`fail_next_insert`, `fail_next_insert_for_kind`,
-/// `fail_next_delete`) cover the warn-on-fail arms in
-/// `IngestUseCase`, `QuarantineUseCase`, and `ApplyConfigUseCase`.
-/// Those arms log a `tracing::warn!` and return `Ok(())` from the
-/// outer use case — the projection write is intentionally post-commit
-/// and post-event-append (eventual consistency; the
-/// `RefcountReconcileUseCase` sweep heals drift).
+/// `fail_next_delete`) drive two different postures, and which one a test is
+/// pinning matters:
+///
+/// - **Every mint path aborts.** `ingest_inner` and `register_by_hash_inner`
+///   hand their whole edge set — each artifact's own `primary_content`, the
+///   `metadata_blob` / `wheel_metadata` edges, and the caller-supplied
+///   `claimed_edges` (`oci_subject`, `oci_config`, `oci_layer`,
+///   `oci_index_member`) — to the lifecycle transition, so an armed insert
+///   failure there fails the whole mint and leaves no artifact, no event and
+///   no earlier edge behind. Reached through
+///   [`Self::insert_all_or_nothing`], which is what gives the mock the
+///   rollback the Postgres adapter gets from its transaction. A
+///   `content_references` row is a claim on bytes — the storage GC deletes a
+///   blob exactly when no row targets its hash — so a committed artifact
+///   without its edge is collectable, not merely un-projected.
+/// - **The warn-on-fail arms that remain are DELETES, not inserts**: the
+///   reject-side `delete_by_source` sweeps in `QuarantineUseCase` and
+///   `ApplyConfigUseCase`. Those log a `tracing::warn!` and return `Ok(())`
+///   from the outer use case. No production mint path warns-and-continues on
+///   an insert any more; the only post-commit *inserters* left are the two
+///   backfill handlers, whose job is repairing referrers that committed
+///   edgeless in an earlier release.
+///
 /// The toggles let tests branch-cover the `if let Err(e) = …` arms
 /// without abandoning the happy-path semantics every other test
 /// relies on. The hooks are one-shot: they fire on the next matching
 /// call, then clear themselves. `fail_next_insert_for_kind` is the
 /// version that targets a specific `kind` value — the only way to
-/// reliably exercise the second insert in `ingest_inner` (the
+/// reliably exercise the second edge of `ingest_inner`'s set (the
 /// `metadata_blob` arm) without also failing the preceding
-/// `primary_content` arm.
+/// `primary_content` one.
 pub struct MockContentReferenceIndex {
     entries: Mutex<HashMap<(Uuid, Uuid, String, String), ContentReference>>,
     next_insert_error: Mutex<Option<DomainError>>,
@@ -5118,15 +5224,38 @@ impl MockContentReferenceIndex {
         self.entries.lock().unwrap().len()
     }
 
+    /// Upsert `edges` as **one all-or-nothing** write: on the first failure
+    /// the map is restored to exactly what it held before the call.
+    ///
+    /// The counterpart of the Postgres adapter committing an artifact's
+    /// `content_references` edges inside the artifact's own transaction —
+    /// the rollback is what makes a half-applied edge set unreachable there,
+    /// and a mock that left the earlier edges behind would let an app-layer
+    /// pin assert a state production cannot produce. Used by
+    /// [`MockArtifactLifecycle`]'s `commit_transition_with_enqueues`
+    /// override; the per-edge [`ContentReferenceIndex::insert`] stays as it
+    /// was for the paths that genuinely write one edge at a time.
+    pub async fn insert_all_or_nothing(&self, edges: &[ContentReference]) -> DomainResult<()> {
+        // Cloned, not held: `insert` below takes the same lock.
+        let before = self.entries.lock().unwrap().clone();
+        for edge in edges {
+            if let Err(e) = self.insert(edge.clone()).await {
+                *self.entries.lock().unwrap() = before;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// Arm a one-shot failure on the **next** [`ContentReferenceIndex::insert`]
     /// call regardless of `kind`. The error is consumed by the next call;
     /// subsequent calls succeed unless re-armed. Used by branch-coverage
-    /// tests for the warn-on-fail arms when the path under
-    /// test only issues one insert call (e.g. the inline-strategy
-    /// `ingest_direct` path or `register_by_hash`). For the
-    /// `HashReference`-strategy split path, which issues two insert
-    /// calls in `(primary_content, metadata_blob)` order, prefer
-    /// [`Self::fail_next_insert_for_kind`] to target one arm in
+    /// tests when the path under test commits or writes a single edge (the
+    /// inline-strategy `ingest_direct` path, which carries only
+    /// `primary_content`, or `register_by_hash`). For the
+    /// `HashReference`-strategy split path, whose transition carries
+    /// `(primary_content, metadata_blob)` in that order, prefer
+    /// [`Self::fail_next_insert_for_kind`] to target one edge in
     /// isolation.
     pub fn fail_next_insert(&self, err: DomainError) {
         *self.next_insert_error.lock().unwrap() = Some(err);
@@ -5136,9 +5265,11 @@ impl MockContentReferenceIndex {
     /// [`ContentReferenceIndex::insert`] call **whose `kind` matches**.
     /// Inserts with a different `kind` are unaffected (they pass through
     /// to the happy path). The error is consumed by the next matching
-    /// call. Used by the metadata-blob warn-on-fail branch test to fail
-    /// the second insert call on the HashReference split path while
-    /// letting the preceding `primary_content` insert succeed.
+    /// call. Used by the metadata-blob and wheel-metadata rollback pins to
+    /// fail the second or third edge of `ingest_inner`'s set while letting
+    /// the preceding `primary_content` one through — which is what makes
+    /// those pins about the rollback of an *earlier* edge rather than about
+    /// a single-edge failure.
     pub fn fail_next_insert_for_kind(&self, kind: &str, err: DomainError) {
         *self.next_insert_error_for_kind.lock().unwrap() = Some((kind.to_string(), err));
     }

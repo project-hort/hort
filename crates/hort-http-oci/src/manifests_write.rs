@@ -29,28 +29,51 @@
 //!    `MANIFEST_INVALID`. On a tag PUT
 //!    the computed hash is used to mint the response's `Location`
 //!    header and `Docker-Content-Digest`.
-//! 4. Parse the manifest JSON by media-type shape. A single-image
-//!    manifest yields `config.digest` + `layers[*].digest`; an image
-//!    index / manifest list yields `manifests[*].digest` (child
-//!    **manifest** references). Resolve each referenced blob / child
-//!    through
+//! 4. **Before** the ingest of step 6: parse the manifest JSON by
+//!    media-type shape. A single-image manifest yields `config.digest` +
+//!    `layers[*].digest`; an image index / manifest list yields
+//!    `manifests[*].digest` (child **manifest** references). Resolve
+//!    each referenced blob / child through
 //!    [`ArtifactRepository::find_by_checksum`]; enforce
-//!    `artifact.repository_id == repo` (cross-repo isolation). Any
-//!    missing blob / child returns 400 `MANIFEST_BLOB_UNKNOWN` with a
-//!    `detail.blobs` array. The manifest artifact stays committed so
-//!    the client's retry-after-pushing-blobs path is idempotent; the
-//!    group is NOT created.
-//! 5. Attach the primary `manifest` member to the group, plus (single-
+//!    `artifact.repository_id == repo` (cross-repo isolation).
+//! 5. Build the manifest's content-reference claim set from the resolved
+//!    references — one [`ContentReferenceClaim`] per `oci_config` /
+//!    `oci_layer` / `oci_index_member` edge, plus the `oci_subject`
+//!    claim of step 2 — and hand the set to step 6's ingest so every
+//!    edge commits in the manifest artifact's own transaction.
+//!    Membership claims are built **only** when every reference
+//!    resolved, so an edge can never name a blob this repository does
+//!    not hold.
+//! 6. Ingest the manifest bytes, carrying the claim set.
+//! 7. Any missing blob / child now returns 400 `MANIFEST_BLOB_UNKNOWN`
+//!    with a `detail.blobs` array. Deliberately answered **after** the
+//!    mint: the manifest artifact stays committed so the client's
+//!    retry-after-pushing-blobs path is idempotent; the group is NOT
+//!    created, and the manifest carries no membership claims.
+//! 8. Attach the primary `manifest` member to the group, plus (single-
 //!    image only) config + layers, via
 //!    [`ArtifactGroupUseCase::add_member`]. Shared per-request
 //!    `correlation_id`; every call threads `causation_id =
 //!    Some(manifest_event_id)` — the audit-trail contract.
-//! 6. Tag-reference PUTs call
+//! 9. Tag-reference PUTs call
 //!    [`RefUseCase::set`](hort_app::use_cases::ref_use_case::RefUseCase::set)
 //!    with `RefTarget::ContentHash(manifest_digest)`. Digest-reference
 //!    PUTs skip this step (digest is self-naming).
-//! 7. If the manifest carries `subject.digest`, insert a
-//!    [`ContentReference`] row with `kind = "oci_subject"`.
+//!
+//! **No step records a [`ContentReference`] row after the ingest
+//! returned, and that order is the contract.** A `content_references` row
+//! is a claim on bytes — the storage GC deletes a CAS blob exactly when no
+//! row targets its hash — so an edge written beside its referrer's
+//! transaction rather than inside it is a window in which the manifest is
+//! live and the bytes it claims carry one fewer claim. For `oci_subject`,
+//! `oci_config`, `oci_layer` and `oci_index_member` the target is
+//! *another* artifact's content and nothing repairs the gap afterwards: the
+//! refcount-reconcile sweep derives `primary_content` / `metadata_blob`
+//! from the artifact row, and no relational row records what a manifest
+//! references. The parse and the resolve therefore run ahead of the mint
+//! (both are reads, and both only ever used the manifest's id as a log
+//! field), which is what makes every claim derivable before the
+//! transaction that has to carry it.
 //!
 //! Response: 201 + `Location: /v2/<repo_key>/<name>/manifests/<ref>` +
 //! `Docker-Content-Digest: sha256:<hex>`. Empty body.
@@ -76,7 +99,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 #[cfg(test)]
 use axum::Router;
-use chrono::Utc;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -86,7 +108,7 @@ use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::error::DomainError;
 use hort_domain::events::{Actor, ApiActor};
-use hort_domain::ports::content_reference_index::ContentReference;
+use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::types::{ArtifactCoords, ContentHash};
 use hort_formats::oci::OciFormatHandler;
 
@@ -551,6 +573,17 @@ fn is_pure_signature_manifest(
 /// mismatch. The wire mapping (Conflict -> ManifestInvalid) is preserved.
 /// The signature path surfaces the same `Conflict` shape on a
 /// put-vs-declared mismatch.
+///
+/// `claimed_edges` are the content-reference edges the manifest claims on
+/// bytes it does not own: its `subject.digest`, and — when every declared
+/// reference resolved in this repository — its `oci_config` / `oci_layer` /
+/// `oci_index_member` membership edges. They are handed to the ingest
+/// rather than written after it so they commit in the manifest artifact's
+/// own transaction: a `content_references` row is what keeps the target's
+/// bytes out of the storage GC, and an edge written afterwards is a window
+/// in which the referrer is live and its target collectable. Both ingest
+/// arms take them, so a pure-signature referrer is covered exactly like any
+/// other manifest.
 #[allow(clippy::too_many_arguments)]
 async fn run_manifest_ingest(
     ctx: &AppContext,
@@ -560,6 +593,7 @@ async fn run_manifest_ingest(
     media_type: &str,
     subject_digest_str: Option<String>,
     subject_digest_parsed: &Option<ContentHash>,
+    claimed_edges: &[ContentReferenceClaim],
     hashes: &ManifestHashDecision,
     body_bytes: &[u8],
 ) -> Result<IngestOutcome, Response> {
@@ -600,6 +634,7 @@ async fn run_manifest_ingest(
                 // `Some` here (an `is_pure_signature` manifest carries a
                 // `subject.digest`, gated at `is_pure_signature` above).
                 subject_digest_parsed.clone(),
+                claimed_edges,
                 stream,
             )
             .await
@@ -617,7 +652,7 @@ async fn run_manifest_ingest(
             trust_upstream_publish_time: false,
         };
         ctx.ingest_use_case
-            .ingest_verified(ingest_req, stream, &OciFormatHandler)
+            .ingest_verified(ingest_req, claimed_edges, stream, &OciFormatHandler)
             .await
     };
 
@@ -647,17 +682,24 @@ async fn run_manifest_ingest(
 ///   rejection.
 /// - Single-image manifest: the unchanged `config` + `layers[]` parse.
 ///
-/// On either path a parse failure lands as `MANIFEST_INVALID`; the manifest
-/// artifact is already committed, so the client can retry with a corrected
-/// manifest (or push the blobs/children and retry). The partially-attached
-/// state is permitted to persist. `media_type_is_index` was computed up
-/// front (declared-vs-shape cross-check); reused here to dispatch the
-/// blob/child parse.
+/// On either path a parse failure lands as `MANIFEST_INVALID`.
+/// `media_type_is_index` was computed up front (declared-vs-shape
+/// cross-check); reused here to dispatch the blob/child parse.
+///
+/// **Runs before the mint**, which is why the diagnostic names the body's
+/// computed digest rather than an artifact id: the manifest this body
+/// describes does not exist yet, and a body this parse rejects never
+/// becomes an artifact at all. That is a change from the ordering this
+/// handler used to have — the parse ran after the ingest and a structurally
+/// invalid manifest stayed committed — and it is the price of having the
+/// membership claims in hand before the transaction that must carry them.
+/// The client sees the same 400 `MANIFEST_INVALID` either way; what it no
+/// longer leaves behind is an artifact row for a body hort refused.
 fn parse_referenced_blobs(
     media_type_is_index: bool,
     body_bytes: &[u8],
     parsed_manifest: &serde_json::Value,
-    manifest_artifact_id: Uuid,
+    manifest_digest: &ContentHash,
 ) -> Result<Vec<ReferencedBlob>, Box<Response>> {
     let result = if media_type_is_index {
         parse_index_children(body_bytes)
@@ -666,8 +708,8 @@ fn parse_referenced_blobs(
     };
     result.map_err(|detail| {
         tracing::warn!(
-            manifest_artifact_id = %manifest_artifact_id,
-            "manifest parse failed post-ingest; artifact stays committed for client retry"
+            manifest_digest = %manifest_digest,
+            "manifest parse failed pre-ingest; nothing minted"
         );
         Box::new(
             OciError::ManifestInvalid {
@@ -676,6 +718,39 @@ fn parse_referenced_blobs(
             .into_response(),
         )
     })
+}
+
+/// The outcome of resolving a manifest's declared references against the
+/// repository, as it stands **before** the manifest is minted.
+///
+/// Two outcomes, because the mint happens between them and the claim set
+/// depends on which one it is. [`Self::Complete`] means every declared
+/// reference resolved to an artifact in this repository, so the membership
+/// edges are safe to claim: no claim can name bytes the repository does not
+/// hold. [`Self::Missing`] carries the raw `sha256:<hex>` strings for the
+/// 400 `MANIFEST_BLOB_UNKNOWN` the caller answers **after** the mint — the
+/// manifest still commits (unchanged contract: the client's
+/// retry-after-pushing-the-blobs path is idempotent) and simply carries no
+/// membership claims, which is exactly what the post-ingest insert loop
+/// this replaced also left behind on that path.
+enum ResolvedReferences {
+    /// Boxed because an `Option<Artifact>` dwarfs a `Vec<String>` and
+    /// `clippy::large_enum_variant` is right to object: the
+    /// unknown-blob arm is the one every missing-blob PUT returns, and it
+    /// should not carry an artifact-sized hole. Same reflex as this
+    /// module's `Box<Response>` returns.
+    Complete(Box<ResolvedReferenceSet>),
+    Missing(Vec<String>),
+}
+
+/// The artifacts behind a [`ResolvedReferences::Complete`] resolution: the
+/// config blob (single-image manifests only — an index has none) and the
+/// layer blobs, in manifest order, as `attach_group_members` consumes them.
+/// An index's children are resolved for existence only and so appear in
+/// neither field.
+struct ResolvedReferenceSet {
+    config_artifact: Option<Artifact>,
+    layer_artifacts: Vec<Artifact>,
 }
 
 /// Resolve each referenced blob / child manifest. Cross-repo isolation: a
@@ -687,13 +762,24 @@ fn parse_referenced_blobs(
 /// platform manifests before the index). A single-image manifest has a
 /// resolved `config`; an index carries none — the config is required only
 /// on the single-image path.
+///
+/// `Err` is reserved for the two failures that must abort before anything
+/// is minted: an infrastructure error from the lookup, and the defensive
+/// no-config assertion. A *missing* reference is not an error here — it is
+/// the [`ResolvedReferences::Missing`] outcome, answered after the mint so
+/// the committed-manifest contract is preserved.
+///
+/// This is a pure read — `find_in_repo_by_hash` and nothing else — which is
+/// what makes it runnable ahead of the mint. It used to take the minted
+/// manifest's id and used it only as a log field; the pre-mint diagnostics
+/// name the body's computed digest instead.
 async fn resolve_and_check_referenced_blobs(
     ctx: &AppContext,
     repo_id: Uuid,
     referenced: &[ReferencedBlob],
     media_type_is_index: bool,
-    manifest_artifact_id: Uuid,
-) -> Result<(Option<Artifact>, Vec<Artifact>), Response> {
+    manifest_digest: &ContentHash,
+) -> Result<ResolvedReferences, Response> {
     let (config_artifact, layer_artifacts, missing) =
         resolve_referenced_blobs(ctx, repo_id, referenced)
             .await
@@ -704,13 +790,15 @@ async fn resolve_and_check_referenced_blobs(
     if !missing.is_empty() {
         // The manifest artifact stays committed so a client retry after
         // pushing the missing blobs reconciles cleanly. We do NOT create
-        // the group on this path.
+        // the group on this path, and the mint carries no membership
+        // claims — an edge must never name a blob the repository lacks.
         tracing::info!(
-            manifest_artifact_id = %manifest_artifact_id,
+            manifest_digest = %manifest_digest,
             missing = ?missing,
-            "manifest referenced unknown blobs; group attachment deferred until client retry"
+            "manifest referenced unknown blobs; group attachment and membership claims \
+             deferred until client retry"
         );
-        return Err(OciError::ManifestBlobUnknown { blobs: missing }.into_response());
+        return Ok(ResolvedReferences::Missing(missing));
     }
 
     if !media_type_is_index && config_artifact.is_none() {
@@ -719,25 +807,34 @@ async fn resolve_and_check_referenced_blobs(
         // mark it missing. The current parser rejects missing config, so
         // this branch is an assertion.
         tracing::error!(
-            manifest_artifact_id = %manifest_artifact_id,
+            manifest_digest = %manifest_digest,
             "resolve_referenced_blobs returned None config with empty missing list"
         );
         return Err(OciError::Internal.into_response());
     }
 
-    Ok((config_artifact, layer_artifacts))
+    Ok(ResolvedReferences::Complete(Box::new(
+        ResolvedReferenceSet {
+            config_artifact,
+            layer_artifacts,
+        },
+    )))
 }
 
-/// Identifiers shared by every post-ingest write in the manifest-PUT
-/// pipeline (group attach, ref set, content-reference inserts) — bundled to
-/// avoid repeating the same 8+ argument list across every stage.
+/// Identifiers shared by the post-ingest writes left in the manifest-PUT
+/// pipeline — the group attach and the tag-ref set — bundled to avoid
+/// repeating the same argument list across both stages.
+///
+/// The content-reference inserts used to be in that list and are no longer:
+/// every edge now rides the ingest transition as a
+/// [`ContentReferenceClaim`], which is why nothing here carries a media
+/// type any more (the claim metadata is built before the mint).
 struct ManifestPostIngest<'a> {
     repo_id: Uuid,
     repo_key: &'a str,
     manifest_artifact: &'a Artifact,
     manifest_digest: &'a ContentHash,
     manifest_event_id: Uuid,
-    media_type: &'a str,
     correlation_id: Uuid,
     actor_any: Actor,
     group_coords: ArtifactCoords,
@@ -917,197 +1014,160 @@ async fn set_tag_ref(
     Ok(())
 }
 
-/// Insert the content-reference row if the manifest carries
-/// `subject.digest`. `ContentReferenceIndex::insert` is upsert-on-PK (see
-/// the port docstring) so a client retry with the same manifest simply
-/// refreshes the row — no find_by_target pre-check needed here. The digest
-/// itself was validated up front via `subject_digest_parsed` (N-5 fix); a
-/// `None` here means the manifest had no `subject` field at all.
+/// The content-reference claim the manifest carries when it declares a
+/// `subject.digest`: `kind = "oci_subject"`, target the subject image's
+/// content hash. `None` when the manifest had no `subject` field at all;
+/// the digest itself was validated up front by `validate_subject_digest`.
 ///
-/// This INSERT is a genuine SQL `ON CONFLICT ... DO UPDATE` upsert (see
-/// `pg_content_reference_repo.rs::insert`) — a duplicate can NEVER surface
-/// as `DomainError::Conflict` here; the database absorbs it silently as a
-/// metadata refresh. Any `Err` reaching this call site is therefore a
-/// genuine infrastructure failure (e.g. FK violation, connection loss), not
-/// an idempotency case — never swallow it.
-async fn insert_subject_content_reference(
-    ctx: &AppContext,
-    m: &ManifestPostIngest<'_>,
+/// **A claim, not a row.** The claim rides the manifest's own ingest
+/// transition (see [`run_manifest_ingest`]), so the referrer and the row
+/// that keeps its subject's bytes alive commit together or not at all. It
+/// used to be an `insert_for_repo` issued after the ingest had returned,
+/// which is a window in which the manifest is live, servable through the
+/// Referrers API, and its subject has one fewer claim against the storage
+/// GC — the GC deletes a CAS blob exactly when no `content_references` row
+/// targets its hash. Nothing repairs that afterwards: the refcount-reconcile
+/// sweep derives `primary_content` and `metadata_blob` from the artifact row
+/// and mints no tree edge, because no artifact row records one. The subject
+/// is another artifact's content, so the failure mode is somebody else's
+/// bytes going away.
+///
+/// Idempotency is unchanged and now belongs to the transition: the upsert is
+/// on `(repository_id, source_artifact_id, target_content_hash, kind)`, so a
+/// client retry of the same manifest refreshes the row.
+fn subject_content_reference_claim(
     subject_digest_parsed: &Option<ContentHash>,
+    media_type: &str,
     artifact_type_opt: &Option<String>,
-) -> Result<(), Response> {
-    let Some(subject_hash) = subject_digest_parsed.clone() else {
-        return Ok(());
-    };
-    let reference_row = ContentReference {
-        source_artifact_id: m.manifest_artifact.id,
-        target_content_hash: subject_hash,
-        kind: "oci_subject".into(),
-        metadata: serde_json::json!({
-            "artifact_type": artifact_type_opt,
-            "media_type": m.media_type,
-        }),
-        repository_id: m.repo_id,
-        recorded_at: Utc::now(),
-    };
-    // Write goes through the use case (ADR 0008). The method is no-authz
-    // by contract (caller has already extracted `WriteRepoAccess` for
-    // `repo_id`); the use case carries the explicit `repo_id` argument so
-    // future audits can grep for cross-repo write confusion at the
-    // use-case boundary.
-    if let Err(e) = ctx
-        .content_reference_use_case
-        .insert_for_repo(m.repo_id, reference_row)
-        .await
-    {
-        if let Some(busy) = manifest_write_contention(&e, "content_references_insert") {
-            return Err(busy.into_response());
-        }
-        tracing::error!(
-            manifest_artifact_id = %m.manifest_artifact.id,
-            manifest_digest = %m.manifest_digest,
-            repo_key = %m.repo_key,
-            error = ?e,
-            stage = "content_references_insert",
-            "content_references (oci_subject) insert failed; upsert cannot Conflict — \
-             this is a genuine error, referrers index is eventual — operator rebuild is \
-             future work"
-        );
-        return Err(OciError::Internal.into_response());
-    }
-    Ok(())
+) -> Option<ContentReferenceClaim> {
+    subject_digest_parsed
+        .clone()
+        .map(|subject_hash| ContentReferenceClaim {
+            target_content_hash: subject_hash,
+            kind: "oci_subject".into(),
+            metadata: serde_json::json!({
+                "artifact_type": artifact_type_opt,
+                "media_type": media_type,
+            }),
+        })
 }
 
-/// Manifest→blob membership edges (#46 Item 1). For a single-image
-/// manifest, record one content-reference row per referenced blob:
-/// `source =` the manifest artifact, `target =` the blob's own content
-/// hash, `kind = "oci_config"` (the config blob) / `"oci_layer"` (each
-/// layer blob). An image index has no config/layers — `referenced`
-/// contains only `ChildManifest` entries there, so this loop is a no-op on
-/// that path (its children are covered by `insert_index_member_content_references`).
+/// The manifest→blob / index→child membership claims a manifest body
+/// declares: one [`ContentReferenceClaim`] per referenced blob, with
+/// `kind = "oci_config"` (the config blob), `"oci_layer"` (each layer
+/// blob) or `"oci_index_member"` (each child manifest of an image index /
+/// manifest list). A single-image manifest declares the first two and no
+/// third; an index declares only the third.
 ///
-/// These are GC-ACTIVE keepalive edges, exactly like `oci_subject` /
-/// `oci_index_member`: the purge refcount counts rows of every kind
-/// against a target hash, so a live manifest keeps its config/layer blobs
-/// alive here too. This does not double-count against the
-/// `ArtifactGroupUseCase::add_member` calls in [`attach_group_members`] —
+/// These are GC-ACTIVE keepalive claims, exactly like `oci_subject`: the
+/// purge refcount counts rows of every kind against a target hash, so a
+/// live manifest keeps its config / layer blobs and an index keeps every
+/// child manifest's bytes. This does not double-count against the
+/// [`ArtifactGroupUseCase::add_member`] calls in [`attach_group_members`] —
 /// group membership is an orthogonal, GC-invisible axis (the
 /// purge/refcount sweep never reads `artifact_group_members`). Manifest
 /// DELETE's `delete_by_source` removes every kind for the source, so these
-/// edges are cleaned up exactly like `oci_index_member`; the manifest's
-/// own primary-content edge is then re-derived by the storage-GC sweep
-/// from `artifacts.checksum_sha256` when it collects the manifest bytes.
-async fn insert_blob_content_references(
-    ctx: &AppContext,
-    m: &ManifestPostIngest<'_>,
+/// rows are cleaned up together; the manifest's own primary-content edge is
+/// then re-derived by the storage-GC sweep from `artifacts.checksum_sha256`
+/// when it collects the manifest bytes.
+///
+/// **A claim set, not a row set.** These used to be two post-ingest
+/// `insert_for_repo` loops, which meant a failure left the manifest live
+/// with its constituents holding one fewer claim against the storage GC and
+/// no sweep able to re-derive a tree edge. They now ride the manifest's own
+/// ingest transition. The ordering worry that kept them outside it — that a
+/// claim made before the blob-existence gate could name a blob the
+/// repository does not hold, and so hand the blob's own later ingest a
+/// zero-window quarantine carve-out it did not earn — is answered by
+/// *resolving first and claiming second*: the caller builds this set only
+/// from a [`ResolvedReferences::Complete`] resolution, and the
+/// unknown-blob 400 still answers after the mint, so the committed-manifest
+/// retry contract is untouched. Neither side of that trade-off had to be
+/// paid.
+///
+/// The widened PK `(repository_id, source_artifact_id,
+/// target_content_hash, kind)` (migration 013) lets N targets share one
+/// `(source, kind)` — an index with N children, a manifest with N layers.
+/// A manifest may legally repeat a layer digest, so the set may carry the
+/// same `(target, kind)` twice; the adapter issues one upsert per claim, so
+/// the repeat refreshes rather than tripping the primary key.
+///
+/// [`ArtifactGroupUseCase::add_member`]:
+///     hort_app::use_cases::artifact_group_use_case::ArtifactGroupUseCase::add_member
+pub(crate) fn membership_claims(
     referenced: &[ReferencedBlob],
-) -> Result<(), Response> {
-    for blob in referenced
+    media_type: &str,
+) -> Vec<ContentReferenceClaim> {
+    referenced
         .iter()
-        .filter(|r| r.role == BlobRole::Config || r.role == BlobRole::Layer)
-    {
-        let kind = if blob.role == BlobRole::Config {
-            "oci_config"
-        } else {
-            "oci_layer"
-        };
-        let blob_reference = ContentReference {
-            source_artifact_id: m.manifest_artifact.id,
-            target_content_hash: blob.hash.clone(),
-            kind: kind.into(),
-            metadata: serde_json::json!({
-                "digest": blob.digest_raw,
-                "media_type": m.media_type,
-            }),
-            repository_id: m.repo_id,
-            recorded_at: Utc::now(),
-        };
-        if let Err(e) = ctx
-            .content_reference_use_case
-            .insert_for_repo(m.repo_id, blob_reference)
-            .await
-        {
-            if let Some(busy) = manifest_write_contention(&e, "oci_blob_reference_insert") {
-                return Err(busy.into_response());
-            }
-            tracing::error!(
-                manifest_artifact_id = %m.manifest_artifact.id,
-                manifest_digest = %m.manifest_digest,
-                blob_digest = %blob.digest_raw,
-                kind,
-                repo_key = %m.repo_key,
-                error = ?e,
-                stage = "oci_blob_reference_insert",
-                "blob content_references insert failed; upsert cannot Conflict — this is a \
-                 genuine error, GC alive-keep for this blob is eventual — operator rebuild is \
-                 future work"
-            );
-            return Err(OciError::Internal.into_response());
-        }
-    }
-    Ok(())
+        .map(|blob| match blob.role {
+            BlobRole::ChildManifest => ContentReferenceClaim {
+                target_content_hash: blob.hash.clone(),
+                kind: "oci_index_member".into(),
+                metadata: serde_json::json!({
+                    "child_digest": blob.digest_raw,
+                    "media_type": media_type,
+                }),
+            },
+            BlobRole::Config | BlobRole::Layer => ContentReferenceClaim {
+                target_content_hash: blob.hash.clone(),
+                kind: if blob.role == BlobRole::Config {
+                    "oci_config"
+                } else {
+                    "oci_layer"
+                }
+                .into(),
+                metadata: serde_json::json!({
+                    "digest": blob.digest_raw,
+                    "media_type": media_type,
+                }),
+            },
+        })
+        .collect()
 }
 
-/// Image-index membership edges (D3). For an image index / manifest list,
-/// record one `oci_index_member` content-reference row per child manifest:
-/// `source =` the index artifact, `target =` the child's own content hash,
-/// `kind =` the fixed literal `"oci_index_member"`. This both records the
-/// index→child membership and keeps every child manifest's blob alive
-/// under GC — the purge refcount counts rows of *every* kind against a
-/// target hash (`purge_use_case`), so a live index keeps its children
-/// exactly as a live `oci_subject` referrer keeps its subject.
+/// The complete content-reference claim set the manifest PUT hands to its
+/// ingest: the `oci_subject` claim (when the body declares one) followed by
+/// the membership claims.
 ///
-/// The widened PK `(repository_id, source_artifact_id, target_content_hash,
-/// kind)` (migration 013) lets N children share one `(source = index_id,
-/// kind = "oci_index_member")` — each row is distinguished by its
-/// `target_content_hash`. `source = index` is pinned — the direction the
-/// GC-alive-keep and the index-DELETE sweep both key on. The
-/// `ChildManifest` entries come from `parse_index_children`
-/// (`hort_domain::oci::index_child_digests`); a single-image manifest has
-/// none, so this loop is a no-op there.
-async fn insert_index_member_content_references(
-    ctx: &AppContext,
-    m: &ManifestPostIngest<'_>,
+/// The membership claims are gated on the resolution being
+/// [`ResolvedReferences::Complete`], and that gate is the whole reason this
+/// function exists rather than a bare `extend`. An `oci_config` /
+/// `oci_layer` / `oci_index_member` row is a tree edge that
+/// `hort_app`'s referenced-tree-descendant predicate counts, so a row
+/// naming a blob the repository does not hold would let that blob's own
+/// later ingest see itself already referenced and take the zero-window
+/// quarantine carve-out — an observation window shortened on the strength
+/// of an edge written for content that did not exist. Resolving before the
+/// mint removes the possibility rather than mitigating it: on the
+/// unknown-blob path there is no membership claim to be wrong about.
+///
+/// `oci_subject` is NOT gated the same way, and deliberately: the OCI
+/// Referrers flow lets a referrer be pushed for a subject this repository
+/// has not got, and the handler has always minted that referrer — gating
+/// it would refuse a legitimate push.
+///
+/// What that costs is worth stating, because it is not nothing and the
+/// opposite is easy to assume. `oci_subject` **is** a tree edge on the
+/// descendant predicate: `is_referenced_tree_descendant` counts every
+/// kind outside `{primary_content, metadata_blob}`, `oci_subject`
+/// included. So a referrer for an absent subject does set the zero-window
+/// carve-out for that subject's own later ingest. That is the pre-existing
+/// shape of the Referrers flow and resolving the membership claims before
+/// the mint neither introduces nor repairs it; the two are gated
+/// differently because the push each one refuses is different, not
+/// because one of them is harmless.
+fn manifest_ingest_claims(
+    subject_claim: Option<ContentReferenceClaim>,
+    resolved: &ResolvedReferences,
     referenced: &[ReferencedBlob],
-) -> Result<(), Response> {
-    for child in referenced
-        .iter()
-        .filter(|r| r.role == BlobRole::ChildManifest)
-    {
-        let member_reference = ContentReference {
-            source_artifact_id: m.manifest_artifact.id,
-            target_content_hash: child.hash.clone(),
-            kind: "oci_index_member".into(),
-            metadata: serde_json::json!({
-                "child_digest": child.digest_raw,
-                "media_type": m.media_type,
-            }),
-            repository_id: m.repo_id,
-            recorded_at: Utc::now(),
-        };
-        if let Err(e) = ctx
-            .content_reference_use_case
-            .insert_for_repo(m.repo_id, member_reference)
-            .await
-        {
-            if let Some(busy) = manifest_write_contention(&e, "oci_index_member_insert") {
-                return Err(busy.into_response());
-            }
-            tracing::error!(
-                manifest_artifact_id = %m.manifest_artifact.id,
-                manifest_digest = %m.manifest_digest,
-                child_digest = %child.digest_raw,
-                repo_key = %m.repo_key,
-                error = ?e,
-                stage = "oci_index_member_insert",
-                "index-member content_references insert failed; upsert cannot Conflict — \
-                 this is a genuine error, GC alive-keep for this child is eventual — operator \
-                 rebuild is future work"
-            );
-            return Err(OciError::Internal.into_response());
-        }
+    media_type: &str,
+) -> Vec<ContentReferenceClaim> {
+    let mut claims: Vec<ContentReferenceClaim> = subject_claim.into_iter().collect();
+    if matches!(resolved, ResolvedReferences::Complete(_)) {
+        claims.extend(membership_claims(referenced, media_type));
     }
-    Ok(())
+    claims
 }
 
 /// Entry point for `PUT /v2/:repo_key/*tail`.
@@ -1165,6 +1225,41 @@ async fn put_manifest_dispatch_inner(
 
     let hashes = resolve_manifest_hash(&body_bytes, &reference)?;
 
+    // The subject claim is built from the parsed body, ahead of the mint,
+    // and handed to the ingest: it is a claim on the SUBJECT image's bytes,
+    // and the transaction that makes the referrer live is the only place it
+    // can be recorded without leaving a window in which the subject has one
+    // fewer claim against the storage GC.
+    let subject_claim =
+        subject_content_reference_claim(&subject_digest_parsed, &media_type, &artifact_type_opt);
+
+    // Parse and resolve the declared references BEFORE the mint. Both are
+    // reads over data already in hand (the body, and `find_in_repo_by_hash`)
+    // and both only ever used the manifest's id as a log field, so neither
+    // needs the artifact to exist. Running them here is what puts the
+    // membership claims in the ingest's hands: a `content_references` row is
+    // the claim that keeps bytes alive, and the manifest's own transaction is
+    // the only place to record a claim on somebody else's bytes without
+    // leaving a window in which the manifest is live and those bytes are
+    // collectable.
+    let referenced = parse_referenced_blobs(
+        media_type_is_index,
+        &body_bytes,
+        &parsed_manifest,
+        &hashes.computed_hash,
+    )?;
+    let resolved = resolve_and_check_referenced_blobs(
+        ctx,
+        repo_id,
+        &referenced,
+        media_type_is_index,
+        &hashes.computed_hash,
+    )
+    .await
+    .map_err(Box::new)?;
+
+    let claims = manifest_ingest_claims(subject_claim, &resolved, &referenced, &media_type);
+
     let ingest_outcome = run_manifest_ingest(
         ctx,
         repo_id,
@@ -1173,6 +1268,7 @@ async fn put_manifest_dispatch_inner(
         &media_type,
         subject_digest_str,
         &subject_digest_parsed,
+        &claims,
         &hashes,
         &body_bytes,
     )
@@ -1183,21 +1279,21 @@ async fn put_manifest_dispatch_inner(
     let manifest_event_id = ingest_outcome.ingested_event_id;
     let manifest_digest = hashes.computed_hash.clone();
 
-    let referenced = parse_referenced_blobs(
-        media_type_is_index,
-        &body_bytes,
-        &parsed_manifest,
-        manifest_artifact.id,
-    )?;
-    let (config_artifact, layer_artifacts) = resolve_and_check_referenced_blobs(
-        ctx,
-        repo_id,
-        &referenced,
-        media_type_is_index,
-        manifest_artifact.id,
-    )
-    .await
-    .map_err(Box::new)?;
+    // The unknown-blob answer lands HERE — after the mint — and that is the
+    // unchanged contract, not an oversight: a manifest referencing blobs the
+    // client has not pushed yet stays committed so the retry-after-pushing
+    // path is idempotent. What the reorder above changed is only that such a
+    // manifest now also carries no membership claims, which is what the
+    // post-ingest insert loop this replaced already left behind on this path
+    // (its gate returned before the first insert).
+    let (config_artifact, layer_artifacts) = match resolved {
+        ResolvedReferences::Complete(set) => (set.config_artifact, set.layer_artifacts),
+        ResolvedReferences::Missing(blobs) => {
+            return Err(Box::new(
+                OciError::ManifestBlobUnknown { blobs }.into_response(),
+            ));
+        }
+    };
 
     let post_ingest = ManifestPostIngest {
         repo_id,
@@ -1205,7 +1301,6 @@ async fn put_manifest_dispatch_inner(
         manifest_artifact: &manifest_artifact,
         manifest_digest: &manifest_digest,
         manifest_event_id,
-        media_type: &media_type,
         correlation_id,
         actor_any: Actor::Api(actor.clone()),
         group_coords: oci_group_coords(&name, &manifest_digest),
@@ -1219,21 +1314,6 @@ async fn put_manifest_dispatch_inner(
             .await
             .map_err(Box::new)?;
     }
-
-    insert_subject_content_reference(
-        ctx,
-        &post_ingest,
-        &subject_digest_parsed,
-        &artifact_type_opt,
-    )
-    .await
-    .map_err(Box::new)?;
-    insert_blob_content_references(ctx, &post_ingest, &referenced)
-        .await
-        .map_err(Box::new)?;
-    insert_index_member_content_references(ctx, &post_ingest, &referenced)
-        .await
-        .map_err(Box::new)?;
 
     Ok(created_manifest_response(
         &repo_key,
@@ -1746,20 +1826,22 @@ async fn resolve_referenced_blobs(
     Ok((config, layers, missing))
 }
 
-/// Register-only `content_references` membership-edge write for the
-/// **pull-through** ingest path (#46 Item 4 — the pull-through re-fix).
-/// Parses the just-ingested manifest bytes by media type and writes the
-/// SAME edges the hosted PUT path writes above — `oci_index_member` per
-/// child for an image index, `oci_config` + `oci_layer` per referenced
-/// blob for a single-image manifest — **without fetching** the
-/// referenced children/blobs (register by digest only; #46 Item 1/D3
-/// scope). `source = manifest_artifact_id` (the artifact the pull-through
-/// path just ingested), `target =` each declared child/blob digest.
+/// The `content_references` membership claims a **pull-through** manifest
+/// declares, derived from its body: `oci_index_member` per child for an
+/// image index, `oci_config` + `oci_layer` per referenced blob for a
+/// single-image manifest. `target =` each declared child/blob digest.
 ///
-/// Item 2's `IngestUseCase::is_referenced_descendant` target-check reads
-/// exactly these kinds; before this function existed, a proxy pull-through
-/// never wrote them, so every proxy descendant's target-check always
-/// missed and got the full quarantine window (the bug this closes).
+/// **Register by digest, no existence check — and that is the mechanism,
+/// not an omission.** A proxy descendant's edge is what gives it the
+/// zero-window quarantine carve-out on its own later ingest (ADR 0007,
+/// `referenced_descendant.rs`): the target-check reads exactly these kinds,
+/// and before these edges were written at all, every proxy descendant's
+/// check missed and took the full observation window. The hosted PUT path
+/// gates its claims on in-repo resolution because ADR 0043 makes it
+/// reject an unknown-blob manifest in the same breath; a pull-through
+/// manifest's constituents legitimately are not here yet — the worker
+/// fetches an index's children off the request path — so gating here would
+/// mean never claiming them.
 ///
 /// **The body decides whether this is an index, never the declared media
 /// type.** `media_type` is the upstream's `Content-Type`, which an upstream
@@ -1773,28 +1855,41 @@ async fn resolve_referenced_blobs(
 /// bytes match their digest and only the header lies. A disagreement is
 /// still worth knowing about, so it is logged; it just does not decide.
 ///
-/// **Non-fatal by design.** The manifest is already committed
-/// (`ArtifactIngested` has landed) by the time this runs — a parse or
-/// insert failure here must not fail the pull-through response or undo
-/// the ingest. Mirrors the existing warn-and-continue posture of the
-/// pull-through path's other post-ingest side effects (the leader-side
-/// tag→digest ref write and prefetch trigger in `manifests.rs`) and the
-/// "content_references is eventually authoritative" invariant the
-/// `RefcountReconcileUseCase` sweep already backstops. Idempotent — a
-/// re-pull of the same manifest re-registers the same rows via the
-/// upsert-on-PK `insert_for_repo` contract.
-pub(crate) async fn register_membership_edges_from_pull(
-    ctx: &AppContext,
+/// # Derivation failure is warn-and-continue; an insert failure is not
+///
+/// A parse failure yields **no** claims and does not fail the pull: the
+/// bytes match the digest the upstream declared and the manifest is
+/// legitimately servable, so it is minted with its own `primary_content`
+/// edge and without membership edges — the state
+/// `oci_membership_edge_backfill` exists to repair. The warn is the report
+/// of it. (Mirrors `oci_index_child_ingest::derive_claims`.)
+///
+/// An **insert** failure is a different animal and no longer reachable
+/// here: there is no insert left in this function. The claims this returns
+/// ride the referrer's own ingest transition, so a failed edge fails the
+/// mint and the client's retry of the GET re-runs the whole pull. This was
+/// an `insert_for_repo` loop with a `warn!`-and-continue arm per edge,
+/// which left the manifest committed and servable while a blob it
+/// references carried one fewer claim against the storage GC — and nothing
+/// repairs a tree edge afterwards, because the refcount-reconcile sweep
+/// derives `primary_content` / `metadata_blob` from the artifact row and no
+/// relational row records what a manifest references. A committed manifest
+/// with no claim was not retriable; a failed GET is.
+///
+/// Idempotency is unchanged and now belongs to the transition: the upsert is
+/// on `(repository_id, source_artifact_id, target_content_hash, kind)`, so a
+/// re-pull of the same manifest refreshes the same rows.
+pub(crate) fn pull_membership_claims(
     repo_id: Uuid,
-    manifest_artifact_id: Uuid,
+    manifest_digest: &ContentHash,
     media_type: &str,
     body: &[u8],
-) {
+) -> Vec<ContentReferenceClaim> {
     let body_is_index = hort_domain::oci::is_image_index(body);
     if is_index_media_type(media_type) != body_is_index {
         tracing::warn!(
-            manifest_artifact_id = %manifest_artifact_id,
             %repo_id,
+            manifest_digest = %manifest_digest,
             media_type,
             body_is_index,
             "OCI pull-through: upstream media type disagrees with the manifest body's \
@@ -1806,14 +1901,14 @@ pub(crate) async fn register_membership_edges_from_pull(
             Ok(r) => r,
             Err(detail) => {
                 tracing::warn!(
-                    manifest_artifact_id = %manifest_artifact_id,
                     %repo_id,
+                    manifest_digest = %manifest_digest,
                     media_type,
                     ?detail,
-                    "OCI pull-through: image-index child parse failed; membership edges \
-                     not registered (non-fatal, register-only best-effort)"
+                    "OCI pull-through: image-index child parse failed; manifest minted \
+                     without membership edges"
                 );
-                return;
+                return Vec::new();
             }
         }
     } else {
@@ -1821,77 +1916,33 @@ pub(crate) async fn register_membership_edges_from_pull(
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(
-                    manifest_artifact_id = %manifest_artifact_id,
                     %repo_id,
+                    manifest_digest = %manifest_digest,
                     media_type,
                     error = %e,
-                    "OCI pull-through: manifest body did not parse as JSON; membership \
-                     edges not registered (non-fatal, register-only best-effort)"
+                    "OCI pull-through: manifest body did not parse as JSON; manifest \
+                     minted without membership edges"
                 );
-                return;
+                return Vec::new();
             }
         };
         match parse_manifest_blobs(&parsed) {
             Ok(r) => r,
             Err(detail) => {
                 tracing::warn!(
-                    manifest_artifact_id = %manifest_artifact_id,
                     %repo_id,
+                    manifest_digest = %manifest_digest,
                     media_type,
                     ?detail,
-                    "OCI pull-through: manifest blob parse failed; membership edges not \
-                     registered (non-fatal, register-only best-effort)"
+                    "OCI pull-through: manifest blob parse failed; manifest minted \
+                     without membership edges"
                 );
-                return;
+                return Vec::new();
             }
         }
     };
 
-    for blob in &referenced {
-        let (kind, metadata) = match blob.role {
-            BlobRole::ChildManifest => (
-                "oci_index_member",
-                serde_json::json!({
-                    "child_digest": blob.digest_raw,
-                    "media_type": media_type,
-                }),
-            ),
-            BlobRole::Config | BlobRole::Layer => (
-                if blob.role == BlobRole::Config {
-                    "oci_config"
-                } else {
-                    "oci_layer"
-                },
-                serde_json::json!({
-                    "digest": blob.digest_raw,
-                    "media_type": media_type,
-                }),
-            ),
-        };
-        let reference_row = ContentReference {
-            source_artifact_id: manifest_artifact_id,
-            target_content_hash: blob.hash.clone(),
-            kind: kind.into(),
-            metadata,
-            repository_id: repo_id,
-            recorded_at: Utc::now(),
-        };
-        if let Err(e) = ctx
-            .content_reference_use_case
-            .insert_for_repo(repo_id, reference_row)
-            .await
-        {
-            tracing::warn!(
-                manifest_artifact_id = %manifest_artifact_id,
-                %repo_id,
-                blob_digest = %blob.digest_raw,
-                kind,
-                error = %e,
-                "OCI pull-through: content_references insert failed; membership edge not \
-                 registered (non-fatal, eventual — operator reconcile is future work)"
-            );
-        }
-    }
+    membership_claims(&referenced, media_type)
 }
 
 /// Extract the `Content-Type` header as an owned `String`. Missing or
@@ -1996,7 +2047,7 @@ mod tests {
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
     use hort_domain::events::DomainEvent;
     use hort_domain::ports::artifact_repository::ArtifactRepository;
-    use hort_domain::ports::content_reference_index::ContentReferenceIndex;
+    use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
     use hort_domain::ports::ref_registry::RefRegistryPort;
 
     use hort_http_core::test_support::build_mock_ctx;
@@ -2864,6 +2915,439 @@ mod tests {
         assert_eq!(kind, "oci_subject");
         assert!(artifact_type_ok, "metadata.artifact_type must be present");
         assert!(media_type_ok, "metadata.media_type must be present");
+    }
+
+    /// **The acceptance for the `oci_subject` edge.** A failed subject edge
+    /// takes the whole manifest PUT with it: no manifest artifact, no event
+    /// on its stream, no edge — and a 500, not a 201 over a referrer that
+    /// never recorded its claim.
+    ///
+    /// `oci_subject` targets the SUBJECT image's bytes, so this is not the
+    /// referrer's own bookkeeping going missing — it is somebody else's
+    /// bytes losing a claim. The storage GC deletes a CAS blob exactly when
+    /// no `content_references` row targets its hash, and no sweep
+    /// re-derives a tree edge (the refcount reconcile converges
+    /// `primary_content` / `metadata_blob` from the artifact row, which
+    /// records nothing about what a manifest references). A failed PUT is
+    /// retriable; a committed referrer with no subject row was not
+    /// repairable from the request path at all.
+    #[test]
+    fn put_with_failing_subject_edge_rolls_back_the_manifest() {
+        let (status, subject_rows, manifest_present, event_batches) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"subject-bytes");
+            let body = build_manifest_with_subject(&config_hash, &[], &subject_hash);
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            // Baseline: the two seeded blobs each committed their own
+            // `primary_content` edge through the ingest, so count the
+            // batches already recorded rather than assuming zero.
+            let batches_before = h.events.appended_batches().len();
+
+            h.content_references.fail_next_insert_for_kind(
+                "oci_subject",
+                DomainError::Invariant("simulated oci_subject insert failure".into()),
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+            let status = resp.status();
+
+            let subject_rows = h
+                .content_references
+                .find_by_target(repo_id, &subject_hash, Some("oci_subject"))
+                .await
+                .unwrap()
+                .len();
+            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_present = h
+                .artifacts
+                .find_by_path(repo_id, &manifest_path)
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = h.events.appended_batches().len() - batches_before;
+            (status, subject_rows, manifest_present, event_batches)
+        });
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed claim on the subject's bytes must fail the PUT"
+        );
+        assert_eq!(subject_rows, 0, "no oci_subject row landed");
+        assert!(
+            !manifest_present,
+            "no manifest artifact may survive the rolled-back PUT"
+        );
+        assert_eq!(
+            event_batches, 0,
+            "no event may survive the rolled-back PUT — not even ArtifactIngested"
+        );
+    }
+
+    /// The counter-assertion: on the happy path ONE lifecycle call carries
+    /// the manifest artifact AND its whole claim set — its own content, its
+    /// `oci_subject`, and its `oci_config` membership claim. Without it the
+    /// rollback test above would pass equally against a PUT that recorded no
+    /// edge at all.
+    ///
+    /// The `oci_config` claim riding the same call is the point of the
+    /// membership-edge conversion: this used to be a second write issued
+    /// after the transition returned.
+    #[test]
+    fn put_with_subject_commits_the_edge_with_the_manifest_transition() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"subject-bytes");
+            let body = build_manifest_with_subject(&config_hash, &[], &subject_hash);
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+
+            let manifest = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .await
+                .unwrap()
+                .expect("manifest minted");
+
+            // The manifest's own transition — the last recorded one, after
+            // the two seeded blobs' mints — carries its own content claim,
+            // the subject claim and the config membership claim.
+            let manifest_edges: Vec<(String, String)> = h
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == manifest.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            assert_eq!(
+                manifest_edges,
+                vec![
+                    (
+                        "primary_content".to_string(),
+                        manifest.sha256_checksum.as_ref().to_owned()
+                    ),
+                    ("oci_subject".to_string(), subject_hash.as_ref().to_owned()),
+                    ("oci_config".to_string(), config_hash.as_ref().to_owned()),
+                ],
+                "the manifest's claim on its own bytes, on its subject's and on its \
+                 config blob's, in one call"
+            );
+            let carrying: Vec<_> = h
+                .lifecycle
+                .ingest_edges()
+                .into_iter()
+                .filter(|(id, _)| *id == manifest.id)
+                .collect();
+            assert_eq!(
+                carrying.len(),
+                1,
+                "one transition carries the manifest's whole edge set"
+            );
+        });
+    }
+
+    /// **The acceptance for the single-image membership edges.** A failed
+    /// `oci_layer` claim takes the whole manifest PUT with it: no manifest
+    /// artifact, no event on its stream, and the `oci_config` claim the
+    /// transition had already applied rolled back with it.
+    ///
+    /// These claim the CONFIG and LAYER blobs' bytes — other artifacts'
+    /// content. The storage GC deletes a CAS blob exactly when no
+    /// `content_references` row targets its hash, and no sweep re-derives a
+    /// tree edge (the refcount reconcile converges `primary_content` /
+    /// `metadata_blob` from the artifact row, which records nothing about
+    /// what a manifest references). Before the conversion this was two
+    /// post-ingest insert loops: a failure left a live, servable manifest
+    /// whose layers were collectable and nothing in the request path could
+    /// repair it. A failed PUT is retriable.
+    #[test]
+    fn put_with_failing_layer_edge_rolls_back_the_manifest() {
+        let (status, config_rows, layer_rows, manifest_present, event_batches) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+            let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            // The two seeded blobs each committed their own
+            // `primary_content` edge through the ingest, so count the
+            // batches already recorded rather than assuming zero.
+            let batches_before = h.events.appended_batches().len();
+
+            // Target the LAYER claim, which the transition applies AFTER
+            // the config claim — so this is about the rollback of an
+            // earlier edge, not about a single-edge failure.
+            h.content_references.fail_next_insert_for_kind(
+                "oci_layer",
+                DomainError::Invariant("simulated oci_layer insert failure".into()),
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+            let status = resp.status();
+
+            let config_rows = h
+                .content_references
+                .find_by_target(repo_id, &config_hash, Some("oci_config"))
+                .await
+                .unwrap()
+                .len();
+            let layer_rows = h
+                .content_references
+                .find_by_target(repo_id, &layer_hash, Some("oci_layer"))
+                .await
+                .unwrap()
+                .len();
+            let manifest_present = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = h.events.appended_batches().len() - batches_before;
+            (
+                status,
+                config_rows,
+                layer_rows,
+                manifest_present,
+                event_batches,
+            )
+        });
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed claim on a layer's bytes must fail the PUT"
+        );
+        assert_eq!(layer_rows, 0, "no oci_layer row landed");
+        assert_eq!(
+            config_rows, 0,
+            "the oci_config claim the transition applied first rolled back with it"
+        );
+        assert!(
+            !manifest_present,
+            "no manifest artifact may survive the rolled-back PUT"
+        );
+        assert_eq!(
+            event_batches, 0,
+            "no event may survive the rolled-back PUT — not even ArtifactIngested"
+        );
+    }
+
+    /// **The acceptance for the image-index membership edges.** A failed
+    /// `oci_index_member` claim takes the whole index PUT with it: no index
+    /// artifact, no event on its stream, no row.
+    ///
+    /// An index's claim is on its CHILDREN's bytes, and a live index is the
+    /// only thing keeping them out of the storage GC — the refcount query
+    /// counts rows of every kind against a target hash.
+    #[test]
+    fn put_image_index_with_failing_member_edge_rolls_back_the_index() {
+        let (status, member_rows, index_present, event_batches) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child = seed_blob(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
+            let media = "application/vnd.oci.image.index.v1+json";
+            let body = build_index_json(std::slice::from_ref(&child), media);
+            let index_hex = hex::encode(Sha256::digest(&body));
+
+            let batches_before = h.events.appended_batches().len();
+            h.content_references.fail_next_insert_for_kind(
+                "oci_index_member",
+                DomainError::Invariant("simulated oci_index_member insert failure".into()),
+            );
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(uri, body, media))
+                .await
+                .unwrap();
+            let status = resp.status();
+
+            let member_rows = h
+                .content_references
+                .find_by_target(repo_id, &child, Some("oci_index_member"))
+                .await
+                .unwrap()
+                .len();
+            let index_present = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let event_batches = h.events.appended_batches().len() - batches_before;
+            (status, member_rows, index_present, event_batches)
+        });
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed claim on a child manifest's bytes must fail the PUT"
+        );
+        assert_eq!(member_rows, 0, "no oci_index_member row landed");
+        assert!(
+            !index_present,
+            "no index artifact may survive the rolled-back PUT"
+        );
+        assert_eq!(event_batches, 0, "no event may survive the rolled-back PUT");
+    }
+
+    /// The counter-assertion for the index case: ONE lifecycle call carries
+    /// the index artifact AND an `oci_index_member` claim per declared
+    /// child. Without it the rollback test above would pass equally against
+    /// a PUT that claimed nothing.
+    #[test]
+    fn put_image_index_commits_member_claims_with_the_index_transition() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let child_a = seed_blob(&h.artifacts, &h.storage, repo_id, b"amd64-child-manifest");
+            let child_b = seed_blob(&h.artifacts, &h.storage, repo_id, b"arm64-child-manifest");
+            let media = "application/vnd.oci.image.index.v1+json";
+            let body = build_index_json(&[child_a.clone(), child_b.clone()], media);
+            let index_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(uri, body, media))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+
+            let index = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .await
+                .unwrap()
+                .expect("index minted");
+
+            let index_edges: Vec<(String, String)> = h
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == index.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            assert_eq!(
+                index_edges,
+                vec![
+                    (
+                        "primary_content".to_string(),
+                        index.sha256_checksum.as_ref().to_owned()
+                    ),
+                    ("oci_index_member".to_string(), child_a.as_ref().to_owned()),
+                    ("oci_index_member".to_string(), child_b.as_ref().to_owned()),
+                ],
+                "the index's claim on its own bytes and on both children's, in one call"
+            );
+            let carrying: Vec<_> = h
+                .lifecycle
+                .ingest_edges()
+                .into_iter()
+                .filter(|(id, _)| *id == index.id)
+                .collect();
+            assert_eq!(
+                carrying.len(),
+                1,
+                "one transition carries the index's whole edge set"
+            );
+        });
+    }
+
+    /// The gate that makes claiming-before-resolving safe: a manifest whose
+    /// layer the client has not pushed yet is still minted — unchanged
+    /// contract, the retry-after-pushing path stays idempotent — and it
+    /// carries NO membership claim.
+    ///
+    /// This is the pin on the ordering worry that previously kept these
+    /// edges outside the transition. `oci_config` / `oci_layer` /
+    /// `oci_index_member` are tree-edge kinds that the
+    /// referenced-tree-descendant predicate counts, so a claim naming a
+    /// blob the repository does not hold would hand that blob's own later
+    /// ingest the zero-window quarantine carve-out on the strength of an
+    /// edge written for content that did not exist. Resolving before the
+    /// mint removes the possibility instead of mitigating it: there is no
+    /// membership claim on this path to be wrong about. The `oci_subject`
+    /// claim is deliberately NOT gated this way — a referrer for a subject
+    /// this repository lacks is legitimate OCI Referrers usage and
+    /// `oci_subject` is not on the descendant predicate.
+    #[test]
+    fn put_with_missing_blob_mints_the_manifest_with_no_membership_claims() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            // Never pushed — the layer the client still owes.
+            let missing_hash: ContentHash = hex::encode(Sha256::digest(b"never-pushed-layer"))
+                .parse()
+                .unwrap();
+            let body = build_manifest_json(&config_hash, std::slice::from_ref(&missing_hash));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+            let manifest = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .await
+                .unwrap()
+                .expect("manifest must persist so client retry reconciles");
+
+            let manifest_edges: Vec<(String, String)> = h
+                .lifecycle
+                .ingest_edge_kinds()
+                .into_iter()
+                .filter(|(id, _, _)| *id == manifest.id)
+                .map(|(_, kind, target)| (kind, target))
+                .collect();
+            assert_eq!(
+                manifest_edges,
+                vec![(
+                    "primary_content".to_string(),
+                    manifest.sha256_checksum.as_ref().to_owned()
+                )],
+                "an unknown-blob manifest claims its own bytes and nothing else — no \
+                 oci_config for the blob that DID resolve either, because the resolution \
+                 as a whole was incomplete"
+            );
+            assert_eq!(
+                h.content_references.entry_count(),
+                // The manifest's own `primary_content` row and nothing
+                // else. `seed_blob` inserts the config blob's artifact row
+                // directly, so that blob never ran an ingest and has no row
+                // of its own here.
+                1,
+                "no membership row exists anywhere for an unknown-blob manifest"
+            );
+        });
     }
 
     // ----------------------------------------------------------------
@@ -4127,200 +4611,147 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // #46 Item 4 — `register_membership_edges_from_pull` direct unit tests.
-    // The pull-through call sites (`manifests.rs`) are exercised at the
-    // HTTP level in that module's own test suite; these tests pin the
-    // shared function's own contract (idempotency, fail-safe on a
-    // malformed body) directly, against the lighter-weight `harness()`
-    // used throughout this module.
+    // `pull_membership_claims` direct unit tests. The pull-through call
+    // sites (`manifests.rs`) are exercised at the HTTP level in that
+    // module's own test suite; these tests pin the shared derivation's own
+    // contract (what it derives, the fail-safe on a malformed body, and
+    // that the BODY decides index-versus-image) directly.
+    //
+    // The function this replaced wrote the rows itself, and these tests
+    // read them back out of the mock index. There is nothing to read back
+    // now: the derivation takes no port, no `AppContext` and no artifact
+    // id, so it CANNOT write — the claims it returns are carried into the
+    // referrer's own ingest transition by the caller. "No edge is written
+    // beside the transition here" is therefore a property of the
+    // signature, not an assertion a future change could quietly falsify.
     // ---------------------------------------------------------------------
 
-    /// Calling `register_membership_edges_from_pull` twice with the
-    /// identical inputs (simulating a re-pull of the same manifest)
-    /// upserts, not duplicates — same widened-PK idempotency contract
-    /// the PUT path relies on (`put_single_image_manifest_blob_edges_idempotent_on_repush`
-    /// above).
+    /// Flattened `(kind, target_hex)` for a claim set, in derivation
+    /// order — the shape these assertions want, since the per-claim
+    /// `metadata` is pinned separately below.
+    fn claim_kinds(claims: &[ContentReferenceClaim]) -> Vec<(String, String)> {
+        claims
+            .iter()
+            .map(|c| (c.kind.clone(), c.target_content_hash.as_ref().to_owned()))
+            .collect()
+    }
+
+    /// A single-image body yields exactly one `oci_config` claim and one
+    /// `oci_layer` claim per layer, in manifest order, each targeting the
+    /// blob's own content hash.
     #[test]
-    fn register_membership_edges_from_pull_idempotent_on_repeat_call() {
-        let (config_rows, layer_rows) = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            let config_hash: ContentHash =
-                hex::encode(Sha256::digest(b"pull-config")).parse().unwrap();
-            let layer_hash: ContentHash =
-                hex::encode(Sha256::digest(b"pull-layer")).parse().unwrap();
-            let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
-            let manifest_artifact_id = Uuid::new_v4();
-            let media_type = "application/vnd.oci.image.manifest.v1+json";
+    fn pull_membership_claims_derives_config_and_layer_claims() {
+        let config_hash: ContentHash = hex::encode(Sha256::digest(b"pull-config")).parse().unwrap();
+        let layer_hash: ContentHash = hex::encode(Sha256::digest(b"pull-layer")).parse().unwrap();
+        let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
+        let media_type = "application/vnd.oci.image.manifest.v1+json";
 
-            register_membership_edges_from_pull(
-                &h.ctx,
-                repo_id,
-                manifest_artifact_id,
-                media_type,
-                &body,
-            )
-            .await;
-            // Second call — identical inputs, simulating a re-pull.
-            register_membership_edges_from_pull(
-                &h.ctx,
-                repo_id,
-                manifest_artifact_id,
-                media_type,
-                &body,
-            )
-            .await;
+        let claims =
+            pull_membership_claims(Uuid::new_v4(), &compute_sha256(&body), media_type, &body);
 
-            let config_rows = h
-                .content_references
-                .find_by_target(repo_id, &config_hash, Some("oci_config"))
-                .await
-                .unwrap()
-                .len();
-            let layer_rows = h
-                .content_references
-                .find_by_target(repo_id, &layer_hash, Some("oci_layer"))
-                .await
-                .unwrap()
-                .len();
-            (config_rows, layer_rows)
-        });
         assert_eq!(
-            config_rows, 1,
-            "repeat call must upsert, not duplicate, oci_config"
+            claim_kinds(&claims),
+            vec![
+                ("oci_config".to_string(), config_hash.as_ref().to_owned()),
+                ("oci_layer".to_string(), layer_hash.as_ref().to_owned()),
+            ],
+            "config first, then layers in manifest order"
         );
         assert_eq!(
-            layer_rows, 1,
-            "repeat call must upsert, not duplicate, oci_layer"
+            claims[0].metadata["digest"],
+            format!("sha256:{}", config_hash.as_ref()),
+            "the claim metadata echoes the raw digest form the body declared"
+        );
+        assert_eq!(claims[0].metadata["media_type"], media_type);
+        assert_eq!(
+            claims[1].metadata["digest"],
+            format!("sha256:{}", layer_hash.as_ref())
         );
     }
 
     /// A body that fails to parse — malformed JSON, or a body neither
-    /// `parse_manifest_blobs` nor `parse_index_children` can enumerate — is
-    /// a non-fatal, silent skip: no `content_references` rows are written,
-    /// and the function returns normally (no panic). Register-only is
-    /// best-effort by design — the manifest is already committed by the
-    /// time this runs.
+    /// `parse_manifest_blobs` nor `parse_index_children` can enumerate —
+    /// yields an EMPTY claim set rather than an error. The bytes matched
+    /// the digest the upstream declared, so the manifest is legitimately
+    /// servable and is minted with its own `primary_content` edge and no
+    /// membership edges; refusing the pull over a projection hort cannot
+    /// derive would be the wrong trade. Mirrors
+    /// `oci_index_child_ingest::derive_claims`.
     #[test]
-    fn register_membership_edges_from_pull_malformed_body_is_skipped_non_fatal() {
-        let entry_count = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            let manifest_artifact_id = Uuid::new_v4();
-
-            register_membership_edges_from_pull(
-                &h.ctx,
-                repo_id,
-                manifest_artifact_id,
-                "application/vnd.oci.image.manifest.v1+json",
-                b"this is not json",
-            )
-            .await;
-
-            h.content_references.entry_count()
-        });
-        assert_eq!(
-            entry_count, 0,
-            "a malformed body must write zero edges, not panic or partially write"
+    fn pull_membership_claims_malformed_body_yields_no_claims() {
+        let body = b"this is not json";
+        let claims = pull_membership_claims(
+            Uuid::new_v4(),
+            &compute_sha256(body),
+            "application/vnd.oci.image.manifest.v1+json",
+            body,
+        );
+        assert!(
+            claims.is_empty(),
+            "a malformed body derives nothing, and derives it without failing"
         );
     }
 
     /// An upstream serving a structurally-index body under a SINGLE-IMAGE
-    /// `Content-Type` still gets `oci_index_member` edges: the pull-through
-    /// edge write, the eager child-ingest enqueue and the child-ingest
+    /// `Content-Type` still yields `oci_index_member` claims: the claim
+    /// derivation, the eager child-ingest enqueue and the child-ingest
     /// handler all decide on the body, so the feature has exactly one answer
     /// to index-versus-image. Deciding on the header here would ingest the
-    /// children while never writing the index's membership rows, and digest
+    /// children while never claiming the index's membership, and digest
     /// verification cannot catch that — the bytes match, the header lies.
     #[test]
-    fn register_membership_edges_from_pull_index_body_under_image_media_type_writes_member_edges() {
-        let (member_rows, config_rows) = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            let child: ContentHash = hex::encode(Sha256::digest(b"pull-child")).parse().unwrap();
-            let body = build_index_json(
-                std::slice::from_ref(&child),
-                "application/vnd.oci.image.index.v1+json",
-            );
-            let manifest_artifact_id = Uuid::new_v4();
+    fn pull_membership_claims_index_body_under_image_media_type_yields_member_claims() {
+        let child: ContentHash = hex::encode(Sha256::digest(b"pull-child")).parse().unwrap();
+        let body = build_index_json(
+            std::slice::from_ref(&child),
+            "application/vnd.oci.image.index.v1+json",
+        );
 
-            register_membership_edges_from_pull(
-                &h.ctx,
-                repo_id,
-                manifest_artifact_id,
-                // The lie: an index body announced as a single-image manifest.
-                "application/vnd.oci.image.manifest.v1+json",
-                &body,
-            )
-            .await;
+        let claims = pull_membership_claims(
+            Uuid::new_v4(),
+            &compute_sha256(&body),
+            // The lie: an index body announced as a single-image manifest.
+            "application/vnd.oci.image.manifest.v1+json",
+            &body,
+        );
 
-            let member_rows = h
-                .content_references
-                .find_by_target(repo_id, &child, Some("oci_index_member"))
-                .await
-                .unwrap()
-                .len();
-            (member_rows, h.content_references.entry_count())
-        });
         assert_eq!(
-            member_rows, 1,
-            "the body's shape decides: an index body gets oci_index_member edges whatever \
-             Content-Type the upstream declared"
+            claim_kinds(&claims),
+            vec![("oci_index_member".to_string(), child.as_ref().to_owned())],
+            "the body's shape decides: an index body yields oci_index_member claims \
+             whatever Content-Type the upstream declared, and nothing else — the \
+             single-image parse must not have run"
         );
         assert_eq!(
-            config_rows, 1,
-            "and nothing else — the single-image parse must not have run"
+            claims[0].metadata["child_digest"],
+            format!("sha256:{}", child.as_ref()),
+            "an index member's metadata key is `child_digest`, not `digest`"
         );
     }
 
-    /// The mirror case: a single-image body announced as an index writes the
-    /// `oci_config`/`oci_layer` edges the bytes actually call for, not the
-    /// zero child edges the declared type would have produced.
+    /// The mirror case: a single-image body announced as an index yields the
+    /// `oci_config`/`oci_layer` claims the bytes actually call for, not the
+    /// zero child claims the declared type would have produced.
     #[test]
-    fn register_membership_edges_from_pull_image_body_under_index_media_type_writes_blob_edges() {
-        let (config_rows, layer_rows) = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            let config_hash: ContentHash =
-                hex::encode(Sha256::digest(b"pull-config")).parse().unwrap();
-            let layer_hash: ContentHash =
-                hex::encode(Sha256::digest(b"pull-layer")).parse().unwrap();
-            let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
-            let manifest_artifact_id = Uuid::new_v4();
+    fn pull_membership_claims_image_body_under_index_media_type_yields_blob_claims() {
+        let config_hash: ContentHash = hex::encode(Sha256::digest(b"pull-config")).parse().unwrap();
+        let layer_hash: ContentHash = hex::encode(Sha256::digest(b"pull-layer")).parse().unwrap();
+        let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
 
-            register_membership_edges_from_pull(
-                &h.ctx,
-                repo_id,
-                manifest_artifact_id,
-                "application/vnd.oci.image.index.v1+json",
-                &body,
-            )
-            .await;
+        let claims = pull_membership_claims(
+            Uuid::new_v4(),
+            &compute_sha256(&body),
+            "application/vnd.oci.image.index.v1+json",
+            &body,
+        );
 
-            let config_rows = h
-                .content_references
-                .find_by_target(repo_id, &config_hash, Some("oci_config"))
-                .await
-                .unwrap()
-                .len();
-            let layer_rows = h
-                .content_references
-                .find_by_target(repo_id, &layer_hash, Some("oci_layer"))
-                .await
-                .unwrap()
-                .len();
-            (config_rows, layer_rows)
-        });
-        assert_eq!(config_rows, 1);
-        assert_eq!(layer_rows, 1);
+        assert_eq!(
+            claim_kinds(&claims),
+            vec![
+                ("oci_config".to_string(), config_hash.as_ref().to_owned()),
+                ("oci_layer".to_string(), layer_hash.as_ref().to_owned()),
+            ]
+        );
     }
 
     /// A Docker manifest-list media type routes down the same index path.
@@ -4589,17 +5020,28 @@ mod tests {
     /// An index declaring MORE than the domain cap of children →
     /// `MANIFEST_INVALID` (the domain `index_child_digests` returns
     /// `Validation`; the handler maps it to the same shape the
-    /// single-image over-cap rejection produces). The manifest artifact
-    /// still commits (parse runs post-ingest) but no group is created.
+    /// single-image over-cap rejection produces). No group is created.
+    ///
+    /// **And nothing is minted.** The reference parse moved ahead of the
+    /// ingest — it has to, because the membership claims it produces must
+    /// ride the mint's transaction — so a body this parse rejects no longer
+    /// leaves an artifact row behind. That is a deliberate change from the
+    /// previous ordering, in which the parse ran post-ingest and the
+    /// docstring here recorded the manifest as still committed; the client
+    /// sees the same 400 either way. It does not touch the *unknown-blob*
+    /// contract, which is a resolution outcome rather than a parse failure
+    /// and still mints (see
+    /// `put_with_missing_blob_mints_the_manifest_with_no_membership_claims`).
     #[test]
     fn put_image_index_over_child_cap_returns_400_manifest_invalid() {
         // MAX_INDEX_CHILDREN in hort-domain is 1024; declare 1025 children
         // (synthetic sha256 digests — never resolved, the cap rejects
         // before resolution).
         let over_cap = 1025usize;
-        let (status, body, group_calls) = run(async {
+        let (status, body, group_calls, index_present) = run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
             h.repositories.insert(repo);
             let manifests: Vec<serde_json::Value> = (0..over_cap)
                 .map(|i| {
@@ -4616,6 +5058,7 @@ mod tests {
                 "manifests": manifests,
             });
             let body = serde_json::to_vec(&index).unwrap();
+            let index_hex = hex::encode(Sha256::digest(&body));
 
             let router = router().with_state(h.ctx.clone());
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
@@ -4630,7 +5073,13 @@ mod tests {
             let status = resp.status();
             let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             let group_calls = h.group_lifecycle.commit_call_count();
-            (status, rbody, group_calls)
+            let index_present = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            (status, rbody, group_calls, index_present)
         });
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -4641,6 +5090,11 @@ mod tests {
         assert_eq!(
             group_calls, 0,
             "no group created for an over-cap index (rejected pre-attach)"
+        );
+        assert!(
+            !index_present,
+            "a body the reference parse rejects is not minted: the parse runs ahead of \
+             the ingest so its claims can ride the transition"
         );
     }
 

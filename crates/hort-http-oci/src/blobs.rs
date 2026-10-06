@@ -881,7 +881,15 @@ pub(crate) async fn try_upstream_blob_pull(
             let reader: Box<dyn AsyncRead + Send + Unpin> =
                 Box::new(StreamReader::new(fetch.stream));
             let outcome = blob_ingest
-                .ingest_verified(request, reader, &OciFormatHandler)
+                .ingest_verified(
+                    request,
+                    // A pulled blob claims only its own content; the
+                    // manifest that references it carries the
+                    // `oci_config` / `oci_layer` claims.
+                    &[],
+                    reader,
+                    &OciFormatHandler,
+                )
                 .await?;
             Ok(outcome.artifact.sha256_checksum)
         })
@@ -1015,6 +1023,10 @@ pub(crate) async fn try_upstream_blob_pull(
                         // `None`/immediately-downloadable with no gate at
                         // all.
                         seed_import_quarantine_anchor: None,
+                        // A pulled-through FILE / blob claims only its own
+                        // content; the mint derives that edge itself. Only a
+                        // manifest-shaped follower has foreign bytes to claim.
+                        claimed_edges: Vec::new(),
                     },
                     &OciFormatHandler,
                 )

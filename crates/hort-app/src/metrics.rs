@@ -4059,12 +4059,21 @@ pub fn emit_retention_expired(policy_id: &str, reason: &'static str) {
 /// `result`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetentionPurgedResult {
-    /// Cross-`kind` refcount reached `0` and the CAS blob was deleted
-    /// (or confirmed already-absent — idempotent by design).
+    /// Nothing claimed the hash under the blob lock and the CAS blob
+    /// was deleted (or confirmed already-absent — idempotent by
+    /// design).
     Success,
-    /// A still-live reference (promoted ref / `oci_subject` row) keeps
-    /// the blob alive; only this artifact's reference was removed
+    /// A claim on the hash held under the lock, so the blob is alive;
+    /// only this artifact's reference was removed
     /// (`refs_remaining > 0`). The blob was deliberately NOT deleted.
+    ///
+    /// Covers both kinds of claim: a still-live `content_references`
+    /// row (promoted ref / `oci_subject` row), and — when there is no
+    /// such row — a GC-protected artifact holding the hash without
+    /// one, which the refcount structurally cannot show. They share
+    /// this one `result` value rather than splitting it, because
+    /// raising `result_arity` buys a distinction no alert acts on; the
+    /// `tracing` line at the decision names which claim held.
     BlobKept,
     /// `StoragePort::delete` failed transiently for a refcount-0 blob.
     /// The `ArtifactExpired` decision is NOT lost (no `ArtifactPurged`

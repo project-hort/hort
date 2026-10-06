@@ -4132,8 +4132,8 @@ emit_retention_expired, RetentionEvaluationResult}`;
 
 The two-stage split's second stage: for each `ArtifactExpired` event
 with no following `ArtifactPurged`, the GC walk decrements
-`content_references`, deletes the CAS blob when the cross-`kind`
-refcount hits `0`, and emits `ArtifactPurged`. One
+`content_references`, deletes the CAS blob when nothing claims the hash
+under the blob lock, and emits `ArtifactPurged`. One
 `hort_retention_purged_total` emission per content-hash decision.
 
 **No `policy_id` label on this metric.** Unlike the two evaluation
@@ -4153,14 +4153,25 @@ on this series. Cardinality ceiling is a fixed `result_arity (4)`.
 `result` value semantics (one emission per content-hash purge
 decision; an empty pending set emits nothing):
 
-- `success` — the cross-`kind` `content_references` count for the hash
-  reached `0`, the CAS blob was deleted via `StoragePort::delete`
+- `success` — nothing claimed the hash under the blob lock, the CAS blob
+  was deleted via `StoragePort::delete`
   (idempotent: an already-absent blob is also `success`), and
   `ArtifactPurged{refs_remaining=0}` was appended.
-- `blob_kept` — a still-live reference (a promoted ref, or an OCI
-  `oci_subject` row) keeps the blob alive (`refs_remaining > 0`); only
-  this artifact's reference was removed and the blob was deliberately
-  NOT deleted. `ArtifactPurged{refs_remaining=N}` was appended.
+- `blob_kept` — a claim on the hash held under the lock
+  (`refs_remaining > 0`); only this artifact's reference was removed
+  and the blob was deliberately NOT deleted.
+  `ArtifactPurged{refs_remaining=N}` was appended. Two kinds of claim
+  land on this one value: a still-live `content_references` row (a
+  promoted ref, or an OCI `oci_subject` row), or — when the row count
+  is `0` — a GC-protected artifact (`quarantined` / `rejected` /
+  `scan_indeterminate`) whose primary content or metadata blob is this
+  hash. The second kind has no reference edge to count, by design: the
+  refcount repair mints none for retained evidence, and CAS shares its
+  bytes with every artifact of the same content, so a released
+  sibling's purge would otherwise delete them. The `result` label does
+  not separate the two — that would raise `result_arity` for a
+  distinction no alert acts on; the `tracing` line at the decision
+  names which claim held.
 - `storage_error` — `StoragePort::delete` failed transiently for a
   refcount-0 blob. **The `ArtifactExpired` decision is not lost**: no
   `ArtifactPurged` is emitted, the `content_references` rows are not
@@ -4233,7 +4244,14 @@ decision; an empty candidate set emits nothing):
 - `skipped` — a precondition stopped the seal this pass: the meta-
   stream guard (`StreamId::eventstore_retention()`), a non-terminal
   tail (`TerminalGated`), the retention floor not yet elapsed, an already-
-  sealed empty-read (idempotent re-run), or an unregistered category.
+  sealed empty-read (idempotent re-run), an unregistered category, or the
+  chokepoint refusing because the stream moved past the tail the sweep
+  proved it at (`SealOutcome::NotAtProvenVersion` — an event landed
+  between the proof and the seal; summary field
+  `skipped_stream_changed`). That last one is deliberately a `skipped`
+  and not an `errors` increment: nothing failed and nothing was removed,
+  so a late event on a healthy system must not make the sweep read as
+  broken.
   One emission per skipped candidate regardless of which precondition
   fired — the precise reason is a `tracing` field, never a metric
   label (cardinality hard-block). A per-stream chokepoint failure is

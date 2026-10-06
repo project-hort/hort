@@ -329,10 +329,21 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
                 Box::pin(async { unreachable!("read_category not exercised") })
             }
-            fn delete_stream(&self, _s: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+            fn delete_stream(
+                &self,
+                _s: StreamId,
+                _authority: hort_domain::ports::event_store::SealAuthority,
+            ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>>
+            {
                 Box::pin(async { unreachable!() })
             }
-            fn archive_stream(&self, _s: StreamId, _t: &str) -> BoxFuture<'_, DomainResult<()>> {
+            fn archive_stream(
+                &self,
+                _s: StreamId,
+                _t: &str,
+                _authority: hort_domain::ports::event_store::SealAuthority,
+            ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>>
+            {
                 Box::pin(async { unreachable!() })
             }
         }

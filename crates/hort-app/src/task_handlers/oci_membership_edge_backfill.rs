@@ -14,10 +14,22 @@
 //! streams each manifest from CAS, invokes
 //! [`FormatHandler::extract_oci_manifest_blob_refs`] to re-derive the
 //! `config`/`layers[*]` blob set, and inserts the missing edges —
-//! mirroring the write path's `register_membership_edges_from_pull` one
-//! for one (`hort-http-oci::manifests_write`), which this handler cannot
-//! call directly (ADR 0008 layering — format-crate internals are not
+//! mirroring the write path's `pull_membership_claims` derivation one for
+//! one (`hort-http-oci::manifests_write`), which this handler cannot call
+//! directly (ADR 0008 layering — format-crate internals are not
 //! reachable from `hort-app`).
+//!
+//! **This handler is now the one place that writes a membership edge
+//! AFTER its referrer committed, and it is the exception that proves the
+//! rule.** Every minting path carries its edges into the referrer's own
+//! transaction (see
+//! [`ContentReferenceClaim`](hort_domain::ports::content_reference_index::ContentReferenceClaim)),
+//! because an edge written beside that transaction is a window in which
+//! the referrer is live and the bytes it claims are collectable. A
+//! *repair* handler has no such option by construction: the referrer it
+//! repairs committed long ago, in an earlier release, without the edge.
+//! Writing one afterwards is the whole job. Do not read this handler as
+//! precedent for a new writer on a minting path.
 //!
 //! # Image manifests only
 //!

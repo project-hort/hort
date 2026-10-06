@@ -2718,7 +2718,11 @@ mod tests {
         fn delete_stream(
             &self,
             _stream_id: StreamId,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<hort_domain::ports::event_store::SealOutcome>,
+        > {
             Box::pin(async { unimplemented!("retention path unreachable from policy tests") })
         }
 
@@ -2726,7 +2730,11 @@ mod tests {
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<
+            '_,
+            hort_domain::error::DomainResult<hort_domain::ports::event_store::SealOutcome>,
+        > {
             Box::pin(async { unimplemented!("retention path unreachable from policy tests") })
         }
     }

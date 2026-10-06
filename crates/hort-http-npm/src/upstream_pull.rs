@@ -480,7 +480,14 @@ pub(crate) async fn try_upstream_tarball_pull(
                 trust_upstream_publish_time: blob_trust_publish_time,
             };
             let outcome = blob_ingest
-                .ingest_verified(request, reader, &blob_handler)
+                .ingest_verified(
+                    request,
+                    // A tarball claims only its own content; the
+                    // primary-content edge is derived inside the ingest.
+                    &[],
+                    reader,
+                    &blob_handler,
+                )
                 .await?;
             Ok(outcome.artifact.sha256_checksum)
         })
@@ -592,6 +599,10 @@ pub(crate) async fn try_upstream_tarball_pull(
                         // `ingest_verified`, which only ever gated the
                         // leader's own (possibly different) repo's row.
                         seed_import_quarantine_anchor: None,
+                        // A pulled-through FILE / blob claims only its own
+                        // content; the mint derives that edge itself. Only a
+                        // manifest-shaped follower has foreign bytes to claim.
+                        claimed_edges: Vec::new(),
                     },
                     &NpmFormatHandler,
                 )

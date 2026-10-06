@@ -6,6 +6,7 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
+use hort_domain::ports::content_reference_index::ContentReference;
 use hort_domain::ports::event_store::{AppendEvents, AppendResult};
 use hort_domain::ports::repo_security_score_repository::ScoreDelta;
 use hort_domain::ports::scan_findings_repository::ScanFindingsRow;
@@ -17,6 +18,7 @@ use crate::artifact_repo::PgArtifactRepository;
 use crate::contention::{contention_backoff, with_contention_retry, CONTENTION_RETRY_ATTEMPTS};
 use crate::event_store::PgEventStore;
 use crate::jobs_repository::{enqueue_provenance_verify_in_tx, enqueue_scan_in_tx};
+use crate::pg_content_reference_repo::upsert_edges_in_tx;
 use crate::repo_security_score_repository::apply_delta_in_tx;
 use crate::sbom_components::replace_for_artifact_in_tx;
 use crate::scan_findings_repository::insert_findings_in_tx;
@@ -26,7 +28,10 @@ use crate::scan_findings_repository::insert_findings_in_tx;
 /// Wraps event append + artifact save + artifact-metadata upsert in a
 /// single SQL transaction, eliminating the dual-write hazard. Lock
 /// acquisition order: events → artifacts → artifact_metadata →
-/// repo_security_scores.
+/// repo_security_scores → jobs → blob locks → content_references. Each
+/// method takes the prefix of that order it needs; no method reorders it,
+/// which is what keeps two of them running concurrently from forming a
+/// cycle.
 pub struct PgArtifactLifecycle {
     event_store: Arc<PgEventStore>,
     artifact_repo: Arc<PgArtifactRepository>,
@@ -179,18 +184,29 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
         })
     }
 
-    /// Atomic ingest transition + ingest-time job enqueue.
+    /// Atomic ingest transition + ingest-time job enqueue + the artifact's
+    /// content-reference edges.
     ///
     /// Fulfils the [`ArtifactLifecyclePort::commit_transition_with_enqueues`]
-    /// no-strand guarantee for the Postgres backend by spanning **one** SQL
-    /// transaction: the events, the artifact projection, the optional metadata
-    /// upsert, and every ingest-time `jobs` insert commit-or-roll-back
+    /// no-strand and no-edgeless-artifact guarantees for the Postgres backend
+    /// by spanning **one** SQL transaction: the events, the artifact
+    /// projection, the optional metadata upsert, every ingest-time `jobs`
+    /// insert and every `content_references` edge commit-or-roll-back
     /// together. A `ScanRequested` / provenance-gate event can therefore never
-    /// land without its `jobs` row. Lock order:
-    /// events → artifacts → artifact_metadata → jobs.
+    /// land without its `jobs` row, and an artifact can never land without the
+    /// row that claims its bytes against the storage GC. Lock order:
+    /// events → artifacts → artifact_metadata → jobs → blob locks →
+    /// content_references.
+    ///
+    /// The edges go **last**: `content_references.source_artifact_id`
+    /// references `artifacts(id)`, so the artifact row has to exist first, and
+    /// putting the blob locks after every row this transaction writes means it
+    /// is never holding one of those rows' locks *and* waiting for a blob lock
+    /// — see [`upsert_edges_in_tx`] for the rest of that argument.
     ///
     /// The scan enqueue is idempotent (`enqueue_scan_in_tx` swallows the
-    /// `jobs_scan_unique` conflict); any other insert failure aborts the whole
+    /// `jobs_scan_unique` conflict) and so is the edge upsert (`ON CONFLICT DO
+    /// UPDATE` on the full PK); any other insert failure aborts the whole
     /// transition (the ingest fails and is retriable), never a partial commit.
     ///
     /// ## Contention retry
@@ -221,9 +237,11 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
         events: AppendEvents,
         metadata: Option<ArtifactMetadata>,
         enqueues: &'a [IngestEnqueue],
+        edges: &'a [ContentReference],
     ) -> BoxFuture<'a, DomainResult<AppendResult>> {
         let artifact = artifact.clone();
         let enqueues = enqueues.to_vec();
+        let edges = edges.to_vec();
         Box::pin(async move {
             with_contention_retry(
                 "ingest transition",
@@ -238,6 +256,7 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
                     let artifact = &artifact;
                     let metadata = &metadata;
                     let enqueues = &enqueues;
+                    let edges = &edges;
                     async move {
                         let mut uow = self.event_store.begin_unit_of_work().await?;
 
@@ -279,6 +298,15 @@ impl ArtifactLifecyclePort for PgArtifactLifecycle {
                                 }
                             }
                         }
+
+                        // Last, because `content_references.source_artifact_id`
+                        // references `artifacts(id)` — and because the blob
+                        // locks it takes are then the only locks this
+                        // transaction acquires after the ones it already
+                        // holds, so it never waits on a blob lock while
+                        // holding a row somebody waiting on a blob lock
+                        // wants.
+                        upsert_edges_in_tx(uow.tx(), edges).await?;
 
                         uow.commit().await?;
                         Ok(result)

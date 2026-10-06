@@ -391,6 +391,9 @@ async fn upload(
                 // mapping, so the quarantine-anchor stays `ingested_at`.
                 trust_upstream_publish_time: false,
             },
+            // A distribution file claims only its own content; the
+            // primary-content edge is derived inside the ingest.
+            &[],
             stream,
             // `handler` (instantiated at the top of this function for
             // `normalize_name`) is reused here so the ingest cap check

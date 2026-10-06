@@ -85,7 +85,9 @@ use std::env;
 
 use hort_adapters_postgres::event_store::PgEventStore;
 use hort_domain::events::{system_actor, ArtifactRejected, DomainEvent, RejectionReason, StreamId};
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{
+    AppendEvents, EventStore, EventToAppend, ExpectedVersion, SealAuthority,
+};
 use serial_test::serial;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 use uuid::Uuid;
@@ -533,6 +535,12 @@ async fn bare_hort_retention_role_member_cannot_delete_without_set_role() {
 /// Helper: append one terminal event to a fresh artifact stream via the
 /// real adapter (running as the connecting role — both roles include
 /// hort_app_role so INSERT is permitted).
+/// The seal authority for a stream `seed_stream_via_adapter` produced:
+/// exactly one event, so the tail it proved is position 0.
+const SEEDED_TAIL: SealAuthority = SealAuthority {
+    final_stream_position: 0,
+};
+
 async fn seed_stream_via_adapter(store: &PgEventStore) -> (Uuid, StreamId) {
     let artifact_id = Uuid::new_v4();
     let stream = StreamId::artifact(artifact_id);
@@ -582,7 +590,7 @@ async fn e2e_seal_and_remove_both_memberships_succeeds_and_tombstones() {
     // The real chokepoint: tombstone append (as hort_app_role-equiv) then
     // SET LOCAL ROLE hort_retention_role then DELETE, all in one tx.
     store
-        .delete_stream(stream.clone())
+        .delete_stream(stream.clone(), SEEDED_TAIL)
         .await
         .expect("seal_and_remove must succeed for the both-membership user");
 
@@ -665,7 +673,7 @@ async fn e2e_seal_and_remove_hort_app_role_only_fails_closed_no_rows_no_tombston
 
     // Fail-closed: the SET LOCAL ROLE permission-denied must propagate
     // as Err (caught, not panicked).
-    let result = store.delete_stream(stream.clone()).await;
+    let result = store.delete_stream(stream.clone(), SEEDED_TAIL).await;
     assert!(
         result.is_err(),
         "hort_app_role-only seal MUST fail-closed (SET LOCAL ROLE \

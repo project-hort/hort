@@ -349,7 +349,9 @@ impl ArtifactUseCase {
     /// item — `PurgeUseCase::process_expired` consumes it exactly as it
     /// consumes an `ArtifactExpired`, removing this artifact's
     /// `content_references` source edges and deleting the blob only once
-    /// the cross-`kind` refcount reaches zero. Because the event commits
+    /// nothing claims the hash under the blob lock — no cross-`kind`
+    /// reference row, and no GC-protected artifact holding the hash
+    /// without one. Because the event commits
     /// in the same transaction as `deleted_at`, the retirement and the
     /// work item authorising the byte release cannot come apart.
     ///
@@ -1029,13 +1031,24 @@ impl ArtifactUseCase {
     /// neither, and reusing the latter would also emit its
     /// hold-read-served audit line for a read that served nobody.
     ///
-    /// The caller today is the OCI pull-through's post-coalesce
-    /// membership-edge registration: a coalesced follower that registers
-    /// its own per-repo manifest row from an already-CAS-resident hash
-    /// never held the manifest bytes, yet that row's
-    /// `content_references` edges must exist exactly as the ingesting
-    /// leg's do — so it re-derives them from the authoritative CAS
-    /// content.
+    /// The caller today is the OCI pull-through's coalesced follower: a
+    /// follower that registers its own per-repo manifest row from an
+    /// already-CAS-resident hash never held the manifest bytes, yet that
+    /// row's `content_references` edges must exist exactly as the
+    /// ingesting leg's do — so it re-derives them from the authoritative
+    /// CAS content.
+    ///
+    /// **Keyed on the content hash, not an artifact id**, and that is
+    /// load-bearing rather than a convenience. The edges this read feeds
+    /// are claims on bytes, and a claim has to travel into the transaction
+    /// that mints the claiming row (see
+    /// [`ContentReferenceClaim`](hort_domain::ports::content_reference_index::ContentReferenceClaim)) —
+    /// so the read necessarily happens **before** that row exists and
+    /// there is no id to resolve. The hash is sufficient: these bytes are
+    /// CAS-resident and checksum-verified (ADR 0006) by the leg that
+    /// fetched them, and CAS is keyed on exactly this hash. An
+    /// id-keyed variant could only have been called after the mint, which
+    /// is the ordering the claim exists to avoid.
     ///
     /// `max_bytes` is a hard ceiling the caller sets from its own
     /// format's shape: exceeding it is a `Validation` error, never an
@@ -1046,13 +1059,12 @@ impl ArtifactUseCase {
     #[tracing::instrument(skip(self))]
     pub async fn read_content_for_projection(
         &self,
-        artifact_id: Uuid,
+        content_hash: &ContentHash,
         max_bytes: usize,
     ) -> AppResult<Vec<u8>> {
-        let artifact = self.artifacts.find_by_id(artifact_id).await?;
         let mut stream = self
             .storage
-            .get(&artifact.sha256_checksum)
+            .get(content_hash)
             .await
             .map_err(|e| AppError::Storage(e.to_string()))?;
         let mut buf: Vec<u8> = Vec::new();
@@ -1060,7 +1072,7 @@ impl ArtifactUseCase {
         loop {
             let n = stream.read(&mut chunk).await.map_err(|e| {
                 AppError::Storage(format!(
-                    "projection re-read of artifact {artifact_id} failed mid-stream: {e}"
+                    "projection re-read of CAS blob {content_hash} failed mid-stream: {e}"
                 ))
             })?;
             if n == 0 {
@@ -1068,7 +1080,7 @@ impl ArtifactUseCase {
             }
             if buf.len() + n > max_bytes {
                 return Err(AppError::Domain(DomainError::Validation(format!(
-                    "artifact {artifact_id} content exceeds the {max_bytes}-byte projection \
+                    "CAS blob {content_hash} content exceeds the {max_bytes}-byte projection \
                      re-read ceiling; refusing to buffer it"
                 ))));
             }
@@ -2451,10 +2463,21 @@ mod tests {
             ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
                 Box::pin(async { unreachable!() })
             }
-            fn delete_stream(&self, _s: DStreamId) -> BoxFuture<'_, DomainResult<()>> {
+            fn delete_stream(
+                &self,
+                _s: DStreamId,
+                _authority: hort_domain::ports::event_store::SealAuthority,
+            ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>>
+            {
                 Box::pin(async { unreachable!() })
             }
-            fn archive_stream(&self, _s: DStreamId, _t: &str) -> BoxFuture<'_, DomainResult<()>> {
+            fn archive_stream(
+                &self,
+                _s: DStreamId,
+                _t: &str,
+                _authority: hort_domain::ports::event_store::SealAuthority,
+            ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>>
+            {
                 Box::pin(async { unreachable!() })
             }
         }
@@ -2699,8 +2722,9 @@ mod tests {
     /// hold-read-served audit line, so neither can stand in here.
     #[tokio::test]
     async fn read_content_for_projection_reads_a_quarantined_artifact() {
-        let (uc, id, _) = projection_harness(QuarantineStatus::Quarantined, b"held bytes".to_vec());
-        let bytes = uc.read_content_for_projection(id, 1024).await.unwrap();
+        let (uc, _, hash) =
+            projection_harness(QuarantineStatus::Quarantined, b"held bytes".to_vec());
+        let bytes = uc.read_content_for_projection(&hash, 1024).await.unwrap();
         assert_eq!(bytes, b"held bytes");
     }
 
@@ -2708,8 +2732,8 @@ mod tests {
     /// design, because the caller must work in both states.
     #[tokio::test]
     async fn read_content_for_projection_reads_a_released_artifact() {
-        let (uc, id, _) = projection_harness(QuarantineStatus::Released, b"free bytes".to_vec());
-        let bytes = uc.read_content_for_projection(id, 1024).await.unwrap();
+        let (uc, _, hash) = projection_harness(QuarantineStatus::Released, b"free bytes".to_vec());
+        let bytes = uc.read_content_for_projection(&hash, 1024).await.unwrap();
         assert_eq!(bytes, b"free bytes");
     }
 
@@ -2718,9 +2742,9 @@ mod tests {
     #[tokio::test]
     async fn read_content_for_projection_accumulates_across_chunks() {
         let content = vec![b'x'; PROJECTION_READ_CHUNK_BYTES * 2 + 7];
-        let (uc, id, _) = projection_harness(QuarantineStatus::None, content.clone());
+        let (uc, _, hash) = projection_harness(QuarantineStatus::None, content.clone());
         let bytes = uc
-            .read_content_for_projection(id, content.len())
+            .read_content_for_projection(&hash, content.len())
             .await
             .unwrap();
         assert_eq!(bytes.len(), content.len());
@@ -2733,9 +2757,9 @@ mod tests {
     /// prefix.
     #[tokio::test]
     async fn read_content_for_projection_refuses_content_over_the_ceiling() {
-        let (uc, id, _) = projection_harness(QuarantineStatus::None, vec![b'y'; 4096]);
+        let (uc, _, hash) = projection_harness(QuarantineStatus::None, vec![b'y'; 4096]);
         let err = uc
-            .read_content_for_projection(id, 1024)
+            .read_content_for_projection(&hash, 1024)
             .await
             .expect_err("over-ceiling content must be refused");
         assert!(
@@ -2744,16 +2768,22 @@ mod tests {
         );
     }
 
+    /// A hash CAS does not hold surfaces as a `Storage` error rather than
+    /// empty bytes. The caller derives a projection from what comes back,
+    /// so "nothing is there" and "the document is empty" must not look the
+    /// same — the follower that reads here would otherwise claim no
+    /// membership edges and report nothing wrong.
     #[tokio::test]
-    async fn read_content_for_projection_propagates_a_missing_artifact() {
+    async fn read_content_for_projection_propagates_an_absent_cas_blob() {
         let (uc, _, _) = projection_harness(QuarantineStatus::None, b"unused".to_vec());
+        let absent: ContentHash = "a".repeat(64).parse().unwrap();
         let err = uc
-            .read_content_for_projection(Uuid::new_v4(), 1024)
+            .read_content_for_projection(&absent, 1024)
             .await
-            .expect_err("an unknown artifact id must not resolve");
+            .expect_err("a hash CAS does not hold must not resolve");
         assert!(
-            matches!(err, AppError::Domain(DomainError::NotFound { .. })),
-            "expected NotFound, got: {err}"
+            matches!(err, AppError::Storage(_)),
+            "expected a Storage error, got: {err}"
         );
     }
 
@@ -2766,14 +2796,13 @@ mod tests {
         let repo_id = repo.id;
         repositories.insert(repo);
         let artifact = sample_artifact_in_repo(repo_id);
-        let artifact_id = artifact.id;
         let hash = artifact.sha256_checksum.clone();
         artifacts.insert(artifact);
-        storage.fail_get_persistent(hash);
+        storage.fail_get_persistent(hash.clone());
 
         let uc = ArtifactUseCase::new(artifacts, storage, repositories, true);
         let err = uc
-            .read_content_for_projection(artifact_id, 1024)
+            .read_content_for_projection(&hash, 1024)
             .await
             .expect_err("a CAS open failure must surface");
         assert!(
@@ -2794,17 +2823,16 @@ mod tests {
         let repo_id = repo.id;
         repositories.insert(repo);
         let artifact = sample_artifact_in_repo(repo_id);
-        let id = artifact.id;
         let hash = artifact.sha256_checksum.clone();
         artifacts.insert(artifact);
         storage.insert_content(hash.clone(), b"whole document".to_vec());
         // The mock's truncating reader emits the prefix and then errors
         // — the shape a tampered CAS blob produces.
-        storage.fail_next_get_truncated(hash, b"whole".to_vec());
+        storage.fail_next_get_truncated(hash.clone(), b"whole".to_vec());
 
         let uc = ArtifactUseCase::new(artifacts, storage, repositories, true);
         let err = uc
-            .read_content_for_projection(id, 1024)
+            .read_content_for_projection(&hash, 1024)
             .await
             .expect_err("a mid-stream read failure must surface");
         assert!(

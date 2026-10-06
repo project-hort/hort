@@ -617,7 +617,14 @@ async fn fetch_and_ingest_one(
     };
     match handler_self
         .ingest
-        .ingest_verified(request, reader, handler.as_ref())
+        .ingest_verified(
+            request,
+            // A prefetched artifact claims only its own content; the
+            // primary-content edge is derived inside the ingest.
+            &[],
+            reader,
+            handler.as_ref(),
+        )
         .await
     {
         Ok(_outcome) => {
@@ -1150,7 +1157,14 @@ async fn maven_pull_one(
     };
     match handler_self
         .ingest
-        .ingest_verified(request, reader, handler.as_ref())
+        .ingest_verified(
+            request,
+            // A prefetched artifact claims only its own content; the
+            // primary-content edge is derived inside the ingest.
+            &[],
+            reader,
+            handler.as_ref(),
+        )
         .await
     {
         Ok(_outcome) => {
@@ -1417,7 +1431,14 @@ async fn pypi_per_distribution_fanout(
         };
         match handler_self
             .ingest
-            .ingest_verified(request, reader, handler.as_ref())
+            .ingest_verified(
+                request,
+                // A prefetched artifact claims only its own content; the
+                // primary-content edge is derived inside the ingest.
+                &[],
+                reader,
+                handler.as_ref(),
+            )
             .await
         {
             Ok(_outcome) => {
@@ -2131,13 +2152,20 @@ mod tests {
     ) -> PrefetchIngestHandler {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let events = Arc::new(MockEventStore::new());
-        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let content_refs = Arc::new(MockContentReferenceIndex::new());
+        // Paired so the ingest's refcount edges, which ride
+        // `commit_transition_with_enqueues`, land in the index rather than
+        // being dropped — the Postgres adapter commits them inside the
+        // artifact's own transaction.
+        let lifecycle = Arc::new(
+            MockArtifactLifecycle::new(artifacts.clone())
+                .with_content_references(content_refs.clone()),
+        );
         let storage = Arc::new(MockStoragePort::new());
         let groups = Arc::new(MockArtifactGroupRepository::new());
         let group_lifecycle = Arc::new(MockArtifactGroupLifecyclePort::new(groups.clone()));
         let group_uc = Arc::new(ArtifactGroupUseCase::new(groups, group_lifecycle, true));
         let curation_rules = Arc::new(MockCurationRuleRepository::new());
-        let content_refs = Arc::new(MockContentReferenceIndex::new());
         let policies = Arc::new(MockPolicyProjectionRepository::new());
         let jobs = Arc::new(MockJobsRepository::default());
 

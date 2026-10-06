@@ -924,14 +924,28 @@ pub fn build_mock_ctx_with_label_flag(
     let metadata_mirror = Arc::new(MockMetadataMirror::default());
     let users = Arc::new(MockUserRepository::new());
     let artifact_metadata = Arc::new(MockArtifactMetadataRepository::new());
+    // Hoisted ahead of the lifecycle so the same Arc threads into
+    // `MockArtifactLifecycle::with_content_references` (the ingest's refcount
+    // edges, which commit with the artifact), `IngestUseCase::new` (reads,
+    // plus `register_by_hash`'s own edge) and `ContentReferenceUseCase::new`
+    // (below).
+    let content_references = Arc::new(MockContentReferenceIndex::new());
     // Wire the lifecycle through the metadata repo so a
     // `commit_transition(metadata: Some(_))` call lands in
     // `MockArtifactMetadataRepository` — same as the real Postgres
     // adapter's atomic artifact + metadata write. Without this,
     // pull-through ingest tests that read back the persisted
     // `oci_media_type` see only the no-metadata-row default.
+    //
+    // And through the reference index for the same reason, one table over:
+    // the ingest's `primary_content` / `metadata_blob` / `wheel_metadata`
+    // edges ride `commit_transition_with_enqueues`, so without the wiring
+    // they land nowhere and the read paths see no row — the PEP 658
+    // `.metadata` serve resolves its CAS hash from the `wheel_metadata` row.
     let lifecycle = Arc::new(
-        MockArtifactLifecycle::new(artifacts.clone()).with_metadata_repo(artifact_metadata.clone()),
+        MockArtifactLifecycle::new(artifacts.clone())
+            .with_metadata_repo(artifact_metadata.clone())
+            .with_content_references(content_references.clone()),
     );
 
     let jobs = Arc::new(MockJobsRepository::new());
@@ -972,10 +986,6 @@ pub fn build_mock_ctx_with_label_flag(
         include_repository_label,
     ));
     let curation_rules = Arc::new(MockCurationRuleRepository::new());
-    // Hoisted ahead of IngestUseCase so the same Arc
-    // threads into both `IngestUseCase::new` (refcount writes) and
-    // `ContentReferenceUseCase::new` (below).
-    let content_references = Arc::new(MockContentReferenceIndex::new());
     // Same `policy_projections` Arc threads into
     // both `IngestUseCase::new` (ingest-time scan auto-enqueue) and
     // `QuarantineUseCase::new` below. Hoisted ahead of ingest for the

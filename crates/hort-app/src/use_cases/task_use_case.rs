@@ -605,14 +605,19 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
             panic!("PanicEventStore::read_category must not be called");
         }
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             panic!("PanicEventStore::delete_stream must not be called");
         }
         fn archive_stream(
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
             panic!("PanicEventStore::archive_stream must not be called");
         }
     }
@@ -826,15 +831,20 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Vec<PersistedEvent>>> {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn delete_stream(&self, _stream_id: StreamId) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+        fn delete_stream(
+            &self,
+            _stream_id: StreamId,
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
         }
         fn archive_stream(
             &self,
             _stream_id: StreamId,
             _target: &str,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
+            _authority: hort_domain::ports::event_store::SealAuthority,
+        ) -> BoxFuture<'_, DomainResult<hort_domain::ports::event_store::SealOutcome>> {
+            Box::pin(async { Ok(hort_domain::ports::event_store::SealOutcome::Sealed) })
         }
     }
 
