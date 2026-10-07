@@ -7,690 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Security
-
-- **A failed OCI blob-upload `PATCH` can no longer grow the staging file past
-  the upload cap** (#338). `append_chunk_core` wrote the body to staging and
-  advanced the session record's `bytes_received` afterwards, via
-  `compare_and_swap`. Three exits sat between the two and left the `.part` file
-  longer than the record claimed: a short read on the declared-length path, an
-  over-cap body on the unframed-length path, and — the sharpest — a CAS miss,
-  where two concurrent `PATCH`es had both already appended and only one bumped
-  the record. From then on every further `PATCH` computed the cap against the
-  stale, smaller recorded offset, appended again, saw a physical total it could
-  not explain and returned `500` — having enlarged the file once more. Repeating
-  that drove a single session's staging file arbitrarily far past
-  `HORT_OCI_MAX_UPLOAD_BYTES` while the recorded offset never moved; a writer
-  authorised to push to one repository reached it with two competing `PATCH`es.
-  The finalize-time digest check kept the wrong bytes out of CAS — it does
-  nothing about the disk the session fills, which is a denial-of-service against
-  every tenant sharing the volume.
-  - The fix is at the root the three exits share, not on the three exits. The
-    staging port's own concurrency contract already said the OCI use case
-    "gates every `PATCH` on an optimistic-concurrency check … via
-    `compare_and_swap`" — but the check ran *after* the append, so it gated
-    nothing. The claim now comes first: the use case advances `bytes_received`
-    to the ceiling of the `PATCH`'s byte budget before a byte reaches staging,
-    so the loser of a race is rejected having written nothing and the winner's
-    bytes are the only bytes in the file.
-  - Because the record moves first it is never smaller than the file, which is
-    what takes the physical length out of the authority chain for good: a failed
-    `PATCH` leaves the record over-stating staging, and
-    `StatefulUploadStagingPort::append_at` — which now writes at the caller's
-    asserted offset instead of blindly at the end — refuses the next write as a
-    gap rather than appending on top of it. An unframed body's claim reserves the
-    remaining cap headroom and settles back down to the bytes that landed, so a
-    `Transfer-Encoding: chunked` sequence still appends chunk by chunk.
-  - The over-cap signal also left the file: `append_at` takes a byte budget,
-    stops at it, and reports "the body wanted more" in its return value. The
-    previous form encoded that bit by reading one byte past the cap and letting
-    it land, so an over-cap `PATCH` left staging at `max_bytes + 1`.
-  - Position-checked writing replaces the adapter's `O_APPEND` open mode, whose
-    "every write lands at whatever the current end is" semantics were the
-    mechanism the overrun ran on. It also repairs a staging file left long by
-    the old ordering: the first write at a recorded offset drops the unaccounted
-    tail, which the record never claimed and no finalize could have turned into
-    content.
-
-- **`hort-server admin --output=file:<path>` can no longer write a fresh bearer
-  into a file whose permissions or type it did not set** (#338).
-  `issue-svc-token` and `bootstrap-session` document a 0600 output file and
-  opened the path with `create(true).truncate(true).mode(0o600)`.
-  `OpenOptionsExt::mode` applies only when a file is *created*, so an existing
-  group- or world-readable file at that path kept its own permissions and the
-  plaintext token was written into it, and a symlink at that path was followed
-  to wherever it pointed. Both states are reachable by any local user who can
-  create the path before the mint runs. What leaked is a service-account bearer
-  or a full-cap bootstrap admin PAT; the issuance gates (DSN access,
-  `HORT_TOKEN_ALLOW_ADMIN`) guard the minting, not this sink.
-  - The sink now places the token through an atomic
-    `create_new(true).mode(0o600)` sibling temp file + `rename` over the
-    target, so the secret only ever reaches an inode the process created at
-    0600 and a symlink at the target is **replaced instead of followed**.
-    Re-running against the same path still overwrites — what makes the
-    overwrite safe is the atomic replace, not a refusal to overwrite.
-  - One way, not two: that write form already existed in `hort-cli auth
-    login`, which fixed the identical fault class for `~/.hort/config.toml`.
-    It now lives once, in a new std-only zero-`hort-*`-dependency leaf crate
-    `hort-secret-file` (the shape `hort-attribution` established, ADR 0047 D2 —
-    `hort-cli` carries no `hort-domain`/`hort-app`/`hort-adapters-*`
-    dependency, so a shared helper cannot live in either), and both sinks call
-    it.
-  - The shared writer deliberately does **not** create or `chmod` the target's
-    parent directory, unlike the `~/.hort/` caller that still tightens its own.
-    An operator-named path is not the process's to re-permission: the native
-    deployment's default token location is `/etc/hort/tasks-token`, and
-    `/etc/hort` is kept `root:hort` 0750 so `hort-server.service` can read the
-    env files beside the token — pulling it to 0700 on a mint would break the
-    service. The replaced file is owned by the writing process, so a deployment
-    that needs another owner (the Ansible timers role chowns the token to its
-    run user) still sets it after the write, as it already did.
-
-- **The PyPI simple index no longer interpolates upstream text into the page
-  unescaped** (#338). The PEP 503 HTML builder concatenated five dynamic values
-  into the document and escaped one of them. An upstream serving a
-  `hashes.sha256` shaped `a"></a><a href="https://attacker.example/…` closed the
-  `href`, closed the anchor and opened a second one; a standard parser reads
-  that as another download link, so the **client's** candidate set changes and
-  can point outside Hort's artifact and quarantine path entirely. The same held
-  for an upstream-supplied `filename`, which the builder interpolated twice —
-  into the URL and into the anchor text. Reaching a proxy repository's index was
-  the only prerequisite.
-  - Every interpolated value is now escaped — filename (both positions),
-    package name, base URL, the PEP 658 metadata hash and `requires-python` —
-    so "nothing reaches the output unescaped" is a property a reader confirms
-    from one function rather than from an invariant three crates away.
-  - The upstream hash is additionally closed **by type**: the index-serving
-    `PypiVersionFile::hash_sha256` is now a `ContentHash` rather than a verbatim
-    `Option<String>`, so a value that is not a canonical SHA-256 digest cannot
-    be represented, let alone served. This loses no verification a client could
-    have passed — a non-digest can never match a `hexdigest()` — and an
-    upstream that spells a real digest in uppercase is case-folded rather than
-    dropped. The upstream-checksum verification path (ADR 0006) reads a
-    different struct on the per-version JSON projection and is untouched.
-  - `html_escape_attr` is renamed `html_escape`: the five-character set is a
-    correct superset for element text too, and the `_attr` suffix made its
-    (correct) use on the anchor text read as an oversight. Its inverse in the
-    HTML projector is renamed and widened to match, so a Hort proxying a Hort
-    recovers the upstream's filename instead of re-escaping an already-escaped
-    one — which also fixes that mangling where it reached `files[].url` on the
-    JSON arm.
-
-- **Artifact-lifecycle events no longer bypass repository visibility** (#338).
-  `GET /api/v1/events?category=artifact` and the subscription delivery filter
-  both decided per-event visibility from an `Option<Uuid>` extractor whose
-  `None` meant "no repository, therefore visible". Nineteen artifact-stream
-  event types return no `repository_id` — they name the artifact, because the
-  artifact aggregate owns exactly one repository — so an authenticated account
-  with **no `Read` grant anywhere** could read every repository's scanner
-  names, severity counts, findings-blob hashes, release justifications and
-  operator ids, and an `OwnedByActor` subscription (which needs no read proof
-  to create) delivered the same to an external webhook or NATS target. The
-  same absent value had the opposite effect on an explicit
-  `RepositoryScope::Some([repo])` subscriber, which silently lost that
-  repository's entire lifecycle feed: an allow-list cannot match an event that
-  names no repository. Both directions are closed by one change.
-  - **Resolution, not payload extension.** `EventTypeKind::repository_id` is
-    replaced by `EventTypeKind::disclosed_repositories`, which classifies a
-    payload exhaustively into *global* (no repository association), one or two
-    repository references (carried directly, or named through the artifact /
-    artifact-group aggregate), or *unattributable*. Adding a `repository_id`
-    field to the nineteen event types would have left every already-stored
-    event unprotected and would have altered the canonical bytes of every
-    event written before it (`ChainBreak::HashMismatch`, ADR 0002). The fix
-    therefore applies to the existing store, with no migration.
-  - **One primitive, both call sites.** `hort_app::use_cases::event_visibility`
-    holds the classification, the batch resolution and the fail-closed
-    dispositions; the read handler and the delivery filter consult it and
-    differ only in the gate they then apply. The convention they each
-    implemented locally is gone, not patched.
-  - **One round trip per page, not per event.** A new
-    `EventRepositoryResolver` port resolves a whole page's aggregates in a
-    single statement — joins against unnested-array CTEs, never
-    `= ANY($1::uuid[])`, whose pooled generic plan degrades to a row-by-row
-    scan (1.3 s against 64.2 s on this project's corpus). Resolution is by
-    identity and never filtered on liveness, so a purged artifact's events
-    stay visible to its own repository's readers.
-  - **The promotion chain needs both repositories.** `PromotionRequested` /
-    `ApprovalRequested` / `ArtifactPromoted` / `PromotionRejected` disclose a
-    source and a target and the served payload carries both identities, so
-    `Read` on one of them is not authority to read it.
-  - **Unresolvable is admin-only, not invisible.** `CasIntegrityMismatch` is
-    keyed on a CAS content hash no single repository owns, and an aggregate
-    whose repository was deleted has no row left to resolve; both now require
-    live `Permission::Admin` instead of passing through.
-  - Two tests that pinned the bypass as the intended contract
-    (`non_privileged_category_none_repo_event_unchanged_for_non_admin`,
-    `all_scope_event_without_repo_skips_authz`) are renamed and inverted
-    rather than deleted, so the inversion is visible as one.
-
-- **No path that mints an artifact writes a content-reference edge after the
-  fact any more** (#335). The last three writers — the OCI manifest PUT's
-  `oci_config` / `oci_layer` / `oci_index_member` membership edges, both
-  pull-through leader legs, and the coalesced follower — now carry their edges
-  into the minting transaction as claims. A `content_references` row is what
-  keeps bytes out of the storage GC (it deletes a CAS blob exactly when no row
-  targets its hash), and for a manifest's *tree* edges the target is another
-  artifact's content, which nothing re-derives: the refcount-reconcile sweep
-  converges `primary_content` / `metadata_blob` from the artifact row, and no
-  relational row records what a manifest references. Every one of these was
-  `warn!`-and-continue, so a failure served a live, servable manifest whose
-  config, layers or children had one fewer claim.
-  - **The manifest PUT** resolves its declared references **before** the mint
-    and builds the membership claims only from a complete resolution. That
-    answers the ordering question in full rather than trading one risk for
-    another: an edge can never name a blob the repository does not hold (those
-    kinds feed the referenced-tree-descendant predicate, so one that did would
-    hand the blob's own later ingest a zero-window quarantine carve-out it did
-    not earn), and the unknown-blob 400 still answers *after* the mint, so a
-    manifest referencing blobs the client has not pushed yet stays committed
-    for the retry exactly as ADR 0043 requires — it simply claims nothing.
-  - **The two pull-through leader legs** read the cached manifest body once,
-    into memory, **before** the ingest instead of re-reading the tempfile
-    after it, derive the claims from that copy and hand them to
-    `ingest_verified`. The eager child-ingest enqueue and the prefetch trigger
-    read the same copy and stay post-commit — they are `jobs` rows and
-    scheduling hints, not claims on bytes.
-  - **The coalesced follower** reads the manifest out of CAS before minting
-    its own per-repo row, keyed on the content hash rather than on an artifact
-    id it does not have yet, and passes the claims on
-    `RegisterExistingCasBlobRequest`.
-  - Pull-through deliberately keeps claiming **by digest with no existence
-    check**: that edge is the mechanism behind the zero-window anchor for a
-    proxy descendant (ADR 0007), and a proxied constituent legitimately is not
-    present yet. Only the atomicity changed, not when an edge is written.
-  - One **observable change on an error path**: a manifest body whose
-    reference parse fails (a malformed `config.digest`, an over-cap index) is
-    no longer minted. The parse has to precede the mint for its claims to ride
-    the transaction, and the client sees the same 400 `MANIFEST_INVALID`
-    either way — what it no longer leaves behind is an artifact row for a body
-    hort refused. The *unknown-blob* contract is untouched.
-  Evidence per site is the rollback: an injected insert failure asserting that
-  neither the referrer nor its events survive, each paired with a success pin
-  showing one lifecycle call carries the referrer and its whole edge set. The
-  two backfill handlers are now the only production callers that insert an edge
-  after its referrer committed, which is their purpose — they repair referrers
-  that committed edgeless in an earlier release. No backfill, no migration, no
-  repair of existing edgeless rows.
-
-- **The three remaining content-reference writers now commit their edge in the
-  transaction that makes the claiming artifact live** (#335), completing the
-  work the ingest-mint path started. A `content_references` row is not a
-  projection that may lag: the storage GC deletes a CAS blob exactly when no
-  row targets its hash, so an edge written after its referrer committed is a
-  window in which the claim does not exist and the bytes are collectable, with
-  the referrer already live and unable to re-assert it.
-  - `register_by_hash_inner` (the OCI cross-repo blob mount, the coalesced
-    pull-through follower, and the seed-import cutover) wrote its
-    `primary_content` edge after a plain `commit_transition`, warn-and-continue
-    on failure. It mints a per-repo row over a CAS blob the source
-    repository's artifact already holds, so without that edge the new artifact
-    counted **zero** against bytes CAS shares with the source: release and
-    purge that sibling and the count reached zero with the new row still live
-    and servable. The genesis commit now carries the edge.
-  - The OCI manifest PUT's `oci_subject` edge is derived from the parsed body
-    before the mint and handed to the ingest as a claim, so the referrer and
-    the row that keeps its subject's bytes alive commit together. This one is
-    sharper than `primary_content`: the target is **another** artifact's
-    content, and the refcount-reconcile sweep cannot repair it — it converges
-    `primary_content` / `metadata_blob` from the artifact row, and no
-    relational row records what a manifest references.
-  - The eager index-child ingest (`oci-index-child-ingest`) derived its
-    `oci_config` / `oci_layer` / `oci_index_member` edges after the child
-    manifest was committed and inserted them one at a time, non-fatally. The
-    derivation moved ahead of the ingest — it only ever needed the fetched body
-    and the digest the ingest is keyed on — and the edges now ride the child's
-    transition. The handler no longer holds a content-reference port at all, so
-    there is nothing there that could write one afterwards. A failed edge fails
-    the unit; the `jobs` row is retried, where a committed manifest with a
-    missing claim was only repairable by re-reading manifest bodies out of CAS.
-  - `ingest_signature_manifest` also gains the `primary_content` edge it never
-    wrote: a pushed cosign signature manifest commits status-`None`, outside
-    the scan/quarantine lifecycle and therefore outside the GC's
-    protected-evidence rule, so its own bytes counted zero against themselves
-    until the next reconcile sweep converged them.
-  - A fourth writer the sweep for this change turned up: the provenance
-    orchestrator's upstream-referrer landing
-    (`ProvenanceOrchestrationUseCase::commit_referrer_manifest`, the inlined
-    twin of the primitive above) likewise minted its referrer manifest with no
-    edge at all and inserted the `oci_subject` row afterwards. Both now ride
-    its transition. It had no obstacle of its own, and leaving the inlined
-    copy unconverted while converting the primitive it mirrors is exactly the
-    drift this audit keeps finding.
-  Evidence is the rollback, not the end state: per edge, a test injects an
-  insert failure and asserts that **neither** the referrer **nor** its events
-  survive, each paired with a success pin showing one lifecycle call carries
-  both. No backfill, no migration, no repair of existing edgeless rows; the
-  refcount reconcile and its in-process gate are untouched. **Still open and
-  carrying the same hazard**: the OCI manifest PUT's membership edges
-  (`oci_config` / `oci_layer` / `oci_index_member`) and the pull-through leg's
-  post-ingest registration of the same. The manifest-PUT pair is blocked on a
-  decision, not on mechanism: claiming those edges before the manifest's
-  blob-existence gate would let an edge name a blob the repository does not
-  hold, and those kinds feed the referenced-tree-descendant predicate, so the
-  blob's own later ingest would take the zero-window quarantine carve-out —
-  while moving the gate ahead of the mint reverses the deliberate contract that
-  an unknown-blob manifest stays committed for the client's retry. Both
-  functions now document that trade-off in place.
-
-- **An ingested artifact's claim on its own bytes now commits in the same
-  transaction as the artifact** (#335). The storage GC deletes a CAS blob
-  exactly when no `content_references` row targets its hash, so the
-  `primary_content` edge is not a projection that may lag — it is the claim
-  that keeps the bytes alive. The ingest committed the artifact and wrote the
-  edge **afterwards**, in a step allowed to fail without failing the ingest,
-  and the comment over `write_ingest_refcounts` justified that with a claim
-  that reads backwards: "a missing refcount row only delays GC, it doesn't
-  break correctness". It delays nothing. The artifact counted **zero** against
-  its own content, and because CAS deduplicates, a released sibling carrying
-  the same bytes drove the observed count to zero — leaving a live, servable
-  artifact pointing at bytes the sweep was authorised to delete. The bracket
-  already existed: `commit_transition_with_enqueues` was writing four things
-  atomically (events, artifact row, metadata, job-queue rows) behind the port
-  boundary, with the edge standing just outside it. All three ingest-mint
-  edges now ride it — `primary_content`, `metadata_blob`, and the PEP 658
-  `wheel_metadata`, whose extraction moved **ahead** of the commit because it
-  only ever needed the bytes the primary `storage.put` had already placed in
-  CAS, so its edge belongs in the transition that creates the artifact
-  claiming them rather than in a second one. A failed edge now fails the
-  ingest: the upload is retriable, an edgeless committed artifact is not. The
-  edge upsert is idempotent on the full primary key, which is what keeps the
-  adapter's existing contention retry re-runnable, and the blob-reclamation
-  locks for a transition's several targets are taken up front in one total
-  order, so two overlapping ingests sharing targets cannot each hold the
-  other's next lock. No backfill and no migration: existing edgeless rows stay
-  the operator reconcile's business, and the reconcile and its in-process gate
-  are untouched. **Still open, deliberately out of this change**:
-  `register_by_hash_inner`'s own `primary_content` edge (the OCI cross-repo
-  mount and pull-dedup follower path) and the two OCI manifest-write edges
-  (`oci_subject`, `oci_index_member`) still write beside their transitions and
-  carry the same hazard. The `register_by_hash_inner` comment, which deferred
-  to the inverted rationale above, now states the hazard instead, so nothing
-  in the tree claims a missing edge merely postpones collection.
-
-- **An event-stream seal now carries the version its own proof was read at**
-  (#335). `EventStoreRetentionUseCase` proves an artifact stream's tail is
-  `ArtifactPurged` and that the retention floor has elapsed, then calls
-  `delete_stream`, which opened a **new** transaction, re-read the head without
-  `FOR UPDATE`, wrote the `StreamSealed` tombstone to the audit-meta stream and
-  deleted every row of the target stream — without re-checking terminality or
-  the floor at any point. A late `ArtifactExpired` (the retention evaluation
-  appends with `ExpectedVersion::Any` against a candidate it read earlier) had
-  two windows: landing before the seal's head read, a stream that was no longer
-  terminal was deleted under a tombstone that described it perfectly; landing
-  between that read and the `DELETE`, the tombstone recorded the old head while
-  the new event was removed with the rest. ADR 0020 does not cover this — its
-  single-flight serializes seal jobs against each other, not a seal against an
-  append — and no lock could: the append path takes none either, relying on the
-  `(stream_id, stream_position)` unique index that `004_events.sql` calls
-  "Optimistic concurrency". Closed the way #334 closed the same shape one layer
-  up, by pairing the decision with the version that authorizes it:
-  `delete_stream` / `archive_stream` now take a `SealAuthority` — the
-  `stream_position` of the tail the caller's proof read — and answer
-  `SealOutcome::NotAtProvenVersion` instead of removing anything when the
-  stream has moved. The `DELETE` itself carries the condition as a predicate,
-  because a re-check phrased as its own statement cannot see an append that
-  commits before it (read-committed gives every statement a fresh snapshot),
-  and its row count is compared against the count the tombstone claims — the
-  predicate stops the removal, the comparison is what turns the stop into a
-  rolled-back refusal rather than a committed tombstone over an intact stream.
-  The authority is one observation with the verdict it belongs to: the
-  terminal-proof read's own tail row for `TerminalGated`, and the enumeration
-  row's new `last_stream_position` for `AgeGated` categories, which perform no
-  proof read and whose rotated audit streams were open to the same defect from
-  the other end. The refusal is a skip (`skipped_stream_changed`), never an
-  error: nothing failed and nothing was removed, so a late event must not make
-  a healthy sweep read as broken. Deliberately still open and documented at the
-  `seal_and_remove` chokepoint: an append committing *after* the `DELETE`'s
-  snapshot survives as a live event following a `SealedGap`, because no
-  mechanism inside one transaction reaches past its own commit.
-
-- **The purge no longer decides from a page row it read before it started
-  deleting** (#335). The storage-GC sweep reads a page of pending work items
-  and then walks it, and both protection rules — retained scan evidence is
-  never collected, a `KeepLastN` tag target is exempt — were evaluated against
-  that page row. Between the page read and a given item's destructive step lies
-  the complete processing of every item ahead of it, storage deletes included:
-  the longest interval in the sweep, not the shortest. A scan verdict moving an
-  artifact to `rejected` inside that window, or a tag landing on a `KeepLastN`
-  target, was not seen. `purge_artifact_refs` already locked the artifact row
-  (`SELECT … FOR UPDATE`) but read only `checksum_sha256` under it and deleted
-  the `content_references` edges unconditionally — the lock was there, nothing
-  load-bearing was read under it. Worse, the comment at the tag check claimed
-  the fact was re-read "immediately before deleting" and that "the last reader
-  before the destructive step is the one that decides"; neither was true, and a
-  false assurance in a comment is the same defect as one in code with a longer
-  half-life. Closed by reading all four facts in that same `FOR UPDATE`
-  statement — `quarantine_status` against the one shared
-  `gc_protected_quarantine_status_names`, the tag fact through the one shared
-  `ARTIFACT_IS_TAG_TARGETED_SQL` the page query and the evaluator already use,
-  and the two expiry-stream facts through predicates now likewise spelled once
-  — and refusing there: the transaction ends with no `DELETE`, no worklist row
-  and no event, so the work item stays pending and the next sweep re-reads
-  everything. The composite rule is unchanged and now has exactly one author
-  (`PendingPurge::is_gc_protected` / `::is_tag_exempt`, which both readers
-  call). A refusal arrives as its own value on the new `PurgePreparation`
-  outcome rather than as the empty worklist that already meant "there is no
-  such artifact row", and the sweep counts the two readers apart
-  (`skipped_protected_under_lock` / `skipped_tag_exempt_under_lock` beside the
-  existing steady-state counters) because a protection holding inside the
-  sweep's own window is a far rarer signal than a protected artifact being
-  skipped again. The use case's checks over the page row stay, as what they
-  always were: a pre-exit that saves taking the lock. Unchanged by design: once
-  a worklist exists the edges are already gone, so a retry returns it without
-  consulting the facts — declining then would strand a purge that can never
-  finish, and from that point the hash-level claim check protects the bytes.
-
-- **Garbage collection no longer deletes quarantined evidence's bytes through a
-  released sibling** (#335). GC protection was a property of the *artifact* and
-  reclamation a property of the *bytes*, with nothing joining the two.
-  `GC_PROTECTED_QUARANTINE_STATUSES` (`quarantined` / `rejected` /
-  `scan_indeterminate`) is bound at three sites and protected at only two:
-  `list_pending_purge` never offers such an artifact as a purge candidate and
-  the retention candidate reader never expires one — but `refcount_reconcile`
-  deliberately mints it **no** `content_references` edge, precisely so a
-  repaired refcount cannot make a quarantined blob look GC-protected for the
-  wrong reason. Reclamation decides on hashes: `begin_blob_reclaim` counted
-  `content_references` rows for the target hash, so a protected artifact
-  contributed **zero** to the count of its own content. When a released sibling
-  sharing that hash expired, the sweep read `0` under the blob lock, took a
-  `Granted` lease and deleted the shared CAS object. The protected artifact was
-  never a candidate for anything and its bytes were gone — retained scan
-  evidence destroyed with every filter working as written. Closed by asking,
-  under the already-held blob lock and only on the path that would otherwise
-  delete, whether any non-deleted GC-protected artifact claims the hash — as
-  its primary content (`artifacts.checksum_sha256`) **or** as its metadata blob
-  (`artifact_metadata.metadata_blob`, a different table, trimmed the same way
-  `refcount_reconcile` trims it), with the status list bound from the one
-  shared `gc_protected_quarantine_status_names` rather than a second literal.
-  A claim yields the new terminal `BlobReclaim::ProtectedClaim { claimants }`
-  — a *keep*, not a deferral: a `rejected` artifact is permanent, so re-asking
-  would never answer differently and the sibling's purge would never finish.
-  The reconcile exclusion is untouched. `ArtifactPurged.refs_remaining`
-  consequently means **claims on these bytes observed under the lock** —
-  `content_references` rows, or, when there are none, the protected artifacts
-  holding the hash — so `0 ⇒ the blob was deleted` stays true on every path
-  that emits it; no event field was added.
-
-- **A one-hour break-glass credential can no longer compose into a 30-day
-  standing full-admin one** (#334). `admin bootstrap-session` is deliberately
-  short: it demands operator-level Postgres (DSN) access *and*
-  `HORT_TOKEN_ALLOW_ADMIN=true`, reuses the reserved non-service-account
-  `bootstrap-admin` principal, revokes the prior bootstrap token, and clamps
-  the full-cap admin PAT it issues to **one hour**. With the server process
-  carrying the same `HORT_TOKEN_ALLOW_ADMIN=true`, that one-hour credential was
-  accepted by the public authenticated self-mint route
-  (`POST /api/v1/users/me/tokens`), whose admin gate checks only the flag and
-  the admin principal — the break-glass user is deliberately not a service
-  account, so the one refusal on that path did not reach it — and then permits
-  an explicit admin-PAT expiry of **1 to 30 days**. The derived PAT carried an
-  operator-chosen name, while the next bootstrap run looked only for the
-  reserved name `bootstrap-session` in the *first page* of the principal's
-  tokens, so nothing ever revoked it. Possession of the hour-long credential
-  therefore yielded a 30-day full-admin credential needing no further DSN
-  access. Each half was separately accepted and separately tested —
-  `docs/auth-catalog.md` Entry 2 permits the 30-day admin PAT, ADR 0038
-  describes bootstrap as the short-lived path with no standing admin — and the
-  defect was the composition, which is what ADR 0016's cross-opt-in matrix
-  exists to catch; the matrix had never been applied to the auth opt-ins and
-  now carries a second axis for credential-authority gates. **ADR 0038 governs
-  a bootstrap-derived PAT** (decided 2026-10-03): the shared issuance gates now
-  refuse any issuance whose token *owner* is the reserved identity
-  (`403 bootstrap_admin_mint_forbidden`) — a rejection, not a shortened expiry
-  and not a warning, anchored on the owner rather than the route so a future
-  issuance route inherits it, and keyed on the row's `UNIQUE`, unwritable
-  username rather than on a token label. Independently, bootstrap rotation now
-  revokes **every** live token the principal owns, across every page, instead of
-  the one matching the reserved name: a name is operator-chosen and says nothing
-  about ownership. The general admin-PAT feature, its 1-30 day window, and the
-  bootstrap one-hour clamp are unchanged — only the break-glass principal's
-  reach into the self-mint route. The `admin bootstrap-session` CLI mint is the
-  one path that still issues for that identity, and it is the only one that
-  carries both bounds.
-
-- **An `Exclusion` scoped to a repository is now refused by every writer, not
-  silently applied to all of them** (#334). `scope: { repository: <name> }` was
-  accepted by the gitops apply and by
-  `POST /api/v1/admin/policies/:id/exclusions`, recorded on the
-  `ExclusionAdded` event, stored on the projection and rendered by the
-  exclusions listing — and never read. The finding filter matches on
-  `expires_at`, `cve_id` and `package_pattern` only; it could not read the
-  scope, because the artifact coordinates it matches against carry no
-  repository identity. So a CVE waiver an operator narrowed to one repository
-  cleared that CVE for **every** repository the parent policy governed: the
-  edit read as a narrowing and acted as a widening, with the
-  post-exclusion re-evaluation cascade releasing artifacts across all of them.
-  Both writers now refuse it — the gitops path before its first write
-  (`exclusion_scope_not_implemented`, also reported offline by
-  `hort-server validate-config`), and the HTTP path in
-  `PolicyUseCase::add_exclusion`, which every inbound writer passes through.
-  `scope: global` applies exactly as before. To waive a CVE for one repository,
-  scope the parent `ScanPolicy` to it — a policy scope *is* enforced.
-  **Rows stored before this release keep their scope and keep acting
-  globally**; nothing rewrites them. Removing one is refused nowhere — only
-  writing one is: dropping the envelope from the declared tree removes it, and
-  so does the HTTP `DELETE`. The removal is the direction that withdraws an
-  assurance nothing honoured, and it re-rejects findings in every repository
-  the parent policy governs rather than only the one the scope named, which
-  the server logs (policy id, CVE, the stored repository id, the rationale) as
-  it removes the row.
-
-- **A `ScanPolicy.licensePolicy` is now refused at apply instead of accepted
-  and ignored** (#334). The scan path dispatches to the licence evaluator with
-  a hard-coded **empty** licence list — no port surfaces an artifact's
-  licences — so a well-formed `{denied_licenses: [GPL-3.0], action: Block}`
-  compared its denied set against zero licences, produced zero violations, and
-  left the scan clean whatever the artifact was licensed under, while the
-  operator who wrote it believed releases were gated on licence compliance.
-  The field is now rejected unless it is `{}` or omitted (the evaluator's own
-  "no policy declared" short-circuit, and what every shipped example tree
-  writes), with a message that says the control is not implemented so nobody
-  retries with a different value
-  (`scan_policy_license_policy_not_implemented`). A projection stored before
-  this release keeps its value and keeps deciding nothing.
-
-- **A `virtualMembers` entry on another format is now refused at apply**
-  (#334). Nothing compared a member's `format` with its virtual repository's:
-  cross-document validation required each member to be declared and
-  non-virtual, the per-envelope validator checked only the virtual's *own*
-  format, and serve-time `resolve_members` re-checked Read visibility and
-  repository type. So a `pypi` hosted repository could be a member of an `npm`
-  virtual — and because a non-proxy member *owns* the names it holds (ADR 0031
-  name-level pinning), it would suppress the virtual's npm proxy for every name
-  it held while serving nothing an npm client can install. Such a member is now
-  rejected, naming both formats
-  (`virtual_member_format_not_enforced`). A format-homogeneous virtual —
-  every shipped example tree — applies exactly as before; a cross-format
-  aggregate is one virtual per format.
-
-- **A `ScanPolicy.maxArtifactAge` is now refused at apply instead of accepted
-  and never read** (#334). The cap travelled the whole configuration path —
-  parsed, format-validated, converted to `max_artifact_age_secs`, diffed
-  field-by-field, event-sourced onto the policy stream, persisted, and written
-  into both the config snapshot and drift detection — and was read by nothing
-  that decides. The evaluator exists
-  (`hort_domain::policy::evaluate_age_gates`, which turns an exceeded cap into
-  a `Medium` `max-artifact-age` violation) and had **no production caller**:
-  no scan-result evaluation, no release decision and no retention pass ever
-  asked the question. So an operator who wrote `maxArtifactAge: 90d` declared
-  a staleness cap, could read it back from the policy and saw it in the
-  snapshot — while every artifact older than the cap kept passing every gate.
-  Any declared duration is now rejected
-  (`scan_policy_max_artifact_age_not_implemented`); the inert state is the
-  absent field, and unlike `licensePolicy` there is no accepted *value*,
-  because `None` is the only thing the evaluator reads as "no cap". `0s` is
-  refused exactly like `90d` — the rejection is the missing consumer, not the
-  number. The humantime format check stays, so a malformed duration is still a
-  per-envelope error. The evaluator is deliberately **not** deleted: it is the
-  implementation this row is held open for, and the row's retirement trigger
-  names the condition that removes the row again. A projection stored before
-  this release keeps its `max_artifact_age_secs` and keeps deciding nothing.
-  The `max-artifact-age` policy-violation metric key stays in its closed label
-  set — it is the domain's stable rule id — but the catalog no longer claims
-  the promotion gate emits it.
-
-All four are the [ADR 0015](docs/adr/0015-apply-time-linter-inert-fields-and-naming.md)
-accepted-at-apply-inert-at-runtime block, closed the way that ADR prescribes:
-a fail-closed apply-time rejection that points the operator at the missing
-enforcement, rather than removing the operator surface. The full set of named
-lint rows, each row's retirement trigger, and — separately — where the
-surfaces with *no* named row are actually validated is now a reference page:
-[`docs/architecture/reference/apply-time-linter-rows.md`](docs/architecture/reference/apply-time-linter-rows.md).
-`maxArtifactAge` is the surface that page found with neither a row nor a
-consumer, closed as its row 13.
-
-### Fixed
-
-- **A stored quarantine status the domain cannot parse no longer decodes to the
-  most permissive one** (#334). `artifacts.quarantine_status`'s CHECK accepts
-  seven values; `QuarantineStatus` models five, and the adapter stores `None`
-  as SQL `NULL` rather than as a literal — so three prototype-era spellings
-  (`unscanned`, `clean`, `flagged`) were schema-legal and unparsable, and the
-  domain's `none` was unstorable. The row mapper resolved the disagreement by
-  discarding the parse error and substituting `QuarantineStatus::None`: at once
-  the most permissive state in the system — `Artifact::is_downloadable` admits
-  it, and the default `ReleasedOnly` index mode serves it — and a state the
-  column cannot hold. A schema-valid `unscanned` row was therefore **advertised
-  by the index and served on download** with no release authority behind it and
-  no `ArtifactReleased` in its stream, and the mapper's own unit test asserted
-  `'unscanned' -> None` as correct. The same substitution sat on the two hot
-  index-serve reads (`package_version_status`, `package_version_anchors`), and
-  again on the npm / PyPI / cargo **proxy** index sources as
-  `unwrap_or_else(… Vec::new())` — "degrade to no status known", which under
-  `IncludePending` re-advertises every version hort is deliberately holding
-  back, because the filters there drop only what hort *knows* is non-servable.
-
-  The column now has exactly one codec
-  (`hort_adapters_postgres::quarantine_status_sql`), encoder and fail-closed
-  decoder as an inverse pair: `NULL` is the stored spelling of `None` and the
-  only input that decodes to it; anything else that does not round-trip is a
-  `DomainError::Invariant`. A read that cannot classify an artifact no longer
-  produces a classification — the request fails instead of serving. The same
-  decode now backs the purge-GC mapper, which had been collapsing the three
-  legacy spellings to "not GC-protected" on its own. Migration
-  `030_artifacts_quarantine_status_legacy_backfill.sql` replaces the spellings
-  in the data with the **held** state — `'quarantined'` plus a
-  `quarantine_window_start` anchor derived from `created_at` — because a
-  spelling the domain cannot classify means no scan verdict is on record, and
-  the fail-closed reading of that is a hold rather than "nothing holds it".
-  Writing `NULL` would have handed the affected rows back the permissive
-  `QuarantineStatus::None` the new codec exists to deny them. `'quarantined'`
-  rather than a terminal state because nothing incriminating is known about
-  such a row: the stranded-rescan sweep (`select_stranded`) admits a
-  `'quarantined'` artifact with no scan job, so the hold resolves itself once a
-  verdict exists, which `'rejected'` and `'scan_indeterminate'` — both never
-  auto-rescanned (ADR 0007) — would not. The anchor ships in the same statement
-  because the release sweep's candidacy filter requires it; without it the hold
-  would have no exit but an admin override. Affected rows stop being downloadable
-  and stop being advertised, by the old fleet as well as the new one during a
-  rolling upgrade — a deliberate availability change, since a legacy spelling the
-  CHECK happens to accept is not an operator opt-out of the hold. Narrowing the CHECK to
-  the storable set is a contraction under
-  [ADR 0030](docs/adr/0030-sensitive-surface-structural-guards.md) and is
-  scheduled for **0.14.3**, recorded under "Scheduled contractions" in
-  `migrations/CONTRACTIONS.toml`. The structural guard
-  `crates/hort-app/tests/status_decode_fails_closed.rs` — a sibling of
-  `db_gate_not_silent`, which already refuses a discarded error on a Postgres
-  connect for the same reason — rejects a discarded error on any
-  quarantine-status read or decode across `crates/`, and carries a
-  counter-assertion so a rename cannot make it vacuously green.
-
-- **A `ScanPolicy` scoped to a repository no envelope declares is now rejected
-  instead of crashlooping the pod** (#334). The apply pipeline resolves
-  `scope: { repository: <name> }` to a repository id through a map built from
-  the *declared* repositories, and treats a miss as an invariant violation —
-  but nothing rejected an undeclared name: such a bundle passed the whole
-  pre-write validation and then **panicked** in Stage 2. A panic is not a
-  `GitopsBootError`, so the boot path could not park the pod not-ready on it;
-  it crashlooped, and it did so after Stage 1 had already written. The trigger
-  was a typo in a scope name. Cross-document validation carried the sibling
-  rule for a `RetentionPolicy` scope, an `UpstreamMapping`'s repository, an
-  `Exclusion`'s parent policy and a `PermissionGrant`'s repository and service
-  account — and none for a `ScanPolicy`'s own scope. It now rejects the bundle
-  before the first write with a dangling-reference error naming the policy, the
-  field and the missing repository, identically from the boot preflight and
-  from `hort-server validate-config`. A scope naming a declared repository
-  applies exactly as before, including one declared in the same bundle. The
-  panic stays where it is: with the rule in place it asserts an invariant the
-  admission boundary already excludes.
-
-- **A gitops bundle is no longer half-applied when a late check refuses it**
-  (#334). The apply pipeline validates in stages and writes between them, and
-  it ships no rollback, so any rejection raised from a stage left a partial
-  apply behind. The reachable bad state was a refused *tightening* beside a
-  committed *loosening* from the same bundle: a `PermissionGrant` the grant
-  linter rejects, applied together with a `ScanPolicy` that drops
-  `requireApproval` and moves `enforcement` to `record`, failed the apply —
-  with the loosened policy already live and the grant never written. The
-  operator's `apply` looked atomic and was not atomic at exactly the security
-  boundary.
-
-  Two checks were reachable only after a write, for two different reasons.
-  The permission-grant linter (single-claim, wildcard-repo-non-admin,
-  unjustified high-privilege direct-user, reserved-claim-name collision) ran
-  inside the final grant stage, behind the repository, policy and mapping
-  writes — although the rule already existed in the snapshot-free validator
-  the offline `hort-server validate-config` uses, and its verdict is provably
-  invariant to the resolved database ids. It is now consumed in the pre-write
-  pass, so the rejection happens before the first write; the grant stage keeps
-  its gate over the port-resolved set as defence-in-depth, and keeps being the
-  single emitter of `hort_apply_config_linter_total`. The three TLS-material
-  invariants on `kind: UpstreamMapping` (an mTLS pair must be complete, any
-  TLS field requires an `https://` upstream, `pinnedCertSha256` must be 64
-  lowercase hex characters) existed only in the domain constructor, which
-  gitops reaches in its third stage; they are now also per-spec validation
-  rules, which both the boot preflight and `validate-config` run. A custom CA
-  alone, a pin alone and the full https combination stay accepted — the
-  mirror matches the constructor's rejection set exactly.
-
-  Which configurations are rejected is unchanged; only when. On the boot path
-  the earlier rejection is also the difference between parking the pod
-  not-ready (`GitopsBootError::PreflightValidate`) and crashlooping on a tree
-  that has been partly written. The claim that no rejection is reachable only
-  from a write-capable stage is now two tests rather than a comment: an
-  exhaustive, wildcard-free match over every lint rule asserting the
-  pre-write pass consumes each rejecting one, and a per-stage corpus
-  asserting the preflight refuses every bundle a stage would.
-
-- **A lifecycle decision can no longer be committed over a newer verdict**
-  (#334). Several call sites derived an artifact's outcome from stored
-  evidence and committed it behind an optimistic append, reading the
-  expected stream version *after* deriving the decision. A verdict that
-  committed in that window is already contained in the version just read,
-  so the append does not conflict: it succeeds, and the paired projection
-  write puts the stale decision's status over the newer one. In the loosen
-  direction that released an artifact on scan evidence a later scan had
-  already superseded; in the tighten direction it re-held an artifact over
-  a clean verdict that landed after the evidence was read. The window was
-  as long as whatever sat between the two reads — a policy and
-  exclusion-set resolution, a findings-blob fetch from CAS, a
-  signature-bundle round trip to an upstream, an event append on another
-  stream.
-
-  Eight of the fifteen affected sites read the version after the decision;
-  the other seven read it first but through a second, separate read of the
-  same stream. The correction is a primitive rather than a patch per site:
-  `ArtifactAtVersion` returns the artifact, its complete bounded event
-  stream and the `ExpectedVersion` from **one** capped read, so the
-  evidence and the version are the same observation and there is no
-  "before" left to get wrong. Every reader that asked the stream a question
-  — the latest `ScanCompleted`, the latest rejection reason, the
-  per-finding blob, the `ProvenanceVerified` behind the release gate, the
-  prior-scan baseline for the clean → vulnerable delta, the ingest-source
-  label — now takes that paired stream instead of fetching one of its own,
-  which is what makes the wrong order inexpressible rather than merely
-  avoided at the sites that were fixed.
-
-  Reads go down, not up: four stream reads become one in
-  `record_scan_result`, five become one in the curator re-evaluation
-  endpoint and the policy-mutation loosen pass, three become one in the
-  provenance-misrejection repair and in the timer-release sweep per
-  candidate. `read_artifact_stream` and the append-version derivation also
-  collapse onto a single bounded `read_stream`, so the workspace now holds
-  exactly one.
-
-## [0.14.1] - 2026-10-02
-
 ### Added
 
 - **A job row abandoned in `running` is recovered** (#306). A worker that died
@@ -972,6 +288,154 @@ consumer, closed as its row 13.
   effect before this.
 
 ### Fixed
+
+- **A stored quarantine status the domain cannot parse no longer decodes to the
+  most permissive one** (#334). `artifacts.quarantine_status`'s CHECK accepts
+  seven values; `QuarantineStatus` models five, and the adapter stores `None`
+  as SQL `NULL` rather than as a literal — so three prototype-era spellings
+  (`unscanned`, `clean`, `flagged`) were schema-legal and unparsable, and the
+  domain's `none` was unstorable. The row mapper resolved the disagreement by
+  discarding the parse error and substituting `QuarantineStatus::None`: at once
+  the most permissive state in the system — `Artifact::is_downloadable` admits
+  it, and the default `ReleasedOnly` index mode serves it — and a state the
+  column cannot hold. A schema-valid `unscanned` row was therefore **advertised
+  by the index and served on download** with no release authority behind it and
+  no `ArtifactReleased` in its stream, and the mapper's own unit test asserted
+  `'unscanned' -> None` as correct. The same substitution sat on the two hot
+  index-serve reads (`package_version_status`, `package_version_anchors`), and
+  again on the npm / PyPI / cargo **proxy** index sources as
+  `unwrap_or_else(… Vec::new())` — "degrade to no status known", which under
+  `IncludePending` re-advertises every version hort is deliberately holding
+  back, because the filters there drop only what hort *knows* is non-servable.
+
+  The column now has exactly one codec
+  (`hort_adapters_postgres::quarantine_status_sql`), encoder and fail-closed
+  decoder as an inverse pair: `NULL` is the stored spelling of `None` and the
+  only input that decodes to it; anything else that does not round-trip is a
+  `DomainError::Invariant`. A read that cannot classify an artifact no longer
+  produces a classification — the request fails instead of serving. The same
+  decode now backs the purge-GC mapper, which had been collapsing the three
+  legacy spellings to "not GC-protected" on its own. Migration
+  `030_artifacts_quarantine_status_legacy_backfill.sql` replaces the spellings
+  in the data with the **held** state — `'quarantined'` plus a
+  `quarantine_window_start` anchor derived from `created_at` — because a
+  spelling the domain cannot classify means no scan verdict is on record, and
+  the fail-closed reading of that is a hold rather than "nothing holds it".
+  Writing `NULL` would have handed the affected rows back the permissive
+  `QuarantineStatus::None` the new codec exists to deny them. `'quarantined'`
+  rather than a terminal state because nothing incriminating is known about
+  such a row: the stranded-rescan sweep (`select_stranded`) admits a
+  `'quarantined'` artifact with no scan job, so the hold resolves itself once a
+  verdict exists, which `'rejected'` and `'scan_indeterminate'` — both never
+  auto-rescanned (ADR 0007) — would not. The anchor ships in the same statement
+  because the release sweep's candidacy filter requires it; without it the hold
+  would have no exit but an admin override. Affected rows stop being downloadable
+  and stop being advertised, by the old fleet as well as the new one during a
+  rolling upgrade — a deliberate availability change, since a legacy spelling the
+  CHECK happens to accept is not an operator opt-out of the hold. Narrowing the CHECK to
+  the storable set is a contraction under
+  [ADR 0030](docs/adr/0030-sensitive-surface-structural-guards.md) and is
+  scheduled for **0.14.2**, recorded under "Scheduled contractions" in
+  `migrations/CONTRACTIONS.toml`. The structural guard
+  `crates/hort-app/tests/status_decode_fails_closed.rs` — a sibling of
+  `db_gate_not_silent`, which already refuses a discarded error on a Postgres
+  connect for the same reason — rejects a discarded error on any
+  quarantine-status read or decode across `crates/`, and carries a
+  counter-assertion so a rename cannot make it vacuously green.
+
+- **A `ScanPolicy` scoped to a repository no envelope declares is now rejected
+  instead of crashlooping the pod** (#334). The apply pipeline resolves
+  `scope: { repository: <name> }` to a repository id through a map built from
+  the *declared* repositories, and treats a miss as an invariant violation —
+  but nothing rejected an undeclared name: such a bundle passed the whole
+  pre-write validation and then **panicked** in Stage 2. A panic is not a
+  `GitopsBootError`, so the boot path could not park the pod not-ready on it;
+  it crashlooped, and it did so after Stage 1 had already written. The trigger
+  was a typo in a scope name. Cross-document validation carried the sibling
+  rule for a `RetentionPolicy` scope, an `UpstreamMapping`'s repository, an
+  `Exclusion`'s parent policy and a `PermissionGrant`'s repository and service
+  account — and none for a `ScanPolicy`'s own scope. It now rejects the bundle
+  before the first write with a dangling-reference error naming the policy, the
+  field and the missing repository, identically from the boot preflight and
+  from `hort-server validate-config`. A scope naming a declared repository
+  applies exactly as before, including one declared in the same bundle. The
+  panic stays where it is: with the rule in place it asserts an invariant the
+  admission boundary already excludes.
+
+- **A gitops bundle is no longer half-applied when a late check refuses it**
+  (#334). The apply pipeline validates in stages and writes between them, and
+  it ships no rollback, so any rejection raised from a stage left a partial
+  apply behind. The reachable bad state was a refused *tightening* beside a
+  committed *loosening* from the same bundle: a `PermissionGrant` the grant
+  linter rejects, applied together with a `ScanPolicy` that drops
+  `requireApproval` and moves `enforcement` to `record`, failed the apply —
+  with the loosened policy already live and the grant never written. The
+  operator's `apply` looked atomic and was not atomic at exactly the security
+  boundary.
+
+  Two checks were reachable only after a write, for two different reasons.
+  The permission-grant linter (single-claim, wildcard-repo-non-admin,
+  unjustified high-privilege direct-user, reserved-claim-name collision) ran
+  inside the final grant stage, behind the repository, policy and mapping
+  writes — although the rule already existed in the snapshot-free validator
+  the offline `hort-server validate-config` uses, and its verdict is provably
+  invariant to the resolved database ids. It is now consumed in the pre-write
+  pass, so the rejection happens before the first write; the grant stage keeps
+  its gate over the port-resolved set as defence-in-depth, and keeps being the
+  single emitter of `hort_apply_config_linter_total`. The three TLS-material
+  invariants on `kind: UpstreamMapping` (an mTLS pair must be complete, any
+  TLS field requires an `https://` upstream, `pinnedCertSha256` must be 64
+  lowercase hex characters) existed only in the domain constructor, which
+  gitops reaches in its third stage; they are now also per-spec validation
+  rules, which both the boot preflight and `validate-config` run. A custom CA
+  alone, a pin alone and the full https combination stay accepted — the
+  mirror matches the constructor's rejection set exactly.
+
+  Which configurations are rejected is unchanged; only when. On the boot path
+  the earlier rejection is also the difference between parking the pod
+  not-ready (`GitopsBootError::PreflightValidate`) and crashlooping on a tree
+  that has been partly written. The claim that no rejection is reachable only
+  from a write-capable stage is now two tests rather than a comment: an
+  exhaustive, wildcard-free match over every lint rule asserting the
+  pre-write pass consumes each rejecting one, and a per-stage corpus
+  asserting the preflight refuses every bundle a stage would.
+
+- **A lifecycle decision can no longer be committed over a newer verdict**
+  (#334). Several call sites derived an artifact's outcome from stored
+  evidence and committed it behind an optimistic append, reading the
+  expected stream version *after* deriving the decision. A verdict that
+  committed in that window is already contained in the version just read,
+  so the append does not conflict: it succeeds, and the paired projection
+  write puts the stale decision's status over the newer one. In the loosen
+  direction that released an artifact on scan evidence a later scan had
+  already superseded; in the tighten direction it re-held an artifact over
+  a clean verdict that landed after the evidence was read. The window was
+  as long as whatever sat between the two reads — a policy and
+  exclusion-set resolution, a findings-blob fetch from CAS, a
+  signature-bundle round trip to an upstream, an event append on another
+  stream.
+
+  Eight of the fifteen affected sites read the version after the decision;
+  the other seven read it first but through a second, separate read of the
+  same stream. The correction is a primitive rather than a patch per site:
+  `ArtifactAtVersion` returns the artifact, its complete bounded event
+  stream and the `ExpectedVersion` from **one** capped read, so the
+  evidence and the version are the same observation and there is no
+  "before" left to get wrong. Every reader that asked the stream a question
+  — the latest `ScanCompleted`, the latest rejection reason, the
+  per-finding blob, the `ProvenanceVerified` behind the release gate, the
+  prior-scan baseline for the clean → vulnerable delta, the ingest-source
+  label — now takes that paired stream instead of fetching one of its own,
+  which is what makes the wrong order inexpressible rather than merely
+  avoided at the sites that were fixed.
+
+  Reads go down, not up: four stream reads become one in
+  `record_scan_result`, five become one in the curator re-evaluation
+  endpoint and the policy-mutation loosen pass, three become one in the
+  provenance-misrejection repair and in the timer-release sweep per
+  candidate. `read_artifact_stream` and the append-version derivation also
+  collapse onto a single bounded `read_stream`, so the workspace now holds
+  exactly one.
 
 - **The storage-GC purge locked the artifact, but the blob is what it
   destroys** (#320). `purge_gc` took `SELECT checksum_sha256 FROM artifacts
@@ -1653,6 +1117,538 @@ consumer, closed as its row 13.
   now come from one definition shared by the candidate reader, the
   pending-purge reader, the refcount reconcile and the purge-path mapper,
   which is what kept them from drifting apart again.
+
+### Security
+
+- **A failed OCI blob-upload `PATCH` can no longer grow the staging file past
+  the upload cap** (#338). `append_chunk_core` wrote the body to staging and
+  advanced the session record's `bytes_received` afterwards, via
+  `compare_and_swap`. Three exits sat between the two and left the `.part` file
+  longer than the record claimed: a short read on the declared-length path, an
+  over-cap body on the unframed-length path, and — the sharpest — a CAS miss,
+  where two concurrent `PATCH`es had both already appended and only one bumped
+  the record. From then on every further `PATCH` computed the cap against the
+  stale, smaller recorded offset, appended again, saw a physical total it could
+  not explain and returned `500` — having enlarged the file once more. Repeating
+  that drove a single session's staging file arbitrarily far past
+  `HORT_OCI_MAX_UPLOAD_BYTES` while the recorded offset never moved; a writer
+  authorised to push to one repository reached it with two competing `PATCH`es.
+  The finalize-time digest check kept the wrong bytes out of CAS — it does
+  nothing about the disk the session fills, which is a denial-of-service against
+  every tenant sharing the volume.
+  - The fix is at the root the three exits share, not on the three exits. The
+    staging port's own concurrency contract already said the OCI use case
+    "gates every `PATCH` on an optimistic-concurrency check … via
+    `compare_and_swap`" — but the check ran *after* the append, so it gated
+    nothing. The claim now comes first: the use case advances `bytes_received`
+    to the ceiling of the `PATCH`'s byte budget before a byte reaches staging,
+    so the loser of a race is rejected having written nothing and the winner's
+    bytes are the only bytes in the file.
+  - Because the record moves first it is never smaller than the file, which is
+    what takes the physical length out of the authority chain for good: a failed
+    `PATCH` leaves the record over-stating staging, and
+    `StatefulUploadStagingPort::append_at` — which now writes at the caller's
+    asserted offset instead of blindly at the end — refuses the next write as a
+    gap rather than appending on top of it. An unframed body's claim reserves the
+    remaining cap headroom and settles back down to the bytes that landed, so a
+    `Transfer-Encoding: chunked` sequence still appends chunk by chunk.
+  - The over-cap signal also left the file: `append_at` takes a byte budget,
+    stops at it, and reports "the body wanted more" in its return value. The
+    previous form encoded that bit by reading one byte past the cap and letting
+    it land, so an over-cap `PATCH` left staging at `max_bytes + 1`.
+  - Position-checked writing replaces the adapter's `O_APPEND` open mode, whose
+    "every write lands at whatever the current end is" semantics were the
+    mechanism the overrun ran on. It also repairs a staging file left long by
+    the old ordering: the first write at a recorded offset drops the unaccounted
+    tail, which the record never claimed and no finalize could have turned into
+    content.
+
+- **`hort-server admin --output=file:<path>` can no longer write a fresh bearer
+  into a file whose permissions or type it did not set** (#338).
+  `issue-svc-token` and `bootstrap-session` document a 0600 output file and
+  opened the path with `create(true).truncate(true).mode(0o600)`.
+  `OpenOptionsExt::mode` applies only when a file is *created*, so an existing
+  group- or world-readable file at that path kept its own permissions and the
+  plaintext token was written into it, and a symlink at that path was followed
+  to wherever it pointed. Both states are reachable by any local user who can
+  create the path before the mint runs. What leaked is a service-account bearer
+  or a full-cap bootstrap admin PAT; the issuance gates (DSN access,
+  `HORT_TOKEN_ALLOW_ADMIN`) guard the minting, not this sink.
+  - The sink now places the token through an atomic
+    `create_new(true).mode(0o600)` sibling temp file + `rename` over the
+    target, so the secret only ever reaches an inode the process created at
+    0600 and a symlink at the target is **replaced instead of followed**.
+    Re-running against the same path still overwrites — what makes the
+    overwrite safe is the atomic replace, not a refusal to overwrite.
+  - One way, not two: that write form already existed in `hort-cli auth
+    login`, which fixed the identical fault class for `~/.hort/config.toml`.
+    It now lives once, in a new std-only zero-`hort-*`-dependency leaf crate
+    `hort-secret-file` (the shape `hort-attribution` established, ADR 0047 D2 —
+    `hort-cli` carries no `hort-domain`/`hort-app`/`hort-adapters-*`
+    dependency, so a shared helper cannot live in either), and both sinks call
+    it.
+  - The shared writer deliberately does **not** create or `chmod` the target's
+    parent directory, unlike the `~/.hort/` caller that still tightens its own.
+    An operator-named path is not the process's to re-permission: the native
+    deployment's default token location is `/etc/hort/tasks-token`, and
+    `/etc/hort` is kept `root:hort` 0750 so `hort-server.service` can read the
+    env files beside the token — pulling it to 0700 on a mint would break the
+    service. The replaced file is owned by the writing process, so a deployment
+    that needs another owner (the Ansible timers role chowns the token to its
+    run user) still sets it after the write, as it already did.
+
+- **The PyPI simple index no longer interpolates upstream text into the page
+  unescaped** (#338). The PEP 503 HTML builder concatenated five dynamic values
+  into the document and escaped one of them. An upstream serving a
+  `hashes.sha256` shaped `a"></a><a href="https://attacker.example/…` closed the
+  `href`, closed the anchor and opened a second one; a standard parser reads
+  that as another download link, so the **client's** candidate set changes and
+  can point outside Hort's artifact and quarantine path entirely. The same held
+  for an upstream-supplied `filename`, which the builder interpolated twice —
+  into the URL and into the anchor text. Reaching a proxy repository's index was
+  the only prerequisite.
+  - Every interpolated value is now escaped — filename (both positions),
+    package name, base URL, the PEP 658 metadata hash and `requires-python` —
+    so "nothing reaches the output unescaped" is a property a reader confirms
+    from one function rather than from an invariant three crates away.
+  - The upstream hash is additionally closed **by type**: the index-serving
+    `PypiVersionFile::hash_sha256` is now a `ContentHash` rather than a verbatim
+    `Option<String>`, so a value that is not a canonical SHA-256 digest cannot
+    be represented, let alone served. This loses no verification a client could
+    have passed — a non-digest can never match a `hexdigest()` — and an
+    upstream that spells a real digest in uppercase is case-folded rather than
+    dropped. The upstream-checksum verification path (ADR 0006) reads a
+    different struct on the per-version JSON projection and is untouched.
+  - `html_escape_attr` is renamed `html_escape`: the five-character set is a
+    correct superset for element text too, and the `_attr` suffix made its
+    (correct) use on the anchor text read as an oversight. Its inverse in the
+    HTML projector is renamed and widened to match, so a Hort proxying a Hort
+    recovers the upstream's filename instead of re-escaping an already-escaped
+    one — which also fixes that mangling where it reached `files[].url` on the
+    JSON arm.
+
+- **Artifact-lifecycle events no longer bypass repository visibility** (#338).
+  `GET /api/v1/events?category=artifact` and the subscription delivery filter
+  both decided per-event visibility from an `Option<Uuid>` extractor whose
+  `None` meant "no repository, therefore visible". Nineteen artifact-stream
+  event types return no `repository_id` — they name the artifact, because the
+  artifact aggregate owns exactly one repository — so an authenticated account
+  with **no `Read` grant anywhere** could read every repository's scanner
+  names, severity counts, findings-blob hashes, release justifications and
+  operator ids, and an `OwnedByActor` subscription (which needs no read proof
+  to create) delivered the same to an external webhook or NATS target. The
+  same absent value had the opposite effect on an explicit
+  `RepositoryScope::Some([repo])` subscriber, which silently lost that
+  repository's entire lifecycle feed: an allow-list cannot match an event that
+  names no repository. Both directions are closed by one change.
+  - **Resolution, not payload extension.** `EventTypeKind::repository_id` is
+    replaced by `EventTypeKind::disclosed_repositories`, which classifies a
+    payload exhaustively into *global* (no repository association), one or two
+    repository references (carried directly, or named through the artifact /
+    artifact-group aggregate), or *unattributable*. Adding a `repository_id`
+    field to the nineteen event types would have left every already-stored
+    event unprotected and would have altered the canonical bytes of every
+    event written before it (`ChainBreak::HashMismatch`, ADR 0002). The fix
+    therefore applies to the existing store, with no migration.
+  - **One primitive, both call sites.** `hort_app::use_cases::event_visibility`
+    holds the classification, the batch resolution and the fail-closed
+    dispositions; the read handler and the delivery filter consult it and
+    differ only in the gate they then apply. The convention they each
+    implemented locally is gone, not patched.
+  - **One round trip per page, not per event.** A new
+    `EventRepositoryResolver` port resolves a whole page's aggregates in a
+    single statement — joins against unnested-array CTEs, never
+    `= ANY($1::uuid[])`, whose pooled generic plan degrades to a row-by-row
+    scan (1.3 s against 64.2 s on this project's corpus). Resolution is by
+    identity and never filtered on liveness, so a purged artifact's events
+    stay visible to its own repository's readers.
+  - **The promotion chain needs both repositories.** `PromotionRequested` /
+    `ApprovalRequested` / `ArtifactPromoted` / `PromotionRejected` disclose a
+    source and a target and the served payload carries both identities, so
+    `Read` on one of them is not authority to read it.
+  - **Unresolvable is admin-only, not invisible.** `CasIntegrityMismatch` is
+    keyed on a CAS content hash no single repository owns, and an aggregate
+    whose repository was deleted has no row left to resolve; both now require
+    live `Permission::Admin` instead of passing through.
+  - Two tests that pinned the bypass as the intended contract
+    (`non_privileged_category_none_repo_event_unchanged_for_non_admin`,
+    `all_scope_event_without_repo_skips_authz`) are renamed and inverted
+    rather than deleted, so the inversion is visible as one.
+
+- **No path that mints an artifact writes a content-reference edge after the
+  fact any more** (#335). The last three writers — the OCI manifest PUT's
+  `oci_config` / `oci_layer` / `oci_index_member` membership edges, both
+  pull-through leader legs, and the coalesced follower — now carry their edges
+  into the minting transaction as claims. A `content_references` row is what
+  keeps bytes out of the storage GC (it deletes a CAS blob exactly when no row
+  targets its hash), and for a manifest's *tree* edges the target is another
+  artifact's content, which nothing re-derives: the refcount-reconcile sweep
+  converges `primary_content` / `metadata_blob` from the artifact row, and no
+  relational row records what a manifest references. Every one of these was
+  `warn!`-and-continue, so a failure served a live, servable manifest whose
+  config, layers or children had one fewer claim.
+  - **The manifest PUT** resolves its declared references **before** the mint
+    and builds the membership claims only from a complete resolution. That
+    answers the ordering question in full rather than trading one risk for
+    another: an edge can never name a blob the repository does not hold (those
+    kinds feed the referenced-tree-descendant predicate, so one that did would
+    hand the blob's own later ingest a zero-window quarantine carve-out it did
+    not earn), and the unknown-blob 400 still answers *after* the mint, so a
+    manifest referencing blobs the client has not pushed yet stays committed
+    for the retry exactly as ADR 0043 requires — it simply claims nothing.
+  - **The two pull-through leader legs** read the cached manifest body once,
+    into memory, **before** the ingest instead of re-reading the tempfile
+    after it, derive the claims from that copy and hand them to
+    `ingest_verified`. The eager child-ingest enqueue and the prefetch trigger
+    read the same copy and stay post-commit — they are `jobs` rows and
+    scheduling hints, not claims on bytes.
+  - **The coalesced follower** reads the manifest out of CAS before minting
+    its own per-repo row, keyed on the content hash rather than on an artifact
+    id it does not have yet, and passes the claims on
+    `RegisterExistingCasBlobRequest`.
+  - Pull-through deliberately keeps claiming **by digest with no existence
+    check**: that edge is the mechanism behind the zero-window anchor for a
+    proxy descendant (ADR 0007), and a proxied constituent legitimately is not
+    present yet. Only the atomicity changed, not when an edge is written.
+  - One **observable change on an error path**: a manifest body whose
+    reference parse fails (a malformed `config.digest`, an over-cap index) is
+    no longer minted. The parse has to precede the mint for its claims to ride
+    the transaction, and the client sees the same 400 `MANIFEST_INVALID`
+    either way — what it no longer leaves behind is an artifact row for a body
+    hort refused. The *unknown-blob* contract is untouched.
+  Evidence per site is the rollback: an injected insert failure asserting that
+  neither the referrer nor its events survive, each paired with a success pin
+  showing one lifecycle call carries the referrer and its whole edge set. The
+  two backfill handlers are now the only production callers that insert an edge
+  after its referrer committed, which is their purpose — they repair referrers
+  that committed edgeless in an earlier release. No backfill, no migration, no
+  repair of existing edgeless rows.
+
+- **The three remaining content-reference writers now commit their edge in the
+  transaction that makes the claiming artifact live** (#335), completing the
+  work the ingest-mint path started. A `content_references` row is not a
+  projection that may lag: the storage GC deletes a CAS blob exactly when no
+  row targets its hash, so an edge written after its referrer committed is a
+  window in which the claim does not exist and the bytes are collectable, with
+  the referrer already live and unable to re-assert it.
+  - `register_by_hash_inner` (the OCI cross-repo blob mount, the coalesced
+    pull-through follower, and the seed-import cutover) wrote its
+    `primary_content` edge after a plain `commit_transition`, warn-and-continue
+    on failure. It mints a per-repo row over a CAS blob the source
+    repository's artifact already holds, so without that edge the new artifact
+    counted **zero** against bytes CAS shares with the source: release and
+    purge that sibling and the count reached zero with the new row still live
+    and servable. The genesis commit now carries the edge.
+  - The OCI manifest PUT's `oci_subject` edge is derived from the parsed body
+    before the mint and handed to the ingest as a claim, so the referrer and
+    the row that keeps its subject's bytes alive commit together. This one is
+    sharper than `primary_content`: the target is **another** artifact's
+    content, and the refcount-reconcile sweep cannot repair it — it converges
+    `primary_content` / `metadata_blob` from the artifact row, and no
+    relational row records what a manifest references.
+  - The eager index-child ingest (`oci-index-child-ingest`) derived its
+    `oci_config` / `oci_layer` / `oci_index_member` edges after the child
+    manifest was committed and inserted them one at a time, non-fatally. The
+    derivation moved ahead of the ingest — it only ever needed the fetched body
+    and the digest the ingest is keyed on — and the edges now ride the child's
+    transition. The handler no longer holds a content-reference port at all, so
+    there is nothing there that could write one afterwards. A failed edge fails
+    the unit; the `jobs` row is retried, where a committed manifest with a
+    missing claim was only repairable by re-reading manifest bodies out of CAS.
+  - `ingest_signature_manifest` also gains the `primary_content` edge it never
+    wrote: a pushed cosign signature manifest commits status-`None`, outside
+    the scan/quarantine lifecycle and therefore outside the GC's
+    protected-evidence rule, so its own bytes counted zero against themselves
+    until the next reconcile sweep converged them.
+  - A fourth writer the sweep for this change turned up: the provenance
+    orchestrator's upstream-referrer landing
+    (`ProvenanceOrchestrationUseCase::commit_referrer_manifest`, the inlined
+    twin of the primitive above) likewise minted its referrer manifest with no
+    edge at all and inserted the `oci_subject` row afterwards. Both now ride
+    its transition. It had no obstacle of its own, and leaving the inlined
+    copy unconverted while converting the primitive it mirrors is exactly the
+    drift this audit keeps finding.
+  Evidence is the rollback, not the end state: per edge, a test injects an
+  insert failure and asserts that **neither** the referrer **nor** its events
+  survive, each paired with a success pin showing one lifecycle call carries
+  both. No backfill, no migration, no repair of existing edgeless rows; the
+  refcount reconcile and its in-process gate are untouched. **Still open and
+  carrying the same hazard**: the OCI manifest PUT's membership edges
+  (`oci_config` / `oci_layer` / `oci_index_member`) and the pull-through leg's
+  post-ingest registration of the same. The manifest-PUT pair is blocked on a
+  decision, not on mechanism: claiming those edges before the manifest's
+  blob-existence gate would let an edge name a blob the repository does not
+  hold, and those kinds feed the referenced-tree-descendant predicate, so the
+  blob's own later ingest would take the zero-window quarantine carve-out —
+  while moving the gate ahead of the mint reverses the deliberate contract that
+  an unknown-blob manifest stays committed for the client's retry. Both
+  functions now document that trade-off in place.
+
+- **An ingested artifact's claim on its own bytes now commits in the same
+  transaction as the artifact** (#335). The storage GC deletes a CAS blob
+  exactly when no `content_references` row targets its hash, so the
+  `primary_content` edge is not a projection that may lag — it is the claim
+  that keeps the bytes alive. The ingest committed the artifact and wrote the
+  edge **afterwards**, in a step allowed to fail without failing the ingest,
+  and the comment over `write_ingest_refcounts` justified that with a claim
+  that reads backwards: "a missing refcount row only delays GC, it doesn't
+  break correctness". It delays nothing. The artifact counted **zero** against
+  its own content, and because CAS deduplicates, a released sibling carrying
+  the same bytes drove the observed count to zero — leaving a live, servable
+  artifact pointing at bytes the sweep was authorised to delete. The bracket
+  already existed: `commit_transition_with_enqueues` was writing four things
+  atomically (events, artifact row, metadata, job-queue rows) behind the port
+  boundary, with the edge standing just outside it. All three ingest-mint
+  edges now ride it — `primary_content`, `metadata_blob`, and the PEP 658
+  `wheel_metadata`, whose extraction moved **ahead** of the commit because it
+  only ever needed the bytes the primary `storage.put` had already placed in
+  CAS, so its edge belongs in the transition that creates the artifact
+  claiming them rather than in a second one. A failed edge now fails the
+  ingest: the upload is retriable, an edgeless committed artifact is not. The
+  edge upsert is idempotent on the full primary key, which is what keeps the
+  adapter's existing contention retry re-runnable, and the blob-reclamation
+  locks for a transition's several targets are taken up front in one total
+  order, so two overlapping ingests sharing targets cannot each hold the
+  other's next lock. No backfill and no migration: existing edgeless rows stay
+  the operator reconcile's business, and the reconcile and its in-process gate
+  are untouched. **Still open, deliberately out of this change**:
+  `register_by_hash_inner`'s own `primary_content` edge (the OCI cross-repo
+  mount and pull-dedup follower path) and the two OCI manifest-write edges
+  (`oci_subject`, `oci_index_member`) still write beside their transitions and
+  carry the same hazard. The `register_by_hash_inner` comment, which deferred
+  to the inverted rationale above, now states the hazard instead, so nothing
+  in the tree claims a missing edge merely postpones collection.
+
+- **An event-stream seal now carries the version its own proof was read at**
+  (#335). `EventStoreRetentionUseCase` proves an artifact stream's tail is
+  `ArtifactPurged` and that the retention floor has elapsed, then calls
+  `delete_stream`, which opened a **new** transaction, re-read the head without
+  `FOR UPDATE`, wrote the `StreamSealed` tombstone to the audit-meta stream and
+  deleted every row of the target stream — without re-checking terminality or
+  the floor at any point. A late `ArtifactExpired` (the retention evaluation
+  appends with `ExpectedVersion::Any` against a candidate it read earlier) had
+  two windows: landing before the seal's head read, a stream that was no longer
+  terminal was deleted under a tombstone that described it perfectly; landing
+  between that read and the `DELETE`, the tombstone recorded the old head while
+  the new event was removed with the rest. ADR 0020 does not cover this — its
+  single-flight serializes seal jobs against each other, not a seal against an
+  append — and no lock could: the append path takes none either, relying on the
+  `(stream_id, stream_position)` unique index that `004_events.sql` calls
+  "Optimistic concurrency". Closed the way #334 closed the same shape one layer
+  up, by pairing the decision with the version that authorizes it:
+  `delete_stream` / `archive_stream` now take a `SealAuthority` — the
+  `stream_position` of the tail the caller's proof read — and answer
+  `SealOutcome::NotAtProvenVersion` instead of removing anything when the
+  stream has moved. The `DELETE` itself carries the condition as a predicate,
+  because a re-check phrased as its own statement cannot see an append that
+  commits before it (read-committed gives every statement a fresh snapshot),
+  and its row count is compared against the count the tombstone claims — the
+  predicate stops the removal, the comparison is what turns the stop into a
+  rolled-back refusal rather than a committed tombstone over an intact stream.
+  The authority is one observation with the verdict it belongs to: the
+  terminal-proof read's own tail row for `TerminalGated`, and the enumeration
+  row's new `last_stream_position` for `AgeGated` categories, which perform no
+  proof read and whose rotated audit streams were open to the same defect from
+  the other end. The refusal is a skip (`skipped_stream_changed`), never an
+  error: nothing failed and nothing was removed, so a late event must not make
+  a healthy sweep read as broken. Deliberately still open and documented at the
+  `seal_and_remove` chokepoint: an append committing *after* the `DELETE`'s
+  snapshot survives as a live event following a `SealedGap`, because no
+  mechanism inside one transaction reaches past its own commit.
+
+- **The purge no longer decides from a page row it read before it started
+  deleting** (#335). The storage-GC sweep reads a page of pending work items
+  and then walks it, and both protection rules — retained scan evidence is
+  never collected, a `KeepLastN` tag target is exempt — were evaluated against
+  that page row. Between the page read and a given item's destructive step lies
+  the complete processing of every item ahead of it, storage deletes included:
+  the longest interval in the sweep, not the shortest. A scan verdict moving an
+  artifact to `rejected` inside that window, or a tag landing on a `KeepLastN`
+  target, was not seen. `purge_artifact_refs` already locked the artifact row
+  (`SELECT … FOR UPDATE`) but read only `checksum_sha256` under it and deleted
+  the `content_references` edges unconditionally — the lock was there, nothing
+  load-bearing was read under it. Worse, the comment at the tag check claimed
+  the fact was re-read "immediately before deleting" and that "the last reader
+  before the destructive step is the one that decides"; neither was true, and a
+  false assurance in a comment is the same defect as one in code with a longer
+  half-life. Closed by reading all four facts in that same `FOR UPDATE`
+  statement — `quarantine_status` against the one shared
+  `gc_protected_quarantine_status_names`, the tag fact through the one shared
+  `ARTIFACT_IS_TAG_TARGETED_SQL` the page query and the evaluator already use,
+  and the two expiry-stream facts through predicates now likewise spelled once
+  — and refusing there: the transaction ends with no `DELETE`, no worklist row
+  and no event, so the work item stays pending and the next sweep re-reads
+  everything. The composite rule is unchanged and now has exactly one author
+  (`PendingPurge::is_gc_protected` / `::is_tag_exempt`, which both readers
+  call). A refusal arrives as its own value on the new `PurgePreparation`
+  outcome rather than as the empty worklist that already meant "there is no
+  such artifact row", and the sweep counts the two readers apart
+  (`skipped_protected_under_lock` / `skipped_tag_exempt_under_lock` beside the
+  existing steady-state counters) because a protection holding inside the
+  sweep's own window is a far rarer signal than a protected artifact being
+  skipped again. The use case's checks over the page row stay, as what they
+  always were: a pre-exit that saves taking the lock. Unchanged by design: once
+  a worklist exists the edges are already gone, so a retry returns it without
+  consulting the facts — declining then would strand a purge that can never
+  finish, and from that point the hash-level claim check protects the bytes.
+
+- **Garbage collection no longer deletes quarantined evidence's bytes through a
+  released sibling** (#335). GC protection was a property of the *artifact* and
+  reclamation a property of the *bytes*, with nothing joining the two.
+  `GC_PROTECTED_QUARANTINE_STATUSES` (`quarantined` / `rejected` /
+  `scan_indeterminate`) is bound at three sites and protected at only two:
+  `list_pending_purge` never offers such an artifact as a purge candidate and
+  the retention candidate reader never expires one — but `refcount_reconcile`
+  deliberately mints it **no** `content_references` edge, precisely so a
+  repaired refcount cannot make a quarantined blob look GC-protected for the
+  wrong reason. Reclamation decides on hashes: `begin_blob_reclaim` counted
+  `content_references` rows for the target hash, so a protected artifact
+  contributed **zero** to the count of its own content. When a released sibling
+  sharing that hash expired, the sweep read `0` under the blob lock, took a
+  `Granted` lease and deleted the shared CAS object. The protected artifact was
+  never a candidate for anything and its bytes were gone — retained scan
+  evidence destroyed with every filter working as written. Closed by asking,
+  under the already-held blob lock and only on the path that would otherwise
+  delete, whether any non-deleted GC-protected artifact claims the hash — as
+  its primary content (`artifacts.checksum_sha256`) **or** as its metadata blob
+  (`artifact_metadata.metadata_blob`, a different table, trimmed the same way
+  `refcount_reconcile` trims it), with the status list bound from the one
+  shared `gc_protected_quarantine_status_names` rather than a second literal.
+  A claim yields the new terminal `BlobReclaim::ProtectedClaim { claimants }`
+  — a *keep*, not a deferral: a `rejected` artifact is permanent, so re-asking
+  would never answer differently and the sibling's purge would never finish.
+  The reconcile exclusion is untouched. `ArtifactPurged.refs_remaining`
+  consequently means **claims on these bytes observed under the lock** —
+  `content_references` rows, or, when there are none, the protected artifacts
+  holding the hash — so `0 ⇒ the blob was deleted` stays true on every path
+  that emits it; no event field was added.
+
+- **A one-hour break-glass credential can no longer compose into a 30-day
+  standing full-admin one** (#334). `admin bootstrap-session` is deliberately
+  short: it demands operator-level Postgres (DSN) access *and*
+  `HORT_TOKEN_ALLOW_ADMIN=true`, reuses the reserved non-service-account
+  `bootstrap-admin` principal, revokes the prior bootstrap token, and clamps
+  the full-cap admin PAT it issues to **one hour**. With the server process
+  carrying the same `HORT_TOKEN_ALLOW_ADMIN=true`, that one-hour credential was
+  accepted by the public authenticated self-mint route
+  (`POST /api/v1/users/me/tokens`), whose admin gate checks only the flag and
+  the admin principal — the break-glass user is deliberately not a service
+  account, so the one refusal on that path did not reach it — and then permits
+  an explicit admin-PAT expiry of **1 to 30 days**. The derived PAT carried an
+  operator-chosen name, while the next bootstrap run looked only for the
+  reserved name `bootstrap-session` in the *first page* of the principal's
+  tokens, so nothing ever revoked it. Possession of the hour-long credential
+  therefore yielded a 30-day full-admin credential needing no further DSN
+  access. Each half was separately accepted and separately tested —
+  `docs/auth-catalog.md` Entry 2 permits the 30-day admin PAT, ADR 0038
+  describes bootstrap as the short-lived path with no standing admin — and the
+  defect was the composition, which is what ADR 0016's cross-opt-in matrix
+  exists to catch; the matrix had never been applied to the auth opt-ins and
+  now carries a second axis for credential-authority gates. **ADR 0038 governs
+  a bootstrap-derived PAT** (decided 2026-10-03): the shared issuance gates now
+  refuse any issuance whose token *owner* is the reserved identity
+  (`403 bootstrap_admin_mint_forbidden`) — a rejection, not a shortened expiry
+  and not a warning, anchored on the owner rather than the route so a future
+  issuance route inherits it, and keyed on the row's `UNIQUE`, unwritable
+  username rather than on a token label. Independently, bootstrap rotation now
+  revokes **every** live token the principal owns, across every page, instead of
+  the one matching the reserved name: a name is operator-chosen and says nothing
+  about ownership. The general admin-PAT feature, its 1-30 day window, and the
+  bootstrap one-hour clamp are unchanged — only the break-glass principal's
+  reach into the self-mint route. The `admin bootstrap-session` CLI mint is the
+  one path that still issues for that identity, and it is the only one that
+  carries both bounds.
+
+- **An `Exclusion` scoped to a repository is now refused by every writer, not
+  silently applied to all of them** (#334). `scope: { repository: <name> }` was
+  accepted by the gitops apply and by
+  `POST /api/v1/admin/policies/:id/exclusions`, recorded on the
+  `ExclusionAdded` event, stored on the projection and rendered by the
+  exclusions listing — and never read. The finding filter matches on
+  `expires_at`, `cve_id` and `package_pattern` only; it could not read the
+  scope, because the artifact coordinates it matches against carry no
+  repository identity. So a CVE waiver an operator narrowed to one repository
+  cleared that CVE for **every** repository the parent policy governed: the
+  edit read as a narrowing and acted as a widening, with the
+  post-exclusion re-evaluation cascade releasing artifacts across all of them.
+  Both writers now refuse it — the gitops path before its first write
+  (`exclusion_scope_not_implemented`, also reported offline by
+  `hort-server validate-config`), and the HTTP path in
+  `PolicyUseCase::add_exclusion`, which every inbound writer passes through.
+  `scope: global` applies exactly as before. To waive a CVE for one repository,
+  scope the parent `ScanPolicy` to it — a policy scope *is* enforced.
+  **Rows stored before this release keep their scope and keep acting
+  globally**; nothing rewrites them. Removing one is refused nowhere — only
+  writing one is: dropping the envelope from the declared tree removes it, and
+  so does the HTTP `DELETE`. The removal is the direction that withdraws an
+  assurance nothing honoured, and it re-rejects findings in every repository
+  the parent policy governs rather than only the one the scope named, which
+  the server logs (policy id, CVE, the stored repository id, the rationale) as
+  it removes the row.
+
+- **A `ScanPolicy.licensePolicy` is now refused at apply instead of accepted
+  and ignored** (#334). The scan path dispatches to the licence evaluator with
+  a hard-coded **empty** licence list — no port surfaces an artifact's
+  licences — so a well-formed `{denied_licenses: [GPL-3.0], action: Block}`
+  compared its denied set against zero licences, produced zero violations, and
+  left the scan clean whatever the artifact was licensed under, while the
+  operator who wrote it believed releases were gated on licence compliance.
+  The field is now rejected unless it is `{}` or omitted (the evaluator's own
+  "no policy declared" short-circuit, and what every shipped example tree
+  writes), with a message that says the control is not implemented so nobody
+  retries with a different value
+  (`scan_policy_license_policy_not_implemented`). A projection stored before
+  this release keeps its value and keeps deciding nothing.
+
+- **A `virtualMembers` entry on another format is now refused at apply**
+  (#334). Nothing compared a member's `format` with its virtual repository's:
+  cross-document validation required each member to be declared and
+  non-virtual, the per-envelope validator checked only the virtual's *own*
+  format, and serve-time `resolve_members` re-checked Read visibility and
+  repository type. So a `pypi` hosted repository could be a member of an `npm`
+  virtual — and because a non-proxy member *owns* the names it holds (ADR 0031
+  name-level pinning), it would suppress the virtual's npm proxy for every name
+  it held while serving nothing an npm client can install. Such a member is now
+  rejected, naming both formats
+  (`virtual_member_format_not_enforced`). A format-homogeneous virtual —
+  every shipped example tree — applies exactly as before; a cross-format
+  aggregate is one virtual per format.
+
+- **A `ScanPolicy.maxArtifactAge` is now refused at apply instead of accepted
+  and never read** (#334). The cap travelled the whole configuration path —
+  parsed, format-validated, converted to `max_artifact_age_secs`, diffed
+  field-by-field, event-sourced onto the policy stream, persisted, and written
+  into both the config snapshot and drift detection — and was read by nothing
+  that decides. The evaluator exists
+  (`hort_domain::policy::evaluate_age_gates`, which turns an exceeded cap into
+  a `Medium` `max-artifact-age` violation) and had **no production caller**:
+  no scan-result evaluation, no release decision and no retention pass ever
+  asked the question. So an operator who wrote `maxArtifactAge: 90d` declared
+  a staleness cap, could read it back from the policy and saw it in the
+  snapshot — while every artifact older than the cap kept passing every gate.
+  Any declared duration is now rejected
+  (`scan_policy_max_artifact_age_not_implemented`); the inert state is the
+  absent field, and unlike `licensePolicy` there is no accepted *value*,
+  because `None` is the only thing the evaluator reads as "no cap". `0s` is
+  refused exactly like `90d` — the rejection is the missing consumer, not the
+  number. The humantime format check stays, so a malformed duration is still a
+  per-envelope error. The evaluator is deliberately **not** deleted: it is the
+  implementation this row is held open for, and the row's retirement trigger
+  names the condition that removes the row again. A projection stored before
+  this release keeps its `max_artifact_age_secs` and keeps deciding nothing.
+  The `max-artifact-age` policy-violation metric key stays in its closed label
+  set — it is the domain's stable rule id — but the catalog no longer claims
+  the promotion gate emits it.
+
+All four are the [ADR 0015](docs/adr/0015-apply-time-linter-inert-fields-and-naming.md)
+accepted-at-apply-inert-at-runtime block, closed the way that ADR prescribes:
+a fail-closed apply-time rejection that points the operator at the missing
+enforcement, rather than removing the operator surface. The full set of named
+lint rows, each row's retirement trigger, and — separately — where the
+surfaces with *no* named row are actually validated is now a reference page:
+[`docs/architecture/reference/apply-time-linter-rows.md`](docs/architecture/reference/apply-time-linter-rows.md).
+`maxArtifactAge` is the surface that page found with neither a row nor a
+consumer, closed as its row 13.
 
 ## [0.14.0] - 2026-09-20
 
