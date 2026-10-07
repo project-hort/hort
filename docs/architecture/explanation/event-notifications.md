@@ -36,8 +36,10 @@ The `NotificationDispatcher`
 broadcast channel once per process and owns one tokio task per active
 subscription. It reconciles the task set every 30 seconds and on
 `subscription_changes` LISTEN/NOTIFY events, spawning tasks for newly
-active subscriptions and cancelling tasks whose rows vanished or were
-disabled.
+active subscriptions, cancelling tasks whose rows vanished or were
+disabled or whose owner no longer resolves to a delivery authority, and
+re-publishing a freshly synthesised owner principal into every task that
+survives the pass.
 
 **Delivery is driven by the event store, not by that channel**
 ([ADR 0061](../../adr/0061-store-driven-notification-delivery.md)). Each
@@ -241,11 +243,16 @@ would have traded one silent failure for the other.
 Each subscription also carries `snapshot_claims` — the creator's
 resolved claim set captured at create/update time as the delivery
 authority floor. The dispatcher synthesises the owner principal from
-that snapshot at task spawn, with one critical exception: any `"admin"`
-string in the snapshot is stripped and re-derived from the owner's live
-`is_admin` bit (`dispatcher.rs`, `synthesise_principal`), so a snapshot
-elevated by a then-admin actor cannot retroactively unlock privileged
-categories for an owner whose admin was revoked.
+that snapshot on every reconcile pass — for a task already running as
+much as for one being spawned — with one critical exception: any
+`"admin"` string in the snapshot is stripped and re-derived from the
+owner's live `is_admin` bit (`dispatcher.rs`, `synthesise_principal`),
+so a snapshot elevated by a then-admin actor cannot retroactively unlock
+privileged categories for an owner whose admin was revoked. The
+re-synthesised principal is published into the running task, which reads
+it per event, so revoking the bit takes effect within one reconcile
+interval; a principal that stops resolving at all — owner row gone,
+deactivated, or unreadable — cancels the task instead.
 
 Repository-capped API tokens cannot escape their cap through the
 durable side-effect either: a capped token must name an explicit

@@ -21,16 +21,51 @@ on:
       - 'LICENSE-APACHE'
       - 'CLAUDE.md'
   workflow_dispatch:
+  # Reusable: the publish workflows call this file as their pre-publish gate
+  # (`ci-gate` in docker-publish.yml and release.yml) so a `v*` tag cannot
+  # publish images, charts, crates or a GitHub Release while `security-audit`,
+  # `cargo-deny` or `attribution-sync` are red. GitHub Actions has no `needs:`
+  # across workflow boundaries, and a `uses:` call is how this repository
+  # already consumes e2e.yml and build-binaries.yml.
+  #
+  # Adding this trigger does not remove the three above: the standalone run on
+  # push / pull_request / workflow_dispatch is unchanged.
+  workflow_call:
+    inputs:
+      gate_for:
+        description: >-
+          Name of the publish workflow consuming this run as its gate
+          (`docker-publish` / `release`). Empty on CI's own push /
+          pull_request / workflow_dispatch runs. Two things below read it, and
+          both are wrong without it — see the `concurrency` comment and the
+          `build-binaries` job.
+        type: string
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
-# Concurrency: keyed by `event_name` + `ref` so push, pull_request, and
-# workflow_dispatch are isolated from each other. `cancel-in-progress` is
-# only true for auto-triggered runs (push / pull_request); a manual run
-# (`workflow_dispatch`) is never cancelled by a subsequent push.
+# Concurrency: keyed by the consuming workflow + `event_name` + `ref`, so push,
+# pull_request, and workflow_dispatch are isolated from each other, AND a run
+# called as a publish gate is isolated from CI's own run of the same ref.
+# `cancel-in-progress` is only true for auto-triggered runs (push /
+# pull_request); a manual run (`workflow_dispatch`) is never cancelled by a
+# subsequent push.
+#
+# Why `gate_for` is in the group. A `v*` tag starts three runs of this file: CI
+# itself, plus one per calling publish workflow. In a called workflow the
+# `github` context is the CALLER's, so `github.event_name` is `push` and
+# `github.ref` is the tag for all three — without a discriminator they share
+# one group, `cancel-in-progress` is true for a push, and the three cancel each
+# other until one survives. A cancelled gate blocks its publish chain, so every
+# tag would fail to publish. e2e.yml hit the same collision and solved it by
+# dropping its tag trigger (see its `on:` comment); that answer does not reach
+# here, because this file has TWO callers and they would still collide with
+# each other. `gate_for` is empty for CI's own runs, so their grouping is
+# exactly what it was.
 concurrency:
-  group: ci-${{ github.event_name }}-${{ github.ref }}
+  group: ci-${{ inputs.gate_for || 'standalone' }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
@@ -608,7 +643,17 @@ jobs:
     name: Build binaries (verify)
     # PRs + manual runs only: the release path builds these on tags, and a
     # post-merge main push needn't rebuild what the PR already verified.
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    #
+    # Never when this run is a publish gate (`gate_for` set), for a reason
+    # stronger than cost. In a called workflow `github.event_name` is the
+    # CALLER's event, so a `workflow_dispatch` of release.yml would run this
+    # verify build inside the same workflow run as release.yml's own
+    # `build-binaries` (publish: true). Both upload `${{ matrix.name }}` —
+    # `hort-cli-linux-amd64` and the rest — and artifact names must be unique
+    # per run, so the second upload fails and the real, cosign-signed release
+    # build is the one that dies. The verify build exists to prove a PR
+    # compiles; a publish workflow has the signed build for that.
+    if: ${{ !inputs.gate_for && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') }}
     permissions:
       contents: read
     uses: ./.github/workflows/build-binaries.yml

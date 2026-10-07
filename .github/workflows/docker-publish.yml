@@ -3,10 +3,21 @@ name: Docker Publish
 on:
   push:
     tags: ['v*']
+  # A manual dispatch picks its OWN ref, and dispatching a workflow needs only
+  # Actions write access — so the ref a dispatch carries is not a release
+  # decision and must not be read as one. Every job below that pushes, signs or
+  # attests therefore requires `startsWith(github.ref, 'refs/tags/v')` in its
+  # own `if:`: a dispatch against `develop`, or any other writable ref, builds
+  # nothing, pushes nothing and signs nothing.
+  #
+  # With the ref pinned to a release tag, `docker/metadata-action`'s
+  # `type=semver` entries in `merge` derive the version tags FROM THE REF, so
+  # the input below can only ADD a tag to that same digest. `merge` accepts
+  # exactly the two values this description names and rejects the rest.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag (e.g., v1.0.0, latest)'
+        description: 'Additional image tag — `latest`, or this release tag itself (e.g. v1.0.0). Any other value is rejected. The ref must be a refs/tags/v* release tag.'
         required: true
         default: 'latest'
 
@@ -32,6 +43,82 @@ env:
   WORKER_IMAGE: ${{ github.repository }}-worker
 
 jobs:
+  # ════════════════════════════════════════════════════════════════════════════
+  # CI GATE — the advisory and attribution checks run BEFORE anything is built
+  # ════════════════════════════════════════════════════════════════════════════
+  # A `v*` tag starts this workflow, ci.yml and release.yml independently, and
+  # GitHub Actions has no `needs:` across workflow boundaries. So ci.yml's
+  # `security-audit` (`cargo audit --deny warnings`), `cargo-deny` and
+  # `attribution-sync` (`scripts/check-attribution.sh`) jobs could be RED while
+  # this workflow published and cosign-signed the images and the Helm chart —
+  # a tagged commit with a fresh advisory, a banned dependency or stale
+  # THIRD-PARTY-LICENSES shipping anyway (ADR 0047 / ADR 0049 promise the
+  # opposite). Calling ci.yml as a reusable workflow puts those checks inside
+  # THIS run's dependency graph, where `needs:` can hold the publish.
+  #
+  # The gate is the WHOLE ci.yml run, not only those three jobs: a `uses:`
+  # caller waits on every job the callee defines, so clippy, the unit and
+  # integration suites and coverage hold the publish too. That is stricter than
+  # ci.yml's own `ci-complete` roll-up, which lets a red `coverage` through, and
+  # stricter in the fail-closed direction — the one this gate exists for.
+  #
+  # `uses:` rather than `workflow_run:` deliberately: a `workflow_run`-triggered
+  # run executes in the default branch's context, not the tag's, which is the
+  # wrong commit for a gate whose whole claim is "these checks passed for THIS
+  # artifact". GitLab's `security:attribution-sync` already gates GitLab's own
+  # image/chart stages on tags; it simply cannot stop a GitHub workflow.
+  #
+  # Cost, named rather than hidden: on a non-alpha tag ci.yml runs three times —
+  # once standalone, once per calling publish workflow. That is accepted. The
+  # alternative, extracting the three security jobs into their own small
+  # reusable workflow so only the cheap part repeats, is a restructuring of
+  # ci.yml for a cost nobody has measured.
+  ci-gate:
+    name: 🔐 CI Gate (audit / deny / attribution)
+    # The same condition as `build-images`, the root it gates — two independent
+    # requirements, and both have to hold:
+    #
+    #   startsWith(github.ref, 'refs/tags/v')
+    #       The ref is a release tag. A dispatch chooses its own ref, so
+    #       without this test a dispatch from any writable branch reaches this
+    #       whole public chain; with it, nothing here even starts.
+    #   !contains(github.ref, '-alpha.')
+    #       An `-alpha.N` tag is hort's internal-only track (ADR 0048) and this
+    #       public chain skips on it.
+    #
+    # The two are not redundant: `refs/tags/v1.2.3-alpha.1` passes the first
+    # test and is excluded only by the second.
+    #
+    # A gate job without these conditions would still RUN and burn a full CI
+    # run for a chain that then skips. `build-images` keeps its own copy rather
+    # than relying on the skip cascade from here, so both exclusions stay
+    # readable at the job they are about.
+    #
+    # This job cannot also carry `environment: release`: Actions rejects
+    # `environment:` on a `uses:` job (only `name`, `uses`, `with`, `secrets`,
+    # `needs`, `if` and `permissions` are allowed there), so the environment
+    # declaration starts at `build-images`.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-alpha.') }}
+    # A called workflow cannot request more than its caller grants — Actions
+    # fails the run outright on an escalation — so this is the UNION of the
+    # job-level requests inside ci.yml, not what the gate itself uses:
+    #   contents: read       every job checks out;
+    #   id-token: write      hort-deps-gate / check-rust / test-backend-unit /
+    #                        coverage mint the hort OIDC token (a no-op unless
+    #                        HORT_PROXY_ACTIVE, which is false off a same-repo
+    #                        PR — so nothing mints anything on a tag);
+    #   pull-requests: write hort-deps-gate's quarantine-triage comment.
+    # This is a ceiling for the callee, not a grant to anything else here; each
+    # ci.yml job still narrows to its own declared set, and these are exactly
+    # the permissions ci.yml already has when it runs standalone on this tag.
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    uses: ./.github/workflows/ci.yml
+    with:
+      gate_for: docker-publish
+
   # Build EVERY published image (server + worker) on EVERY supported arch in a
   # single matrix. The image axis (`server`/`worker`) and the platform axis
   # (`amd64`/`arm64`) are independent, so a worker-specific build failure does
@@ -42,18 +129,75 @@ jobs:
   build-images:
     name: ${{ matrix.image }} (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
+    # The public publish path carries the same protected environment as the
+    # internal mirror jobs further down (`mirror-to-hort-oci`,
+    # `mirror-to-hort-base`, `publish-chart-registry-hort-rs`) — which had it
+    # while the jobs publishing to ghcr.io, the most-consumed artifacts hort
+    # ships, did not. `merge` and `publish-chart` declare it too.
+    #
+    # READ THIS BEFORE TRUSTING IT. A GitHub environment gates a job only if
+    # the REPOSITORY SETTINGS carry protection rules — Settings → Environments
+    # → release → required reviewers, and/or a deployment branch/tag rule. Those
+    # settings live outside this tree, nothing in this repository can assert
+    # them, and without them the declaration is inert: it mints a deployment
+    # record and gates nothing. The intended rules are the ones ADR 0034 and
+    # release.yml's `hort-publish` comment already document — tag refs only
+    # (`refs/tags/v*`) plus at least one reviewer.
+    #
+    # So this line is NOT the guarantee that a dispatch cannot publish. The
+    # `if:` below is, it depends on no setting outside this file, and it must
+    # never be weakened on the grounds that the environment will catch it.
+    #
+    # Cost, named rather than hidden: an environment mints a deployment record
+    # per referencing job run, so a release now stamps them for this matrix
+    # (4) plus `merge` (2) and `publish-chart` (1) as well as the internal
+    # mirrors. No new shape — this workflow already chains three sequential
+    # `environment: release` jobs in one run.
+    environment: release
+    # Nothing is built before the advisory / attribution gate passes. No `if:`
+    # override on this edge: a failed or cancelled `ci-gate` skips this job
+    # through Actions' default behaviour, which is the fail-closed outcome.
+    needs: [ci-gate]
     # `-alpha.N` tags are hort's internal-only pre-release track (ADR 0048):
     # staging + the local hort registry, never this public ghcr publish. The
     # internal build/publish happens instead via the GitLab pipeline
     # (`.gitlab-ci.yml` `build-images:*` / `helm:lint-and-publish`, tag-regex
-    # gated to include `alpha`). This is the root job of the public-publish
-    # chain — `scan-containers` / `merge` / `mirror-to-hort-oci` /
-    # `publish-chart` / `verify-published` all transitively `needs:` it (or
-    # `merge`), so skipping it here cascades through the rest of the
-    # workflow's default "skip if a needed job was skipped" behaviour.
-    # `summary` is the one job that overrides that default (`if: always()`)
-    # and needs its own matching guard — see below.
-    if: ${{ !contains(github.ref, '-alpha.') }}
+    # gated to include `alpha`).
+    #
+    # This is the root job of the IMAGE chain — `ci-gate` above is the root of
+    # the workflow — and two separate things follow from that. An earlier
+    # wording put them in one sentence, which read as though reaching this job
+    # and being in the publish chain were the same property:
+    #
+    # 1. Skip cascade (what the `if:` below is for). EVERY other job here
+    #    reaches `build-images` through `needs:` — `scan-containers` and `merge`
+    #    directly, all the rest via `merge` — so skipping it on an `-alpha.`
+    #    ref skips all of them through Actions' default "skip if a needed job
+    #    was skipped" behaviour. `summary` is the one job that overrides that
+    #    default (`if: always()`) and therefore needs its own matching guard —
+    #    see below. `ci-gate` is UPSTREAM of this job and so cannot inherit the
+    #    cascade either; it carries the same condition itself.
+    # 2. Publish chain (a narrower set). Reaching `build-images` does not make
+    #    a job part of the publish chain. That chain is
+    #    `ci-gate` → `build-images` → `scan-containers` → `merge` →
+    #    { `publish-chart`, `mirror-to-hort-oci` → `mirror-to-hort-base` } →
+    #    `verify-published` / `publish-chart-registry-hort-rs`. Both gates sit
+    #    between the source and the first push — `ci-gate` before anything is
+    #    built, the CVE gate between the build and the first tagged push — so a
+    #    fresh advisory, a banned dependency, stale attribution or a fixable
+    #    CRITICAL holds the publish instead of only failing its own job beside
+    #    it. `summary` is a reporter, not a publisher, and is deliberately not
+    #    in this chain.
+    #
+    # The release-tag requirement is a THIRD thing, and it is deliberately not
+    # left to the skip cascade: every job in that chain which pushes, signs or
+    # attests states `startsWith(github.ref, 'refs/tags/v')` itself. Neither
+    # gate above helps here — a dispatch from a branch passes CI and the CVE
+    # scan perfectly well — and a cascade is only as strong as the `if:` of the
+    # job inheriting it, which an `always()` anywhere downstream silently
+    # voids. Per-job, "no release tag, no published artifact" is readable at
+    # every job it is about and survives an edit elsewhere.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-alpha.') }}
     permissions:
       contents: read
       packages: write
@@ -150,18 +294,60 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # SCAN-CONTAINERS: the publish-path CVE gate, and a prerequisite of `merge`.
+  #
+  # Matrixed over exactly the image × arch set `build-images` pushes and `merge`
+  # publishes, so every digest that lands on ghcr.io has been scanned. A
+  # single-entry scan of server/amd64 left the worker image and both arm64
+  # variants with no scan input at all.
+  #
+  # The runner stays amd64 for all four entries: Trivy inspects the layers of a
+  # digest it pulls from the registry, so an arm64 image needs no arm64 runner.
+  #
+  # `fail-fast: false`, as in `build-images` and `merge`: the job's output is
+  # the list of what has to be fixed before the release can go out, so one
+  # entry's fixable CRITICAL must not cancel the other three and hide theirs.
+  # This costs nothing in gate strength — `merge` waits for the whole matrix,
+  # and one failed entry is enough to hold the publish. Note that this is
+  # job-level and therefore all-or-nothing across images: `needs:` has no
+  # per-matrix-entry granularity, so a CRITICAL in the worker image holds the
+  # server publish too. That is the conservative direction for a release gate.
+  # ════════════════════════════════════════════════════════════════════════════
   scan-containers:
-    name: Security Scan
+    name: Security Scan (${{ matrix.image }}/${{ matrix.arch }})
     runs-on: ubuntu-24.04
     needs: [build-images]
     permissions:
       contents: read
       packages: read
       security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [server, worker]
+        arch: [amd64, arm64]
+    env:
+      # Same resolution `build-images` and `merge` use — project-hort/hort-server
+      # or project-hort/hort-worker.
+      IMAGE_NAME: ${{ github.repository }}-${{ matrix.image }}
+      # One SARIF file and one Security-tab category per matrix entry. A shared
+      # category makes GitHub treat each upload as a new full result set for
+      # the same analysis, so the four entries overwrite one another and the
+      # tab shows whichever landed last as the whole truth.
+      SARIF_FILE: trivy-${{ matrix.image }}-${{ matrix.arch }}.sarif
+      SARIF_CATEGORY: trivy-${{ matrix.image }}-${{ matrix.arch }}
 
     steps:
+      # Checked out for `.trivyignore`, which Trivy reads from the working
+      # directory — the accepted-CVE list is the gate's escape hatch.
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # buildx supplies `imagetools inspect` for the digest resolution below;
+      # the same idiom `merge` and `mirror-to-hort-base` use.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Log in to Container Registry
         uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4
@@ -170,26 +356,64 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download backend amd64 digest
+      - name: Download digest
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: server-digests-amd64
-          path: /tmp/server-digests
+          name: ${{ matrix.image }}-digests-${{ matrix.arch }}
+          path: /tmp/digests
 
       - name: Resolve image reference
         id: refs
+        env:
+          ARCH: ${{ matrix.arch }}
+          ARTIFACT: ${{ matrix.image }}-digests-${{ matrix.arch }}
         run: |
-          BACKEND_DIGEST=$(ls /tmp/server-digests/)
-          echo "backend=${{ env.REGISTRY }}/${{ env.SERVER_IMAGE }}@sha256:${BACKEND_DIGEST}" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          # `build-images` exports exactly one zero-byte file per entry, named
+          # for the pushed digest minus its `sha256:` prefix. Assert the count:
+          # several files would splice into a multi-line $GITHUB_OUTPUT value,
+          # and now that this job gates the publish a malformed ref has to fail
+          # here with a clear message rather than as an opaque Trivy error.
+          count=$(find /tmp/digests -maxdepth 1 -type f | wc -l)
+          if [ "${count}" -ne 1 ]; then
+            echo "::error::expected exactly 1 digest file in ${ARTIFACT}, found ${count}"
+            exit 1
+          fi
+          pushed="sha256:$(basename "$(find /tmp/digests -maxdepth 1 -type f)")"
+          repo="${REGISTRY}/${IMAGE_NAME}"
+          echo "pushed by build-images: ${repo}@${pushed}"
+
+          # With provenance + SBOM attestations on (see `build-images`), buildx
+          # wraps even a single-platform build in an OCI image index: the
+          # platform's image manifest plus an `unknown/unknown` attestation
+          # manifest. So `${pushed}` is an INDEX digest, and Trivy resolving an
+          # index picks a child by platform — defaulting to the runner's
+          # linux/amd64, because trivy only passes a platform to
+          # go-containerregistry when `--platform` is given explicitly, and the
+          # pinned trivy-action has no input for it. On the arm64 entries that
+          # default has no matching child and the scan dies with "no child with
+          # platform ... in index", which is not a CVE verdict but would still
+          # hold the publish. Resolve the per-arch image manifest here instead:
+          # it is unambiguous for Trivy, and it is the exact object `merge`
+          # folds into the published multi-arch tag.
+          raw=$(docker buildx imagetools inspect --raw "${repo}@${pushed}")
+          if jq -e 'has("manifests")' >/dev/null 2>&1 <<<"${raw}"; then
+            scan_digest=$(jq -r --arg arch "${ARCH}" \
+              '[.manifests[] | select(.platform.os == "linux" and .platform.architecture == $arch)]
+               | .[0].digest // empty' <<<"${raw}")
+            if [ -z "${scan_digest}" ]; then
+              echo "::error::no linux/${ARCH} manifest in index ${repo}@${pushed}"
+              exit 1
+            fi
+          else
+            # Not an index (attestations off) — the exported digest IS the
+            # image manifest, and there is nothing to resolve.
+            scan_digest="${pushed}"
+          fi
+          echo "ref=${repo}@${scan_digest}" >> "$GITHUB_OUTPUT"
+          echo "scanning ${repo}@${scan_digest}"
 
       # --- Trivy CVE scanning ---
-      # --ignore-unfixed: only fail on CVEs with available patches.
-      # Unpatched UBI base image CVEs (Red Hat's responsibility) are still
-      # reported in SARIF for visibility but don't block the build.
-      # Trivy scans upload SARIF to GitHub Security tab for visibility.
-      # The publish-path scan below is BLOCKING on fixable CRITICALs (exit-code
-      # 1, INFRA-3); unfixed base-image CVEs still pass (`ignore-unfixed: true`)
-      # and accepted ones are tracked in `.trivyignore`.
       # NOTE: trivy binary extracted from official GHCR image because the
       # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
       - name: Install Trivy
@@ -199,72 +423,128 @@ jobs:
           docker rm "$CONTAINER_ID"
           trivy --version
 
-      # Publish-path gate: fail the build on any CRITICAL CVE that has a fix
-      # available upstream (`ignore-unfixed: true` still lets unpatched base-image
-      # CVEs through — those are tracked in `.trivyignore` / the scheduled scan).
-      # The SARIF is still produced and uploaded (`if: always()` below) so the
-      # Security tab keeps full visibility even when this step fails.
-      # Two separate invocations because trivy-action's SARIF mode ignores
-      # the severity filter ("Building SARIF report with all severities")
-      # and the exit code then fires on ANY fixable finding — a single
-      # sarif+exit-code step therefore gates on a policy this workflow
+      # Two separate invocations, deliberately. trivy-action's SARIF mode
+      # ignores the severity filter ("Building SARIF report with all
+      # severities") and the exit code then fires on ANY fixable finding — a
+      # single sarif+exit-code step therefore gates on a policy this workflow
       # never declared (it failed v0.12.0-beta.2 on HIGH-and-below openssl
-      # findings in the base image). Splitting keeps the Security tab
-      # fully populated while the gate enforces exactly the documented
-      # policy: fixable CRITICALs block, everything else is visibility.
+      # findings in the base image). Splitting keeps the Security tab fully
+      # populated while the gate below enforces exactly the documented policy.
       # The second scan reuses TRIVY_CACHE_DIR, so it costs seconds.
-      - name: Trivy scan - Backend (SARIF, all severities, non-blocking)
+      - name: Trivy scan (SARIF, all severities, non-blocking)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
-          image-ref: ${{ steps.refs.outputs.backend }}
+          image-ref: ${{ steps.refs.outputs.ref }}
           format: 'sarif'
-          output: 'backend-trivy.sarif'
+          output: ${{ env.SARIF_FILE }}
           ignore-unfixed: true
           exit-code: '0'
           skip-setup-trivy: true
 
-      - name: Trivy gate - Backend (fixable CRITICALs block)
+      # THE gate, and the only step in this job allowed to decide its result.
+      # `merge` and every publishing job downstream of it reach this job
+      # through `needs:`, so a non-zero exit here stops the publish instead of
+      # merely failing a job beside it.
+      #
+      # The policy itself is unchanged by that move: a CRITICAL CVE with a fix
+      # available upstream blocks. `ignore-unfixed: true` still lets CVEs with
+      # no published fix through — nothing in this repository can clear those,
+      # they are the distroless/Debian base maintainers' to patch, and the
+      # weekly Scheduled Container Scan workflow tracks them instead. HIGH and
+      # below stay reported-only in the SARIF above, and consciously accepted
+      # CRITICALs are listed in `.trivyignore`.
+      - name: Trivy gate (fixable CRITICALs block the publish)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # 0.36.0
         with:
-          image-ref: ${{ steps.refs.outputs.backend }}
+          image-ref: ${{ steps.refs.outputs.ref }}
           format: 'table'
           severity: 'CRITICAL'
           ignore-unfixed: true
           exit-code: '1'
           skip-setup-trivy: true
 
-      - name: Upload Backend Trivy SARIF
+      # Visibility, not verdict — and now load-bearing that it stays that way.
+      # Since this job gates the publish, an outage in the CodeQL upload action
+      # or the artifact service would otherwise hold a release on something
+      # that is not a security finding. `continue-on-error: true` keeps the
+      # Trivy gate step above as the sole decider; `if: always()` still uploads
+      # when the gate failed, which is the run where the Security tab matters
+      # most.
+      - name: Upload Trivy SARIF
         uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         if: always()
+        continue-on-error: true
         with:
-          sarif_file: 'backend-trivy.sarif'
-          category: 'trivy-backend'
+          sarif_file: ${{ env.SARIF_FILE }}
+          category: ${{ env.SARIF_CATEGORY }}
 
       - name: Upload Trivy report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
+        continue-on-error: true
         with:
-          name: trivy-scan-reports
-          path: |
-            backend-trivy.sarif
+          # Per-entry name: upload-artifact v4+ rejects a second upload under a
+          # name another matrix entry already claimed.
+          name: trivy-scan-reports-${{ matrix.image }}-${{ matrix.arch }}
+          path: ${{ env.SARIF_FILE }}
           retention-days: 90
 
       - name: Scan summary
         if: always()
+        env:
+          IMAGE: ${{ matrix.image }}
+          ARCH: ${{ matrix.arch }}
+          REF: ${{ steps.refs.outputs.ref }}
         run: |
-          echo "## Container Security Scan Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Trivy CVE Scan (server image)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Policy**: CRITICAL / HIGH CVEs reported (informational; unfixed base-image CVEs do not block)" >> $GITHUB_STEP_SUMMARY
-          echo "- **Server**: $([ -f backend-trivy.sarif ] && echo 'Scanned' || echo 'Skipped')" >> $GITHUB_STEP_SUMMARY
+          if [ -f "${SARIF_FILE}" ]; then
+            sarif_state="uploaded under Security-tab category \`${SARIF_CATEGORY}\`"
+          else
+            sarif_state="not produced — the all-severities scan did not complete"
+          fi
+          {
+            echo "## Container CVE scan — ${IMAGE} (linux/${ARCH})"
+            echo ""
+            echo "- **Scanned digest**: \`${REF:-unresolved}\`"
+            echo "- **BLOCKING**: a CRITICAL CVE with a fix available upstream fails this"
+            echo "  job, and \`merge\` plus every publishing job downstream of it reach this"
+            echo "  job through \`needs:\` — so the images and the chart do not get published."
+            echo "  Clear it with a base-image or dependency bump, or record a reviewed"
+            echo "  acceptance in \`.trivyignore\`."
+            echo "- **Reported, not blocking**: HIGH and below, and any CVE with no upstream"
+            echo "  fix (\`ignore-unfixed: true\`). The weekly Scheduled Container Scan"
+            echo "  workflow tracks those."
+            echo "- **SARIF**: ${sarif_state}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # One manifest-list merge + cosign-sign + provenance attestation per image.
   # Matrixed over the same image axis as `build-images`; each entry fans in its
   # own per-arch digests (`<image>-digests-*`) into a single multi-arch tag set.
+  #
+  # This is the first job that makes anything public: `imagetools create`
+  # pushes the semver/`latest` tags and `cosign sign` attests the digest. It
+  # therefore `needs: scan-containers` as well as `build-images` — that edge is
+  # what makes the CVE gate a publish prerequisite rather than a job that fails
+  # beside the publish. Every job downstream reaches `scan-containers` through
+  # this edge (`publish-chart`, `verify-published`, both mirrors and
+  # `publish-chart-registry-hort-rs` all `needs:` `merge`), so this one line
+  # gates the whole chain — and since `scan-containers` needs `build-images`,
+  # which needs `ci-gate`, the same line carries the advisory / attribution gate
+  # to every one of those jobs too. `build-images` stays listed explicitly: it
+  # is where the digest artifacts this job downloads come from, and the
+  # `-alpha.` skip guard lives there.
   merge:
     name: ${{ matrix.image }} Multi-Arch Manifest
     runs-on: ubuntu-latest
-    needs: [build-images]
+    # The protected environment, and precisely what it does and does not buy —
+    # see the long note on `build-images`. The `if:` below, not this line, is
+    # what makes a branch dispatch unable to publish.
+    environment: release
+    needs: [build-images, scan-containers]
+    # This is the job that pushes the consumable tags, signs the digest and
+    # attests it, so it states the release-tag requirement itself instead of
+    # inheriting it from `build-images` (see the `if:` note there). The
+    # `-alpha.` exclusion keeps arriving through the cascade, unchanged.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: read
       packages: write
@@ -279,6 +559,60 @@ jobs:
       IMAGE_NAME: ${{ github.repository }}-${{ matrix.image }}
 
     steps:
+      # The dispatch input can only ADD a tag. The job's `if:` pins the ref to a
+      # release tag, so the `type=semver` entries below already derive `X.Y.Z`
+      # and `X.Y` FROM THE REF; all the input can still do is put one more tag
+      # on that same digest. Exactly two values mean anything there — `latest`,
+      # and the release tag itself — and those are the two the input's own
+      # description names. Anything else moves a version tag onto a build it
+      # does not describe: dispatched on the `v0.14.1` ref, an input of
+      # `v2.0.0` would push, cosign-sign and attest `v2.0.0` pointing at
+      # 0.14.1's code, under hort's own release identity.
+      #
+      # Rejected here rather than quietly dropped by the `enable=` expression:
+      # a dropped tag is indistinguishable from a successful publish in the run
+      # summary, and the operator did ask for that tag. Fail-closed rejection,
+      # not a degraded path (ADR 0016). First step in the job, so it fails
+      # before any registry login.
+      #
+      # The `v`-less spelling (`0.14.1`) is rejected too, and nothing is lost by
+      # that: `type=semver,pattern={{version}}` already pushes exactly that tag.
+      #
+      # Scope note on `latest`, so the next reader does not have to re-derive
+      # it. On a stable tag the value is a no-op — the `type=raw,value=latest`
+      # entry below already emits it. The one ref where it would do something
+      # is a public pre-release (`-beta.N` / `-rc.N`, reserved but not in use
+      # today; `-alpha.N` never reaches this job at all), where it would move
+      # `:latest` onto a pre-release — which a TAG PUSH cannot do, because
+      # that entry's `enable=` carries a `!contains(github.ref, '-')`
+      # stability guard this comparison does not. Tightening that is a
+      # separate decision about what the input is for, not part of pinning it
+      # to the ref.
+      - name: Validate dispatch tag input
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${INPUT_TAG}" != "latest" ] && [ "${INPUT_TAG}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag input '${INPUT_TAG}' is neither 'latest' nor this ref's own tag '${GITHUB_REF_NAME}'. The version tags are derived from the ref; the input may only add 'latest' or '${GITHUB_REF_NAME}'."
+            exit 1
+          fi
+          # `latest` must obey the same stability rule the tag-push path obeys.
+          # The `type=raw,value=latest` entry below carries
+          # `!contains(github.ref, '-')`, so a tag push never moves `:latest`
+          # onto a pre-release. Without this check the dispatch path would be
+          # the one way to do exactly that — the input's only effect on a
+          # stable tag is a no-op (the entry already emits `latest`), so a
+          # pre-release ref is the single case where it changes anything, and
+          # it is the case the other path forbids. A dispatch must not permit
+          # what a tag push rejects.
+          if [ "${INPUT_TAG}" = "latest" ] && [ "${GITHUB_REF_NAME}" != "${GITHUB_REF_NAME%%-*}" ]; then
+            echo "::error::ref '${GITHUB_REF_NAME}' is a pre-release, so 'latest' is refused: moving ':latest' onto a pre-release is what the tag-push path's stability guard prevents. Dispatch with '${GITHUB_REF_NAME}' instead."
+            exit 1
+          fi
+          echo "tag input '${INPUT_TAG}' accepted for ref ${GITHUB_REF_NAME}"
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -299,6 +633,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The `type=semver` entries derive the version tags from the ref, which
+      # this job's `if:` guarantees is a `refs/tags/v*` tag. The final
+      # `type=raw` entry is the dispatch input, and it is validated by the
+      # first step of this job — `latest` or this ref's own tag, nothing else.
       - name: Extract metadata (ghcr.io)
         id: meta
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6
@@ -510,7 +848,16 @@ jobs:
   publish-chart:
     name: Publish Helm Chart
     runs-on: ubuntu-latest
+    # The protected environment, and precisely what it does and does not buy —
+    # see the long note on `build-images`. The `if:` below, not this line, is
+    # what makes a branch dispatch unable to publish.
+    environment: release
     needs: [merge]
+    # This job pushes the chart and cosign-signs it, so it states the
+    # release-tag requirement itself rather than inheriting it from `merge`
+    # (see the `if:` note on `build-images`). It is also what lets the
+    # `Chart.yaml` assertion below run on every path this job can take.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     outputs:
       chart-digest: ${{ steps.chart.outputs.digest }}
     permissions:
@@ -521,28 +868,35 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The version comes from the ref on BOTH paths. This job's `if:` requires
+      # a `refs/tags/v*` ref, so a dispatch carries a release tag exactly as a
+      # push does and there is no second source of truth to choose between.
+      #
+      # What this replaces: the dispatch branch read the operator's `tag` input
+      # instead, stripped a leading `v`, and accepted anything SemVer-shaped.
+      # That is how a dispatch could publish and sign a chart version the tree
+      # never declared — and the `Chart.yaml` assertion below was skipped on
+      # precisely that path, so nothing compared the two.
       - name: Resolve chart version
         id: ver
         run: |
           set -euo pipefail
-          if [ "${GITHUB_REF}" != "${GITHUB_REF#refs/tags/v}" ]; then
-            # Tag push: vX.Y.Z[-pre] → X.Y.Z[-pre].
-            VERSION="${GITHUB_REF#refs/tags/v}"
-          else
-            # workflow_dispatch: use the provided tag input, stripping any
-            # leading 'v'. The 'latest' sentinel is not a chart version.
-            VERSION="${INPUT_TAG#v}"
-          fi
+          # vX.Y.Z[-pre] → X.Y.Z[-pre].
+          VERSION="${GITHUB_REF#refs/tags/v}"
           if ! printf '%s' "${VERSION}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-            echo "::notice::'${VERSION}' is not a SemVer chart version (e.g. a 'latest' dispatch); skipping chart publish."
+            # Reachable only for a malformed release tag — `refs/tags/vfoo`
+            # satisfies this job's `if:` — never for a dispatch sentinel any
+            # more. No chart version can be derived from it, so skip rather
+            # than invent one; the run does not pass silently either, because
+            # `verify-published` probes `charts/hort-server:${VERSION}` on
+            # every `refs/tags/v*` ref and will not find it.
+            echo "::notice::'${VERSION}' is not a SemVer chart version; skipping chart publish."
             echo "publish=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "publish=true" >> "$GITHUB_OUTPUT"
           echo "Chart version: ${VERSION}"
-        env:
-          INPUT_TAG: ${{ github.event.inputs.tag }}
 
       - name: Verify helm is available
         if: steps.ver.outputs.publish == 'true'
@@ -574,9 +928,15 @@ jobs:
       # binary are versioned together). `helm package --version/--app-version`
       # overrides at publish time, but a stale Chart.yaml drifts from §3.4 for
       # source-tree consumers (`helm install ./deploy/...`, `helm template`).
-      # Skipped on workflow_dispatch where the version is operator-supplied.
+      #
+      # Runs on every path this job can take. It used to carry
+      # `&& startsWith(github.ref, 'refs/tags/v')`, which exempted the one path
+      # where the version came from neither the tree nor the ref — the
+      # operator-supplied dispatch input. That exemption was the whole reason
+      # the assertion could be bypassed, and it has nothing left to exempt now
+      # that the job requires a release tag and the version is read off it.
       - name: Assert Chart.yaml matches tag (§3.4)
-        if: steps.ver.outputs.publish == 'true' && startsWith(github.ref, 'refs/tags/v')
+        if: steps.ver.outputs.publish == 'true'
         run: |
           set -euo pipefail
           VERSION="${{ steps.ver.outputs.version }}"
@@ -914,7 +1274,45 @@ jobs:
     if: ${{ always() && !contains(github.ref, '-alpha.') }}
     steps:
       - name: Summary
+        env:
+          MERGE_RESULT: ${{ needs.merge.result }}
+          CHART_RESULT: ${{ needs.publish-chart.result }}
         run: |
+          # `if: always()` above also runs this job when the publish chain
+          # stopped, so the heading has to follow what actually happened. A
+          # summary that lists image refs and a `cosign verify` command for a
+          # run that pushed nothing is operator-facing misinformation, and the
+          # gates below make that outcome reachable on a tag that was meant to
+          # publish — `merge` is the job that pushes the tags and signs them,
+          # so its result is the one that decides what this summary may claim.
+          #
+          # Take the ref first, though. A dispatch chooses its own ref and this
+          # workflow publishes only from a release tag, so on any other ref the
+          # whole chain skips without a single gate having run. That has nothing
+          # to do with a red gate and must not be reported as one — and ten grey
+          # skipped boxes do not explain themselves.
+          if [ "${GITHUB_REF}" = "${GITHUB_REF#refs/tags/v}" ]; then
+            {
+              echo "## Nothing was published — the ref is not a release tag"
+              echo ""
+              echo "This workflow builds, pushes, signs and attests only from a \`refs/tags/v*\` ref. This run is on \`${GITHUB_REF}\`, so every job in the publish chain skipped: nothing was built and nothing reached a registry."
+              echo ""
+              echo "To publish, push the release tag (see \`RELEASING.md\`). Dispatching this workflow against a branch cannot publish, by design — the dispatcher picks the ref, and Actions write access is not a release approval."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "${MERGE_RESULT}" != "success" ]; then
+            echo "## Nothing was published" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The multi-arch merge did not succeed (\`${MERGE_RESULT}\`), so no image tag, signature, attestation or chart reached the registry." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Three things can hold the chain by design — read whichever one applies:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **CI Gate** (\`ci-gate\`, before anything is built): the whole CI run for this tag — most often \`security-audit\` (a RustSec advisory), \`cargo-deny\` (a banned dependency or license), or \`attribution-sync\` (stale \`THIRD-PARTY-LICENSES\`)." >> $GITHUB_STEP_SUMMARY
+            echo "- **Security Scan** (\`scan-containers\`, between build and push): a fixable CRITICAL CVE in any of the four scanned images." >> $GITHUB_STEP_SUMMARY
+            echo "- **Release approval** (\`environment: release\` on \`build-images\` / \`merge\` / \`publish-chart\`): a rejected or still-pending deployment review stops the chain too, and shows up as a skipped job rather than a red gate." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
           echo "## Published Artifacts" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Images" >> $GITHUB_STEP_SUMMARY
@@ -922,7 +1320,11 @@ jobs:
           echo "- \`${{ env.REGISTRY }}/${{ env.WORKER_IMAGE }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Helm Chart" >> $GITHUB_STEP_SUMMARY
-          echo "- \`oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/hort-server\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${CHART_RESULT}" = "success" ]; then
+            echo "- \`oci://${{ env.REGISTRY }}/${{ github.repository_owner }}/charts/hort-server\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **not published** (\`${CHART_RESULT}\`) — the images above are live, the chart is not." >> $GITHUB_STEP_SUMMARY
+          fi
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Supply Chain Security" >> $GITHUB_STEP_SUMMARY
           echo "- All images signed with [cosign](https://docs.sigstore.dev/cosign/overview/) keyless signing (GitHub OIDC)" >> $GITHUB_STEP_SUMMARY

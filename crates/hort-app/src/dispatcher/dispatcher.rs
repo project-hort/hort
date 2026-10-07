@@ -20,17 +20,24 @@
 //!   [`SubscriptionRepository::list_active`]; vanished subscriptions
 //!   have their per-task cancellation token fired, and new ones get a
 //!   spawn.
-//! - Owner-principal synthesis happens once **at task spawn**, not
-//!   every reconcile. The dispatcher loads the owner's `User` row via
-//!   [`UserRepository::find_by_id`] and synthesises a
-//!   [`CallerPrincipal`] from `subscription.snapshot_claims` with the
-//!   stale-`"admin"` strip + live-`is_admin` re-derivation (ADR 0012).
-//!   The 30s reconcile governs add/remove of tasks and
-//!   disabled-row teardown — it does **not** re-synthesise an
-//!   already-running task's principal. Live *grant* revocation is
-//!   still honored per delivered event via the `RbacEvaluator`
-//!   reload; only the spawn-frozen `is_admin`-bit input is not
-//!   refreshed until cancel+respawn (bounded accepted residual).
+//! - Owner-principal synthesis runs on **every** reconcile pass, for a
+//!   subscription that already has a task as much as for a new one. The
+//!   dispatcher loads the owner's `User` row via
+//!   [`UserRepository::find_by_id`], synthesises a [`CallerPrincipal`]
+//!   from `subscription.snapshot_claims` with the stale-`"admin"` strip
+//!   plus the live-`is_admin` re-derivation (ADR 0012), and publishes it
+//!   into the task's [`SubscriptionTaskDeps::owner_principal`] `ArcSwap`,
+//!   which the task re-reads per delivered event. The principal and the
+//!   `RbacEvaluator` are the two inputs the delivery filter's
+//!   `authorize` call takes, so each is bounded by one refresh cadence
+//!   — the reconcile interval here, `HORT_RBAC_REFRESH_SECS` for the
+//!   evaluator — and neither is fixed for the task's lifetime.
+//!   Revoking `User.is_admin` therefore stops a running task from
+//!   delivering privileged-category events without a cancel+respawn.
+//! - A subscription whose principal stops resolving — owner row gone,
+//!   deactivated, or unreadable — has its task **cancelled**, not left
+//!   running on the authority it was spawned with. That is the same
+//!   disposition a vanished or disabled row gets.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -259,22 +266,70 @@ impl NotificationDispatcher {
         // empty vec we still want to surface zero.
         emit_state_gauge(&active);
 
-        // Spawn new.
+        // Re-resolve every active subscription's owner principal, then
+        // spawn or republish. The principal is one of the two inputs
+        // the per-event delivery filter authorizes with, and the other
+        // (the `RbacEvaluator`) is republished on its own refresh
+        // cadence — so resolving this one only at spawn would decide
+        // `Permission::Admin` from a `User.is_admin` bit of unbounded
+        // age. One owner read per active subscription per pass is the
+        // cost of the two inputs ageing at the same rate.
         for sub in active {
-            if tasks.contains_key(&sub.id) {
+            let Some(principal) = self.synthesise_principal(&sub).await else {
+                // No resolvable principal means no authority to deliver
+                // under. A running task is torn down rather than left
+                // on the authority it was spawned with — the same
+                // disposition a vanished row gets above.
+                //
+                // This is uniform on purpose: a deactivated owner, a
+                // missing row and a *failed read* all land here, even
+                // though only the first two are statements about
+                // authority. Teardown is the one disposition that
+                // neither loses events nor widens authority, and both
+                // alternatives give up one of those:
+                //
+                // - Leaving the task on its existing principal would
+                //   extend the owner's last-known authority for as long
+                //   as the read keeps failing. That is unbounded, and it
+                //   is the opposite of the one-interval bound this
+                //   per-pass refresh exists to establish.
+                // - Leaving the task running with the `"admin"` claim
+                //   stripped would drop every privileged-category event
+                //   for the duration, silently and permanently: a
+                //   filtered event is `Disposition::Consumed`, which
+                //   advances the persisted position past it.
+                //
+                // A torn-down task resumes from the persisted
+                // `last_delivered_position`, so the cost is re-delivery
+                // bounded by `PROGRESS_DEBOUNCE` — duplicates the
+                // at-least-once contract already permits, in exchange
+                // for losing nothing and granting nothing.
+                if let Some(handle) = tasks.remove(&sub.id) {
+                    tracing::info!(
+                        subscription_id = %sub.id.0,
+                        owner_user_id = %sub.owner_user_id,
+                        "owner principal no longer resolves; cancelling task"
+                    );
+                    handle.cancel.cancel();
+                }
+                continue;
+            };
+            if let Some(handle) = tasks.get(&sub.id) {
+                // Already running: publish the refreshed principal in
+                // place. The task reads it on its next event; no
+                // cancel, no respawn, no cursor movement.
+                handle.owner_principal.store(Arc::new(principal));
                 continue;
             }
             let task_cancel = parent_cancel.child_token();
-            let Some(principal) = self.synthesise_principal(&sub).await else {
-                continue;
-            };
+            let owner_principal = Arc::new(ArcSwap::from_pointee(principal));
             let deps = SubscriptionTaskDeps {
                 event_store: self.publisher.clone(),
                 use_case: self.use_case.clone(),
                 rbac: self.rbac.clone(),
                 repositories: self.repository_repo.clone(),
                 event_visibility: self.event_visibility.clone(),
-                owner_principal: principal,
+                owner_principal: owner_principal.clone(),
                 notifiers: self.notifiers.clone(),
                 budget: Arc::new(Mutex::new(FailureBudget::new())),
                 progress: Arc::new(Mutex::new(ProgressDebouncer::new(
@@ -293,6 +348,7 @@ impl NotificationDispatcher {
                 TaskHandle {
                     join: handle,
                     cancel: task_cancel,
+                    owner_principal,
                 },
             );
         }
@@ -300,9 +356,20 @@ impl NotificationDispatcher {
 
     /// Build the per-task `CallerPrincipal` from the owner's User row
     /// and the subscription's `snapshot_claims` authority floor.
-    /// Returns `None` (skipping the task spawn) if the owner is
-    /// unknown, the lookup fails, or the owner is deactivated — those
-    /// signal stale state that the next reconcile will resolve.
+    ///
+    /// Called on every reconcile pass for every active subscription,
+    /// whether or not it already has a task: the result is the
+    /// authority the per-event delivery filter decides under, so its
+    /// freshness is bounded by this call's cadence.
+    ///
+    /// Returns `None` if the owner is unknown, the lookup fails, or the
+    /// owner is deactivated. The caller's disposition for `None` is the
+    /// same in all three cases and in both situations — no spawn for a
+    /// subscription without a task, cancellation for one with a task.
+    /// A transient lookup failure therefore costs a running task its
+    /// delivery loop until a later pass resolves the owner again, which
+    /// is the fail-closed direction: the alternative is delivering on
+    /// authority nothing could confirm.
     ///
     /// # Claim resolution
     ///
@@ -336,7 +403,7 @@ impl NotificationDispatcher {
                     tracing::info!(
                         subscription_id = %sub.id.0,
                         owner_user_id = %sub.owner_user_id,
-                        "owner deactivated; skipping task spawn"
+                        "owner deactivated; no delivery authority for this subscription"
                     );
                     return None;
                 }
@@ -384,7 +451,7 @@ impl NotificationDispatcher {
                     subscription_id = %sub.id.0,
                     owner_user_id = %sub.owner_user_id,
                     error = %e,
-                    "owner user lookup failed; skipping task spawn"
+                    "owner user lookup failed; no delivery authority for this subscription"
                 );
                 None
             }
@@ -400,6 +467,12 @@ struct TaskHandle {
     #[allow(dead_code)]
     join: JoinHandle<()>,
     cancel: CancellationToken,
+    /// The same `ArcSwap` the running task holds in its
+    /// [`SubscriptionTaskDeps`]. Kept here so a reconcile pass can
+    /// publish a freshly synthesised principal into a task it is not
+    /// otherwise touching — that write is the whole mechanism by which
+    /// a revoked `User.is_admin` reaches a running delivery walk.
+    owner_principal: Arc<ArcSwap<CallerPrincipal>>,
 }
 
 /// Build a degraded-state broadcast receiver — a closed channel that
@@ -441,8 +514,10 @@ mod tests {
     };
     use hort_domain::entities::user::{AuthProvider, User};
     use hort_domain::error::{DomainError, DomainResult};
-    use hort_domain::events::PersistedEvent;
-    use hort_domain::events::StreamCategory;
+    use hort_domain::events::{
+        Actor, ApiActor, DomainEvent, FilterSummary, PersistedEvent, RepositoryScopeKind,
+        StreamCategory, StreamId, SubscriptionCreated, TargetKindWire,
+    };
     use hort_domain::ports::event_notifier::{EventNotifier, NotifyOutcome};
     use hort_domain::ports::subscription_change_listener::SubscriptionChangeEvent;
     use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
@@ -451,6 +526,7 @@ mod tests {
     use url::Url;
     use uuid::Uuid;
 
+    use crate::dispatcher::subscription_task::STORE_POLL_INTERVAL;
     use crate::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
     use crate::use_cases::test_support::{
         MockArtifactGroupRepository, MockArtifactRepository, MockEventRepositoryResolver,
@@ -461,10 +537,18 @@ mod tests {
 
     struct RecordingNotifier {
         outcome: NotifyOutcome,
+        delivered: Mutex<Vec<u64>>,
     }
     impl RecordingNotifier {
         fn new(outcome: NotifyOutcome) -> Self {
-            Self { outcome }
+            Self {
+                outcome,
+                delivered: Mutex::new(Vec::new()),
+            }
+        }
+        /// Global positions handed to `notify`, in delivery order.
+        fn delivered(&self) -> Vec<u64> {
+            self.delivered.lock().unwrap().clone()
         }
     }
     impl EventNotifier for RecordingNotifier {
@@ -472,8 +556,12 @@ mod tests {
             &'a self,
             _t: &'a SubscriptionTarget,
             _subscription_id: SubscriptionId,
-            _e: &'a [PersistedEvent],
+            e: &'a [PersistedEvent],
         ) -> BoxFuture<'a, NotifyOutcome> {
+            self.delivered
+                .lock()
+                .unwrap()
+                .extend(e.iter().map(|ev| ev.global_position));
             let outcome = self.outcome.clone();
             Box::pin(async move { outcome })
         }
@@ -689,12 +777,74 @@ mod tests {
         }
     }
 
+    /// Subscription selecting the privileged `User` category under admin
+    /// scope. Delivery of a `User`-category event with no repository
+    /// association turns on `Permission::Admin` for the owner principal
+    /// and on nothing else, which is exactly the decision the per-event
+    /// principal reload is there to keep current.
+    fn privileged_sub(owner_user_id: Uuid) -> Subscription {
+        let mut s = make_sub(owner_user_id);
+        s.filter.categories = vec![StreamCategory::User];
+        s
+    }
+
+    /// `SubscriptionCreated` on the owner's user stream: privileged
+    /// category (`User` is in the `requires_admin` set) and no
+    /// repository association, so the delivery filter decides it on the
+    /// owner's live admin authority alone.
+    fn privileged_event(owner_user_id: Uuid, global_position: u64) -> PersistedEvent {
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::user(owner_user_id),
+            stream_position: global_position,
+            global_position,
+            event: DomainEvent::SubscriptionCreated(SubscriptionCreated {
+                subscription_id: Uuid::new_v4(),
+                owner_user_id,
+                target_kind: TargetKindWire::Webhook,
+                filter_summary: FilterSummary {
+                    categories: vec!["user".into()],
+                    event_type_count: 0,
+                    repository_scope_kind: RepositoryScopeKind::All,
+                    predicate_hash: [0; 32],
+                },
+                snapshot_claims_count: 0,
+                at: Utc::now(),
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(ApiActor {
+                user_id: owner_user_id,
+            }),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
     fn make_dispatcher(
         sub_repo: Arc<MockSubRepo>,
         user_repo: Arc<MockUserRepository>,
         change_listener: Arc<dyn SubscriptionChangeListener>,
     ) -> NotificationDispatcher {
-        let mock_es = Arc::new(MockEventStore::new());
+        make_dispatcher_with(
+            sub_repo,
+            user_repo,
+            change_listener,
+            Arc::new(MockEventStore::new()),
+            vec![Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered))],
+        )
+    }
+
+    /// [`make_dispatcher`] with the event store and the notifier set
+    /// supplied by the caller — what the delivery-behaviour tests need in
+    /// order to seed events and read back what reached the target.
+    fn make_dispatcher_with(
+        sub_repo: Arc<MockSubRepo>,
+        user_repo: Arc<MockUserRepository>,
+        change_listener: Arc<dyn SubscriptionChangeListener>,
+        mock_es: Arc<MockEventStore>,
+        notifiers: Vec<Arc<dyn EventNotifier>>,
+    ) -> NotificationDispatcher {
         let (sender, _rx) = broadcast::channel::<Arc<PersistedEvent>>(16);
         let publisher = Arc::new(EventStorePublisher::new(mock_es, sender));
         let rbac = Arc::new(ArcSwap::from_pointee(empty_eval()));
@@ -709,8 +859,6 @@ mod tests {
             guard,
             SubscriptionUseCaseConfig::default(),
         ));
-        let notifiers: Vec<Arc<dyn EventNotifier>> =
-            vec![Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered))];
         NotificationDispatcher::new(
             publisher,
             use_case,
@@ -837,6 +985,187 @@ mod tests {
         let parent = CancellationToken::new();
         dispatcher.reconcile(&mut tasks, &parent).await;
         assert!(tasks.is_empty(), "missing user row → no spawn");
+        parent.cancel();
+    }
+
+    // -- live owner authority on a running task --------------------------
+
+    /// The property the per-event principal reload exists for: revoking
+    /// the owner's `is_admin` bit stops a **running** task from
+    /// delivering privileged-category events, and one reconcile pass is
+    /// all it takes. The task is neither cancelled nor respawned — the
+    /// pass re-synthesises the principal and stores it into the same
+    /// `ArcSwap` the task loads per event, so the delivery that follows
+    /// is decided under the revoked authority on the original task's
+    /// original cursor.
+    ///
+    /// Reaching this outcome through a cancel-and-respawn would prove
+    /// nothing: that path worked before the principal became swappable.
+    #[tokio::test(start_paused = true)]
+    async fn revoking_admin_stops_privileged_delivery_to_a_running_task_without_a_respawn() {
+        let owner = Uuid::new_v4();
+        let sub_repo = Arc::new(MockSubRepo::new());
+        let user_repo = Arc::new(MockUserRepository::new());
+        user_repo.insert(admin_user(owner));
+        let sub = privileged_sub(owner);
+        sub_repo.set_active(vec![sub.clone()]);
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(StreamCategory::User, vec![privileged_event(owner, 1)]);
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let dispatcher = make_dispatcher_with(
+            sub_repo,
+            user_repo.clone(),
+            Arc::new(NeverChangeListener),
+            mock_es.clone(),
+            vec![notifier.clone()],
+        );
+        let mut tasks: HashMap<SubscriptionId, TaskHandle> = HashMap::new();
+        let parent = CancellationToken::new();
+
+        // Pass 1 spawns under admin authority; the startup catch-up
+        // delivers the privileged event.
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            notifier.delivered(),
+            vec![1],
+            "an admin owner receives a privileged-category event"
+        );
+        let spawned_task_id = tasks.get(&sub.id).expect("task spawned").join.id();
+
+        // Revoke admin on the live row, then one reconcile pass.
+        user_repo.insert(non_admin_user(owner));
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        let handle = tasks.get(&sub.id).expect("the task must survive the pass");
+        assert_eq!(
+            handle.join.id(),
+            spawned_task_id,
+            "the same task must still be running — a respawn would \
+             prove nothing about live authority"
+        );
+        assert!(
+            !handle.cancel.is_cancelled(),
+            "the task must not have been cancelled"
+        );
+        assert!(
+            !handle
+                .owner_principal
+                .load()
+                .claims
+                .iter()
+                .any(|c| c == "admin"),
+            "the republished principal must have lost the admin claim"
+        );
+
+        // A second privileged event lands. The running task's next store
+        // poll reads it and the filter denies it on the refreshed
+        // principal.
+        mock_es.set_category(
+            StreamCategory::User,
+            vec![privileged_event(owner, 1), privileged_event(owner, 2)],
+        );
+        tokio::time::sleep(STORE_POLL_INTERVAL * 2).await;
+        assert_eq!(
+            notifier.delivered(),
+            vec![1],
+            "a revoked admin bit must stop privileged delivery to the \
+             already-running task"
+        );
+
+        parent.cancel();
+    }
+
+    /// The companion to the test above, and the control that gives it
+    /// its meaning: with the owner still admin, the same reconcile pass
+    /// republishes an unchanged principal and delivery continues. So the
+    /// denial above is the revocation, not the republish.
+    #[tokio::test(start_paused = true)]
+    async fn republishing_an_unchanged_principal_leaves_privileged_delivery_intact() {
+        let owner = Uuid::new_v4();
+        let sub_repo = Arc::new(MockSubRepo::new());
+        let user_repo = Arc::new(MockUserRepository::new());
+        user_repo.insert(admin_user(owner));
+        let sub = privileged_sub(owner);
+        sub_repo.set_active(vec![sub.clone()]);
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(StreamCategory::User, vec![privileged_event(owner, 1)]);
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let dispatcher = make_dispatcher_with(
+            sub_repo,
+            user_repo,
+            Arc::new(NeverChangeListener),
+            mock_es.clone(),
+            vec![notifier.clone()],
+        );
+        let mut tasks: HashMap<SubscriptionId, TaskHandle> = HashMap::new();
+        let parent = CancellationToken::new();
+
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(notifier.delivered(), vec![1]);
+        let spawned_task_id = tasks.get(&sub.id).expect("task spawned").join.id();
+
+        // The owner's row is untouched; the pass re-reads it and stores
+        // the same authority back.
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        let handle = tasks.get(&sub.id).expect("the task must survive");
+        assert_eq!(handle.join.id(), spawned_task_id, "no respawn");
+        assert!(
+            handle
+                .owner_principal
+                .load()
+                .claims
+                .iter()
+                .any(|c| c == "admin"),
+            "an owner who is still admin keeps the admin claim"
+        );
+
+        mock_es.set_category(
+            StreamCategory::User,
+            vec![privileged_event(owner, 1), privileged_event(owner, 2)],
+        );
+        tokio::time::sleep(STORE_POLL_INTERVAL * 2).await;
+        assert_eq!(
+            notifier.delivered(),
+            vec![1, 2],
+            "an unchanged principal must not interrupt delivery"
+        );
+
+        parent.cancel();
+    }
+
+    /// Deactivating an owner tears its running tasks down at the next
+    /// pass. Before the principal was re-resolved per pass this only
+    /// prevented new spawns, so an already-running task kept delivering
+    /// on a deactivated owner's authority indefinitely.
+    #[tokio::test]
+    async fn reconcile_tears_down_a_running_task_when_the_owner_is_deactivated() {
+        let owner = Uuid::new_v4();
+        let sub_repo = Arc::new(MockSubRepo::new());
+        let user_repo = Arc::new(MockUserRepository::new());
+        user_repo.insert(admin_user(owner));
+        let sub = make_sub(owner);
+        sub_repo.set_active(vec![sub.clone()]);
+        let dispatcher =
+            make_dispatcher(sub_repo, user_repo.clone(), Arc::new(NeverChangeListener));
+        let mut tasks: HashMap<SubscriptionId, TaskHandle> = HashMap::new();
+        let parent = CancellationToken::new();
+
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        let task_cancel = tasks.get(&sub.id).expect("task spawned").cancel.clone();
+        assert!(!task_cancel.is_cancelled());
+
+        user_repo.insert(inactive_user(owner));
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        assert!(
+            tasks.is_empty(),
+            "a deactivated owner's running task must be torn down"
+        );
+        assert!(
+            task_cancel.is_cancelled(),
+            "the torn-down task's cancellation token must be fired"
+        );
+
         parent.cancel();
     }
 
