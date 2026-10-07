@@ -60,6 +60,7 @@ use crate::metrics::{
     emit_dispatcher_principal_resolved, set_subscription_state_gauge, DispatcherPrincipalSource,
 };
 use crate::rbac::{add_admin_claim_if_admin, RbacEvaluator};
+use crate::use_cases::event_visibility::EventVisibilityUseCase;
 use crate::use_cases::subscription_use_case::SubscriptionUseCase;
 
 /// Reconcile interval.
@@ -100,6 +101,11 @@ pub struct NotificationDispatcher {
     user_repo: Arc<dyn UserRepository>,
     subscription_repo: Arc<dyn SubscriptionRepository>,
     repository_repo: Arc<dyn RepositoryRepository>,
+    /// The repository-visibility primitive, shared with the
+    /// `GET /api/v1/events` read gate. Cloned into every spawned task's
+    /// [`SubscriptionTaskDeps`] so each catch-up page resolves its
+    /// aggregates in one round trip.
+    event_visibility: Arc<EventVisibilityUseCase>,
     change_listener: Arc<dyn SubscriptionChangeListener>,
     notifiers: Vec<Arc<dyn EventNotifier>>,
 }
@@ -116,6 +122,7 @@ impl NotificationDispatcher {
         user_repo: Arc<dyn UserRepository>,
         subscription_repo: Arc<dyn SubscriptionRepository>,
         repository_repo: Arc<dyn RepositoryRepository>,
+        event_visibility: Arc<EventVisibilityUseCase>,
         change_listener: Arc<dyn SubscriptionChangeListener>,
         notifiers: Vec<Arc<dyn EventNotifier>>,
     ) -> Self {
@@ -126,6 +133,7 @@ impl NotificationDispatcher {
             user_repo,
             subscription_repo,
             repository_repo,
+            event_visibility,
             change_listener,
             notifiers,
         }
@@ -265,6 +273,7 @@ impl NotificationDispatcher {
                 use_case: self.use_case.clone(),
                 rbac: self.rbac.clone(),
                 repositories: self.repository_repo.clone(),
+                event_visibility: self.event_visibility.clone(),
                 owner_principal: principal,
                 notifiers: self.notifiers.clone(),
                 budget: Arc::new(Mutex::new(FailureBudget::new())),
@@ -444,6 +453,7 @@ mod tests {
 
     use crate::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
     use crate::use_cases::test_support::{
+        MockArtifactGroupRepository, MockArtifactRepository, MockEventRepositoryResolver,
         MockEventStore, MockRepositoryRepository, MockUserRepository,
     };
 
@@ -708,6 +718,12 @@ mod tests {
             user_repo,
             sub_repo,
             repos,
+            Arc::new(EventVisibilityUseCase::new(Arc::new(
+                MockEventRepositoryResolver::new(
+                    Arc::new(MockArtifactRepository::new()),
+                    Arc::new(MockArtifactGroupRepository::new()),
+                ),
+            ))),
             change_listener,
             notifiers,
         )

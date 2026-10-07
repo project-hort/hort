@@ -171,6 +171,73 @@ authority each time, all delegating to the single
   bound; live grants are the floor, so revoking a role cuts off
   delivery without touching the subscription.
 
+### Which repository an event belongs to is resolved, not read off the payload
+
+The read gate and the delivery filter both have to answer "which
+repositories does this event disclose?", and for most of the artifact
+lifecycle the payload does not say. `ArtifactIngested`,
+`ChecksumMismatch`, `ArtifactDeleted` and `ArtifactDownloaded` carry a
+`repository_id`; `ArtifactQuarantined`, `ScanRequested`,
+`ScanCompleted`, `ArtifactBecameVulnerable`, `ArtifactReleased`,
+`ArtifactRejected`, `ScanIndeterminate`, `ChecksumVerified`, the
+provenance verdicts, `ArtifactReEvaluated`, `PolicyEvaluated`,
+`ApprovalDecided`, `ArtifactExpired`, `ArtifactPurged` and
+`ArtifactCorrupted` name the **artifact**, because the artifact
+aggregate already owns exactly one repository. The payload is not
+extended to add one: already-stored events would not gain the field, so
+the gate would only work for events written after the change, and a
+field appended to an event type alters the canonical bytes of every
+event written before it (the chain verifier's `ChainBreak::HashMismatch`
+— see [ADR 0002](../../adr/0002-event-sourcing.md)).
+
+So the resolution happens on the read side, for stored and future events
+alike, through one primitive both call sites use
+(`hort_app::use_cases::event_visibility`):
+
+1. `EventTypeKind::disclosed_repositories` classifies the payload —
+   exhaustively, with no wildcard arm — into *global* (no repository
+   association exists), a set of one or two repository references
+   (carried directly, or named indirectly through the artifact /
+   artifact-group aggregate), or *unattributable*.
+2. `EventVisibilityUseCase::index` resolves every indirect reference on
+   the page in a **single** round trip (`EventRepositoryResolver`). The
+   read handler does this for the page it just read; the dispatcher does
+   it for each catch-up page. Neither resolves per event — that would
+   put a database round trip on each event of the read hot path.
+3. Each call site then applies its own gate to the same answer: the read
+   handler requires `Permission::Read` on **every** disclosed
+   repository, the filter additionally intersects with the stored
+   `RepositoryScope`.
+
+Three properties of that design are load-bearing:
+
+- **The conjunction.** The promotion chain (`PromotionRequested`,
+  `ApprovalRequested`, `ArtifactPromoted`, `PromotionRejected`)
+  discloses a source *and* a target, and the delivered payload carries
+  both repository identities — so `Read` on one of them is not authority
+  to receive it.
+- **Resolution is by identity, never filtered on liveness.** Purge
+  retires an artifact's projection row (`artifacts.deleted_at`) instead
+  of removing it, and `ArtifactPurged` / `ArtifactExpired` are precisely
+  the events a repository's own readers still need. A liveness filter in
+  the resolver would hide a repository's retention history from the
+  people entitled to it.
+- **Unresolvable means admin-only, not invisible.**
+  `CasIntegrityMismatch` is keyed on a CAS content hash that any number
+  of repositories' artifacts may point at (its stream `entity_id` is
+  derived from the hash, not from an artifact id), and an aggregate
+  whose repository was deleted has no row left to resolve. Both fail
+  closed onto live `Permission::Admin`: there is no repository to check,
+  and an audit fact that no one can read is its own failure mode.
+
+The symmetry is why both halves ship together. The same absent
+`repository_id` that let a grantless account read every repository's
+scanner names and release justifications **also** made a correctly
+restricted `RepositoryScope::Some([repo])` subscriber lose that
+repository's entire lifecycle feed: an allow-list cannot match an event
+that names no repository. A change that only closed the disclosure
+would have traded one silent failure for the other.
+
 Each subscription also carries `snapshot_claims` — the creator's
 resolved claim set captured at create/update time as the delivery
 authority floor. The dispatcher synthesises the owner principal from
@@ -382,10 +449,11 @@ on, and it has two limits that are not corner cases:
   filtering breaks it the same way and less visibly, because it is
   applied **per event, not per stream** — both the dispatcher
   (`crates/hort-app/src/use_cases/subscription_filter.rs`) and the pull
-  surface drop an individual event whose `repository_id` you lack `Read`
-  on, or whose type is an authorization-model mutation or a privileged
-  audit fact you are not admin for, while passing its stream-mates that
-  carry no repository association at all. So contiguity is a detector
+  surface drop an individual event whose disclosed repositories you lack
+  `Read` on, or whose type is an authorization-model mutation or a
+  privileged audit fact you are not admin for, while passing its
+  stream-mates that have no repository association at all. So contiguity
+  is a detector
   only when nothing between you and the log is removing events: no
   `event_types` filter, and a principal that can read everything in the
   categories you take. Where that does not hold, use the trailing-window

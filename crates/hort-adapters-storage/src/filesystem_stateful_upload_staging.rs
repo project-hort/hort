@@ -26,12 +26,12 @@
 use std::path::{Path, PathBuf};
 
 use tokio::fs::{self, OpenOptions};
-use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncSeekExt, AsyncWriteExt};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::stateful_upload_staging::StatefulUploadStagingPort;
+use hort_domain::ports::stateful_upload_staging::{StagingAppend, StatefulUploadStagingPort};
 use hort_domain::ports::BoxFuture;
 
 /// Copy-buffer size for streaming appends. 64 KiB matches the CAS
@@ -52,10 +52,13 @@ const STAGING_SUFFIX: &str = ".part";
 
 /// Filesystem adapter for [`StatefulUploadStagingPort`].
 ///
-/// Every session is one file on disk. `append` opens in `O_APPEND`
-/// mode; the kernel serialises concurrent small writes. `stream_read`
-/// returns a fresh `tokio::fs::File` positioned at byte 0. `delete`
-/// tolerates missing files — finalize and GC may race to clean up.
+/// Every session is one file on disk. `append_at` seeks to the caller's
+/// asserted offset and writes there — deliberately **not** `O_APPEND`,
+/// whose "every write lands at whatever the current end is" semantics
+/// are exactly what lets a file outgrow the progress its owner recorded.
+/// `stream_read` returns a fresh `tokio::fs::File` positioned at byte 0.
+/// `delete` tolerates missing files — finalize and GC may race to clean
+/// up.
 pub struct FilesystemStatefulUploadStaging {
     root: PathBuf,
 }
@@ -64,7 +67,7 @@ impl FilesystemStatefulUploadStaging {
     /// Construct a staging adapter rooted at `root`.
     ///
     /// The directory is created eagerly (best-effort — failures are
-    /// logged but don't panic; each `append` re-attempts `create_dir_all`
+    /// logged but don't panic; each `append_at` re-attempts `create_dir_all`
     /// before opening the file, matching the CAS adapter's posture of
     /// not coupling composition-root startup to filesystem state).
     ///
@@ -73,7 +76,7 @@ impl FilesystemStatefulUploadStaging {
     /// single sub-millisecond syscall — and keeping it sync lets the
     /// constructor stay non-async so callers don't need `.await` at
     /// every instantiation site (matches `FilesystemStorage::new`). The
-    /// hot path (`append`) uses `tokio::fs::create_dir_all` via
+    /// hot path (`append_at`) uses `tokio::fs::create_dir_all` via
     /// `ensure_dir` on every call, so per-request IO stays async.
     ///
     /// Plumbing from the `HORT_STATEFUL_UPLOAD_STAGING_DIR` environment
@@ -84,7 +87,7 @@ impl FilesystemStatefulUploadStaging {
             warn!(
                 root = %root.display(),
                 error = %e,
-                "failed to create stateful-upload staging root; append() will retry"
+                "failed to create stateful-upload staging root; append_at() will retry"
             );
         } else {
             // Pin the staging root to 0o700 (ADR 0026 +
@@ -129,14 +132,14 @@ impl FilesystemStatefulUploadStaging {
     ///
     /// [`new`](Self::new) is deliberately best-effort: it `warn!`s
     /// (never panics / errors) on a non-creatable or non-ownable root,
-    /// and every [`append`](StatefulUploadStagingPort::append)
+    /// and every [`append_at`](StatefulUploadStagingPort::append_at)
     /// re-attempts `create_dir_all`. The original mode-pinning scope was
     /// limited to the narrow *writable-but-unownable* case (a laxer mode
     /// only leaks the existence of session UUIDs; chunk files are
     /// themselves 0o600). It did **not** anticipate the chart's own
     /// `readOnlyRootFilesystem: true` making the S3-default root *entirely
     /// unwritable*, where the failure is not "laxer mode" but "chunked
-    /// upload non-functional, silently" — `append()` "retries" forever and
+    /// upload non-functional, silently" — `append_at()` "retries" forever and
     /// OCI `docker push` / Git LFS 5xx at runtime with no readiness signal.
     ///
     /// This method brings that surface under the fail-closed/loud discipline
@@ -147,7 +150,7 @@ impl FilesystemStatefulUploadStaging {
     /// a [`StatefulUploadStagingPort`] trait method — the port signature is
     /// unchanged.
     ///
-    /// The per-`append()` `warn!` stays as transient-case
+    /// The per-`append_at()` `warn!` stays as transient-case
     /// defense-in-depth (a root that becomes non-writable *after* a
     /// healthy boot); this gate is the boot-time fail-loud addition.
     ///
@@ -219,31 +222,34 @@ impl FilesystemStatefulUploadStaging {
 }
 
 impl StatefulUploadStagingPort for FilesystemStatefulUploadStaging {
-    fn append(
+    fn append_at(
         &self,
         session_id: Uuid,
+        offset: u64,
+        limit: u64,
         mut stream: Box<dyn AsyncRead + Send + Unpin>,
-    ) -> BoxFuture<'_, DomainResult<u64>> {
+    ) -> BoxFuture<'_, DomainResult<StagingAppend>> {
         Box::pin(async move {
-            debug!(%session_id, op = "append", "stateful upload staging append");
+            debug!(%session_id, offset, limit, op = "append_at", "stateful upload staging write");
 
             ensure_dir(&self.root).await?;
             let path = self.resolve(session_id);
 
-            // O_APPEND is the load-bearing primitive here. The kernel
-            // atomically advances the file position and writes in one
-            // syscall for every `write(2)` call; concurrent appenders
-            // on the same fd cannot interleave small writes. See the
-            // trait's concurrency-contract docstring.
+            // Opened WITHOUT `O_APPEND`: the write position is the
+            // caller's asserted `offset`, not the file's end at the
+            // moment the kernel gets the write. O_APPEND would make the
+            // physical length the sum of whatever arrives, which is the
+            // one thing this port must not let happen — see the trait's
+            // concurrency contract.
             //
             // Mode 0o600 is set atomically with O_CREAT (ADR 0026 +
-            // `docs/architecture/security.md`). Because `append` may be
+            // `docs/architecture/security.md`). Because `append_at` may be
             // called many times for the same session, the mode argument
             // only takes effect on the create call (existing chunk files
             // keep their existing mode — which is also 0o600 from the
-            // first append). On non-Unix the mode is silently ignored.
+            // first write). On non-Unix the mode is silently ignored.
             let mut open_opts = OpenOptions::new();
-            open_opts.create(true).append(true);
+            open_opts.create(true).write(true);
             #[cfg(unix)]
             {
                 open_opts.mode(0o600);
@@ -251,70 +257,126 @@ impl StatefulUploadStagingPort for FilesystemStatefulUploadStaging {
             let mut file = open_opts.open(&path).await.map_err(|e| {
                 warn!(
                     %session_id,
-                    op = "append",
+                    op = "append_at",
                     error = %e,
-                    "failed to open staging file for append"
+                    "failed to open staging file for write"
                 );
                 DomainError::Invariant(format!("stateful upload staging open failed: {e}"))
             })?;
 
-            // Stream copy through a fixed-size buffer so memory stays
-            // bounded regardless of the PATCH body size.
-            let mut buf = vec![0u8; CHUNK_SIZE];
-            loop {
-                use tokio::io::AsyncReadExt;
-                let n = stream.read(&mut buf).await.map_err(|e| {
+            let current = stat_len(&file, session_id).await?;
+            if current < offset {
+                // A gap. Writing at `offset` would leave `offset -
+                // current` bytes the client never sent inside the
+                // content; the finalize digest would then reject a blob
+                // the registry itself corrupted. Refuse having written
+                // nothing — the length is unchanged, so a retry cannot
+                // grow the file either.
+                warn!(
+                    %session_id,
+                    op = "append_at",
+                    offset,
+                    current,
+                    "staging write offset is past the end of the staging file"
+                );
+                return Err(DomainError::Invariant(format!(
+                    "stateful upload staging write at offset {offset} would leave a gap: \
+                     staging holds {current} bytes"
+                )));
+            }
+            if current > offset {
+                // Debris: bytes beyond what the caller's record accounts
+                // for, left by an earlier write whose record update never
+                // landed. Dropping them is the repair — the record is the
+                // authority, so these bytes can never become content, and
+                // leaving them would corrupt the blob the next write
+                // completes.
+                debug!(
+                    %session_id,
+                    op = "append_at",
+                    offset,
+                    current,
+                    "dropping unaccounted staging tail before write"
+                );
+                file.set_len(offset).await.map_err(|e| {
                     warn!(
                         %session_id,
-                        op = "append",
+                        op = "append_at",
                         error = %e,
-                        "failed to read from input stream"
+                        "failed to truncate staging file to the caller's offset"
                     );
-                    DomainError::Invariant(format!("stateful upload staging read failed: {e}"))
+                    DomainError::Invariant(format!("stateful upload staging truncate failed: {e}"))
                 })?;
+            }
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| {
+                    warn!(
+                        %session_id,
+                        op = "append_at",
+                        error = %e,
+                        "failed to seek staging file to the caller's offset"
+                    );
+                    DomainError::Invariant(format!("stateful upload staging seek failed: {e}"))
+                })?;
+
+            // Stream copy through a fixed-size buffer so memory stays
+            // bounded regardless of the body size, and never read more
+            // than `limit` into the file.
+            let mut buf = vec![0u8; CHUNK_SIZE];
+            let mut remaining = limit;
+            while remaining > 0 {
+                // `remaining` is a u64 budget; the buffer slice is a
+                // usize. Clamping through u64 first means the cast can
+                // only ever see a value <= CHUNK_SIZE.
+                let want = remaining.min(CHUNK_SIZE as u64) as usize;
+                let n = read_or_invariant(&mut stream, &mut buf[..want], session_id).await?;
                 if n == 0 {
                     break;
                 }
                 file.write_all(&buf[..n]).await.map_err(|e| {
                     warn!(
                         %session_id,
-                        op = "append",
+                        op = "append_at",
                         error = %e,
                         "failed to write chunk to staging file"
                     );
                     DomainError::Invariant(format!("stateful upload staging write failed: {e}"))
                 })?;
+                remaining -= n as u64;
             }
 
-            // Flush pending writes so metadata().len() sees the bytes we
+            // The budget ran out with the stream possibly still holding
+            // bytes. Read one to find out — and discard it. The caller
+            // needs the "there was more" bit to reject the request; the
+            // file must not carry it, or the length exceeds the cap the
+            // budget expressed.
+            let truncated = if remaining == 0 {
+                read_or_invariant(&mut stream, &mut buf[..1], session_id).await? > 0
+            } else {
+                false
+            };
+
+            // Flush pending writes so the stat below sees the bytes we
             // just wrote. `flush` is sufficient here — we don't need the
             // crash-safety of `sync_all` for scratch space (a GC sweep
             // cleans up crashed sessions anyway).
             file.flush().await.map_err(|e| {
                 warn!(
                     %session_id,
-                    op = "append",
+                    op = "append_at",
                     error = %e,
                     "failed to flush staging file"
                 );
                 DomainError::Invariant(format!("stateful upload staging flush failed: {e}"))
             })?;
 
-            let total = file
-                .metadata()
-                .await
-                .map_err(|e| {
-                    warn!(
-                        %session_id,
-                        op = "append",
-                        error = %e,
-                        "failed to stat staging file after write"
-                    );
-                    DomainError::Invariant(format!("stateful upload staging stat failed: {e}"))
-                })?
-                .len();
-
-            Ok(total)
+            // Report the file's measured length, not `offset + written`.
+            // The caller cross-checks this against what it reserved, and
+            // a check fed by the same arithmetic it is verifying would
+            // confirm nothing.
+            let total = stat_len(&file, session_id).await?;
+            Ok(StagingAppend { total, truncated })
         })
     }
 
@@ -517,6 +579,45 @@ async fn ensure_dir(path: &Path) -> DomainResult<()> {
     Ok(())
 }
 
+/// Measured length of `file`, as `DomainError::Invariant` on failure.
+///
+/// Used both before the write (to classify the caller's offset against
+/// the file) and after it (to report the physical length rather than a
+/// recomputation of what we believe we wrote).
+async fn stat_len(file: &fs::File, session_id: Uuid) -> DomainResult<u64> {
+    Ok(file
+        .metadata()
+        .await
+        .map_err(|e| {
+            warn!(
+                %session_id,
+                op = "append_at",
+                error = %e,
+                "failed to stat staging file"
+            );
+            DomainError::Invariant(format!("stateful upload staging stat failed: {e}"))
+        })?
+        .len())
+}
+
+/// One `read` from the request body, with the adapter's error envelope.
+async fn read_or_invariant<R: AsyncRead + Unpin + ?Sized>(
+    stream: &mut R,
+    buf: &mut [u8],
+    session_id: Uuid,
+) -> DomainResult<usize> {
+    use tokio::io::AsyncReadExt;
+    stream.read(buf).await.map_err(|e| {
+        warn!(
+            %session_id,
+            op = "append_at",
+            error = %e,
+            "failed to read from input stream"
+        );
+        DomainError::Invariant(format!("stateful upload staging read failed: {e}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -536,15 +637,32 @@ mod tests {
         Box::new(Cursor::new(bytes.to_vec()))
     }
 
+    /// Write `bytes` at the session's current end with a budget of
+    /// exactly their length — the shape the OCI use case produces for a
+    /// `Content-Length`-framed PATCH that reserved what it then wrote.
+    /// Tests whose subject is not the position check itself use this.
+    async fn write_tail(
+        s: &FilesystemStatefulUploadStaging,
+        session: Uuid,
+        bytes: &[u8],
+    ) -> DomainResult<StagingAppend> {
+        let offset = std::fs::metadata(s.resolve(session))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        s.append_at(session, offset, bytes.len() as u64, reader(bytes))
+            .await
+    }
+
     /// Append then read back — bytes round-trip through staging.
     #[tokio::test]
-    async fn append_then_stream_read_round_trips_single_chunk() {
+    async fn write_then_stream_read_round_trips_single_chunk() {
         let dir = tempfile::tempdir().unwrap();
         let s = staging(&dir);
         let session = Uuid::new_v4();
 
-        let total = s.append(session, reader(b"hello world")).await.unwrap();
-        assert_eq!(total, 11);
+        let out = write_tail(&s, session, b"hello world").await.unwrap();
+        assert_eq!(out.total, 11);
+        assert!(!out.truncated);
 
         let mut r = s.stream_read(session).await.unwrap();
         let mut out = Vec::new();
@@ -552,26 +670,36 @@ mod tests {
         assert_eq!(out, b"hello world");
     }
 
-    /// Multiple sequential appends accumulate into the same file.
+    /// Sequential writes at successive offsets accumulate into the same
+    /// file.
     #[tokio::test]
-    async fn sequential_appends_concatenate_in_order() {
+    async fn sequential_writes_concatenate_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let s = staging(&dir);
         let session = Uuid::new_v4();
 
-        let t1 = s.append(session, reader(b"chunk-A|")).await.unwrap();
-        assert_eq!(t1, 8);
-        let t2 = s.append(session, reader(b"chunk-B|")).await.unwrap();
-        assert_eq!(t2, 16);
-        let t3 = s.append(session, reader(b"chunk-C")).await.unwrap();
-        assert_eq!(t3, 23);
+        let t1 = s
+            .append_at(session, 0, 8, reader(b"chunk-A|"))
+            .await
+            .unwrap();
+        assert_eq!(t1.total, 8);
+        let t2 = s
+            .append_at(session, 8, 8, reader(b"chunk-B|"))
+            .await
+            .unwrap();
+        assert_eq!(t2.total, 16);
+        let t3 = s
+            .append_at(session, 16, 7, reader(b"chunk-C"))
+            .await
+            .unwrap();
+        assert_eq!(t3.total, 23);
 
         let mut r = s.stream_read(session).await.unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).await.unwrap();
-        // Sequential appends on a single task preserve order — this is
-        // stronger than the concurrency contract's guarantee but is the
-        // common case in the happy-path PATCH flow.
+        // Each write names its own offset, so the order is the offsets'
+        // order and not the scheduler's.
+
         assert_eq!(out, b"chunk-A|chunk-B|chunk-C");
     }
 
@@ -585,7 +713,7 @@ mod tests {
         let s = staging(&dir);
         let session = Uuid::new_v4();
 
-        s.append(session, reader(b"x")).await.unwrap();
+        write_tail(&s, session, b"x").await.unwrap();
 
         let expected = dir.path().join(format!("{session}.part"));
         assert!(
@@ -600,14 +728,22 @@ mod tests {
         );
     }
 
-    /// Two concurrent `append` calls on the same session both land in
-    /// the file and the final byte count equals the sum of the two
-    /// payloads. The adapter relies on `O_APPEND` kernel serialisation
-    /// — two parallel small writes cannot interleave, but their
-    /// relative order is unspecified (hence we assert on byte-count
-    /// and membership, not on the concatenation order).
+    /// Two concurrent `append_at` calls that name the same offset cannot
+    /// make the file longer than that offset plus one budget.
+    ///
+    /// This is the property that replaced `O_APPEND`. Under `O_APPEND`
+    /// every write landed at whatever the end happened to be, so two
+    /// racers produced the SUM of their payloads — a length no single
+    /// caller's record accounted for, and the seed of an unbounded staging
+    /// file across retries. Writing at an asserted position makes the
+    /// loser overwrite instead of extend.
+    ///
+    /// The caller is still required to serialise (see the trait's
+    /// concurrency contract); this is the backstop for when it does not,
+    /// which is why the assertion is on the bound and not on which
+    /// payload won.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_appends_on_same_session_serialise_via_o_append() {
+    async fn concurrent_writes_at_one_offset_cannot_exceed_the_budget() {
         let dir = tempfile::tempdir().unwrap();
         let s = Arc::new(staging(&dir));
         let session = Uuid::new_v4();
@@ -618,32 +754,139 @@ mod tests {
         let sa = Arc::clone(&s);
         let sb = Arc::clone(&s);
 
-        let ta = tokio::spawn(async move { sa.append(session, reader(a)).await });
-        let tb = tokio::spawn(async move { sb.append(session, reader(b)).await });
+        let ta = tokio::spawn(async move { sa.append_at(session, 0, 10, reader(a)).await });
+        let tb = tokio::spawn(async move { sb.append_at(session, 0, 10, reader(b)).await });
 
         let (ra, rb) = tokio::join!(ta, tb);
-        let _ = ra.unwrap().unwrap();
-        let _ = rb.unwrap().unwrap();
+        ra.unwrap().unwrap();
+        rb.unwrap().unwrap();
 
         let mut r = s.stream_read(session).await.unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).await.unwrap();
 
-        // Both payloads landed in full.
-        assert_eq!(out.len(), 20, "total bytes must equal sum of writes");
-        assert_eq!(out.iter().filter(|&&x| x == b'A').count(), 10);
-        assert_eq!(out.iter().filter(|&&x| x == b'B').count(), 10);
-
-        // The A-run and the B-run are each contiguous — O_APPEND's
-        // kernel-level atomicity for writes under PIPE_BUF (4 KiB)
-        // prevents interleaving. The adapter does not hold a mutex;
-        // this is the OS guarantee we rely on.
-        let concat_ab = b"AAAAAAAAAABBBBBBBBBB";
-        let concat_ba = b"BBBBBBBBBBAAAAAAAAAA";
-        assert!(
-            &out[..] == concat_ab || &out[..] == concat_ba,
-            "writes must not interleave; got {:?}",
+        assert_eq!(
+            out.len(),
+            10,
+            "two racers at offset 0 must not sum; got {:?}",
             String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// An offset past the end of the staging file is a gap: the adapter
+    /// writes nothing and leaves the length untouched. Filling the hole
+    /// would put bytes the client never sent into the middle of the blob.
+    #[tokio::test]
+    async fn write_past_end_of_staging_refuses_and_leaves_length_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = staging(&dir);
+        let session = Uuid::new_v4();
+
+        write_tail(&s, session, b"0123456789").await.unwrap();
+
+        let err = s
+            .append_at(session, 20, 5, reader(b"abcde"))
+            .await
+            .expect_err("a write past the end must be refused");
+        match err {
+            DomainError::Invariant(msg) => {
+                assert!(
+                    msg.contains("would leave a gap"),
+                    "unexpected Invariant message: {msg}"
+                );
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+
+        let len = std::fs::metadata(s.resolve(session)).unwrap().len();
+        assert_eq!(len, 10, "a refused write must not change the file");
+    }
+
+    /// An offset *short* of the end means the file carries bytes the
+    /// caller's record does not account for. The adapter drops that tail
+    /// before writing — the record is the authority, so those bytes can
+    /// never become content, and leaving them would corrupt the blob the
+    /// write completes. This is also what repairs a staging file left
+    /// long by an earlier release's append-then-record ordering.
+    #[tokio::test]
+    async fn write_before_end_of_staging_drops_the_unaccounted_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = staging(&dir);
+        let session = Uuid::new_v4();
+
+        write_tail(&s, session, b"GOOD").await.unwrap();
+        // Debris: four more bytes nobody's record knows about.
+        write_tail(&s, session, b"junk").await.unwrap();
+        assert_eq!(std::fs::metadata(s.resolve(session)).unwrap().len(), 8);
+
+        let out = s
+            .append_at(session, 4, 5, reader(b"BYTES"))
+            .await
+            .expect("a write at the recorded offset must succeed");
+        assert_eq!(out.total, 9);
+
+        let mut r = s.stream_read(session).await.unwrap();
+        let mut bytes = Vec::new();
+        r.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"GOODBYTES", "the junk tail must be gone");
+    }
+
+    /// A stream longer than the budget is cut at the budget and reported
+    /// as `truncated` — the surplus byte never reaches the file, so the
+    /// length cannot exceed `offset + limit`.
+    #[tokio::test]
+    async fn write_over_budget_reports_truncated_and_keeps_the_surplus_off_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = staging(&dir);
+        let session = Uuid::new_v4();
+
+        let out = s
+            .append_at(session, 0, 4, reader(b"0123456789"))
+            .await
+            .unwrap();
+        assert!(out.truncated, "an over-budget body must report truncated");
+        assert_eq!(out.total, 4, "the file must stop at the budget");
+
+        let mut r = s.stream_read(session).await.unwrap();
+        let mut bytes = Vec::new();
+        r.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"0123");
+    }
+
+    /// A stream that exactly fills the budget is NOT truncated. The
+    /// distinction is the reason `truncated` is a separate field: a cap
+    /// that is exactly met is a legal upload, and encoding "there was
+    /// more" by letting one extra byte land would put the file over the
+    /// very cap the budget expresses.
+    #[tokio::test]
+    async fn write_exactly_filling_the_budget_is_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = staging(&dir);
+        let session = Uuid::new_v4();
+
+        let out = s.append_at(session, 0, 4, reader(b"0123")).await.unwrap();
+        assert!(!out.truncated);
+        assert_eq!(out.total, 4);
+    }
+
+    /// A body larger than the copy buffer still stops exactly at the
+    /// budget — the per-iteration clamp, not the buffer size, is what
+    /// bounds the write.
+    #[tokio::test]
+    async fn write_over_budget_across_multiple_buffer_fills_stops_at_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = staging(&dir);
+        let session = Uuid::new_v4();
+
+        let body = vec![7u8; CHUNK_SIZE * 3];
+        let limit = (CHUNK_SIZE as u64) + 123;
+        let out = s.append_at(session, 0, limit, reader(&body)).await.unwrap();
+        assert!(out.truncated);
+        assert_eq!(out.total, limit);
+        assert_eq!(
+            std::fs::metadata(s.resolve(session)).unwrap().len(),
+            limit,
+            "the measured file length must equal the budget"
         );
     }
 
@@ -656,23 +899,23 @@ mod tests {
         let s = staging(&dir);
         let session = Uuid::new_v4();
 
-        // Never appended — file does not exist.
+        // Never written — file does not exist.
         s.delete(session)
             .await
             .expect("delete must tolerate missing file");
     }
 
-    /// `delete` after `append` removes the file and is idempotent.
+    /// `delete` after a write removes the file and is idempotent.
     #[tokio::test]
-    async fn delete_after_append_removes_file_and_is_idempotent() {
+    async fn delete_after_write_removes_file_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let s = staging(&dir);
         let session = Uuid::new_v4();
 
-        s.append(session, reader(b"to-be-deleted")).await.unwrap();
+        write_tail(&s, session, b"to-be-deleted").await.unwrap();
 
         let path = dir.path().join(format!("{session}.part"));
-        assert!(path.exists(), "file must exist after append");
+        assert!(path.exists(), "file must exist after the write");
 
         s.delete(session).await.unwrap();
         assert!(!path.exists(), "file must be gone after delete");
@@ -703,17 +946,18 @@ mod tests {
         }
     }
 
-    /// `append` on an empty stream still creates the file (byte count
-    /// zero is a legal PATCH body on the OCI wire) and `stream_read`
-    /// returns an empty reader.
+    /// A zero-budget write on an empty stream still creates the file
+    /// (byte count zero is a legal PATCH body on the OCI wire) and
+    /// `stream_read` returns an empty reader.
     #[tokio::test]
-    async fn append_empty_stream_creates_zero_byte_file() {
+    async fn write_empty_stream_creates_zero_byte_file() {
         let dir = tempfile::tempdir().unwrap();
         let s = staging(&dir);
         let session = Uuid::new_v4();
 
-        let total = s.append(session, reader(b"")).await.unwrap();
-        assert_eq!(total, 0);
+        let out = s.append_at(session, 0, 0, reader(b"")).await.unwrap();
+        assert_eq!(out.total, 0);
+        assert!(!out.truncated);
 
         let path = dir.path().join(format!("{session}.part"));
         assert!(path.exists(), "file must exist after zero-byte append");
@@ -732,10 +976,8 @@ mod tests {
         let session_a = Uuid::new_v4();
         let session_b = Uuid::new_v4();
 
-        s.append(session_a, reader(b"session-a-bytes"))
-            .await
-            .unwrap();
-        s.append(session_b, reader(b"session-b-bytes-longer"))
+        write_tail(&s, session_a, b"session-a-bytes").await.unwrap();
+        write_tail(&s, session_b, b"session-b-bytes-longer")
             .await
             .unwrap();
 
@@ -757,18 +999,18 @@ mod tests {
         assert_eq!(out_b2, b"session-b-bytes-longer");
     }
 
-    /// `append` under a root that cannot be created (here: a path
+    /// `append_at` under a root that cannot be created (here: a path
     /// under `/dev/null`, which is a character device, so `mkdir`
     /// refuses) surfaces as `DomainError::Invariant` via `ensure_dir`.
     /// Exercises the `warn!` + `Invariant` arm in `ensure_dir` that
     /// covers every non-happy startup/append filesystem failure.
     #[tokio::test]
-    async fn append_under_uncreatable_root_returns_invariant() {
+    async fn write_under_uncreatable_root_returns_invariant() {
         let root = PathBuf::from("/dev/null/hort-stateful-upload-staging-will-not-exist");
         let s = FilesystemStatefulUploadStaging::new(root);
         let session = Uuid::new_v4();
 
-        match s.append(session, reader(b"x")).await {
+        match write_tail(&s, session, b"x").await {
             Err(DomainError::Invariant(msg)) => {
                 assert!(
                     msg.contains("stateful upload staging mkdir failed")
@@ -777,7 +1019,7 @@ mod tests {
                 );
             }
             Err(other) => panic!("expected Invariant, got {other:?}"),
-            Ok(_) => panic!("append must fail when the root is uncreatable"),
+            Ok(_) => panic!("the write must fail when the root is uncreatable"),
         }
     }
 
@@ -833,7 +1075,7 @@ mod tests {
         let mut expected: Vec<Uuid> = Vec::new();
         for _ in 0..5 {
             let session = Uuid::new_v4();
-            s.append(session, reader(b"x")).await.unwrap();
+            write_tail(&s, session, b"x").await.unwrap();
             expected.push(session);
         }
 
@@ -854,8 +1096,8 @@ mod tests {
 
         for _ in 0..1500 {
             let session = Uuid::new_v4();
-            // Use direct file creation rather than `append` to keep this
-            // test fast — `append` does an O_APPEND open + flush per
+            // Use direct file creation rather than `append_at` to keep
+            // this test fast — `append_at` does an open + stat + flush per
             // session and 1500 round-trips dwarfs the test runner's
             // patience.
             std::fs::File::create(dir.path().join(format!("{session}.part"))).unwrap();
@@ -880,8 +1122,8 @@ mod tests {
         // Two real sessions.
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        s.append(a, reader(b"x")).await.unwrap();
-        s.append(b, reader(b"y")).await.unwrap();
+        write_tail(&s, a, b"x").await.unwrap();
+        write_tail(&s, b, b"y").await.unwrap();
 
         // Defensive litter — neither is a parseable Uuid filename.
         std::fs::write(dir.path().join("README.txt"), b"hi").unwrap();
@@ -907,7 +1149,7 @@ mod tests {
     // (ADR 0026 + `docs/architecture/security.md`)
     // ----------------------------------------------------------------------
 
-    /// `append` creates the chunk file at mode 0o600. The chunk holds
+    /// `append_at` creates the chunk file at mode 0o600. The chunk holds
     /// pre-finalization bytes (an OCI blob upload mid-PATCH) — leaking
     /// it group/world-readable is a confidentiality breach.
     #[cfg(unix)]
@@ -919,7 +1161,7 @@ mod tests {
         let s = staging(&dir);
         let session = Uuid::new_v4();
 
-        s.append(session, reader(b"chunk-bytes")).await.unwrap();
+        write_tail(&s, session, b"chunk-bytes").await.unwrap();
 
         let path = dir.path().join(format!("{session}.part"));
         let meta = std::fs::metadata(&path).unwrap();
@@ -966,7 +1208,7 @@ mod tests {
         // Still usable.
         let s3 = FilesystemStatefulUploadStaging::new(dir.path().to_path_buf());
         let session = Uuid::new_v4();
-        s3.append(session, reader(b"x")).await.unwrap();
+        write_tail(&s3, session, b"x").await.unwrap();
     }
 
     // ----------------------------------------------------------------------

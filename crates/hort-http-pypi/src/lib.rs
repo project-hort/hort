@@ -4251,7 +4251,13 @@ mod tests {
             updated_at: now,
         });
 
-        let upstream_html = r#"<a href="https://files.pythonhosted.org/x/y/requests-2.31.0.tar.gz#sha256=abc">requests-2.31.0.tar.gz</a>"#;
+        // 64 lowercase hex: `PypiVersionFile::hash_sha256` is a
+        // `ContentHash`, so a short placeholder would be dropped at the
+        // projection boundary and never reach the served fragment.
+        let upstream_sha = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let upstream_html = format!(
+            r#"<a href="https://files.pythonhosted.org/x/y/requests-2.31.0.tar.gz#sha256={upstream_sha}">requests-2.31.0.tar.gz</a>"#
+        );
         mocks.upstream_proxy.insert_metadata(
             "",
             "/simple/requests/",
@@ -4274,7 +4280,9 @@ mod tests {
         // to the local file route. The local-list path could not have
         // produced this — there are no artifacts seeded for this repo.
         assert!(
-            html.contains("/pypi/pypi-mirror/simple/requests/requests-2.31.0.tar.gz#sha256=abc"),
+            html.contains(&format!(
+                "/pypi/pypi-mirror/simple/requests/requests-2.31.0.tar.gz#sha256={upstream_sha}"
+            )),
             "Proxy branch must rewrite upstream URLs: got {html}"
         );
         assert!(
@@ -6170,6 +6178,323 @@ mod tests {
             unreachable!()
         };
         assert!(payload.files[0].metadata_hash.is_none());
+    }
+
+    // -- Proxy index escaping / narrowing (PEP 503 anchor injection) ---------------
+    //
+    // On a proxy repository the served PEP 503 page is built from an
+    // upstream body, so `filename` and `hashes.sha256` are verbatim
+    // upstream input interpolated into an `href` attribute and an anchor
+    // text. An upstream that closes the attribute and the anchor adds a
+    // DOWNLOAD LINK the client's resolver treats as one more candidate
+    // distribution — and that candidate need not resolve back into
+    // hort's artifact or quarantine path at all. The later verified file
+    // serve does not repair an index the client already parsed.
+    //
+    // These tests drive the real projector (`parse_body_to_entries`) and
+    // the real builder, and COUNT ANCHORS rather than grepping for the
+    // payload: a page that merely lacks the attacker's host string may
+    // still have gained a link.
+
+    /// Count opening anchor tags. `<a ` survives escaping only as a real
+    /// tag — any `<` in an interpolated value becomes `&lt;`.
+    fn served_anchor_count(html: &str) -> usize {
+        html.matches("<a ").count()
+    }
+
+    /// Build the served PEP 503 page from a projected upstream body,
+    /// exactly as `serve_simple_index_unified` does.
+    fn render_proxy_html(entries: Vec<hort_app::use_cases::index_serve::VersionEntry>) -> String {
+        use hort_formats::index_serve::IndexBuilder as _;
+        let bytes = hort_formats::pypi::index::PypiHtmlIndexBuilder.build(
+            hort_app::use_cases::index_serve::BuildContext {
+                package_name: "requests",
+                base_url: "/pypi/pypi-mirror/simple/requests",
+                index_mode: hort_domain::entities::repository::IndexMode::IncludePending,
+                ordering: &hort_app::use_cases::index_serve_filter::Pep440Ordering,
+            },
+            entries,
+        );
+        String::from_utf8(bytes.to_vec()).expect("builder emits valid UTF-8")
+    }
+
+    /// The main vector in its realistic form. A PEP 691 JSON upstream can
+    /// put a double quote inside `hashes.sha256` without breaking its own
+    /// body — JSON strings carry quotes freely — so this is the shape an
+    /// attacker-controlled or compromised upstream actually sends. (The
+    /// PEP 503 HTML arm cannot deliver a raw quote here: the projector's
+    /// `href="([^"]*)"` capture stops at the first quote.)
+    ///
+    /// The hash is closed by TYPE: `PypiVersionFile::hash_sha256` is a
+    /// `ContentHash`, so the payload collapses to `None` at the
+    /// projection boundary and never reaches the builder.
+    #[tokio::test]
+    async fn proxy_upstream_hash_cannot_inject_a_second_anchor() {
+        let payload = "a\"></a><a href=\"https://evil.example/requests-9.9.tar.gz\">\
+                       requests-9.9.tar.gz</a><a href=\"b";
+        let body = serde_json::json!({
+            "meta": {"api-version": "1.1"},
+            "name": "requests",
+            "files": [{
+                "filename": "requests-2.31.0.tar.gz",
+                "url": "https://files.pythonhosted.org/x/y/requests-2.31.0.tar.gz",
+                "hashes": {"sha256": payload},
+            }],
+            "versions": ["2.31.0"],
+        });
+        let (entries, _) = index_source::parse_body_to_entries(
+            &bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            simple_index::SimpleIndexFormat::Json,
+            "requests",
+            &std::collections::HashMap::new(),
+        );
+        let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload
+        else {
+            unreachable!()
+        };
+        assert!(
+            p.files[0].hash_sha256.is_none(),
+            "an unparseable upstream hash must not survive the projection"
+        );
+
+        let html = render_proxy_html(entries);
+        assert_eq!(
+            served_anchor_count(&html),
+            1,
+            "exactly one anchor for the one upstream file: {html}"
+        );
+        assert_eq!(html.matches("</a>").count(), 1, "{html}");
+        assert!(
+            !html.contains("evil.example"),
+            "the dropped hash must not reach the page at all: {html}"
+        );
+        assert!(
+            !html.contains("#sha256="),
+            "a hash that cannot be a sha256 digest is omitted, not emitted: {html}"
+        );
+    }
+
+    /// An upstream hash that IS a sha256 digest but is spelled in
+    /// uppercase still names that digest, so the projection folds case
+    /// instead of dropping it: dropping would remove a client-side check
+    /// that can succeed, which a non-hex or wrong-length value never
+    /// could. The served fragment is the canonical lowercase form — the
+    /// form a client's own `hexdigest()` produces.
+    #[tokio::test]
+    async fn proxy_upstream_uppercase_hash_is_case_folded_not_dropped() {
+        let lower = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let body = serde_json::json!({
+            "meta": {"api-version": "1.1"},
+            "name": "requests",
+            "files": [{
+                "filename": "requests-2.31.0.tar.gz",
+                "url": "https://files.pythonhosted.org/x/y/requests-2.31.0.tar.gz",
+                "hashes": {"sha256": lower.to_uppercase()},
+            }],
+            "versions": ["2.31.0"],
+        });
+        let (entries, _) = index_source::parse_body_to_entries(
+            &bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            simple_index::SimpleIndexFormat::Json,
+            "requests",
+            &std::collections::HashMap::new(),
+        );
+        let html = render_proxy_html(entries);
+        assert!(
+            html.contains(&format!("#sha256={lower}")),
+            "uppercase upstream digest must serve as canonical lowercase: {html}"
+        );
+    }
+
+    /// The second vector: `filename`. It is interpolated into the `href`
+    /// AND into the anchor's element text, and unlike the hash it cannot
+    /// be narrowed to a type without changing which files hort serves —
+    /// so escaping is what closes it. The payload keeps a `-1.0.tar.gz`
+    /// tail so `extract_version_from_filename` still yields a version and
+    /// the row survives to the builder; a payload that got dropped for an
+    /// unrelated reason would make this test vacuous.
+    #[tokio::test]
+    async fn proxy_upstream_filename_cannot_inject_a_second_anchor() {
+        let payload = "x\"></a><a href=\"https://evil.example/requests-9.9.tar.gz\">\
+                       requests-9.9.tar.gz</a><a href=\"-1.0.tar.gz";
+        let body = serde_json::json!({
+            "meta": {"api-version": "1.1"},
+            "name": "requests",
+            "files": [{
+                "filename": payload,
+                "url": "https://files.pythonhosted.org/x/y/requests-2.31.0.tar.gz",
+                "hashes": {},
+            }],
+            "versions": ["1.0"],
+        });
+        let (entries, _) = index_source::parse_body_to_entries(
+            &bytes::Bytes::from(serde_json::to_vec(&body).unwrap()),
+            simple_index::SimpleIndexFormat::Json,
+            "requests",
+            &std::collections::HashMap::new(),
+        );
+        let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            p.files[0].filename, payload,
+            "the row must survive to the builder, or this test proves nothing"
+        );
+
+        let html = render_proxy_html(entries);
+        assert_eq!(
+            served_anchor_count(&html),
+            1,
+            "exactly one anchor for the one upstream file: {html}"
+        );
+        assert_eq!(html.matches("</a>").count(), 1, "{html}");
+        assert!(
+            !html.contains("href=\"https://evil.example"),
+            "the injected absolute URL must not be a live href: {html}"
+        );
+    }
+
+    /// The escape and the un-escape are one mechanism and ship together.
+    /// A conforming HTML upstream escapes its attribute values, so the
+    /// projector must un-escape every value it lifts out of one — not
+    /// just `requires-python`. Without that, a hort proxying a hort would
+    /// read `foo&amp;bar` as a literal filename and re-escape it to
+    /// `foo&amp;amp;bar`; the JSON arm, which does no escaping, would
+    /// publish the mangled form in `files[].url` outright.
+    ///
+    /// The un-escape is also why the builder's escaping is load-bearing
+    /// for the HTML arm: `&quot;` lets a conforming upstream deliver a
+    /// quote in a filename that the raw `href="([^"]*)"` capture could
+    /// not.
+    #[tokio::test]
+    async fn proxy_html_upstream_escaped_filename_round_trips_byte_for_byte() {
+        let html_upstream = "<!DOCTYPE html><html><body>\
+             <a href=\"https://files.pythonhosted.org/x/y/req&amp;uests-1.0.tar.gz\">\
+             req&amp;uests-1.0.tar.gz</a></body></html>";
+        let (entries, _) = index_source::parse_body_to_entries(
+            &bytes::Bytes::from(html_upstream.to_string()),
+            simple_index::SimpleIndexFormat::Html,
+            "requests",
+            &std::collections::HashMap::new(),
+        );
+        let hort_app::use_cases::index_serve::PerVersionPayload::Pypi(p) = &entries[0].payload
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            p.files[0].filename, "req&uests-1.0.tar.gz",
+            "the projection carries the DECODED filename, not the entity"
+        );
+
+        let html = render_proxy_html(entries);
+        assert_eq!(served_anchor_count(&html), 1, "{html}");
+        assert!(
+            html.contains("/pypi/pypi-mirror/simple/requests/req&amp;uests-1.0.tar.gz"),
+            "the served href must re-escape to the upstream's own bytes: {html}"
+        );
+        assert!(
+            !html.contains("&amp;amp;"),
+            "no double-escaping on the round trip: {html}"
+        );
+    }
+
+    /// End-to-end through the router: a proxy repository whose upstream
+    /// serves the PEP 691 JSON injection body. The format is sniffed from
+    /// the body's first byte, so the client can ask for (and get) the PEP
+    /// 503 HTML page built from that JSON upstream — the full chain the
+    /// unit-level tests above cover one stage at a time.
+    #[tokio::test]
+    async fn proxy_serve_end_to_end_upstream_injection_yields_one_anchor() {
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::repository::RepositoryType;
+        use hort_domain::ports::repository_upstream_mapping_repository::{
+            RepositoryUpstreamMapping, UpstreamAuth,
+        };
+        use hort_http_core::test_support::build_mock_ctx;
+
+        let metrics_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+            .build_recorder()
+            .handle();
+        let (ctx, mocks) = build_mock_ctx(metrics_handle);
+
+        let mut repo = sample_repository();
+        repo.key = "pypi-mirror".into();
+        repo.format = RepositoryFormat::Pypi;
+        repo.repo_type = RepositoryType::Proxy;
+        repo.upstream_url = Some("https://pypi.org".into());
+        // `IncludePending` keeps the upstream catalog when hort has no
+        // status row — otherwise the quarantine filter would drop the
+        // anchor and the test would pass vacuously.
+        repo.index_mode = hort_domain::entities::repository::IndexMode::IncludePending;
+        mocks.repositories.insert(repo.clone());
+
+        let now = Utc::now();
+        mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: repo.id,
+            path_prefix: "".into(),
+            upstream_url: "https://pypi.org".into(),
+            upstream_name_prefix: None,
+            upstream_auth: UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            created_at: now,
+            updated_at: now,
+        });
+
+        let filename_payload = "x\"></a><a href=\"https://evil.example/requests-9.9.tar.gz\">\
+                                requests-9.9.tar.gz</a><a href=\"-1.0.tar.gz";
+        let hash_payload = "a\"></a><a href=\"https://evil.example/requests-8.8.tar.gz\">\
+                            requests-8.8.tar.gz</a><a href=\"b";
+        let upstream = serde_json::json!({
+            "meta": {"api-version": "1.1"},
+            "name": "requests",
+            "files": [{
+                "filename": filename_payload,
+                "url": "https://files.pythonhosted.org/x/y/requests-1.0.tar.gz",
+                "hashes": {"sha256": hash_payload},
+            }],
+            "versions": ["1.0"],
+        });
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            "/simple/requests/",
+            serde_json::to_vec(&upstream).unwrap(),
+        );
+
+        let res = router(ctx)
+            .oneshot(
+                Request::get("/pypi/pypi-mirror/simple/requests/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 65536).await.unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            served_anchor_count(html),
+            1,
+            "one upstream file must yield exactly one anchor: {html}"
+        );
+        assert_eq!(html.matches("</a>").count(), 1, "{html}");
+        assert!(
+            !html.contains("href=\"https://evil.example"),
+            "no injected absolute URL may become a live href: {html}"
+        );
+        assert!(
+            !html.contains("#sha256="),
+            "the unparseable upstream hash is omitted, not emitted: {html}"
+        );
     }
 
     // -- authz tests ----------------------------------------------------------------

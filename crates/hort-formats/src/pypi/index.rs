@@ -91,13 +91,35 @@ pub use hort_app::use_cases::index_serve::{PypiVersionFile, PypiVersionPayload};
 pub struct PypiHtmlIndexBuilder;
 
 impl IndexBuilder for PypiHtmlIndexBuilder {
+    /// # Escaping contract
+    ///
+    /// The PEP 503 document is assembled by concatenation, so **every**
+    /// dynamic value interpolated below passes through [`html_escape`]
+    /// — no exceptions, including values a type already constrains
+    /// (`metadata_hash` is a `ContentHash`, 64 lowercase hex, for
+    /// which the escape is provably a no-op). The rule is total on
+    /// purpose: "nothing reaches the output un-escaped" is checkable by
+    /// reading this one function, whereas "everything except X, which is
+    /// safe because of an invariant three crates away" is not, and the
+    /// exception is what a later edit copies.
+    ///
+    /// The values are attacker-reachable in the ordinary case: on a
+    /// proxy repository `filename` and `hash_sha256` come from the
+    /// upstream simple-index body. A `filename` carrying `"></a><a
+    /// href="https://…` closes the anchor and opens a second one, and
+    /// a conforming client reads the injected anchor as one more
+    /// distribution file — a candidate that need not resolve back into
+    /// hort's artifact and quarantine path at all.
     fn build(&self, ctx: BuildContext<'_>, entries: Vec<VersionEntry>) -> Bytes {
+        // Escaped once; `pkg` lands in two element-text positions and
+        // `base` in every `href` attribute.
+        let pkg = html_escape(ctx.package_name);
+        let base = html_escape(ctx.base_url);
         let mut html = format!(
             "<!DOCTYPE html>\n<html>\n<head>\
              <meta name=\"pypi:repository-version\" content=\"1.0\"/>\
              <title>Links for {pkg}</title></head>\n<body>\n\
              <h1>Links for {pkg}</h1>\n",
-            pkg = ctx.package_name,
         );
 
         for entry in &entries {
@@ -116,17 +138,16 @@ impl IndexBuilder for PypiHtmlIndexBuilder {
                 // URL shape: `{base_url}/{filename}{#sha256=...}`.
                 // PEP 503 places the hash in the URL fragment;
                 // `requires-python` rides as a `data-` attribute.
-                let mut href = format!(
-                    "{base}/{filename}",
-                    base = ctx.base_url,
-                    filename = file.filename,
-                );
+                // The href is composed from already-escaped pieces, so
+                // the composed string is never escaped a second time.
+                let filename = html_escape(&file.filename);
+                let mut href = format!("{base}/{filename}");
                 if let Some(hash) = file.hash_sha256.as_ref() {
                     href.push_str("#sha256=");
-                    href.push_str(hash);
+                    href.push_str(&html_escape(hash.as_ref()));
                 }
                 let requires_python_attr = match file.requires_python.as_ref() {
-                    Some(rp) => format!(" data-requires-python=\"{}\"", html_escape_attr(rp)),
+                    Some(rp) => format!(" data-requires-python=\"{}\"", html_escape(rp)),
                     None => String::new(),
                 };
                 // PEP 658 `data-dist-info-metadata`. Emitted as
@@ -139,13 +160,15 @@ impl IndexBuilder for PypiHtmlIndexBuilder {
                 // unconditional `="true"` was incorrect for sdists,
                 // which PEP 658 explicitly excludes).
                 let metadata_attr = match file.metadata_hash.as_ref() {
-                    Some(h) => format!(" data-dist-info-metadata=\"sha256={h}\""),
+                    Some(h) => format!(
+                        " data-dist-info-metadata=\"sha256={}\"",
+                        html_escape(h.as_ref())
+                    ),
                     None => String::new(),
                 };
                 html.push_str(&format!(
                     "<a href=\"{href}\"{requires_python_attr}{metadata_attr}>\
                      {filename}</a>\n",
-                    filename = file.filename,
                 ));
             }
         }
@@ -155,10 +178,27 @@ impl IndexBuilder for PypiHtmlIndexBuilder {
     }
 }
 
-/// Escape a string for use inside an HTML double-quoted attribute
-/// value. Covers the five characters the HTML5 spec names for
-/// attribute contexts.
-fn html_escape_attr(s: &str) -> String {
+/// Escape a string for interpolation into the PEP 503 HTML document.
+///
+/// Covers the five characters HTML5 names for a double-quoted
+/// attribute value (`&`, `<`, `>`, `"`, `'`). That set is a strict
+/// superset of what an element-text position needs (`&` and `<`), and
+/// the surplus entities render as the literal characters they stand
+/// for, so **one** function is correct in both positions this builder
+/// emits — hence the context-neutral name. The earlier `_attr` suffix
+/// described the function's origin rather than its reach and made its
+/// (correct) use on the anchor text read as an oversight; a separate
+/// `_text` variant escaping only `&`/`<` would be a second, weaker
+/// tool whose sole added capability is being applied in the wrong
+/// place.
+///
+/// `&` is replaced first so the ampersands this function itself
+/// introduces are not escaped a second time.
+///
+/// `crate::pypi` has no un-escaping counterpart; the proxy read side's
+/// `html_unescape` (in `hort-http-pypi`'s HTML simple-index projector)
+/// is the inverse and must stay in step with this entity set.
+fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -213,7 +253,7 @@ impl IndexBuilder for PypiJsonIndexBuilder {
                     let mut hashes = serde_json::Map::new();
                     hashes.insert(
                         "sha256".to_string(),
-                        serde_json::Value::String(hash.clone()),
+                        serde_json::Value::String(hash.to_string()),
                     );
                     row.insert("hashes".to_string(), serde_json::Value::Object(hashes));
                 } else {
@@ -303,6 +343,13 @@ mod tests {
         }
     }
 
+    /// Distinct 64-lowercase-hex digests. `PypiVersionFile::hash_sha256`
+    /// is a `ContentHash`, so the short placeholders the pre-narrowing
+    /// tests used (`"h1"`, `"abc123def"`) are no longer constructible —
+    /// which is the point of the narrowing, not an inconvenience of it.
+    const SHA_A: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const SHA_B: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
     fn file(
         filename: &str,
         hash_sha256: Option<&str>,
@@ -310,7 +357,7 @@ mod tests {
     ) -> PypiVersionFile {
         PypiVersionFile {
             filename: filename.to_string(),
-            hash_sha256: hash_sha256.map(str::to_string),
+            hash_sha256: hash_sha256.map(|h| h.parse().expect("valid sha256 hex")),
             requires_python: requires_python.map(str::to_string),
             metadata_hash: None,
         }
@@ -329,7 +376,7 @@ mod tests {
             metadata_hash_hex.parse().expect("valid sha256 hex");
         PypiVersionFile {
             filename: filename.to_string(),
-            hash_sha256: hash_sha256.map(str::to_string),
+            hash_sha256: hash_sha256.map(|h| h.parse().expect("valid sha256 hex")),
             requires_python: requires_python.map(str::to_string),
             metadata_hash: Some(metadata_hash),
         }
@@ -339,6 +386,54 @@ mod tests {
     /// Lets every PEP-658 emission test share the same wire string.
     const METADATA_HASH_HEX: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+    /// Count the opening anchor tags in a PEP 503 document.
+    ///
+    /// `<a ` can only appear as a real opening tag: every dynamic value
+    /// the builder interpolates goes through `html_escape`, which turns
+    /// a `<` into `&lt;`. So this count moving is the direct observable
+    /// of an injected anchor — which is why the escaping tests below
+    /// assert on it rather than on the absence of a substring. A page
+    /// that merely lacks `https://evil.example` may still have gained a
+    /// second link.
+    fn anchor_count(html: &str) -> usize {
+        html.matches("<a ").count()
+    }
+
+    /// Companion to [`anchor_count`] — an injected `</a>` is how the
+    /// attacker closes hort's own anchor before opening theirs, so the
+    /// close count has to stay in step with the open count.
+    fn anchor_close_count(html: &str) -> usize {
+        html.matches("</a>").count()
+    }
+
+    /// The two boundary shapes every escaping test below runs: a bare
+    /// double quote (closes the attribute it sits in) and a complete
+    /// anchor-injection payload (closes the attribute, closes hort's
+    /// anchor, opens an absolute-URL anchor of the attacker's choosing,
+    /// and re-opens an attribute so the rest of the line still parses).
+    const QUOTE_CASE: &str = "q\"q";
+    const TAG_CASE: &str =
+        "t\"></a><a href=\"https://evil.example/pwn-9.9.tar.gz\">pwn</a><a href=\"t";
+
+    /// Assert the document still carries exactly `files` anchors and
+    /// that no attacker-chosen absolute URL became a live `href`.
+    fn assert_no_injection(html: &str, files: usize) {
+        assert_eq!(
+            anchor_count(html),
+            files,
+            "expected exactly {files} anchor(s): {html}"
+        );
+        assert_eq!(
+            anchor_close_count(html),
+            files,
+            "expected exactly {files} closing anchor tag(s): {html}"
+        );
+        assert!(
+            !html.contains("href=\"https://evil.example"),
+            "no attacker-chosen absolute URL may become a live href: {html}"
+        );
+    }
 
     fn build_html(entries: Vec<VersionEntry>, package: &str, base: &str) -> String {
         let bytes = PypiHtmlIndexBuilder.build(
@@ -388,7 +483,7 @@ mod tests {
     fn html_single_file_emits_anchor_with_sha256_fragment_and_requires_python() {
         let f = file(
             "requests-2.31.0-py3-none-any.whl",
-            Some("abc123def"),
+            Some(SHA_A),
             Some(">=3.7"),
         );
         let html = build_html(
@@ -397,9 +492,9 @@ mod tests {
             "/pypi/m/simple/requests",
         );
         assert!(
-            html.contains(
-                "<a href=\"/pypi/m/simple/requests/requests-2.31.0-py3-none-any.whl#sha256=abc123def\""
-            ),
+            html.contains(&format!(
+                "<a href=\"/pypi/m/simple/requests/requests-2.31.0-py3-none-any.whl#sha256={SHA_A}\""
+            )),
             "anchor must embed base_url + filename + sha256 fragment: {html}"
         );
         // `>` is HTML-escaped to `&gt;` per html_escape_attr.
@@ -450,18 +545,18 @@ mod tests {
         let entry = entry(
             "2.31.0",
             vec![
-                file("requests-2.31.0.tar.gz", Some("h1"), None),
+                file("requests-2.31.0.tar.gz", Some(SHA_A), None),
                 file(
                     "requests-2.31.0-py3-none-any.whl",
-                    Some("h2"),
+                    Some(SHA_B),
                     Some(">=3.7"),
                 ),
             ],
         );
         let html = build_html(vec![entry], "requests", "/pypi/m/simple/requests");
-        assert!(html.contains("requests-2.31.0.tar.gz#sha256=h1"));
+        assert!(html.contains(&format!("requests-2.31.0.tar.gz#sha256={SHA_A}")));
         assert!(
-            html.contains("requests-2.31.0-py3-none-any.whl#sha256=h2"),
+            html.contains(&format!("requests-2.31.0-py3-none-any.whl#sha256={SHA_B}")),
             "wheel anchor must render alongside sdist anchor: {html}"
         );
         // Two anchors total.
@@ -486,6 +581,210 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // HTML escaping — one test per interpolated value, each with a
+    // quote boundary case and a full anchor-injection boundary case.
+    // Every assertion COUNTS anchors (see `anchor_count`): proving a
+    // payload substring is absent would not prove the client's
+    // candidate set is unchanged, which is the property that matters.
+    // -----------------------------------------------------------------
+
+    /// `filename` lands in TWO positions — the `href` attribute and the
+    /// anchor's element text — and on a proxy repository it is verbatim
+    /// upstream input. Both positions have to be escaped; escaping only
+    /// the attribute would leave the text node able to close the anchor.
+    #[test]
+    fn html_escapes_filename_in_both_href_and_anchor_text() {
+        for payload in [QUOTE_CASE, TAG_CASE] {
+            let name = format!("{payload}-1.0.tar.gz");
+            let html = build_html(
+                vec![entry("1.0", vec![file(&name, Some(SHA_A), None)])],
+                "evil",
+                "/pypi/m/simple/evil",
+            );
+            assert_no_injection(&html, 1);
+            assert!(
+                !html.contains("\">pwn</a>"),
+                "the injected anchor's text must not render as markup: {html}"
+            );
+            // Both occurrences are escaped: the attribute and the text.
+            let escaped = html_escape(&name);
+            assert_eq!(
+                html.matches(escaped.as_str()).count(),
+                2,
+                "filename must appear escaped in BOTH the href and the \
+                 anchor text: {html}"
+            );
+        }
+    }
+
+    /// `package_name` lands in `<title>` and `<h1>` — element text, not
+    /// an attribute. A `<` there opens a tag just as surely as it does
+    /// inside an attribute value, which is why this builder uses one
+    /// context-neutral escaper for both positions.
+    #[test]
+    fn html_escapes_package_name_in_title_and_h1() {
+        for payload in [QUOTE_CASE, TAG_CASE] {
+            let html = build_html(
+                vec![entry(
+                    "1.0",
+                    vec![file("evil-1.0.tar.gz", Some(SHA_A), None)],
+                )],
+                payload,
+                "/pypi/m/simple/evil",
+            );
+            assert_no_injection(&html, 1);
+            let escaped = html_escape(payload);
+            assert!(
+                html.contains(&format!("<title>Links for {escaped}</title>")),
+                "title must carry the escaped package name: {html}"
+            );
+            assert!(
+                html.contains(&format!("<h1>Links for {escaped}</h1>")),
+                "h1 must carry the escaped package name: {html}"
+            );
+        }
+    }
+
+    /// `base_url` is NOT purely operator configuration: the PyPI serve
+    /// handler composes it as `/pypi/{repo_key}/simple/{canonical_name}`,
+    /// so the package name travels into it a second time. It is
+    /// interpolated into the same `href` attribute as the filename and
+    /// is escaped on the same terms.
+    #[test]
+    fn html_escapes_base_url_in_href() {
+        for payload in [QUOTE_CASE, TAG_CASE] {
+            let base = format!("/pypi/m/simple/{payload}");
+            let html = build_html(
+                vec![entry(
+                    "1.0",
+                    vec![file("evil-1.0.tar.gz", Some(SHA_A), None)],
+                )],
+                "evil",
+                &base,
+            );
+            assert_no_injection(&html, 1);
+            assert!(
+                html.contains(&html_escape(&base)),
+                "href must carry the escaped base_url: {html}"
+            );
+        }
+    }
+
+    /// `requires_python` was the one value the pre-fix builder escaped.
+    /// Re-asserted here under the same anchor-counting standard as its
+    /// siblings so the whole set is proved the same way.
+    #[test]
+    fn html_escapes_requires_python_attribute() {
+        for payload in [QUOTE_CASE, TAG_CASE] {
+            let html = build_html(
+                vec![entry(
+                    "1.0",
+                    vec![file("evil-1.0.tar.gz", Some(SHA_A), Some(payload))],
+                )],
+                "evil",
+                "/pypi/m/simple/evil",
+            );
+            assert_no_injection(&html, 1);
+            assert!(
+                html.contains(&format!(
+                    " data-requires-python=\"{}\"",
+                    html_escape(payload)
+                )),
+                "requires-python must render escaped: {html}"
+            );
+        }
+    }
+
+    /// The `#sha256=` fragment is the main upstream-controlled vector,
+    /// and it is closed by TYPE rather than by escaping: `hash_sha256`
+    /// is a `ContentHash`, so neither boundary payload can be placed in
+    /// a `PypiVersionFile` at all. The source drops what does not parse
+    /// — see `hort-http-pypi`'s `proxy_upstream_hash_*` tests for the
+    /// end-to-end form with a real upstream body.
+    #[test]
+    fn html_hash_fragment_is_closed_by_the_content_hash_type() {
+        for payload in [QUOTE_CASE, TAG_CASE] {
+            assert!(
+                payload.parse::<hort_domain::types::ContentHash>().is_err(),
+                "an injecting hash must not be representable as a ContentHash"
+            );
+        }
+        // What a representable value emits: one anchor, fragment is the
+        // 64-hex digest and nothing else.
+        let html = build_html(
+            vec![entry(
+                "1.0",
+                vec![file("evil-1.0.tar.gz", Some(SHA_A), None)],
+            )],
+            "evil",
+            "/pypi/m/simple/evil",
+        );
+        assert_no_injection(&html, 1);
+        assert!(
+            html.contains(&format!("evil-1.0.tar.gz#sha256={SHA_A}\"")),
+            "fragment must be the 64-hex digest: {html}"
+        );
+    }
+
+    /// Same closure for the PEP 658 attribute: `metadata_hash` is a
+    /// `ContentHash` on both source paths. The builder still routes it
+    /// through `html_escape` (a provable no-op for 64 lowercase hex) so
+    /// the "nothing reaches the output un-escaped" rule has no exception
+    /// for a later edit to copy.
+    #[test]
+    fn html_metadata_hash_attribute_is_closed_by_the_content_hash_type() {
+        let f = file_with_metadata_hash(
+            "example-1.0.0-py3-none-any.whl",
+            Some(SHA_A),
+            None,
+            METADATA_HASH_HEX,
+        );
+        let html = build_html(
+            vec![entry("1.0.0", vec![f])],
+            "example",
+            "/pypi/m/simple/example",
+        );
+        assert_no_injection(&html, 1);
+        assert_eq!(
+            html_escape(METADATA_HASH_HEX),
+            METADATA_HASH_HEX,
+            "escaping a 64-lowercase-hex digest is a no-op"
+        );
+    }
+
+    /// An ampersand is the one escaped character that appears in
+    /// legitimate text, and the one a double-escaping bug corrupts.
+    /// `html_escape` replaces `&` first, so its own entities are not
+    /// re-escaped — one pass, `&` → `&amp;`, never `&amp;amp;`.
+    #[test]
+    fn html_escape_does_not_double_escape_its_own_entities() {
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+        assert_eq!(html_escape("<a&b>"), "&lt;a&amp;b&gt;");
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
+        assert!(!html_escape("a<b").contains("&amp;lt;"));
+    }
+
+    /// Multi-file versions still emit exactly one anchor per file when
+    /// every file carries a payload — the count is per file, not a
+    /// fixed 1, and a payload must not merge or split anchors.
+    #[test]
+    fn html_injection_payloads_on_every_file_keep_one_anchor_per_file() {
+        let e = entry(
+            "1.0",
+            vec![
+                file(&format!("{QUOTE_CASE}-1.0.tar.gz"), Some(SHA_A), None),
+                file(
+                    &format!("{TAG_CASE}-1.0-py3-none-any.whl"),
+                    Some(SHA_B),
+                    Some(TAG_CASE),
+                ),
+            ],
+        );
+        let html = build_html(vec![e], TAG_CASE, &format!("/pypi/m/simple/{QUOTE_CASE}"));
+        assert_no_injection(&html, 2);
+    }
+
+    // -----------------------------------------------------------------
     // JSON — empty set
     // -----------------------------------------------------------------
 
@@ -506,7 +805,7 @@ mod tests {
     fn json_single_file_emits_full_row_with_hashes_and_requires_python() {
         let f = file(
             "requests-2.31.0-py3-none-any.whl",
-            Some("abc123def"),
+            Some(SHA_A),
             Some(">=3.7"),
         );
         let json = build_json(
@@ -523,7 +822,7 @@ mod tests {
             row["url"].as_str().unwrap(),
             "/pypi/m/simple/requests/requests-2.31.0-py3-none-any.whl"
         );
-        assert_eq!(row["hashes"]["sha256"].as_str().unwrap(), "abc123def");
+        assert_eq!(row["hashes"]["sha256"].as_str().unwrap(), SHA_A);
         assert_eq!(row["requires-python"].as_str().unwrap(), ">=3.7");
         // `metadata_hash = None` (default in `file()`) → PEP 691
         // "no metadata available" (`"dist-info-metadata": false`).
@@ -572,10 +871,10 @@ mod tests {
         let entry = entry(
             "2.31.0",
             vec![
-                file("requests-2.31.0.tar.gz", Some("h1"), None),
+                file("requests-2.31.0.tar.gz", Some(SHA_A), None),
                 file(
                     "requests-2.31.0-py3-none-any.whl",
-                    Some("h2"),
+                    Some(SHA_B),
                     Some(">=3.7"),
                 ),
             ],
@@ -644,7 +943,7 @@ mod tests {
 
     #[test]
     fn json_url_construction_uses_base_url_and_filename_never_raw_upstream() {
-        let f = file("requests-2.31.0.tar.gz", Some("h"), None);
+        let f = file("requests-2.31.0.tar.gz", Some(SHA_A), None);
         let json = build_json(
             vec![entry("2.31.0", vec![f])],
             "requests",
@@ -663,16 +962,16 @@ mod tests {
 
     #[test]
     fn html_url_construction_uses_base_url_and_filename_never_raw_upstream() {
-        let f = file("requests-2.31.0.tar.gz", Some("h"), None);
+        let f = file("requests-2.31.0.tar.gz", Some(SHA_A), None);
         let html = build_html(
             vec![entry("2.31.0", vec![f])],
             "requests",
             "http://localhost/pypi/m/simple/requests",
         );
         assert!(
-            html.contains(
-                "http://localhost/pypi/m/simple/requests/requests-2.31.0.tar.gz#sha256=h"
-            ),
+            html.contains(&format!(
+                "http://localhost/pypi/m/simple/requests/requests-2.31.0.tar.gz#sha256={SHA_A}"
+            )),
             "anchor must embed base_url + filename: {html}",
         );
         assert!(
@@ -772,7 +1071,7 @@ mod tests {
     fn html_wheel_with_metadata_hash_emits_pep658_attribute() {
         let f = file_with_metadata_hash(
             "example-1.0.0-py3-none-any.whl",
-            Some("aaaa"),
+            Some(SHA_A),
             None,
             METADATA_HASH_HEX,
         );
@@ -791,7 +1090,7 @@ mod tests {
     #[test]
     fn html_wheel_without_metadata_hash_omits_pep658_attribute() {
         // `None` → attribute OMITTED, NOT `="true"`.
-        let f = file("example-1.0.0-py3-none-any.whl", Some("aaaa"), None);
+        let f = file("example-1.0.0-py3-none-any.whl", Some(SHA_A), None);
         let html = build_html(
             vec![entry("1.0.0", vec![f])],
             "example",
@@ -818,7 +1117,7 @@ mod tests {
         // the no-attribute branch is what fires for sdists in
         // production. Test the production path: sdist with default
         // None → no attribute.
-        let f = file("example-1.0.0.tar.gz", Some("aaaa"), None);
+        let f = file("example-1.0.0.tar.gz", Some(SHA_A), None);
         let html = build_html(
             vec![entry("1.0.0", vec![f])],
             "example",
@@ -838,7 +1137,7 @@ mod tests {
     fn json_wheel_with_metadata_hash_emits_dist_info_metadata_object() {
         let f = file_with_metadata_hash(
             "example-1.0.0-py3-none-any.whl",
-            Some("aaaa"),
+            Some(SHA_A),
             None,
             METADATA_HASH_HEX,
         );
@@ -864,7 +1163,7 @@ mod tests {
     fn json_wheel_without_metadata_hash_emits_dist_info_metadata_false() {
         // Per PEP 691 — `false` is the wire shape for "no metadata
         // file available."
-        let f = file("example-1.0.0-py3-none-any.whl", Some("aaaa"), None);
+        let f = file("example-1.0.0-py3-none-any.whl", Some(SHA_A), None);
         let json = build_json(
             vec![entry("1.0.0", vec![f])],
             "example",
@@ -885,7 +1184,7 @@ mod tests {
         // ContentReference lookup never returns rows for sdists). The
         // builder therefore emits `false` for every sdist row, by
         // construction.
-        let f = file("example-1.0.0.tar.gz", Some("aaaa"), None);
+        let f = file("example-1.0.0.tar.gz", Some(SHA_A), None);
         let json = build_json(
             vec![entry("1.0.0", vec![f])],
             "example",

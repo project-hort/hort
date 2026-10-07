@@ -72,6 +72,7 @@ use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 // endpoint use case. Wraps the pure `PrefetchUseCase` planner above
 // with the I/O-bearing orchestration (the pure
 // planner stays untouched).
+use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
@@ -1708,6 +1709,7 @@ async fn build_notification_runtime(
     user_repo: Arc<dyn UserRepository>,
     subscription_repo: Arc<dyn hort_domain::ports::subscription_repository::SubscriptionRepository>,
     repo_repo: Arc<dyn hort_domain::ports::repository_repository::RepositoryRepository>,
+    event_visibility: Arc<EventVisibilityUseCase>,
     webhook_notifier: Arc<hort_notifier_webhook::WebhookNotifier>,
 ) -> Option<NotificationRuntime> {
     if !notify_config.enabled {
@@ -1760,6 +1762,7 @@ async fn build_notification_runtime(
         user_repo,
         subscription_repo,
         repo_repo,
+        event_visibility,
         change_listener,
         notifiers,
     );
@@ -2790,6 +2793,18 @@ pub async fn build_app_context(
         },
     ));
 
+    // The repository-visibility primitive shared by the
+    // `GET /api/v1/events` read gate and the notification dispatcher's
+    // delivery filter. ONE instance for both: the post-ingest artifact
+    // lifecycle carries no repository column, and two independent
+    // resolutions of "which repository does this event disclose" would
+    // be free to drift apart.
+    let event_visibility_use_case = Arc::new(EventVisibilityUseCase::new(Arc::new(
+        hort_adapters_postgres::event_repository_resolver::PgEventRepositoryResolver::new(
+            db.clone(),
+        ),
+    )));
+
     // Boot-time unsafe-config gauges for the two webhook-safety
     // operator opt-ins — see `emit_webhook_unsafe_config_gauges`.
     emit_webhook_unsafe_config_gauges(&notify_config);
@@ -2808,6 +2823,7 @@ pub async fn build_app_context(
         user_repo.clone(),
         subscription_repo.clone(),
         repo_repo.clone(),
+        event_visibility_use_case.clone(),
         webhook_notifier.clone(),
     )
     .await;
@@ -3051,6 +3067,7 @@ pub async fn build_app_context(
         // mounts the `/api/v1/subscriptions` + `/api/v1/events`
         // routes.
         subscription_use_case,
+        event_visibility_use_case,
         // Curator decision authority over quarantined /
         // non-terminal artifacts; HTTP decision handlers mount under
         // `/api/v1/admin/curation/...`.

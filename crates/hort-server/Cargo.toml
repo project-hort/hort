@@ -33,6 +33,14 @@ hort-http-core         = { workspace = true }
 # compile time. Backs the `license` / `attribution` subcommands
 # (`src/cli/license.rs`, `src/cli/attribution.rs`).
 hort-attribution       = { workspace = true }
+# Atomic 0600 secret-file write, shared with `hort-cli`. Backs the
+# `admin issue-svc-token` / `admin bootstrap-session` `--output=file:`
+# sink: the plaintext bearer must land in an inode this process created at
+# 0600, never in a pre-existing file whose mode or type it inherited. A
+# std-only leaf crate with zero `hort-*` deps of its own — see that
+# crate's Cargo.toml for why the helper cannot live in `hort-domain` or
+# `hort-app`.
+hort-secret-file       = { workspace = true }
 # The per-format HTTP adapter crates (ADR 0008). Each one
 # depends only on hort-domain + hort-app + hort-formats + hort-http-core and
 # carries no adapter deps. hort-server is the only crate that lists all

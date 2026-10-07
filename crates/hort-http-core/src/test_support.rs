@@ -39,6 +39,7 @@ use hort_app::use_cases::curation_use_case::CurationUseCase;
 use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
+use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
@@ -72,7 +73,7 @@ use hort_app::use_cases::test_support::{
     MockApiTokenRepository, MockArtifactGroupLifecyclePort, MockArtifactGroupRepository,
     MockArtifactLifecycle, MockArtifactMetadataRepository, MockArtifactRepository,
     MockClaimMappingRepository, MockContentReferenceIndex, MockCurationRuleRepository,
-    MockEventStore, MockJobsRepository, MockPermissionGrantRepository,
+    MockEventRepositoryResolver, MockEventStore, MockJobsRepository, MockPermissionGrantRepository,
     MockPolicyProjectionRepository, MockRefLifecyclePort, MockRefRegistryPort,
     MockRepoSecurityScoreRepository, MockRepositoryRepository,
     MockRepositoryUpstreamMappingRepository, MockStatefulUploadStagingPort, MockStoragePort,
@@ -1243,6 +1244,21 @@ pub fn build_mock_ctx_with_label_flag(
         SubscriptionUseCaseConfig::default(),
     ));
 
+    // The repository-visibility primitive. Resolves out of the SAME
+    // seeded `MockArtifactRepository` / `MockArtifactGroupRepository`
+    // rows the rest of the harness uses, so a test that seeds an
+    // artifact has already told the events-read gate which repository
+    // owns it — there is no second map to keep in sync. An artifact with
+    // no seeded row stays unresolved, which is how the fail-closed arm
+    // is reachable from a test.
+    let event_repository_resolver = Arc::new(MockEventRepositoryResolver::new(
+        artifacts.clone(),
+        artifact_groups.clone(),
+    ));
+    let event_visibility_use_case = Arc::new(EventVisibilityUseCase::new(
+        event_repository_resolver.clone(),
+    ));
+
     // `CurationUseCase` wired
     // with the same ports the production composition root threads
     // (events, artifacts, lifecycle, policy projections). The three
@@ -1390,6 +1406,7 @@ pub fn build_mock_ctx_with_label_flag(
         rbac_resolve_use_case,
         // See field doc.
         subscription_use_case,
+        event_visibility_use_case,
         // See field doc.
         curation_use_case,
         provenance_misrejection_repair_use_case,
@@ -1661,6 +1678,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         // reconstruct the harness from scratch via `build_mock_ctx`
         // rather than mutating in place.
         subscription_use_case: base.subscription_use_case.clone(),
+        event_visibility_use_case: base.event_visibility_use_case.clone(),
         // Carry forward the same
         // `Arc<CurationUseCase>`. The curation surface is admin-only
         // (gated by `CurateOrAdminPrincipal`) and does NOT consume

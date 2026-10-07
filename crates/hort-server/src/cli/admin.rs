@@ -29,9 +29,7 @@
 //!
 //! [`Command::Admin`]: super::Command::Admin
 
-use std::fs;
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -144,8 +142,12 @@ pub struct IssueSvcTokenArgs {
     ///
     /// - `stdout` (default): print to stdout. The Helm bootstrap Job pipes
     ///   this into `kubectl create secret generic`.
-    /// - `file:<path>`: write to `<path>` with mode 0600. Useful for local
-    ///   dev and provisioning scripts that need a file-based secret.
+    /// - `file:<path>`: atomically place the token at `<path>` as a file
+    ///   this process created at mode 0600 — a pre-existing file or
+    ///   symlink there is *replaced*, never inherited or followed, so the
+    ///   0600 promise holds on an overwrite too. `<path>`'s parent
+    ///   directory must already exist and is left untouched. Useful for
+    ///   local dev and provisioning scripts that need a file-based secret.
     /// - `kube-secret`: deferred —
     ///   post-v1 (cluster RBAC); not implemented in v1. The bootstrap Job
     ///   uses the `stdout` mode and shells out to `kubectl`. This mode
@@ -223,7 +225,9 @@ pub struct BootstrapSessionArgs {
     /// Output mode for the issued token.
     ///
     /// - `stdout` (default): print to stdout.
-    /// - `file:<path>`: write to `<path>` with mode 0600.
+    /// - `file:<path>`: atomically place the token at `<path>` as a file
+    ///   this process created at mode 0600 (see `issue-svc-token`'s
+    ///   `--output` for the exact guarantee).
     ///
     /// Same shape as `issue-svc-token`; `kube-secret` is not supported
     /// here (the bootstrap token is a one-off break-glass credential,
@@ -708,22 +712,42 @@ fn parse_output_mode(output: &str) -> anyhow::Result<Option<String>> {
 
 /// Write the plaintext token to the resolved output sink.
 ///
-/// `None` → stdout (the Helm / provisioning caller reads it). `Some(path)`
-/// → write to `<path>` with mode 0600 so only the owning process can read.
+/// `None` → stdout (the Helm / provisioning caller reads it).
+/// `Some(path)` → atomically place it at `<path>` as a file *this* process
+/// created at mode 0600, via the shared
+/// [`hort_secret_file::write_secret_file`].
+///
+/// The secret never reaches a file whose mode or type this process did not
+/// set. `OpenOptionsExt::mode` applies only when a file is *created*, so
+/// opening `<path>` with `create(true).truncate(true).mode(0o600)` would
+/// leave a pre-existing group- or world-readable file at its own
+/// permissions and write the bearer into it — the documented 0600 output
+/// silently not holding — and would follow a symlink at `<path>` to a path
+/// the operator never named. Replacing the directory entry closes both.
+/// What leaks on that path is a service-account bearer or a full-cap
+/// bootstrap admin PAT, and the issuance gates (DSN access,
+/// `HORT_TOKEN_ALLOW_ADMIN`) guard the *minting*, not this sink.
+///
+/// Re-running the command against the same `<path>` keeps working: what
+/// makes the overwrite safe is the atomic replace, not a refusal to
+/// overwrite.
+///
+/// `<path>`'s parent directory must already exist and is never modified.
+/// The operator chose that directory, and the native deployment's default
+/// token location is `/etc/hort/tasks-token` — a directory deliberately
+/// kept `root:hort` 0750 so `hort-server.service` can read the env files
+/// beside the token. Tightening it to 0700 on a token mint would break the
+/// service. The parent's mode is not what protects the secret anyway; the
+/// 0600 inode is. The replaced file is owned by this process, so a caller
+/// needing a different owner (the Ansible timers role chowns the token to
+/// its run user) sets it after the write.
 fn write_plaintext(output_path: &Option<String>, plaintext: &str) -> anyhow::Result<()> {
     match output_path {
         None => {
             println!("{plaintext}");
         }
         Some(path) => {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(path)
-                .with_context(|| format!("opening output file {path:?}"))?;
-            file.write_all(plaintext.as_bytes())
+            hort_secret_file::write_secret_file(Path::new(path), plaintext.as_bytes())
                 .with_context(|| format!("writing token to {path:?}"))?;
             eprintln!("info: token written to {path}");
         }
@@ -1735,6 +1759,146 @@ mod tests {
         );
         let err = parse_output_mode("kube-secret").unwrap_err();
         assert!(err.to_string().contains("unknown output mode"));
+    }
+
+    // -- `--output=file:` sink: the secret never lands in a file whose
+    //    mode or type this process did not set -----------------------------
+    //
+    // The three cases the sink has to survive, each asserting the
+    // PERMISSIONS of the resulting file and not merely its content:
+    // a pre-existing world-readable regular file, a pre-existing symlink,
+    // and a target that does not exist yet. What flows through here is a
+    // service-account bearer or a full-cap bootstrap admin PAT, so these
+    // run against a real filesystem — the mode bits of the resulting
+    // inode, and whether a symlink was followed, are not observable any
+    // other way.
+
+    const SINK_TOKEN: &str = "hort_pat_sekret-bearer-value";
+
+    /// Permission bits of `path`.
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+
+    /// Drive the `file:<path>` sink exactly as the command does: through
+    /// `parse_output_mode`, so the test covers the real argument path and
+    /// not just the writer.
+    fn write_token_to(path: &Path) {
+        let mode = parse_output_mode(&format!("file:{}", path.display())).expect("parse");
+        assert_eq!(mode.as_deref(), Some(path.to_str().unwrap()));
+        write_plaintext(&mode, SINK_TOKEN).expect("write");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_target_that_does_not_exist_is_created_0600() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("svc.token");
+
+        write_token_to(&path);
+
+        assert_eq!(mode_of(&path), 0o600, "a fresh token file must be 0600");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SINK_TOKEN);
+        // No temp sibling may survive — a leftover would be a second copy
+        // of the bearer at a name nothing cleans up.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["svc.token".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_existing_world_readable_target_ends_up_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("svc.token");
+
+        // A local user pre-creates the operator's output path 0644. With
+        // `create(true).truncate(true).mode(0o600)` the mode would survive
+        // (mode applies only on create) and the bearer would land in a
+        // world-readable file.
+        std::fs::write(&path, "pre-existing").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&path), 0o644, "precondition");
+
+        write_token_to(&path);
+
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the documented 0600 output must hold on an overwrite too"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SINK_TOKEN,
+            "and the overwrite must still work — operators re-run \
+             issue-svc-token against the same path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_existing_symlink_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let elsewhere = dir.path().join("attacker-readable");
+        std::fs::write(&elsewhere, "original elsewhere bytes").unwrap();
+        let path = dir.path().join("svc.token");
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+
+        write_token_to(&path);
+
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the symlink must be replaced by our own regular file"
+        );
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SINK_TOKEN);
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            "original elsewhere bytes",
+            "the bearer must not reach the link target — a path the \
+             operator never named"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_leaves_the_operators_directory_mode_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let etc_hort = dir.path().join("etc-hort");
+        std::fs::create_dir(&etc_hort).unwrap();
+        // Mimic the native deployment's /etc/hort: group-readable on
+        // purpose so the service user can read hort-server.env beside the
+        // token. Pulling it to 0700 on a mint would break the service.
+        std::fs::set_permissions(&etc_hort, std::fs::Permissions::from_mode(0o750)).unwrap();
+
+        write_token_to(&etc_hort.join("tasks-token"));
+
+        assert_eq!(mode_of(&etc_hort), 0o750);
+    }
+
+    #[test]
+    fn output_file_with_a_missing_parent_directory_fails_loudly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("no-such-dir").join("svc.token");
+        let mode = parse_output_mode(&format!("file:{}", path.display())).expect("parse");
+
+        let err = write_plaintext(&mode, SINK_TOKEN).expect_err("must fail");
+
+        // The message has to name the path the operator passed, so a
+        // provisioning run that fails is actionable from its log alone.
+        let msg = format!("{err:#}");
+        assert!(msg.contains(path.to_str().unwrap()), "unexpected: {msg}");
+        assert!(!path.exists(), "no partial token file may be left behind");
     }
 
     // -- bootstrap-session: HORT_TOKEN_ALLOW_ADMIN gate ----------------------

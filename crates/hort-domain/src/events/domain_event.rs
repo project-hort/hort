@@ -581,8 +581,8 @@ impl DomainEvent {
     /// The locus is
     /// `ArtifactDownloaded`: it carries a `repository_id` (lands on
     /// `StreamCategory::DownloadAudit`) and
-    /// [`crate::entities::subscription::EventTypeKind::repository_id`]
-    /// returns `Some(repo)` for it, so the *None-repo*
+    /// [`crate::entities::subscription::EventTypeKind::disclosed_repositories`]
+    /// answers with that repository, so the *no-repository-association*
     /// admin re-check never sees it and it escapes to any `Read` principal
     /// on the repo. Like [`Self::is_authorization_model_mutation`], when
     /// this predicate is `true` the read + subscription gates require

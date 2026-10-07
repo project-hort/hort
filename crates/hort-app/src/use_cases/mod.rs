@@ -35,6 +35,10 @@ pub mod effective_permissions_use_case;
 // `StreamSealed` tombstone is emitted by the adapter, never
 // reimplemented here). Two seal modes; registered with the worker via
 // the retention registration seam.
+/// The repository-visibility primitive shared by the
+/// `GET /api/v1/events` read gate and the subscription delivery filter.
+/// Both consult it; neither re-derives it.
+pub mod event_visibility;
 pub mod eventstore_retention_use_case;
 pub mod group_reconcile_use_case;
 // Shared `IndexFilter` implementations

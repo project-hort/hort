@@ -18,7 +18,13 @@ mod cas_scrub_events;
 mod chain;
 mod checkpoint_build;
 mod curation_events;
-mod domain_event;
+// `pub(crate)` rather than private: the module's `#[cfg(test)]`
+// `all_test_variants()` corpus is the crate's canonical
+// one-instance-per-`DomainEvent`-variant list, and the exhaustiveness
+// guards that walk it live outside `events` (notably
+// `entities::subscription`'s repository-disclosure guard). The public
+// API is unchanged — every type is re-exported below.
+pub(crate) mod domain_event;
 mod download_events;
 mod oidc_issuer_events;
 mod policy_events;

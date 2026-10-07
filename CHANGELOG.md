@@ -9,6 +9,161 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A failed OCI blob-upload `PATCH` can no longer grow the staging file past
+  the upload cap** (#338). `append_chunk_core` wrote the body to staging and
+  advanced the session record's `bytes_received` afterwards, via
+  `compare_and_swap`. Three exits sat between the two and left the `.part` file
+  longer than the record claimed: a short read on the declared-length path, an
+  over-cap body on the unframed-length path, and — the sharpest — a CAS miss,
+  where two concurrent `PATCH`es had both already appended and only one bumped
+  the record. From then on every further `PATCH` computed the cap against the
+  stale, smaller recorded offset, appended again, saw a physical total it could
+  not explain and returned `500` — having enlarged the file once more. Repeating
+  that drove a single session's staging file arbitrarily far past
+  `HORT_OCI_MAX_UPLOAD_BYTES` while the recorded offset never moved; a writer
+  authorised to push to one repository reached it with two competing `PATCH`es.
+  The finalize-time digest check kept the wrong bytes out of CAS — it does
+  nothing about the disk the session fills, which is a denial-of-service against
+  every tenant sharing the volume.
+  - The fix is at the root the three exits share, not on the three exits. The
+    staging port's own concurrency contract already said the OCI use case
+    "gates every `PATCH` on an optimistic-concurrency check … via
+    `compare_and_swap`" — but the check ran *after* the append, so it gated
+    nothing. The claim now comes first: the use case advances `bytes_received`
+    to the ceiling of the `PATCH`'s byte budget before a byte reaches staging,
+    so the loser of a race is rejected having written nothing and the winner's
+    bytes are the only bytes in the file.
+  - Because the record moves first it is never smaller than the file, which is
+    what takes the physical length out of the authority chain for good: a failed
+    `PATCH` leaves the record over-stating staging, and
+    `StatefulUploadStagingPort::append_at` — which now writes at the caller's
+    asserted offset instead of blindly at the end — refuses the next write as a
+    gap rather than appending on top of it. An unframed body's claim reserves the
+    remaining cap headroom and settles back down to the bytes that landed, so a
+    `Transfer-Encoding: chunked` sequence still appends chunk by chunk.
+  - The over-cap signal also left the file: `append_at` takes a byte budget,
+    stops at it, and reports "the body wanted more" in its return value. The
+    previous form encoded that bit by reading one byte past the cap and letting
+    it land, so an over-cap `PATCH` left staging at `max_bytes + 1`.
+  - Position-checked writing replaces the adapter's `O_APPEND` open mode, whose
+    "every write lands at whatever the current end is" semantics were the
+    mechanism the overrun ran on. It also repairs a staging file left long by
+    the old ordering: the first write at a recorded offset drops the unaccounted
+    tail, which the record never claimed and no finalize could have turned into
+    content.
+
+- **`hort-server admin --output=file:<path>` can no longer write a fresh bearer
+  into a file whose permissions or type it did not set** (#338).
+  `issue-svc-token` and `bootstrap-session` document a 0600 output file and
+  opened the path with `create(true).truncate(true).mode(0o600)`.
+  `OpenOptionsExt::mode` applies only when a file is *created*, so an existing
+  group- or world-readable file at that path kept its own permissions and the
+  plaintext token was written into it, and a symlink at that path was followed
+  to wherever it pointed. Both states are reachable by any local user who can
+  create the path before the mint runs. What leaked is a service-account bearer
+  or a full-cap bootstrap admin PAT; the issuance gates (DSN access,
+  `HORT_TOKEN_ALLOW_ADMIN`) guard the minting, not this sink.
+  - The sink now places the token through an atomic
+    `create_new(true).mode(0o600)` sibling temp file + `rename` over the
+    target, so the secret only ever reaches an inode the process created at
+    0600 and a symlink at the target is **replaced instead of followed**.
+    Re-running against the same path still overwrites — what makes the
+    overwrite safe is the atomic replace, not a refusal to overwrite.
+  - One way, not two: that write form already existed in `hort-cli auth
+    login`, which fixed the identical fault class for `~/.hort/config.toml`.
+    It now lives once, in a new std-only zero-`hort-*`-dependency leaf crate
+    `hort-secret-file` (the shape `hort-attribution` established, ADR 0047 D2 —
+    `hort-cli` carries no `hort-domain`/`hort-app`/`hort-adapters-*`
+    dependency, so a shared helper cannot live in either), and both sinks call
+    it.
+  - The shared writer deliberately does **not** create or `chmod` the target's
+    parent directory, unlike the `~/.hort/` caller that still tightens its own.
+    An operator-named path is not the process's to re-permission: the native
+    deployment's default token location is `/etc/hort/tasks-token`, and
+    `/etc/hort` is kept `root:hort` 0750 so `hort-server.service` can read the
+    env files beside the token — pulling it to 0700 on a mint would break the
+    service. The replaced file is owned by the writing process, so a deployment
+    that needs another owner (the Ansible timers role chowns the token to its
+    run user) still sets it after the write, as it already did.
+
+- **The PyPI simple index no longer interpolates upstream text into the page
+  unescaped** (#338). The PEP 503 HTML builder concatenated five dynamic values
+  into the document and escaped one of them. An upstream serving a
+  `hashes.sha256` shaped `a"></a><a href="https://attacker.example/…` closed the
+  `href`, closed the anchor and opened a second one; a standard parser reads
+  that as another download link, so the **client's** candidate set changes and
+  can point outside Hort's artifact and quarantine path entirely. The same held
+  for an upstream-supplied `filename`, which the builder interpolated twice —
+  into the URL and into the anchor text. Reaching a proxy repository's index was
+  the only prerequisite.
+  - Every interpolated value is now escaped — filename (both positions),
+    package name, base URL, the PEP 658 metadata hash and `requires-python` —
+    so "nothing reaches the output unescaped" is a property a reader confirms
+    from one function rather than from an invariant three crates away.
+  - The upstream hash is additionally closed **by type**: the index-serving
+    `PypiVersionFile::hash_sha256` is now a `ContentHash` rather than a verbatim
+    `Option<String>`, so a value that is not a canonical SHA-256 digest cannot
+    be represented, let alone served. This loses no verification a client could
+    have passed — a non-digest can never match a `hexdigest()` — and an
+    upstream that spells a real digest in uppercase is case-folded rather than
+    dropped. The upstream-checksum verification path (ADR 0006) reads a
+    different struct on the per-version JSON projection and is untouched.
+  - `html_escape_attr` is renamed `html_escape`: the five-character set is a
+    correct superset for element text too, and the `_attr` suffix made its
+    (correct) use on the anchor text read as an oversight. Its inverse in the
+    HTML projector is renamed and widened to match, so a Hort proxying a Hort
+    recovers the upstream's filename instead of re-escaping an already-escaped
+    one — which also fixes that mangling where it reached `files[].url` on the
+    JSON arm.
+
+- **Artifact-lifecycle events no longer bypass repository visibility** (#338).
+  `GET /api/v1/events?category=artifact` and the subscription delivery filter
+  both decided per-event visibility from an `Option<Uuid>` extractor whose
+  `None` meant "no repository, therefore visible". Nineteen artifact-stream
+  event types return no `repository_id` — they name the artifact, because the
+  artifact aggregate owns exactly one repository — so an authenticated account
+  with **no `Read` grant anywhere** could read every repository's scanner
+  names, severity counts, findings-blob hashes, release justifications and
+  operator ids, and an `OwnedByActor` subscription (which needs no read proof
+  to create) delivered the same to an external webhook or NATS target. The
+  same absent value had the opposite effect on an explicit
+  `RepositoryScope::Some([repo])` subscriber, which silently lost that
+  repository's entire lifecycle feed: an allow-list cannot match an event that
+  names no repository. Both directions are closed by one change.
+  - **Resolution, not payload extension.** `EventTypeKind::repository_id` is
+    replaced by `EventTypeKind::disclosed_repositories`, which classifies a
+    payload exhaustively into *global* (no repository association), one or two
+    repository references (carried directly, or named through the artifact /
+    artifact-group aggregate), or *unattributable*. Adding a `repository_id`
+    field to the nineteen event types would have left every already-stored
+    event unprotected and would have altered the canonical bytes of every
+    event written before it (`ChainBreak::HashMismatch`, ADR 0002). The fix
+    therefore applies to the existing store, with no migration.
+  - **One primitive, both call sites.** `hort_app::use_cases::event_visibility`
+    holds the classification, the batch resolution and the fail-closed
+    dispositions; the read handler and the delivery filter consult it and
+    differ only in the gate they then apply. The convention they each
+    implemented locally is gone, not patched.
+  - **One round trip per page, not per event.** A new
+    `EventRepositoryResolver` port resolves a whole page's aggregates in a
+    single statement — joins against unnested-array CTEs, never
+    `= ANY($1::uuid[])`, whose pooled generic plan degrades to a row-by-row
+    scan (1.3 s against 64.2 s on this project's corpus). Resolution is by
+    identity and never filtered on liveness, so a purged artifact's events
+    stay visible to its own repository's readers.
+  - **The promotion chain needs both repositories.** `PromotionRequested` /
+    `ApprovalRequested` / `ArtifactPromoted` / `PromotionRejected` disclose a
+    source and a target and the served payload carries both identities, so
+    `Read` on one of them is not authority to read it.
+  - **Unresolvable is admin-only, not invisible.** `CasIntegrityMismatch` is
+    keyed on a CAS content hash no single repository owns, and an aggregate
+    whose repository was deleted has no row left to resolve; both now require
+    live `Permission::Admin` instead of passing through.
+  - Two tests that pinned the bypass as the intended contract
+    (`non_privileged_category_none_repo_event_unchanged_for_non_admin`,
+    `all_scope_event_without_repo_skips_authz`) are renamed and inverted
+    rather than deleted, so the inversion is visible as one.
+
 - **No path that mints an artifact writes a content-reference edge after the
   fact any more** (#335). The last three writers — the OCI manifest PUT's
   `oci_config` / `oci_layer` / `oci_index_member` membership edges, both

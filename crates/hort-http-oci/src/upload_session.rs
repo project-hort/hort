@@ -64,7 +64,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -557,8 +557,8 @@ impl ContentRange {
 
 /// Append a chunk of bytes to an in-flight OCI blob upload session.
 ///
-/// Composes three outbound ports under one optimistic-concurrency CAS
-/// window:
+/// Composes three outbound ports, claiming the byte range before writing
+/// it:
 ///
 /// 1. `ctx.ephemeral_durable.get(session_key("oci", session_id))` — loads the
 ///    [`UploadSessionRecord`]; missing / decode-failed / tenant-mismatch
@@ -568,14 +568,23 @@ impl ContentRange {
 ///    the caller-supplied `max_bytes` cap.  Each kind of mismatch
 ///    surfaces as a distinct [`AppError`] variant so the adapter can
 ///    emit the right status code (416 / 400 / 413).
-/// 3. `ctx.stateful_upload_staging.append(session_id, stream)` — appends
-///    the body bytes to staging.  Non-retryable; a failure on this step
-///    leaves the session's `bytes_received` unchanged (we haven't CASed
-///    yet).
-/// 4. `ctx.ephemeral_durable.compare_and_swap(key, record.version, new_record,
-///    TTL)` — atomic bump + TTL slide.  A CAS miss means a concurrent
-///    PATCH won; we surface [`DomainError::Conflict`] so the adapter
-///    emits `400 BLOB_UPLOAD_INVALID`.
+/// 3. `ctx.ephemeral_durable.compare_and_swap(key, record.version, …)` —
+///    advances `bytes_received` to the ceiling of this PATCH's byte
+///    budget (`bytes_received + Content-Length`, or the remaining cap
+///    headroom for an unframed body) + TTL slide. A CAS miss means a
+///    concurrent PATCH won; we surface [`DomainError::Conflict`] so the
+///    adapter emits `400 BLOB_UPLOAD_INVALID` — **before** any byte
+///    reaches staging, which is what makes the claim a serialisation
+///    rather than a bookkeeping update.
+/// 4. `ctx.stateful_upload_staging.append_at(session_id, offset, limit,
+///    stream)` — writes the body bytes at the claimed offset, bounded by
+///    the claimed budget. Non-retryable; a failure here leaves the record
+///    over-stating staging, so the session is wedged (the client restarts
+///    with a fresh `POST`) but the staging file cannot be grown any
+///    further by retrying.
+/// 5. Unframed bodies only: a second `compare_and_swap` settles the claim
+///    down to the bytes that actually landed, so the next PATCH in a
+///    `Transfer-Encoding: chunked` sequence has headroom to append into.
 ///
 /// # Tenant isolation
 ///
@@ -598,8 +607,9 @@ impl ContentRange {
 /// # Metric emission
 ///
 /// Every error path (RangeInvalid, BodyLengthMismatch, SizeExceeded,
-/// tenant-mismatch NotFound, CAS-miss Conflict, decode-failure
-/// Invariant, staging-failure Invariant, ephemeral-failure Invariant)
+/// tenant-mismatch NotFound, CAS-miss Conflict on either CAS,
+/// decode-failure Invariant, staging-failure Invariant,
+/// ephemeral-failure Invariant)
 /// emits `hort_stateful_upload_sessions_total{format="oci",
 /// repository=<label>, result="aborted"}` exactly once.  Success does
 /// NOT emit — the catalog reserves `created`/`aborted`/`finalized` and
@@ -637,8 +647,9 @@ pub(crate) async fn append_chunk(
 /// Streaming variant for a PATCH that carries **no** `Content-Length`
 /// (`Transfer-Encoding: chunked` — RFC 7230 §3.3.2 forbids sending both a
 /// `Content-Length` and a `Transfer-Encoding`). The body is bounded
-/// in-stream by `max_bytes` inside [`append_chunk_core`]; the actual bytes
-/// landed are authoritative (no declared length to cross-check).
+/// bounded by the cap headroom the staging write reserves inside
+/// [`append_chunk_core`]; the actual bytes landed are authoritative (no
+/// declared length to cross-check).
 #[tracing::instrument(skip(ctx, stream), fields(repository_id = %repo_id))]
 pub(crate) async fn append_chunk_streaming(
     ctx: &AppContext,
@@ -752,89 +763,160 @@ async fn append_chunk_core(
         }
     }
 
-    let new_total = match body_length {
-        // Declared-length path (Content-Length present; the transport
-        // frames the body to exactly `len` bytes). Pre-flight the size cap,
-        // then cross-check staging landed exactly the declared count.
+    // --- Budget: the most bytes this PATCH may add to staging.
+    //
+    // Declared-length path (Content-Length present; the transport frames
+    // the body to exactly `len` bytes): the budget IS the declared
+    // length, pre-flighted against the cap. Streaming path (no
+    // Content-Length — `Transfer-Encoding: chunked`): the transport does
+    // not bound the body, so the budget is the remaining cap headroom
+    // and the staging port reports a body that wanted more.
+    let offset = record.bytes_received;
+    let limit = match body_length {
         Some(len) => {
             // `checked_add` guards a pathological overflow before the
             // comparison; a silent wrap would emit the wrong error code.
-            let projected = record
-                .bytes_received
-                .checked_add(len)
-                .ok_or(AppError::SizeExceeded)?;
+            let projected = offset.checked_add(len).ok_or(AppError::SizeExceeded)?;
             if projected > max_bytes {
                 return Err(AppError::SizeExceeded);
             }
-            let new_total = ctx
-                .stateful_upload_staging
-                .append(session_id, stream)
-                .await
-                .map_err(AppError::from)?;
+            len
+        }
+        None => max_bytes.saturating_sub(offset),
+    };
+    // Cannot overflow: the declared path rejected `offset + len >
+    // max_bytes` above, and the streaming path's `limit` is
+    // `max_bytes - offset` clamped at zero.
+    let reserved = offset + limit;
+
+    // --- Claim [offset, reserved) in the record BEFORE writing a byte.
+    //
+    // This CAS is the serialisation the staging port's concurrency
+    // contract requires, and the ordering is the whole point: the loser
+    // of a concurrent-PATCH race is rejected here, having appended
+    // nothing, so the winner's bytes are the only bytes in the file. CAS
+    // *after* the append gates nothing — both racers write, the file ends
+    // up longer than the record either of them wrote, and from then on
+    // every cap check computes against a length that is already stale, so
+    // each further PATCH grows the file again without the record ever
+    // catching up.
+    //
+    // The claim is also why the record is never smaller than the file:
+    // `bytes_received` moves to the budget's ceiling first and only comes
+    // back down once the bytes are on disk. A failed PATCH therefore
+    // leaves the record over-stating staging, never under-stating it, and
+    // the position check in `append_at` turns the next PATCH into a
+    // refusal rather than another append.
+    //
+    // `version` mirrors the store's own counter, which `compare_and_swap`
+    // bumps by one on success.
+    let reserved_record = cas_bytes_received(
+        ctx,
+        session_id,
+        key,
+        &record,
+        reserved,
+        session_max_age,
+        "reserve",
+    )
+    .await?;
+
+    let appended = ctx
+        .stateful_upload_staging
+        .append_at(session_id, offset, limit, stream)
+        .await
+        .map_err(AppError::from)?;
+
+    match body_length {
+        Some(len) => {
             // Staging-port invariant: a disagreement means the body
             // short-read (client hung up / lied about Content-Length) or an
             // adapter bug. Either way the session is inconsistent with the
             // declared length — `Invariant` → 500. A naive `Conflict` would
-            // invite endless retries of the same corrupt PATCH.
-            if new_total != record.bytes_received + len {
+            // invite endless retries of the same corrupt PATCH. The record
+            // stays at the reservation, so staging is strictly shorter than
+            // the record claims and the next PATCH's `append_at` refuses
+            // the gap instead of appending on top.
+            if appended.truncated || appended.total != reserved {
                 tracing::warn!(
                     session_id = %session_id,
-                    expected = record.bytes_received + len,
-                    actual = new_total,
-                    "staging append byte count disagreed with declared body length"
+                    expected = reserved,
+                    actual = appended.total,
+                    truncated = appended.truncated,
+                    declared = len,
+                    "staging write byte count disagreed with declared body length"
                 );
                 return Err(AppError::Domain(DomainError::Invariant(
                     "staging append byte count disagreed with declared body length".into(),
                 )));
             }
-            new_total
+            Ok(reserved_record)
         }
-        // Streaming path (no Content-Length — `Transfer-Encoding: chunked`).
-        // The transport does not bound the body, so bound the read at the
-        // cap: `take(headroom)` (headroom = remaining cap + 1) truncates, so
-        // staging never grows past `max_bytes + 1`, and a body that reaches
-        // the +1 trips the post-append cap check. Actual bytes landed are
-        // authoritative — there is no declared length to cross-check.
         None => {
-            let headroom = max_bytes
-                .saturating_sub(record.bytes_received)
-                .saturating_add(1);
-            let bounded: Box<dyn AsyncRead + Send + Unpin> = Box::new(stream.take(headroom));
-            let new_total = ctx
-                .stateful_upload_staging
-                .append(session_id, bounded)
-                .await
-                .map_err(AppError::from)?;
-            if new_total > max_bytes {
+            // The body wanted more than the remaining headroom. Staging
+            // holds exactly `max_bytes` and the record agrees; the surplus
+            // never reached disk.
+            if appended.truncated {
                 return Err(AppError::SizeExceeded);
             }
-            new_total
+            if appended.total == reserved {
+                return Ok(reserved_record);
+            }
+            // A streaming body is almost always shorter than the headroom
+            // it reserved, so settle the claim down to what actually
+            // landed — otherwise the session would read as full after one
+            // chunk and no further PATCH could append. A miss here means a
+            // PATCH raced in on the reservation; the record keeps the
+            // ceiling (still >= staging) and the client restarts.
+            cas_bytes_received(
+                ctx,
+                session_id,
+                key,
+                &reserved_record,
+                appended.total,
+                session_max_age,
+                "settle",
+            )
+            .await
         }
-    };
+    }
+}
 
-    // --- CAS bump.  `new_record.version = record.version + 1` keeps
-    // the in-record mirror in lock-step with the store's own counter
-    // after a successful `compare_and_swap`.
-    let new_record = UploadSessionRecord {
-        bytes_received: new_total,
-        version: record.version + 1,
-        ..record
+/// Move the session record's `bytes_received` to `bytes` under an
+/// optimistic-concurrency check on `from.version`, returning the written
+/// record.
+///
+/// A version mismatch means another PATCH won the race: the
+/// spec-compliant response is 400 `BLOB_UPLOAD_INVALID`, so surface
+/// `Conflict` and let the HTTP adapter translate. `phase` names which of
+/// the two CAS sites lost, for the operator reading the log.
+async fn cas_bytes_received(
+    ctx: &AppContext,
+    session_id: Uuid,
+    key: &str,
+    from: &UploadSessionRecord,
+    bytes: u64,
+    session_max_age: Duration,
+    phase: &'static str,
+) -> AppResult<UploadSessionRecord> {
+    let next = UploadSessionRecord {
+        bytes_received: bytes,
+        version: from.version + 1,
+        ..*from
     };
-    let new_bytes = encode_record(&new_record).map_err(AppError::from)?;
-    let cas_outcome = ctx
+    let encoded = encode_record(&next).map_err(AppError::from)?;
+    let outcome = ctx
         .ephemeral_durable
-        .compare_and_swap(key, record.version, new_bytes, session_max_age)
+        .compare_and_swap(key, from.version, encoded, session_max_age)
         .await
         .map_err(AppError::from)?;
-    match cas_outcome {
-        Some(_new_store_version) => Ok(new_record),
+    match outcome {
+        Some(_new_store_version) => Ok(next),
         None => {
-            // Concurrent PATCH bumped the version underneath us. The
-            // spec-compliant response is 400 `BLOB_UPLOAD_INVALID`.
-            // Surface as Conflict; the HTTP adapter translates.
             tracing::info!(
                 session_id = %session_id,
-                expected_version = record.version,
+                expected_version = from.version,
+                phase,
                 "OCI upload PATCH CAS miss: concurrent PATCH won"
             );
             Err(AppError::Domain(DomainError::Conflict(
@@ -2881,14 +2963,26 @@ mod tests {
             .await
             .expect("streaming append must succeed without Content-Length");
             assert_eq!(out.bytes_received, content.len() as u64);
-            assert_eq!(out.version, 2);
+            // Two CAS bumps, not one: an unframed body has no declared
+            // length, so the claim reserves the whole remaining cap
+            // headroom before the write and settles down to what landed.
+            // Leaving the ceiling in place would read as a full session
+            // and no further chunk could append.
+            assert_eq!(out.version, 3);
             let staged = mocks.stateful_upload_staging.bytes_for(session_id).unwrap();
             assert_eq!(staged, content);
+
+            // The settled record is what a subsequent PATCH computes
+            // against, and it matches the physical staging length.
+            let key = session_key("oci", session_id);
+            let stored = ctx.ephemeral_durable.get(&key).await.unwrap().unwrap();
+            let decoded = decode_record(&stored).unwrap();
+            assert_eq!(decoded.bytes_received, staged.len() as u64);
         });
     }
 
     #[test]
-    fn append_chunk_streaming_over_cap_rejects_and_bounds_staging() {
+    fn append_chunk_streaming_over_cap_rejects_and_bounds_staging_to_the_cap() {
         run(async {
             let handle = PrometheusBuilder::new().build_recorder().handle();
             let (ctx, mocks) = build_mock_ctx(handle);
@@ -2900,9 +2994,10 @@ mod tests {
             let session_id = Uuid::new_v4();
             seed_session(&ctx, session_id, repo_id, 0, 1).await;
 
-            // A streaming body over the cap: the bounded `take(max_bytes+1)`
-            // truncates and the post-append check rejects — staging never
-            // grows unbounded even though no length was declared.
+            // A streaming body over the cap: the write is bounded by the
+            // headroom the claim reserved and the port reports the surplus
+            // out-of-band, so staging stops at exactly `max_bytes` — the
+            // over-cap signal never costs a byte on disk.
             let content = vec![0u8; 100];
             let err = append_chunk_streaming(
                 &ctx,
@@ -2921,10 +3016,14 @@ mod tests {
                 .bytes_for(session_id)
                 .map(|b| b.len())
                 .unwrap_or(0);
-            assert!(
-                staged <= 17,
-                "staging must be bounded to max_bytes+1, got {staged}"
-            );
+            assert_eq!(staged, 16, "staging must stop at max_bytes exactly");
+
+            // And the record agrees: it holds the reserved ceiling, which
+            // is the cap, so staging is not longer than the record claims.
+            let key = session_key("oci", session_id);
+            let stored = ctx.ephemeral_durable.get(&key).await.unwrap().unwrap();
+            let decoded = decode_record(&stored).unwrap();
+            assert_eq!(decoded.bytes_received, 16);
         });
     }
 
@@ -3255,6 +3354,263 @@ mod tests {
             &[("format", "oci"), ("result", "aborted")]
         )
         .is_some());
+    }
+
+    /// Declared-length path, short read: the body delivers fewer bytes
+    /// than `Content-Length` promised. The PATCH fails, and the staging
+    /// file is **not longer than the record says** — which is the
+    /// property that matters, because every later PATCH computes the cap
+    /// against the record. Asserting only the status code is what let the
+    /// overrun live: the status was always right.
+    #[test]
+    fn append_chunk_short_read_leaves_staging_no_longer_than_the_record() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.key = "myrepo".into();
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            let session_id = Uuid::new_v4();
+            seed_session(&ctx, session_id, repo_id, 0, 1).await;
+
+            // Declares 10 bytes, delivers 5 — a client that hung up
+            // mid-body, or lied about the length.
+            let range = ContentRange { start: 0, end: 9 };
+            let err = append_chunk(
+                &ctx,
+                session_id,
+                Some(range),
+                cursor_of(&[0u8; 5]),
+                10,
+                1_000_000,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .expect_err("a short read must not be reported as progress");
+            assert!(matches!(err, AppError::Domain(DomainError::Invariant(_))));
+
+            let staged = mocks
+                .stateful_upload_staging
+                .bytes_for(session_id)
+                .map(|b| b.len() as u64)
+                .unwrap_or(0);
+            let key = session_key("oci", session_id);
+            let stored = ctx.ephemeral_durable.get(&key).await.unwrap().unwrap();
+            let recorded = decode_record(&stored).unwrap().bytes_received;
+            assert_eq!(staged, 5, "only the bytes that arrived may be staged");
+            assert!(
+                staged <= recorded,
+                "staging ({staged}) must not outrun the record ({recorded})"
+            );
+        });
+    }
+
+    /// A PATCH whose claim loses the race writes **nothing**. Seeded the
+    /// way `append_chunk_cas_miss_returns_conflict` seeds it — an
+    /// in-record `version` that is stale w.r.t. the store's counter — plus
+    /// bytes already staged by the winner, so the test can show the loser
+    /// neither extends the file nor overwrites what the winner put there.
+    #[test]
+    fn append_chunk_cas_miss_writes_no_bytes_and_keeps_the_winners_staging() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.key = "myrepo".into();
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+            let session_id = Uuid::new_v4();
+
+            // The winner's PATCH: 5 staged bytes, record at 5.
+            seed_session(&ctx, session_id, repo_id, 0, 1).await;
+            append_chunk(
+                &ctx,
+                session_id,
+                Some(ContentRange { start: 0, end: 4 }),
+                cursor_of(b"WWWWW"),
+                5,
+                1_000_000,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .expect("the winning PATCH must succeed");
+
+            // A second write bumps the store's counter while leaving the
+            // in-record `version` behind, which is exactly the state the
+            // loser of a concurrent PATCH reads.
+            let key = session_key("oci", session_id);
+            let current = ctx.ephemeral_durable.get(&key).await.unwrap().unwrap();
+            ctx.ephemeral_durable
+                .put(&key, current, OCI_SESSION_TTL)
+                .await
+                .unwrap();
+
+            let err = append_chunk(
+                &ctx,
+                session_id,
+                Some(ContentRange { start: 5, end: 7 }),
+                cursor_of(b"LLL"),
+                3,
+                1_000_000,
+                repo_id,
+                TEST_MAX_AGE,
+            )
+            .await
+            .expect_err("the losing PATCH must be rejected");
+            assert!(matches!(err, AppError::Domain(DomainError::Conflict(_))));
+
+            let staged = mocks.stateful_upload_staging.bytes_for(session_id).unwrap();
+            assert_eq!(
+                staged, b"WWWWW",
+                "the loser must neither extend nor overwrite the winner's bytes"
+            );
+        });
+    }
+
+    /// Retrying a failing PATCH cannot grow the staging file, let alone
+    /// push it past `max_bytes`.
+    ///
+    /// Each iteration declares 8 bytes and delivers 4. Before the claim
+    /// moved ahead of the write, iteration *n* appended its 4 bytes and
+    /// then failed, so 50 iterations left a 200-byte `.part` file under a
+    /// 64-byte cap, with the record still reading 0 — a legitimate writer
+    /// filling a disk with two values it controls. Now the first
+    /// iteration's bytes are the only bytes that ever land: the record
+    /// runs ahead, so every later write is refused at the position check,
+    /// and once the record reaches the cap the request is rejected before
+    /// staging is touched at all.
+    #[test]
+    fn append_chunk_repeated_short_reads_cannot_grow_staging_past_the_cap() {
+        run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.key = "myrepo".into();
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            let session_id = Uuid::new_v4();
+            seed_session(&ctx, session_id, repo_id, 0, 1).await;
+
+            const MAX_BYTES: u64 = 64;
+            for i in 0..50 {
+                // No `Content-Range` — the offset comes from the record,
+                // so the client never has to guess it to keep retrying.
+                let err = append_chunk(
+                    &ctx,
+                    session_id,
+                    None,
+                    cursor_of(&[0u8; 4]),
+                    8,
+                    MAX_BYTES,
+                    repo_id,
+                    TEST_MAX_AGE,
+                )
+                .await
+                .expect_err("a short-read PATCH must always fail");
+                assert!(
+                    matches!(
+                        err,
+                        AppError::Domain(DomainError::Invariant(_)) | AppError::SizeExceeded
+                    ),
+                    "iteration {i} surfaced an unexpected error: {err:?}"
+                );
+
+                let staged = mocks
+                    .stateful_upload_staging
+                    .bytes_for(session_id)
+                    .map(|b| b.len() as u64)
+                    .unwrap_or(0);
+                assert!(
+                    staged <= MAX_BYTES,
+                    "iteration {i}: staging grew to {staged} past the {MAX_BYTES}-byte cap"
+                );
+                assert_eq!(
+                    staged, 4,
+                    "iteration {i}: only the first attempt's bytes may ever be staged"
+                );
+            }
+        });
+    }
+
+    /// Two PATCHes racing on one session: whichever wins keeps its bytes
+    /// whole, and staging matches the record exactly.
+    ///
+    /// The assertion is deliberately on the invariant rather than on who
+    /// won — both possible schedules satisfy it, so the test cannot go
+    /// flaky. If the two interleave, the loser's claim misses the CAS and
+    /// it writes nothing; if they serialise, the second one's
+    /// `Content-Range` no longer matches the advanced record and it is
+    /// rejected as an unsatisfiable range. What must never happen — and
+    /// did, when the record was written after the append — is both bodies
+    /// landing, which leaves staging holding six bytes the record cannot
+    /// account for.
+    #[test]
+    fn concurrent_patches_leave_the_winners_staging_whole() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let mut repo = sample_repository();
+            repo.key = "myrepo".into();
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            let session_id = Uuid::new_v4();
+            seed_session(&ctx, session_id, repo_id, 0, 1).await;
+            let ctx = Arc::new(ctx);
+
+            let mut handles = Vec::new();
+            for payload in [b"AAA", b"BBB"] {
+                let ctx = Arc::clone(&ctx);
+                handles.push(tokio::spawn(async move {
+                    append_chunk(
+                        &ctx,
+                        session_id,
+                        Some(ContentRange { start: 0, end: 2 }),
+                        cursor_of(payload),
+                        3,
+                        1_000_000,
+                        repo_id,
+                        TEST_MAX_AGE,
+                    )
+                    .await
+                }));
+            }
+            let mut outcomes = Vec::new();
+            for h in handles {
+                outcomes.push(h.await.unwrap());
+            }
+            assert_eq!(
+                outcomes.iter().filter(|r| r.is_ok()).count(),
+                1,
+                "exactly one of two PATCHes at the same offset may be accepted: {outcomes:?}"
+            );
+
+            let staged = mocks.stateful_upload_staging.bytes_for(session_id).unwrap();
+            assert!(
+                staged == b"AAA" || staged == b"BBB",
+                "the winner's three bytes must be whole and alone; got {:?}",
+                String::from_utf8_lossy(&staged)
+            );
+
+            let key = session_key("oci", session_id);
+            let stored = ctx.ephemeral_durable.get(&key).await.unwrap().unwrap();
+            let recorded = decode_record(&stored).unwrap().bytes_received;
+            assert_eq!(
+                recorded,
+                staged.len() as u64,
+                "the record must account for exactly the staged bytes"
+            );
+        });
     }
 
     #[test]
