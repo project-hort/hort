@@ -83,10 +83,14 @@ pub struct FilterContext<'a> {
     /// the field is held but never consulted. Future predicate variants
     /// that need repository metadata reach for it through this port.
     pub repositories: &'a Arc<dyn RepositoryRepository>,
-    /// Owner principal resolved against the current evaluator. The
-    /// dispatcher constructs this once per delivery batch from the
-    /// owner's `User` row + the evaluator's role resolution so the
-    /// `authorize` call shape matches the one used at creation time.
+    /// Owner principal, synthesised from the owner's `User` row +
+    /// `snapshot_claims` so the `authorize` call shape matches the one
+    /// used at creation time. The dispatcher re-synthesises it on every
+    /// reconcile pass and the delivery task loads the current value
+    /// alongside `rbac` for each event, so the two inputs this context
+    /// authorizes with are the same age — a revoked `User.is_admin`
+    /// reaches the gate below on the reconcile cadence, just as a
+    /// revoked grant reaches it on the evaluator's refresh cadence.
     pub owner_principal: &'a CallerPrincipal,
     /// Aggregate→repository lookups for the page this event came from,
     /// resolved in one round trip before the per-event walk. Shared with

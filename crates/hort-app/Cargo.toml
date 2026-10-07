@@ -133,3 +133,11 @@ tracing-subscriber = { workspace = true }
 # part of a fail-closed guard; `deny_unknown_fields` on the real parser turns
 # a mistyped manifest key into an error instead of a silently-ignored knob.
 toml = { workspace = true }
+# Parses the two checked-in GitHub publish workflows, the input the
+# `publish_chain_is_gated` target enforces. The same argument as the `toml`
+# dev-dep above: hand-rolling a YAML subset parser would make the guard's own
+# input format the least-trusted part of a fail-closed guard — and YAML is the
+# worse bet of the two, since `needs:` may be a flow or a block sequence and an
+# `if:` may be a folded block scalar. Already a workspace dependency
+# (`hort-config`), so this adds no package to `Cargo.lock`.
+serde_yaml_ng = { workspace = true }

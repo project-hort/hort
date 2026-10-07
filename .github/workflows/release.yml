@@ -3,10 +3,36 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # A manual dispatch picks its OWN ref, and dispatching a workflow needs only
+  # Actions write access — so the ref a dispatch carries is not a release
+  # decision and must not be read as one. Every job below that signs an asset,
+  # publishes a crate or creates the GitHub Release therefore requires
+  # `startsWith(github.ref, 'refs/tags/v')` in its own `if:`: a dispatch
+  # against `develop`, or any other writable ref, signs nothing, publishes
+  # nothing and creates no tag. `ci-gate` and `e2e-gate` carry the same
+  # condition, so such a dispatch is a complete no-op rather than a full ci.yml
+  # run plus the compose E2E suite for a workflow that could then produce
+  # nothing. Branch and PR coverage does not depend on those two edges: ci.yml
+  # and e2e.yml both run on branch pushes themselves.
+  #
+  # Why that matters more here than anywhere else in the repo: the `release`
+  # job holds `contents: write` and `softprops/action-gh-release` CREATES the
+  # tag it is handed. Before the conditions below, a dispatch from a branch
+  # with `version: 2.0.0` minted a real `v2.0.0` git tag pointing at that
+  # branch commit and hung cosign-signed assets off it. The release itself
+  # stayed a draft — but only as a side effect of `verify-images-published`
+  # being ref-gated and therefore `skipped`, and a git tag is not a draft: it
+  # is visible in every clone, to `git describe`, and to anything that reads
+  # the tag list.
+  #
+  # With the ref pinned to a release tag, `GITHUB_REF` already carries the
+  # version, so the input below cannot be a second source of truth. It is a
+  # statement of intent: `release` derives the version from the ref on every
+  # path and rejects a dispatch whose input disagrees with it.
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g., 1.0.0)'
+        description: 'Release version of the dispatched tag (e.g. 1.0.0) — must equal the version carried by the ref; any other value is rejected. The ref must be a refs/tags/v* release tag.'
         required: true
 
 # No workflow-level permissions block: each job below declares the minimal
@@ -20,11 +46,86 @@ env:
 
 jobs:
   # ════════════════════════════════════════════════════════════════════════════
+  # CI GATE — the advisory and attribution checks run BEFORE anything ships
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  # A `v*` tag starts this workflow, ci.yml and docker-publish.yml
+  # independently, and GitHub Actions has no `needs:` across workflow
+  # boundaries. So ci.yml's `security-audit` (`cargo audit --deny warnings`),
+  # `cargo-deny` and `attribution-sync` (`scripts/check-attribution.sh`) jobs
+  # could be RED while this workflow signed and uploaded release binaries,
+  # published crates to registry.hort.rs and published the GitHub Release —
+  # a tagged commit with a fresh advisory, a banned dependency or stale
+  # THIRD-PARTY-LICENSES shipping anyway, which is the opposite of what
+  # ADR 0047 / ADR 0049 promise. Calling ci.yml as a reusable workflow puts
+  # those checks inside THIS run's dependency graph, where `needs:` can hold
+  # the release — the same mechanism `e2e-gate` below already uses for e2e.yml.
+  #
+  # The gate is the WHOLE ci.yml run, not only those three jobs: a `uses:`
+  # caller waits on every job the callee defines, so clippy, the unit and
+  # integration suites and coverage hold the release too. That is stricter than
+  # ci.yml's own `ci-complete` roll-up, which lets a red `coverage` through, and
+  # stricter in the fail-closed direction — the one this gate exists for.
+  #
+  # `uses:` rather than `workflow_run:` deliberately: a `workflow_run`-triggered
+  # run executes in the default branch's context, not the tag's, which is the
+  # wrong commit for a gate whose whole claim is "these checks passed for THIS
+  # artifact".
+  #
+  # Cost, named rather than hidden: on a non-alpha tag ci.yml runs three times —
+  # once standalone, once per calling publish workflow. That is accepted;
+  # extracting the three security jobs into their own reusable workflow so only
+  # the cheap part repeats is a restructuring of ci.yml for a cost nobody has
+  # measured.
+  #
+  # No `-alpha.` guard here, matching the rest of this workflow: its alpha
+  # safety is indirect and already works (no images are published for an alpha,
+  # so `verify-images-published` fails, the gate step reports not-all-passed and
+  # the GitHub Release stays a draft; `build-binaries` only ever uploads
+  # workflow artifacts).
+  ci-gate:
+    name: 🔐 CI Gate (audit / deny / attribution)
+    # Ref-gated for the same reason docker-publish.yml's `ci-gate` is: without
+    # it a branch dispatch runs a full CI pass for a workflow that can then
+    # produce nothing, because every job that signs or publishes below requires
+    # a release ref. Branch and PR coverage does not depend on this edge —
+    # ci.yml runs on its own for those, and has its own `workflow_dispatch`.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+    # A called workflow cannot request more than its caller grants — Actions
+    # fails the run outright on an escalation — so this is the UNION of the
+    # job-level requests inside ci.yml, not what the gate itself uses:
+    #   contents: read       every job checks out;
+    #   id-token: write      hort-deps-gate / check-rust / test-backend-unit /
+    #                        coverage mint the hort OIDC token (a no-op unless
+    #                        HORT_PROXY_ACTIVE, which is false off a same-repo
+    #                        PR — so nothing mints anything on a tag);
+    #   pull-requests: write hort-deps-gate's quarantine-triage comment.
+    # This is a ceiling for the callee, not a grant to anything else here; each
+    # ci.yml job still narrows to its own declared set, and these are exactly
+    # the permissions ci.yml already has when it runs standalone on this tag.
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    uses: ./.github/workflows/ci.yml
+    with:
+      gate_for: release
+
+  # ════════════════════════════════════════════════════════════════════════════
   # E2E GATE - Must pass before release proceeds
   # ════════════════════════════════════════════════════════════════════════════
 
   e2e-gate:
     name: 🚦 E2E Gate
+    # Ref-gated with `ci-gate`, and this one also removes a live collision: a
+    # called workflow evaluates `github.ref` as the CALLER's, so a branch
+    # dispatch of this workflow landed in `e2e-${{ github.ref }}` — the same
+    # concurrency group as that branch's own push-triggered E2E run, with
+    # `cancel-in-progress: true`. Dispatching from `develop` therefore killed
+    # `develop`'s E2E. A tag push was never affected (different group), so the
+    # release gate was never at risk; the branch case simply has no reason to
+    # exist, since e2e.yml runs on branch pushes by itself.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     # e2e.yml runs the full native-tests compose suite across both posture
     # lanes (base + native-tokens overlay) as two jobs (no input knobs); it is
     # reusable via its `workflow_call:` trigger, and a `uses:` caller waits on
@@ -41,7 +142,27 @@ jobs:
 
   build-binaries:
     name: Build binaries
-    needs: [e2e-gate]
+    # Both gates. A failed or cancelled `ci-gate` or `e2e-gate` skips this job
+    # through Actions' default behaviour, and the `if:` below carries NO
+    # `always()`, so that default survives it — the two edges keep gating.
+    # Everything that publishes downstream (`verify-images-published`,
+    # `hort-publish`, `release`) requires
+    # `needs.build-binaries.result == 'success'`, so a skip here is the
+    # fail-closed stop for the whole workflow — nothing is signed, no crate is
+    # published, and no GitHub Release is created at all.
+    needs: [e2e-gate, ci-gate]
+    # `publish: true` below is what makes this the SIGNING build:
+    # build-binaries.yml stamps the workspace version from the ref and
+    # `cosign sign-blob`s every asset under hort's release identity. A dispatch
+    # picks its own ref, so without this test a dispatch from any writable
+    # branch produced real Sigstore signatures over branch content carrying a
+    # release version number.
+    #
+    # Stated here on the job rather than inherited, for two reasons. Neither
+    # gate above helps — a branch passes CI and the E2E suite perfectly well —
+    # and a skip cascade is only as strong as the `if:` of the job inheriting
+    # it, which an `always()` anywhere downstream silently voids.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
     permissions:
       contents: read
       id-token: write   # keyless cosign signing inside the reusable workflow
@@ -172,7 +293,10 @@ jobs:
   # CRA Annex I §2 mandates a maintained SBOM as part of delivery. We emit
   # one CycloneDX JSON SBOM per workspace member via cargo-cyclonedx and
   # attach the bundled tarball to the release. The SBOM job runs in parallel
-  # with `build-binaries` because it has no binary dependencies.
+  # with `build-binaries` because it has no binary dependencies — it waits on
+  # the same two gates, not on the binaries. Its result is a publish-or-draft
+  # input in the `release` job below: an SBOM the dependency graph has not been
+  # cleared for is not provenance.
 
   sbom:
     name: 📜 Generate SBOM
@@ -180,8 +304,26 @@ jobs:
     permissions:
       contents: read
       id-token: write   # keyless cosign sign-blob of the SBOM bundle (Fulcio OIDC)
-    needs: [e2e-gate]
-    if: always() && needs.e2e-gate.result == 'success'
+    needs: [e2e-gate, ci-gate]
+    # Three independent requirements, all conjoined.
+    #
+    # `always()` neutralises the implicit blocking that `needs:` would
+    # otherwise give, which is why the two gate clauses have to be named here
+    # explicitly — adding a gate to the list above without a clause here would
+    # leave it decorative.
+    #
+    # The ref test answers a different hazard than the two gates do. The step
+    # below `cosign sign-blob`s the SBOM bundle under hort's release identity,
+    # and a dispatch picks its own ref: without this test a dispatch from any
+    # writable branch produced a real Sigstore signature over an SBOM of
+    # branch content. This job carries no `environment: release` and never did
+    # — so the ref test, not that declaration, is the whole of what keeps the
+    # dispatch path from signing here.
+    if: |
+      always() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.e2e-gate.result == 'success' &&
+      needs.ci-gate.result == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -283,7 +425,16 @@ jobs:
     permissions:
       contents: read
       id-token: write   # required to mint the OIDC token for the gha-release SA
-    needs: [e2e-gate, build-binaries]
+    # `needs:` names only `build-binaries`, deliberately. The `if:` below opens
+    # with `always()`, which voids the implicit blocking of every entry here,
+    # and it tests `build-binaries.result` alone — so an `e2e-gate` entry in
+    # this list would gate nothing while reading to a reviewer as though the
+    # E2E suite guarded the crates publish. It does guard it, one step further
+    # back: `build-binaries` requires both `e2e-gate` and `ci-gate` and carries
+    # no `always()`, so reaching this job at all means both gates were green.
+    # `sbom` and `release` carry the same note about their own decorative
+    # edges; this one had the edge without the note.
+    needs: [build-binaries]
     if: |
       always() &&
       needs.build-binaries.result == 'success' &&
@@ -448,8 +599,58 @@ jobs:
     permissions:
       contents: write   # softprops/action-gh-release creates the GitHub Release + uploads assets
     needs: [build-binaries, verify-images-published, sbom]
-    if: always() && needs.build-binaries.result == 'success'
+    # Two independent requirements, conjoined.
+    #
+    #   startsWith(github.ref, 'refs/tags/v')
+    #       The `contents: write` above is handed to
+    #       `softprops/action-gh-release`, which CREATES the tag it is given.
+    #       `always()` has already voided the implicit needs-gating, so this
+    #       condition is the only thing between a dispatch and a real `v*` git
+    #       tag minted on a branch commit with cosign-signed assets hanging
+    #       off it. Inheriting it was never an option: `always()` keeps only
+    #       the needs this `if:` tests for success, and it tests exactly one —
+    #       so `verify-images-published`, which carries the same ref test, is
+    #       not in this job's effective-needs closure at all.
+    #   needs.build-binaries.result == 'success'
+    #       The signed assets exist. This is the one needs-edge `always()`
+    #       leaves gating, deliberately: `verify-images-published` and `sbom`
+    #       are read as draft-or-publish inputs in the gate step below
+    #       instead, which is what `always()` is here for.
+    if: |
+      always() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.build-binaries.result == 'success'
     steps:
+      # First step in the job, before the checkout, because it needs nothing
+      # from the tree and because everything after it depends on the answer.
+      #
+      # The `if:` on this job pins the ref to a release tag, so `GITHUB_REF`
+      # already carries the version and the dispatch input cannot be a second
+      # source of truth — it can only agree with the ref or disagree with it,
+      # and a disagreement means the operator dispatched a ref other than the
+      # one they named. Reject that loudly instead of picking a side: silently
+      # preferring either one releases something nobody asked for. The input
+      # survives as a confirmation prompt (`required: true` keeps the field in
+      # the dispatch form), not as a knob — for any given ref there is exactly
+      # one value it can hold.
+      #
+      # Nothing else in this workflow reads the input, so the rejection here
+      # cannot come after a mis-stamped artifact: `build-binaries` and `sbom`
+      # both derive the version from the ref, and `Determine version` below
+      # does too.
+      - name: Validate dispatch version input
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          REF_VERSION="${GITHUB_REF#refs/tags/v}"
+          if [ "${INPUT_VERSION}" != "${REF_VERSION}" ]; then
+            echo "::error::version input '${INPUT_VERSION}' does not match the dispatched ref ${GITHUB_REF} (version '${REF_VERSION}'). Dispatch the tag you mean to release — the released version is derived from the ref, never from this input."
+            exit 1
+          fi
+          echo "version input agrees with the ref: ${REF_VERSION}"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -459,32 +660,82 @@ jobs:
           path: artifacts
           pattern: hort-*
 
+      # One path, not two. Both outputs come from `GITHUB_REF` on a tag push
+      # and on a dispatch alike: the `if:` on this job guarantees the ref is a
+      # `refs/tags/v*` tag, which leaves no second path for an input to serve.
+      # That is also what makes the create step below unable to mint a tag
+      # anywhere — the `tag` it is handed is, by construction, the ref this run
+      # is already on. An input-derived tag was the opposite property: it named
+      # a tag that need not exist, and `action-gh-release` creates what it
+      # cannot find.
       - name: Determine version
         id: version
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-            echo "tag=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
+          set -euo pipefail
+          echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
 
       - name: Check gate status
         id: gates
         run: |
-          # The E2E gate (e2e.yml) is a hard prerequisite for build-binaries,
-          # so reaching this job already implies E2E passed. The remaining
-          # publish-vs-draft decision rests on the image-publish gate.
+          # Two of the four gates are already implied by reaching this job:
+          # `e2e-gate` (e2e.yml) and `ci-gate` (ci.yml — cargo-audit,
+          # cargo-deny, THIRD-PARTY-LICENSES sync) are both hard prerequisites
+          # of `build-binaries`, and this job runs only when `build-binaries`
+          # succeeded.
+          #
+          # The other two run BESIDE `build-binaries`, so `needs:` cannot block
+          # on them (this job is `if: always()`, which is what lets a gate
+          # failure still produce a draft rather than no release at all) and
+          # their results are read here instead:
+          #
+          #   - verify-images-published — every image the chart references is
+          #     live on ghcr.io at this version;
+          #   - sbom — the cosign-signed CycloneDX bundle. ADR 0047 / ADR 0049
+          #     promise it as part of release provenance and CRA Annex I §2
+          #     requires it as part of delivery, so a release published without
+          #     it makes a provenance claim that is false. Being in `needs:` is
+          #     not enough on its own: `always()` neutralises the implicit
+          #     blocking, which is exactly how a red `sbom` used to yield a
+          #     fully published release with no SBOM attached.
+          #
+          # Either one not green ⇒ DRAFT, which is the fail-closed outcome.
+          #
+          # What the draft does NOT protect, stated because for a long time it
+          # was the only thing standing between a branch dispatch and a
+          # release — by accident. It never covered the git tag: the create
+          # step below holds `contents: write` and `action-gh-release` mints
+          # the tag it is handed, so a dispatch from a branch produced a real
+          # `v*` tag on a branch commit (visible in every clone, to
+          # `git describe` and to anything reading the tag list) with
+          # cosign-signed assets attached to the draft. And the draft was not
+          # a decision anyone recorded: it happened because
+          # `verify-images-published` is ref-gated and so reports `skipped`
+          # off a tag, which this step reads as not-green. A side effect of
+          # another job's condition is not a guarantee. The `if:` on THIS job
+          # is now the reason a branch dispatch cannot release, and the ref
+          # condition on `build-binaries` / `sbom` is the reason it cannot
+          # sign; the draft is back to being only what the next paragraph
+          # says.
+          #
+          # What the draft DOES protect, on a legitimate release tag: these
+          # two gates run BESIDE `build-binaries` rather than before it, so
+          # `needs:` cannot hold this job on them without also losing the
+          # ability to produce anything. The draft is how a red gate yields
+          # "nothing published" instead of "no release at all" — the signed
+          # assets stay attached and reviewable, and a re-run can publish them
+          # once the gate is green.
           IMAGES_GATE="${{ needs.verify-images-published.result }}"
+          SBOM_GATE="${{ needs.sbom.result }}"
           echo "images_gate=${IMAGES_GATE}" >> $GITHUB_OUTPUT
+          echo "sbom_gate=${SBOM_GATE}" >> $GITHUB_OUTPUT
 
-          if [[ "$IMAGES_GATE" == "success" ]]; then
+          if [[ "$IMAGES_GATE" == "success" && "$SBOM_GATE" == "success" ]]; then
             echo "all_passed=true" >> $GITHUB_OUTPUT
-            echo "Gates passed: images=$IMAGES_GATE"
+            echo "Gates passed: images=$IMAGES_GATE sbom=$SBOM_GATE"
           else
             echo "all_passed=false" >> $GITHUB_OUTPUT
-            echo "::warning::A required gate is not green: images=$IMAGES_GATE. Release will be created as DRAFT."
+            echo "::warning::A required gate is not green: images=$IMAGES_GATE sbom=$SBOM_GATE. Release will be created as DRAFT."
           fi
 
       - name: Collect release assets

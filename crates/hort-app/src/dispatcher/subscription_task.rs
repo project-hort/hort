@@ -257,30 +257,29 @@ pub struct SubscriptionTaskDeps {
     /// tenant's. Resolved ONCE per page in [`catch_up`], not per event.
     /// Shared with the `GET /api/v1/events` read gate.
     pub event_visibility: Arc<EventVisibilityUseCase>,
-    /// Owner principal — synthesised **once at task spawn** from the
-    /// owner's `User` row + `snapshot_claims` (the stale-`"admin"`
-    /// strip + live-`is_admin` re-derivation happens at that synthesis
-    /// time; see [`crate::dispatcher::dispatcher`]
-    /// `synthesise_principal`). This value is then **frozen for the
-    /// life of the task** — it is captured into `SubscriptionTaskDeps`
-    /// at spawn and the per-event filter walk reuses it.
+    /// Owner principal — synthesised from the owner's `User` row +
+    /// `snapshot_claims` (the stale-`"admin"` strip + live-`is_admin`
+    /// re-derivation; see [`crate::dispatcher::dispatcher`]
+    /// `synthesise_principal`) and **re-published by the dispatcher on
+    /// every reconcile pass**, for a running task as much as for a new
+    /// one. The per-event filter walk `load()`s it, so the authority a
+    /// delivery is decided under is at most one reconcile interval old.
     ///
-    /// The dispatcher's 30s reconcile cadence governs **add/remove of
-    /// tasks** (spawn for newly-active subscriptions, cancel on
-    /// vanish/disable) and disabled-row teardown — it does **NOT**
-    /// re-synthesise an already-running task's `owner_principal`
-    /// (`dispatcher.rs` skips re-synthesis via
-    /// `if tasks.contains_key(&sub.id) { continue; }`). A change to
-    /// the owner's `User` row (notably the `is_admin` bit) is picked
-    /// up only at the next **cancel+respawn** of the task, not on the
-    /// reconcile tick. There is no per-reconcile freshness guarantee
-    /// for a running task's principal. Live *grant* revocation is
-    /// still honored independently per delivered event by the
-    /// dispatch-time privileged-category gate, which reloads the
-    /// [`RbacEvaluator`] (`rbac` field) on every processed event;
-    /// only the spawn-frozen `user.is_admin` *bit* input is subject
-    /// to this freeze (an accepted residual).
-    pub owner_principal: CallerPrincipal,
+    /// Mirroring the `rbac` field above is the substance of this type,
+    /// not symmetry: both are inputs to the same `authorize` call in
+    /// [`crate::use_cases::subscription_filter::matches`], and two
+    /// inputs to one authorization decision have to age at the same
+    /// rate. Each is bounded by one refresh cadence — the reconcile
+    /// interval for this field, `HORT_RBAC_REFRESH_SECS` for the
+    /// evaluator — which is why revoking `User.is_admin` stops a
+    /// *running* task from delivering privileged-category events with
+    /// no cancel-and-respawn needed.
+    ///
+    /// A principal that stops resolving at all (owner row gone,
+    /// deactivated, or unreadable) is never published as a degraded
+    /// value here; the reconcile cancels the task instead, so this
+    /// field only ever holds authority the owner currently has.
+    pub owner_principal: Arc<ArcSwap<CallerPrincipal>>,
     /// First-match notifier registry — the task walks this and uses
     /// the first `supports(target) == true` adapter. Empty registry
     /// drops every event with a warning (degraded state, not a panic).
@@ -639,16 +638,23 @@ async fn process_event_for_subscription(
     resume_from: Option<u64>,
     repository_index: &EventRepositoryIndex,
 ) -> Disposition {
-    // 1. Load the current evaluator snapshot. One `.load()` per event;
-    //    revocation propagates within the auth cache TTL.
+    // 1. Load the two authority inputs together — one `.load()` each
+    //    per event. The evaluator carries the owner's grants and the
+    //    principal carries the owner's live `is_admin` bit, and step 2
+    //    below hands both to the same `authorize` call; taking them in
+    //    one place is what keeps the pair the same age. Either one
+    //    changing (a revoked grant, a revoked admin bit) reaches this
+    //    walk within its publisher's refresh cadence.
     let evaluator_guard = deps.rbac.load();
     let evaluator = &**evaluator_guard;
+    let owner_principal_guard = deps.owner_principal.load();
+    let owner_principal = &**owner_principal_guard;
 
     // 2. Filter via the pure subscription_filter helper.
     let ctx = FilterContext {
         rbac: evaluator,
         repositories: &deps.repositories,
-        owner_principal: &deps.owner_principal,
+        owner_principal,
         repository_index,
     };
     if !filter_matches(&subscription.filter, event, &ctx).await {
@@ -1226,7 +1232,7 @@ mod tests {
                     Arc::new(MockArtifactGroupRepository::new()),
                 ),
             ))),
-            owner_principal: principal,
+            owner_principal: Arc::new(ArcSwap::from_pointee(principal)),
             notifiers: vec![notifier],
             budget: Arc::new(Mutex::new(FailureBudget::new())),
             progress: Arc::new(Mutex::new(ProgressDebouncer::new(

@@ -1120,6 +1120,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **A published hort image or chart is now gated on the checks that were
+  supposed to secure it** (#339). The public publish path ran three workflows
+  that a `v*` tag triggered independently, and none of the publishing jobs
+  consumed the others' verdicts — so every gate the repository declared for
+  this path was advisory in effect:
+  - The container CVE scan declared itself blocking on fixable CRITICALs
+    (`exit-code: 1`) and was a **leaf** in the dependency graph: nothing had a
+    `needs:` edge onto it, so the manifest merge pushed the tags and
+    `cosign sign`ed the digest beside a failing scan. The job's own run summary
+    said "informational" while its step comment said "BLOCKING" — both true, of
+    the step and of the system respectively. It also scanned only the server's
+    amd64 digest, leaving three of the four published digests with no scan
+    input at all. The scan is now a prerequisite of the merge, and runs once per
+    published image and architecture.
+  - `cargo audit`, `cargo deny` and the third-party attribution check ran on
+    the tag and no publish job depended on them, so a tagged commit with stale
+    attribution, a denied dependency or a fresh advisory could still publish and
+    sign. Both public publish workflows now require them. A side effect worth
+    knowing: trigger `paths-ignore` filters do not apply to a called workflow,
+    so a docs-only tagged commit no longer skips the advisory check before
+    publication.
+  - A failed SBOM job produced a fully published release without the signed
+    SBOM. The release gate now consults that result; a red SBOM leaves the
+    release a draft.
+  - **Nothing publishes from a ref that is not a release tag.** A manual
+    workflow dispatch chose its own ref, and the image tag came from a
+    free-form input defaulting to `latest`: a repository writer could build any
+    branch and publish a cosign-signed public `latest`, plus a chart whose
+    version came from that input with no comparison against the in-tree
+    `Chart.yaml`. The release workflow's dispatch path went further — it was not
+    ref-gated at all, so it created a real `v*` git tag on a branch commit and
+    attached cosign-signed assets to it. Every signing and publishing job now
+    requires a `refs/tags/v*` ref, versions are derived from the ref rather than
+    from an input, and the surviving inputs are rejected unless they match it.
+  - A structural guard (`crates/hort-app/tests/publish_chain_is_gated.rs`)
+    holds those edges. It walks *effective* dependencies rather than declared
+    ones, because a job whose condition contains `always()` runs even when a
+    dependency failed — which is how the SBOM edge came to be listed and
+    inert — and it asserts the ref condition per job, because a chain gated
+    only at its root makes every removal downstream look correct.
+
+- **A running subscription's admin authority now follows the owner's live
+  state** (#339). The notification dispatcher synthesised the owner
+  `CallerPrincipal` only when it *spawned* a task — the reconcile loop skipped
+  any subscription that already had one — and moved it into the task as a plain
+  owned value. The per-event delivery filter then authorized every event against
+  two inputs of different ages: the `RbacEvaluator`, reloaded per event and
+  swapped by the refresh task every `HORT_RBAC_REFRESH_SECS`, and that
+  spawn-frozen principal. Since the privileged-category gate decides
+  `Permission::Admin` from the principal's synthetic `"admin"` claim, revoking
+  an owner's `User.is_admin` did not stop their running subscription from
+  streaming `Policy` / `Admin` / `Authorization` / `User` / `AuthAttempts` /
+  `DownloadAudit` / `TokenUse` / `RetentionPolicy` events off-box; nothing
+  short of a cancel-and-respawn repaired it, and no reconcile tick caused one.
+  Revoked *grants* did take effect, because those travel in the evaluator — the
+  admin bit was the single stale input.
+  - The principal is now an `ArcSwap` the task loads per event, immediately
+    beside the evaluator it is handed to, and the reconcile re-synthesises it
+    for every active subscription rather than only for new ones. Both inputs to
+    the one authorization decision are now bounded by one refresh cadence — the
+    reconcile interval for the principal, `HORT_RBAC_REFRESH_SECS` for the
+    evaluator — instead of one of them being fixed for the task's lifetime. No
+    new configuration: the existing cadence is adopted, not revised.
+  - Revoking `User.is_admin` therefore stops privileged-category delivery to an
+    **already-running** subscription within one reconcile interval, with the
+    task neither cancelled nor respawned and its delivery cursor untouched.
+  - Deactivating an owner (`is_active = false`) now **tears down** that owner's
+    already-running subscription tasks at the next reconcile pass. Previously it
+    only prevented new spawns, so a deactivated owner's existing tasks kept
+    delivering indefinitely. The same teardown applies when the owner row is
+    gone or unreadable — fail closed rather than deliver on authority nothing
+    could confirm.
+  - Cost: one owner read per active subscription per reconcile pass, where the
+    loop previously did one per newly active subscription.
+    `hort_dispatcher_principal_resolved_total` now increments at that rate, so
+    its series track the active-subscription count rather than the spawn rate.
+
 - **A failed OCI blob-upload `PATCH` can no longer grow the staging file past
   the upload cap** (#338). `append_chunk_core` wrote the body to staging and
   advanced the session record's `bytes_received` afterwards, via
