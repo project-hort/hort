@@ -7,8 +7,8 @@
   [0039](0039-keyed-provenance-verification.md) (the provenance hold + the
   write-authorized manifest HEAD-and-GET exemption the push-then-sign payoff
   reuses),
-  [0008](0008-per-format-adapter-free-http-crates.md) (the index PUT writes its
-  membership rows through the content-reference use case, adapter-free),
+  [0008](0008-per-format-adapter-free-http-crates.md) (the index PUT records its
+  membership rows adapter-free, through a use case and never an adapter),
   [0054](0054-content-level-age-evidence-anchors-quarantine.md) /
   [0015](0015-apply-time-linter-inert-fields-and-naming.md) (the anchor
   derivation the eager-child-ingest amendment rests on, and the inert-field rule
@@ -68,8 +68,9 @@ lifecycle. There is **no index-specific lifecycle** and no group-model overhaul.
    new **fixed** kind `"oci_index_member"` is added to the allocated vocabulary
    (`content_reference_index.rs`): an index PUT writes one row per child —
    `source = index artifact, target = child manifest's own content hash,
-   kind = "oci_index_member"` — through the content-reference use case
-   (adapter-free, ADR 0008; mirrors the `oci_subject` write). N children share
+   kind = "oci_index_member"` — recorded **in the index artifact's own
+   minting transaction** and adapter-free (ADR 0008; the same shape as the
+   `oci_subject` write — see the 2026-10-07 amendment). N children share
    one `(source, kind)`, distinct only by target hash.
 
 3. **Quarantine / scan / release / provenance: the generic manifest lifecycle,
@@ -116,8 +117,9 @@ still reject `Unsigned` at window expiry.
 just index→child manifest: a single-image manifest PUT additionally writes one
 row per referenced blob — `kind = "oci_config"` for the config blob,
 `"oci_layer"` for each layer blob — `source = manifest artifact, target =
-blob's own content hash`, through the same content-reference use case
-(adapter-free, ADR 0008) as `oci_index_member`. Bounded by the existing
+blob's own content hash`, recorded the same way as `oci_index_member` — in
+the manifest artifact's own minting transaction, adapter-free (ADR 0008; see
+the 2026-10-07 amendment). Bounded by the existing
 `MAX_BLOB_REFERENCES`; idempotent on re-PUT via the widened PK (point 2 above).
 An index PUT is unaffected — it has no config/layers, only `oci_index_member`
 for its children. These are GC-active keepalive edges exactly like
@@ -262,6 +264,70 @@ there is no sweep that walks existing `oci_index_member` rows and enqueues them.
 Its children continue to arrive lazily, on the first client GET, exactly as
 before. Deploying this and then wondering why an existing index's children are
 still lazy is the expected observation, not a bug.
+
+### Membership edges commit with the artifact that claims them (issue #337, amended 2026-10-07)
+
+*Authorised by the answer on issue #337; implementing work on #335, units
+268–270.*
+
+The wording above said these rows are written "through the content-reference
+use case". They are not, any more: `oci_index_member`, `oci_config`,
+`oci_layer` and `oci_subject` travel into the mint as a
+`ContentReferenceClaim` — the edge minus the three fields only the mint can
+supply — and commit in the **same transaction** as the claiming artifact's
+events, row and metadata, or not at all.
+
+**Why this is the shape.** A `content_references` row is not a projection
+that may lag: the storage GC deletes a CAS object exactly when no row targets
+its hash, so the row *is* the claim that keeps the bytes alive. Written after
+its referrer committed, it leaves a window in which the referrer is live and
+its target is collectable — and for a **tree** edge nothing repairs that
+afterwards. The refcount reconcile derives `primary_content` and
+`metadata_blob` from the artifact row; no relational row records what a
+manifest references, so an edge that never landed cannot be re-derived and
+the referrer cannot re-assert it.
+
+**The ordering this forces, and it is OCI-specific, which is why it belongs
+here.** `oci_config` / `oci_layer` / `oci_index_member` are kinds the
+referenced-tree-descendant predicate counts. An edge naming a blob the
+repository does not hold would therefore let that blob's own later ingest see
+itself already referenced and take the zero-window quarantine carve-out — an
+observation window shortened on the strength of an edge written for content
+that did not exist. So the declared references are resolved **before** the
+mint and the membership claims are built only from a *complete* resolution.
+The unknown-blob posture is unchanged: a manifest referencing blobs the client
+has not pushed yet is still minted and still answered with 400
+`MANIFEST_BLOB_UNKNOWN`, so the retry-after-pushing path stays idempotent — it
+simply carries no membership claims, which is what the previous
+insert-after-the-gate already left behind on that path.
+
+`oci_subject` is deliberately **not** gated the same way: the Referrers flow
+legitimately lets a referrer be pushed for a subject this repository does not
+hold, and gating it would refuse a legitimate push. Note what that costs,
+because the opposite is easy to assume — `oci_subject` **is** a tree edge on
+the descendant predicate, so a referrer for an absent subject does set the
+zero-window carve-out for that subject's own later ingest. Pre-existing, and
+neither introduced nor repaired by moving the edge into the mint.
+
+**Unchanged by this amendment:** which rows exist, their key, that they are
+GC-active, idempotent on re-PUT, bounded by `MAX_BLOB_REFERENCES`, and
+adapter-free under [0008](0008-per-format-adapter-free-http-crates.md) — the
+format crate still speaks only to a use case.
+
+**A note for whoever edits this next.** The clause that went stale named a
+*call site*, and that is why it drifted — twice, since the `oci_subject` half
+was already wrong before the membership half caught up. A decision record
+holds the decision and its consequences, not the call graph. The two durable
+properties here are *adapter-free* and *the edge commits in the transaction of
+the artifact that claims it*; neither names a function, and both survive the
+next rebuild of the path. State those, not the caller.
+
+**Deliberately not stated here:** the format-agnostic rule that a new
+post-commit edge writer on any minting path is a defect. That holds for every
+format, not just OCI, so it lives where a developer adding a new `kind` meets
+it — the port module documentation in `content_reference_index.rs` — rather
+than in a format-specific decision record. The two backfill handlers remain
+the only production writers after a commit, which is their entire purpose.
 
 ## Consequences
 
