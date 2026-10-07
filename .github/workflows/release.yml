@@ -257,11 +257,17 @@ jobs:
   # rejected by hort with `aud_mismatch` at the OidcIssuer gate before
   # federatedIdentities matching is even reached.
   #
-  # Protected environment setup (required before go-live — document in README):
+  # Protected environment setup — CONFIGURED as of 2026-10-07:
   #   GitHub → Settings → Environments → release:
-  #     - Deployment branch/tag rule: refs/tags/v* (tag refs only)
-  #     - Required reviewer: at least one approver
-  #   This ensures only a reviewed, tagged release can trigger this job.
+  #     - Deployment branches and tags: tags matching `v*`
+  #     - No required reviewer (single maintainer; self-approval is friction
+  #       without review, so the tag rule is the whole gate)
+  #   GitHub therefore refuses to emit the `environment: release` claim for any
+  #   other ref, which is what makes `gha-release`'s federation trustworthy —
+  #   SA claim matching is exact and has no globs, so no `ref:` pattern could
+  #   express this inside hort.
+  #   This is the SECOND mechanism, not the only one: every job declaring the
+  #   environment also carries its own `refs/tags/v*` condition.
   #
   # cargo publish mechanics for a path-dep workspace:
   #   - `cargo publish --no-verify` is required: the workspace uses path deps
