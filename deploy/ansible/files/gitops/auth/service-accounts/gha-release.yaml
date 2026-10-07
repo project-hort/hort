@@ -16,9 +16,17 @@ spec:
   federatedIdentities:
     # LEGACY (pre-#82). `environment: release` is emitted only when the
     # GitHub Actions job targets a protected environment named "release".
-    # The environment enforces tag-only trigger + required reviewers — hort
-    # does not need a `ref:` glob because the environment gate is
-    # authoritative. (A ref glob would require exact-match anyway — globs
+    # The environment enforces a tag-only trigger — `Deployment branches and
+    # tags` is set to tags matching `v*` — so hort does not need a `ref:` glob
+    # because the environment gate is authoritative. GitHub refuses to emit
+    # this claim for any other ref, which is the point: SA claim matching is
+    # exact and has no globs, so the environment is the only mechanism that can
+    # express "some release tag" at all.
+    #
+    # NO reviewer requirement, deliberately. A single-maintainer project gains
+    # no second pair of eyes from self-approval, so a required reviewer would be
+    # friction without review. The tag rule is the whole of the gate, and it is
+    # the half that works mechanically. (A ref glob would require exact-match anyway — globs
     # are not supported by the SA claim matcher.) Unlike gha-ci, this
     # identity never needed the #64 environment-as-discriminator workaround
     # — `environment: release` was always a real protected gate, not a
@@ -33,10 +41,13 @@ spec:
     # hort-publish; docker-publish.yml's mirror-to-hort-oci,
     # mirror-to-hort-base, publish-chart-registry-hort-rs) now ALSO request
     # audience `hort-server-release` explicitly. `environment: release`
-    # stays — it is a real protected environment (tag-only + required
-    # reviewer), not a claim-stamping shim like gha-ci's retired
-    # `environment: ci` — so this FI is belt-and-suspenders alongside the
-    # legacy one above, not a replacement for the environment gate.
+    # stays — it is a real protected environment (tag-only), not a
+    # claim-stamping shim like gha-ci's retired `environment: ci` — so this FI
+    # is belt-and-suspenders alongside the legacy one above, not a replacement
+    # for the environment gate. The distinction is load-bearing and was once
+    # only asserted: until the deployment rule was set, this environment had no
+    # protection rules either, which made it exactly the shim this comment says
+    # it is not.
     - issuer: github-actions
       claims:
         repository: project-hort/hort
