@@ -202,7 +202,7 @@ the result instead.
 | rfc6979 | 0.6.0 | MIT | https://github.com/RustCrypto/signatures |
 | signature | 3.0.0 | MIT | https://github.com/RustCrypto/traits |
 | rand_core | 0.10.1 | MIT | https://github.com/rust-random/rand_core |
-| zeroize | 1.9.0 | MIT | https://github.com/RustCrypto/utils |
+| zeroize | 1.9.1 | MIT | https://github.com/RustCrypto/utils |
 | getrandom | 0.4.2 | MIT | https://github.com/rust-random/getrandom |
 | postcard | 1.1.3 | MIT | https://github.com/jamesmunns/postcard |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
@@ -9131,7 +9131,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### zeroize 1.9.0 — MIT
+### zeroize 1.9.1 — MIT
 
 Repository: https://github.com/RustCrypto/utils
 
