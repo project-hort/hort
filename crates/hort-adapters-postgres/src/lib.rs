@@ -61,6 +61,7 @@ pub mod curation_queue_repository;
 pub mod curation_rule_repo;
 pub mod event_chain_head_reader;
 pub mod event_chain_reader;
+pub mod event_repository_resolver;
 pub mod event_store;
 pub mod jobs_repository;
 pub mod mappers;

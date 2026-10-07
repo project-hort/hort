@@ -46,6 +46,9 @@ use hort_domain::ports::curation_queue_repository::{
     CurationQueueEntry, CurationQueueFilter, CurationQueueRepository,
 };
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
+use hort_domain::ports::event_repository_resolver::{
+    EventAggregateRepositories, EventRepositoryResolver,
+};
 use hort_domain::ports::event_store::{
     AppendEvents, AppendResult, EventStore, ExpectedVersion, ReadFrom, SealAuthority, SealOutcome,
     SubscribeFrom,
@@ -72,7 +75,7 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
 };
 use hort_domain::ports::scan_findings_repository::{ScanFindingsRepository, ScanFindingsRow};
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
-use hort_domain::ports::stateful_upload_staging::StatefulUploadStagingPort;
+use hort_domain::ports::stateful_upload_staging::{StagingAppend, StatefulUploadStagingPort};
 use hort_domain::ports::storage::{PutResult, StoragePort, StreamItem};
 use hort_domain::ports::upstream_proxy::{
     ArtifactFetch, BlobFetch, BlobStream, ManifestFetch, ManifestFetchOutcome,
@@ -312,6 +315,20 @@ impl MockArtifactRepository {
         row.quarantine_deadline = None;
         row.provenance_hold_indefinite = false;
         self.artifacts.lock().unwrap().insert(row.id, row);
+    }
+
+    /// The repository a seeded artifact belongs to, by identity — the
+    /// read [`MockEventRepositoryResolver`] serves from, so the harness
+    /// keeps ONE source of truth for "which repo owns this artifact".
+    /// Deliberately ignores `is_deleted`: resolution is identity, and a
+    /// retired artifact's events still have to be gated against the
+    /// repository that owned it.
+    pub fn repository_of(&self, artifact_id: Uuid) -> Option<Uuid> {
+        self.artifacts
+            .lock()
+            .unwrap()
+            .get(&artifact_id)
+            .map(|a| a.repository_id)
     }
 
     /// Friendly alias for [`Self::insert`] for the
@@ -4812,6 +4829,82 @@ impl MockArtifactGroupRepository {
         );
         self.by_coords.lock().unwrap().insert(key, updated);
     }
+
+    /// The repository a seeded group belongs to, by group id. The read
+    /// [`MockEventRepositoryResolver`] serves from — see
+    /// [`MockArtifactRepository::repository_of`] for why the harness
+    /// resolves out of the seeded rows rather than a second map.
+    pub fn repository_of(&self, group_id: Uuid) -> Option<Uuid> {
+        self.by_id
+            .lock()
+            .unwrap()
+            .get(&group_id)
+            .map(|g| g.repository_id)
+    }
+}
+
+/// [`EventRepositoryResolver`] over the harness's own seeded rows.
+///
+/// Deliberately **not** a third seedable map: it reads
+/// [`MockArtifactRepository`] / [`MockArtifactGroupRepository`], so a
+/// test that seeds an artifact has already told the resolver which
+/// repository owns it, and the harness cannot drift into a state where
+/// the artifact store and the visibility gate disagree. An id with no
+/// seeded row is absent from the answer — which is what makes the
+/// consumers' fail-closed path testable without a second knob.
+pub struct MockEventRepositoryResolver {
+    artifacts: Arc<MockArtifactRepository>,
+    groups: Arc<MockArtifactGroupRepository>,
+    /// FIFO of injected errors. Each call pops the front and returns it
+    /// verbatim, so a test can drive a consumer's
+    /// resolution-failed arm.
+    errors: Mutex<std::collections::VecDeque<DomainError>>,
+}
+
+impl MockEventRepositoryResolver {
+    #[must_use]
+    pub fn new(
+        artifacts: Arc<MockArtifactRepository>,
+        groups: Arc<MockArtifactGroupRepository>,
+    ) -> Self {
+        Self {
+            artifacts,
+            groups,
+            errors: Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Arm the next resolution call to fail with `err`. Queued, so a
+    /// test can arm several consecutive failures.
+    pub fn fail_next(&self, err: DomainError) {
+        self.errors.lock().unwrap().push_back(err);
+    }
+}
+
+impl EventRepositoryResolver for MockEventRepositoryResolver {
+    fn resolve_event_aggregates<'a>(
+        &'a self,
+        artifact_ids: &'a [Uuid],
+        artifact_group_ids: &'a [Uuid],
+    ) -> BoxFuture<'a, DomainResult<EventAggregateRepositories>> {
+        if let Some(err) = self.errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
+        let artifacts = artifact_ids
+            .iter()
+            .filter_map(|id| self.artifacts.repository_of(*id).map(|repo| (*id, repo)))
+            .collect();
+        let groups = artifact_group_ids
+            .iter()
+            .filter_map(|id| self.groups.repository_of(*id).map(|repo| (*id, repo)))
+            .collect();
+        Box::pin(async move {
+            Ok(EventAggregateRepositories {
+                artifacts,
+                artifact_groups: groups,
+            })
+        })
+    }
 }
 
 impl ArtifactGroupRepository for MockArtifactGroupRepository {
@@ -5032,11 +5125,13 @@ impl ArtifactGroupLifecyclePort for MockArtifactGroupLifecyclePort {
 // cost for unit tests.
 // ---------------------------------------------------------------------------
 
-/// In-memory mock for [`StatefulUploadStagingPort`]. Appends accumulate
-/// in a `Vec<u8>` per session id; `stream_read` returns an `AsyncRead`
-/// wrapping a cursor over the bytes; `delete` is idempotent. Matches
-/// the real `FilesystemStatefulUploadStaging`'s semantics without
-/// touching disk.
+/// In-memory mock for [`StatefulUploadStagingPort`]. Writes land at the
+/// caller's asserted offset in a `Vec<u8>` per session id; `stream_read`
+/// returns an `AsyncRead` wrapping a cursor over the bytes; `delete` is
+/// idempotent. Matches the real `FilesystemStatefulUploadStaging`'s
+/// semantics — including the gap refusal, the unaccounted-tail
+/// truncation and the `truncated` over-budget signal — without touching
+/// disk.
 pub struct MockStatefulUploadStagingPort {
     chunks: Mutex<HashMap<Uuid, Vec<u8>>>,
 }
@@ -5063,20 +5158,47 @@ impl MockStatefulUploadStagingPort {
 }
 
 impl StatefulUploadStagingPort for MockStatefulUploadStagingPort {
-    fn append(
+    fn append_at(
         &self,
         session_id: Uuid,
+        offset: u64,
+        limit: u64,
         mut stream: Box<dyn AsyncRead + Send + Unpin>,
-    ) -> BoxFuture<'_, DomainResult<u64>> {
+    ) -> BoxFuture<'_, DomainResult<StagingAppend>> {
         Box::pin(async move {
+            // Read one byte past the budget so the mock can report
+            // `truncated` the way the filesystem adapter does — and, like
+            // it, keep that surplus byte out of the staged bytes.
             let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await.map_err(|e| {
-                DomainError::Invariant(format!("mock stateful upload staging read failed: {e}"))
-            })?;
+            (&mut stream)
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut buf)
+                .await
+                .map_err(|e| {
+                    DomainError::Invariant(format!("mock stateful upload staging read failed: {e}"))
+                })?;
+            let truncated = buf.len() as u64 > limit;
+            if truncated {
+                buf.truncate(limit as usize);
+            }
+
             let mut chunks = self.chunks.lock().unwrap();
             let entry = chunks.entry(session_id).or_default();
+            let current = entry.len() as u64;
+            // Position-checked write, same three cases as the filesystem
+            // adapter: refuse a gap, drop an unaccounted tail, then write.
+            if current < offset {
+                return Err(DomainError::Invariant(format!(
+                    "stateful upload staging write at offset {offset} would leave a gap: \
+                     staging holds {current} bytes"
+                )));
+            }
+            entry.truncate(offset as usize);
             entry.extend_from_slice(&buf);
-            Ok(entry.len() as u64)
+            Ok(StagingAppend {
+                total: entry.len() as u64,
+                truncated,
+            })
         })
     }
 
@@ -7836,13 +7958,14 @@ mod tests {
         let staging = MockStatefulUploadStagingPort::new();
         let session_id = Uuid::new_v4();
 
-        // Two appends: the second must concatenate onto the first.
+        // Two writes at successive offsets: the second must concatenate
+        // onto the first.
         let first: Box<dyn AsyncRead + Send + Unpin> =
             Box::new(std::io::Cursor::new(b"hello ".to_vec()));
-        staging.append(session_id, first).await.unwrap();
+        staging.append_at(session_id, 0, 6, first).await.unwrap();
         let second: Box<dyn AsyncRead + Send + Unpin> =
             Box::new(std::io::Cursor::new(b"world".to_vec()));
-        staging.append(session_id, second).await.unwrap();
+        staging.append_at(session_id, 6, 5, second).await.unwrap();
 
         let mut reader = staging.stream_read(session_id).await.unwrap();
         let mut buf = Vec::new();
@@ -7877,7 +8000,7 @@ mod tests {
         let session_id = Uuid::new_v4();
         let payload: Box<dyn AsyncRead + Send + Unpin> =
             Box::new(std::io::Cursor::new(b"payload".to_vec()));
-        staging.append(session_id, payload).await.unwrap();
+        staging.append_at(session_id, 0, 7, payload).await.unwrap();
         staging.delete(session_id).await.unwrap();
         // Second delete of the same id must also be OK.
         staging.delete(session_id).await.unwrap();

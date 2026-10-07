@@ -250,12 +250,12 @@ pub struct PypiVersionPayload {
 ///   `requests-2.31.0-py3-none-any.whl` or `requests-2.31.0.tar.gz`).
 ///   Builder embeds it verbatim as the link text (HTML) / `filename`
 ///   field (JSON) and uses it as the URL's last segment.
-/// - `hash_sha256` — the SHA-256 hex digest. Emitted as the
-///   `#sha256=...` URL fragment in HTML and as `hashes.sha256` in
-///   JSON. `None` is rare but legitimate (an upstream that doesn't
-///   publish hashes; Hort hosted-without-checksum is possible too) —
-///   the builder omits the attribute in that case rather than
-///   emitting empty bytes.
+/// - `hash_sha256` — the SHA-256 digest, as a validated
+///   [`ContentHash`]. Emitted as the `#sha256=...` URL fragment in
+///   HTML and as `hashes.sha256` in JSON. `None` is rare but
+///   legitimate (an upstream that doesn't publish hashes; Hort
+///   hosted-without-checksum is possible too) — the builder omits
+///   the attribute in that case rather than emitting empty bytes.
 /// - `requires_python` — PEP 503 `data-requires-python` attribute /
 ///   PEP 691 `requires-python` field. Carried verbatim from the
 ///   stored metadata or upstream entry; absent when the publisher
@@ -266,10 +266,25 @@ pub struct PypiVersionFile {
     /// The builder uses this as the URL basename when composing the
     /// per-file simple-index download link.
     pub filename: String,
-    /// SHA-256 hex digest. `None` when the source could not supply
-    /// one; builders omit the corresponding hash field in that case
-    /// (no empty-string / `null` emission).
-    pub hash_sha256: Option<String>,
+    /// SHA-256 digest. `None` when the source could not supply one;
+    /// builders omit the corresponding hash field in that case (no
+    /// empty-string / `null` emission).
+    ///
+    /// Typed, not `String`, for the same reason [`Self::metadata_hash`]
+    /// is: this value is interpolated into a URL fragment inside an
+    /// HTML attribute, and on the proxy path it arrives verbatim from
+    /// an upstream simple-index body. A [`ContentHash`] is 64 lowercase
+    /// hex characters by construction, so no value that reaches here
+    /// can carry a quote, an angle bracket, or a `#`. The sources parse
+    /// at projection time and drop what does not parse — a value that
+    /// is not a canonical SHA-256 hex digest could never have matched a
+    /// client's own `hexdigest()` comparison, so serving it labelled
+    /// `sha256=` was a guaranteed-failing check, not a check.
+    ///
+    /// This is NOT the field the upstream-checksum verification reads
+    /// (ADR 0006): that is `PypiVersionFileInfo::sha256` on the
+    /// per-version JSON projection, which stays a verbatim `String`.
+    pub hash_sha256: Option<ContentHash>,
     /// PEP 503 `data-requires-python` / PEP 691 `requires-python`.
     /// `None` when absent; builders omit the attribute / field in
     /// that case.
@@ -1109,9 +1124,12 @@ mod tests {
     /// builders consume.
     #[test]
     fn pypi_per_version_payload_has_required_fields() {
+        // 64 lowercase hex — the only shape `ContentHash` admits, and
+        // therefore the only shape this field can carry.
+        const SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         let file = PypiVersionFile {
             filename: "requests-2.31.0.tar.gz".into(),
-            hash_sha256: Some("abc123".into()),
+            hash_sha256: Some(SHA.parse().expect("valid sha256 hex")),
             requires_python: Some(">=3.7".into()),
             metadata_hash: None,
         };
@@ -1123,7 +1141,10 @@ mod tests {
             PerVersionPayload::Pypi(p) => {
                 assert_eq!(p.files.len(), 1);
                 assert_eq!(p.files[0].filename, "requests-2.31.0.tar.gz");
-                assert_eq!(p.files[0].hash_sha256.as_deref(), Some("abc123"));
+                assert_eq!(
+                    p.files[0].hash_sha256.as_ref().map(ContentHash::as_ref),
+                    Some(SHA)
+                );
                 assert_eq!(p.files[0].requires_python.as_deref(), Some(">=3.7"));
             }
             PerVersionPayload::Npm(_)

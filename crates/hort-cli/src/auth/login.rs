@@ -895,7 +895,7 @@ pub fn persist_token(server_url: &str, token: &str) -> Result<()> {
 /// Behaviour-preserving core of [`persist_token`] parameterised on the target
 /// path so it is testable without driving `$HOME`.
 ///
-/// Write-then-chmod TOCTOU fix. The previous implementation did
+/// Write-then-chmod TOCTOU fix. The original implementation did
 /// `fs::write` (creating the file at the process umask, commonly 0644,
 /// containing the plaintext bearer token) and *then* `set_permissions(0600)`,
 /// leaving a world-readable window on a multi-user host; on an existing file
@@ -903,21 +903,24 @@ pub fn persist_token(server_url: &str, token: &str) -> Result<()> {
 /// mode/symlink. The hardened path:
 ///
 /// - `create_dir_all(parent)` then (Unix) tightens the parent to `0o700` —
-///   it may have been created under the process umask.
-/// - Writes a uniquely-named sibling temp file in the **same directory** via
-///   `OpenOptions … create_new(true).mode(0o600)` — on Unix `create_new` +
-///   `mode` is an atomic create at 0600 (no umask window — case (a)) that
-///   *fails* if anything (file or symlink) already exists at the temp name
-///   (case (c)).
-/// - `sync_all()` then `std::fs::rename(temp, path)` — an atomic same-filesystem
-///   replace, so the final file never inherits a stale mode from a
-///   pre-existing target (case (b)) and a concurrent reader sees either the
-///   old or the new file, never a partial/0644 one.
-/// - The temp file is best-effort removed on every error path.
+///   it may have been created under the process umask. This half stays
+///   *here* rather than moving into the shared writer: this path is
+///   `~/.hort/`, a directory this process creates for its own use, so
+///   tightening it is correct. `hort-server`'s `admin --output=file:`
+///   sink takes an **operator-named** path, where the same chmod would be
+///   an unrequested side effect on a directory the operator configured
+///   (and would break `/etc/hort`'s deliberate `root:hort` 0750).
+/// - [`hort_secret_file::write_secret_file`] then performs the atomic
+///   0600 placement itself — a `create_new(true).mode(0o600)` sibling temp
+///   file, `sync_all`, `rename` over the target — so the final file never
+///   inherits a stale mode from a pre-existing target, a symlink at the
+///   target is replaced rather than followed, and a concurrent reader sees
+///   either the old or the complete new file, never a partial/0644 one.
+///   That crate's docs carry the full fault-class analysis; it is the one
+///   place in the workspace that knows how to put a secret on disk.
 fn persist_token_to(path: &std::path::Path, server_url: &str, token: &str) -> Result<()> {
     // Ensure parent directory exists.
-    let parent = path.parent();
-    if let Some(parent) = parent {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating config directory {parent:?}"))?;
         // The dir may have been created under the process umask (e.g. 0755).
@@ -937,54 +940,8 @@ fn persist_token_to(path: &std::path::Path, server_url: &str, token: &str) -> Re
          token  = \"{token}\"\n"
     );
 
-    // Unique sibling temp name in the SAME directory (rename is only atomic
-    // within one filesystem). pid + a counter avoids collisions between
-    // concurrent `hort-cli auth login` invocations.
-    let dir = parent.unwrap_or_else(|| std::path::Path::new("."));
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "config.toml".to_string());
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
-
-    let write_result = (|| -> Result<()> {
-        // `create_new` ⇒ O_EXCL: fails if a file or symlink already exists at
-        // the temp name (defeats symlink/file pre-creation, case (c)).
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            // Atomic create at 0600 — no umask-widened window (case (a)).
-            opts.mode(0o600);
-        }
-        let mut f = opts
-            .open(&tmp_path)
-            .with_context(|| format!("creating temp config file {tmp_path:?}"))?;
-        use std::io::Write;
-        f.write_all(content.as_bytes())
-            .with_context(|| format!("writing temp config file {tmp_path:?}"))?;
-        f.sync_all()
-            .with_context(|| format!("syncing temp config file {tmp_path:?}"))?;
-        Ok(())
-    })();
-
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-
-    // Atomic same-filesystem replace. A pre-existing target (any mode/symlink)
-    // is replaced wholesale — the final inode is always our fresh 0600 file
-    // (cases (b)/(c)), and a concurrent reader never observes a 0644 partial.
-    if let Err(e) = std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("atomically replacing config file {path:?}"))
-    {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
+    hort_secret_file::write_secret_file(path, content.as_bytes())
+        .with_context(|| format!("writing config file {path:?}"))?;
 
     Ok(())
 }

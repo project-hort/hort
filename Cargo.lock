@@ -2763,6 +2763,7 @@ dependencies = [
  "clap_complete",
  "directories",
  "hort-attribution",
+ "hort-secret-file",
  "humantime",
  "mockito",
  "rand 0.10.3",
@@ -3231,6 +3232,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hort-secret-file"
+version = "0.14.2-dev"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "hort-server"
 version = "0.14.2-dev"
 dependencies = [
@@ -3269,6 +3277,7 @@ dependencies = [
  "hort-http-subscriptions",
  "hort-notifier-nats",
  "hort-notifier-webhook",
+ "hort-secret-file",
  "hyper",
  "hyper-util",
  "ipnet",

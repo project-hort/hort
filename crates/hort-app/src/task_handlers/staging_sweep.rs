@@ -219,7 +219,7 @@ mod tests {
     use hort_domain::events::system_actor;
     use hort_domain::ports::ephemeral_store::EphemeralStore;
     use hort_domain::ports::jobs_repository::{JobRow, JobStatus, KindFields};
-    use hort_domain::ports::stateful_upload_staging::StatefulUploadStagingPort;
+    use hort_domain::ports::stateful_upload_staging::{StagingAppend, StatefulUploadStagingPort};
     use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
     use hort_domain::ports::BoxFuture;
     use metrics::SharedString;
@@ -270,12 +270,14 @@ mod tests {
     }
 
     impl StatefulUploadStagingPort for MockStaging {
-        fn append(
+        fn append_at(
             &self,
             _session_id: Uuid,
+            _offset: u64,
+            _limit: u64,
             _stream: Box<dyn AsyncRead + Send + Unpin>,
-        ) -> BoxFuture<'_, DomainResult<u64>> {
-            unreachable!("sweep does not call append")
+        ) -> BoxFuture<'_, DomainResult<StagingAppend>> {
+            unreachable!("sweep does not write staging bytes")
         }
 
         fn stream_read(

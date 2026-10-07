@@ -1048,3 +1048,381 @@ async fn get_events_serves_ordinary_repository_event_to_read_only_caller() {
         "ordinary repo events must still reach a Read caller (no regression)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Repository disclosure of artifact-lifecycle events
+//
+// The post-ingest artifact lifecycle carries no repository column:
+// `ArtifactQuarantined`, `ScanCompleted`, `ArtifactReleased`,
+// `ArtifactRejected`, the provenance verdicts, `ArtifactExpired` and
+// `ArtifactPurged` name the *artifact*, and the artifact aggregate owns
+// the repository. Reading that absence as "visible" let an
+// authenticated account with no `Read` grant anywhere pull every
+// repository's scanner names, severity counts, findings-blob hashes and
+// release justifications off this endpoint.
+//
+// The tests below pin BOTH directions, because a change that only
+// stopped the disclosure would silently blind a legitimate reader to its
+// own repository's lifecycle. They seed the artifact through
+// `mocks.artifacts` — the same store the resolver reads — so the fixture
+// states "this artifact belongs to this repository" exactly once.
+// ---------------------------------------------------------------------------
+
+/// Minimal artifact row for the repository resolver to answer from.
+fn seeded_artifact(id: Uuid, repository_id: Uuid) -> hort_domain::entities::artifact::Artifact {
+    use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
+    Artifact {
+        id,
+        repository_id,
+        name: "pkg".into(),
+        name_as_published: "pkg".into(),
+        version: Some("1.0.0".into()),
+        path: "pkg/1.0.0/pkg-1.0.0.tar.gz".into(),
+        size_bytes: 1,
+        sha256_checksum: "a".repeat(64).parse::<ContentHash>().unwrap(),
+        sha1_checksum: None,
+        md5_checksum: None,
+        content_type: "application/octet-stream".into(),
+        quarantine_status: QuarantineStatus::Released,
+        rejection_reason: None,
+        quarantine_window_start: None,
+        quarantine_deadline: None,
+        provenance_hold_indefinite: false,
+        upstream_published_at: None,
+        uploaded_by: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        deleted_at: None,
+    }
+}
+
+/// `ScanCompleted` on the artifact's own stream — the payload names the
+/// artifact and carries the scanner, the severity counts and the
+/// findings-blob hash, but no repository.
+fn scan_completed_event(artifact_id: Uuid, global_pos: u64) -> PersistedEvent {
+    use hort_domain::events::{ScanAssessment, ScanCompleted, SeveritySummary};
+    PersistedEvent {
+        event_id: Uuid::new_v4(),
+        stream_id: StreamId::artifact(artifact_id),
+        stream_position: 0,
+        global_position: global_pos,
+        event: DomainEvent::ScanCompleted(ScanCompleted {
+            artifact_id,
+            scanner: "trivy".into(),
+            finding_count: 3,
+            severity_summary: SeveritySummary {
+                critical: 1,
+                high: 2,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: None,
+            assessment: ScanAssessment::Analysed,
+        }),
+        correlation_id: Uuid::new_v4(),
+        causation_id: None,
+        actor: Actor::Api(ApiActor {
+            user_id: Uuid::new_v4(),
+        }),
+        event_version: 1,
+        stored_at: Utc::now(),
+    }
+}
+
+/// Direction 1 — the disclosure. An authenticated caller with **no**
+/// `Read` grant at all gets none of another repository's
+/// artifact-lifecycle events, and that holds for events **already in the
+/// store** (the fixture seeds persisted events; no payload field was
+/// added).
+#[tokio::test]
+async fn get_events_withholds_artifact_lifecycle_events_from_a_caller_with_no_grants() {
+    let (base, mocks) = new_ctx();
+    let repo = Uuid::new_v4();
+    let artifact = Uuid::new_v4();
+    mocks.artifacts.insert(seeded_artifact(artifact, repo));
+    // Auth on, with a grant that names some OTHER repository — so the
+    // evaluator is populated and the caller is a real principal, it just
+    // holds nothing on `repo`.
+    let ctx = enable_auth(&base, &mocks, &[(Uuid::new_v4(), Uuid::new_v4())]);
+
+    mocks.events.set_category(
+        StreamCategory::Artifact,
+        vec![scan_completed_event(artifact, 1)],
+    );
+
+    let mut p = user_principal();
+    p.claims = vec!["test-role".into()];
+
+    let router = build_router(ctx);
+    let resp = router
+        .oneshot(get("/api/v1/events?category=artifact", p))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let events = body["events"].as_array().unwrap();
+    assert!(
+        events.is_empty(),
+        "a caller with no Read grant on the artifact's repository must receive \
+         nothing; got {events:?}"
+    );
+    // The position still advances — `next_after` is deliberately
+    // unfiltered, so the caller does not re-read what filtered out.
+    assert_eq!(body["next_after"], 1);
+}
+
+/// Direction 2 — the delivery. The same event, same store, a caller that
+/// DOES hold `Read` on the artifact's repository: delivered. A fix that
+/// only closed the disclosure (treating "no repository column" as
+/// invisible) would fail here.
+#[tokio::test]
+async fn get_events_serves_artifact_lifecycle_events_to_a_read_granted_caller() {
+    let (base, mocks) = new_ctx();
+    let repo = Uuid::new_v4();
+    let artifact = Uuid::new_v4();
+    mocks.artifacts.insert(seeded_artifact(artifact, repo));
+    let ctx = enable_auth(&base, &mocks, &[(Uuid::new_v4(), repo)]);
+
+    mocks.events.set_category(
+        StreamCategory::Artifact,
+        vec![scan_completed_event(artifact, 7)],
+    );
+
+    let mut p = user_principal();
+    p.claims = vec!["test-role".into()];
+
+    let router = build_router(ctx);
+    let resp = router
+        .oneshot(get("/api/v1/events?category=artifact", p))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "a Read-granted caller must still receive its own repository's \
+         artifact-lifecycle events"
+    );
+    assert_eq!(events[0]["global_position"], 7);
+    assert_eq!(events[0]["event_type"], "ScanCompleted");
+}
+
+/// Mixed page: one artifact per repository, caller holds `Read` on one.
+/// Proves the resolution is per event rather than per page, and that the
+/// two artifacts were resolved in the same pass.
+#[tokio::test]
+async fn get_events_filters_artifact_lifecycle_events_per_repository() {
+    let (base, mocks) = new_ctx();
+    let mine = Uuid::new_v4();
+    let theirs = Uuid::new_v4();
+    let my_artifact = Uuid::new_v4();
+    let their_artifact = Uuid::new_v4();
+    mocks.artifacts.insert(seeded_artifact(my_artifact, mine));
+    mocks
+        .artifacts
+        .insert(seeded_artifact(their_artifact, theirs));
+    let ctx = enable_auth(&base, &mocks, &[(Uuid::new_v4(), mine)]);
+
+    mocks.events.set_category(
+        StreamCategory::Artifact,
+        vec![
+            scan_completed_event(my_artifact, 1),
+            scan_completed_event(their_artifact, 2),
+            scan_completed_event(my_artifact, 3),
+        ],
+    );
+
+    let mut p = user_principal();
+    p.claims = vec!["test-role".into()];
+
+    let router = build_router(ctx);
+    let resp = router
+        .oneshot(get("/api/v1/events?category=artifact", p))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    let events = body["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["global_position"], 1);
+    assert_eq!(events[1]["global_position"], 3);
+}
+
+/// An artifact with no projection row (its repository was deleted,
+/// cascading the artifacts away) fails closed for a non-admin caller.
+#[tokio::test]
+async fn get_events_withholds_an_unresolvable_artifact_event_from_a_non_admin() {
+    let (base, mocks) = new_ctx();
+    let repo = Uuid::new_v4();
+    // Deliberately do NOT seed the artifact.
+    let ctx = enable_auth(&base, &mocks, &[(Uuid::new_v4(), repo)]);
+
+    mocks.events.set_category(
+        StreamCategory::Artifact,
+        vec![scan_completed_event(Uuid::new_v4(), 1)],
+    );
+
+    let mut p = user_principal();
+    p.claims = vec!["test-role".into()];
+
+    let router = build_router(ctx);
+    let resp = router
+        .oneshot(get("/api/v1/events?category=artifact", p))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert!(
+        body["events"].as_array().unwrap().is_empty(),
+        "an unresolvable disclosure must fail closed"
+    );
+}
+
+/// …and an admin still reads it, so fail-closed means admin-only rather
+/// than invisible to everyone. Admin is also what keeps a
+/// `CasIntegrityMismatch` — a CAS-hash-keyed fact no single repository
+/// owns — readable.
+#[tokio::test]
+async fn get_events_serves_an_unresolvable_artifact_event_to_an_admin() {
+    let (base, mocks) = new_ctx();
+    let ctx = enable_auth(&base, &mocks, &[]);
+
+    mocks.events.set_category(
+        StreamCategory::Artifact,
+        vec![scan_completed_event(Uuid::new_v4(), 1)],
+    );
+
+    let router = build_router(ctx);
+    let resp = router
+        .oneshot(get("/api/v1/events?category=artifact", admin_principal()))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(
+        body["events"].as_array().unwrap().len(),
+        1,
+        "an admin must still be able to read an unattributable audit fact"
+    );
+}
+
+/// `CasIntegrityMismatch` rides `StreamCategory::Artifact` with a stream
+/// `entity_id` derived from the content hash rather than an artifact id,
+/// and no number of repositories owns the hash. It is withheld from a
+/// non-admin even though its category is non-admin.
+#[tokio::test]
+async fn get_events_withholds_cas_integrity_mismatch_from_a_non_admin() {
+    use hort_domain::events::CasIntegrityMismatch;
+    let (base, mocks) = new_ctx();
+    let repo = Uuid::new_v4();
+    let ctx = enable_auth(&base, &mocks, &[(Uuid::new_v4(), repo)]);
+
+    let hash = "b".repeat(64).parse::<ContentHash>().unwrap();
+    mocks.events.set_category(
+        StreamCategory::Artifact,
+        vec![PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(Uuid::new_v4()),
+            stream_position: 0,
+            global_position: 1,
+            event: DomainEvent::CasIntegrityMismatch(CasIntegrityMismatch {
+                content_hash: hash.clone(),
+                backend: "filesystem".into(),
+                observed_hash: hash,
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(ApiActor {
+                user_id: Uuid::new_v4(),
+            }),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }],
+    );
+
+    let mut p = user_principal();
+    p.claims = vec!["test-role".into()];
+
+    let router = build_router(ctx);
+    let resp = router
+        .oneshot(get("/api/v1/events?category=artifact", p))
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert!(
+        body["events"].as_array().unwrap().is_empty(),
+        "a CAS-integrity fact names a content hash, not a repository; no \
+         repository grant can authorise it"
+    );
+}
+
+/// A promotion discloses a source AND a target, and the served payload
+/// carries both repository ids. `Read` on one of them is not authority
+/// to read it; `Read` on both is.
+#[tokio::test]
+async fn get_events_requires_read_on_both_repositories_of_a_promotion() {
+    use hort_domain::events::ArtifactPromoted;
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+
+    let promotion = |pos: u64| PersistedEvent {
+        event_id: Uuid::new_v4(),
+        stream_id: StreamId::artifact(Uuid::new_v4()),
+        stream_position: 0,
+        global_position: pos,
+        event: DomainEvent::ArtifactPromoted(ArtifactPromoted {
+            artifact_id: Uuid::new_v4(),
+            source_repository_id: source,
+            target_repository_id: target,
+        }),
+        correlation_id: Uuid::new_v4(),
+        causation_id: None,
+        actor: Actor::Api(ApiActor {
+            user_id: Uuid::new_v4(),
+        }),
+        event_version: 1,
+        stored_at: Utc::now(),
+    };
+
+    // Read on the source only → withheld.
+    let (base, mocks) = new_ctx();
+    let ctx = enable_auth(&base, &mocks, &[(Uuid::new_v4(), source)]);
+    mocks
+        .events
+        .set_category(StreamCategory::Artifact, vec![promotion(1)]);
+    let mut p = user_principal();
+    p.claims = vec!["test-role".into()];
+    let resp = build_router(ctx)
+        .oneshot(get("/api/v1/events?category=artifact", p))
+        .await
+        .unwrap();
+    assert!(
+        body_json(resp).await["events"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "Read on the source alone must not disclose the target's identity"
+    );
+
+    // Read on both → served.
+    let (base, mocks) = new_ctx();
+    let ctx = enable_auth(
+        &base,
+        &mocks,
+        &[(Uuid::new_v4(), source), (Uuid::new_v4(), target)],
+    );
+    mocks
+        .events
+        .set_category(StreamCategory::Artifact, vec![promotion(1)]);
+    let mut p = user_principal();
+    p.claims = vec!["test-role".into()];
+    let resp = build_router(ctx)
+        .oneshot(get("/api/v1/events?category=artifact", p))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_json(resp).await["events"].as_array().unwrap().len(),
+        1,
+        "Read on both disclosed repositories must serve the promotion"
+    );
+}

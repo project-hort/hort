@@ -29,6 +29,7 @@ pub mod ephemeral_store;
 pub mod event_chain_head_reader;
 pub mod event_chain_reader;
 pub mod event_notifier;
+pub mod event_repository_resolver;
 pub mod event_store;
 pub mod federated_jwt_validator;
 pub mod format_handler;

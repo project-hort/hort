@@ -40,6 +40,23 @@ use crate::error::DomainResult;
 
 use super::BoxFuture;
 
+/// Outcome of one [`StatefulUploadStagingPort::append_at`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagingAppend {
+    /// The staging file's physical length after the write — always
+    /// `offset + <bytes written>`, because the write is positioned at
+    /// `offset` and the adapter drops anything that was beyond it.
+    pub total: u64,
+    /// `stream` still had bytes when the `limit` was reached. The
+    /// surplus was **not** written: the over-limit signal lives here,
+    /// never in the file's length. A caller that cannot distinguish "the
+    /// body exactly filled the budget" (legal) from "the body wanted
+    /// more than the budget" (reject) has to encode that bit somewhere,
+    /// and encoding it by letting one surplus byte land on disk makes
+    /// the file exceed the very cap the budget expresses.
+    pub truncated: bool,
+}
+
 /// Scratch-space port for chunks-in-flight during three-phase / chunked
 /// stateful upload.
 ///
@@ -50,34 +67,65 @@ use super::BoxFuture;
 /// computes the real hash) and calls [`delete`](Self::delete) here to
 /// clean up.
 pub trait StatefulUploadStagingPort: Send + Sync {
-    /// Append bytes from `stream` to the staging area for `session_id`.
+    /// Write up to `limit` bytes from `stream` into the staging area for
+    /// `session_id`, **starting at `offset`**. Creates the staging file
+    /// on first call.
     ///
-    /// Reads `stream` to EOF, appends to the session's staging file,
-    /// and returns the new total byte count for the session (i.e. the
-    /// file's length after the flush). Creates the staging file on
-    /// first call.
+    /// # Position is asserted, not discovered
+    ///
+    /// `offset` is the caller's recorded progress for the session. The
+    /// adapter writes there rather than at whatever the file's current
+    /// end happens to be, which is what keeps the physical file from
+    /// ever becoming the authority on how much of the upload has landed:
+    ///
+    /// - `offset == len(file)` — the ordinary case. The bytes extend the
+    ///   file and `total` is `offset + n`.
+    /// - `offset > len(file)` — a gap. The adapter writes **nothing**
+    ///   and returns [`DomainError::Invariant`](crate::error::DomainError::Invariant):
+    ///   filling the hole would put bytes the client never sent into the
+    ///   middle of the content, and the finalize-time digest check would
+    ///   then reject a blob whose body the registry itself corrupted.
+    /// - `offset < len(file)` — bytes past the caller's recorded
+    ///   progress, i.e. debris from an earlier write whose record update
+    ///   never landed. The adapter truncates to `offset` before writing.
+    ///   That is a repair, not data loss: the caller's record is the
+    ///   authority and does not account for those bytes, so no finalize
+    ///   can ever turn them into content.
+    ///
+    /// At most `limit` bytes are written. If `stream` has more,
+    /// [`StagingAppend::truncated`] is set and the surplus is discarded,
+    /// so the file's length never exceeds `offset + limit`.
     ///
     /// # Concurrency contract
     ///
-    /// Filesystem adapters are expected to use `O_APPEND` open-mode
-    /// semantics, which the kernel serialises atomically for writes up
-    /// to `PIPE_BUF` (4 KiB on Linux). Two concurrent `append` calls on
-    /// the same `session_id` therefore produce a well-defined final
-    /// byte-count equal to the sum of both stream lengths; the relative
-    /// order of the two payloads in the file is unspecified but the
-    /// content of each individual small write is not interleaved.
+    /// The port does **not** resolve concurrent writers and callers must
+    /// not lean on it to. Two `append_at` calls racing on one
+    /// `session_id` aim at the same `offset`, so the loser overwrites the
+    /// winner's bytes rather than extending past them.
     ///
-    /// Callers that require a strict ordering of chunks must serialise
-    /// at a higher layer — the OCI use case does this by gating every
-    /// `PATCH` on an optimistic-concurrency check against the upload
-    /// session state held in
-    /// [`EphemeralStore`](crate::ports::ephemeral_store::EphemeralStore)
-    /// via `compare_and_swap`.
-    fn append(
+    /// **Callers MUST serialise `append_at` per session by claiming the
+    /// byte range in their own session record BEFORE calling here.** The
+    /// OCI use case advances the session record's `bytes_received` to
+    /// `offset + limit` through
+    /// [`EphemeralStore::compare_and_swap`](crate::ports::ephemeral_store::EphemeralStore::compare_and_swap)
+    /// *first*, so the loser of a `PATCH` race is rejected having written
+    /// nothing at all. Claiming the range **after** the write serialises
+    /// nothing: both racers reach the port, both write, and the file ends
+    /// up longer than either record claims — which then makes every
+    /// subsequent cap check compute against a length that is already
+    /// stale, and the file grows once more on each retry.
+    ///
+    /// What position-checked writing buys even where a caller gets that
+    /// ordering wrong: the file is bounded by `offset + limit` instead of
+    /// growing by the sum of the racers' lengths. That is a backstop, not
+    /// a substitute for the claim.
+    fn append_at(
         &self,
         session_id: Uuid,
+        offset: u64,
+        limit: u64,
         stream: Box<dyn AsyncRead + Send + Unpin>,
-    ) -> BoxFuture<'_, DomainResult<u64>>;
+    ) -> BoxFuture<'_, DomainResult<StagingAppend>>;
 
     /// Open the staging file for `session_id` for reading.
     ///

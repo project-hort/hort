@@ -108,10 +108,11 @@ impl DownloadActor {
 /// same semantics as [`super::AuthenticationAttempted::at`].
 ///
 /// `repository_id` is carried directly in the payload (it is the
-/// stream-sharding key); `EventTypeKind::repository_id` returns it so
-/// the subscription dispatcher's repo-scope filter sees it — though the
-/// event type is in `HIGH_VOLUME_EVENT_TYPES` and is therefore
-/// subscription-excluded at issuance regardless.
+/// stream-sharding key); `EventTypeKind::disclosed_repositories` answers
+/// with it directly — no artifact-aggregate lookup — so the read gate
+/// and the subscription dispatcher's repo-scope filter both see it,
+/// though the event type is in `HIGH_VOLUME_EVENT_TYPES` and is
+/// therefore subscription-excluded at issuance regardless.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactDownloaded {
     /// The artifact whose content was served.

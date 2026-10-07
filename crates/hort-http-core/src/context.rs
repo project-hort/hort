@@ -24,6 +24,7 @@ use hort_app::gitops_apply_status::GitopsApplyStatus;
 use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
+use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase;
@@ -391,6 +392,20 @@ pub struct AppContext {
     /// composition wiring has not landed — the field is unwired in
     /// production and only the mock test harness populates it.
     pub subscription_use_case: Arc<SubscriptionUseCase>,
+    /// The repository-visibility primitive for the
+    /// `GET /api/v1/events` read gate (`hort-http-events`), shared with
+    /// the notification dispatcher's subscription filter.
+    ///
+    /// The handler needs it because the post-ingest artifact lifecycle
+    /// carries no repository column: `ArtifactQuarantined`,
+    /// `ScanCompleted`, `ArtifactReleased` and their siblings name the
+    /// artifact, and the artifact aggregate owns the repository. Without
+    /// resolving that, the per-event repo filter has nothing to check a
+    /// non-admin caller's `Read` grants against. The use case resolves a
+    /// whole page in one round trip, which is why the handler holds the
+    /// use case rather than the `pub(crate)` `artifacts` port (ADR 0008)
+    /// — and why the resolution is not per event.
+    pub event_visibility_use_case: Arc<EventVisibilityUseCase>,
     /// Curator decision authority over quarantined
     /// / non-terminal artifacts. The inbound HTTP adapter
     /// (`handlers/admin/curation/`) calls
@@ -930,6 +945,8 @@ pub struct AppContextParts {
     pub rbac_resolve_use_case: Arc<RbacResolveUseCase>,
     /// See [`AppContext::subscription_use_case`].
     pub subscription_use_case: Arc<SubscriptionUseCase>,
+    /// See [`AppContext::event_visibility_use_case`].
+    pub event_visibility_use_case: Arc<EventVisibilityUseCase>,
 
     /// See [`AppContext::curation_use_case`].
     pub curation_use_case: Arc<CurationUseCase>,
@@ -1058,6 +1075,7 @@ impl AppContext {
             effective_permissions_use_case: parts.effective_permissions_use_case,
             rbac_resolve_use_case: parts.rbac_resolve_use_case,
             subscription_use_case: parts.subscription_use_case,
+            event_visibility_use_case: parts.event_visibility_use_case,
             curation_use_case: parts.curation_use_case,
             provenance_misrejection_repair_use_case: parts.provenance_misrejection_repair_use_case,
             policy_use_case: parts.policy_use_case,

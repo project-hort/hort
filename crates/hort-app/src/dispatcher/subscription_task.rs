@@ -121,6 +121,7 @@ use crate::metrics::{
     notify_outcome_label, target_kind_label,
 };
 use crate::rbac::RbacEvaluator;
+use crate::use_cases::event_visibility::{EventRepositoryIndex, EventVisibilityUseCase};
 use crate::use_cases::subscription_filter::{matches as filter_matches, FilterContext};
 use crate::use_cases::subscription_use_case::SubscriptionUseCase;
 
@@ -249,6 +250,13 @@ pub struct SubscriptionTaskDeps {
     /// repository metadata. v1 ships zero variants; the field is held
     /// but never consulted by the v1 filter.
     pub repositories: Arc<dyn RepositoryRepository>,
+    /// Resolves the repository a catch-up page's events disclose. The
+    /// post-ingest artifact lifecycle carries no repository column — the
+    /// artifact aggregate does — so without this the filter cannot tell
+    /// the owner's own repository's `ArtifactReleased` from another
+    /// tenant's. Resolved ONCE per page in [`catch_up`], not per event.
+    /// Shared with the `GET /api/v1/events` read gate.
+    pub event_visibility: Arc<EventVisibilityUseCase>,
     /// Owner principal — synthesised **once at task spawn** from the
     /// owner's `User` row + `snapshot_claims` (the stale-`"admin"`
     /// strip + live-`is_admin` re-derivation happens at that synthesis
@@ -537,6 +545,32 @@ async fn catch_up(
             return false;
         }
         let was_full_page = events.len() as u64 >= CATCHUP_PAGE;
+
+        // Resolve, for the whole page in one round trip, the repository
+        // every event discloses. This is the batch boundary the
+        // visibility primitive is built around: the per-event walk below
+        // consults the index without touching the database.
+        //
+        // Fail closed on a resolution failure the same way a failed read
+        // does — end the pass with the mark where it is, so the next tick
+        // retries this page. Continuing with an unresolved index would
+        // silently degrade the page to admin-only and, because the
+        // cursor would advance over it, drop the owner's own events for
+        // good.
+        let repository_index = match deps.event_visibility.index(&events).await {
+            Ok(index) => index,
+            Err(e) => {
+                emit_subscription_read_error();
+                tracing::warn!(
+                    subscription_id = %subscription.id.0,
+                    error = %e,
+                    "event repository resolution failed; the pass stops and the next \
+                     tick retries the same page"
+                );
+                return false;
+            }
+        };
+
         for event in events {
             if cancel.is_cancelled() {
                 return true;
@@ -544,7 +578,15 @@ async fn catch_up(
             // The mark before this event: where a restart would resume if
             // this event is not consumed here.
             let resume_from = cursor.mark();
-            match process_event_for_subscription(&event, subscription, deps, resume_from).await {
+            match process_event_for_subscription(
+                &event,
+                subscription,
+                deps,
+                resume_from,
+                &repository_index,
+            )
+            .await
+            {
                 Disposition::Consumed => {
                     // Advance only over an event this task is done with —
                     // delivered, filtered out, or dropped for want of a
@@ -586,11 +628,16 @@ enum Disposition {
 /// and because reads resume with a strict `>` the next pass would start
 /// above it. One transport attempt, ever, and a 30-second receiver outage
 /// would silently swallow every event that arrived in it.
+///
+/// `repository_index` is the page-wide aggregate→repository resolution
+/// [`catch_up`] built before the walk. Taking it as a parameter rather
+/// than resolving here is what keeps the per-event path free of I/O.
 async fn process_event_for_subscription(
     event: &PersistedEvent,
     subscription: &Subscription,
     deps: &SubscriptionTaskDeps,
     resume_from: Option<u64>,
+    repository_index: &EventRepositoryIndex,
 ) -> Disposition {
     // 1. Load the current evaluator snapshot. One `.load()` per event;
     //    revocation propagates within the auth cache TTL.
@@ -602,6 +649,7 @@ async fn process_event_for_subscription(
         rbac: evaluator,
         repositories: &deps.repositories,
         owner_principal: &deps.owner_principal,
+        repository_index,
     };
     if !filter_matches(&subscription.filter, event, &ctx).await {
         return Disposition::Consumed;
@@ -764,6 +812,7 @@ mod tests {
     use crate::rbac::RbacEvaluator;
     use crate::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
     use crate::use_cases::test_support::{
+        MockArtifactGroupRepository, MockArtifactRepository, MockEventRepositoryResolver,
         MockEventStore, MockRepositoryRepository, MockUserRepository,
     };
 
@@ -1166,6 +1215,17 @@ mod tests {
             use_case,
             rbac,
             repositories: repos,
+            // Empty artifact / group stores: every event these tests
+            // drive is an `ArtifactIngested`, which carries its
+            // repository in the payload and therefore needs no
+            // resolution. The disclosure-resolving paths have their own
+            // tests below, which seed the stores.
+            event_visibility: Arc::new(EventVisibilityUseCase::new(Arc::new(
+                MockEventRepositoryResolver::new(
+                    Arc::new(MockArtifactRepository::new()),
+                    Arc::new(MockArtifactGroupRepository::new()),
+                ),
+            ))),
             owner_principal: principal,
             notifiers: vec![notifier],
             budget: Arc::new(Mutex::new(FailureBudget::new())),
@@ -1247,7 +1307,14 @@ mod tests {
         );
         let event = ingested_event(repo_id, 1);
         // No budget exhaustion possible — single event, mismatched filter.
-        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        let disposition = process_event_for_subscription(
+            &event,
+            &sub,
+            &deps,
+            None,
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert!(
             matches!(disposition, Disposition::Consumed),
             "a filtered-out event is consumed, so the pass walks on past it"
@@ -1276,7 +1343,14 @@ mod tests {
             principal,
         );
         let event = ingested_event(repo_id, 5);
-        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        let disposition = process_event_for_subscription(
+            &event,
+            &sub,
+            &deps,
+            None,
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert!(matches!(disposition, Disposition::Consumed));
         let calls = notifier.calls();
         assert_eq!(calls.len(), 1, "exactly one notify call");
@@ -1308,7 +1382,14 @@ mod tests {
         );
         // Zero-interval debouncer in make_deps → first success persists.
         let event = ingested_event(repo_id, 42);
-        let _ = process_event_for_subscription(&event, &sub, &deps, Some(41)).await;
+        let _ = process_event_for_subscription(
+            &event,
+            &sub,
+            &deps,
+            Some(41),
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         let progress = sub_repo.progress_calls();
         assert_eq!(progress.len(), 1);
         assert_eq!(progress[0].0, sub.id);
@@ -1344,7 +1425,14 @@ mod tests {
             principal,
         );
         let event = ingested_event(repo_id, 7);
-        let disposition = process_event_for_subscription(&event, &sub, &deps, Some(6)).await;
+        let disposition = process_event_for_subscription(
+            &event,
+            &sub,
+            &deps,
+            Some(6),
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert!(
             matches!(disposition, Disposition::Halt),
             "a failed delivery halts the pass; a single failure does not exhaust the budget"
@@ -1391,8 +1479,14 @@ mod tests {
         let mut exhausted = false;
         for i in 1..=100u64 {
             let event = ingested_event(repo_id, i);
-            let disposition =
-                process_event_for_subscription(&event, &sub, &deps, Some(i - 1)).await;
+            let disposition = process_event_for_subscription(
+                &event,
+                &sub,
+                &deps,
+                Some(i - 1),
+                &EventRepositoryIndex::empty(),
+            )
+            .await;
             exhausted = matches!(disposition, Disposition::ExitTask);
             if exhausted {
                 break;
@@ -1426,7 +1520,14 @@ mod tests {
         // Replace with empty registry to also exercise the empty branch.
         deps.notifiers = vec![];
         let event = ingested_event(repo_id, 1);
-        let disposition = process_event_for_subscription(&event, &sub, &deps, None).await;
+        let disposition = process_event_for_subscription(
+            &event,
+            &sub,
+            &deps,
+            None,
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert!(
             matches!(disposition, Disposition::Consumed),
             "an undeliverable target is not a delivery failure — it must not wedge the pass"
@@ -1459,7 +1560,14 @@ mod tests {
             principal,
         );
         let event = ingested_event(Uuid::new_v4(), 1);
-        let _ = process_event_for_subscription(&event, &sub, &deps, None).await;
+        let _ = process_event_for_subscription(
+            &event,
+            &sub,
+            &deps,
+            None,
+            &EventRepositoryIndex::empty(),
+        )
+        .await;
         assert_eq!(notifier.calls().len(), 1);
     }
 
@@ -1500,6 +1608,181 @@ mod tests {
         assert!(
             matches!(cursor.read_from(), SubscribeFrom::AfterGlobal(2)),
             "the cursor must have advanced over everything the pass read"
+        );
+    }
+
+    /// A counting resolver that answers from a fixed map and records
+    /// how many times it was called. Lets a test assert the page-level
+    /// batch boundary: ONE call for the whole page, never one per event.
+    struct CountingResolver {
+        artifacts: HashMap<Uuid, Uuid>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        fail: bool,
+    }
+
+    impl hort_domain::ports::event_repository_resolver::EventRepositoryResolver for CountingResolver {
+        fn resolve_event_aggregates<'a>(
+            &'a self,
+            artifact_ids: &'a [Uuid],
+            _artifact_group_ids: &'a [Uuid],
+        ) -> BoxFuture<
+            'a,
+            DomainResult<hort_domain::ports::event_repository_resolver::EventAggregateRepositories>,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Box::pin(async {
+                    Err(DomainError::Invariant("database error: down".into()))
+                });
+            }
+            let artifacts = artifact_ids
+                .iter()
+                .filter_map(|id| self.artifacts.get(id).map(|r| (*id, *r)))
+                .collect();
+            Box::pin(async move {
+                Ok(
+                    hort_domain::ports::event_repository_resolver::EventAggregateRepositories {
+                        artifacts,
+                        artifact_groups: HashMap::new(),
+                    },
+                )
+            })
+        }
+    }
+
+    /// `ArtifactQuarantined` on the artifact's own stream — payload
+    /// names the artifact, not the repository.
+    fn quarantined_event(artifact_id: Uuid, global_pos: u64) -> PersistedEvent {
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(artifact_id),
+            stream_position: 0,
+            global_position: global_pos,
+            event: DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: Utc::now(),
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: Actor::Api(ApiActor {
+                user_id: Uuid::new_v4(),
+            }),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
+    /// The catch-up pass resolves the whole page's repository
+    /// disclosures in ONE round trip and delivers the events the owner
+    /// holds `Read` on.
+    ///
+    /// Both halves matter: the delivery is the symmetry half of the fix
+    /// (these events used to be dropped outright for a
+    /// `RepositoryScope::Some` owner and delivered indiscriminately for
+    /// an `OwnedByActor` one), and the call count is the hot-path
+    /// constraint — a resolution per event would be four calls here.
+    #[tokio::test]
+    async fn catch_up_resolves_the_page_once_and_delivers_what_the_owner_may_read() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let artifact_a = Uuid::new_v4();
+        let artifact_b = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::Some(vec![repo_id]));
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            vec![
+                quarantined_event(artifact_a, 1),
+                quarantined_event(artifact_b, 2),
+                quarantined_event(artifact_a, 3),
+                quarantined_event(artifact_b, 4),
+            ],
+        );
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo,
+            mock_es,
+            principal,
+        );
+        deps.event_visibility = Arc::new(EventVisibilityUseCase::new(Arc::new(CountingResolver {
+            artifacts: HashMap::from([(artifact_a, repo_id), (artifact_b, repo_id)]),
+            calls: calls.clone(),
+            fail: false,
+        })));
+
+        let cancel = CancellationToken::new();
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+
+        assert!(!exit);
+        assert_eq!(
+            notifier.calls().len(),
+            4,
+            "an allow-list naming the artifacts' repository must receive that \
+             repository's lifecycle events — the half the bypass fix must not lose"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the page must cost ONE resolution, not one per event"
+        );
+    }
+
+    /// A failed resolution ends the pass with the cursor where it is, so
+    /// the next tick retries the same page. Advancing over an unresolved
+    /// page would drop the owner's own events permanently: the
+    /// disclosure would read as unresolvable, the events would filter
+    /// out as `Consumed`, and the mark would move past them.
+    #[tokio::test]
+    async fn catch_up_stops_without_advancing_when_resolution_fails() {
+        let owner_user_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let artifact = Uuid::new_v4();
+        let rbac = Arc::new(ArcSwap::from_pointee(eval_with_repo_read(repo_id)));
+        let principal = dev_principal(owner_user_id);
+        let sub = make_subscription(owner_user_id, RepositoryScope::OwnedByActor);
+        let sub_repo = Arc::new(MockSubRepo::new());
+        sub_repo.insert(sub.clone());
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::Artifact,
+            vec![
+                quarantined_event(artifact, 1),
+                quarantined_event(artifact, 2),
+            ],
+        );
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let mut deps = make_deps(
+            owner_user_id,
+            rbac,
+            notifier.clone(),
+            sub_repo,
+            mock_es,
+            principal,
+        );
+        deps.event_visibility = Arc::new(EventVisibilityUseCase::new(Arc::new(CountingResolver {
+            artifacts: HashMap::new(),
+            calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail: true,
+        })));
+
+        let cancel = CancellationToken::new();
+        let mut cursor = ReadCursor::new(sub.last_delivered_position);
+        let exit = catch_up(&sub, &deps, &cancel, &mut cursor).await;
+
+        assert!(!exit, "a resolution failure is not task-fatal");
+        assert!(notifier.calls().is_empty(), "nothing is delivered");
+        assert!(
+            matches!(cursor.read_from(), SubscribeFrom::Start),
+            "the mark must not move, so the next tick retries the same page"
         );
     }
 

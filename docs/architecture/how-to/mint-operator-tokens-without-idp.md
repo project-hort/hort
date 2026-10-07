@@ -81,6 +81,22 @@ hort-server admin issue-svc-token --name=maintainer-dev \
 TOK=$(cat "$TF"); rm -f "$TF"
 ```
 
+The token is placed atomically as a file the command created at mode
+`0600`: whatever `<path>` held before — including a world-readable
+file left there by another user, or a symlink pointing elsewhere — is
+**replaced**, not inherited or followed, so the 0600 promise also holds
+when you re-run against a path that already exists. Two consequences
+worth knowing:
+
+- The **parent directory must already exist** and is never modified. The
+  command does not create it and does not change its mode: that
+  directory is yours (`/etc/hort` is deliberately `root:hort` 0750 so
+  the service can read the env files beside the token).
+- The resulting file is owned by the **user running the command**, not
+  by whoever owned a previous file at that path. If a reader needs a
+  different owner, `chown` it after the mint — as the Ansible
+  `hort_timers` role does for `/etc/hort/tasks-token`.
+
 `--name` selects the target `ServiceAccount` by its gitops
 `metadata.name` — the command requires the envelope to already exist
 (applied via gitops) and never fabricates one
