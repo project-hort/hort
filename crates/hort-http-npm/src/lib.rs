@@ -48,7 +48,10 @@ use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_i
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
-use hort_http_core::limits::{BoundedPath, DEFAULT_PUBLISH_BODY_LIMIT};
+use hort_http_core::limits::{
+    publish_disabled_response, refuse_publishes_when_disabled, BoundedPath,
+    DEFAULT_PUBLISH_BODY_LIMIT,
+};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 use hort_http_core::middleware::trust::RequestTrust;
 
@@ -122,11 +125,24 @@ pub fn npm_routes() -> Router<Arc<AppContext>> {
 /// `DefaultBodyLimit::max(limit)` on the layer stack as
 /// defence-in-depth for any future non-streaming extractor (or for
 /// the per-route limit extractor on GET handlers, which read no body).
+///
+/// All of that is the **size** meaning. A zero limit is the
+/// refuse-all-publishes kill switch instead, answered by
+/// `hort_http_core::limits::refuse_publishes_when_disabled` — `503`,
+/// before any publish reaches a handler — and not by either byte
+/// counter. Through the counters a zero-byte publish was refused only
+/// because the decoder found no attachment, which is a property of the
+/// payload grammar and not a promise the limit made. The guard is
+/// method-scoped and wraps the whole subtree, so it also holds the
+/// dist-tag `PUT` — a dist-tag write retargets what `npm install`
+/// resolves to, and its own small per-route body limit would otherwise
+/// let it through — while leaving every GET and the dist-tag `DELETE`
+/// untouched.
 pub fn npm_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
     // Scoped (more-specific) routes are registered first. axum's matchit
     // disambiguates by segment count, but ordering first preserves intent
     // and guards against a future matcher rule change.
-    Router::new()
+    let routes = Router::new()
         // Maintainer dist-tag writes. Six segments with three literals
         // (`-`, `package`, `dist-tags`), so they cannot collide with any
         // of the all-param read routes below (2–5 segments). `{pkg}`
@@ -167,7 +183,8 @@ pub fn npm_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
         .layer(DefaultBodyLimit::max(limit))
         // Propagate the same value to the streaming publish decoder
         // so it can emit 413 itself when counting body bytes.
-        .layer(Extension(NpmPublishLimit(limit)))
+        .layer(Extension(NpmPublishLimit(limit)));
+    refuse_publishes_when_disabled(routes, limit, publish_disabled_response)
 }
 
 /// Router-scoped marker carrying the configured publish body limit.

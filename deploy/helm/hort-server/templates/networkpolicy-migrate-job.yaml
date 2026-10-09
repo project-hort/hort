@@ -18,16 +18,35 @@ WHY THIS EXISTS
   Kubernetes NetworkPolicies are purely additive (the effective allow
   set for a pod is the UNION of every policy selecting it). This policy
   introduces NO new restriction on any pod; it only ADDS an egress
-  allowance to the Job/CronJob pods. The app-pod policy in
+  allowance to this release's Job/CronJob pods. The app-pod policy in
   `networkpolicy.yaml` is left byte-identical.
 
-SELECTOR
-  `matchExpressions: hort-server.io/job Exists` selects exactly the
-  Job/CronJob pods (every cronjob-*.yaml + job-migrate.yaml +
-  svc-token-bootstrap-job.yaml pod template sets this label). The app
-  Deployment pods do NOT carry an `hort-server.io/job` label (they carry
-  `app.kubernetes.io/component: server` instead), so this policy never
-  selects an app pod — the app-pod deny-all is untouched.
+SELECTOR — two clauses, both load-bearing
+  The `podSelector` ANDs `matchLabels: hort-server.selectorLabels` with
+  `matchExpressions: hort-server.io/job Exists`, so it selects exactly
+  THIS RELEASE's Job/CronJob pods: a pod must carry this release's
+  `app.kubernetes.io/{name,instance}` AND an `hort-server.io/job` key.
+  Every cronjob-*.yaml + job-migrate.yaml + svc-token-bootstrap-job.yaml
+  + prepull-*.yaml + tests/test-connection.yaml pod template sets both
+  (`job-migrate.yaml`'s pod-template labels are the pattern), so no
+  pod that needs the allowance loses it.
+
+  Neither clause may be dropped:
+  - WITHOUT the release scope, the only thing between any pod in the
+    namespace and this unrestricted-egress allowance is one label of its
+    own choosing. A principal who may create or label a Pod but may NOT
+    touch NetworkPolicies would take the allowance by writing
+    `hort-server.io/job: anything`, and in a namespace whose own policy
+    denies egress would reach the destinations that policy meant to
+    block; patching the label onto an existing restricted pod does the
+    same. The scope also keeps two releases of this chart in one
+    namespace from granting each other's Job pods egress.
+  - WITHOUT the `Exists` clause this would be the app pods' own
+    selector: the app Deployment pods carry the same
+    `hort-server.selectorLabels` and are kept out only by not carrying
+    an `hort-server.io/job` key (they carry
+    `app.kubernetes.io/component: server` instead). The app-pod deny-all
+    is untouched.
 
 EGRESS SHAPE — why unrestricted egress + explicit DNS, not an ipBlock
   The DB endpoint is inside the operator-supplied opaque Secret DSN
@@ -39,24 +58,34 @@ EGRESS SHAPE — why unrestricted egress + explicit DNS, not an ipBlock
   out of scope. The deterministic fact is that these
   Jobs need outbound network at all. The standard, no-guess bootstrap-
   Job carve-out is therefore: allow DNS resolution (UDP+TCP 53) and
-  otherwise-unrestricted egress, SCOPED to the Job pods only. The
-  migrate Job by design opens exactly one outbound TCP connection (to
-  Postgres via HORT_DATABASE_URL — see job-migrate.yaml) and makes no
+  otherwise-unrestricted egress, SCOPED to this release's Job pods only.
+  The migrate Job by design opens exactly one outbound TCP connection
+  (to Postgres via HORT_DATABASE_URL — see job-migrate.yaml) and makes no
   Kubernetes API calls; the svc-token-bootstrap Job additionally needs
   the kube-apiserver (kubectl apply of the token Secret). Both are
   covered by the un-narrowed `to: []` egress rule below without the
-  chart guessing any address. Operators who DO know their cluster CIDRs
-  and want a tighter Job egress narrow it via the app `egress` posture
-  guidance in control-plane-tiers.md; this policy guarantees the
-  default install is not bricked.
+  chart guessing any address.
+
+  An operator who DOES know their cluster CIDRs and wants a tighter Job
+  egress has exactly one lever: narrowing the `to:` of THIS rule — by
+  forking the chart or by a `--post-renderer` patch. Two things that do
+  NOT work, and were once recommended here: a second, tighter
+  NetworkPolicy (by the additivity rule above the effective allow set is
+  the UNION of every policy selecting the pod, so another policy can
+  only ADD — nothing can subtract this `to: []`); and the app `egress`
+  posture, which never reaches these pods at all (it selects the app
+  pods, which the `Exists` clause excludes). Editing this rule is safe
+  to reason about precisely because its scope is now this release's Job
+  pods: it does not reach a neighbouring release or any unrelated pod in
+  the namespace.
 
 PER-PRE-APP-HOOK-JOB VERDICT (audit table)
   | Template                       | Kind | Helm hook / trigger          | Needs net before app readiness?              | Disposition |
   |--------------------------------|------|------------------------------|----------------------------------------------|-------------|
   | prepull-daemonset.yaml, prepull-worker-daemonset.yaml | DaemonSet | pre-install,pre-upgrade (-10) | NO — image pulls run via the node's container runtime, outside the pod network namespace entirely; the `pause` placeholder container needs nothing once running | not pre-app in the network sense (no egress needed at all); carries `hort-server.io/job` anyway for consistency with every other Job/CronJob/DaemonSet pod template, so it lands in this policy's allowance at zero cost |
-  | prepull-job.yaml               | Job  | pre-install,pre-upgrade (-9) | YES — `kubectl rollout status`/`delete` against the kube-apiserver, before the Deployment exists | CARVE-OUT (same scoped allowance; covered by this policy's `hort-server.io/job` selector) |
+  | prepull-job.yaml               | Job  | pre-install,pre-upgrade (-9) | YES — `kubectl rollout status`/`delete` against the kube-apiserver, before the Deployment exists | CARVE-OUT (same scoped allowance; covered by this policy's release-scoped `hort-server.io/job` selector) |
   | job-migrate.yaml               | Job  | pre-install,pre-upgrade (-5) | YES — Postgres before the Deployment exists   | CARVE-OUT (this policy fixes it) |
-  | svc-token-bootstrap-job.yaml   | Job  | post-install,post-upgrade(5) | YES — init-ctr → Postgres (admin DSN); main-ctr → kube-apiserver (kubectl). Runs while the deny-all is active. | CARVE-OUT (same scoped allowance; covered by this policy's `hort-server.io/job` selector) |
+  | svc-token-bootstrap-job.yaml   | Job  | post-install,post-upgrade(5) | YES — init-ctr → Postgres (admin DSN); main-ctr → kube-apiserver (kubectl). Runs while the deny-all is active. | CARVE-OUT (same scoped allowance; covered by this policy's release-scoped `hort-server.io/job` selector) |
   | cronjob-noop.yaml              | CronJob | schedule (scheduledTasks.adminTasksEnabled, default OFF) | NO — scheduled, never on the install critical path; not a pre-app hook | not pre-app; covered defensively by the same selector (cheap, correct, identical deny-all problem) |
   | cronjob-staging-sweep.yaml     | CronJob | schedule                  | NO — scheduled task, post-readiness            | not pre-app; covered defensively |
   | cronjob-scrub.yaml             | CronJob | schedule (scrub.enabled)  | NO — scheduled CAS scrub, post-readiness       | not pre-app; covered defensively |
@@ -73,8 +102,8 @@ PER-PRE-APP-HOOK-JOB VERDICT (audit table)
   hook that still needs net while the deny-all is active. The CronJobs
   are scheduled tasks (default-disabled), never on the install critical
   path — but they share the identical deny-all problem, so the single
-  `hort-server.io/job Exists` selector covers them too at zero extra cost
-  and with no posture change to the app pods.
+  release-scoped `hort-server.io/job Exists` selector covers them too at
+  zero extra cost and with no posture change to the app pods.
 
 ESCAPE HATCH PARITY
   Gated on the SAME `.Values.networkPolicy.enabled` as the app-pod
@@ -90,10 +119,15 @@ metadata:
   labels:
     {{- include "hort-server.labels" . | nindent 4 }}
 spec:
-  # Selects exactly the Job/CronJob pods (every such pod template sets
-  # an `hort-server.io/job` label). The app Deployment pods do not carry
-  # this label key, so this policy never selects an app pod.
+  # Selects exactly THIS RELEASE's Job/CronJob pods. The two clauses AND
+  # together: a pod must carry this release's name/instance labels AND an
+  # `hort-server.io/job` key. Dropping the first would hand this
+  # unrestricted-egress allowance to any pod in the namespace willing to
+  # set one label of its own; dropping the second would hand it to the app
+  # pods, which carry the same name/instance labels. See SELECTOR above.
   podSelector:
+    matchLabels:
+      {{- include "hort-server.selectorLabels" . | nindent 6 }}
     matchExpressions:
       - key: hort-server.io/job
         operator: Exists
@@ -111,9 +145,11 @@ spec:
     # Postgres host in the opaque Secret DSN, and — for the
     # svc-token-bootstrap Job — the kube-apiserver) is not known to the
     # chart and MUST NOT be guessed (the chart deliberately keeps
-    # CIDR auto-discovery out of scope). This is an ADDITIVE
-    # allowance on the Job pods only; the app-pod deny-all is unchanged.
-    # Operators who know their CIDRs can layer a tighter policy — this
-    # one only guarantees the default install is not bricked.
+    # CIDR auto-discovery out of scope). This is an ADDITIVE allowance
+    # on this release's Job pods only; the app-pod deny-all is
+    # unchanged. Narrowing it means editing THIS rule (chart fork or
+    # `--post-renderer` patch): a second, tighter NetworkPolicy cannot
+    # subtract an allow rule — see the additivity note at the top of
+    # this file.
     - {}
 {{- end -}}

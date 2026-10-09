@@ -239,8 +239,15 @@ pub struct Config {
     /// `hort_http_core::limits::DEFAULT_PUBLISH_BODY_LIMIT` (300 MiB).
     /// Malformed values surface as [`ConfigError::InvalidValue`].
     ///
-    /// Only PyPI and npm consume this override; Cargo carries its own
-    /// fixed 200 MiB ceiling per `hort_http_core::limits::CARGO_PUBLISH_BODY_LIMIT`.
+    /// npm, PyPI and Maven consume a non-zero override as their ceiling;
+    /// Cargo keeps its own fixed 200 MiB per
+    /// `hort_http_core::limits::CARGO_PUBLISH_BODY_LIMIT`, and the OCI
+    /// push path takes no ceiling from this value at all. An explicit
+    /// `Some(0)` is the refuse-all-publishes kill switch and closes
+    /// every publish surface — the four hosted formats (see
+    /// `hort_http_core::limits::cargo_publish_body_limit`) and OCI push
+    /// — answering `503` on the publish methods via
+    /// `hort_http_core::limits::refuse_publishes_when_disabled`.
     pub publish_body_limit_bytes: Option<usize>,
     /// Per-session Postgres statement timeout.
     /// Parsed from `PG_STATEMENT_TIMEOUT_MS`.
@@ -3176,8 +3183,17 @@ fn parse_positive_optional<T: PositiveInt>(var: &'static str) -> Result<Option<T
 ///
 /// Note: unlike the other `Option<_>` parser this one does NOT reject
 /// zero — a zero publish-body-limit is an explicit "refuse all publishes"
-/// kill-switch, handled downstream — so an explicit `"0"` resolves to
-/// `Some(0)`, distinct from the unset `None` (binary default).
+/// kill-switch — so an explicit `"0"` resolves to `Some(0)`, distinct
+/// from the unset `None` (binary default). Downstream is
+/// `http::build_router_with_oci_config`, which carries the zero into the
+/// four hosted-format route builders (cargo, npm, PyPI, Maven) and into
+/// the OCI route builder, so the switch closes every publish surface
+/// rather than some of them. Each of those subtrees applies
+/// `hort_http_core::limits::refuse_publishes_when_disabled`, which
+/// answers a publish method with `503` instead of leaving the refusal
+/// to a zero-byte `DefaultBodyLimit` — a limit of zero admits a body of
+/// zero bytes, which is how an empty Maven `.jar` used to be ingested
+/// with the switch on.
 fn parse_publish_body_limit_bytes() -> Result<Option<usize>, ConfigError> {
     const VAR: &str = "HORT_PUBLISH_BODY_MAX_SIZE";
     match std::env::var(VAR) {

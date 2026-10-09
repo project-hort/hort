@@ -34,6 +34,18 @@
 //!   evaluator — and neither is fixed for the task's lifetime.
 //!   Revoking `User.is_admin` therefore stops a running task from
 //!   delivering privileged-category events without a cancel+respawn.
+//! - The freshly listed row's **delivery-shaping fields** — its target
+//!   and its filter — are published on the same pass into the same
+//!   running task, as a
+//!   [`DeliveryShape`](crate::dispatcher::subscription_task::DeliveryShape)
+//!   in the task's [`SubscriptionTaskDeps::delivery_shape`] `ArcSwap`.
+//!   `PATCH /api/v1/subscriptions/:id` persists the row and notifies
+//!   this loop, so a rotated webhook URL and a narrowed filter take
+//!   effect for the next delivered event — within one reconcile
+//!   interval, with no restart. The projection is narrow on purpose:
+//!   republishing `last_delivered_position` would rewind a running
+//!   task's cursor by up to the progress debounce floor and
+//!   re-deliver that window on every pass.
 //! - A subscription whose principal stops resolving — owner row gone,
 //!   deactivated, or unreadable — has its task **cancelled**, not left
 //!   running on the authority it was spawned with. That is the same
@@ -60,7 +72,7 @@ use hort_domain::ports::user_repository::UserRepository;
 
 use crate::dispatcher::failure_budget::FailureBudget;
 use crate::dispatcher::subscription_task::{
-    self, ProgressDebouncer, SubscriptionTaskDeps, PROGRESS_DEBOUNCE,
+    self, DeliveryShape, ProgressDebouncer, SubscriptionTaskDeps, PROGRESS_DEBOUNCE,
 };
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
@@ -274,6 +286,14 @@ impl NotificationDispatcher {
         // `Permission::Admin` from a `User.is_admin` bit of unbounded
         // age. One owner read per active subscription per pass is the
         // cost of the two inputs ageing at the same rate.
+        //
+        // The same pass republishes the row's own delivery-shaping
+        // fields. `active` already holds a freshly read `Subscription`
+        // for every active id — this pass listed it — so publishing the
+        // target and filter costs nothing beyond the store of one
+        // `Arc`, and it is what stops a PATCHed row being visible
+        // through the API while delivery still follows the row the task
+        // was spawned with.
         for sub in active {
             let Some(principal) = self.synthesise_principal(&sub).await else {
                 // No resolvable principal means no authority to deliver
@@ -315,14 +335,25 @@ impl NotificationDispatcher {
                 continue;
             };
             if let Some(handle) = tasks.get(&sub.id) {
-                // Already running: publish the refreshed principal in
-                // place. The task reads it on its next event; no
+                // Already running: publish the refreshed principal and
+                // the freshly listed row's delivery-shaping fields in
+                // place. The task reads both on its next event; no
                 // cancel, no respawn, no cursor movement.
+                //
+                // Written unconditionally rather than on a diff: the
+                // store of one `Arc` is cheaper than the `PartialEq`
+                // walk over a filter's category and event-type vectors
+                // that would decide whether to skip it, and the two have
+                // the same effect.
                 handle.owner_principal.store(Arc::new(principal));
+                handle
+                    .delivery_shape
+                    .store(Arc::new(DeliveryShape::from(&sub)));
                 continue;
             }
             let task_cancel = parent_cancel.child_token();
             let owner_principal = Arc::new(ArcSwap::from_pointee(principal));
+            let delivery_shape = Arc::new(ArcSwap::from_pointee(DeliveryShape::from(&sub)));
             let deps = SubscriptionTaskDeps {
                 event_store: self.publisher.clone(),
                 use_case: self.use_case.clone(),
@@ -330,6 +361,7 @@ impl NotificationDispatcher {
                 repositories: self.repository_repo.clone(),
                 event_visibility: self.event_visibility.clone(),
                 owner_principal: owner_principal.clone(),
+                delivery_shape: delivery_shape.clone(),
                 notifiers: self.notifiers.clone(),
                 budget: Arc::new(Mutex::new(FailureBudget::new())),
                 progress: Arc::new(Mutex::new(ProgressDebouncer::new(
@@ -349,6 +381,7 @@ impl NotificationDispatcher {
                     join: handle,
                     cancel: task_cancel,
                     owner_principal,
+                    delivery_shape,
                 },
             );
         }
@@ -473,6 +506,14 @@ struct TaskHandle {
     /// otherwise touching — that write is the whole mechanism by which
     /// a revoked `User.is_admin` reaches a running delivery walk.
     owner_principal: Arc<ArcSwap<CallerPrincipal>>,
+    /// The same `ArcSwap` the running task holds for the live row's
+    /// delivery-shaping fields, published by the same pass and for the
+    /// same reason: it is how a PATCHed target and a narrowed filter
+    /// reach a running delivery walk. Deliberately a
+    /// [`DeliveryShape`] and not the whole [`Subscription`] — see that
+    /// type for why republishing `last_delivered_position` would rewind
+    /// the task's cursor.
+    delivery_shape: Arc<ArcSwap<DeliveryShape>>,
 }
 
 /// Build a degraded-state broadcast receiver — a closed channel that
@@ -510,7 +551,8 @@ mod tests {
 
     use chrono::Utc;
     use hort_domain::entities::subscription::{
-        EventTypeFilter, RepositoryScope, SubscriptionFilter, SubscriptionState, SubscriptionTarget,
+        EventTypeFilter, EventTypeKind, RepositoryScope, SubscriptionFailure, SubscriptionFilter,
+        SubscriptionState, SubscriptionTarget,
     };
     use hort_domain::entities::user::{AuthProvider, User};
     use hort_domain::error::{DomainError, DomainResult};
@@ -518,7 +560,7 @@ mod tests {
         Actor, ApiActor, DomainEvent, FilterSummary, PersistedEvent, RepositoryScopeKind,
         StreamCategory, StreamId, SubscriptionCreated, TargetKindWire,
     };
-    use hort_domain::ports::event_notifier::{EventNotifier, NotifyOutcome};
+    use hort_domain::ports::event_notifier::{EventNotifier, NotifyFailureReason, NotifyOutcome};
     use hort_domain::ports::subscription_change_listener::SubscriptionChangeEvent;
     use hort_domain::ports::webhook_target_guard::WebhookTargetGuard;
     use hort_domain::ports::BoxFuture;
@@ -527,7 +569,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::dispatcher::subscription_task::STORE_POLL_INTERVAL;
-    use crate::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
+    use crate::use_cases::subscription_use_case::{
+        SubscriptionUseCase, SubscriptionUseCaseConfig, UpdateSubscriptionRequest,
+    };
     use crate::use_cases::test_support::{
         MockArtifactGroupRepository, MockArtifactRepository, MockEventRepositoryResolver,
         MockEventStore, MockRepositoryRepository, MockUserRepository,
@@ -537,7 +581,12 @@ mod tests {
 
     struct RecordingNotifier {
         outcome: NotifyOutcome,
-        delivered: Mutex<Vec<u64>>,
+        /// One entry per delivered event: the target it was addressed to
+        /// and its global position. The target is recorded because it is
+        /// the field a PATCH changes under a running task — asserting on
+        /// positions alone cannot tell a delivery to the rotated-away
+        /// receiver from one to the new receiver.
+        delivered: Mutex<Vec<(SubscriptionTarget, u64)>>,
     }
     impl RecordingNotifier {
         fn new(outcome: NotifyOutcome) -> Self {
@@ -548,20 +597,34 @@ mod tests {
         }
         /// Global positions handed to `notify`, in delivery order.
         fn delivered(&self) -> Vec<u64> {
-            self.delivered.lock().unwrap().clone()
+            self.delivered
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, position)| *position)
+                .collect()
+        }
+        /// The target each delivery was addressed to, in delivery order.
+        fn delivered_targets(&self) -> Vec<SubscriptionTarget> {
+            self.delivered
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(target, _)| target.clone())
+                .collect()
         }
     }
     impl EventNotifier for RecordingNotifier {
         fn notify<'a>(
             &'a self,
-            _t: &'a SubscriptionTarget,
+            t: &'a SubscriptionTarget,
             _subscription_id: SubscriptionId,
             e: &'a [PersistedEvent],
         ) -> BoxFuture<'a, NotifyOutcome> {
             self.delivered
                 .lock()
                 .unwrap()
-                .extend(e.iter().map(|ev| ev.global_position));
+                .extend(e.iter().map(|ev| (t.clone(), ev.global_position)));
             let outcome = self.outcome.clone();
             Box::pin(async move { outcome })
         }
@@ -597,9 +660,16 @@ mod tests {
 
     // -- Mock SubscriptionRepository -------------------------------------
 
+    /// One recorded `update_last_delivered` call: the subscription, the
+    /// position it was asked to store (`None` = "do not move it") and
+    /// the failure it carried. Same alias `subscription_task`'s own mock
+    /// uses for the same tuple.
+    type ProgressCall = (SubscriptionId, Option<u64>, Option<SubscriptionFailure>);
+
     struct MockSubRepo {
         active: Mutex<Vec<Subscription>>,
         list_active_should_fail: Mutex<bool>,
+        progress_calls: Mutex<Vec<ProgressCall>>,
     }
 
     impl MockSubRepo {
@@ -607,6 +677,7 @@ mod tests {
             Self {
                 active: Mutex::new(Vec::new()),
                 list_active_should_fail: Mutex::new(false),
+                progress_calls: Mutex::new(Vec::new()),
             }
         }
         fn set_active(&self, subs: Vec<Subscription>) {
@@ -614,6 +685,16 @@ mod tests {
         }
         fn fail_list_active(&self) {
             *self.list_active_should_fail.lock().unwrap() = true;
+        }
+        /// Every position write the dispatcher asked for, in order: the
+        /// subscription, the position (`None` = "do not move it") and
+        /// the failure it carried. Recorded rather than mirrored into
+        /// the row, so a test can assert that **no** write was asked for
+        /// — which is a statement about the progress debouncer, where
+        /// "the row still says what it said" would be true of this mock
+        /// whatever the debouncer did.
+        fn progress_calls(&self) -> Vec<ProgressCall> {
+            self.progress_calls.lock().unwrap().clone()
         }
     }
 
@@ -685,10 +766,14 @@ mod tests {
         }
         fn update_last_delivered(
             &self,
-            _id: SubscriptionId,
-            _position: Option<u64>,
-            _last_failure: Option<&hort_domain::entities::subscription::SubscriptionFailure>,
+            id: SubscriptionId,
+            position: Option<u64>,
+            last_failure: Option<&SubscriptionFailure>,
         ) -> BoxFuture<'_, DomainResult<()>> {
+            self.progress_calls
+                .lock()
+                .unwrap()
+                .push((id, position, last_failure.cloned()));
             Box::pin(async { Ok(()) })
         }
     }
@@ -741,6 +826,34 @@ mod tests {
         u
     }
 
+    /// Webhook target at `url`, with the env-var secret locator every
+    /// fixture here shares. A target PATCH is a change of this URL.
+    fn webhook(url: &str) -> SubscriptionTarget {
+        SubscriptionTarget::Webhook {
+            url: url.parse::<Url>().unwrap(),
+            secret_ref: hort_domain::ports::secret_port::SecretRef {
+                source: hort_domain::ports::secret_port::SecretSource::EnvVar,
+                location: "HORT_WEBHOOK_SECRET".into(),
+            },
+        }
+    }
+
+    /// The owner acting on their own subscription, carrying the `"admin"`
+    /// claim the privileged-category gate requires at update time. This
+    /// is the principal a `PATCH /api/v1/subscriptions/:id` arrives with.
+    fn admin_owner_principal(owner_user_id: Uuid) -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: owner_user_id,
+            external_id: format!("test:{owner_user_id}"),
+            username: format!("user-{owner_user_id}"),
+            email: "admin@example.com".into(),
+            claims: vec!["admin".into()],
+            token_kind: None,
+            issued_at: Utc::now(),
+            token_cap: None,
+        }
+    }
+
     fn sub_with_snapshot(owner_user_id: Uuid, snapshot_claims: Vec<String>) -> Subscription {
         let mut s = make_sub(owner_user_id);
         s.snapshot_claims = snapshot_claims;
@@ -754,13 +867,7 @@ mod tests {
             created_by_token_id: None,
             name: format!("sub-{}", Uuid::new_v4()),
             description: None,
-            target: SubscriptionTarget::Webhook {
-                url: "https://hooks.example.com/x".parse::<Url>().unwrap(),
-                secret_ref: hort_domain::ports::secret_port::SecretRef {
-                    source: hort_domain::ports::secret_port::SecretSource::EnvVar,
-                    location: "HORT_WEBHOOK_SECRET".into(),
-                },
-            },
+            target: webhook("https://hooks.example.com/x"),
             filter: SubscriptionFilter {
                 categories: vec![StreamCategory::Artifact],
                 event_types: EventTypeFilter::All,
@@ -916,23 +1023,388 @@ mod tests {
         parent.cancel();
     }
 
+    /// An id set with nothing added or removed costs the running task
+    /// neither a cancel nor a respawn — and the pass still writes the
+    /// row it just listed into that task.
+    ///
+    /// The second half is the half that changed. "Leaves existing tasks
+    /// untouched" used to be the whole claim, and it was the skip that
+    /// let a PATCHed target and a narrowed filter sit unused in the
+    /// database while delivery followed the row the task was spawned
+    /// with. An unchanged *id* set says nothing about the rows behind
+    /// those ids, which is why this test edits the row between the two
+    /// passes: asserting the shape against a row that never changed
+    /// would be satisfied by the spawn-time write alone.
     #[tokio::test]
-    async fn reconcile_leaves_existing_tasks_untouched_when_active_set_unchanged() {
+    async fn reconcile_keeps_the_running_task_and_republishes_its_row_when_the_ids_are_unchanged() {
         let owner = Uuid::new_v4();
         let sub_repo = Arc::new(MockSubRepo::new());
         let user_repo = Arc::new(MockUserRepository::new());
         user_repo.insert(admin_user(owner));
         let s = make_sub(owner);
         sub_repo.set_active(vec![s.clone()]);
-        let dispatcher = make_dispatcher(sub_repo, user_repo, Arc::new(NeverChangeListener));
+        let dispatcher =
+            make_dispatcher(sub_repo.clone(), user_repo, Arc::new(NeverChangeListener));
         let mut tasks: HashMap<SubscriptionId, TaskHandle> = HashMap::new();
         let parent = CancellationToken::new();
         dispatcher.reconcile(&mut tasks, &parent).await;
         let original_count = tasks.len();
-        // Reconcile again — the same subscription is still active.
+        let spawned_task_id = tasks.get(&s.id).expect("task spawned").join.id();
+
+        // Same id, different row.
+        let mut edited = s.clone();
+        edited.target = webhook("https://elsewhere.example.com/hook");
+        sub_repo.set_active(vec![edited.clone()]);
         dispatcher.reconcile(&mut tasks, &parent).await;
+
         assert_eq!(tasks.len(), original_count);
-        assert!(tasks.contains_key(&s.id));
+        let handle = tasks.get(&s.id).expect("the task must survive the pass");
+        assert_eq!(handle.join.id(), spawned_task_id, "no respawn");
+        assert!(
+            !handle.cancel.is_cancelled(),
+            "the task must not have been cancelled"
+        );
+        assert_eq!(
+            *handle.delivery_shape.load_full(),
+            DeliveryShape::from(&edited),
+            "the pass must publish the row it just listed into the \
+             surviving task, not leave the spawn-time one in place"
+        );
+        parent.cancel();
+    }
+
+    /// A target PATCHed on an **active** subscription takes effect for
+    /// the next delivered event, within one reconcile pass, on the task
+    /// that is already running.
+    ///
+    /// This is the compromised-webhook rotation: the old receiver must
+    /// stop receiving, and it must stop without the process restarting.
+    /// Reaching the new target through a cancel-and-respawn would prove
+    /// nothing — that path worked before the row became swappable, and
+    /// it is also what the operator cannot trigger.
+    #[tokio::test(start_paused = true)]
+    async fn a_patched_target_takes_effect_on_a_running_task_without_a_respawn() {
+        let owner = Uuid::new_v4();
+        let sub_repo = Arc::new(MockSubRepo::new());
+        let user_repo = Arc::new(MockUserRepository::new());
+        user_repo.insert(admin_user(owner));
+        let rotated_away = webhook("https://compromised.example.com/hook");
+        let rotated_to = webhook("https://fresh.example.com/hook");
+        let mut sub = privileged_sub(owner);
+        sub.target = rotated_away.clone();
+        sub_repo.set_active(vec![sub.clone()]);
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(StreamCategory::User, vec![privileged_event(owner, 1)]);
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let dispatcher = make_dispatcher_with(
+            sub_repo,
+            user_repo,
+            Arc::new(NeverChangeListener),
+            mock_es.clone(),
+            vec![notifier.clone()],
+        );
+        let mut tasks: HashMap<SubscriptionId, TaskHandle> = HashMap::new();
+        let parent = CancellationToken::new();
+
+        // Pass 1 spawns against the compromised target; the startup
+        // catch-up delivers position 1 to it.
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(notifier.delivered(), vec![1]);
+        let spawned_task_id = tasks.get(&sub.id).expect("task spawned").join.id();
+
+        // The PATCH: a new target through the use case, which persists
+        // the row and validates the URL on the way in (so the task does
+        // not have to).
+        dispatcher
+            .use_case
+            .update(
+                &admin_owner_principal(owner),
+                sub.id,
+                UpdateSubscriptionRequest {
+                    name: None,
+                    description: None,
+                    target: Some(rotated_to.clone()),
+                    filter: None,
+                    state: None,
+                },
+            )
+            .await
+            .expect("the owner may retarget their own subscription");
+
+        // One reconcile pass is the whole mechanism.
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        let handle = tasks.get(&sub.id).expect("the task must survive the pass");
+        assert_eq!(
+            handle.join.id(),
+            spawned_task_id,
+            "the same task must still be running — a respawn would \
+             prove nothing about the live row"
+        );
+        assert!(
+            !handle.cancel.is_cancelled(),
+            "the task must not have been cancelled"
+        );
+        assert_eq!(
+            handle.delivery_shape.load().target,
+            rotated_to,
+            "the republished shape must carry the new target"
+        );
+
+        // A second event lands. The running task's next store poll
+        // delivers it to the new receiver.
+        mock_es.set_category(
+            StreamCategory::User,
+            vec![privileged_event(owner, 1), privileged_event(owner, 2)],
+        );
+        tokio::time::sleep(STORE_POLL_INTERVAL * 2).await;
+        assert_eq!(
+            notifier.delivered(),
+            vec![1, 2],
+            "the event after the PATCH must still be delivered"
+        );
+        assert_eq!(
+            notifier.delivered_targets(),
+            vec![rotated_away, rotated_to],
+            "the delivery after the PATCH must address the new target — a \
+             rotation away from a compromised URL that keeps feeding the old \
+             receiver is the defect"
+        );
+
+        parent.cancel();
+    }
+
+    /// A filter narrowed on an **active** subscription stops delivering
+    /// what it excluded, on the already-running task and within one
+    /// reconcile pass. This is the security-relevant direction.
+    ///
+    /// The narrowing is on `event_types`, which leaves the category and
+    /// the authority path alone: the task still *reads* the event (same
+    /// category, same cursor) and the per-event filter walk is what
+    /// rejects it. A category narrowing would also stop the delivery,
+    /// but through the merged read rather than through the published
+    /// filter, so it would not pin this.
+    #[tokio::test(start_paused = true)]
+    async fn a_narrowed_filter_stops_delivery_to_a_running_task_without_a_respawn() {
+        let owner = Uuid::new_v4();
+        let sub_repo = Arc::new(MockSubRepo::new());
+        let user_repo = Arc::new(MockUserRepository::new());
+        user_repo.insert(admin_user(owner));
+        let sub = privileged_sub(owner);
+        assert!(
+            matches!(sub.filter.event_types, EventTypeFilter::All),
+            "the fixture must start wide, so the narrowing is the change"
+        );
+        sub_repo.set_active(vec![sub.clone()]);
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(StreamCategory::User, vec![privileged_event(owner, 1)]);
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let dispatcher = make_dispatcher_with(
+            sub_repo,
+            user_repo,
+            Arc::new(NeverChangeListener),
+            mock_es.clone(),
+            vec![notifier.clone()],
+        );
+        let mut tasks: HashMap<SubscriptionId, TaskHandle> = HashMap::new();
+        let parent = CancellationToken::new();
+
+        // Pass 1 spawns under the wide filter; position 1 is a
+        // `SubscriptionCreated`, which `EventTypeFilter::All` matches.
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(notifier.delivered(), vec![1]);
+        let spawned_task_id = tasks.get(&sub.id).expect("task spawned").join.id();
+
+        // The PATCH: drop `SubscriptionCreated` from the event-type list.
+        let narrowed = SubscriptionFilter {
+            event_types: EventTypeFilter::Some(vec![EventTypeKind::SubscriptionDeleted]),
+            ..sub.filter.clone()
+        };
+        dispatcher
+            .use_case
+            .update(
+                &admin_owner_principal(owner),
+                sub.id,
+                UpdateSubscriptionRequest {
+                    name: None,
+                    description: None,
+                    target: None,
+                    filter: Some(narrowed.clone()),
+                    state: None,
+                },
+            )
+            .await
+            .expect("the owner may narrow their own subscription's filter");
+
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        let handle = tasks.get(&sub.id).expect("the task must survive the pass");
+        assert_eq!(
+            handle.join.id(),
+            spawned_task_id,
+            "the same task must still be running"
+        );
+        assert!(
+            !handle.cancel.is_cancelled(),
+            "a narrowed filter is not a reason to tear the task down"
+        );
+        assert_eq!(
+            handle.delivery_shape.load().filter,
+            narrowed,
+            "the republished shape must carry the narrowed filter"
+        );
+
+        // A second `SubscriptionCreated` lands — read by the same walk,
+        // and now outside the filter.
+        mock_es.set_category(
+            StreamCategory::User,
+            vec![privileged_event(owner, 1), privileged_event(owner, 2)],
+        );
+        tokio::time::sleep(STORE_POLL_INTERVAL * 2).await;
+        assert_eq!(
+            notifier.delivered(),
+            vec![1],
+            "an event type the PATCH removed must stop being delivered to \
+             the already-running task"
+        );
+
+        parent.cancel();
+    }
+
+    /// A failed delivery on a running task records the failure and
+    /// leaves the position where it was.
+    ///
+    /// This is the one path on which the dispatcher's own
+    /// `ProgressDebouncer` wiring writes at all — a failure is an audit
+    /// signal and is not debounced — which is what makes the
+    /// "no write was asked for" assertion in the cursor test below a
+    /// measurement of the debounce rather than a restatement of the
+    /// fixture. The position written is the one *before* the failed
+    /// event, so the next pass re-reads it.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_delivery_records_the_failure_without_moving_the_position() {
+        let owner = Uuid::new_v4();
+        let sub_repo = Arc::new(MockSubRepo::new());
+        let user_repo = Arc::new(MockUserRepository::new());
+        user_repo.insert(admin_user(owner));
+        let mut sub = privileged_sub(owner);
+        sub.last_delivered_position = Some(1);
+        sub_repo.set_active(vec![sub.clone()]);
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(
+            StreamCategory::User,
+            vec![privileged_event(owner, 1), privileged_event(owner, 2)],
+        );
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Failed {
+            reason: NotifyFailureReason::Dns,
+        }));
+        let dispatcher = make_dispatcher_with(
+            sub_repo.clone(),
+            user_repo,
+            Arc::new(NeverChangeListener),
+            mock_es,
+            vec![notifier.clone()],
+        );
+        let mut tasks: HashMap<SubscriptionId, TaskHandle> = HashMap::new();
+        let parent = CancellationToken::new();
+
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(
+            notifier.delivered(),
+            vec![2],
+            "the pass resumes above the seeded position and attempts 2"
+        );
+
+        let progress = sub_repo.progress_calls();
+        assert_eq!(progress.len(), 1, "a failure persists immediately");
+        assert_eq!(progress[0].0, sub.id);
+        assert_eq!(
+            progress[0].1,
+            Some(1),
+            "the position written alongside a failure is the one before \
+             the event nobody received"
+        );
+        assert_eq!(
+            progress[0]
+                .2
+                .as_ref()
+                .expect("the failure itself is recorded")
+                .reason,
+            NotifyFailureReason::Dns
+        );
+
+        parent.cancel();
+    }
+
+    /// A republish must not move the task's cursor.
+    ///
+    /// The task owns its progress, and the persisted
+    /// `last_delivered_position` is debounced up to `PROGRESS_DEBOUNCE`
+    /// behind it — here it is still `None` while the task has already
+    /// delivered position 1. A published value that carried the cursor
+    /// would therefore re-seed the walk at `None` on every reconcile
+    /// tick and re-deliver position 1 each time, for as long as the
+    /// debounce held the write back. `DeliveryShape` cannot carry it,
+    /// and this test is what says so from the outside.
+    #[tokio::test(start_paused = true)]
+    async fn republishing_the_row_does_not_rewind_a_running_tasks_cursor() {
+        let owner = Uuid::new_v4();
+        let sub_repo = Arc::new(MockSubRepo::new());
+        let user_repo = Arc::new(MockUserRepository::new());
+        user_repo.insert(admin_user(owner));
+        let sub = privileged_sub(owner);
+        assert_eq!(
+            sub.last_delivered_position, None,
+            "the row starts with no persisted position"
+        );
+        sub_repo.set_active(vec![sub.clone()]);
+        let mock_es = Arc::new(MockEventStore::new());
+        mock_es.set_category(StreamCategory::User, vec![privileged_event(owner, 1)]);
+        let notifier = Arc::new(RecordingNotifier::new(NotifyOutcome::Delivered));
+        let dispatcher = make_dispatcher_with(
+            sub_repo.clone(),
+            user_repo,
+            Arc::new(NeverChangeListener),
+            mock_es.clone(),
+            vec![notifier.clone()],
+        );
+        let mut tasks: HashMap<SubscriptionId, TaskHandle> = HashMap::new();
+        let parent = CancellationToken::new();
+
+        dispatcher.reconcile(&mut tasks, &parent).await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(notifier.delivered(), vec![1], "position 1 is delivered");
+
+        // The debouncer holds the write back, so the task is ahead of
+        // the row — the state a republish has to survive. Asserted on
+        // what the dispatcher *asked* the store for, not on the row:
+        // the row is `None` whatever happens, the absence of a write is
+        // the debouncer.
+        assert!(
+            sub_repo.progress_calls().is_empty(),
+            "the 5-minute success debounce must not have asked for a position \
+             write yet, so the row a republish carries is still the `None` it \
+             started as while the task's own cursor sits at 1"
+        );
+
+        // Republish that behind-the-task row into the running task.
+        dispatcher.reconcile(&mut tasks, &parent).await;
+
+        // Position 2 lands; the pass that picks it up must start above 1.
+        mock_es.set_category(
+            StreamCategory::User,
+            vec![privileged_event(owner, 1), privileged_event(owner, 2)],
+        );
+        tokio::time::sleep(STORE_POLL_INTERVAL * 2).await;
+        assert_eq!(
+            notifier.delivered(),
+            vec![1, 2],
+            "the republish must not rewind the cursor — a second delivery of \
+             position 1 here is the re-delivery loop a published \
+             `last_delivered_position` would create"
+        );
+
         parent.cancel();
     }
 

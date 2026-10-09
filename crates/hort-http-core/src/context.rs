@@ -778,14 +778,25 @@ pub struct AppContext {
     /// `rate_limit_config`.
     pub http_timeout_config: crate::middleware::request_timeout::HttpTimeoutConfig,
     /// Per-publish body-size ceiling applied to
-    /// PyPI and npm publish routes via `DefaultBodyLimit::max`. `None`
+    /// the npm, PyPI and Maven publish routes via
+    /// `DefaultBodyLimit::max`. `None`
     /// means "use the shared default" ([`crate::limits::DEFAULT_PUBLISH_BODY_LIMIT`],
     /// 300 MiB). `Some(n)` comes from the `HORT_PUBLISH_BODY_MAX_SIZE`
     /// env var parsed by `hort-server::config::Config`.
     ///
-    /// Cargo is deliberately NOT driven by this field; it keeps its
-    /// own fixed 200 MiB ceiling via
-    /// [`crate::limits::CARGO_PUBLISH_BODY_LIMIT`].
+    /// Cargo's *ceiling* is deliberately NOT driven by this field; it
+    /// keeps its own fixed 200 MiB via
+    /// [`crate::limits::CARGO_PUBLISH_BODY_LIMIT`]. The OCI push path
+    /// takes no ceiling from it at all — it bounds each upload chunk
+    /// through its own session accounting.
+    ///
+    /// `Some(0)` is not a ceiling but the refuse-all-publishes kill
+    /// switch. It reaches Cargo via
+    /// [`crate::limits::cargo_publish_body_limit`] and OCI via
+    /// `oci_routes_with_publish_limit`, and the refusal itself —
+    /// `503`, publish methods only, no `Retry-After` — comes from
+    /// [`crate::limits::refuse_publishes_when_disabled`] rather than
+    /// from `DefaultBodyLimit`.
     pub publish_body_limit_bytes: Option<usize>,
     /// Per-version-object byte cap inside
     /// the streaming JSON projectors (npm `versions{}` value, PyPI

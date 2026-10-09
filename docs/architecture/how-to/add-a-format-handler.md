@@ -374,15 +374,30 @@ use std::sync::Arc;
 use axum::Router;
 
 use hort_http_core::context::AppContext;
+use hort_http_core::limits::{publish_disabled_response, refuse_publishes_when_disabled};
 
 pub fn myfmt_routes() -> Router<Arc<AppContext>> {
-    Router::new()
+    myfmt_routes_with_publish_limit(hort_http_core::limits::DEFAULT_PUBLISH_BODY_LIMIT)
+}
+
+pub fn myfmt_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
+    let routes = Router::new()
         .route("/:repo_key/...", get(download))
         .route("/:repo_key/...", put(upload).layer(
-            axum::extract::DefaultBodyLimit::max(hort_http_core::limits::DEFAULT_PUBLISH_BODY_LIMIT),
-        ))
+            axum::extract::DefaultBodyLimit::max(limit),
+        ));
+    // A size is the body limit's job; a zero is the operator's
+    // refuse-all-publishes hold, and this is the one definition of it.
+    refuse_publishes_when_disabled(routes, limit, publish_disabled_response)
 }
 ```
+
+The composition root calls the `_with_publish_limit` form with the
+effective `HORT_PUBLISH_BODY_MAX_SIZE`; the no-argument wrapper keeps
+the format's own default for tests and for any caller that does not
+thread configuration. Do not hard-code the constant into the route, and
+do not leave a zero limit to `DefaultBodyLimit` — see the two
+body-limit bullets in the checklist below for why.
 
 Handler bodies follow the shape established by the existing per-format
 crates:
@@ -438,7 +453,23 @@ Rules to respect:
 - **Configure a body size limit** on upload routes with
   `axum::extract::DefaultBodyLimit::max(N)`. Reuse
   `hort_http_core::limits::DEFAULT_PUBLISH_BODY_LIMIT` (300 MiB) or the
-  format-specific constant already in `limits.rs`.
+  format-specific constant already in `limits.rs`. Take the number as a
+  `*_routes_with_publish_limit(limit)` parameter rather than hard-coding
+  the constant into the route, and keep a `*_routes()` wrapper that
+  passes the format's own default: the composition root threads the
+  parsed `HORT_PUBLISH_BODY_MAX_SIZE` through that parameter.
+- **Apply the publish kill switch** in that same builder:
+  `hort_http_core::limits::refuse_publishes_when_disabled(routes, limit,
+  publish_disabled_response)`. A zero limit is not a ceiling but the
+  operator's refuse-all-publishes hold, and it is only a hold if every
+  publish surface honours it. Do NOT let `DefaultBodyLimit::max(0)`
+  answer it for you — a zero-byte ceiling admits a zero-byte body, so a
+  publish route with no envelope to fail on (a bare `PUT` of file bytes)
+  ingests an empty artifact while the switch is on. The guard
+  discriminates by method, so reads and deletions are untouched, and
+  the refusal is `503` with no `Retry-After`. Pass your own
+  `PublishRefusal` only if your protocol mandates a specific error body
+  (the OCI subtree does).
 - **Return 503 + `Retry-After`** for downloads blocked by quarantine,
   not 409. Proxies cache 409.
 - **Use `BoundedPath<T>`** (from `hort-http-core::limits`) for every

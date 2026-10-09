@@ -191,6 +191,17 @@ Three things worth noticing:
   through it; pure reads go through the repositories and `EventStore`
   directly. `ArtifactMetadataRepository` deliberately has no `save`
   method — writes are owned by the lifecycle port.
+- **`AuthorityLifecyclePort` is the same guarantee for the CRUD rows
+  that carry an audit trail** — permission grants, claim mappings, OIDC
+  issuers, gitops-managed upstream mappings, service-account
+  aggregates. One call commits the desired rows and the audit batches
+  the gitops apply's prior-vs-desired diff produced, so none of those
+  rows can become live with nothing in the authorization stream
+  attesting it. The repositories keep their read surfaces and nothing
+  else: four of the five are read-only traits and the fifth
+  (`RepositoryUpstreamMappingRepository`) keeps only its non-gitops
+  `managed_by = 'local'` CRUD pair, so an apply branch that tries to
+  write an authority row outside the transaction does not compile.
 - **`FormatHandler` is synchronous.** It is a pure strategy pattern, not
   an I/O port. Parsing a download path has no state to block on.
 - **Upload-payload metadata** flows from the inbound handler via

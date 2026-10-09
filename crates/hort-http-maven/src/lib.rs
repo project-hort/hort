@@ -61,7 +61,10 @@ use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_i
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
-use hort_http_core::limits::{BoundedPath, DEFAULT_PUBLISH_BODY_LIMIT};
+use hort_http_core::limits::{
+    publish_disabled_response, refuse_publishes_when_disabled, BoundedPath,
+    DEFAULT_PUBLISH_BODY_LIMIT,
+};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 
 pub(crate) mod serve;
@@ -86,19 +89,49 @@ use serve::MetadataLevel;
 /// `hort_upstream_insecure_total`.
 pub(crate) const UPSTREAM_PROXY_FORMAT: RepositoryFormat = RepositoryFormat::Maven;
 
-/// Build the Maven route tree (GET / HEAD / PUT on a wildcard tail).
+/// Build the Maven route tree with the default publish body limit
+/// (GET / HEAD / PUT on a wildcard tail).
 ///
 /// PUT carries the shared publish body limit
 /// ([`DEFAULT_PUBLISH_BODY_LIMIT`] — 300 MiB) so a large `.jar` is not
-/// rejected by axum's default 2 MiB ceiling. The server mounts this tree
-/// under `/maven`.
+/// rejected by axum's default 2 MiB ceiling. Operators can override it
+/// via `HORT_PUBLISH_BODY_MAX_SIZE`; the override is threaded through
+/// `AppContext` and reaches this builder as
+/// [`maven_routes_with_publish_limit`] in `http.rs::build_router`. The
+/// server mounts this tree under `/maven`.
 pub fn maven_routes() -> Router<Arc<AppContext>> {
-    Router::new().route(
+    maven_routes_with_publish_limit(DEFAULT_PUBLISH_BODY_LIMIT)
+}
+
+/// Build the Maven route tree with a custom publish body limit (in bytes).
+///
+/// `http.rs::build_router` calls this with the effective limit
+/// (`HORT_PUBLISH_BODY_MAX_SIZE` or the default). Tests also use it
+/// directly to exercise the body-limit reject path without sending
+/// hundreds of megabytes.
+///
+/// A **size** is carried by `DefaultBodyLimit` alone: [`upload`]
+/// consumes the body through the buffering `Bytes` extractor, which
+/// consults the `DefaultBodyLimit` marker, so there is no streaming
+/// consumer that would need the value handed to it a second time as an
+/// `Extension` (contrast npm, whose publish decoder reads a raw
+/// `Body`).
+///
+/// **Zero** is the refuse-all-publishes kill switch rather than a
+/// ceiling, and it is answered by
+/// `hort_http_core::limits::refuse_publishes_when_disabled` — `503`,
+/// before the PUT reaches the handler — not by the body limit. Leaving
+/// it to `DefaultBodyLimit::max(0)` admitted a zero-byte `.jar`,
+/// because this PUT has no envelope that could fail on empty input:
+/// the switch was on and an empty artifact was ingested.
+pub fn maven_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
+    let routes = Router::new().route(
         "/{repo_key}/{*artifact_path}",
         get(download)
             .head(download)
-            .put(upload.layer(DefaultBodyLimit::max(DEFAULT_PUBLISH_BODY_LIMIT))),
-    )
+            .put(upload.layer(DefaultBodyLimit::max(limit))),
+    );
+    refuse_publishes_when_disabled(routes, limit, publish_disabled_response)
 }
 
 /// Resolve the repo for a Maven request and confirm it is a Maven- or

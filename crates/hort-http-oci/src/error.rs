@@ -247,6 +247,21 @@ pub enum OciError {
     /// and surfacing them is a log-injection / response-reflection
     /// vector. The validator enforces this at its source.
     NameInvalid { message: String },
+    /// 503 — publishing is administratively disabled on this server
+    /// (`HORT_PUBLISH_BODY_MAX_SIZE=0`), so every push method on
+    /// `/v2/*` is refused before it reaches a handler. Emitted by the
+    /// shared guard
+    /// `hort_http_core::limits::refuse_publishes_when_disabled`, which
+    /// `crate::oci_routes_with_publish_limit` applies to the OCI
+    /// subtree, rather than by any handler.
+    ///
+    /// Like [`Self::ScanIndeterminate`] and unlike [`Self::Quarantined`]
+    /// / [`Self::Unavailable`], this hold has no self-resolving
+    /// deadline — it ends when an operator changes the configuration —
+    /// so it carries no `retry_after_seconds` and emits no
+    /// `Retry-After`. Code is `UNAVAILABLE`, the same spec-extension
+    /// the other two holds use; no new OCI error code.
+    PublishingDisabled,
 }
 
 impl OciError {
@@ -280,6 +295,7 @@ impl OciError {
             Self::BadGateway { .. } => "MANIFEST_INVALID",
             Self::TooManyRequests { .. } => "TOOMANYREQUESTS",
             Self::NameInvalid { .. } => "NAME_INVALID",
+            Self::PublishingDisabled => "UNAVAILABLE",
         }
     }
 
@@ -307,6 +323,7 @@ impl OciError {
             Self::BadGateway { .. } => StatusCode::BAD_GATEWAY,
             Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::NameInvalid { .. } => StatusCode::BAD_REQUEST,
+            Self::PublishingDisabled => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -339,6 +356,11 @@ impl OciError {
             Self::BadGateway { .. } => "upstream proxy fetch failed".to_string(),
             Self::TooManyRequests { .. } => "too many requests".to_string(),
             Self::NameInvalid { message } => message.clone(),
+            // Mirrors the wording of
+            // `hort_http_core::limits::publish_disabled_response` so an
+            // operator reading two client logs side by side sees one
+            // answer, not two.
+            Self::PublishingDisabled => "publishing is disabled on this server".to_string(),
         }
     }
 
@@ -411,8 +433,27 @@ impl OciError {
             // echoed (log-injection vector). Same shape as
             // `Unsupported`, `DigestInvalid`, etc.
             Self::NameInvalid { .. } => None,
+            // No `retry_after_seconds` — the hold has no self-resolving
+            // deadline (see the variant doc). `null` on the wire, same
+            // shape as `ScanIndeterminate`.
+            Self::PublishingDisabled => None,
         }
     }
+}
+
+/// The `/v2/*` refusal served while the publish kill switch is on.
+///
+/// Handed to `hort_http_core::limits::refuse_publishes_when_disabled`
+/// as this subtree's `PublishRefusal` by
+/// [`crate::oci_routes_with_publish_limit`]. The OCI Distribution spec
+/// requires an error response to carry the `errors`-array envelope, so
+/// the `/v2/*` subtree cannot answer the hold with the generic
+/// `{"error":...}` body the hosted-format routers use: docker and the
+/// containerd resolver parse the envelope and surface its `message`,
+/// and would otherwise report nothing better than "unexpected status:
+/// 503".
+pub fn publishing_disabled_response() -> Response {
+    OciError::PublishingDisabled.into_response()
 }
 
 /// Wire shape of a single error in the `errors` array.
@@ -732,6 +773,32 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
         assert_eq!(parsed["errors"][0]["message"], "artifact is quarantined");
+        assert!(parsed["errors"][0]["detail"].is_null());
+    }
+
+    #[tokio::test]
+    async fn publishing_disabled_is_503_with_no_retry_after_and_null_detail() {
+        // The administrative publish hold: same `UNAVAILABLE`
+        // spec-extension code and 503 as the other two holds, but — like
+        // `ScanIndeterminate` and unlike `Quarantined` / `Unavailable` —
+        // no deadline to quote, so no `Retry-After` and a null detail.
+        // Reached through the constructor the OCI subtree actually hands
+        // to the shared guard, so a rename cannot leave this green while
+        // the wiring points elsewhere.
+        let response = publishing_disabled_response();
+        let status = response.status();
+        assert!(
+            response.headers().get("Retry-After").is_none(),
+            "the publish hold has no deadline, so it must never carry Retry-After"
+        );
+        let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert_eq!(
+            parsed["errors"][0]["message"],
+            "publishing is disabled on this server"
+        );
         assert!(parsed["errors"][0]["detail"].is_null());
     }
 

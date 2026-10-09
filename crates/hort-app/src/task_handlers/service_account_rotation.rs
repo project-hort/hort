@@ -1298,12 +1298,6 @@ mod tests {
             {
                 Box::pin(async { Ok(Vec::new()) })
             }
-            fn save_managed(
-                &self,
-                _items: &[hort_domain::entities::rbac::PermissionGrant],
-            ) -> BoxFuture<'_, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
         }
 
         let writer = Arc::new(MockKubernetesSecretWriter::new());

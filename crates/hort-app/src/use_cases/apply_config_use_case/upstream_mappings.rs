@@ -5,13 +5,50 @@ impl ApplyConfigUseCase {
     ///
     /// Stage 3: depends on Repository being applied first so
     /// `repo_id_by_name` is populated for every desired repository.
-    /// Each `create` and `update` calls `save_managed`, with the
-    /// digest computed from the spec; deletes call `delete_managed_by_id`.
-    ///
     /// `repo_id_by_name` carries the post-Stage-2 view, so a desired
     /// mapping that references a freshly-created repository resolves
     /// correctly (cross-doc-reference validation already ensured the
     /// key exists in the map).
+    ///
+    /// **Rows and events commit together.** The branch builds the whole
+    /// [`UpstreamMappingCommit`] — one upsert per `create` / `update`
+    /// envelope, one delete per `plan.delete` id — plus the per-stream
+    /// audit batches, and hands both to
+    /// [`AuthorityLifecyclePort::commit_upstream_mappings`], which
+    /// writes them in one transaction. A mapping names the **upstream a
+    /// proxy repository will trust and fetch from**, with its
+    /// credential reference and its TLS material, so a mapping that
+    /// commits unattested is a changed trust anchor the authorization
+    /// stream is silent about.
+    ///
+    /// Before the port this branch was the worst-shaped member of the
+    /// family: each row write was independently committed, *and*
+    /// the closing `append_grouped_authorization_events` was one
+    /// transaction per stream, so a part-way failure could leave some
+    /// repositories' mappings live and unattested while others were
+    /// audited. Both halves are now one unit. And the retry could not
+    /// repair it either — the next apply's prior-vs-desired diff
+    /// compares against rows that already carry the change, so it
+    /// emits nothing.
+    ///
+    /// **One prior snapshot, read before any write.** The pre-port
+    /// shape read `list_managed_by_gitops` up to three times, including
+    /// once *after* the upserts, purely to recover the surrogate id of
+    /// a freshly-written row for the audit payload. With the write
+    /// deferred to a single commit there is no post-write read to take,
+    /// so the id is resolved up front from the row at the mapping's
+    /// `(repository_id, path_prefix)` identity — exactly what the
+    /// adapter's `ON CONFLICT … DO UPDATE` preserves. The snapshot is
+    /// [`RepositoryUpstreamMappingRepository::list_all`] rather than the
+    /// gitops partition because a pre-existing `managed_by = 'local'`
+    /// row at that identity is adopted by the upsert and keeps its id:
+    /// reading only the gitops partition would mint a fresh id for it
+    /// and emit an audit event naming a row that does not exist.
+    ///
+    /// **Report / metric counters are emitted while the plan is walked,
+    /// i.e. before the commit** — the same point every other authority
+    /// branch emits theirs. They used to be emitted after each row's
+    /// own commit, so a mid-way failure counted only what had landed.
     pub(super) async fn apply_upstream_mappings(
         &self,
         plan: &KindPlan<UpstreamMappingSpec, Uuid>,
@@ -24,9 +61,34 @@ impl ApplyConfigUseCase {
         // boot-time miss parks not-ready (`GitopsBootError::PreflightValidate`)
         // instead of writing Stage-1/2 rows and then crashlooping. This
         // re-checks the same diff-scoped set immediately before this stage's
-        // `save_managed`. See `check_upstream_allowlist_for_plan`.
+        // commit. See `check_upstream_allowlist_for_plan`.
         self.check_upstream_allowlist_for_plan(plan)?;
 
+        if plan.create.is_empty() && plan.update.is_empty() && plan.delete.is_empty() {
+            // Nothing in the plan: no snapshot read, no row write, no
+            // event, no transaction. An unchanged replay is the common
+            // case on every boot.
+            return Ok(());
+        }
+
+        // The one prior snapshot, taken before any write. Keyed two
+        // ways: by natural identity for the upsert id resolution and
+        // the `previous_*` audit fields, and by primary key for the
+        // delete events (the diff layer surfaces ids).
+        let prior = self.upstream_mappings.list_all().await?;
+        let mut prior_by_identity: HashMap<(Uuid, String), RepositoryUpstreamMapping> =
+            HashMap::with_capacity(prior.len());
+        let mut prior_by_id: HashMap<Uuid, RepositoryUpstreamMapping> =
+            HashMap::with_capacity(prior.len());
+        for mapping in prior {
+            prior_by_identity.insert(
+                (mapping.repository_id, mapping.path_prefix.clone()),
+                mapping.clone(),
+            );
+            prior_by_id.insert(mapping.id, mapping);
+        }
+
+        let mut change = UpstreamMappingCommit::default();
         // Collect per-stream audit events.
         // Every UpstreamMapping mutation is repo-scoped (the row
         // carries a non-NULL `repository_id`), so the routing target
@@ -34,25 +96,16 @@ impl ApplyConfigUseCase {
         // emit failure-mode contract as `apply_permission_grants`.
         let mut authz_events_by_stream: HashMap<StreamId, Vec<EventToAppend>> = HashMap::new();
 
-        // Capture prior-state for every update row before any
-        // save_managed runs. This mirrors the model from `apply_roles`. We need
-        // the prior `(secret_ref, upstream_url, id, repository_id)`
-        // to compute the `previous_*` fields on the
-        // `RepositoryUpstreamMappingChanged` event before the upsert
-        // overwrites them.
-        let pre_update_state: HashMap<Uuid, RepositoryUpstreamMapping> = if plan.update.is_empty() {
-            HashMap::new()
-        } else {
-            self.upstream_mappings
-                .list_managed_by_gitops()
-                .await?
-                .into_iter()
-                .map(|m| (m.id, m))
-                .collect()
-        };
-
-        for env in plan.create.iter().chain(plan.update.iter()) {
-            let digest = spec_digest_upstream_mapping(&env.spec);
+        // Creates and updates in one pass, in that order — the two
+        // differ only in the event's `change` tag and whether it
+        // carries `previous_*` fields, and the chained order is the
+        // order the pre-port shape emitted in.
+        for (env, is_create) in plan
+            .create
+            .iter()
+            .map(|env| (env, true))
+            .chain(plan.update.iter().map(|env| (env, false)))
+        {
             let repository_id = *repo_id_by_name.get(&env.spec.repository).ok_or_else(|| {
                 // Validation runs before diff, so a missing
                 // entry here would indicate a bug in
@@ -63,99 +116,42 @@ impl ApplyConfigUseCase {
                     env.metadata.name, env.spec.repository
                 ))
             })?;
-            let mapping = build_upstream_mapping_from_spec(env, repository_id, &digest)?;
-            self.upstream_mappings.save_managed(&mapping).await?;
-        }
+            // Reuse the row's surrogate id when one already exists at
+            // this identity (the `ON CONFLICT` update keeps it), mint a
+            // fresh one otherwise — so the audit `mapping_id` names the
+            // row the commit writes. Mirrors `apply_claim_mappings`.
+            let prior_row = prior_by_identity.get(&(repository_id, env.spec.path_prefix.clone()));
+            let mapping_id = prior_row.map(|m| m.id).unwrap_or_else(Uuid::new_v4);
+            let digest = spec_digest_upstream_mapping(&env.spec);
+            let mapping =
+                build_upstream_mapping_from_spec(env, mapping_id, repository_id, &digest)?;
 
-        // Build `RepositoryUpstreamMappingChanged` audit events for
-        // every create / update / delete row. The `previous_*` /
-        // `new_*` payload fields carry the secret-ref **identifier**
-        // (`<source>:<location>`) and the literal upstream URL —
-        // never the resolved secret value. The post-save snapshot
-        // resolves the row's actual primary key via
-        // `find_managed_by_repo_and_prefix`.
-        let post_save_state: HashMap<(Uuid, String), RepositoryUpstreamMapping> =
-            if plan.create.is_empty() && plan.update.is_empty() {
-                HashMap::new()
+            // The `previous_*` / `new_*` payload fields carry the
+            // secret-ref **identifier** (`<source>:<location>`) and the
+            // literal upstream URL — never the resolved secret value.
+            // A create carries no `previous_*`: either there is no row,
+            // or there is a `local` row the gitops partition has never
+            // seen, and the event records the post-state either way.
+            let (kind, previous_secret_ref, previous_url) = if is_create {
+                (UpstreamMappingChange::Created, None, None)
             } else {
-                self.upstream_mappings
-                    .list_managed_by_gitops()
-                    .await?
-                    .into_iter()
-                    .map(|m| ((m.repository_id, m.path_prefix.clone()), m))
-                    .collect()
+                (
+                    UpstreamMappingChange::Updated,
+                    prior_row
+                        .and_then(|p| p.secret_ref.as_ref())
+                        .map(secret_ref_name),
+                    prior_row.map(|p| p.upstream_url.clone()),
+                )
             };
-
-        for env in plan.create.iter() {
-            let repository_id = *repo_id_by_name.get(&env.spec.repository).ok_or_else(|| {
-                DomainError::Invariant(format!(
-                    "UpstreamMapping `{}` references repository `{}` not in repo_id_by_name",
-                    env.metadata.name, env.spec.repository
-                ))
-            })?;
-            let key = (repository_id, env.spec.path_prefix.clone());
-            let saved = post_save_state.get(&key).ok_or_else(|| {
-                DomainError::Invariant(format!(
-                    "UpstreamMapping `{}` not in post-save snapshot at key (repo={repository_id}, prefix={:?})",
-                    env.metadata.name, env.spec.path_prefix
-                ))
-            })?;
-            let stream_id = StreamId::repository(repository_id);
             authz_events_by_stream
-                .entry(stream_id)
+                .entry(StreamId::repository(repository_id))
                 .or_default()
                 .push(EventToAppend::new(
                     DomainEvent::RepositoryUpstreamMappingChanged(
                         RepositoryUpstreamMappingChanged {
-                            mapping_id: saved.id,
+                            mapping_id,
                             repository_id,
-                            change: UpstreamMappingChange::Created,
-                            previous_secret_ref: None,
-                            new_secret_ref: env.spec.secret_ref.as_ref().map(secret_ref_name),
-                            previous_url: None,
-                            new_url: Some(env.spec.upstream_url.clone()),
-                        },
-                    ),
-                ));
-            emit_gitops_object(gitops_kind::UPSTREAM_MAPPING, GitopsObjectResult::Created);
-            report.created += 1;
-        }
-        for env in plan.update.iter() {
-            let repository_id = *repo_id_by_name.get(&env.spec.repository).ok_or_else(|| {
-                DomainError::Invariant(format!(
-                    "UpstreamMapping `{}` references repository `{}` not in repo_id_by_name",
-                    env.metadata.name, env.spec.repository
-                ))
-            })?;
-            let key = (repository_id, env.spec.path_prefix.clone());
-            let saved = post_save_state.get(&key).ok_or_else(|| {
-                DomainError::Invariant(format!(
-                    "UpstreamMapping `{}` not in post-save snapshot at key (repo={repository_id}, prefix={:?})",
-                    env.metadata.name, env.spec.path_prefix
-                ))
-            })?;
-            // Prior state lookup: keyed by the post-save id (which is
-            // stable across upsert per the adapter contract). When the
-            // diff classifier saw an update but the prior snapshot
-            // does not contain the row (race window between snapshot
-            // collection and save_managed), fall back to None — the
-            // event still records the post-state, which is the
-            // operator-visible thing.
-            let prior = pre_update_state.get(&saved.id);
-            let previous_secret_ref = prior
-                .and_then(|p| p.secret_ref.as_ref())
-                .map(secret_ref_name);
-            let previous_url = prior.map(|p| p.upstream_url.clone());
-            let stream_id = StreamId::repository(repository_id);
-            authz_events_by_stream
-                .entry(stream_id)
-                .or_default()
-                .push(EventToAppend::new(
-                    DomainEvent::RepositoryUpstreamMappingChanged(
-                        RepositoryUpstreamMappingChanged {
-                            mapping_id: saved.id,
-                            repository_id,
-                            change: UpstreamMappingChange::Updated,
+                            change: kind,
                             previous_secret_ref,
                             new_secret_ref: env.spec.secret_ref.as_ref().map(secret_ref_name),
                             previous_url,
@@ -163,30 +159,25 @@ impl ApplyConfigUseCase {
                         },
                     ),
                 ));
-            emit_gitops_object(gitops_kind::UPSTREAM_MAPPING, GitopsObjectResult::Updated);
-            report.updated += 1;
+            change.upserts.push(mapping);
+            if is_create {
+                emit_gitops_object(gitops_kind::UPSTREAM_MAPPING, GitopsObjectResult::Created);
+                report.created += 1;
+            } else {
+                emit_gitops_object(gitops_kind::UPSTREAM_MAPPING, GitopsObjectResult::Updated);
+                report.updated += 1;
+            }
         }
 
-        // Read about-to-be-deleted rows BEFORE any
-        // delete_managed_by_id runs. This snapshot is bounded by the
-        // `idx_repository_upstream_mappings_managed_by` partial index
-        // and the operator's repo count (typically O(10s)).
-        let pre_delete_state: HashMap<Uuid, RepositoryUpstreamMapping> = if plan.delete.is_empty() {
-            HashMap::new()
-        } else {
-            self.upstream_mappings
-                .list_managed_by_gitops()
-                .await?
-                .into_iter()
-                .map(|m| (m.id, m))
-                .collect()
-        };
         for id in &plan.delete {
-            self.upstream_mappings.delete_managed_by_id(*id).await?;
-            if let Some(prior) = pre_delete_state.get(id) {
-                let stream_id = StreamId::repository(prior.repository_id);
+            change.deletes.push(*id);
+            // A scheduled id absent from the snapshot was deleted
+            // out-of-band between the plan's own snapshot and this read.
+            // The delete is still issued (it is a no-op) but there is no
+            // prior state to describe, so no event is emitted.
+            if let Some(prior) = prior_by_id.get(id) {
                 authz_events_by_stream
-                    .entry(stream_id)
+                    .entry(StreamId::repository(prior.repository_id))
                     .or_default()
                     .push(EventToAppend::new(
                         DomainEvent::RepositoryUpstreamMappingChanged(
@@ -206,25 +197,30 @@ impl ApplyConfigUseCase {
             report.deleted += 1;
         }
 
-        // Per-kind audit-commit log
-        // line. All UpstreamMapping events are repo-scoped, so
-        // `streams` here is the count of distinct repositories
-        // touched in this apply.
-        let total_um_events: usize = authz_events_by_stream.values().map(Vec::len).sum();
+        // Every row operation AND every per-stream audit batch, in one
+        // transaction.
+        let batches = Self::grouped_authorization_batches(
+            authz_events_by_stream,
+            Kind::UpstreamMapping,
+            token,
+        );
+        // All UpstreamMapping events are repo-scoped, so `streams` here
+        // is the count of distinct repositories touched in this apply.
+        // Counted before the commit consumes the batches, emitted after
+        // it returned `Ok`.
+        let total_um_events: usize = batches.iter().map(|b| b.events.len()).sum();
+        let um_streams = batches.len();
+        self.authority
+            .commit_upstream_mappings(&change, batches)
+            .await?;
         if total_um_events > 0 {
             tracing::info!(
                 kind = "upstream_mapping",
                 events = total_um_events,
-                streams = authz_events_by_stream.len(),
+                streams = um_streams,
                 "upstream_mapping audit events committed"
             );
         }
-        self.append_grouped_authorization_events(
-            authz_events_by_stream,
-            Kind::UpstreamMapping,
-            token,
-        )
-        .await?;
 
         Ok(())
     }
@@ -326,6 +322,7 @@ impl ApplyConfigUseCase {
 /// an unknown value here is an invariant.
 fn build_upstream_mapping_from_spec(
     env: &Envelope<UpstreamMappingSpec>,
+    id: Uuid,
     repository_id: Uuid,
     digest: &[u8; 32],
 ) -> AppResult<RepositoryUpstreamMapping> {
@@ -365,10 +362,12 @@ fn build_upstream_mapping_from_spec(
     // defence-in-depth re-check so any future bypass of validate_*
     // surfaces here, not at fetch time.
     let mapping = RepositoryUpstreamMapping::new(RepositoryUpstreamMappingArgs {
-        // Adapter's INSERT ... ON CONFLICT (repository_id, path_prefix)
-        // DO UPDATE preserves the existing row id on conflict, so the
-        // freshly-minted id here is harmless on the update path.
-        id: Uuid::new_v4(),
+        // Resolved by the caller against the row at this mapping's
+        // `(repository_id, path_prefix)` identity, so the audit
+        // `mapping_id` names the row the commit writes. The adapter's
+        // `ON CONFLICT (repository_id, path_prefix) DO UPDATE` keeps an
+        // existing row's id, which is what makes that resolution right.
+        id,
         repository_id,
         path_prefix: env.spec.path_prefix.clone(),
         upstream_url: env.spec.upstream_url.clone(),
@@ -412,7 +411,7 @@ mod tests {
     /// Happy path: a desired `UpstreamMapping` against a freshly-
     /// created repository round-trips through the apply pipeline. The
     /// pipeline must resolve `spec.repository` → `repository_id` from
-    /// the Stage 2 result map, then `save_managed` the row with
+    /// the Stage 2 result map, then commit the row with
     /// `managed_by=GitOps`.
     #[tokio::test]
     async fn apply_upstream_mapping_create_writes_managed_row() {
@@ -453,7 +452,7 @@ mod tests {
 
     /// Re-applying the same desired state produces zero churn — the
     /// digest matches, the diff classifies the mapping as `unchanged`,
-    /// and `save_managed` is NOT called the second time.
+    /// no row is written the second time.
     #[tokio::test]
     async fn apply_upstream_mapping_reapply_is_idempotent() {
         let h = build_harness();
@@ -712,6 +711,233 @@ mod tests {
             "managed mapping must be removed"
         );
     }
+    // ----------------------------------------------------------------------
+    // Mapping rows commit with their audit events (one transaction).
+    // ----------------------------------------------------------------------
+
+    fn mapping_changed_count(evts: &[DomainEvent]) -> usize {
+        evts.iter()
+            .filter(|e| matches!(e, DomainEvent::RepositoryUpstreamMappingChanged(_)))
+            .count()
+    }
+
+    /// An audit-append failure during the upstream-mapping apply leaves
+    /// the row **exactly as it was** — the apply fails closed rather
+    /// than half-done. This is the property the retry cannot supply: a
+    /// committed re-point with no event is invisible to the next
+    /// apply's digest comparison, so no replacement event is ever
+    /// emitted and the repository keeps fetching from an upstream the
+    /// authorization stream never named.
+    #[tokio::test]
+    async fn apply_upstream_mapping_commit_failure_leaves_the_row_unchanged() {
+        let h = build_harness();
+        let seeded = DesiredState {
+            repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "oci-mirror-dockerhub",
+                "oci-mirror-e2e",
+                "dockerhub/",
+                "https://registry-1.docker.io",
+            )],
+            ..Default::default()
+        };
+        h.uc.apply(seeded, env_oidc()).await.unwrap();
+        let repo_id = h.repos.find_by_key("oci-mirror-e2e").await.unwrap().id;
+        let before = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(before.len(), 1);
+        let events_before = mapping_changed_count(&repo_stream_events(&h.events, repo_id).await);
+
+        // Re-point the same `(repository_id, path_prefix)` identity,
+        // with the commit armed to fail.
+        h.authority.fail_next(
+            AuthoritySite::UpstreamMappings,
+            DomainError::Invariant("event store unavailable".into()),
+        );
+        let repointed = DesiredState {
+            repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "oci-mirror-dockerhub",
+                "oci-mirror-e2e",
+                "dockerhub/",
+                "https://attacker.example.com",
+            )],
+            ..Default::default()
+        };
+        let err =
+            h.uc.apply(repointed, env_oidc())
+                .await
+                .expect_err("an audit-append failure must fail the apply");
+        assert!(
+            err.to_string().contains("event store unavailable"),
+            "the event-store failure must surface, got: {err}"
+        );
+
+        let after = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].upstream_url, "https://registry-1.docker.io",
+            "the mapping must still name the upstream the stream attested — \
+             rows and events commit together"
+        );
+        assert_eq!(
+            after[0].managed_by_digest, before[0].managed_by_digest,
+            "and the digest must not have advanced, or the next apply \
+             would read the change as already applied"
+        );
+        assert_eq!(
+            mapping_changed_count(&repo_stream_events(&h.events, repo_id).await),
+            events_before,
+            "no audit event may have landed either"
+        );
+    }
+
+    /// An apply that touches two repositories hands the whole batch
+    /// list to **one** commit call, which is what makes the multi-stream
+    /// append atomic. Before the port each stream was its own
+    /// `EventStore::append` transaction *and* each row its own commit,
+    /// so a list that failed part-way left some repositories' mappings
+    /// live and unattested while others were audited.
+    #[tokio::test]
+    async fn apply_upstream_mapping_commit_takes_every_stream_in_one_call() {
+        let h = build_harness();
+        let desired = DesiredState {
+            repositories: vec![repo_env("mirror-a", "proxy"), repo_env("mirror-b", "proxy")],
+            upstream_mappings: vec![
+                upstream_mapping_env("um-a", "mirror-a", "a/", "https://a.example.com"),
+                upstream_mapping_env("um-b", "mirror-b", "b/", "https://b.example.com"),
+            ],
+            ..Default::default()
+        };
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+
+        let commits: Vec<usize> = h
+            .authority
+            .commits()
+            .into_iter()
+            .filter(|(site, _)| *site == AuthoritySite::UpstreamMappings)
+            .map(|(_, batches)| batches)
+            .collect();
+        assert_eq!(
+            commits,
+            vec![2],
+            "exactly one commit call carrying both repositories' batches"
+        );
+
+        let repo_a = h.repos.find_by_key("mirror-a").await.unwrap().id;
+        let repo_b = h.repos.find_by_key("mirror-b").await.unwrap().id;
+        assert_eq!(
+            mapping_changed_count(&repo_stream_events(&h.events, repo_a).await),
+            1
+        );
+        assert_eq!(
+            mapping_changed_count(&repo_stream_events(&h.events, repo_b).await),
+            1
+        );
+    }
+
+    /// An unchanged replay reaches the port **not at all**: with no
+    /// create, update or delete there is no row to write and no event
+    /// to append, so the branch returns before the snapshot read and
+    /// before the commit.
+    #[tokio::test]
+    async fn apply_upstream_mapping_unchanged_replay_opens_no_commit() {
+        let h = build_harness();
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "oci-mirror-dockerhub",
+                "oci-mirror-e2e",
+                "dockerhub/",
+                "https://registry-1.docker.io",
+            )],
+            ..Default::default()
+        };
+        h.uc.apply(desired.clone(), env_oidc()).await.unwrap();
+        let commits_after_first = h
+            .authority
+            .commits()
+            .into_iter()
+            .filter(|(site, _)| *site == AuthoritySite::UpstreamMappings)
+            .count();
+        assert_eq!(commits_after_first, 1, "the seeding apply commits once");
+
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+        let commits_after_second = h
+            .authority
+            .commits()
+            .into_iter()
+            .filter(|(site, _)| *site == AuthoritySite::UpstreamMappings)
+            .count();
+        assert_eq!(
+            commits_after_second, commits_after_first,
+            "an unchanged replay must not open a transaction"
+        );
+    }
+
+    /// The row id the audit event names is the row the commit writes,
+    /// across a re-point: the branch resolves it from the mapping's
+    /// `(repository_id, path_prefix)` identity before the write, which
+    /// is what the adapter's `ON CONFLICT … DO UPDATE` preserves.
+    /// Resolving it afterwards is what the pre-port shape needed a
+    /// post-write snapshot read for.
+    #[tokio::test]
+    async fn apply_upstream_mapping_update_event_names_the_existing_row_id() {
+        let h = build_harness();
+        let seeded = DesiredState {
+            repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "oci-mirror-dockerhub",
+                "oci-mirror-e2e",
+                "dockerhub/",
+                "https://registry-1.docker.io",
+            )],
+            ..Default::default()
+        };
+        h.uc.apply(seeded, env_oidc()).await.unwrap();
+        let repo_id = h.repos.find_by_key("oci-mirror-e2e").await.unwrap().id;
+        let seeded_id = h.upstream.list_managed_by_gitops().await.unwrap()[0].id;
+
+        let repointed = DesiredState {
+            repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "oci-mirror-dockerhub",
+                "oci-mirror-e2e",
+                "dockerhub/",
+                "https://mirror.example.com",
+            )],
+            ..Default::default()
+        };
+        h.uc.apply(repointed, env_oidc()).await.unwrap();
+
+        let rows = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, seeded_id, "the row id stays stable");
+        assert_eq!(rows[0].upstream_url, "https://mirror.example.com");
+
+        let updated: Vec<_> = repo_stream_events(&h.events, repo_id)
+            .await
+            .into_iter()
+            .filter_map(|e| match e {
+                DomainEvent::RepositoryUpstreamMappingChanged(c)
+                    if c.change == UpstreamMappingChange::Updated =>
+                {
+                    Some(c)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(updated.len(), 1, "exactly one Updated event");
+        assert_eq!(
+            updated[0].mapping_id, seeded_id,
+            "the audit event must name the row the commit wrote"
+        );
+        assert_eq!(
+            updated[0].previous_url.as_deref(),
+            Some("https://registry-1.docker.io"),
+            "and carry the pre-commit upstream as `previous_url`"
+        );
+    }
+
     // ----------------------------------------------------------------------
     // Pre-write TLS-material rejection (mirror of the domain constructor)
     // ----------------------------------------------------------------------

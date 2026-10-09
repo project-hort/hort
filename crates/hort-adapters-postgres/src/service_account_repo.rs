@@ -187,151 +187,168 @@ impl ServiceAccountRepository for PgServiceAccountRepository {
             compose(sa_row, fi_rows, fr_row).map(Some)
         })
     }
+}
 
-    fn upsert(&self, sa: &ServiceAccount) -> BoxFuture<'_, DomainResult<()>> {
-        // Capture every field — the async block runs after the borrow
-        // ends so we can't keep `&sa` around.
-        let id = sa.id;
-        let name = sa.name.clone();
-        let backing_user_id = sa.backing_user_id;
-        let federated_identities = sa.federated_identities.clone();
-        let fallback_rotation = sa.fallback_rotation.clone();
+// ---------------------------------------------------------------------------
+// In-transaction writes — shared with the authority lifecycle adapter
+// ---------------------------------------------------------------------------
 
-        Box::pin(async move {
-            tracing::info!(entity = "service_account", name = %name, "upsert (gitops apply)");
-            let mut tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;
+/// UPSERT the whole SA aggregate on the caller's open transaction.
+///
+/// Three statement groups, in this order:
+///
+/// 1. UPSERT the `service_accounts` row. `ON CONFLICT (name) DO UPDATE`
+///    so the row's primary key stays stable across re-applies even if
+///    the caller-supplied id differs; the persisted id drives the two
+///    sub-aggregate writes below.
+/// 2. Replace the `service_account_federated_identities` rows: DELETE
+///    the existing set, then INSERT the new one preserving the order
+///    from `sa.federated_identities` as the row `position`. The unique
+///    `(service_account_id, position)` index would otherwise collide on
+///    a re-INSERT without the prior DELETE — which is why the swap has
+///    to be inside a transaction.
+/// 3. Reconcile the `service_account_fallback_rotations` row: UPSERT
+///    keyed on the (PRIMARY KEY) `service_account_id` when `Some`,
+///    DELETE any prior row when `None`.
+///
+/// Takes `&mut PgConnection` rather than a generic `PgExecutor` — unlike
+/// [`crate::oidc_issuer_repo::upsert_in_tx`] this is many statements,
+/// and they must all land on the *same* connection, so there is no
+/// pool-shaped caller to accommodate. The transaction boundary itself
+/// belongs to the caller, and today there is exactly one:
+/// `crate::authority_lifecycle::PgAuthorityLifecycle`, which hands over
+/// the transaction that also appends the attesting
+/// `ServiceAccountCreated` / `ServiceAccountUpdated` event. A service
+/// account is a federated-identity trust anchor (ADR 0018), so the row
+/// and its audit event must not be able to land separately.
+pub(crate) async fn upsert_in_tx(
+    conn: &mut sqlx::PgConnection,
+    sa: &ServiceAccount,
+) -> DomainResult<()> {
+    let name = sa.name.as_str();
+    tracing::info!(entity = "service_account", name = %name, "upsert (gitops apply)");
 
-            // 1. UPSERT the SA row. `ON CONFLICT (name) DO UPDATE` so
-            // the row's primary key stays stable across re-applies
-            // even if the caller-supplied id differs.
-            let row: (Uuid,) = sqlx::query_as(
-                r#"INSERT INTO service_accounts
-                       (id, name, backing_user_id)
-                   VALUES ($1, $2, $3)
-                   ON CONFLICT (name) DO UPDATE SET
-                       backing_user_id = EXCLUDED.backing_user_id,
-                       updated_at      = NOW()
-                   RETURNING id"#,
-            )
-            .bind(id)
-            .bind(&name)
-            .bind(backing_user_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;
-            let persisted_id = row.0;
+    // 1. The SA row.
+    let row: (Uuid,) = sqlx::query_as(
+        r#"INSERT INTO service_accounts
+               (id, name, backing_user_id)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (name) DO UPDATE SET
+               backing_user_id = EXCLUDED.backing_user_id,
+               updated_at      = NOW()
+           RETURNING id"#,
+    )
+    .bind(sa.id)
+    .bind(name)
+    .bind(sa.backing_user_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|e| map_sqlx_error(&e, "ServiceAccount", name))?;
+    let persisted_id = row.0;
 
-            // 2. Replace federated-identity rows. DELETE existing,
-            // then INSERT the new set preserving order as `position`.
-            // The transaction makes the swap atomic; the unique
-            // `(service_account_id, position)` index would otherwise
-            // collide on a re-INSERT without the prior DELETE.
+    // 2. Replace the federated-identity rows.
+    sqlx::query(
+        "DELETE FROM service_account_federated_identities \
+         WHERE service_account_id = $1",
+    )
+    .bind(persisted_id)
+    .execute(&mut *conn)
+    .await
+    .map_err(|e| map_sqlx_error(&e, "ServiceAccount", name))?;
+
+    for (position, fi) in sa.federated_identities.iter().enumerate() {
+        let claims_json = serde_json::Value::Object(
+            fi.claims
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect(),
+        );
+        sqlx::query(
+            r#"INSERT INTO service_account_federated_identities
+                   (service_account_id, issuer_name, claims, position)
+               VALUES ($1, $2, $3, $4)"#,
+        )
+        .bind(persisted_id)
+        .bind(&fi.issuer_name)
+        .bind(&claims_json)
+        .bind(position as i32)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| map_sqlx_error(&e, "ServiceAccount", name))?;
+    }
+
+    // 3. Reconcile the fallback-rotation row.
+    match sa.fallback_rotation.as_ref() {
+        Some(fr) => {
+            let rotation_iv = duration_to_pg_interval(fr.rotation_interval)?;
+            let validity_iv = duration_to_pg_interval(fr.validity)?;
+            let format_str = match fr.format {
+                SecretFormat::Dockerconfigjson => "dockerconfigjson",
+                SecretFormat::Opaque => "opaque",
+            };
             sqlx::query(
-                "DELETE FROM service_account_federated_identities \
+                r#"INSERT INTO service_account_fallback_rotations
+                       (service_account_id, target_namespace, target_name,
+                        format, rotation_interval, validity)
+                   VALUES ($1, $2, $3, $4, $5, $6)
+                   ON CONFLICT (service_account_id) DO UPDATE SET
+                       target_namespace  = EXCLUDED.target_namespace,
+                       target_name       = EXCLUDED.target_name,
+                       format            = EXCLUDED.format,
+                       rotation_interval = EXCLUDED.rotation_interval,
+                       validity          = EXCLUDED.validity"#,
+            )
+            .bind(persisted_id)
+            .bind(&fr.target_secret_namespace)
+            .bind(&fr.target_secret_name)
+            .bind(format_str)
+            .bind(rotation_iv)
+            .bind(validity_iv)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "ServiceAccount", name))?;
+        }
+        None => {
+            sqlx::query(
+                "DELETE FROM service_account_fallback_rotations \
                  WHERE service_account_id = $1",
             )
             .bind(persisted_id)
-            .execute(&mut *tx)
+            .execute(&mut *conn)
             .await
-            .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;
-
-            for (position, fi) in federated_identities.iter().enumerate() {
-                let claims_json = serde_json::Value::Object(
-                    fi.claims
-                        .iter()
-                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
-                        .collect(),
-                );
-                sqlx::query(
-                    r#"INSERT INTO service_account_federated_identities
-                           (service_account_id, issuer_name, claims, position)
-                       VALUES ($1, $2, $3, $4)"#,
-                )
-                .bind(persisted_id)
-                .bind(&fi.issuer_name)
-                .bind(&claims_json)
-                .bind(position as i32)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;
-            }
-
-            // 3. Reconcile the fallback-rotation row. If `Some`,
-            // UPSERT keyed by the (PRIMARY KEY) service_account_id.
-            // If `None`, DELETE any prior row.
-            match fallback_rotation {
-                Some(fr) => {
-                    let rotation_iv = duration_to_pg_interval(fr.rotation_interval)?;
-                    let validity_iv = duration_to_pg_interval(fr.validity)?;
-                    let format_str = match fr.format {
-                        SecretFormat::Dockerconfigjson => "dockerconfigjson",
-                        SecretFormat::Opaque => "opaque",
-                    };
-                    sqlx::query(
-                        r#"INSERT INTO service_account_fallback_rotations
-                               (service_account_id, target_namespace, target_name,
-                                format, rotation_interval, validity)
-                           VALUES ($1, $2, $3, $4, $5, $6)
-                           ON CONFLICT (service_account_id) DO UPDATE SET
-                               target_namespace  = EXCLUDED.target_namespace,
-                               target_name       = EXCLUDED.target_name,
-                               format            = EXCLUDED.format,
-                               rotation_interval = EXCLUDED.rotation_interval,
-                               validity          = EXCLUDED.validity"#,
-                    )
-                    .bind(persisted_id)
-                    .bind(&fr.target_secret_namespace)
-                    .bind(&fr.target_secret_name)
-                    .bind(format_str)
-                    .bind(rotation_iv)
-                    .bind(validity_iv)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;
-                }
-                None => {
-                    sqlx::query(
-                        "DELETE FROM service_account_fallback_rotations \
-                         WHERE service_account_id = $1",
-                    )
-                    .bind(persisted_id)
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;
-                }
-            }
-
-            tx.commit()
-                .await
-                .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;
-            Ok(())
-        })
+            .map_err(|e| map_sqlx_error(&e, "ServiceAccount", name))?;
+        }
     }
+    Ok(())
+}
 
-    fn delete_by_name(&self, name: &str) -> BoxFuture<'_, DomainResult<()>> {
-        let name = name.to_string();
-        Box::pin(async move {
-            tracing::info!(
-                entity = "service_account",
-                name = %name,
-                "delete_by_name (gitops apply)"
-            );
-            // The CASCADE FKs on
-            // `service_account_federated_identities.service_account_id`
-            // and `service_account_fallback_rotations.service_account_id`
-            // drop the sub-aggregate rows alongside.
-            sqlx::query("DELETE FROM service_accounts WHERE name = $1")
-                .bind(&name)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| map_sqlx_error(&e, "ServiceAccount", &name))?;
-            Ok(())
-        })
-    }
+/// DELETE the SA row by `name` on the caller's executor.
+///
+/// The CASCADE FKs on
+/// `service_account_federated_identities.service_account_id` and
+/// `service_account_fallback_rotations.service_account_id` drop the
+/// sub-aggregate rows alongside. Deleting a name that no longer exists
+/// is a no-op (returns `Ok`) — a re-apply after an out-of-band
+/// `DELETE` must not fail.
+///
+/// Takes `&mut PgConnection` like [`upsert_in_tx`], not a generic
+/// executor: the authority adapter's open transaction is the only
+/// caller, so there is no pool-shaped one to accommodate.
+pub(crate) async fn delete_by_name_in_tx(
+    conn: &mut sqlx::PgConnection,
+    name: &str,
+) -> DomainResult<()> {
+    tracing::info!(
+        entity = "service_account",
+        name = %name,
+        "delete_by_name (gitops apply)"
+    );
+    sqlx::query("DELETE FROM service_accounts WHERE name = $1")
+        .bind(name)
+        .execute(conn)
+        .await
+        .map_err(|e| map_sqlx_error(&e, "ServiceAccount", name))?;
+    Ok(())
 }
 
 #[cfg(test)]

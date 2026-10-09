@@ -1886,6 +1886,20 @@ pub fn with_pat_over_http_allowed(base: &Arc<AppContext>, allowed: bool) -> Arc<
     rebuild(base, |ctx| ctx.pat_over_http_allowed = allowed)
 }
 
+/// Override `publish_body_limit_bytes` on a mock context — the parsed
+/// `HORT_PUBLISH_BODY_MAX_SIZE` slot. `None` is the harness default
+/// ("operator set nothing"); `Some(0)` is the refuse-all-publishes kill
+/// switch, which the composition root has to carry into every publish
+/// subtree — the four hosted formats and OCI push — so each can apply
+/// [`crate::limits::refuse_publishes_when_disabled`].
+///
+/// Every port `Arc` is carried forward, so repositories seeded through
+/// the `MockPorts` handle obtained alongside the base context stay
+/// visible on the rebuilt one.
+pub fn with_publish_body_limit(base: &Arc<AppContext>, limit: Option<usize>) -> Arc<AppContext> {
+    rebuild(base, |ctx| ctx.publish_body_limit_bytes = limit)
+}
+
 /// Override the #65 pull-through release bounded-await bound on a mock
 /// context. The shared harness default is `0` (disabled) precisely so
 /// this override is required to exercise the feature — see the field's

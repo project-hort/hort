@@ -5,32 +5,37 @@ impl ApplyConfigUseCase {
     /// `ClaimMappingRepository`, `claim_mappings` table —
     /// there is no `roles` table in the additive-claims model).
     ///
-    /// **Whole-partition reconcile.**
-    /// `ClaimMappingRepository::save_managed` atomically deletes every
-    /// gitops-managed row absent from `items` and upserts every row in
-    /// `items` (keyed on the `(idp_group, claim)` UNIQUE identity). The
-    /// branch therefore:
+    /// **Whole-partition reconcile, committed with its audit events.**
+    /// [`AuthorityLifecyclePort::commit_claim_mappings`] atomically
+    /// deletes every gitops-managed row absent from the desired set,
+    /// upserts every row present (keyed on the `(idp_group, claim)`
+    /// UNIQUE identity), **and** appends the audit batch — all in one
+    /// transaction. The branch therefore:
     ///
     /// 1. builds the **complete** desired gitops-managed mapping set
     ///    from every declared envelope (`desired.claim_mappings`, not
-    ///    just the changed subset — `save_managed` is whole-partition);
+    ///    just the changed subset — the reconcile is whole-partition);
     /// 2. reads the prior managed set (`list_managed_by_gitops`) and
     ///    diffs it against the desired set by `(idp_group, claim)` to
     ///    emit one `ClaimMappingApplied` per added-or-changed row and
     ///    one `ClaimMappingRevoked` per removed row
     ///    (audit-event-per-mutation invariant);
-    /// 3. calls `save_managed(&complete_desired_set)` once.
+    /// 3. commits rows + events in one call.
     ///
-    /// Diff-then-emit failure-mode contract is preserved:
-    /// a `save_managed` failure aborts the apply (strict-atomic) before
-    /// any audit event lands; a save that succeeds followed by an
-    /// event-store append failure surfaces the apply error and the next
-    /// apply re-runs the diff against the now-saved state (idempotent —
-    /// no events to re-emit). The `plan` argument drives the
-    /// per-envelope `created` / `updated` / `deleted` report + metric
-    /// counters; the audit events are derived from the live
-    /// prior-vs-desired diff so they stay correct even if the plan's
-    /// coarse classification and the row state diverge.
+    /// **Failure mode (changed).** A failure on either side — the row
+    /// reconcile or the audit append — now leaves the partition
+    /// **unchanged**: the apply aborts fail-closed instead of
+    /// half-done. Before the port, an append failure after a committed
+    /// row write left the mapping active with nothing in the
+    /// authorization stream attesting it, and the retry could not
+    /// repair that: the next apply diffs against the already-changed
+    /// rows, finds an unchanged digest, and emits nothing.
+    ///
+    /// The `plan` argument drives the per-envelope `created` /
+    /// `updated` / `deleted` report + metric counters; the audit events
+    /// are derived from the live prior-vs-desired diff so they stay
+    /// correct even if the plan's coarse classification and the row
+    /// state diverge.
     pub(super) async fn apply_claim_mappings(
         &self,
         plan: &KindPlan<ClaimMappingSpec, String>,
@@ -39,7 +44,7 @@ impl ApplyConfigUseCase {
         token: &GitOpsApplyToken,
     ) -> AppResult<()> {
         // Prior gitops-managed set, keyed by the natural identity
-        // `(idp_group, claim)` — the same key `save_managed` upserts on
+        // `(idp_group, claim)` — the same key the reconcile upserts on
         // and the table's UNIQUE constraint enforces.
         let prior = self.claim_mappings.list_managed_by_gitops().await?;
         let prior_by_identity: HashMap<(String, String), ClaimMapping> = prior
@@ -48,7 +53,7 @@ impl ApplyConfigUseCase {
             .collect();
 
         // Complete desired gitops-managed set — every declared envelope,
-        // not just the plan's changed subset (`save_managed` reconciles
+        // not just the plan's changed subset (the commit reconciles
         // the whole partition). The digest is the canonicalised spec
         // hash; the adapter writes `managed_by = gitops` unconditionally.
         let mut desired_set: Vec<ClaimMapping> = Vec::with_capacity(desired.claim_mappings.len());
@@ -94,7 +99,7 @@ impl ApplyConfigUseCase {
         }
 
         // Revocations: every prior gitops-managed identity absent from
-        // the desired set. `save_managed` deletes these rows; the audit
+        // the desired set. The reconcile deletes these rows; the audit
         // event attests the removal.
         for ((idp_group, claim), prev) in &prior_by_identity {
             if !desired_identities.contains(&(idp_group.clone(), claim.clone())) {
@@ -123,73 +128,72 @@ impl ApplyConfigUseCase {
             report.deleted += 1;
         }
 
-        // Whole-partition atomic delete-absent + upsert-present.
-        self.claim_mappings.save_managed(&desired_set).await?;
-
-        self.append_authorization_events(authz_events, Kind::ClaimMapping, token)
+        // Whole-partition delete-absent + upsert-present AND the audit
+        // batch, in one transaction: an append failure rolls the
+        // partition back rather than leaving a live mapping the
+        // authorization stream says nothing about.
+        let batches = Self::authorization_batches(authz_events, Kind::ClaimMapping, token);
+        self.authority
+            .commit_claim_mappings(&desired_set, batches)
             .await?;
         Ok(())
     }
 
-    /// Append a batch of authorization audit events to the global
-    /// authorization stream.
+    /// Build the audit batch list for the global authorization stream.
     ///
-    /// `expected_version: Any` — gitops apply runs in
-    /// a single boot-time process and concurrent apply is prevented
-    /// at a higher layer (boot lock). No-op when `events` is empty
-    /// (avoids an unnecessary append round-trip).
+    /// The single-stream case of
+    /// [`grouped_authorization_batches`](Self::grouped_authorization_batches),
+    /// expressed through it rather than beside it so there is one
+    /// definition of "what an authorization audit batch looks like".
+    /// An empty `events` vec yields an empty list — an unchanged gitops
+    /// replay emits nothing, and the row reconcile still runs.
     ///
     /// **Compile-time gate.** The
-    /// `_token: &GitOpsApplyToken` argument refuses to compile any
+    /// `token: &GitOpsApplyToken` argument refuses to compile any
     /// caller outside the gitops apply pipeline. The token is
     /// constructible only from inside `hort-app` (via the `pub(crate)`
     /// constructor), and a non-gitops caller has nothing to pass. See
     /// [`GitOpsApplyToken`] for the architectural rationale.
-    async fn append_authorization_events(
-        &self,
+    pub(super) fn authorization_batches(
         events: Vec<EventToAppend>,
         kind: Kind,
-        _token: &GitOpsApplyToken,
-    ) -> AppResult<()> {
-        if events.is_empty() {
-            return Ok(());
-        }
-        let actor = gitops_actor_for_kind(kind);
-        self.events
-            .append(AppendEvents {
-                stream_id: StreamId::authorization(),
-                expected_version: ExpectedVersion::Any,
-                events,
-                correlation_id: Uuid::new_v4(),
-                causation_id: None,
-                actor,
-            })
-            .await?;
-        Ok(())
+        token: &GitOpsApplyToken,
+    ) -> Vec<AppendEvents> {
+        Self::grouped_authorization_batches(
+            [(StreamId::authorization(), events)].into_iter().collect(),
+            kind,
+            token,
+        )
     }
 
-    /// Append a per-stream batch of authorization audit events.
+    /// Build the per-stream audit batch list, one [`AppendEvents`] per
+    /// non-empty stream bucket.
     ///
-    /// Used by the repo-scoped emitters (`apply_permission_grants`,
-    /// `apply_upstream_mappings`) that route events to either
-    /// `StreamCategory::Repository(r)` or `StreamCategory::Authorization`
-    /// depending on the per-row `repository_id`. One append round-trip
-    /// per stream — empty buckets are skipped. `expected_version: Any`
+    /// Used by the repo-scoped emitters: `apply_permission_grants`,
+    /// which routes to either `StreamCategory::Repository(r)` or
+    /// `StreamCategory::Authorization` depending on the per-row
+    /// `repository_id`, and `apply_upstream_mappings`, whose every row
+    /// is repo-scoped and so routes to one stream per repository
+    /// touched. Empty buckets are dropped. `expected_version: Any`
     /// (gitops apply is single-process per boot lock).
     ///
+    /// Returning the list instead of appending it is what lets the
+    /// caller hand the batches to
+    /// [`AuthorityLifecyclePort`](hort_domain::ports::authority_lifecycle::AuthorityLifecyclePort),
+    /// which commits them in the same transaction as the rows they
+    /// attest. There is no append-now counterpart any more: every
+    /// authority kind writes its rows through that port, so every
+    /// caller of this builder hands the result to a `commit_*` method.
+    ///
     /// **Compile-time gate.** Same
-    /// `_token: &GitOpsApplyToken` argument as
-    /// [`append_authorization_events`](Self::append_authorization_events) — see that
+    /// `token: &GitOpsApplyToken` argument as
+    /// [`authorization_batches`](Self::authorization_batches) — see that
     /// docstring for the full architectural rationale.
-    pub(super) async fn append_grouped_authorization_events(
-        &self,
+    pub(super) fn grouped_authorization_batches(
         events_by_stream: HashMap<StreamId, Vec<EventToAppend>>,
         kind: Kind,
         _token: &GitOpsApplyToken,
-    ) -> AppResult<()> {
-        if events_by_stream.is_empty() {
-            return Ok(());
-        }
+    ) -> Vec<AppendEvents> {
         let actor = gitops_actor_for_kind(kind);
         // Sort by stream_id for deterministic test assertions; the
         // event store contract does not require ordering across
@@ -200,22 +204,18 @@ impl ApplyConfigUseCase {
         let mut sorted: Vec<(StreamId, Vec<EventToAppend>)> =
             events_by_stream.into_iter().collect();
         sorted.sort_by_key(|(s, _)| s.to_string());
-        for (stream_id, events) in sorted {
-            if events.is_empty() {
-                continue;
-            }
-            self.events
-                .append(AppendEvents {
-                    stream_id,
-                    expected_version: ExpectedVersion::Any,
-                    events,
-                    correlation_id: Uuid::new_v4(),
-                    causation_id: None,
-                    actor: actor.clone(),
-                })
-                .await?;
-        }
-        Ok(())
+        sorted
+            .into_iter()
+            .filter(|(_, events)| !events.is_empty())
+            .map(|(stream_id, events)| AppendEvents {
+                stream_id,
+                expected_version: ExpectedVersion::Any,
+                events,
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: actor.clone(),
+            })
+            .collect()
     }
 }
 
@@ -258,7 +258,7 @@ mod tests {
         let report = h.uc.apply(desired, env_oidc()).await.unwrap();
         assert_eq!(report.created, 1);
         // Whole-partition reconcile fires exactly once.
-        assert_eq!(h.claim_mappings.save_managed_call_count(), 1);
+        assert_eq!(h.claim_mappings.reconcile_call_count(), 1);
         assert_eq!(h.claim_mappings.managed_count(), 1);
         let evts = authz_events(&h).await;
         assert_eq!(
@@ -368,6 +368,60 @@ mod tests {
         );
     }
 
+    /// An audit-append failure during the claim-mapping apply leaves
+    /// the gitops partition **exactly as it was**. The branch's own
+    /// comment already recorded why a retry cannot repair the
+    /// half-applied state — an unchanged digest is a no-op and emits no
+    /// replacement event — so the only place the knowledge could
+    /// become a guarantee is the commit itself.
+    #[tokio::test]
+    async fn apply_claim_mappings_commit_failure_leaves_the_partition_unchanged() {
+        let h = build_harness();
+        let mut seeded = DesiredState::default();
+        seeded
+            .claim_mappings
+            .push(cm_env("devs", "g-dev", "developer"));
+        h.uc.apply(seeded, env_oidc()).await.unwrap();
+        assert_eq!(h.claim_mappings.managed_count(), 1);
+        let saves_before = h.claim_mappings.reconcile_call_count();
+        let applied_before = count_cm_applied(&authz_events(&h).await);
+
+        h.authority.fail_next(
+            AuthoritySite::ClaimMappings,
+            DomainError::Invariant("event store unavailable".into()),
+        );
+        let mut next = DesiredState::default();
+        next.claim_mappings.push(cm_env("ops", "g-ops", "operator"));
+        let err =
+            h.uc.apply(next, env_oidc())
+                .await
+                .expect_err("an audit-append failure must fail the apply");
+        assert!(
+            err.to_string().contains("event store unavailable"),
+            "the event-store failure must surface, got: {err}"
+        );
+
+        assert_eq!(
+            h.claim_mappings.reconcile_call_count(),
+            saves_before,
+            "no second row write may have landed — rows and events commit together"
+        );
+        let identities: Vec<(String, String)> = {
+            let rows = h.claim_mappings.managed.lock().unwrap();
+            rows.keys().cloned().collect()
+        };
+        assert_eq!(
+            identities,
+            vec![("g-dev".to_string(), "developer".to_string())],
+            "the pre-apply mapping must still be the only managed row"
+        );
+        assert_eq!(
+            count_cm_applied(&authz_events(&h).await),
+            applied_before,
+            "no audit event may have landed either"
+        );
+    }
+
     #[tokio::test]
     async fn apply_claim_mappings_empty_desired_revokes_all() {
         let h = build_harness();
@@ -376,7 +430,8 @@ mod tests {
         desired.claim_mappings.push(cm_env("b", "g-b", "cb"));
         h.uc.apply(desired, env_oidc()).await.unwrap();
         assert_eq!(h.claim_mappings.managed_count(), 2);
-        // Empty `claim_mappings` slice in desired → save_managed(&[])
+        // Empty `claim_mappings` slice in desired → commit with an
+        // empty desired set
         // revokes the entire gitops-managed partition.
         let report =
             h.uc.apply(DesiredState::default(), env_oidc())

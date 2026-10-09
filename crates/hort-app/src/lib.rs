@@ -96,6 +96,10 @@ pub mod provenance;
 // named. Pure data + the structural guard's cross-check helper; no I/O.
 pub mod lifecycle_dependency_registry;
 pub mod rbac;
+// The one retry-backoff curve a failing `jobs` row waits out, shared by
+// the task dispatcher and the scan orchestrator so "five attempts"
+// cannot mean two different windows depending on which one is asking.
+pub mod retry_backoff;
 // The vulnerability-scanner backends compiled into this build — the single
 // source of truth the apply-time `scanBackends` validator checks against
 // (sibling of `crate::provenance`). Static, not the live worker registry:

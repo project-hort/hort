@@ -664,14 +664,17 @@ pub trait JobsRepository: Send + Sync {
     /// ([`RequeueOutcome::Requeued`]). A row at or above the cap goes to
     /// `failed` ([`RequeueOutcome::RetriesExhausted`]).
     ///
-    /// **The cap has to be enforced here, and this is the only place it
-    /// can be.** Every other retry budget in the system is spent by code
-    /// running *after* the handler returns — the scan orchestrator's
-    /// `attempts >= max_attempts` branch in `record_outcome`, the
-    /// dispatcher's `TaskOutcome::Failed { retry }` arms. A task that
-    /// kills its worker never reaches any of them, so a requeue that did
-    /// not carry its own cap would re-drive a crash loop forever while
-    /// `attempts` climbed with nothing reading it.
+    /// **The cap has to be enforced here, because for a row whose
+    /// handler never returned this is the only place it can be.** Every
+    /// other place the same budget is spent runs *after* the handler
+    /// returns — the scan orchestrator's `attempts >= max_attempts`
+    /// branch in `record_outcome`, the dispatcher's
+    /// `TaskOutcome::Failed { retry }` arm. A task that kills its worker
+    /// never reaches any of them, so a requeue that did not carry its
+    /// own cap would re-drive a crash loop forever while `attempts`
+    /// climbed with nothing reading it. The number is the same on every
+    /// path on purpose; the dispatcher's `JOB_ATTEMPT_CAP` is what it
+    /// passes in here.
     ///
     /// The row is never deleted. It may be genuinely running, and its
     /// completion has to land somewhere: `mark_completed` /

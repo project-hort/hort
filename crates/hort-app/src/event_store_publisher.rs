@@ -13,11 +13,17 @@
 //! because this sender cannot see every persisted event: an event
 //! appended inside a caller-owned transaction
 //! (`PgEventStore::append_in_tx`, reached through the artifact / ref /
-//! artifact-group lifecycle ports) never reaches
+//! artifact-group / authority lifecycle ports) never reaches
 //! [`append`](EventStore::append) at all, and the channel is per-process
 //! so it carries nothing another replica wrote. What a `send` buys is
 //! latency: a consumer learns there is something to read sooner than
 //! its own poll would have told it.
+//!
+//! The authority port is the newest entry in that list, and its
+//! gitops-apply audit events are the least affected by it: the apply
+//! runs at boot, before any dispatcher exists, so those appends were
+//! already reaching a publisher with no subscribers
+//! (`EventStorePublisher::without_broadcast` in `gitops_boot`).
 //!
 //! # Best-effort contract
 //!

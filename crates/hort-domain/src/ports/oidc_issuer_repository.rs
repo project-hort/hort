@@ -6,9 +6,21 @@
 //! the only read-heavy consumer.
 //!
 //! No `managed_by` field on the row (a deliberate design decision): the
-//! aggregate is exclusively gitops-managed. The port therefore exposes
-//! the four CRUD verbs the apply pipeline + federation handler need
-//! and nothing else.
+//! aggregate is exclusively gitops-managed.
+//!
+//! **This port is read-only.** The write is
+//! [`AuthorityLifecyclePort::commit_oidc_issuers`], which commits the
+//! upsert/delete set **and** the attesting `OidcIssuerCreated` /
+//! `OidcIssuerUpdated` / `OidcIssuerDeleted` events in one
+//! transaction. That matters more here than anywhere else in the
+//! family: an issuer row is a trust anchor, and a serving validator
+//! reads this repository at validation time, so a surviving replica
+//! acts on the new trust state the moment the row commits. See
+//! [`crate::ports::permission_grant_repository`] for why the write
+//! methods are *removed* from this trait rather than left unused.
+//!
+//! [`AuthorityLifecyclePort::commit_oidc_issuers`]:
+//!     crate::ports::authority_lifecycle::AuthorityLifecyclePort::commit_oidc_issuers
 
 use crate::entities::oidc_issuer::OidcIssuer;
 use crate::error::DomainResult;
@@ -32,16 +44,6 @@ pub trait OidcIssuerRepository: Send + Sync {
     /// branch on `/auth/token-exchange` to resolve a
     /// foreign JWT's `iss` to the validator config.
     fn get_by_issuer_url(&self, url: &str) -> BoxFuture<'_, DomainResult<Option<OidcIssuer>>>;
-
-    /// INSERT-or-UPDATE keyed by `name`. The apply pipeline calls this
-    /// on both `plan.create` and `plan.update`; the adapter UPSERTs so
-    /// the row's primary key is stable across re-applies even if the
-    /// caller-supplied `id` differs.
-    fn upsert(&self, issuer: &OidcIssuer) -> BoxFuture<'_, DomainResult<()>>;
-
-    /// DELETE by `name`. The apply pipeline calls this on `plan.delete`.
-    /// A delete of a name that no longer exists is a no-op.
-    fn delete_by_name(&self, name: &str) -> BoxFuture<'_, DomainResult<()>>;
 }
 
 #[cfg(test)]

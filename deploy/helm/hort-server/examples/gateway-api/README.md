@@ -149,9 +149,13 @@ affects pushes.
 
 hort-server's own application-layer cap is
 `HORT_PUBLISH_BODY_MAX_SIZE` (chart key `http.publishBodyMaxSize`, a
-size string such as `"512Mi"`; empty ⇒ binary default 300 MiB). For
-pushes larger than 300 MiB raise the chart value AND the controller's
-per-route cap.
+size string such as `"512Mi"`; empty ⇒ binary default 300 MiB). As a
+size it governs the npm, PyPI and Maven publish routes; cargo keeps its
+own fixed 200 MiB ceiling against any non-zero value, and OCI push
+takes no ceiling from it. For pushes larger than 300 MiB raise the
+chart value AND the controller's per-route cap. (An explicit `"0"` is
+not a size at all but the refuse-all-publishes kill-switch, which does
+close OCI push — see the values reference.)
 Note that the OCI chunked-upload path bounds each `PATCH` chunk
 individually rather than the whole blob, so OCI base layers many
 GB in size pass the binary's per-request limit even at the default;

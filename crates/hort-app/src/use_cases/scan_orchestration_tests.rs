@@ -1,7 +1,6 @@
 //! Unit tests for `ScanOrchestrationUseCase`.
 //!
 //! Coverage targets:
-//! - `compute_backoff` — every documented attempts branch.
 //! - `merge_findings` — collision dedup with severity preference,
 //!   case-insensitive vuln-id, case-sensitive PURL.
 //! - `severity_summary_from_findings` — per-tier counts.
@@ -665,44 +664,15 @@ fn persisted_scan_completed(
 }
 
 // ===========================================================================
-// PURE HELPERS — compute_backoff, merge_findings, severity_summary
+// PURE HELPERS — merge_findings, severity_summary
 // ===========================================================================
-
-#[test]
-fn compute_backoff_attempts_one_returns_60_seconds() {
-    assert_eq!(compute_backoff(1), Duration::from_secs(60));
-}
-
-#[test]
-fn compute_backoff_attempts_two_returns_5_minutes() {
-    assert_eq!(compute_backoff(2), Duration::from_secs(5 * 60));
-}
-
-#[test]
-fn compute_backoff_attempts_three_returns_30_minutes() {
-    assert_eq!(compute_backoff(3), Duration::from_secs(30 * 60));
-}
-
-#[test]
-fn compute_backoff_attempts_four_returns_60_minutes() {
-    assert_eq!(compute_backoff(4), Duration::from_secs(60 * 60));
-}
-
-#[test]
-fn compute_backoff_attempts_five_or_more_returns_60_minutes_cap() {
-    assert_eq!(compute_backoff(5), Duration::from_secs(60 * 60));
-    assert_eq!(compute_backoff(7), Duration::from_secs(60 * 60));
-    assert_eq!(compute_backoff(100), Duration::from_secs(60 * 60));
-}
-
-#[test]
-fn compute_backoff_attempts_zero_defensive_returns_60_seconds() {
-    // Defensive — claim_scan_jobs increments attempts before the
-    // worker observes the row, so attempts == 0 should not occur in
-    // practice. Pin the fallback so a bug doesn't silently produce a
-    // zero-duration retry storm.
-    assert_eq!(compute_backoff(0), Duration::from_secs(60));
-}
+//
+// The backoff curve `record_outcome`'s `Failed` branch waits out is no
+// longer defined in this module: it moved to `crate::retry_backoff`,
+// shared with the task dispatcher, and its per-attempt values are
+// pinned there. `record_outcome`'s own use of it — a `Failed` outcome
+// below `max_attempts` reschedules rather than failing the row — is
+// covered by the `record_outcome` tests further down.
 
 // -- merge_findings: collision preference ----------------------------------
 

@@ -1958,8 +1958,8 @@ mod tests {
         };
 
         // `subscriptions.owner_user_id` is FK → `users(id)`; seed a
-        // backing service-account user (mirrors
-        // `permission_grant_repo::save_managed_round_trips_user_subject`).
+        // backing service-account user (mirrors `seed_backing_user` in
+        // `tests/authority_audit_atomicity.rs`).
         let owner = Uuid::new_v4();
         let uname = format!("sub-owner-{}", owner.simple());
         sqlx::query(

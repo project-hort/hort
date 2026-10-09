@@ -300,11 +300,27 @@ http:
   maxInflightPerIp: 0
   # HORT_PUBLISH_BODY_MAX_SIZE —
   # A human-readable SIZE string ("300Mi", "1Gi", "512Mi") — quote it.
-  # Empty ⇒ env var unset ⇒ binary default (300 MiB). An explicit "0"
-  # is the refuse-all-publishes kill-switch. Override when publishing
-  # artifacts larger than 300 MiB. Strings (not bare integers) so a
-  # multi-GiB value can never round-trip through Helm's float64
-  # coercion into scientific notation (the rc.3 boot-crash class).
+  # Empty ⇒ env var unset ⇒ binary default (300 MiB). Override when
+  # publishing artifacts larger than 300 MiB. Strings (not bare
+  # integers) so a multi-GiB value can never round-trip through Helm's
+  # float64 coercion into scientific notation (the rc.3 boot-crash
+  # class).
+  #
+  # A SIZE applies to npm, PyPI and Maven. Cargo keeps its own fixed
+  # 200 MiB publish ceiling either way — deliberately, so tuning this
+  # value for Python wheels does not silently move cargo's ceiling too.
+  #
+  # An explicit "0" is the refuse-all-publishes kill-switch. It is not
+  # a smaller ceiling, so the cargo carve-out above does not apply to
+  # it, and it closes EVERY publish surface: all four hosted formats
+  # plus the OCI push path (blob upload POST/PATCH/PUT and manifest
+  # PUT), which a size leaves alone. Every publish then answers
+  # "503 Service Unavailable" with no Retry-After — the hold has no
+  # deadline, it ends when you change this value and restart.
+  #
+  # Reads are untouched: GET/HEAD keep serving artifacts while the
+  # switch is on. So are deletions, including the OCI upload-session
+  # cancel a client needs in order to clean up after a refused push.
   publishBodyMaxSize: ""
 
 # -------------------- Upstream proxy --------------------
@@ -752,20 +768,30 @@ podDisruptionBudget:
 # MIGRATE-JOB / BOOTSTRAP CARVE-OUT. These app-pod `ingress`/`egress`
 # rules apply ONLY to the app pods. An ADDITIONAL, separate NetworkPolicy
 # (`networkpolicy-migrate-job.yaml`) is rendered alongside this one
-# whenever `networkPolicy.enabled` is true. It selects ONLY the
-# Job/CronJob pods (by the `hort-server.io/job` label every such pod
-# carries; the app pods do NOT carry it) and grants them DNS + an
-# additive unrestricted egress. WHY: with this app-pod policy's
-# default-EMPTY `egress`, stock Kubernetes renders a deny-all egress;
-# its `podSelector` (the shared `selectorLabels`) ALSO matched the
-# pre-install `migrate` Helm hook Job, so the deny-all blocked the Job
-# from reaching Postgres and `helm install` aborted before the app ever
-# started. The app-pod posture is byte-unchanged (still
-# secure-by-default deny-all until you populate rules); NetworkPolicies
-# are purely additive, so the Job-scoped policy adds an allowance to the
-# Jobs WITHOUT relaxing the app pods. The DB endpoint lives inside the
-# opaque Secret DSN — the chart deliberately does not guess CIDRs; the
-# carve-out is the standard no-guess bootstrap-Job allowance. Setting
+# whenever `networkPolicy.enabled` is true. It selects ONLY THIS
+# RELEASE's Job/CronJob pods — its `podSelector` ANDs this release's
+# `app.kubernetes.io/{name,instance}` labels with the
+# `hort-server.io/job` label key every such pod carries, so a pod needs
+# both to be selected (the app pods carry the name/instance labels but
+# not the job key, so they stay out; a pod belonging to another release,
+# or to nothing in this chart, is out whatever it labels itself) — and
+# grants them DNS + an additive unrestricted egress. WHY: with this
+# app-pod policy's default-EMPTY `egress`, stock Kubernetes renders a
+# deny-all egress; its `podSelector` (the shared `selectorLabels`) ALSO
+# matched the pre-install `migrate` Helm hook Job, so the deny-all
+# blocked the Job from reaching Postgres and `helm install` aborted
+# before the app ever started. The app-pod posture is byte-unchanged
+# (still secure-by-default deny-all until you populate rules);
+# NetworkPolicies are purely additive, so the Job-scoped policy adds an
+# allowance to those Job pods WITHOUT relaxing the app pods. The DB
+# endpoint lives inside the opaque Secret DSN — the chart deliberately
+# does not guess CIDRs; the carve-out is the standard no-guess
+# bootstrap-Job allowance. If you know your CIDRs and want that Job
+# egress tighter, the only lever is narrowing the `to:` of that rule
+# itself (fork the chart, or patch the rendered policy with
+# `--post-renderer`): NetworkPolicy allowances are additive, so a
+# second, tighter policy cannot subtract this one, and the app `egress`
+# rules above never reach the Job pods at all. Setting
 # `networkPolicy.enabled: false` disables BOTH policies. See the
 # docstring in `templates/networkpolicy-migrate-job.yaml` for the full
 # per-Job verdict table.

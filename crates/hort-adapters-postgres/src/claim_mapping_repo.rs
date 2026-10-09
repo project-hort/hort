@@ -43,11 +43,11 @@ pub(crate) struct ClaimMappingRow {
 }
 
 /// Owned column projection of a managed [`ClaimMapping`], built before
-/// the `save_managed` transaction opens so the future borrows nothing
+/// the reconcile transaction opens so the future borrows nothing
 /// from `items`. Named struct (not a 4-tuple) to keep the reconcile
 /// INSERT loop readable and to satisfy `clippy::type_complexity` —
 /// behaviour is identical to the prior tuple form.
-struct PreparedClaimMapping {
+pub(crate) struct PreparedClaimMapping {
     id: Uuid,
     idp_group: String,
     claim: String,
@@ -103,92 +103,95 @@ impl ClaimMappingRepository for PgClaimMappingRepository {
             Ok(rows.into_iter().map(row_to_claim_mapping).collect())
         })
     }
+}
 
-    fn save_managed(&self, items: &[ClaimMapping]) -> BoxFuture<'_, DomainResult<()>> {
-        // Project to owned tuples; reject any element missing a digest
-        // before opening the transaction.
-        let prepared: DomainResult<Vec<PreparedClaimMapping>> = items
-            .iter()
-            .map(|m| {
-                let digest = m.managed_by_digest.ok_or_else(|| {
-                    DomainError::Invariant(format!(
-                        "save_managed requires managed_by_digest on claim_mapping {}",
-                        m.id
-                    ))
-                })?;
-                Ok(PreparedClaimMapping {
-                    id: m.id,
-                    idp_group: m.idp_group.clone(),
-                    claim: m.claim.clone(),
-                    digest: digest.to_vec(),
-                })
+// ---------------------------------------------------------------------------
+// In-transaction reconcile — shared with the authority lifecycle adapter
+// ---------------------------------------------------------------------------
+
+/// Project a managed mapping set to its owned column tuples, rejecting
+/// any element missing a digest **before** a transaction is opened.
+pub(crate) fn prepare_managed_claim_mappings(
+    items: &[ClaimMapping],
+) -> DomainResult<Vec<PreparedClaimMapping>> {
+    items
+        .iter()
+        .map(|m| {
+            let digest = m.managed_by_digest.ok_or_else(|| {
+                DomainError::Invariant(format!(
+                    "a managed claim_mapping requires managed_by_digest, mapping {} has none",
+                    m.id
+                ))
+            })?;
+            Ok(PreparedClaimMapping {
+                id: m.id,
+                idp_group: m.idp_group.clone(),
+                claim: m.claim.clone(),
+                digest: digest.to_vec(),
             })
-            .collect();
-        Box::pin(async move {
-            let prepared = prepared?;
-            tracing::info!(
-                entity = "claim_mapping",
-                count = prepared.len(),
-                "save_managed full reconcile (gitops apply)"
-            );
-
-            // Reconcile the ENTIRE `managed_by = 'gitops'` partition to
-            // `items` in one transaction. `(idp_group, claim)` is the
-            // table's UNIQUE key; delete-absent + upsert-present is
-            // realised as delete-all-gitops + INSERT … ON CONFLICT.
-            // `local` rows are out of scope. One tx → atomic; a failure
-            // rolls the partition back unchanged.
-            let mut tx = self.pool.begin().await.map_err(|e| {
-                tracing::warn!(error = %e, "begin tx for claim_mappings save_managed");
-                map_sqlx_error(&e, "ClaimMapping", "save_managed:begin")
-            })?;
-
-            sqlx::query("DELETE FROM claim_mappings WHERE managed_by = 'gitops'")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "delete gitops-managed mappings");
-                    map_sqlx_error(&e, "ClaimMapping", "save_managed:delete")
-                })?;
-
-            for m in &prepared {
-                // ON CONFLICT guards the case where the same
-                // (idp_group, claim) survives as a `local` row: the
-                // gitops apply takes ownership of it (managed_by flips
-                // to gitops — takes ownership of the surviving row.
-                sqlx::query(
-                    r#"INSERT INTO claim_mappings
-                           (id, idp_group, claim, managed_by, managed_by_digest)
-                       VALUES ($1, $2, $3, 'gitops', $4)
-                       ON CONFLICT (idp_group, claim) DO UPDATE SET
-                           managed_by        = 'gitops',
-                           managed_by_digest = EXCLUDED.managed_by_digest"#,
-                )
-                .bind(m.id)
-                .bind(&m.idp_group)
-                .bind(&m.claim)
-                .bind(&m.digest)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(mapping_id = %m.id, error = %e, "insert gitops mapping");
-                    map_sqlx_error(&e, "ClaimMapping", &m.id.to_string())
-                })?;
-            }
-
-            tx.commit().await.map_err(|e| {
-                tracing::warn!(error = %e, "commit claim_mappings save_managed");
-                map_sqlx_error(&e, "ClaimMapping", "save_managed:commit")
-            })?;
-            Ok(())
         })
+        .collect()
+}
+
+/// Reconcile the ENTIRE `managed_by = 'gitops'` partition to `prepared`
+/// on the caller's open transaction.
+///
+/// `(idp_group, claim)` is the table's UNIQUE key; delete-absent +
+/// upsert-present is realised as delete-all-gitops + INSERT … ON
+/// CONFLICT. `local` rows are out of scope.
+///
+/// The caller owns the transaction boundary, which is what lets the
+/// audit append join the same transaction
+/// (`crate::authority_lifecycle::PgAuthorityLifecycle`); a failure on
+/// either side rolls the partition back unchanged.
+pub(crate) async fn reconcile_managed_claim_mappings_in_tx(
+    conn: &mut sqlx::PgConnection,
+    prepared: &[PreparedClaimMapping],
+) -> DomainResult<()> {
+    tracing::info!(
+        entity = "claim_mapping",
+        count = prepared.len(),
+        "managed-partition full reconcile (gitops apply)"
+    );
+
+    sqlx::query("DELETE FROM claim_mappings WHERE managed_by = 'gitops'")
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "delete gitops-managed mappings");
+            map_sqlx_error(&e, "ClaimMapping", "reconcile_managed:delete")
+        })?;
+
+    for m in prepared {
+        // ON CONFLICT guards the case where the same
+        // (idp_group, claim) survives as a `local` row: the gitops
+        // apply takes ownership of the surviving row (managed_by flips
+        // to gitops).
+        sqlx::query(
+            r#"INSERT INTO claim_mappings
+                   (id, idp_group, claim, managed_by, managed_by_digest)
+               VALUES ($1, $2, $3, 'gitops', $4)
+               ON CONFLICT (idp_group, claim) DO UPDATE SET
+                   managed_by        = 'gitops',
+                   managed_by_digest = EXCLUDED.managed_by_digest"#,
+        )
+        .bind(m.id)
+        .bind(&m.idp_group)
+        .bind(&m.claim)
+        .bind(&m.digest)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| {
+            tracing::warn!(mapping_id = %m.id, error = %e, "insert gitops mapping");
+            map_sqlx_error(&e, "ClaimMapping", &m.id.to_string())
+        })?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     fn sample_row() -> ClaimMappingRow {
         ClaimMappingRow {
@@ -256,168 +259,5 @@ mod tests {
         let pool = PgPool::connect_lazy("postgres://localhost/nonexistent")
             .expect("connect_lazy validates only the URL, not connectivity");
         let _ = PgClaimMappingRepository::new(pool);
-    }
-
-    // -- DB-backed integration tests (skipped when DATABASE_URL unset) ------
-
-    use std::env;
-
-    async fn maybe_pool() -> Option<PgPool> {
-        let url = env::var("DATABASE_URL").ok()?;
-        let pool = crate::test_support::isolated_db_from(&url).await?;
-        crate::test_support::migrate_or_panic(&pool).await;
-        Some(pool)
-    }
-
-    // `save_managed` is the authoritative-set reconcile primitive
-    // (delete-absent + upsert-present over the gitops partition, one
-    // transaction). Deferred-execution: no `DATABASE_URL` here →
-    // `maybe_pool` returns `None` and these early-return.
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_round_trips_and_is_idempotent() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = PgClaimMappingRepository::new(pool);
-        let id = Uuid::new_v4();
-        let group = format!("grp-{}", id.simple());
-        let mapping = ClaimMapping {
-            id,
-            idp_group: group.clone(),
-            claim: "developer".into(),
-            managed_by: ManagedBy::GitOps,
-            managed_by_digest: Some([0x33; 32]),
-        };
-        repo.save_managed(std::slice::from_ref(&mapping))
-            .await
-            .expect("save_managed");
-        // Idempotent re-application of the same complete set on the
-        // (idp_group, claim) key.
-        repo.save_managed(std::slice::from_ref(&mapping))
-            .await
-            .expect("save_managed again (idempotent)");
-
-        let all = repo.list_all().await.expect("list_all");
-        let found = all
-            .iter()
-            .find(|m| m.idp_group == group && m.claim == "developer")
-            .expect("mapping present");
-        assert_eq!(found.managed_by, ManagedBy::GitOps);
-        assert_eq!(found.managed_by_digest, Some([0x33; 32]));
-
-        let managed = repo
-            .list_managed_by_gitops()
-            .await
-            .expect("list_managed_by_gitops");
-        assert_eq!(
-            managed.iter().filter(|m| m.idp_group == group).count(),
-            1,
-            "idempotent re-apply must not duplicate the managed row"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_full_reconcile_deletes_absent_managed_rows() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = PgClaimMappingRepository::new(pool);
-        let g1 = format!("grp-a-{}", Uuid::new_v4().simple());
-        let g2 = format!("grp-b-{}", Uuid::new_v4().simple());
-        let m_a = ClaimMapping {
-            id: Uuid::new_v4(),
-            idp_group: g1.clone(),
-            claim: "developer".into(),
-            managed_by: ManagedBy::GitOps,
-            managed_by_digest: Some([0x01; 32]),
-        };
-        let m_b = ClaimMapping {
-            id: Uuid::new_v4(),
-            idp_group: g2.clone(),
-            claim: "reader".into(),
-            managed_by: ManagedBy::GitOps,
-            managed_by_digest: Some([0x02; 32]),
-        };
-        repo.save_managed(&[m_a.clone(), m_b.clone()])
-            .await
-            .expect("first apply");
-
-        // Reconcile to {m_a} — m_b must be revoked (delete-absent).
-        repo.save_managed(std::slice::from_ref(&m_a))
-            .await
-            .expect("reconcile to {m_a}");
-
-        let managed = repo
-            .list_managed_by_gitops()
-            .await
-            .expect("list_managed_by_gitops");
-        assert!(managed.iter().any(|m| m.idp_group == g1));
-        assert!(
-            !managed.iter().any(|m| m.idp_group == g2),
-            "mapping absent from the new authoritative set must be deleted"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_empty_set_revokes_all_gitops_mappings() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = PgClaimMappingRepository::new(pool);
-        let group = format!("grp-{}", Uuid::new_v4().simple());
-        let mapping = ClaimMapping {
-            id: Uuid::new_v4(),
-            idp_group: group.clone(),
-            claim: "developer".into(),
-            managed_by: ManagedBy::GitOps,
-            managed_by_digest: Some([0x33; 32]),
-        };
-        repo.save_managed(std::slice::from_ref(&mapping))
-            .await
-            .expect("seed one mapping");
-
-        repo.save_managed(&[]).await.expect("reconcile to empty");
-
-        let managed = repo
-            .list_managed_by_gitops()
-            .await
-            .expect("list_managed_by_gitops");
-        assert!(
-            !managed.iter().any(|m| m.idp_group == group),
-            "empty authoritative set revokes all gitops-managed mappings"
-        );
-    }
-
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn save_managed_does_not_touch_local_rows() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let local_group = format!("local-{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO claim_mappings (id, idp_group, claim, managed_by) \
-             VALUES ($1, $2, 'local-claim', 'local')",
-        )
-        .bind(Uuid::new_v4())
-        .bind(&local_group)
-        .execute(&pool)
-        .await
-        .expect("insert local mapping");
-
-        let repo = PgClaimMappingRepository::new(pool.clone());
-        repo.save_managed(&[])
-            .await
-            .expect("reconcile gitops empty");
-
-        let all = repo.list_all().await.expect("list_all");
-        assert!(
-            all.iter().any(|m| m.idp_group == local_group),
-            "Local row must survive a gitops-partition reconcile"
-        );
     }
 }

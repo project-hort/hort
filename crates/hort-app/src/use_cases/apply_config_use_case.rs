@@ -6,9 +6,9 @@
 //! HTTP surface. It is the single point of truth for "compute the
 //! plan, then apply it" — the diff is in `hort-config`, the writes
 //! land via the managed-write methods on `RepositoryRepository`,
-//! `ClaimMappingRepository`, `PermissionGrantRepository`,
-//! `CurationRuleRepository`, and through `PolicyUseCase` for
-//! event-sourced kinds.
+//! `CurationRuleRepository`, through `AuthorityLifecyclePort` for the
+//! five authority kinds whose rows commit with their audit events,
+//! and through `PolicyUseCase` for event-sourced kinds.
 //!
 //! # Additive-claims RBAC model (ADR 0012)
 //!
@@ -20,19 +20,46 @@
 //! (`(sorted required_claims, repository_id, permission)` for `Claims`;
 //! `(user_id, repository_id, permission)` for `User`).
 //!
-//! `ClaimMappingRepository::save_managed` /
-//! `PermissionGrantRepository::save_managed` are **whole-partition
-//! reconcile primitives**: the apply
+//! `AuthorityLifecyclePort::commit_claim_mappings` /
+//! `commit_permission_grants` are **whole-partition reconcile
+//! primitives that carry their own audit trail**: the apply
 //! branch builds the *complete* desired gitops-managed set, diffs it
 //! against `list_managed_by_gitops` to emit one
 //! `ClaimMappingApplied`/`PermissionGrantApplied` per added-or-changed
 //! row and one `ClaimMappingRevoked`/`PermissionGrantRevoked` per
-//! removed row (audit-event-per-mutation invariant), then calls
-//! `save_managed(&complete_desired_set)` once — the adapter does the
-//! atomic delete-absent + upsert-present. Because `save_managed`
-//! reconciles the *entire* gitops partition, the ServiceAccount
-//! `User`-subject grants and the envelope-declared grants are unioned
-//! into one `save_managed(permission_grants)` call.
+//! removed row (audit-event-per-mutation invariant), then commits the
+//! complete set **and** those events in one transaction — the adapter
+//! does the atomic delete-absent + upsert-present and joins the audit
+//! append to the same transaction. Because the reconcile covers the
+//! *entire* gitops partition, the ServiceAccount `User`-subject grants
+//! and the envelope-declared grants are unioned into one
+//! `commit_permission_grants` call.
+//!
+//! # Why the audit append rides the row transaction
+//!
+//! The five security-relevant CRUD kinds — permission grants, claim
+//! mappings, OIDC issuers, gitops-managed upstream mappings,
+//! service-account aggregates — each used to write their row, commit
+//! it, and append the attesting event in a separate call. An append
+//! failure (or a process termination) after that commit left the row
+//! **active with nothing in the authorization stream attesting it**,
+//! and the retry could not repair it: the next apply derives its
+//! events from the prior *rows*, which already hold the change, so it
+//! emits nothing. All five now route through
+//! `AuthorityLifecyclePort`, whose adapter commits rows + events in
+//! one `PgUnitOfWork`. Consequence an operator will notice: an
+//! event-store failure during any of those five applies now leaves
+//! the rows **unchanged** — the apply fails closed instead of
+//! half-done.
+//!
+//! The five repository ports no longer carry the write method the port
+//! replaced, so a future apply branch cannot reintroduce the dual
+//! write — it is a compile error, not a review rule. The one write
+//! that stays outside the transaction is the backing `users` row for a
+//! declared `ServiceAccount`, and it has to: the FK from
+//! `service_accounts.backing_user_id` requires it to be durable first.
+//! See `apply_service_accounts` for why an orphan backing user confers
+//! nothing.
 //!
 //! # Topological apply
 //!
@@ -135,10 +162,13 @@ use hort_domain::events::{
 use hort_domain::policy::{evaluate_curation_retroactive, RetroactiveCurationOutcome};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::authority_lifecycle::{
+    AuthorityLifecyclePort, OidcIssuerChange, ServiceAccountCommit, UpstreamMappingCommit,
+};
 use hort_domain::ports::claim_mapping_repository::ClaimMappingRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::federated_jwt_validator::FederatedJwtValidator;
 use hort_domain::ports::oidc_issuer_repository::OidcIssuerRepository;
 use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
@@ -331,19 +361,40 @@ pub struct ApplyReport {
 pub struct ApplyConfigUseCase {
     repositories: Arc<dyn RepositoryRepository>,
     /// Whole-partition reconcile port for
-    /// `claim_mappings` (ADR 0012).
-    /// `save_managed` is the atomic delete-absent + upsert-present
-    /// primitive; revoke/apply audit events are emitted by this use
-    /// case, not the adapter.
+    /// `claim_mappings` (ADR 0012). Read-side only in this use case —
+    /// the apply diff runs off `list_managed_by_gitops`; the write goes
+    /// through [`Self::authority`], which commits the reconcile and the
+    /// revoke/apply audit events this use case derived in one
+    /// transaction.
     claim_mappings: Arc<dyn ClaimMappingRepository>,
     /// Whole-partition reconcile port for
     /// `permission_grants` (ADR 0012;
     /// there is no `role_id` in the additive-claims model). A grant
     /// carries a sum-typed [`GrantSubject`] (`Claims` XOR `User`).
-    /// `save_managed` reconciles the **entire** gitops partition, so
-    /// envelope-declared grants and SA-owned `User`-subject
-    /// grants are unioned into a single call.
+    /// Read-side only in this use case — the apply diff runs off
+    /// `list_managed_by_gitops`; the write goes through
+    /// [`Self::authority`].
     permission_grants: Arc<dyn PermissionGrantRepository>,
+    /// Atomic authority-row-plus-audit-event writer for the three
+    /// security-relevant CRUD kinds — permission grants, claim mappings
+    /// and OIDC issuers. One call commits the desired rows **and** the
+    /// audit batches the prior-vs-desired diff produced; the whole
+    /// gitops-partition reconcile (grants / claim mappings) and the
+    /// per-row upsert/delete set (issuers) join that one transaction.
+    ///
+    /// This closes a dual-write the three branches shared: each wrote
+    /// its row, committed it, and appended the attesting event in a
+    /// separate call, so an append failure — or a process termination —
+    /// left the grant, mapping or issuer **active with nothing in the
+    /// authorization stream attesting it**, in a state the retry
+    /// cannot repair (the next apply diffs against the already-changed
+    /// rows and emits nothing).
+    ///
+    /// A **required** [`Self::new`] parameter, not an opt-in builder: a
+    /// composition point that cannot supply an atomic writer must fail
+    /// to build rather than inherit its way back onto the
+    /// commit-then-append path.
+    authority: Arc<dyn AuthorityLifecyclePort>,
     /// Standalone curation-rule rows plus
     /// the `repository_curation_rules` junction-edge writer.
     curation_rules: Arc<dyn CurationRuleRepository>,
@@ -548,12 +599,11 @@ impl RetentionApply {
     }
 }
 
-/// Compile-time gate for the
-/// authorization-event append helpers ([`ApplyConfigUseCase::
-/// append_authorization_events`] /
-/// [`ApplyConfigUseCase::append_grouped_authorization_events`]).
+/// Compile-time gate for the authorization-event batch builders
+/// ([`ApplyConfigUseCase::authorization_batches`] /
+/// [`ApplyConfigUseCase::grouped_authorization_batches`]).
 ///
-/// **Architectural intent.** The helpers persist `RoleDefined` /
+/// **Architectural intent.** The builders assemble `RoleDefined` /
 /// `GroupMappingAdded` / `PermissionGrantAdded` / etc. — a set of
 /// audit events whose only legitimate emitter is the gitops apply
 /// pipeline. Before this gate, any future contributor could call the
@@ -561,7 +611,7 @@ impl RetentionApply {
 /// invariant "authorization events come from gitops apply only" was
 /// convention, not compile-time enforced. The token plus the pub-crate
 /// constructor turns the invariant into a compile error: without a
-/// `&GitOpsApplyToken`, the helpers refuse to compile, and a
+/// `&GitOpsApplyToken`, the builders refuse to compile, and a
 /// `GitOpsApplyToken` cannot be constructed outside `hort-app` (the
 /// constructor is `pub(crate)`).
 ///
@@ -728,6 +778,7 @@ impl ApplyConfigUseCase {
         repositories: Arc<dyn RepositoryRepository>,
         claim_mappings: Arc<dyn ClaimMappingRepository>,
         permission_grants: Arc<dyn PermissionGrantRepository>,
+        authority: Arc<dyn AuthorityLifecyclePort>,
         curation_rules: Arc<dyn CurationRuleRepository>,
         policy_projections: Arc<dyn PolicyProjectionRepository>,
         policies: Arc<PolicyUseCase>,
@@ -747,6 +798,7 @@ impl ApplyConfigUseCase {
             repositories,
             claim_mappings,
             permission_grants,
+            authority,
             curation_rules,
             policy_projections,
             policies,
@@ -1437,13 +1489,13 @@ impl ApplyConfigUseCase {
         // aggregate + the backing `users` row — its `User`-subject
         // grants are reconciled by the consolidated PermissionGrant
         // pass below.
-        self.apply_oidc_issuers(&plan.oidc_issuers, &mut report)
+        self.apply_oidc_issuers(&plan.oidc_issuers, &mut report, &token)
             .await?;
-        self.apply_service_accounts(&plan.service_accounts, &mut report)
+        self.apply_service_accounts(&plan.service_accounts, &mut report, &token)
             .await?;
 
         // ----- Consolidated PermissionGrant
-        // reconcile (runs LAST). `PermissionGrantRepository::save_managed`
+        // reconcile (runs LAST). `AuthorityLifecyclePort::commit_permission_grants`
         // reconciles the *entire* `managed_by = gitops` partition in one
         // atomic delete-absent + upsert-present, so the
         // envelope-declared grants AND the SA-owned
@@ -2020,7 +2072,7 @@ mod tests {
 
     // --- mock ClaimMappingRepository ---------------------------------------
     //
-    // `save_managed(&[items])` is the whole-partition reconcile
+    // `reconcile_managed_rows(&[items])` is the whole-partition
     // primitive: in one call the adapter deletes every
     // gitops-managed row whose `(idp_group, claim)` identity is absent
     // from `items` and upserts every row that is present, keyed on that
@@ -2032,22 +2084,22 @@ mod tests {
     #[derive(Default)]
     pub(in crate::use_cases::apply_config_use_case) struct MockClaimMappingRepo {
         /// gitops-managed rows keyed by the `(idp_group, claim)` natural
-        /// identity — same key `save_managed` reconciles on.
+        /// identity — the same key the reconcile upserts on.
         pub(in crate::use_cases::apply_config_use_case) managed:
             Mutex<HashMap<(String, String), ClaimMapping>>,
-        /// Every `save_managed` invocation's complete slice (test
+        /// Every reconcile invocation's complete slice (test
         /// introspection: call count + last authoritative set).
-        save_managed_calls: Mutex<Vec<Vec<ClaimMapping>>>,
+        reconcile_calls: Mutex<Vec<Vec<ClaimMapping>>>,
     }
 
     impl MockClaimMappingRepo {
         pub(in crate::use_cases::apply_config_use_case) fn new() -> Self {
             Self::default()
         }
-        /// Number of `save_managed` invocations (the apply pipeline
-        /// calls it once per `apply_claim_mappings`, unconditionally).
-        pub(in crate::use_cases::apply_config_use_case) fn save_managed_call_count(&self) -> usize {
-            self.save_managed_calls.lock().unwrap().len()
+        /// Number of reconcile invocations (the apply pipeline commits
+        /// once per `apply_claim_mappings`, unconditionally).
+        pub(in crate::use_cases::apply_config_use_case) fn reconcile_call_count(&self) -> usize {
+            self.reconcile_calls.lock().unwrap().len()
         }
         /// Current managed-row count after the last reconcile.
         pub(in crate::use_cases::apply_config_use_case) fn managed_count(&self) -> usize {
@@ -2064,16 +2116,28 @@ mod tests {
             let v: Vec<ClaimMapping> = self.managed.lock().unwrap().values().cloned().collect();
             Box::pin(async move { Ok(v) })
         }
-        fn save_managed(&self, items: &[ClaimMapping]) -> BoxFuture<'_, DomainResult<()>> {
-            self.save_managed_calls.lock().unwrap().push(items.to_vec());
-            // Whole-partition reconcile: replace the entire managed set
-            // with `items` keyed on `(idp_group, claim)`.
+    }
+
+    impl MockClaimMappingRepo {
+        /// The whole-partition reconcile, as an **inherent** method:
+        /// replace the entire managed set with `items`, keyed on
+        /// `(idp_group, claim)`.
+        ///
+        /// [`ClaimMappingRepository`] carries no write method any more
+        /// — the write is
+        /// `AuthorityLifecyclePort::commit_claim_mappings`, which
+        /// commits the reconcile with its audit batch in one
+        /// transaction. [`MockAuthorityLifecycle`] writes through here,
+        /// exactly as the Postgres adapter writes through
+        /// `claim_mapping_repo::reconcile_managed_claim_mappings_in_tx`:
+        /// the body stays, the trait wrapper is what went away.
+        fn reconcile_managed_rows(&self, items: &[ClaimMapping]) {
+            self.reconcile_calls.lock().unwrap().push(items.to_vec());
             let mut managed = self.managed.lock().unwrap();
             *managed = items
                 .iter()
                 .map(|m| ((m.idp_group.clone(), m.claim.clone()), m.clone()))
                 .collect();
-            Box::pin(async { Ok(()) })
         }
     }
 
@@ -2082,7 +2146,7 @@ mod tests {
     // --- mock PermissionGrantRepository ------------------------------------
     //
     // There is no `RoleRepository`; grants persist on their own port.
-    // `save_managed(&[items])` is the whole-partition reconcile
+    // `reconcile_managed_rows(&[items])` is the whole-partition
     // primitive: delete every gitops-managed grant whose subject-
     // dependent identity (`grant_identity_key` — `(sorted required_claims,
     // repository_id, permission)` for `Claims`; `(user_id, repository_id,
@@ -2095,23 +2159,23 @@ mod tests {
     #[derive(Default)]
     pub(in crate::use_cases::apply_config_use_case) struct MockPermissionGrantRepo {
         /// gitops-managed grants keyed by the subject-dependent identity
-        /// (`GrantIdentityKey`) — the same key `save_managed` reconciles
+        /// (`GrantIdentityKey`) — the same key the reconcile upserts
         /// on. Keeps surrogate-id churn out of the test assertions.
         managed: Mutex<HashMap<GrantIdentityKey, PermissionGrant>>,
-        /// Every `save_managed` invocation's complete authoritative
-        /// slice (call count + last reconciled set introspection).
-        save_managed_calls: Mutex<Vec<Vec<PermissionGrant>>>,
+        /// Every reconcile invocation's complete authoritative slice
+        /// (call count + last reconciled set introspection).
+        reconcile_calls: Mutex<Vec<Vec<PermissionGrant>>>,
     }
 
     impl MockPermissionGrantRepo {
         pub(in crate::use_cases::apply_config_use_case) fn new() -> Self {
             Self::default()
         }
-        /// Number of `save_managed` invocations. `apply_permission_grants`
-        /// calls it exactly once per apply, unconditionally — the
+        /// Number of reconcile invocations. `apply_permission_grants`
+        /// commits exactly once per apply, unconditionally — the
         /// consolidated reconcile that covers envelope + SA-owned grants.
-        pub(in crate::use_cases::apply_config_use_case) fn save_managed_call_count(&self) -> usize {
-            self.save_managed_calls.lock().unwrap().len()
+        pub(in crate::use_cases::apply_config_use_case) fn reconcile_call_count(&self) -> usize {
+            self.reconcile_calls.lock().unwrap().len()
         }
         /// Current managed-grant count after the last reconcile.
         pub(in crate::use_cases::apply_config_use_case) fn managed_count(&self) -> usize {
@@ -2134,10 +2198,17 @@ mod tests {
             let v: Vec<PermissionGrant> = self.managed.lock().unwrap().values().cloned().collect();
             Box::pin(async move { Ok(v) })
         }
-        fn save_managed(&self, items: &[PermissionGrant]) -> BoxFuture<'_, DomainResult<()>> {
-            self.save_managed_calls.lock().unwrap().push(items.to_vec());
-            // Whole-partition reconcile keyed on the subject-dependent
-            // identity — replace the entire managed set.
+    }
+
+    impl MockPermissionGrantRepo {
+        /// The whole-partition reconcile, as an **inherent** method:
+        /// replace the entire managed set with `items`, keyed on the
+        /// subject-dependent identity. See
+        /// [`MockClaimMappingRepo::reconcile_managed_rows`] for why
+        /// this is not a trait method; the adapter's counterpart is
+        /// `permission_grant_repo::reconcile_managed_grants_in_tx`.
+        fn reconcile_managed_rows(&self, items: &[PermissionGrant]) {
+            self.reconcile_calls.lock().unwrap().push(items.to_vec());
             let mut managed = self.managed.lock().unwrap();
             *managed = items
                 .iter()
@@ -2148,7 +2219,189 @@ mod tests {
                     )
                 })
                 .collect();
-            Box::pin(async { Ok(()) })
+        }
+    }
+
+    // --- mock AuthorityLifecyclePort ---------------------------------------
+    //
+    // The five authority kinds no longer write their rows through the
+    // row ports and then append; they hand rows + audit batches to
+    // `AuthorityLifecyclePort` in one call — and the row ports no longer
+    // carry a write method at all, so the mistake is a compile error.
+    // This mock writes through the same row mocks and event-store mock
+    // the harness already holds (via their inherent `*_row` /
+    // `reconcile_managed_rows` methods), so every pre-existing assertion
+    // on `h.claim_mappings` / `h.grant_repo` / `h.oidc_issuers` /
+    // `h.upstream` / `h.service_accounts` / `h.events` keeps meaning
+    // what it meant.
+    //
+    // The transaction is modelled by **outcome**: an armed failure
+    // returns `Err` having written neither the rows nor the events —
+    // which is what the Postgres adapter's rollback leaves behind. The
+    // rollback itself is pinned against a real server in
+    // `hort-adapters-postgres/tests/authority_audit_atomicity.rs`; what
+    // these app-layer tests pin is that the apply branch has no path
+    // that writes a row outside this one call.
+
+    /// Which authority write a [`MockAuthorityLifecycle`] call or armed
+    /// failure refers to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(in crate::use_cases::apply_config_use_case) enum AuthoritySite {
+        PermissionGrants,
+        ClaimMappings,
+        OidcIssuers,
+        UpstreamMappings,
+        ServiceAccounts,
+    }
+
+    pub(in crate::use_cases::apply_config_use_case) struct MockAuthorityLifecycle {
+        claim_mappings: Arc<MockClaimMappingRepo>,
+        grants: Arc<MockPermissionGrantRepo>,
+        oidc_issuers: Arc<crate::use_cases::test_support::MockOidcIssuerRepository>,
+        upstream_mappings:
+            Arc<crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository>,
+        service_accounts: Arc<crate::use_cases::test_support::MockServiceAccountRepository>,
+        events: Arc<MockPolicyEventStore>,
+        /// One-shot armed failures, keyed by site. Consumed on use.
+        next_error: Mutex<HashMap<AuthoritySite, DomainError>>,
+        /// `(site, batch_count)` per call, in call order — including
+        /// calls that then failed.
+        commits: Mutex<Vec<(AuthoritySite, usize)>>,
+    }
+
+    impl MockAuthorityLifecycle {
+        pub(in crate::use_cases::apply_config_use_case) fn new(
+            claim_mappings: Arc<MockClaimMappingRepo>,
+            grants: Arc<MockPermissionGrantRepo>,
+            oidc_issuers: Arc<crate::use_cases::test_support::MockOidcIssuerRepository>,
+            upstream_mappings: Arc<
+                crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository,
+            >,
+            service_accounts: Arc<crate::use_cases::test_support::MockServiceAccountRepository>,
+            events: Arc<MockPolicyEventStore>,
+        ) -> Self {
+            Self {
+                claim_mappings,
+                grants,
+                oidc_issuers,
+                upstream_mappings,
+                service_accounts,
+                events,
+                next_error: Mutex::new(HashMap::new()),
+                commits: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Arm a one-shot failure for the next commit at `site`. The
+        /// commit records the attempt and then writes nothing — the
+        /// adapter's all-or-nothing outcome.
+        pub(in crate::use_cases::apply_config_use_case) fn fail_next(
+            &self,
+            site: AuthoritySite,
+            err: DomainError,
+        ) {
+            self.next_error.lock().unwrap().insert(site, err);
+        }
+
+        /// `(site, batch_count)` per commit call, in call order.
+        pub(in crate::use_cases::apply_config_use_case) fn commits(
+            &self,
+        ) -> Vec<(AuthoritySite, usize)> {
+            self.commits.lock().unwrap().clone()
+        }
+
+        /// Record the call and consume an armed failure. `Err` here is
+        /// the rolled-back outcome: no row write, no append.
+        fn enter(&self, site: AuthoritySite, batch_count: usize) -> DomainResult<()> {
+            self.commits.lock().unwrap().push((site, batch_count));
+            match self.next_error.lock().unwrap().remove(&site) {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        }
+
+        async fn append_all(&self, batches: Vec<AppendEvents>) -> DomainResult<()> {
+            for batch in batches {
+                self.events.append(batch).await?;
+            }
+            Ok(())
+        }
+    }
+
+    impl AuthorityLifecyclePort for MockAuthorityLifecycle {
+        fn commit_permission_grants<'a>(
+            &'a self,
+            desired: &'a [PermissionGrant],
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::PermissionGrants, batches.len())?;
+                self.grants.reconcile_managed_rows(desired);
+                self.append_all(batches).await
+            })
+        }
+
+        fn commit_claim_mappings<'a>(
+            &'a self,
+            desired: &'a [ClaimMapping],
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::ClaimMappings, batches.len())?;
+                self.claim_mappings.reconcile_managed_rows(desired);
+                self.append_all(batches).await
+            })
+        }
+
+        fn commit_oidc_issuers<'a>(
+            &'a self,
+            change: &'a OidcIssuerChange,
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::OidcIssuers, batches.len())?;
+                for issuer in &change.upserts {
+                    self.oidc_issuers.upsert_row(issuer);
+                }
+                for name in &change.deletes {
+                    self.oidc_issuers.delete_row(name);
+                }
+                self.append_all(batches).await
+            })
+        }
+
+        fn commit_upstream_mappings<'a>(
+            &'a self,
+            change: &'a UpstreamMappingCommit,
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::UpstreamMappings, batches.len())?;
+                for mapping in &change.upserts {
+                    self.upstream_mappings.write_managed_row(mapping)?;
+                }
+                for id in &change.deletes {
+                    self.upstream_mappings.delete_managed_row(*id);
+                }
+                self.append_all(batches).await
+            })
+        }
+
+        fn commit_service_accounts<'a>(
+            &'a self,
+            change: &'a ServiceAccountCommit,
+            batches: Vec<AppendEvents>,
+        ) -> BoxFuture<'a, DomainResult<()>> {
+            Box::pin(async move {
+                self.enter(AuthoritySite::ServiceAccounts, batches.len())?;
+                for sa in &change.upserts {
+                    self.service_accounts.upsert_row(sa);
+                }
+                for name in &change.deletes {
+                    self.service_accounts.delete_row(name);
+                }
+                self.append_all(batches).await
+            })
         }
     }
 
@@ -2805,6 +3058,10 @@ mod tests {
         #[allow(dead_code)]
         pub(in crate::use_cases::apply_config_use_case) users:
             Arc<crate::use_cases::test_support::MockUserRepository>,
+        /// The atomic authority writer the three authority branches
+        /// commit through. Tests arm a per-site failure on it to pin
+        /// the fail-closed outcome.
+        pub(in crate::use_cases::apply_config_use_case) authority: Arc<MockAuthorityLifecycle>,
     }
 
     /// Reconcile-mechanics harness. Pins a **permissive**
@@ -2859,10 +3116,21 @@ mod tests {
         let service_accounts =
             Arc::new(crate::use_cases::test_support::MockServiceAccountRepository::new());
         let users = Arc::new(crate::use_cases::test_support::MockUserRepository::new());
+        // Atomic authority writer — writes through the row mocks above
+        // so the pre-existing row assertions keep working.
+        let authority = Arc::new(MockAuthorityLifecycle::new(
+            claim_mappings.clone(),
+            grant_repo.clone(),
+            oidc_issuers.clone(),
+            upstream.clone(),
+            service_accounts.clone(),
+            events.clone(),
+        ));
         let uc = ApplyConfigUseCase::new(
             repos.clone(),
             claim_mappings.clone(),
             grant_repo.clone(),
+            authority.clone(),
             rule_repo.clone(),
             proj.clone(),
             policies,
@@ -2912,6 +3180,7 @@ mod tests {
             oidc_issuers,
             service_accounts,
             users,
+            authority,
         }
     }
 
@@ -2950,10 +3219,21 @@ mod tests {
         let service_accounts =
             Arc::new(crate::use_cases::test_support::MockServiceAccountRepository::new());
         let users = Arc::new(crate::use_cases::test_support::MockUserRepository::new());
+        // Atomic authority writer — writes through the row mocks above
+        // so the pre-existing row assertions keep working.
+        let authority = Arc::new(MockAuthorityLifecycle::new(
+            claim_mappings.clone(),
+            grant_repo.clone(),
+            oidc_issuers.clone(),
+            upstream.clone(),
+            service_accounts.clone(),
+            events.clone(),
+        ));
         let uc = ApplyConfigUseCase::new(
             repos.clone(),
             claim_mappings.clone(),
             grant_repo.clone(),
+            authority.clone(),
             rule_repo.clone(),
             proj.clone(),
             policies,
@@ -2991,6 +3271,7 @@ mod tests {
             oidc_issuers,
             service_accounts,
             users,
+            authority,
         }
     }
 
@@ -2998,7 +3279,7 @@ mod tests {
     // Apply-config linter wiring (ADR 0015).
     // These tests assert the linter runs INSIDE
     // `apply_permission_grants` BEFORE the whole-partition
-    // `save_managed` commit, with the secure-by-default reject
+    // commit, with the secure-by-default reject
     // posture, under ZERO operator config. They use
     // `build_harness_with_lint_config(LintConfig::default())` — NOT
     // the permissive `build_harness` — so the default
@@ -3013,7 +3294,7 @@ mod tests {
     /// operator config — proving the secure-by-default posture
     /// (blocking out of the box, not opt-in). No grant row and no
     /// `PermissionGrantApplied` event lands (strict-atomic abort before
-    /// `save_managed`).
+    /// the commit).
     #[tokio::test]
     async fn secure_by_default_wildcard_grant_fails_apply_with_zero_config() {
         let h = build_harness_with_lint_config(crate::lint::LintConfig::default());
@@ -3043,9 +3324,9 @@ mod tests {
         // Strict-atomic: the reconcile commit never ran, so no
         // gitops-managed grant row was written.
         assert_eq!(
-            h.grant_repo.save_managed_call_count(),
+            h.grant_repo.reconcile_call_count(),
             0,
-            "linter reject must abort BEFORE the whole-partition save_managed"
+            "linter reject must abort BEFORE the whole-partition commit"
         );
         assert_eq!(h.grant_repo.managed_count(), 0);
     }
@@ -3073,7 +3354,7 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
     }
 
     /// An unjustified direct-`User` **Admin** grant fails apply by
@@ -3103,7 +3384,7 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
     }
 
     /// A `claim_mappings` row resolving to the reserved
@@ -3113,7 +3394,7 @@ mod tests {
     /// **Ordering, resolved.** The collision rule is one of the grant
     /// linter's, and the linter used to run only inside
     /// `apply_permission_grants` — which the pipeline reaches *after*
-    /// `apply_claim_mappings`' whole-partition `save_managed`. The apply
+    /// `apply_claim_mappings`' whole-partition commit. The apply
     /// failed either way, but the claim-mapping partition had already been
     /// reconciled when it did: a refused mapping left behind as a
     /// committed reconcile of the partition it belongs to. The linter's
@@ -3138,9 +3419,9 @@ mod tests {
         // The whole apply failed (the load-bearing property), and nothing
         // was written: neither the grant partition nor — the part that
         // changed — the Stage-1 claim-mapping partition.
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
         assert_eq!(
-            h.claim_mappings.save_managed_call_count(),
+            h.claim_mappings.reconcile_call_count(),
             0,
             "the reject is now pre-write, so the Stage-1 claim-mapping \
              reconcile must not have run"
@@ -3175,7 +3456,7 @@ mod tests {
                 .await
                 .expect("an explicit operator downgrade must let the apply commit");
         assert_eq!(report.created, 1);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
     }
 
@@ -3200,7 +3481,7 @@ mod tests {
                 .expect("a clean bundle must apply under the secure default");
         // repo + claim mapping + grant.
         assert_eq!(report.created, 3);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
     }
 
     // ===================================================================
@@ -3270,7 +3551,7 @@ mod tests {
         );
         // repo + grant created; the linter did NOT reject.
         assert_eq!(report.created, 2);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
     }
 
@@ -3300,7 +3581,7 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
     }
 
     /// A bundle-supplied per-rule downgrade
@@ -3332,7 +3613,7 @@ mod tests {
                 .await
                 .expect("a bundle-declared downgrade must let the wildcard grant commit");
         assert_eq!(report.created, 1);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
     }
 
     /// `resolve_effective_lint_config`: absent kind → the
@@ -3616,9 +3897,9 @@ mod tests {
             .calls()
             .iter()
             .any(|c| matches!(c, MockCall::Save(_))));
-        // Whole-partition reconcile — one `save_managed`
+        // Whole-partition reconcile — one commit
         // call carrying the single declared mapping row.
-        assert_eq!(h.claim_mappings.save_managed_call_count(), 1);
+        assert_eq!(h.claim_mappings.reconcile_call_count(), 1);
         assert_eq!(h.claim_mappings.managed_count(), 1);
     }
 
@@ -3635,7 +3916,7 @@ mod tests {
             .iter()
             .filter(|c| matches!(c, MockCall::SaveManaged(_, _)))
             .count();
-        // The whole-partition `save_managed` reconcile primitive is
+        // The whole-partition reconcile primitive is
         // called unconditionally once per apply;
         // idempotence is observed via zero report churn + a stable
         // managed-row set, not a call-count delta.
@@ -3691,7 +3972,7 @@ mod tests {
     // ClaimMapping apply (ADR 0012 — there is no Role CRUD block and
     // no `roles` table). Every
     // test here asserts shipped `apply_claim_mappings` behaviour: a
-    // single whole-partition `save_managed` per apply,
+    // single whole-partition reconcile per apply,
     // `ClaimMappingApplied` on create OR digest change, silence on an
     // unchanged digest, `ClaimMappingRevoked` for a prior managed row
     // absent from desired, and "empty desired revokes all".
@@ -3716,7 +3997,7 @@ mod tests {
     // PermissionGrant apply (claims-subject; ADR 0012).
     // There is no `role`-keyed grant or per-row save API:
     // a grant carries a sum-typed `GrantSubject`, persistence is the
-    // whole-partition `save_managed` reconcile, and the
+    // whole-partition reconcile, and the
     // diff identity is `(sorted required_claims, repository_id,
     // permission)` for `Claims` / `(user_id, repository_id, permission)`
     // for `User`.
@@ -3734,6 +4015,119 @@ mod tests {
             .count()
     }
 
+    // -------------------------------------------------------------------
+    // Grant rows commit with their audit events (one transaction).
+    // -------------------------------------------------------------------
+
+    /// An audit-append failure during the grant apply leaves the
+    /// gitops partition **exactly as it was** — the apply fails closed
+    /// rather than half-done. This is the property the retry cannot
+    /// supply: a committed row with no event is invisible to the next
+    /// apply's prior-vs-desired diff, so no replacement event is ever
+    /// emitted.
+    #[tokio::test]
+    async fn permission_grant_commit_failure_leaves_the_partition_unchanged() {
+        let h = build_harness();
+        let mut seeded = DesiredState::default();
+        seeded
+            .permission_grants
+            .push(grant_env("dev-read", &["developer", "ops"], "read", None));
+        h.uc.apply(seeded, env_oidc()).await.unwrap();
+        assert_eq!(h.grant_repo.managed_count(), 1);
+        let before = h.grant_repo.managed_snapshot();
+        let applied_before = count_pg_applied(&authz_events(&h).await);
+        let saves_before = h.grant_repo.reconcile_call_count();
+
+        // A different desired set, with the commit armed to fail.
+        h.authority.fail_next(
+            AuthoritySite::PermissionGrants,
+            DomainError::Invariant("event store unavailable".into()),
+        );
+        let mut next = DesiredState::default();
+        next.permission_grants.push(grant_env(
+            "sec-curate",
+            &["security", "ops"],
+            "curate",
+            None,
+        ));
+        let err =
+            h.uc.apply(next, env_oidc())
+                .await
+                .expect_err("an audit-append failure must fail the apply");
+        assert!(
+            err.to_string().contains("event store unavailable"),
+            "the event-store failure must surface, got: {err}"
+        );
+
+        assert_eq!(
+            h.grant_repo.reconcile_call_count(),
+            saves_before,
+            "no second row write may have landed — rows and events commit together"
+        );
+        assert_eq!(
+            h.grant_repo.managed_snapshot(),
+            before,
+            "the gitops grant partition must be byte-identical to its pre-apply state"
+        );
+        assert_eq!(
+            count_pg_applied(&authz_events(&h).await),
+            applied_before,
+            "no audit event may have landed either"
+        );
+    }
+
+    /// A grant reconcile that routes events to several streams hands
+    /// the whole batch list to **one** commit call, which is what makes
+    /// the multi-stream append atomic. Before the port each stream was
+    /// its own `EventStore::append` transaction, so a list that failed
+    /// part-way left some repository streams audited and others not.
+    #[tokio::test]
+    async fn permission_grant_commit_takes_every_stream_in_one_call() {
+        let h = build_harness();
+        let mut desired = DesiredState::default();
+        desired.repositories.push(repo_env("npm-public", "hosted"));
+        // One repo-scoped grant (routes to the repository stream) and
+        // one wildcard grant (routes to the authorization stream).
+        desired.permission_grants.push(grant_env(
+            "dev-read-npm",
+            &["developer", "ops"],
+            "read",
+            Some("npm-public"),
+        ));
+        desired.permission_grants.push(grant_env(
+            "admin-everywhere",
+            &["platform", "admins"],
+            "admin",
+            None,
+        ));
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+
+        let grant_commits: Vec<usize> = h
+            .authority
+            .commits()
+            .into_iter()
+            .filter(|(site, _)| *site == AuthoritySite::PermissionGrants)
+            .map(|(_, batches)| batches)
+            .collect();
+        assert_eq!(
+            grant_commits,
+            vec![2],
+            "exactly one commit call carrying both stream batches"
+        );
+
+        let repo_id = h.repos.find_by_key("npm-public").await.unwrap().id;
+        assert_eq!(
+            count_pg_applied(&repo_stream_events(&h.events, repo_id).await),
+            1,
+            "the repo-scoped grant is audited on its repository stream"
+        );
+        assert_eq!(
+            count_pg_applied(&authz_events(&h).await),
+            1,
+            "the wildcard grant is audited on the authorization stream"
+        );
+    }
+
     #[tokio::test]
     async fn create_permission_grant_resolves_claims_and_repository() {
         let h = build_harness();
@@ -3748,7 +4142,7 @@ mod tests {
         let report = h.uc.apply(desired, env_oidc()).await.unwrap();
         // Repo + Grant = 2 created (no `roles` table).
         assert_eq!(report.created, 2);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
         let g = &h.grant_repo.managed_snapshot()[0];
         assert_eq!(
@@ -3987,9 +4381,9 @@ mod tests {
 
         // Spot-check: every CRUD writer fired once via the
         // whole-partition reconcile primitive.
-        assert_eq!(h.claim_mappings.save_managed_call_count(), 1);
+        assert_eq!(h.claim_mappings.reconcile_call_count(), 1);
         assert_eq!(h.claim_mappings.managed_count(), 1);
-        assert_eq!(h.grant_repo.save_managed_call_count(), 1);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 1);
         assert_eq!(h.grant_repo.managed_count(), 1);
         assert_eq!(h.rule_repo.save_count(), 1);
         // PolicyUseCase fired twice (PolicyCreated + ExclusionAdded).
@@ -4616,8 +5010,13 @@ mod tests {
     use hort_domain::ports::secret_port::{SecretRef, SecretSource};
 
     /// Helper — read every event on a given Repository(repo_id) stream
-    /// as a `Vec<DomainEvent>`.
-    async fn repo_stream_events(events: &MockPolicyEventStore, repo_id: Uuid) -> Vec<DE> {
+    /// as a `Vec<DomainEvent>`. `pub(in …)` so the per-branch test
+    /// modules (e.g. `upstream_mappings::tests`) can read a repo-scoped
+    /// stream without a second copy of this.
+    pub(in crate::use_cases::apply_config_use_case) async fn repo_stream_events(
+        events: &MockPolicyEventStore,
+        repo_id: Uuid,
+    ) -> Vec<DE> {
         events
             .read_stream(&StreamId::repository(repo_id), RF::Start, u64::MAX)
             .await
@@ -5524,6 +5923,7 @@ mod tests {
             h.repos.clone(),
             h.claim_mappings.clone(),
             h.grant_repo.clone(),
+            h.authority.clone(),
             h.rule_repo.clone(),
             h.proj.clone(),
             Arc::new(PolicyUseCase::new(
@@ -7274,7 +7674,7 @@ mod tests {
             // set rejects would fail here.
             if !case.expect_reject {
                 assert_eq!(
-                    h.grant_repo.save_managed_call_count(),
+                    h.grant_repo.reconcile_call_count(),
                     1,
                     "a clean bundle must reach the grant stage's own lint + \
                      reconcile for `{}`",
@@ -7689,15 +8089,15 @@ mod tests {
                 .expect_err("apply must refuse the same bundle");
             assert!(
                 h2.repos.calls().is_empty()
-                    && h2.claim_mappings.save_managed_call_count() == 0
-                    && h2.grant_repo.save_managed_call_count() == 0
+                    && h2.claim_mappings.reconcile_call_count() == 0
+                    && h2.grant_repo.reconcile_call_count() == 0
                     && h2.events.appended().is_empty(),
                 "`{}` must abort before the first write; repo calls {:?}, \
                  claim-mapping reconciles {}, grant reconciles {}, events {}",
                 case.what,
                 h2.repos.calls(),
-                h2.claim_mappings.save_managed_call_count(),
-                h2.grant_repo.save_managed_call_count(),
+                h2.claim_mappings.reconcile_call_count(),
+                h2.grant_repo.reconcile_call_count(),
                 h2.events.appended().len(),
             );
         }
@@ -7771,7 +8171,7 @@ mod tests {
              batch(es) landed",
             h.events.appended().len()
         );
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
 
         // The boot preflight reaches the same verdict, so the pod parks.
         h.uc.preflight_validate(&desired, &env_oidc())

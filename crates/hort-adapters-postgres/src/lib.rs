@@ -30,6 +30,10 @@ pub mod artifact_group_repo;
 pub mod artifact_lifecycle;
 pub mod artifact_metadata_repo;
 pub mod artifact_repo;
+// Atomic authority-row-plus-audit-event writer (ADR 0012 / 0018): a
+// grant / claim-mapping / issuer mutation and the events attesting it
+// share one transaction, so neither can land without the other.
+pub mod authority_lifecycle;
 pub(crate) mod blob_lock;
 pub mod claim_mapping_repo;
 // Transient write-contention (serialization failure / deadlock): the

@@ -14,6 +14,10 @@ pub mod artifact_group_repository;
 pub mod artifact_lifecycle;
 pub mod artifact_metadata_repository;
 pub mod artifact_repository;
+// Atomic authority-row-plus-audit-event commit port (ADR 0012 / 0018):
+// a grant, claim-mapping or issuer mutation and the events that attest
+// it commit in one transaction, so neither can land without the other.
+pub mod authority_lifecycle;
 pub mod checkpoint_anchor;
 pub mod checkpoint_emitter;
 pub mod claim_mapping_repository;

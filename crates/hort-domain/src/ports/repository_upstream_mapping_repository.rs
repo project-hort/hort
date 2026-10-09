@@ -22,11 +22,28 @@
 //! There are no admin REST writers; the gitops apply pipeline is the
 //! sole writer. `managed_by` mirrors `Repository` / `GroupMapping` /
 //! `CurationRule`; `list_managed_by_gitops` is the diff query
-//! `ApplyConfigUseCase` runs every boot. `save_managed` is INSERT-or-
-//! UPDATE keyed on the schema-level `(repository_id, path_prefix)`
-//! UNIQUE; `delete_managed_by_id` removes a gitops row by primary
-//! key (the diff layer surfaces ids, not the composite identity, to
-//! mirror `RoleRepository::delete_managed_grant`).
+//! `ApplyConfigUseCase` runs every boot.
+//!
+//! **The gitops-partition write is not on this port.** It is
+//! [`AuthorityLifecyclePort::commit_upstream_mappings`], which commits
+//! the per-row upsert/delete set **and** the attesting
+//! `RepositoryUpstreamMappingChanged` events in one transaction. A
+//! mapping names the upstream a proxy repository will trust and fetch
+//! from, with its credential reference and TLS material, so a mapping
+//! that commits unattested is a changed trust anchor the authorization
+//! stream is silent about. See
+//! [`crate::ports::permission_grant_repository`] for why the write
+//! methods are *removed* from this trait rather than left unused.
+//!
+//! What stays here is the `managed_by = 'local'` CRUD pair
+//! ([`RepositoryUpstreamMappingRepository::upsert`] /
+//! [`RepositoryUpstreamMappingRepository::delete`]): an
+//! operator-managed row outside the gitops partition, which carries no
+//! digest, no provenance and no audit event, so it is not the shape the
+//! authority port exists to close.
+//!
+//! [`AuthorityLifecyclePort::commit_upstream_mappings`]:
+//!     crate::ports::authority_lifecycle::AuthorityLifecyclePort::commit_upstream_mappings
 //!
 //! # Caching
 //!
@@ -136,7 +153,9 @@ pub struct RepositoryUpstreamMapping {
     /// future non-gitops bootstrap path.
     pub managed_by: ManagedBy,
     /// SHA-256 over the canonicalised YAML spec that produced this
-    /// row, set in lockstep with `save_managed`. `Some(_)` exactly
+    /// row, set in lockstep with the gitops-partition write
+    /// (`AuthorityLifecyclePort::commit_upstream_mappings`).
+    /// `Some(_)` exactly
     /// when `managed_by == ManagedBy::GitOps`; the schema's
     /// `chk_repository_upstream_mappings_managed_digest` mirrors that
     /// invariant.
@@ -402,9 +421,10 @@ impl RepositoryUpstreamMapping {
     }
 }
 
-/// Outbound port: CRUD on `repository_upstream_mappings`.
+/// Outbound port: reads plus the `managed_by = 'local'` CRUD pair on
+/// `repository_upstream_mappings`.
 ///
-/// All four methods are async-fallible via [`BoxFuture`] +
+/// Every method is async-fallible via [`BoxFuture`] +
 /// [`DomainResult`]. Callers serialize through a single instance
 /// (Postgres pool's connection management); concurrency is the
 /// adapter's problem, not this port's.
@@ -439,7 +459,7 @@ pub trait RepositoryUpstreamMappingRepository: Send + Sync {
     /// after a cache refresh window must not see spurious failures.
     fn delete(&self, repository_id: Uuid, path_prefix: &str) -> BoxFuture<'_, DomainResult<()>>;
 
-    // ---- Gitops-managed write surface ----
+    // ---- Gitops-managed read surface ----
 
     /// Every `managed_by = 'gitops'` mapping plus its digest. Bounded
     /// by the partial index `idx_repository_upstream_mappings_managed_by`
@@ -449,30 +469,6 @@ pub trait RepositoryUpstreamMappingRepository: Send + Sync {
     /// [`ApplyConfigUseCase`]: hort-app::use_cases::apply_config_use_case::ApplyConfigUseCase
     fn list_managed_by_gitops(&self)
         -> BoxFuture<'_, DomainResult<Vec<RepositoryUpstreamMapping>>>;
-
-    /// INSERT-or-UPDATE a `managed_by = 'gitops'` row. Sets the
-    /// digest in the same statement so a partial write cannot leave
-    /// `managed_by = 'gitops'` with `managed_by_digest = NULL`. The
-    /// schema CHECK enforces this on the DB side; the port surfaces
-    /// the pairing through `RepositoryUpstreamMapping`.
-    /// [`ApplyConfigUseCase`] is the only caller.
-    ///
-    /// `mapping.managed_by` must be `GitOps` and `mapping.managed_by_digest`
-    /// must be `Some(_)` — adapters return [`DomainError::Invariant`]
-    /// otherwise rather than silently widening the invariant.
-    ///
-    /// [`ApplyConfigUseCase`]: hort-app::use_cases::apply_config_use_case::ApplyConfigUseCase
-    /// [`DomainError::Invariant`]: crate::error::DomainError::Invariant
-    fn save_managed(&self, mapping: &RepositoryUpstreamMapping) -> BoxFuture<'_, DomainResult<()>>;
-
-    /// DELETE a `managed_by = 'gitops'` row by primary key. Refuses
-    /// non-gitops rows defensively (the diff layer never schedules a
-    /// delete on a `managed_by = 'local'` row, but the port enforces
-    /// the invariant in case of out-of-band SQL or future bugs). Pairs
-    /// with `RoleRepository::delete_managed_grant` shape — the diff
-    /// emits ids, not the composite identity, because the partial
-    /// index keeps id lookup cheap.
-    fn delete_managed_by_id(&self, id: Uuid) -> BoxFuture<'_, DomainResult<()>>;
 }
 
 #[cfg(test)]

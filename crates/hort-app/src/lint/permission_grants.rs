@@ -339,7 +339,7 @@ impl LintOutcome {
 /// Pure over its inputs (no I/O) — the caller owns the abort. In
 /// `apply_permission_grants` a `rejected()` outcome returns
 /// `AppError::Domain(DomainError::Validation(_))` *before* the
-/// permission-grant `save_managed`, so no grant row and no
+/// permission-grant commit, so no grant row and no
 /// `PermissionGrantApplied` event lands. That abort is no longer the
 /// earliest one, and must not be mistaken for the whole guarantee: it
 /// comes after the repository, policy and mapping writes of the same
