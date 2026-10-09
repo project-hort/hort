@@ -1,3 +1,5 @@
+use std::fmt;
+
 use futures::stream::BoxStream;
 use tokio::io::AsyncRead;
 
@@ -5,6 +7,68 @@ use crate::error::{DomainError, DomainResult};
 use crate::types::{ByteRange, ContentHash};
 
 use super::BoxFuture;
+
+/// Verdict a verifying CAS read reaches when the stored bytes do not hash
+/// to the key they are stored under.
+///
+/// Every production CAS adapter verifies the bytes it serves (ADR 0003):
+/// the reader handed back by [`StoragePort::get`] accumulates SHA-256 as
+/// bytes flow and, at EOF, fails the read when the accumulated digest
+/// differs from the requested `ContentHash`. This type is the verdict of
+/// that comparison, carried as the payload of the resulting
+/// `io::Error` so the digest the bytes *actually* hashed to reaches the
+/// caller **as data**.
+///
+/// That matters because `io::ErrorKind::InvalidData` alone cannot answer
+/// either question a caller has. It cannot distinguish at-rest corruption
+/// from a backend raising `InvalidData` for its own reasons, and it cannot
+/// produce the observed digest that
+/// `CasIntegrityMismatch` and the scrub's tombstone path both record.
+/// `CasScrubUseCase` classifies from this payload: present ⇒ a hash
+/// mismatch with `computed` as the observed digest, absent ⇒ a read error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CasIntegrityFailure {
+    /// The CAS key the read asked for — the digest the bytes were
+    /// supposed to have.
+    pub expected: ContentHash,
+    /// SHA-256 the delivered bytes actually hashed to.
+    pub computed: ContentHash,
+}
+
+impl fmt::Display for CasIntegrityFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "CAS integrity failure: expected {}, computed {}",
+            self.expected, self.computed
+        )
+    }
+}
+
+impl std::error::Error for CasIntegrityFailure {}
+
+impl CasIntegrityFailure {
+    /// Wrap the verdict in the `io::Error` a verifying read yields.
+    ///
+    /// The single construction point for that error, so no adapter can
+    /// formulate its own message-only variant: an `InvalidData` without
+    /// this payload is indistinguishable from a backend I/O failure and
+    /// is classified as one.
+    pub fn into_io_error(self) -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, self)
+    }
+
+    /// Recover the verdict from an `io::Error` raised while reading a
+    /// [`StoragePort::get`] stream.
+    ///
+    /// `None` for every I/O failure that is not a verification verdict —
+    /// which is precisely the distinction a caller must preserve, and the
+    /// reason this travels as a typed payload rather than as an
+    /// `ErrorKind` to match on.
+    pub fn from_io_error(err: &std::io::Error) -> Option<&Self> {
+        err.get_ref()?.downcast_ref::<Self>()
+    }
+}
 
 /// Result of a successful CAS put operation.
 ///
@@ -82,6 +146,17 @@ pub trait StoragePort: Send + Sync {
     ) -> BoxFuture<'_, DomainResult<PutResult>>;
 
     /// Retrieve content as a stream.
+    ///
+    /// **Verification contract (ADR 0003).** The returned reader verifies
+    /// the bytes it delivers against `hash`: it accumulates SHA-256 as
+    /// bytes flow and, at EOF, fails the read instead of signalling
+    /// end-of-stream when the accumulated digest differs. That failure is
+    /// an `io::Error` carrying a [`CasIntegrityFailure`] payload
+    /// (`CasIntegrityFailure::from_io_error` recovers it), so a caller can
+    /// tell at-rest corruption from a backend read failure and can record
+    /// the digest the bytes actually hashed to. An implementation that
+    /// cannot verify must still never report corruption as a clean EOF —
+    /// `CasScrubUseCase` re-hashes independently to catch exactly that.
     fn get(
         &self,
         hash: &ContentHash,
@@ -282,6 +357,92 @@ mod tests {
                 panic!("expected ShardTruncated variant")
             }
         }
+    }
+
+    // -- CasIntegrityFailure: the verdict travels as data ------------------
+
+    fn hashes() -> (ContentHash, ContentHash) {
+        (
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .unwrap(),
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+                .parse()
+                .unwrap(),
+        )
+    }
+
+    /// The `Display` form names both digests — it is what operators read
+    /// in a failed-download log line, and the only thing a caller that
+    /// does NOT know about the payload can see.
+    #[test]
+    fn cas_integrity_failure_display_names_both_hashes() {
+        let (expected, computed) = hashes();
+        let msg = CasIntegrityFailure {
+            expected: expected.clone(),
+            computed: computed.clone(),
+        }
+        .to_string();
+        assert!(msg.contains(expected.as_ref()), "got: {msg}");
+        assert!(msg.contains(computed.as_ref()), "got: {msg}");
+    }
+
+    /// `into_io_error` produces `InvalidData` and keeps the verdict
+    /// recoverable — the round trip the scrub's classification rests on.
+    #[test]
+    fn cas_integrity_failure_round_trips_through_io_error() {
+        let (expected, computed) = hashes();
+        let verdict = CasIntegrityFailure {
+            expected: expected.clone(),
+            computed: computed.clone(),
+        };
+        let err = verdict.clone().into_io_error();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(CasIntegrityFailure::from_io_error(&err), Some(&verdict));
+        // The message survives too, so a consumer that only logs the
+        // error still names both digests.
+        assert!(err.to_string().contains(computed.as_ref()));
+    }
+
+    /// An `io::Error` that merely *has the same kind* carries no verdict.
+    /// Pins the reason the payload exists: matching on
+    /// `ErrorKind::InvalidData` would read any backend complaint as
+    /// corruption.
+    #[test]
+    fn from_io_error_is_none_for_a_payload_free_invalid_data() {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "backend said the response was malformed",
+        );
+        assert!(CasIntegrityFailure::from_io_error(&err).is_none());
+    }
+
+    /// A bare OS-code error has no inner payload at all — the `get_ref()`
+    /// short-circuit.
+    #[test]
+    fn from_io_error_is_none_for_a_raw_os_error() {
+        let err = std::io::Error::from_raw_os_error(5); // EIO
+        assert!(CasIntegrityFailure::from_io_error(&err).is_none());
+    }
+
+    /// A different typed payload at the same kind is not a verdict —
+    /// the downcast, not the kind, is the discriminator.
+    #[test]
+    fn from_io_error_is_none_for_a_different_typed_payload() {
+        #[derive(Debug)]
+        struct Other;
+        impl fmt::Display for Other {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "other")
+            }
+        }
+        impl std::error::Error for Other {}
+
+        let err = std::io::Error::new(std::io::ErrorKind::InvalidData, Other);
+        assert!(CasIntegrityFailure::from_io_error(&err).is_none());
+        // The payload is genuinely there and renders — so the `None`
+        // above is the downcast refusing, not an absent inner error.
+        assert_eq!(err.to_string(), "other");
     }
 
     /// A minimal impl to pin the trait's default `backend_label` and to

@@ -32,6 +32,7 @@ use hort_config::desired::EnvSnapshot;
 use hort_config::{DesiredState, EnvAuthProvider};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::authority_lifecycle::AuthorityLifecyclePort;
 use hort_domain::ports::claim_mapping_repository::ClaimMappingRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
 use hort_domain::ports::curation_rule_repository::CurationRuleRepository;
@@ -243,10 +244,21 @@ async fn apply_inner(
     );
     let artifact_lifecycle: Arc<dyn ArtifactLifecyclePort> = Arc::new(
         hort_adapters_postgres::artifact_lifecycle::PgArtifactLifecycle::new(
-            pg_event_store,
+            pg_event_store.clone(),
             pg_artifact_repo,
             pg_artifact_metadata_repo,
         ),
+    );
+    // Atomic authority-row-plus-audit-event writer for the three
+    // security-relevant CRUD kinds (permission grants, claim mappings,
+    // OIDC issuers). Shares the `PgEventStore` so the audit append runs
+    // inside the same `PgUnitOfWork` as the row writes — an append
+    // failure rolls the rows back instead of leaving a live grant /
+    // mapping / issuer the authorization stream says nothing about.
+    // Same construction shape as `PgRefLifecycle`: the transaction
+    // handle comes from the event store, so no extra pool clone.
+    let authority: Arc<dyn AuthorityLifecyclePort> = Arc::new(
+        hort_adapters_postgres::authority_lifecycle::PgAuthorityLifecycle::new(pg_event_store),
     );
     // The gitops boot path drives `add_exclusion` /
     // `remove_exclusion` via `Actor::Gitops` (not the curator HTTP
@@ -363,6 +375,7 @@ async fn apply_inner(
         repos,
         claim_mappings,
         permission_grants,
+        authority,
         curation_rule_repo,
         policy_projections,
         policies,

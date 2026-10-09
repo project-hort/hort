@@ -292,6 +292,10 @@ the event exists precisely so operators can alarm on transitions.
 When *every* configured backend errors, the outcome is `Failed` and
 the retry machinery takes over: exponential backoff (one minute, then
 5, 30, 60) up to a retry budget (default 5, `HORT_SCANNER_MAX_ATTEMPTS`).
+That curve is not the scan pipeline's own any more — it lives in
+`hort_app::retry_backoff` and the task dispatcher spends the same four waits
+for every other job kind, so five attempts mean the same ~96-minute window
+wherever the number appears. Change it in one place or not at all.
 Exhausting the budget does not abandon the artifact — it transitions
 it, before the job row is marked failed, to the terminal
 `scan_indeterminate` status via

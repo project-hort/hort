@@ -2,54 +2,88 @@ use super::*;
 
 impl ApplyConfigUseCase {
     /// Apply `ServiceAccount` create / update / delete from the gitops
-    /// plan. Each create / update step:
-    ///
-    /// 1. Ensures a backing `users` row exists (`username = "sa:" || name`,
-    ///    `is_service_account = true`). The user row is shared
-    ///    infrastructure — created on first apply, never deleted by
-    ///    the apply path.
-    /// 2. Composes the full SA aggregate (SA row +
-    ///    federated_identities + fallback_rotation) and calls
-    ///    `service_accounts.upsert`, which runs the whole shape in a
-    ///    single transaction.
+    /// plan.
     ///
     /// The aggregate is identity + federation binding only — this pass
     /// materialises no permission grants. SA authority is declared as
     /// explicit `serviceAccount`-subject `PermissionGrant` envelopes
     /// and reconciled by `apply_permission_grants` (ADR 0037).
     ///
-    /// Delete path: removes the SA aggregate (CASCADE drops sub-rows).
-    /// The backing `users` row stays.
+    /// **Rows and events commit together.** The branch builds the whole
+    /// [`ServiceAccountCommit`] — one aggregate per `create` / `update`
+    /// envelope, one name per `plan.delete` — plus the audit batch, and
+    /// hands both to
+    /// [`AuthorityLifecyclePort::commit_service_accounts`], which
+    /// writes them in one transaction. A service account is a
+    /// **federated-identity trust anchor** (ADR 0018): its
+    /// `federated_identities[].claims` decide which JWTs from a trusted
+    /// issuer may assume it, and the federation handler reads the
+    /// aggregate at assume time — so a surviving replica acts on the
+    /// new trust state the moment the row commits. Before the port each
+    /// `upsert` / `delete_by_name` committed on its own and the whole
+    /// audit batch was appended at the very end, so a failure in
+    /// between left service accounts live with nothing in the
+    /// authorization stream about them, in a state the retry could not
+    /// repair (the next apply diffs against the already-written rows).
+    ///
+    /// **The backing `users` row is written outside the transaction,
+    /// and has to be.** Each create / update step ensures a
+    /// `username = "sa:" || name`, `is_service_account = true` row
+    /// exists via `UserRepository`; the FK from
+    /// `service_accounts.backing_user_id` means it must be durable
+    /// before the SA row can reference it. That is safe because an
+    /// orphan backing user confers nothing: `apply_permission_grants`
+    /// materialises `GrantSubject::User(backing_user_id)` rows only for
+    /// service accounts in the desired set, resolved from the persisted
+    /// SA aggregate, so a users row whose SA commit rolled back carries
+    /// no grant and no token. The next apply finds it by username,
+    /// reuses its id, and re-emits the same `ServiceAccountCreated`.
+    /// The row is shared infrastructure and is never deleted by this
+    /// path (other code may hold tokens scoped to it).
+    ///
+    /// Delete path: removes the SA aggregate (CASCADE drops the
+    /// sub-rows). The SA's `User`-subject permission grants are NOT
+    /// deleted here. A deleted SA is absent from
+    /// `desired.service_accounts`, so the consolidated PermissionGrant
+    /// reconcile (`apply_permission_grants`, which runs after this
+    /// pass) does not include its grants in the desired set and its
+    /// whole-partition delete-absent removes them atomically. Deleting
+    /// them here would be a no-op-with-extra-round-trips at best and a
+    /// double-delete race at worst.
     pub(super) async fn apply_service_accounts(
         &self,
         plan: &KindPlan<ServiceAccountSpec, String>,
         report: &mut ApplyReport,
+        token: &GitOpsApplyToken,
     ) -> AppResult<()> {
         let mut events: Vec<EventToAppend> = Vec::new();
+        let mut change = ServiceAccountCommit::default();
         let now = Utc::now();
 
         for env in &plan.create {
-            let (backing_user_id, sa_id) = self.upsert_service_account_aggregate(env, true).await?;
+            let (backing_user_id, sa) = self.build_service_account_aggregate(env).await?;
             events.push(EventToAppend::new(DomainEvent::ServiceAccountCreated(
                 ServiceAccountCreated {
-                    service_account_id: sa_id,
+                    service_account_id: sa.id,
                     service_account_name: env.metadata.name.clone(),
                     backing_user_id,
                     at: now,
                 },
             )));
+            change.upserts.push(sa);
             emit_gitops_object(gitops_kind::SERVICE_ACCOUNT, GitopsObjectResult::Created);
             report.created += 1;
         }
         for env in &plan.update {
-            let (_, sa_id) = self.upsert_service_account_aggregate(env, false).await?;
+            let (_, sa) = self.build_service_account_aggregate(env).await?;
             events.push(EventToAppend::new(DomainEvent::ServiceAccountUpdated(
                 ServiceAccountUpdated {
-                    service_account_id: sa_id,
+                    service_account_id: sa.id,
                     service_account_name: env.metadata.name.clone(),
                     at: now,
                 },
             )));
+            change.upserts.push(sa);
             emit_gitops_object(gitops_kind::SERVICE_ACCOUNT, GitopsObjectResult::Updated);
             report.updated += 1;
         }
@@ -57,19 +91,11 @@ impl ApplyConfigUseCase {
             let existing = self.service_accounts.get_by_name(name).await?;
             let Some(sa) = existing else {
                 // Row already gone (out-of-band delete or no-op
-                // re-apply) — fall through silently. Idempotent.
+                // re-apply) — fall through silently. Idempotent, and
+                // there is no prior state to attest.
                 continue;
             };
-            // The SA's `User`-subject permission grants
-            // are NOT deleted here. A deleted SA is absent from
-            // `desired.service_accounts`, so the consolidated
-            // PermissionGrant reconcile (`apply_permission_grants`,
-            // which runs after this pass) does not include its grants
-            // in the desired set; `save_managed`'s whole-partition
-            // delete-absent removes them atomically. Deleting them here
-            // would be a no-op-with-extra-round-trips at best and a
-            // double-delete race at worst.
-            self.service_accounts.delete_by_name(name).await?;
+            change.deletes.push(name.clone());
             events.push(EventToAppend::new(DomainEvent::ServiceAccountDeleted(
                 ServiceAccountDeleted {
                     service_account_id: sa.id,
@@ -82,50 +108,62 @@ impl ApplyConfigUseCase {
             report.deleted += 1;
         }
 
-        if !events.is_empty() {
-            tracing::info!(
-                kind = gitops_kind::SERVICE_ACCOUNT,
-                events = events.len(),
-                "service_account audit events committed"
-            );
-            let actor = gitops_actor_for_kind(Kind::ServiceAccount);
-            self.events
-                .append(AppendEvents {
-                    stream_id: StreamId::authorization(),
-                    expected_version: ExpectedVersion::Any,
-                    events,
-                    correlation_id: Uuid::new_v4(),
-                    causation_id: None,
-                    actor,
-                })
-                .await?;
+        if change.upserts.is_empty() && change.deletes.is_empty() {
+            // Nothing in the plan: no row write, no event, no
+            // transaction. Same observable behaviour as before the
+            // port, without a pointless round-trip on every boot.
+            return Ok(());
         }
+
+        let event_count = events.len();
+        let batches = Self::authorization_batches(events, Kind::ServiceAccount, token);
+        self.authority
+            .commit_service_accounts(&change, batches)
+            .await?;
+
+        // Emitted AFTER the commit returned `Ok` — the first point at
+        // which "committed" is true. The same line used to run before
+        // the append, so an operator reading the log saw the claim on a
+        // path that had not yet done the thing it claimed.
+        //
+        // Unguarded, unlike the pre-port `if !events.is_empty()`: the
+        // early return above already established that the change set is
+        // non-empty, and every row operation pushed into it pushed an
+        // event beside it, so `event_count >= 1` here by construction.
+        // A guard would be an unreachable branch.
+        tracing::info!(
+            kind = gitops_kind::SERVICE_ACCOUNT,
+            events = event_count,
+            "service_account audit events committed"
+        );
         Ok(())
     }
 
-    /// Combined SA-create-or-update workhorse: ensure backing user,
-    /// upsert SA aggregate. Returns `(backing_user_id,
-    /// service_account_id)`.
+    /// Ensure the backing `users` row exists and compose the SA
+    /// aggregate the commit will write. Returns `(backing_user_id,
+    /// aggregate)`.
     ///
-    /// This does not reconcile the SA's permission
-    /// grants. SA authority is materialised as
-    /// `GrantSubject::User(backing_user_id)` rows by the consolidated
-    /// `apply_permission_grants` pass, which runs after every SA's
-    /// aggregate + backing user exists (one whole-partition
-    /// `save_managed` covering envelope grants ∪ SA-owned grants).
+    /// Writes the backing user (see
+    /// [`Self::apply_service_accounts`] for why that write is outside
+    /// the authority transaction) and nothing else — the SA rows are
+    /// written by the one `commit_service_accounts` call.
     ///
-    /// `is_create` is informational — the row UPSERT handles both
-    /// cases atomically. We thread it for future-friendly logging
-    /// only.
-    async fn upsert_service_account_aggregate(
+    /// This does not reconcile the SA's permission grants. SA authority
+    /// is materialised as `GrantSubject::User(backing_user_id)` rows by
+    /// the consolidated `apply_permission_grants` pass, which runs
+    /// after every SA's aggregate + backing user exists (one
+    /// whole-partition reconcile covering envelope grants ∪ SA-owned
+    /// grants).
+    async fn build_service_account_aggregate(
         &self,
         env: &Envelope<ServiceAccountSpec>,
-        _is_create: bool,
-    ) -> AppResult<(Uuid, Uuid)> {
+    ) -> AppResult<(Uuid, ServiceAccount)> {
         // 1. Backing user.
         let backing_user_id = self.ensure_backing_user(&env.metadata.name).await?;
 
-        // 2. SA aggregate. Resolve a stable id when the row exists.
+        // 2. SA aggregate. Resolve a stable id when the row exists, so
+        // the audit `service_account_id` names the row the adapter's
+        // `ON CONFLICT (name) DO UPDATE` keeps.
         let existing_id = self
             .service_accounts
             .get_by_name(&env.metadata.name)
@@ -133,9 +171,7 @@ impl ApplyConfigUseCase {
             .map(|s| s.id);
         let sa_id = existing_id.unwrap_or_else(Uuid::new_v4);
         let sa = build_service_account_from_spec(env, sa_id, backing_user_id)?;
-        self.service_accounts.upsert(&sa).await?;
-
-        Ok((backing_user_id, sa_id))
+        Ok((backing_user_id, sa))
     }
 
     /// Look up the backing user by `username = "sa:" || sa_name` and
@@ -254,6 +290,174 @@ mod tests {
     use hort_domain::types::PageRequest;
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
+
+    // -- SA rows commit with their audit events (one transaction) ----------
+
+    fn sa_event_count(evts: &[DomainEvent]) -> usize {
+        use DomainEvent::{
+            ServiceAccountCreated as Created, ServiceAccountDeleted as Deleted,
+            ServiceAccountUpdated as Updated,
+        };
+        evts.iter()
+            .filter(|e| matches!(e, Created(_) | Updated(_) | Deleted(_)))
+            .count()
+    }
+
+    /// An audit-append failure during the SA apply leaves **no SA row**
+    /// — the apply fails closed rather than half-done. This is the
+    /// federated-identity trust-anchor case (ADR 0018): the
+    /// `federated_identities[].claims` decide which JWTs may assume the
+    /// account, so an SA that commits without its event is a live trust
+    /// grant the authorization stream is silent about, in a state the
+    /// retry cannot repair.
+    #[tokio::test]
+    async fn apply_service_account_commit_failure_leaves_no_sa_row() {
+        let h = build_harness();
+        h.authority.fail_next(
+            AuthoritySite::ServiceAccounts,
+            DomainError::Invariant("event store unavailable".into()),
+        );
+        let mut desired = DesiredState::default();
+        desired
+            .service_accounts
+            .push(service_account_env_for_apply("ci-pypi-pusher", None));
+
+        let err =
+            h.uc.apply(desired, env_oidc())
+                .await
+                .expect_err("an audit-append failure must fail the apply");
+        assert!(
+            err.to_string().contains("event store unavailable"),
+            "the event-store failure must surface, got: {err}"
+        );
+
+        assert!(
+            h.service_accounts.snapshot().is_empty(),
+            "no service account may be assumable without an attesting event"
+        );
+        assert_eq!(
+            sa_event_count(&authz_events(&h).await),
+            0,
+            "and no audit event may have landed"
+        );
+    }
+
+    /// The deliberate exception, pinned rather than left to prose: the
+    /// backing `users` row IS durable after the rolled-back commit. It
+    /// has to be written first (the `service_accounts.backing_user_id`
+    /// FK), and it confers nothing on its own — `apply_permission_grants`
+    /// materialises `GrantSubject::User(backing_user_id)` rows only for
+    /// service accounts resolved from the persisted SA aggregate, so
+    /// this orphan carries no grant. The next apply finds it by
+    /// username and reuses its id.
+    #[tokio::test]
+    async fn apply_service_account_commit_failure_leaves_an_unprivileged_backing_user() {
+        let h = build_harness();
+        h.authority.fail_next(
+            AuthoritySite::ServiceAccounts,
+            DomainError::Invariant("event store unavailable".into()),
+        );
+        let mut desired = DesiredState::default();
+        desired
+            .service_accounts
+            .push(service_account_env_for_apply("ci-pypi-pusher", None));
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect_err("the apply must fail");
+
+        let orphan = h
+            .users
+            .find_by_username("sa:ci-pypi-pusher")
+            .await
+            .unwrap()
+            .expect("the backing user is written before the SA commit");
+        assert!(orphan.is_service_account);
+        assert!(
+            !orphan.is_admin,
+            "the backing user must carry no standing authority of its own"
+        );
+        assert_eq!(
+            h.grant_repo.managed_count(),
+            0,
+            "and no permission grant may target it — the grant reconcile \
+             resolves subjects from the persisted SA aggregate, which rolled back"
+        );
+    }
+
+    /// Every SA row operation in one apply goes through **one** commit
+    /// call carrying one audit batch: creates, updates and deletes are
+    /// collected into a single `ServiceAccountCommit`. Before the port
+    /// each `upsert` / `delete_by_name` was independently committed and
+    /// the batch was appended at the very end.
+    #[tokio::test]
+    async fn apply_service_account_commits_every_row_operation_once() {
+        let h = build_harness();
+        // Seed two SAs.
+        let mut seeded = DesiredState::default();
+        seeded
+            .service_accounts
+            .push(service_account_env_for_apply("keeper", None));
+        seeded
+            .service_accounts
+            .push(service_account_env_for_apply("doomed", None));
+        h.uc.apply(seeded, env_oidc()).await.unwrap();
+
+        // Re-apply with `doomed` omitted. `keeper` is re-classified as
+        // an update on every apply — the `service_accounts` table
+        // carries no `managed_by_digest` column, so the diff's
+        // `digest: None` means "force update" (the conservative
+        // re-stamp the snapshot builder documents).
+        let mut next = DesiredState::default();
+        next.service_accounts
+            .push(service_account_env_for_apply("keeper", None));
+        h.uc.apply(next, env_oidc()).await.unwrap();
+
+        let commits: Vec<usize> = h
+            .authority
+            .commits()
+            .into_iter()
+            .filter(|(site, _)| *site == AuthoritySite::ServiceAccounts)
+            .map(|(_, batches)| batches)
+            .collect();
+        assert_eq!(
+            commits,
+            vec![1, 1],
+            "one commit call per apply, each carrying one batch — the \
+             second covers the update AND the delete"
+        );
+        assert_eq!(
+            h.service_accounts
+                .snapshot()
+                .iter()
+                .map(|sa| sa.name.clone())
+                .collect::<Vec<_>>(),
+            vec!["keeper".to_string()],
+            "`doomed` is gone, `keeper` survives"
+        );
+        assert_eq!(
+            sa_event_count(&authz_events(&h).await),
+            4,
+            "two Created from the first apply, one Updated and one Deleted \
+             from the second — every row operation attested"
+        );
+    }
+
+    /// An apply with no SA plan reaches the port **not at all** — no
+    /// row to write, no event to append, so no transaction.
+    #[tokio::test]
+    async fn apply_service_account_empty_plan_opens_no_commit() {
+        let h = build_harness();
+        h.uc.apply(DesiredState::default(), env_oidc())
+            .await
+            .unwrap();
+        assert!(
+            h.authority
+                .commits()
+                .into_iter()
+                .all(|(site, _)| site != AuthoritySite::ServiceAccounts),
+            "an empty SA plan must not open a transaction"
+        );
+    }
 
     // -- ServiceAccount apply ----------------------------------------------
 
@@ -401,8 +605,8 @@ mod tests {
             first_ids, second_ids,
             "surrogate grant ids must carry through a no-op re-apply (no delete+recreate churn)"
         );
-        // Exactly one save_managed call per apply (two total).
-        assert_eq!(h.grant_repo.save_managed_call_count(), 2);
+        // Exactly one grant reconcile per apply (two total).
+        assert_eq!(h.grant_repo.reconcile_call_count(), 2);
     }
 
     #[tokio::test]
@@ -489,7 +693,7 @@ mod tests {
             "validation error must name the missing ServiceAccount: {rendered}"
         );
         // No grant was written.
-        assert_eq!(h.grant_repo.save_managed_call_count(), 0);
+        assert_eq!(h.grant_repo.reconcile_call_count(), 0);
     }
 
     #[tokio::test]
@@ -770,7 +974,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        h.oidc_issuers.upsert(&snapshot_issuer).await.unwrap();
+        h.oidc_issuers.upsert_row(&snapshot_issuer);
         // Build a desired with the SA still referencing `legacy-idp` but
         // NO OidcIssuer envelopes — the issuer is being deleted by
         // omission.

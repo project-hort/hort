@@ -30,7 +30,8 @@
 //! - **`ApplyConfigUseCase::apply_permission_grants`** — over the
 //!   fully-built, port-resolved desired grant set (envelope grants ∪
 //!   SA-owned `User`-subject grants) plus the desired `claim_mappings`,
-//!   *before* the whole-partition `save_managed` commit. This is the
+//!   *before* the whole-partition
+//!   `AuthorityLifecyclePort::commit_permission_grants`. This is the
 //!   authority on the real set and the single emitter of
 //!   `hort_apply_config_linter_total`; its reject arm is defence-in-depth
 //!   on the expansion above.

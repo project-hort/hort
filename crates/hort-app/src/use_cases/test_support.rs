@@ -76,7 +76,7 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
 use hort_domain::ports::scan_findings_repository::{ScanFindingsRepository, ScanFindingsRow};
 use hort_domain::ports::service_account_repository::ServiceAccountRepository;
 use hort_domain::ports::stateful_upload_staging::{StagingAppend, StatefulUploadStagingPort};
-use hort_domain::ports::storage::{PutResult, StoragePort, StreamItem};
+use hort_domain::ports::storage::{CasIntegrityFailure, PutResult, StoragePort, StreamItem};
 use hort_domain::ports::upstream_proxy::{
     ArtifactFetch, BlobFetch, BlobStream, ManifestFetch, ManifestFetchOutcome,
     MetadataFetchOutcome, ReferrerDescriptor, UpstreamProxy,
@@ -2007,9 +2007,11 @@ impl UserRepository for MockUserRepository {
 // ---------------------------------------------------------------------------
 
 /// In-memory [`PermissionGrantRepository`] for use-case and inbound-HTTP
-/// handler tests. `list_all` returns the seeded set; the gitops
-/// reconcile surface (`list_managed_by_gitops` / `save_managed`) is a
-/// no-op because the effective-permissions read path never touches it.
+/// handler tests. `list_all` returns the seeded set;
+/// `list_managed_by_gitops` is a no-op because the
+/// effective-permissions read path never touches it. The port carries
+/// no write method — the gitops reconcile is
+/// `AuthorityLifecyclePort::commit_permission_grants`.
 pub struct MockPermissionGrantRepository {
     grants: Mutex<Vec<hort_domain::entities::rbac::PermissionGrant>>,
 }
@@ -2048,13 +2050,6 @@ impl hort_domain::ports::permission_grant_repository::PermissionGrantRepository
     ) -> BoxFut<'_, DomainResult<Vec<hort_domain::entities::rbac::PermissionGrant>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
-
-    fn save_managed(
-        &self,
-        _items: &[hort_domain::entities::rbac::PermissionGrant],
-    ) -> BoxFut<'_, DomainResult<()>> {
-        Box::pin(async { Ok(()) })
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2063,9 +2058,10 @@ impl hort_domain::ports::permission_grant_repository::PermissionGrantRepository
 
 /// In-memory [`ClaimMappingRepository`](hort_domain::ports::claim_mapping_repository::ClaimMappingRepository)
 /// for use-case and inbound-HTTP handler tests. `list_all` returns the
-/// seeded set; the gitops reconcile surface (`list_managed_by_gitops` /
-/// `save_managed`) is a no-op because the what-if resolver read path
-/// (`RbacResolveUseCase`) only calls `list_all`.
+/// seeded set; `list_managed_by_gitops` is a no-op because the what-if
+/// resolver read path (`RbacResolveUseCase`) only calls `list_all`. The
+/// port carries no write method — the gitops reconcile is
+/// `AuthorityLifecyclePort::commit_claim_mappings`.
 pub struct MockClaimMappingRepository {
     mappings: Mutex<Vec<hort_domain::entities::rbac::ClaimMapping>>,
 }
@@ -2101,13 +2097,6 @@ impl hort_domain::ports::claim_mapping_repository::ClaimMappingRepository
         &self,
     ) -> BoxFut<'_, DomainResult<Vec<hort_domain::entities::rbac::ClaimMapping>>> {
         Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn save_managed(
-        &self,
-        _items: &[hort_domain::entities::rbac::ClaimMapping],
-    ) -> BoxFut<'_, DomainResult<()>> {
-        Box::pin(async { Ok(()) })
     }
 }
 
@@ -3312,27 +3301,65 @@ impl RepoSecurityScoreRepository for MockRepoSecurityScoreRepository {
 // MockStoragePort
 // ---------------------------------------------------------------------------
 
-/// `AsyncRead` that delivers a fixed prefix of valid bytes and then
-/// yields `io::ErrorKind::InvalidData` at EOF.
+/// `AsyncRead` that delivers a fixed prefix of bytes and then fails at
+/// EOF instead of signalling end-of-stream.
 ///
-/// This is a faithful, dependency-free reproduction of the failure
-/// shape `hort_adapters_storage::VerifyingReader` produces when a stored
-/// blob has been tampered: bytes flow through normally, and the final
-/// (would-be-EOF) `poll_read` errors with `InvalidData` instead of
-/// signalling end-of-stream. Used only by `MockStoragePort` when armed
-/// via [`MockStoragePort::fail_next_get_truncated`]; it intentionally
-/// does NOT depend on `hort-adapters-storage` so the per-format
-/// adapter-free dep graph is preserved.
+/// This is a faithful, dependency-free reproduction of the failure shape
+/// `hort_adapters_storage::VerifyingReader` produces: bytes flow through
+/// normally, and the final (would-be-EOF) `poll_read` errors. It
+/// intentionally does NOT depend on `hort-adapters-storage` so the
+/// per-format adapter-free dep graph is preserved — which makes keeping
+/// the two in step a review obligation, not a compile-time one.
+///
+/// `verdict` decides which of the two failure *classes* is reproduced,
+/// and the distinction is the whole point of the double: with `Some`, the
+/// error carries a [`CasIntegrityFailure`] payload exactly as a verifying
+/// adapter's does, and a consumer can recover the observed digest; with
+/// `None`, it is a backend read failure that happens to share the
+/// `InvalidData` kind and carries no verdict. A double that only ever
+/// produced the first would let a consumer pass its tests by matching on
+/// the kind — and a consumer that matched on the kind would read every
+/// backend complaint as corruption.
 struct TruncatingReader {
     prefix: std::io::Cursor<Vec<u8>>,
     errored: bool,
+    verdict: Option<CasIntegrityFailure>,
 }
 
 impl TruncatingReader {
-    fn new(prefix: Vec<u8>) -> Self {
+    /// Reader whose EOF failure is an integrity verdict: the delivered
+    /// bytes are `prefix`, the CAS key claims `expected`, and the
+    /// computed digest the verdict carries is the real SHA-256 of what
+    /// was delivered — the same value a production verifier would have
+    /// accumulated.
+    fn verifying(prefix: Vec<u8>, expected: ContentHash) -> Self {
+        let computed: ContentHash = hex::encode(Sha256::digest(&prefix))
+            .parse()
+            .expect("SHA-256 digest is always valid ContentHash hex");
         Self {
             prefix: std::io::Cursor::new(prefix),
             errored: false,
+            verdict: Some(CasIntegrityFailure { expected, computed }),
+        }
+    }
+
+    /// Reader whose EOF failure is a plain backend I/O failure — same
+    /// `InvalidData` kind, no verdict attached.
+    fn without_verdict(prefix: Vec<u8>) -> Self {
+        Self {
+            prefix: std::io::Cursor::new(prefix),
+            errored: false,
+            verdict: None,
+        }
+    }
+
+    fn failure(&self) -> std::io::Error {
+        match &self.verdict {
+            Some(v) => v.clone().into_io_error(),
+            None => std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "simulated backend read failure (no integrity verdict)",
+            ),
         }
     }
 }
@@ -3347,10 +3374,7 @@ impl AsyncRead for TruncatingReader {
             // Defensive: a well-behaved consumer stops after the error,
             // but if polled again keep returning the same error rather
             // than spuriously signalling clean EOF.
-            return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "CAS integrity failure (simulated): blob tampered",
-            )));
+            return std::task::Poll::Ready(Err(self.failure()));
         }
         let before = buf.filled().len();
         match Pin::new(&mut self.prefix).poll_read(cx, buf) {
@@ -3360,10 +3384,7 @@ impl AsyncRead for TruncatingReader {
                     // reader; instead error, exactly as `VerifyingReader`
                     // does on an EOF hash mismatch.
                     self.errored = true;
-                    std::task::Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "CAS integrity failure (simulated): blob tampered",
-                    )))
+                    std::task::Poll::Ready(Err(self.failure()))
                 } else {
                     std::task::Poll::Ready(Ok(()))
                 }
@@ -3393,7 +3414,22 @@ pub struct MockStoragePort {
     /// is the hash the CAS says the content should be, the value is
     /// the actual (wrong) bytes. Allows the scrub tests to exercise
     /// the `hash_mismatch` path without needing a real collision.
+    ///
+    /// `get` serves these through a *verifying* reader, like both
+    /// production adapters: the wrong bytes flow and the read then fails
+    /// at EOF with the integrity verdict. See
+    /// [`MockStoragePort::inject_tampered`].
     tampered: Mutex<HashMap<ContentHash, Vec<u8>>>,
+    /// Hashes served as raw wrong bytes with **no** verification —
+    /// a `StoragePort` implementation that does not honour the ADR 0003
+    /// read contract. Distinct from `tampered` because the two drive
+    /// different halves of the scrub's classification; see
+    /// [`MockStoragePort::inject_tampered_unverified`].
+    tampered_unverified: Mutex<HashMap<ContentHash, Vec<u8>>>,
+    /// Hashes whose `get` stream fails with a plain backend I/O error —
+    /// no integrity verdict attached. See
+    /// [`MockStoragePort::inject_read_failure`].
+    read_failures: Mutex<HashMap<ContentHash, Vec<u8>>>,
     /// Keys that should appear in `list_all` as `ShardTruncated` —
     /// injected by scrub-use-case tests to
     /// exercise the `shards_truncated` rollup without needing a real
@@ -3469,6 +3505,8 @@ impl MockStoragePort {
             list_errors: Mutex::new(Vec::new()),
             missing_keys: Mutex::new(Vec::new()),
             tampered: Mutex::new(HashMap::new()),
+            tampered_unverified: Mutex::new(HashMap::new()),
+            read_failures: Mutex::new(HashMap::new()),
             shard_truncations: Mutex::new(Vec::new()),
             put_calls: AtomicUsize::new(0),
             get_calls: AtomicUsize::new(0),
@@ -3563,11 +3601,50 @@ impl MockStoragePort {
     }
 
     /// Register a hash that `list_all` will report as present, and whose
-    /// `get()` returns `content` — but `content` hashes to something
-    /// different, simulating a tampered blob. Used by scrub-use-case
-    /// tests to exercise the `result="hash_mismatch"` emission path.
+    /// `get()` serves `content` — bytes that hash to something other than
+    /// `hash`, simulating a tampered blob. Used by scrub-use-case tests
+    /// to exercise the `result="hash_mismatch"` emission path.
+    ///
+    /// **The reader honours the production read contract** (ADR 0003): the
+    /// wrong bytes flow through and the read then fails at EOF with the
+    /// integrity verdict, exactly as `FilesystemStorage::get` and
+    /// `ObjectStoreStorage::get` do. Handing back a bare `Cursor` over the
+    /// wrong bytes instead would exercise a reader shape that no shipped
+    /// adapter produces — and a consumer that only works against that
+    /// shape passes its tests while being unable to classify a real
+    /// corrupted blob at all. Use
+    /// [`inject_tampered_unverified`](Self::inject_tampered_unverified)
+    /// when the non-verifying shape is deliberately what is under test.
     pub fn inject_tampered(&self, hash: ContentHash, content: Vec<u8>) {
         self.tampered.lock().unwrap().insert(hash, content);
+    }
+
+    /// Register a tampered hash served as **raw wrong bytes with no
+    /// verification** — a `StoragePort` implementation that does not
+    /// honour the ADR 0003 read contract.
+    ///
+    /// Not the shape of any shipped adapter, and deliberately so: it is
+    /// the case the `CasScrubUseCase`'s own re-hash exists to catch, since
+    /// a verifier cannot detect its own absence. Scrub tests use this to
+    /// prove corruption is still classified when nothing beneath the scrub
+    /// checks it.
+    pub fn inject_tampered_unverified(&self, hash: ContentHash, content: Vec<u8>) {
+        self.tampered_unverified
+            .lock()
+            .unwrap()
+            .insert(hash, content);
+    }
+
+    /// Register a hash whose `get()` stream delivers `prefix` and then
+    /// fails with a **plain backend I/O error carrying no integrity
+    /// verdict** — at the same `io::ErrorKind::InvalidData` a verifying
+    /// reader uses.
+    ///
+    /// The kind collision is the point: a consumer that classified by
+    /// `ErrorKind` would call this corruption. It is a read failure, and
+    /// the scrub must keep reporting it as one.
+    pub fn inject_read_failure(&self, hash: ContentHash, prefix: Vec<u8>) {
+        self.read_failures.lock().unwrap().insert(hash, prefix);
     }
 
     /// Register a synthetic `StreamItem::ShardTruncated` for `list_all`
@@ -3710,16 +3787,35 @@ impl StoragePort for MockStoragePort {
         // surfaces only when the HTTP handler streams the body), which
         // is precisely the wiring under test.
         if let Some(prefix) = self.inject_get_truncated.lock().unwrap().remove(hash) {
-            let reader = TruncatingReader::new(prefix);
+            let reader = TruncatingReader::verifying(prefix, hash.clone());
             return Box::pin(
                 async move { Ok(Box::new(reader) as Box<dyn AsyncRead + Send + Unpin>) },
             );
         }
-        // Tampered entries take precedence: the mock returns the
-        // (wrong) bytes the test pre-registered so the scrub use case
-        // computes an observed_hash that differs from `hash`.
-        let tampered = self.tampered.lock().unwrap().get(hash).cloned();
-        let result = tampered.or_else(|| self.data.lock().unwrap().get(hash).cloned());
+        // A backend read failure with no integrity verdict, at the same
+        // `InvalidData` kind a verifying reader uses — persistent (not
+        // consumed) so a retrying consumer fails on every attempt.
+        if let Some(prefix) = self.read_failures.lock().unwrap().get(hash).cloned() {
+            let reader = TruncatingReader::without_verdict(prefix);
+            return Box::pin(
+                async move { Ok(Box::new(reader) as Box<dyn AsyncRead + Send + Unpin>) },
+            );
+        }
+        // Tampered entries take precedence over stored content: the mock
+        // serves the (wrong) bytes the test pre-registered through a
+        // verifying reader, so the consumer sees what a production
+        // adapter would hand it — the wrong bytes, then an EOF failure
+        // carrying the digest they actually hashed to.
+        if let Some(content) = self.tampered.lock().unwrap().get(hash).cloned() {
+            let reader = TruncatingReader::verifying(content, hash.clone());
+            return Box::pin(
+                async move { Ok(Box::new(reader) as Box<dyn AsyncRead + Send + Unpin>) },
+            );
+        }
+        // Wrong bytes with no verification at all — a port implementation
+        // that ignores the ADR 0003 read contract.
+        let unverified = self.tampered_unverified.lock().unwrap().get(hash).cloned();
+        let result = unverified.or_else(|| self.data.lock().unwrap().get(hash).cloned());
         let hash_display = hash.to_string();
         Box::pin(async move {
             match result {
@@ -3806,8 +3902,10 @@ impl StoragePort for MockStoragePort {
     fn list_all(&self) -> BoxFuture<'_, DomainResult<BoxStream<'_, StreamItem>>> {
         // Union of:
         //   - hashes in `data` (normal CAS entries)
-        //   - tampered hashes (they "exist" per `list_all` but `get`
-        //     returns wrong bytes)
+        //   - tampered hashes, verifying and unverified (they "exist" per
+        //     `list_all` but `get` serves wrong bytes)
+        //   - injected read-failure hashes (they "exist" but `get`'s
+        //     stream fails with no integrity verdict)
         //   - injected missing hashes (they "exist" per `list_all` but
         //     `get` returns NotFound)
         //   - injected list errors (yield as ReadError before hashes).
@@ -3831,6 +3929,12 @@ impl StoragePort for MockStoragePort {
             items.push(StreamItem::Hash(h.clone()));
         }
         for h in self.tampered.lock().unwrap().keys() {
+            items.push(StreamItem::Hash(h.clone()));
+        }
+        for h in self.tampered_unverified.lock().unwrap().keys() {
+            items.push(StreamItem::Hash(h.clone()));
+        }
+        for h in self.read_failures.lock().unwrap().keys() {
             items.push(StreamItem::Hash(h.clone()));
         }
         for h in self.missing_keys.lock().unwrap().iter() {
@@ -5558,6 +5662,10 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
 /// unique constraint exactly. Upsert semantics fall out of
 /// `HashMap::insert`; delete is a `remove` call; both forms of `list`
 /// scan the values.
+///
+/// The gitops-partition writes are the inherent
+/// [`Self::write_managed_row`] / [`Self::delete_managed_row`], not
+/// trait methods — see those docstrings.
 pub struct MockRepositoryUpstreamMappingRepository {
     entries: Mutex<HashMap<(Uuid, String), RepositoryUpstreamMapping>>,
 }
@@ -5571,6 +5679,62 @@ impl MockRepositoryUpstreamMappingRepository {
 
     pub fn entry_count(&self) -> usize {
         self.entries.lock().unwrap().len()
+    }
+
+    /// The gitops-partition row write, as an **inherent** method.
+    ///
+    /// [`RepositoryUpstreamMappingRepository`] carries no managed-write
+    /// method any more — the write is
+    /// `AuthorityLifecyclePort::commit_upstream_mappings`, which
+    /// commits the rows with their audit events in one transaction. The
+    /// mock authority port in
+    /// `apply_config_use_case::tests::MockAuthorityLifecycle` writes
+    /// through here, exactly as the Postgres adapter writes through
+    /// `repository_upstream_mapping_repo::save_managed_in_tx`: the body
+    /// stays, the trait wrapper is what went away.
+    ///
+    /// Mirrors the adapter's invariant guard and its stable-id
+    /// contract (`ON CONFLICT (repository_id, path_prefix) DO UPDATE`
+    /// keeps the existing row's id and `created_at`).
+    pub fn write_managed_row(&self, mapping: &RepositoryUpstreamMapping) -> DomainResult<()> {
+        use hort_domain::entities::managed_by::ManagedBy;
+        let mb = mapping.managed_by;
+        if mb != ManagedBy::GitOps {
+            return Err(DomainError::Invariant(format!(
+                "a managed upstream mapping must carry managed_by=GitOps, got {mb}"
+            )));
+        }
+        if mapping.managed_by_digest.is_none() {
+            return Err(DomainError::Invariant(
+                "a managed upstream mapping must carry managed_by_digest".into(),
+            ));
+        }
+
+        let mut to_store = mapping.clone();
+        let key = (to_store.repository_id, to_store.path_prefix.clone());
+        let mut guard = self.entries.lock().unwrap();
+        if let Some(existing) = guard.get(&key) {
+            to_store.id = existing.id;
+            to_store.created_at = existing.created_at;
+        }
+        to_store.updated_at = Utc::now();
+        guard.insert(key, to_store);
+        Ok(())
+    }
+
+    /// The gitops-partition row delete, as an inherent method — see
+    /// [`Self::write_managed_row`]. Defensive like the adapter's
+    /// statement: a non-gitops row at that id is left alone.
+    pub fn delete_managed_row(&self, id: Uuid) {
+        use hort_domain::entities::managed_by::ManagedBy;
+        let mut guard = self.entries.lock().unwrap();
+        let key_to_remove = guard
+            .iter()
+            .find(|(_, m)| m.id == id && m.managed_by == ManagedBy::GitOps)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = key_to_remove {
+            guard.remove(&key);
+        }
     }
 }
 
@@ -5656,52 +5820,6 @@ impl RepositoryUpstreamMappingRepository for MockRepositoryUpstreamMappingReposi
                 .then_with(|| a.id.cmp(&b.id))
         });
         Box::pin(async move { Ok(out) })
-    }
-
-    fn save_managed(&self, mapping: &RepositoryUpstreamMapping) -> BoxFuture<'_, DomainResult<()>> {
-        use hort_domain::entities::managed_by::ManagedBy;
-        // Mirror the adapter's invariant guard.
-        let mb = mapping.managed_by;
-        if mb != ManagedBy::GitOps {
-            return Box::pin(async move {
-                Err(DomainError::Invariant(format!(
-                    "save_managed called with managed_by={mb} (expected GitOps)"
-                )))
-            });
-        }
-        if mapping.managed_by_digest.is_none() {
-            return Box::pin(async move {
-                Err(DomainError::Invariant(
-                    "save_managed called without managed_by_digest".into(),
-                ))
-            });
-        }
-
-        let mut to_store = mapping.clone();
-        let key = (to_store.repository_id, to_store.path_prefix.clone());
-        let mut guard = self.entries.lock().unwrap();
-        if let Some(existing) = guard.get(&key) {
-            // Stable-id contract.
-            to_store.id = existing.id;
-            to_store.created_at = existing.created_at;
-        }
-        to_store.updated_at = Utc::now();
-        guard.insert(key, to_store);
-        Box::pin(async move { Ok(()) })
-    }
-
-    fn delete_managed_by_id(&self, id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
-        use hort_domain::entities::managed_by::ManagedBy;
-        // Defensive: only remove if the row is gitops-managed.
-        let mut guard = self.entries.lock().unwrap();
-        let key_to_remove = guard
-            .iter()
-            .find(|(_, m)| m.id == id && m.managed_by == ManagedBy::GitOps)
-            .map(|(k, _)| k.clone());
-        if let Some(key) = key_to_remove {
-            guard.remove(&key);
-        }
-        Box::pin(async move { Ok(()) })
     }
 }
 
@@ -7462,6 +7580,43 @@ impl MockOidcIssuerRepository {
         items.sort_by(|a, b| a.name.cmp(&b.name));
         items
     }
+
+    /// The issuer row upsert, as an **inherent** method.
+    ///
+    /// [`OidcIssuerRepository`] carries no write method any more — the
+    /// write is `AuthorityLifecyclePort::commit_oidc_issuers`, which
+    /// commits the row with its audit event in one transaction. The
+    /// mock authority port in
+    /// `apply_config_use_case::tests::MockAuthorityLifecycle` writes
+    /// through here, exactly as the Postgres adapter writes through
+    /// `oidc_issuer_repo::upsert_in_tx`.
+    ///
+    /// Upsert on name: the apply pipeline's create path may have minted
+    /// a fresh UUID for a row whose name already exists, so the
+    /// existing id is reused to match the adapter's
+    /// `ON CONFLICT (name) DO UPDATE` semantics. Unlike [`Self::seed`],
+    /// which inserts by the issuer's own id.
+    pub fn upsert_row(&self, issuer: &hort_domain::entities::oidc_issuer::OidcIssuer) {
+        let mut issuers = self.issuers.lock().unwrap();
+        let existing_id = issuers
+            .values()
+            .find(|i| i.name == issuer.name)
+            .map(|i| i.id);
+        let id = existing_id.unwrap_or(issuer.id);
+        let mut stored = issuer.clone();
+        stored.id = id;
+        issuers.insert(id, stored);
+    }
+
+    /// The issuer row delete, as an inherent method — see
+    /// [`Self::upsert_row`]. Deleting a name that is not present is a
+    /// no-op, like the adapter's statement.
+    pub fn delete_row(&self, name: &str) {
+        let mut issuers = self.issuers.lock().unwrap();
+        if let Some(id) = issuers.values().find(|i| i.name == name).map(|i| i.id) {
+            issuers.remove(&id);
+        }
+    }
 }
 
 impl OidcIssuerRepository for MockOidcIssuerRepository {
@@ -7490,34 +7645,6 @@ impl OidcIssuerRepository for MockOidcIssuerRepository {
         let issuers = self.issuers.lock().unwrap();
         let result = issuers.values().find(|i| i.issuer_url == url).cloned();
         Box::pin(async move { Ok(result) })
-    }
-
-    fn upsert(
-        &self,
-        issuer: &hort_domain::entities::oidc_issuer::OidcIssuer,
-    ) -> BoxFuture<'_, DomainResult<()>> {
-        let mut issuers = self.issuers.lock().unwrap();
-        // Upsert on name — the apply pipeline's create-path may have
-        // minted a fresh UUID for a row whose name already exists, so
-        // we reuse the existing id to match the Postgres adapter's
-        // `ON CONFLICT (name) DO UPDATE` semantics.
-        let existing_id = issuers
-            .values()
-            .find(|i| i.name == issuer.name)
-            .map(|i| i.id);
-        let id = existing_id.unwrap_or(issuer.id);
-        let mut stored = issuer.clone();
-        stored.id = id;
-        issuers.insert(id, stored);
-        Box::pin(async { Ok(()) })
-    }
-
-    fn delete_by_name(&self, name: &str) -> BoxFuture<'_, DomainResult<()>> {
-        let mut issuers = self.issuers.lock().unwrap();
-        if let Some(id) = issuers.values().find(|i| i.name == name).map(|i| i.id) {
-            issuers.remove(&id);
-        }
-        Box::pin(async { Ok(()) })
     }
 }
 
@@ -7578,7 +7705,8 @@ impl ReplayGuardPort for MockReplayGuardPort {
 }
 
 /// In-memory mock for [`ServiceAccountRepository`]. Stores the full
-/// aggregate; the test-side `upsert` follows the same name-as-identity
+/// aggregate; the test-side write ([`Self::upsert_row`], an inherent
+/// method — see its docstring) follows the same name-as-identity
 /// semantics as the Postgres adapter.
 pub struct MockServiceAccountRepository {
     sas: Mutex<HashMap<Uuid, hort_domain::entities::service_account::ServiceAccount>>,
@@ -7603,12 +7731,44 @@ impl MockServiceAccountRepository {
         items
     }
 
-    /// Synchronous test helper — pre-populate the mock without going
-    /// through the async `upsert` path. Used by the
-    /// rotation handler tests to seed a set of SAs before invoking
-    /// the handler.
+    /// Synchronous test helper — pre-populate the mock by the SA's own
+    /// id. Used by the rotation handler tests to seed a set of SAs
+    /// before invoking the handler.
     pub fn insert(&self, sa: hort_domain::entities::service_account::ServiceAccount) {
         self.sas.lock().unwrap().insert(sa.id, sa);
+    }
+
+    /// The SA aggregate upsert, as an **inherent** method.
+    ///
+    /// [`ServiceAccountRepository`] carries no write method any more —
+    /// the write is
+    /// `AuthorityLifecyclePort::commit_service_accounts`, which commits
+    /// the aggregate with its audit event in one transaction. The mock
+    /// authority port in
+    /// `apply_config_use_case::tests::MockAuthorityLifecycle` writes
+    /// through here, exactly as the Postgres adapter writes through
+    /// `service_account_repo::upsert_in_tx`.
+    ///
+    /// Name-as-identity, like the adapter's
+    /// `ON CONFLICT (name) DO UPDATE`: an existing row's id is
+    /// preserved. Unlike [`Self::insert`], which keys on the id.
+    pub fn upsert_row(&self, sa: &hort_domain::entities::service_account::ServiceAccount) {
+        let mut sas = self.sas.lock().unwrap();
+        let existing_id = sas.values().find(|s| s.name == sa.name).map(|s| s.id);
+        let id = existing_id.unwrap_or(sa.id);
+        let mut stored = sa.clone();
+        stored.id = id;
+        sas.insert(id, stored);
+    }
+
+    /// The SA aggregate delete, as an inherent method — see
+    /// [`Self::upsert_row`]. Deleting a name that is not present is a
+    /// no-op, like the adapter's statement.
+    pub fn delete_row(&self, name: &str) {
+        let mut sas = self.sas.lock().unwrap();
+        if let Some(id) = sas.values().find(|s| s.name == name).map(|s| s.id) {
+            sas.remove(&id);
+        }
     }
 }
 
@@ -7630,27 +7790,6 @@ impl ServiceAccountRepository for MockServiceAccountRepository {
         let sas = self.sas.lock().unwrap();
         let result = sas.values().find(|s| s.name == name).cloned();
         Box::pin(async move { Ok(result) })
-    }
-
-    fn upsert(
-        &self,
-        sa: &hort_domain::entities::service_account::ServiceAccount,
-    ) -> BoxFuture<'_, DomainResult<()>> {
-        let mut sas = self.sas.lock().unwrap();
-        let existing_id = sas.values().find(|s| s.name == sa.name).map(|s| s.id);
-        let id = existing_id.unwrap_or(sa.id);
-        let mut stored = sa.clone();
-        stored.id = id;
-        sas.insert(id, stored);
-        Box::pin(async { Ok(()) })
-    }
-
-    fn delete_by_name(&self, name: &str) -> BoxFuture<'_, DomainResult<()>> {
-        let mut sas = self.sas.lock().unwrap();
-        if let Some(id) = sas.values().find(|s| s.name == name).map(|s| s.id) {
-            sas.remove(&id);
-        }
-        Box::pin(async { Ok(()) })
     }
 }
 
@@ -7952,6 +8091,70 @@ mod tests {
     const VALID_SHA256_A: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const VALID_SHA256_B: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
     const VALID_SHA256_C: &str = "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae";
+
+    /// The upstream-mapping mock's gitops-write guard mirrors the
+    /// adapter's, and that mirroring is load-bearing: the app-layer
+    /// apply tests assert through this mock, so if it silently accepted
+    /// a `managed_by = Local` row or a digest-less one, a branch that
+    /// regressed into writing either would pass them.
+    #[test]
+    fn mock_upstream_mapping_write_refuses_a_non_gitops_row() {
+        use hort_domain::entities::managed_by::ManagedBy;
+        let mock = MockRepositoryUpstreamMappingRepository::new();
+        let now = Utc::now();
+        let base = RepositoryUpstreamMapping {
+            id: Uuid::new_v4(),
+            repository_id: Uuid::new_v4(),
+            path_prefix: "dockerhub/".into(),
+            upstream_url: "https://registry-1.docker.io".into(),
+            upstream_name_prefix: None,
+            upstream_auth:
+                hort_domain::ports::repository_upstream_mapping_repository::UpstreamAuth::Anonymous,
+            secret_ref: None,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            insecure_upstream_url: false,
+            trust_upstream_publish_time: false,
+            mtls_cert_ref: None,
+            mtls_key_ref: None,
+            ca_bundle_ref: None,
+            pinned_cert_sha256: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let err = mock
+            .write_managed_row(&base)
+            .expect_err("a Local row must be refused");
+        assert!(
+            err.to_string().contains("managed_by"),
+            "the error must name the offending column, got: {err}"
+        );
+
+        // GitOps without a digest is the other half of the pairing.
+        let digestless = RepositoryUpstreamMapping {
+            managed_by: ManagedBy::GitOps,
+            ..base.clone()
+        };
+        let err = mock
+            .write_managed_row(&digestless)
+            .expect_err("a digest-less managed row must be refused");
+        assert!(
+            err.to_string().contains("managed_by_digest"),
+            "the error must name the missing column, got: {err}"
+        );
+        assert_eq!(mock.entry_count(), 0, "neither refusal may have written");
+
+        // And the accepted shape still writes.
+        let good = RepositoryUpstreamMapping {
+            managed_by: ManagedBy::GitOps,
+            managed_by_digest: Some([0x11; 32]),
+            ..base
+        };
+        mock.write_managed_row(&good)
+            .expect("a managed row with a digest is accepted");
+        assert_eq!(mock.entry_count(), 1);
+    }
 
     #[tokio::test]
     async fn mock_staging_stream_read_returns_appended_bytes() {
@@ -8465,6 +8668,97 @@ mod tests {
             .expect_err("empty-prefix armed reader must error immediately");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(sink.is_empty(), "no bytes must flow for an empty prefix");
+        // The failure is an integrity verdict, and it names the digest the
+        // delivered (empty) prefix hashes to — what a real verifying
+        // adapter would have accumulated.
+        let verdict =
+            CasIntegrityFailure::from_io_error(&err).expect("verdict must be recoverable");
+        assert_eq!(verdict.expected, hash);
+        assert_eq!(verdict.computed, sha256_of(&[]));
+    }
+
+    // -- MockStoragePort tamper doubles: parity with the real readers --------
+
+    fn sha256_of(bytes: &[u8]) -> ContentHash {
+        hex::encode(Sha256::digest(bytes))
+            .parse()
+            .expect("SHA-256 digest is always valid ContentHash hex")
+    }
+
+    /// [`MockStoragePort::inject_tampered`] must honour the same read
+    /// contract as `FilesystemStorage::get` / `ObjectStoreStorage::get`:
+    /// the wrong bytes flow, and the read then fails at EOF carrying a
+    /// recoverable [`CasIntegrityFailure`] naming the digest they hash to.
+    ///
+    /// This is the double's load-bearing property. Served as a bare cursor
+    /// over the wrong bytes instead, it would let a consumer that cannot
+    /// classify a real corrupted blob pass its tests — which is precisely
+    /// how the scrub shipped recording corruption as a read error.
+    #[tokio::test]
+    async fn mock_storage_inject_tampered_matches_the_real_verifying_readers() {
+        let mock = MockStoragePort::new();
+        let cas_key: ContentHash = VALID_SHA256_A.parse().unwrap();
+        mock.inject_tampered(cas_key.clone(), b"wrong bytes".to_vec());
+
+        let mut r = mock.get(&cas_key).await.expect("get itself resolves Ok");
+        let mut delivered = Vec::new();
+        let err = r
+            .read_to_end(&mut delivered)
+            .await
+            .expect_err("EOF must fail, not signal clean end-of-stream");
+        assert_eq!(
+            &delivered, b"wrong bytes",
+            "the wrong bytes flow through before the failure"
+        );
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        let verdict =
+            CasIntegrityFailure::from_io_error(&err).expect("verdict must be recoverable");
+        assert_eq!(verdict.expected, cas_key);
+        assert_eq!(verdict.computed, sha256_of(b"wrong bytes"));
+    }
+
+    /// [`MockStoragePort::inject_tampered_unverified`] is the deliberate
+    /// opposite: raw wrong bytes, clean EOF, no verdict — a port
+    /// implementation that does not verify on read.
+    #[tokio::test]
+    async fn mock_storage_inject_tampered_unverified_delivers_raw_bytes_cleanly() {
+        let mock = MockStoragePort::new();
+        let cas_key: ContentHash = VALID_SHA256_A.parse().unwrap();
+        mock.inject_tampered_unverified(cas_key.clone(), b"wrong bytes".to_vec());
+
+        let mut r = mock.get(&cas_key).await.unwrap();
+        let mut delivered = Vec::new();
+        r.read_to_end(&mut delivered)
+            .await
+            .expect("an unverifying reader reaches a clean EOF");
+        assert_eq!(&delivered, b"wrong bytes");
+    }
+
+    /// [`MockStoragePort::inject_read_failure`] fails at the same
+    /// `InvalidData` kind a verifying reader uses but carries **no**
+    /// verdict, and is persistent rather than one-shot. A consumer that
+    /// classified by `ErrorKind` would call this corruption.
+    #[tokio::test]
+    async fn mock_storage_inject_read_failure_carries_no_verdict_and_persists() {
+        let mock = MockStoragePort::new();
+        let cas_key: ContentHash = VALID_SHA256_A.parse().unwrap();
+        mock.inject_read_failure(cas_key.clone(), b"part".to_vec());
+
+        for attempt in 0..2 {
+            let mut r = mock.get(&cas_key).await.unwrap();
+            let mut delivered = Vec::new();
+            let err = match r.read_to_end(&mut delivered).await {
+                Err(e) => e,
+                Ok(n) => panic!("attempt {attempt} must fail, read {n} bytes cleanly"),
+            };
+            assert_eq!(&delivered, b"part");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(
+                CasIntegrityFailure::from_io_error(&err).is_none(),
+                "a backend read failure must not look like an integrity verdict"
+            );
+        }
     }
 
     // -- MockKubernetesSecretWriter -------------------------

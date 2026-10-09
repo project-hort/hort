@@ -5,15 +5,22 @@
 //! claim name. The boot caller reads `list_all` to build the
 //! `Vec<ClaimMapping>` that `AuthenticateUseCase` consumes
 //! (`resolve_claims` flattens the caller's `groups` claim against
-//! it). The gitops apply pipeline writes managed rows via `save_managed`
-//! and inspects the managed subset for the apply diff via
-//! `list_managed_by_gitops`.
+//! it). The gitops apply pipeline inspects the managed subset for its
+//! diff via `list_managed_by_gitops`.
 //!
 //! Restart-to-apply remains the contract — there is no live-refresh
-//! path, the same shape the dropped `GroupMappingRepository` had. The
-//! trait surface is deliberately minimal: list, save_managed (the
-//! authoritative-set reconcile primitive — there is no separate
-//! `delete_*`), list_managed_by_gitops.
+//! path, the same shape the dropped `GroupMappingRepository` had.
+//!
+//! **This port is read-only.** The write — the authoritative-set
+//! reconcile of the whole `managed_by = 'gitops'` partition — is
+//! [`AuthorityLifecyclePort::commit_claim_mappings`], which commits the
+//! reconcile **and** the `ClaimMappingApplied` / `ClaimMappingRevoked`
+//! events that attest it in one transaction. See
+//! [`crate::ports::permission_grant_repository`] for why the write
+//! method is *removed* from this trait rather than left unused.
+//!
+//! [`AuthorityLifecyclePort::commit_claim_mappings`]:
+//!     crate::ports::authority_lifecycle::AuthorityLifecyclePort::commit_claim_mappings
 
 use crate::entities::rbac::ClaimMapping;
 use crate::error::DomainResult;
@@ -31,23 +38,6 @@ pub trait ClaimMappingRepository: Send + Sync {
     /// on `managed_by` — this is the diff query the gitops apply
     /// pipeline runs on every boot.
     fn list_managed_by_gitops(&self) -> BoxFuture<'_, DomainResult<Vec<ClaimMapping>>>;
-
-    /// Reconcile the **entire** `managed_by = 'gitops'` partition to
-    /// `items` — the authoritative complete gitops-managed mapping set.
-    /// In a single transaction the
-    /// adapter deletes every `managed_by = 'gitops'` row whose
-    /// `(idp_group, claim)` identity (the table's UNIQUE key) is absent
-    /// from `items` (delete-absent), then upserts every row in `items`
-    /// on that same key (upsert-present) so replaying an unchanged
-    /// gitops set is a no-op.
-    ///
-    /// `save_managed` IS the reconcile/revoke primitive — there is no
-    /// separate `delete_*` method. An empty `items` slice revokes every
-    /// gitops-managed mapping. Every element must carry
-    /// `managed_by_digest`; the adapter writes `managed_by = 'gitops'`
-    /// unconditionally. Revoke/apply audit events are emitted by the
-    /// use case, NOT here.
-    fn save_managed(&self, items: &[ClaimMapping]) -> BoxFuture<'_, DomainResult<()>>;
 }
 
 #[cfg(test)]

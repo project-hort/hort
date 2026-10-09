@@ -215,7 +215,7 @@ surfaces the name `"DATABASE_URL"`. This is identical to the worker.
 | `HORT_HTTP_REQUEST_TIMEOUT_SECS` | u64 | `300` | No | Global per-handler runtime deadline. |
 | `HORT_HTTP_OCI_UPLOAD_TIMEOUT_SECS` | u64 | `3600` | No | Per-route override for OCI blob-upload `PATCH`/`PUT`. |
 | `HORT_SHUTDOWN_GRACE_SECS` | u64 | `60` | No | Graceful-drain wall-clock cap after SIGTERM/SIGINT. |
-| `HORT_PUBLISH_BODY_MAX_SIZE` | size string | _unset → 300 MiB_ | No | PyPI/npm publish body cap. Size string (`"300Mi"`, `"1Gi"`, or a bare byte integer). **`"0"` = refuse all publishes** (kill-switch; not rejected). |
+| `HORT_PUBLISH_BODY_MAX_SIZE` | size string | _unset → 300 MiB_ | No | npm/PyPI/Maven publish body cap. Size string (`"300Mi"`, `"1Gi"`, or a bare byte integer). Cargo keeps its own fixed 200 MiB ceiling against any non-zero value, and OCI push takes no ceiling from it. **`"0"` = refuse all publishes** (kill-switch; not rejected) — closes every publish surface, the four hosted formats and OCI push alike, answering `503` without `Retry-After` on `POST`/`PUT`/`PATCH`; reads and deletions keep working. |
 | `HORT_METADATA_BLOB_MAX_SIZE` | size string | `10Mi` (10 MiB) | No | CAS metadata-blob ceiling. Size string (`"10Mi"`, or a bare byte integer). **`"0"` = accept anything** (not rejected). |
 | `METADATA_CAP_BYTES_<FORMAT>` | usize | _unset → handler default_ | No | Per-format metadata-cap override; `<FORMAT>` suffix is lowercased to the format key. No `HORT_` prefix. |
 

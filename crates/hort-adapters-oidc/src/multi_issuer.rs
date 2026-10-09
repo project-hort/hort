@@ -1034,20 +1034,6 @@ yDp6g/51WjALM10lhGCQasE=
             let snap = self.issuers.lock().unwrap().clone();
             Box::pin(async move { Ok(snap.into_iter().find(|i| i.issuer_url == url)) })
         }
-
-        fn upsert(
-            &self,
-            _issuer: &OidcIssuer,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
-            unimplemented!("StaticIssuerRepo::upsert — not on the validator path")
-        }
-
-        fn delete_by_name(
-            &self,
-            _name: &str,
-        ) -> BoxFuture<'_, hort_domain::error::DomainResult<()>> {
-            unimplemented!("StaticIssuerRepo::delete_by_name — not on the validator path")
-        }
     }
 
     // -- Test helpers ------------------------------------------------------

@@ -5,12 +5,46 @@ impl ApplyConfigUseCase {
     /// plan. Per-row event emission lands on the
     /// [`StreamCategory::Authorization`] stream alongside the other
     /// apply-time authz mutations.
+    ///
+    /// **Rows and events commit together.** The branch builds the whole
+    /// [`OidcIssuerChange`] plus its audit batch from the plan, then
+    /// hands both to
+    /// [`AuthorityLifecyclePort::commit_oidc_issuers`], which writes
+    /// them in one transaction. An issuer row is a trust anchor
+    /// (ADR 0018) — a serving validator reads the repository at
+    /// validation time, so a surviving replica acts on the new trust
+    /// state the moment the row commits. Before the port, each
+    /// `upsert` / `delete_by_name` was an independently committed
+    /// statement and the audit batch was appended at the very end, so
+    /// a failure in between left issuers live with nothing in the
+    /// authorization stream about them — and a reapply could not
+    /// restore the original `Created` / `Deleted`.
+    ///
+    /// **The JWKS warm-up runs after the commit.** It has to: the
+    /// transaction lives inside the adapter, so there is no "between
+    /// the upsert and the next upsert" for it to sit in any more. That
+    /// is also the better order — a cache warmed for an issuer whose
+    /// row then rolled back would be a trust state nothing persisted.
+    /// Warm-up failure still does NOT fail the apply (ADR 0018's
+    /// deliberate lazy-federation posture).
+    ///
+    /// **Report / metric counters are emitted while the plan is walked,
+    /// i.e. before the commit** — the same point the claim-mapping and
+    /// permission-grant branches have always emitted theirs. They used
+    /// to be emitted per successfully-written row, so a mid-way failure
+    /// counted only what had landed. The counters are now
+    /// "what this apply intended"; a failed apply aborts the boot and
+    /// nothing reads the report, and the per-kind
+    /// `hort_gitops_objects_total` series is the signal that an apply
+    /// was attempted, not that it committed.
     pub(super) async fn apply_oidc_issuers(
         &self,
         plan: &KindPlan<OidcIssuerSpec, String>,
         report: &mut ApplyReport,
+        token: &GitOpsApplyToken,
     ) -> AppResult<()> {
         let mut events: Vec<EventToAppend> = Vec::new();
+        let mut change = OidcIssuerChange::default();
         let now = Utc::now();
 
         for env in &plan.create {
@@ -21,11 +55,7 @@ impl ApplyConfigUseCase {
                 .map(|i| i.id)
                 .unwrap_or_else(Uuid::new_v4);
             let issuer = build_oidc_issuer_from_spec(env, id)?;
-            self.oidc_issuers.upsert(&issuer).await?;
-            // Best-effort
-            // JWKS warm-up. MUST NOT fail the apply on error; federation
-            // works lazily via the cache-miss path on first request.
-            self.warm_up_oidc_jwks(&issuer).await;
+            change.upserts.push(issuer);
             events.push(EventToAppend::new(DomainEvent::OidcIssuerCreated(
                 OidcIssuerCreated {
                     issuer_id: id,
@@ -48,13 +78,7 @@ impl ApplyConfigUseCase {
                     ))
                 })?;
             let issuer = build_oidc_issuer_from_spec(env, existing.id)?;
-            self.oidc_issuers.upsert(&issuer).await?;
-            // Best-effort
-            // JWKS warm-up on update too (jwks_uri or audiences may have
-            // shifted; populate the cache so the next federation
-            // request sees the post-update key set without an inline
-            // fetch tax). MUST NOT fail the apply on error.
-            self.warm_up_oidc_jwks(&issuer).await;
+            change.upserts.push(issuer);
             events.push(EventToAppend::new(DomainEvent::OidcIssuerUpdated(
                 OidcIssuerUpdated {
                     issuer_id: existing.id,
@@ -74,7 +98,7 @@ impl ApplyConfigUseCase {
                 .await?
                 .map(|i| i.id)
                 .unwrap_or_else(Uuid::new_v4);
-            self.oidc_issuers.delete_by_name(name).await?;
+            change.deletes.push(name.clone());
             events.push(EventToAppend::new(DomainEvent::OidcIssuerDeleted(
                 OidcIssuerDeleted {
                     issuer_id: prior_id,
@@ -86,23 +110,41 @@ impl ApplyConfigUseCase {
             report.deleted += 1;
         }
 
-        if !events.is_empty() {
-            tracing::info!(
-                kind = gitops_kind::OIDC_ISSUER,
-                events = events.len(),
-                "oidc_issuer audit events committed"
-            );
-            let actor = gitops_actor_for_kind(Kind::OidcIssuer);
-            self.events
-                .append(AppendEvents {
-                    stream_id: StreamId::authorization(),
-                    expected_version: ExpectedVersion::Any,
-                    events,
-                    correlation_id: Uuid::new_v4(),
-                    causation_id: None,
-                    actor,
-                })
-                .await?;
+        if change.upserts.is_empty() && change.deletes.is_empty() {
+            // Nothing in the plan: no row write, no event, no
+            // transaction. Same observable behaviour as before the
+            // port, without a pointless round-trip on every boot.
+            return Ok(());
+        }
+
+        let event_count = events.len();
+        let batches = Self::authorization_batches(events, Kind::OidcIssuer, token);
+        self.authority.commit_oidc_issuers(&change, batches).await?;
+
+        // Emitted AFTER the commit returned `Ok` — the first point at
+        // which "committed" is true. The same line used to run *before*
+        // the append, so an operator reading the log saw the claim on a
+        // path that had not yet done the thing it claimed.
+        //
+        // Unguarded, unlike the pre-port `if !events.is_empty()`: the
+        // early return above already established that the change set is
+        // non-empty, and every row operation pushed into it pushed an
+        // event beside it, so `event_count >= 1` here by construction.
+        // A guard would be an unreachable branch.
+        tracing::info!(
+            kind = gitops_kind::OIDC_ISSUER,
+            events = event_count,
+            "oidc_issuer audit events committed"
+        );
+
+        // Best-effort JWKS warm-up for every issuer whose row is now
+        // durable. MUST NOT fail the apply on error; federation works
+        // lazily via the cache-miss path on first request. Fires on the
+        // update path too (jwks_uri or audiences may have shifted;
+        // populate the cache so the next federation request sees the
+        // post-update key set without an inline fetch tax).
+        for issuer in &change.upserts {
+            self.warm_up_oidc_jwks(issuer).await;
         }
         Ok(())
     }
@@ -248,6 +290,92 @@ mod tests {
         assert!(h.oidc_issuers.snapshot().is_empty());
     }
 
+    // -- rows commit with their audit events ---------------------------------
+
+    /// An audit-append failure during the issuer apply leaves **no**
+    /// issuer row behind. Issuer rows are trust anchors (ADR 0018): a
+    /// serving validator reads the repository at validation time, so a
+    /// row that commits without its attesting event is a live trust
+    /// change the authorization stream is silent about — and a reapply
+    /// cannot restore the original `Created` / `Deleted`.
+    #[tokio::test]
+    async fn apply_oidc_issuer_commit_failure_leaves_no_row() {
+        let h = build_harness();
+        h.authority.fail_next(
+            AuthoritySite::OidcIssuers,
+            DomainError::Invariant("event store unavailable".into()),
+        );
+        let mut desired = DesiredState::default();
+        desired
+            .oidc_issuers
+            .push(oidc_issuer_env_for_apply("github-actions"));
+
+        let err =
+            h.uc.apply(desired, env_oidc())
+                .await
+                .expect_err("an audit-append failure must fail the apply");
+        assert!(
+            err.to_string().contains("event store unavailable"),
+            "the event-store failure must surface, got: {err}"
+        );
+        assert!(
+            h.oidc_issuers.snapshot().is_empty(),
+            "the issuer row must not be in effect after a failed commit"
+        );
+        assert!(
+            !authz_events(&h)
+                .await
+                .iter()
+                .any(|e| matches!(e, DomainEvent::OidcIssuerCreated(_))),
+            "no OidcIssuerCreated may have landed either"
+        );
+    }
+
+    /// The JWKS warm-up runs **after** the commit, so a rolled-back
+    /// issuer never gets its keys cached. A warmed cache for a row
+    /// nothing persisted would be a trust state with no record.
+    #[tokio::test]
+    async fn apply_oidc_issuer_commit_failure_skips_jwks_warm_up() {
+        let h = build_harness();
+        let (uc, validator) = install_validator(&h);
+        validator.register_refresh_outcome("github-actions", Ok(()));
+        h.authority.fail_next(
+            AuthoritySite::OidcIssuers,
+            DomainError::Invariant("event store unavailable".into()),
+        );
+        let mut desired = DesiredState::default();
+        desired
+            .oidc_issuers
+            .push(oidc_issuer_env_for_apply("github-actions"));
+
+        uc.apply(desired, env_oidc())
+            .await
+            .expect_err("an audit-append failure must fail the apply");
+        assert!(
+            validator.refresh_calls().is_empty(),
+            "warm-up must not run for an issuer whose row did not commit"
+        );
+    }
+
+    /// An apply with no issuer envelopes opens no transaction at all —
+    /// the early return before the commit. Same observable behaviour as
+    /// before the port (no row write, no event), without a round-trip
+    /// on every boot.
+    #[tokio::test]
+    async fn apply_oidc_issuer_empty_plan_does_not_commit() {
+        let h = build_harness();
+        h.uc.apply(DesiredState::default(), env_oidc())
+            .await
+            .unwrap();
+        assert!(
+            !h.authority
+                .commits()
+                .iter()
+                .any(|(site, _)| *site == AuthoritySite::OidcIssuers),
+            "an empty issuer plan must not reach the authority port"
+        );
+    }
+
     // -- apply-time JWKS warm-up tests ---------------------------------------
 
     /// Helper: rebuild the apply use case from a base harness with a
@@ -275,6 +403,10 @@ mod tests {
             h.repos.clone(),
             h.claim_mappings.clone(),
             h.grant_repo.clone(),
+            // Same atomic authority writer the base harness holds, so
+            // an armed failure seeded via `h.authority` is observed by
+            // this rebuilt use case too.
+            h.authority.clone(),
             h.rule_repo.clone(),
             h.proj.clone(),
             policies,

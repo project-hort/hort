@@ -106,7 +106,6 @@ test-values-cronjobs.yaml|^                - day$|3|exactly the three retention 
 test-values-cronjobs.yaml|^  concurrencyPolicy: Forbid$|16|every CronJob (incl. the 3 retention + the always-on quarantineReleaseSweep + the always-on scrub + the always-on scanRowRetentionSweep + the always-on jobsRowRetentionSweep + the now-default-on prefetchRowRetentionSweep + scanner-registry-prune + the now-default-on verify-event-chain, ADR 0057) sets concurrencyPolicy: Forbid (single-active layer 1; worker semaphore is layer 2)
 test-values-cronjobs.yaml|name: hort-server-job-bootstrap-egress$|1|additive Job-scoped bootstrap-egress NetworkPolicy renders when networkPolicy.enabled (chart default true)
 test-values-cronjobs.yaml|^kind: NetworkPolicy$|2|BOTH the app-pod NetworkPolicy and the additive Job-scoped policy render with the chart-default networkPolicy.enabled: true
-test-values-cronjobs.yaml|key: hort-server.io/job|1|the Job-scoped policy selects by the hort-server.io/job label Exists (never the app pods)
 test-values-networkpolicy-off.yaml|^kind: NetworkPolicy$|0|networkPolicy.enabled=false disables BOTH NetworkPolicies (app-pod AND the additive Job-scoped one)
 test-values-networkpolicy-off.yaml|name: hort-server-job-bootstrap-egress$|0|the Job-scoped policy does NOT render when networkPolicy.enabled=false
 test-values-cronjobs.yaml|name: HORT_STATEFUL_UPLOAD_STAGING_DIR$|1|HORT_STATEFUL_UPLOAD_STAGING_DIR env rendered unconditionally for storage.backend=filesystem (chart↔binary staging contract)
@@ -167,6 +166,9 @@ test-values-cronjobs.yaml|templates/worker-deployment.yaml|mountPath: /var/lib/h
 test-values-ha.yaml|templates/deployment.yaml|app.kubernetes.io/component: server|2|server Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the existing pod-template label (1) — matchLabels stays a subset of the pod labels
 test-values-ha.yaml|templates/worker-deployment.yaml|app.kubernetes.io/component: worker|3|worker Deployment's spec.selector.matchLabels carries the component discriminator (1) alongside the Deployment metadata label (1) + pod-template label (1)
 test-values-ha.yaml|templates/pdb.yaml|app.kubernetes.io/component: server|1|the server-only PDB's selector.matchLabels carries the component discriminator so it no longer also matches worker pods, which have no PDB of their own
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|^      app\.kubernetes\.io/name: hort-server$|1|the Job-egress policy's podSelector.matchLabels carries this release's name label (6-space indent — the policy's own metadata labels sit at 4, so this pattern sees the SELECTOR alone)
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|^      app\.kubernetes\.io/instance: hort-server$|1|the Job-egress policy's podSelector.matchLabels carries this release's instance label — without it the unrestricted-egress allowance reaches any pod in the namespace that sets an hort-server.io/job label, and a neighbouring release's Jobs too
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|^      - key: hort-server\.io/job$|1|the Job-egress policy's podSelector still ANDs the hort-server.io/job Exists clause onto the release scope — that clause alone is what keeps the app Deployment pods (same release labels, no job key) out of the allowance
 test-values.yaml|templates/prepull-daemonset.yaml|ghcr.io/project-hort/hort-server:|1|the server pre-pull DaemonSet's init container pulls the SAME image repository as the server Deployment
 test-values.yaml|templates/prepull-daemonset.yaml|args: \["--version"\]|1|the init container forces the pull via the no-op --version command (no new binary surface)
 test-values.yaml|templates/prepull-worker-daemonset.yaml|ghcr.io/project-hort/hort-worker:|1|the worker pre-pull DaemonSet's init container pulls the SAME image repository as the worker Deployment
@@ -232,6 +234,47 @@ cronjob_timezone_checks() {
     cat <<'EOF'
 test-values-cronjob-timezone.yaml|Etc/UTC|every rendered CronJob carries the chart-default scheduledTasks.timeZone
 test-values-cronjob-timezone-override.yaml|America/Los_Angeles|an overridden scheduledTasks.timeZone reaches every rendered CronJob (no per-job override exists)
+EOF
+}
+
+# Pod-selector scope checks for the additive Job-egress NetworkPolicy.
+#
+# That policy grants UNRESTRICTED egress (`to: []`), so *who it selects*
+# is a security boundary rather than a detail, and both halves of the
+# boundary need an assertion:
+#
+#   - Too wide and the allowance leaks. A `podSelector` that tested only
+#     whether the `hort-server.io/job` label KEY exists hands unrestricted
+#     egress to any pod in the namespace willing to set one label of its
+#     own choosing — including to a principal who may label a Pod but may
+#     not touch NetworkPolicies. A grep for that label key passes at
+#     every scope, which is exactly why a key-shaped assertion cannot
+#     hold this.
+#   - Too narrow and `helm install` bricks. The allowance exists for the
+#     pre-install migrate hook Job, which must reach Postgres before the
+#     app pod (and its deny-all egress policy) exist. A selector no
+#     legitimate Job pod matches fails at install time, not here —
+#     swapping `hort-server.selectorLabels` for `hort-server.labels` in
+#     the selector is one word and does precisely that.
+#
+# So this check DERIVES both sides from the same render instead of
+# pinning literals: it reads the policy's `podSelector` and each named
+# pod template's own pod-template labels, then evaluates one against the
+# other. `satisfies` rows must be selected by the policy, `excluded`
+# rows must not be. A selector whose `matchLabels` carry no release
+# identity fails outright, and the `excluded` rows fail if the `Exists`
+# clause is dropped — so neither clause can go missing with this green.
+#
+# Format:
+# `<fixture>|<policy template>|<pod template>|satisfies|excluded|<human label>`.
+selector_scope_checks() {
+    cat <<'EOF'
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|templates/job-migrate.yaml|satisfies|the pre-install migrate Job — the pod this whole carve-out exists for — is still selected by the release-scoped policy
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|templates/svc-token-bootstrap-job.yaml|satisfies|the svc-token-bootstrap Job, which needs Postgres + the kube-apiserver while the app-pod deny-all is already active, is still selected
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|templates/prepull-job.yaml|satisfies|the pre-pull wait Job, which talks to the kube-apiserver before the Deployment exists, is still selected
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|templates/cronjob-scrub.yaml|satisfies|a scheduled CronJob's pod template is still selected — its labels nest a level deeper than a Job's, so this covers the CronJob shape too
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|templates/deployment.yaml|excluded|the app Deployment pods carry the SAME release labels as the Jobs and are kept out by the hort-server.io/job Exists clause alone — their deny-all egress must stay untouched
+test-values-cronjobs.yaml|templates/networkpolicy-migrate-job.yaml|templates/worker-deployment.yaml|excluded|same for the worker pods: release labels present, no job key, so no unrestricted-egress allowance
 EOF
 }
 
@@ -438,6 +481,186 @@ while IFS='|' read -r fixture expected_tz label; do
         echo "PASS: ${fixture} → ${label} (${cronjob_count}/${cronjob_count} CronJobs)"
     fi
 done < <(cronjob_timezone_checks)
+
+# Print the `key: value` entries of the first `<block>:` mapping at or
+# below the first line matching `<after>`: the lines strictly more
+# indented than the block header, up to the first line that is not.
+# Indentation-based, not a YAML parser — the suite has only helm and
+# coreutils in CI, and it reads chart-rendered output whose shape these
+# same assertions pin.
+yaml_block_entries() {
+    local after="$1" block="$2"
+    awk -v after="${after}" -v block="${block}" '
+        state == 0 && $0 ~ after { state = 1 }
+        state == 1 && $0 ~ "^[[:space:]]*" block ":[[:space:]]*$" {
+            match($0, /^[[:space:]]*/)
+            indent = RLENGTH
+            state = 2
+            next
+        }
+        state == 2 {
+            if ($0 ~ /^[[:space:]]*(#|$)/) next
+            match($0, /^[[:space:]]*/)
+            if (RLENGTH <= indent) { state = 3; next }
+            entry = $0
+            sub(/^[[:space:]]+/, "", entry)
+            if (entry ~ /^-/) next
+            print entry
+        }
+    '
+}
+
+# Print the label keys of the `podSelector.matchExpressions` entries
+# whose operator is `Exists` (the rendered form is a `- key: <k>` line
+# followed by an `operator: <op>` line).
+selector_exists_keys() {
+    awk '
+        state == 0 && $0 ~ /^[[:space:]]*podSelector:[[:space:]]*$/ { state = 1; next }
+        state == 1 && $0 ~ /^[[:space:]]*matchExpressions:[[:space:]]*$/ {
+            match($0, /^[[:space:]]*/)
+            indent = RLENGTH
+            state = 2
+            next
+        }
+        state == 2 {
+            if ($0 ~ /^[[:space:]]*(#|$)/) next
+            match($0, /^[[:space:]]*/)
+            if (RLENGTH <= indent) { state = 3; next }
+            if ($0 ~ /key:[[:space:]]*[^[:space:]]/) {
+                pending = $0
+                sub(/^.*key:[[:space:]]*/, "", pending)
+            }
+            if ($0 ~ /operator:[[:space:]]*Exists[[:space:]]*$/ && pending != "") {
+                print pending
+                pending = ""
+            }
+        }
+    '
+}
+
+# Process the derived pod-selector scope checks (see
+# selector_scope_checks() above): render the policy and the pod template
+# from the same fixture, then evaluate the rendered `podSelector`
+# against the rendered pod labels.
+while IFS='|' read -r fixture policy_tmpl pod_tmpl verdict label; do
+    [[ -z "${fixture}" ]] && continue
+    fixture_path="${chart_dir}/${fixture}"
+
+    if [[ ! -f "${fixture_path}" ]]; then
+        echo "FAIL: fixture missing: ${fixture}" >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    render_failed=0
+    for tmpl in "${policy_tmpl}" "${pod_tmpl}"; do
+        if ! out=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
+            echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
+            echo "${out}" | sed 's/^/    /' >&2
+            render_failed=1
+            break
+        fi
+        if [[ "${tmpl}" == "${policy_tmpl}" ]]; then
+            policy_rendered="${out}"
+        else
+            pod_rendered="${out}"
+        fi
+    done
+    checked_fixtures+=("${fixture}")
+    if [[ "${render_failed}" -eq 1 ]]; then
+        failed=$((failed + 1))
+        continue
+    fi
+
+    match_labels=$(printf '%s\n' "${policy_rendered}" | yaml_block_entries '^[[:space:]]*podSelector:[[:space:]]*$' 'matchLabels')
+    exists_keys=$(printf '%s\n' "${policy_rendered}" | selector_exists_keys)
+    pod_labels=$(printf '%s\n' "${pod_rendered}" | yaml_block_entries '^[[:space:]]*template:[[:space:]]*$' 'labels')
+
+    # The selector must carry a release identity at all. This is the
+    # assertion whose absence let an existence-only selector ship: the
+    # policy grants unrestricted egress, so without these labels it
+    # selects any pod in the namespace carrying one label of its own
+    # choosing, and a neighbouring release's Job pods besides.
+    scope_ok=1
+    for required in 'app\.kubernetes\.io/name' 'app\.kubernetes\.io/instance'; do
+        # Bounded: match_labels holds one podSelector's matchLabels block —
+        # the same handful of 63-char Kubernetes label lines, far under the
+        # 64 KiB pipe buffer.
+        if ! printf '%s\n' "${match_labels}" | grep -qE "^${required}: .+"; then
+            echo "FAIL: ${fixture} (${policy_tmpl}) → podSelector.matchLabels carries no ${required//\\/}" >&2
+            scope_ok=0
+        fi
+    done
+    # An empty pod-label set would make every `excluded` row pass for
+    # the wrong reason, so refuse to grade on one.
+    if [[ -z "${pod_labels}" ]]; then
+        echo "FAIL: ${fixture} (${pod_tmpl}) → no pod-template labels extracted; the scope check would be vacuous" >&2
+        scope_ok=0
+    fi
+    if [[ "${scope_ok}" -eq 0 ]]; then
+        echo "    the policy grants unrestricted egress (to: []), so its selector scope is load-bearing" >&2
+        echo "    rendered podSelector.matchLabels:" >&2
+        printf '%s\n' "${match_labels}" | sed 's/^/        /' >&2
+        echo "    rendered pod-template labels (${pod_tmpl}):" >&2
+        printf '%s\n' "${pod_labels}" | sed 's/^/        /' >&2
+        failed=$((failed + 1))
+        continue
+    fi
+
+    # Evaluate the selector: every matchLabel must be present verbatim
+    # and every `Exists` key must be present at all.
+    unmet=""
+    while IFS= read -r entry; do
+        [[ -z "${entry}" ]] && continue
+        # Bounded: pod_labels holds one pod template's rendered labels. A
+        # Kubernetes label is a 63-char key plus a 63-char value and a pod
+        # template carries a handful, so this producer cannot approach the
+        # 64 KiB pipe buffer that makes `| grep -q` lossy under pipefail.
+        if ! printf '%s\n' "${pod_labels}" | grep -qxF "${entry}"; then
+            unmet="${unmet}        missing matchLabel: ${entry}"$'\n'
+        fi
+    done <<<"${match_labels}"
+    while IFS= read -r key; do
+        [[ -z "${key}" ]] && continue
+        # Bounded: as above — pod_labels is one pod template's label block,
+        # so the producer finishes writing long before grep -q can exit.
+        if ! printf '%s\n' "${pod_labels}" | grep -qE "^$(printf '%s' "${key}" | sed 's/[.[\*^$]/\\&/g'): "; then
+            unmet="${unmet}        missing Exists key: ${key}"$'\n'
+        fi
+    done <<<"${exists_keys}"
+
+    case "${verdict}" in
+        satisfies)
+            if [[ -z "${unmet}" ]]; then
+                echo "PASS: ${fixture} (${policy_tmpl} vs ${pod_tmpl}) → ${label}"
+            else
+                echo "FAIL: ${fixture} (${policy_tmpl} vs ${pod_tmpl}) → ${label}" >&2
+                echo "    the pod template is NOT selected by the policy:" >&2
+                printf '%s' "${unmet}" >&2
+                echo "    rendered pod-template labels:" >&2
+                printf '%s\n' "${pod_labels}" | sed 's/^/        /' >&2
+                failed=$((failed + 1))
+            fi
+            ;;
+        excluded)
+            if [[ -n "${unmet}" ]]; then
+                echo "PASS: ${fixture} (${policy_tmpl} vs ${pod_tmpl}) → ${label}"
+            else
+                echo "FAIL: ${fixture} (${policy_tmpl} vs ${pod_tmpl}) → ${label}" >&2
+                echo "    the pod template IS selected by the policy, which must not happen" >&2
+                echo "    rendered podSelector.matchLabels:" >&2
+                printf '%s\n' "${match_labels}" | sed 's/^/        /' >&2
+                echo "    rendered podSelector Exists keys:" >&2
+                printf '%s\n' "${exists_keys}" | sed 's/^/        /' >&2
+                failed=$((failed + 1))
+            fi
+            ;;
+        *)
+            echo "FAIL: ${fixture} (${policy_tmpl} vs ${pod_tmpl}) → unknown verdict '${verdict}'; use satisfies or excluded" >&2
+            failed=$((failed + 1))
+            ;;
+    esac
+done < <(selector_scope_checks)
 
 # Catch fixtures that have no expectations row — silently rendering
 # without any assertion is a regression magnet (someone adds a fixture,

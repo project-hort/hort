@@ -61,6 +61,12 @@ use crate::metrics::{
     SbomExtractionResult, SbomResolutionResult, ScanFailureResult, ScanJobsResult,
     ScanTerminalResult,
 };
+// `record_outcome`'s `Failed` branch waits out the workspace's one
+// retry curve. The four-step shape used to be defined here and the task
+// dispatcher carried its own, differently-shaped copy behind the same
+// agreed attempt cap; the definition moved to `crate::retry_backoff` so
+// the number and the window it spans cannot diverge again.
+use crate::retry_backoff::compute_backoff;
 use crate::scanning::any_scan_backend_applies_to;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
@@ -1211,29 +1217,6 @@ impl ScanOrchestrationUseCase {
 // ---------------------------------------------------------------------------
 // Pure helpers (testable without the full use case)
 // ---------------------------------------------------------------------------
-
-/// Backoff schedule for `record_outcome`'s `Failed` branch.
-///
-/// `attempts` is the value already on the job row at the time of the
-/// failure (the post-claim, pre-decision number). The schedule:
-///
-/// - `attempts == 1` → 1 minute
-/// - `attempts == 2` → 5 minutes
-/// - `attempts == 3` → 30 minutes
-/// - `attempts == 4` → 60 minutes
-/// - `attempts >= 5` → 60 minutes (defensive cap; `max_attempts == 5`
-///   default would have routed to `mark_failed` instead)
-/// - `attempts == 0` → 1 minute (defensive — `claim_scan_jobs`
-///   increments attempts before we observe the row, so this branch is
-///   not normally reached).
-pub fn compute_backoff(attempts: u32) -> Duration {
-    match attempts {
-        0 | 1 => Duration::from_secs(60),
-        2 => Duration::from_secs(5 * 60),
-        3 => Duration::from_secs(30 * 60),
-        _ => Duration::from_secs(60 * 60),
-    }
-}
 
 /// Deduplicate a finding set by `(purl, vulnerability_id)`. Collision
 /// preference (see [`prefer_replacement`]): a recognised-informational

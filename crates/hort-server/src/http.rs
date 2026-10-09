@@ -142,14 +142,26 @@ pub fn build_router_with_oci_config(
     enable_token_exchange: bool,
     control_split: bool,
 ) -> Router {
-    // Per-publish body-size ceiling. PyPI and npm
-    // share the same 300 MiB default (`DEFAULT_PUBLISH_BODY_LIMIT`);
-    // operators can override both via `HORT_PUBLISH_BODY_MAX_SIZE`.
-    // Cargo carries its own fixed 200 MiB ceiling — not threaded through
-    // the env override (see `hort_http_core::limits::CARGO_PUBLISH_BODY_LIMIT`).
+    // Per-publish body-size ceiling. npm, PyPI and Maven share the same
+    // 300 MiB default (`DEFAULT_PUBLISH_BODY_LIMIT`) and take the
+    // `HORT_PUBLISH_BODY_MAX_SIZE` override at face value. Cargo keeps
+    // its own fixed 200 MiB ceiling against any non-zero override, but a
+    // zero one is the refuse-all-publishes kill switch rather than a
+    // ceiling and must close every publish surface, so cargo's number
+    // goes through `cargo_publish_body_limit` — the single site of that
+    // split (see `hort_http_core::limits::CARGO_PUBLISH_BODY_LIMIT`).
+    //
+    // What a zero then *does* is not this function's business either:
+    // each of the five publish subtrees applies
+    // `hort_http_core::limits::refuse_publishes_when_disabled`, which
+    // answers the publish methods with `503`. The refusal is deliberately
+    // not left to `DefaultBodyLimit::max(0)` — a zero-byte ceiling
+    // admits a zero-byte body, and a Maven PUT has no envelope that
+    // could fail on one.
     let publish_limit = ctx
         .publish_body_limit_bytes
         .unwrap_or(hort_http_core::limits::DEFAULT_PUBLISH_BODY_LIMIT);
+    let cargo_publish_limit = hort_http_core::limits::cargo_publish_body_limit(publish_limit);
 
     // Per-request deadline.
     //
@@ -238,7 +250,10 @@ pub fn build_router_with_oci_config(
         // routes stay mounted but the dispatcher is not spawned
         // ("flag-off short-circuits").
         .merge(hort_http_events::router())
-        .nest("/cargo", hort_http_cargo::cargo_routes())
+        .nest(
+            "/cargo",
+            hort_http_cargo::cargo_routes_with_publish_limit(cargo_publish_limit),
+        )
         .nest(
             "/npm",
             hort_http_npm::npm_routes_with_publish_limit(publish_limit),
@@ -247,7 +262,10 @@ pub fn build_router_with_oci_config(
             "/pypi",
             hort_http_pypi::pypi_routes_with_publish_limit(publish_limit),
         )
-        .nest("/maven", hort_http_maven::maven_routes());
+        .nest(
+            "/maven",
+            hort_http_maven::maven_routes_with_publish_limit(publish_limit),
+        );
     // Control-plane placement.
     //
     // When the control split is OFF (`HORT_CONTROL_BIND` unset — the
@@ -287,9 +305,17 @@ pub fn build_router_with_oci_config(
         // them in. The OCI subtree carries its own per-request
         // deadline layers (long for uploads, short for reads), so the
         // merge intentionally inherits per-side layer stacks.
-        .merge(hort_http_oci::oci_routes_with_config(
+        // The publish limit reaches the OCI subtree for its
+        // kill-switch meaning only: `0` refuses every push (blob
+        // upload POST/PATCH/PUT and manifest PUT), while a non-zero
+        // *size* changes nothing there — the upload path bounds each
+        // chunk through its own session accounting instead of capping
+        // a whole-blob request body (see
+        // `oci_routes_with_publish_limit`).
+        .merge(hort_http_oci::oci_routes_with_publish_limit(
             oci_http_config,
             ctx.clone(),
+            publish_limit,
         ));
 
     let wrapped = wrap_with_middleware(ctx.clone(), inner);

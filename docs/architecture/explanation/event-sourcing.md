@@ -166,6 +166,78 @@ COMMIT
   keeping the use case free of other I/O inside `commit_transition` is
   load-bearing, not cosmetic.
 
+### The same shape for CRUD rows that carry an audit trail
+
+Permission grants, claim mappings and OIDC issuers are **not**
+event-sourced — the rows are the source of truth and the events are
+their audit trail (ADR 0012, ADR 0018). That makes the divergence
+window worse, not better. An event-sourced aggregate whose projection
+write fails can be rebuilt from its stream; a CRUD row whose *audit*
+append fails is live and unattested, and the gitops apply cannot repair
+it on retry: the next apply derives its events from the prior rows,
+which already hold the change, so it emits nothing. The claim-mapping
+branch had this written in its own comment, as expected behaviour, long
+before it was a guarantee anywhere.
+
+`AuthorityLifecyclePort` (`PgAuthorityLifecycle`) is the same
+`PgUnitOfWork` shape applied there. One call takes the desired rows and
+the audit batches the apply's prior-vs-desired diff produced, and
+commits both or neither:
+
+```
+BEGIN
+DELETE FROM permission_grants WHERE managed_by = 'gitops'
+INSERT INTO permission_grants (...)   -- one row per desired grant
+INSERT INTO events (...)              -- the authorization-stream batch
+INSERT INTO events (...)              -- one batch per repository stream
+COMMIT
+```
+
+Two details differ from the artifact case:
+
+- **Rows first, then the appends.** The failure this closes is an
+  append that fails after the row is durable, so the rows are written
+  first and a failing append has real DML to roll back. There is no
+  deadlock cost: the `events`-first lifecycle adapters never touch
+  these five tables, and gitops apply is single-flight per boot lock.
+- **The batch list is plural.** A grant reconcile routes each row's
+  event to its repository stream or to the global authorization stream,
+  so one reconcile spans several streams; an upstream-mapping apply is
+  repo-scoped on every row, so it spans one stream per repository it
+  touches. They are appended with several `append_in_tx` calls on the
+  *same* unit of work, which is what makes the whole list atomic —
+  previously one `EventStore::append` transaction per stream could
+  leave some repository streams audited and others not.
+
+The port covers **every** authority write: permission grants, claim
+mappings and OIDC issuers, plus the gitops-managed
+`repository_upstream_mappings` set (the upstream a proxy repository
+trusts, with its credential reference and TLS material) and the
+`service_accounts` aggregate (whose `federated_identities[].claims`
+decide which JWTs may assume the account). And the five repository
+ports no longer carry the write method the port replaced, so the
+dual-write shape is a compile error rather than a review rule — the
+same posture the `pub(crate)` `AppContext` fields take against a format
+crate. The one exception is deliberate:
+`RepositoryUpstreamMappingRepository` keeps its non-gitops `upsert` /
+`delete` pair, the `managed_by = 'local'` admin CRUD surface, which
+carries no digest, no provenance and no audit event.
+
+Operator-visible consequence: an event-store failure during any of
+those five applies now leaves the rows **unchanged**. The apply fails
+closed instead of half-done.
+
+One write stays outside the transaction, and has to: the backing
+`users` row for a declared `ServiceAccount`. The FK from
+`service_accounts.backing_user_id` means it must be durable before the
+SA row can reference it. It is safe because an orphan backing user
+confers nothing — the grant reconcile materialises
+`GrantSubject::User(backing_user_id)` rows only for service accounts
+resolved from the *persisted* SA aggregate, so a users row whose SA
+commit rolled back carries no grant and no token. The next apply finds
+it by username, reuses its id, and re-emits the same
+`ServiceAccountCreated`.
+
 ## Content write precedes the metadata transaction
 
 The artifact body is many megabytes and streams through many chunks;

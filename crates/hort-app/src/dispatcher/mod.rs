@@ -31,4 +31,4 @@ pub mod subscription_task;
 
 pub use dispatcher::NotificationDispatcher;
 pub use failure_budget::FailureBudget;
-pub use subscription_task::SubscriptionTaskDeps;
+pub use subscription_task::{DeliveryShape, SubscriptionTaskDeps};

@@ -63,7 +63,10 @@ use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_i
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
-use hort_http_core::limits::{BoundedPath, DEFAULT_PUBLISH_BODY_LIMIT, MAX_MULTIPART_FIELDS};
+use hort_http_core::limits::{
+    publish_disabled_response, refuse_publishes_when_disabled, BoundedPath,
+    DEFAULT_PUBLISH_BODY_LIMIT, MAX_MULTIPART_FIELDS,
+};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 
 /// The one format this crate's read path serves — the key into
@@ -98,15 +101,25 @@ pub fn pypi_routes() -> Router<Arc<AppContext>> {
 /// The body-limit layer is attached to the `POST /:repo_key/` publish
 /// route only — GET routes carry no body, so layering there would be
 /// no-op noise. Mirrors the Cargo builder's route-scoped attachment.
+///
+/// A zero limit is the refuse-all-publishes kill switch rather than a
+/// ceiling, and it is answered by
+/// `hort_http_core::limits::refuse_publishes_when_disabled` — `503`,
+/// before the POST reaches the handler — not by the body limit. Through
+/// the body limit a zero-byte publish was refused only because the
+/// multipart parse failed on empty input, which is a property of the
+/// payload grammar and not a promise the limit made. That guard is
+/// method-scoped, so the `simple/` read routes are untouched by it.
 pub fn pypi_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
-    Router::new()
+    let routes = Router::new()
         .route(
             "/{repo_key}/",
             post(upload).layer(DefaultBodyLimit::max(limit)),
         )
         .route("/{repo_key}/simple/", get(simple_root))
         .route("/{repo_key}/simple/{project}/", get(simple_project))
-        .route("/{repo_key}/simple/{project}/{filename}", get(download))
+        .route("/{repo_key}/simple/{project}/{filename}", get(download));
+    refuse_publishes_when_disabled(routes, limit, publish_disabled_response)
 }
 
 // ---------------------------------------------------------------------------

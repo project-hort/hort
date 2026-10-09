@@ -3285,6 +3285,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-util",
+ "object_store",
  "rand 0.10.3",
  "serde",
  "serde_json",

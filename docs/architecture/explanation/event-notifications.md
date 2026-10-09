@@ -38,8 +38,9 @@ subscription. It reconciles the task set every 30 seconds and on
 `subscription_changes` LISTEN/NOTIFY events, spawning tasks for newly
 active subscriptions, cancelling tasks whose rows vanished or were
 disabled or whose owner no longer resolves to a delivery authority, and
-re-publishing a freshly synthesised owner principal into every task that
-survives the pass.
+re-publishing into every task that survives the pass both a freshly
+synthesised owner principal and the listed row's own delivery-shaping
+fields (its target and its filter).
 
 **Delivery is driven by the event store, not by that channel**
 ([ADR 0061](../../adr/0061-store-driven-notification-delivery.md)). Each
@@ -253,6 +254,31 @@ re-synthesised principal is published into the running task, which reads
 it per event, so revoking the bit takes effect within one reconcile
 interval; a principal that stops resolving at all — owner row gone,
 deactivated, or unreadable — cancels the task instead.
+
+The row's **target and filter** travel the same path, for the same
+reason: an input to a per-event decision may not be older than the
+cadence the rest of that decision runs on. The reconcile pass publishes
+them from the row it just listed into the running task
+(`dispatcher.rs`, `DeliveryShape`), which loads them per event alongside
+the principal and the evaluator — so a `PATCH
+/api/v1/subscriptions/:id` that rotates a webhook URL away from a
+compromised receiver, or narrows a filter to drop a category or an event
+type, takes effect for the next delivered event within one reconcile
+interval, with no restart and no cancel-and-respawn. What is published
+is those two fields and not the whole row: a task owns its own progress,
+and `last_delivered_position` on a freshly read row is behind the task's
+in-memory cursor by up to the 5-minute progress debounce, so a task that
+re-seeded from a republished row would re-deliver that window on every
+reconcile tick. **A filter change applies from the cursor forward** —
+narrowing takes effect for everything the task has not yet walked, while
+a *widened* filter does not retroactively deliver events the task
+already passed under the narrower one, because those positions are below
+its mark and no read starts below the mark
+([ADR 0061](../../adr/0061-store-driven-notification-delivery.md)). The
+delivery walk does not re-validate the target: the create / update path
+validates a webhook target — plaintext rule, URL grammar and the SSRF /
+DNS guard — before it is persisted, so a row that reached the database
+was admitted.
 
 Repository-capped API tokens cannot escape their cap through the
 durable side-effect either: a capped token must name an explicit

@@ -1676,18 +1676,6 @@ mod tests {
         > {
             Box::pin(async { Ok(Vec::new()) })
         }
-        fn save_managed(
-            &self,
-            _m: &RepositoryUpstreamMapping,
-        ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-        fn delete_managed_by_id(
-            &self,
-            _id: Uuid,
-        ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
     }
 
     #[tokio::test]

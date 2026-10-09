@@ -289,9 +289,26 @@ Additional layers, each small and focused:
   `hort_rate_limit_rejects_total{path, scope}` with
   `path=MatchedPath` (never a raw URI).
 - **Body + field caps.** `crates/hort-http-core/src/limits.rs` exports
-  `DEFAULT_PUBLISH_BODY_LIMIT` (300 MiB), `MAX_MULTIPART_FIELDS` (100),
-  `MAX_ROUTE_PARAM_BYTES` (512). Path-param caps are enforced by the
-  `BoundedPath<T>` extractor used by every format handler.
+  `DEFAULT_PUBLISH_BODY_LIMIT` (300 MiB), `CARGO_PUBLISH_BODY_LIMIT`
+  (200 MiB), `MAX_MULTIPART_FIELDS` (100), `MAX_ROUTE_PARAM_BYTES`
+  (512). Path-param caps are enforced by the `BoundedPath<T>` extractor
+  used by every format handler. `HORT_PUBLISH_BODY_MAX_SIZE` overrides
+  the publish cap for npm / PyPI / Maven; cargo keeps its own ceiling
+  against any non-zero value and OCI push takes no ceiling from it
+  (`limits::cargo_publish_body_limit`).
+- **Publish kill switch.** `HORT_PUBLISH_BODY_MAX_SIZE=0` is not a
+  smaller ceiling but an administrative hold, and
+  `limits::refuse_publishes_when_disabled` is its single definition:
+  each publish subtree applies it, and it answers `503` (no
+  `Retry-After` — the hold has no deadline) on the publish methods
+  before a request reaches a handler. Reach is every publish surface,
+  the four hosted formats and the OCI push path alike. Reads (`GET` /
+  `HEAD`) and deletions pass, so turning publishing off never takes
+  serving down with it. The refusal is deliberately not left to the
+  body limit: `DefaultBodyLimit::max(0)` admits a zero-byte body, and a
+  Maven PUT has no envelope that could fail on one — an empty artifact
+  was ingested, with an `ArtifactIngested`, a quarantine timer and a
+  scan job behind it, out of a gate the operator believed shut.
 - **Response headers.** `middleware/security_headers.rs` always emits
   `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`; CSP `default-src 'none';

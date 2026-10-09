@@ -8,20 +8,28 @@
 //! mutually-exclusive columns (`subject_exclusive` CHECK enforces the XOR
 //! at the DB layer).
 //!
-//! The trait surface is deliberately minimal: the composition root reads the
-//! full grant set once at startup (`list_all`) to build the
-//! `RbacEvaluator`; the gitops apply pipeline reconciles the entire
-//! `managed_by = gitops` partition via `save_managed` (the
-//! authoritative-set reconcile primitive) and inspects the managed
-//! subset for the apply diff via `list_managed_by_gitops`. There is no
-//! live-refresh path — restart-to-apply remains the contract, the
-//! same read-once-at-boot shape the dropped `RoleRepository` had.
+//! **This port is read-only.** The composition root reads the full
+//! grant set once at startup (`list_all`) to build the
+//! `RbacEvaluator`, and the gitops apply pipeline inspects the managed
+//! subset for its diff via `list_managed_by_gitops`. There is no
+//! live-refresh path — restart-to-apply remains the contract, the same
+//! read-once-at-boot shape the dropped `RoleRepository` had.
 //!
-//! **`save_managed` is the reconcile/revoke primitive**:
-//! there is no separate `delete_*` method. An earlier per-row signature
-//! diverged from the revoke + minimal-port design intent; the
-//! plan-aligned shape is "here is the complete gitops-managed set,
-//! reconcile to it atomically."
+//! The write — the authoritative-set reconcile of the whole
+//! `managed_by = 'gitops'` partition — is
+//! [`AuthorityLifecyclePort::commit_permission_grants`], which commits
+//! the reconcile **and** the `PermissionGrantApplied` /
+//! `PermissionGrantRevoked` events that attest it in one transaction.
+//! It used to live here as `save_managed`, committing on its own, and
+//! the use case appended afterwards: an append failure left the grant
+//! live with nothing in the authorization stream attesting it, in a
+//! state no retry could repair (the next apply diffs against the
+//! already-changed rows and emits nothing). The method is gone from
+//! this trait rather than merely unused, so a future apply branch
+//! cannot reintroduce the dual write — the mistake is a compile error.
+//!
+//! [`AuthorityLifecyclePort::commit_permission_grants`]:
+//!     crate::ports::authority_lifecycle::AuthorityLifecyclePort::commit_permission_grants
 
 use crate::entities::rbac::PermissionGrant;
 use crate::error::DomainResult;
@@ -44,29 +52,6 @@ pub trait PermissionGrantRepository: Send + Sync {
     /// `(sorted required_claims, repository_id, permission)` for `Claims`,
     /// `(user_id, repository_id, permission)` for `User`.
     fn list_managed_by_gitops(&self) -> BoxFuture<'_, DomainResult<Vec<PermissionGrant>>>;
-
-    /// Reconcile the **entire** `managed_by = 'gitops'` partition to
-    /// `items` — the authoritative complete gitops-managed grant set
-    /// In a single transaction the
-    /// adapter:
-    ///
-    /// - deletes every `managed_by = 'gitops'` row whose subject-
-    ///   dependent identity (`(sorted required_claims, repository_id,
-    ///   permission)` for `Claims`; `(user_id, repository_id,
-    ///   permission)` for `User`) is absent from
-    ///   `items` (delete-absent), then
-    /// - upserts every row in `items` keyed on that same identity, not
-    ///   the surrogate primary key, so replaying an unchanged gitops
-    ///   set is a no-op (upsert-present).
-    ///
-    /// `save_managed` IS the reconcile/revoke primitive — there is no
-    /// separate `delete_*` method. An empty `items` slice therefore
-    /// revokes every gitops-managed grant (an explicitly-emptied
-    /// config). Every element must carry `managed_by_digest`; the
-    /// adapter writes `managed_by = 'gitops'` unconditionally.
-    /// Revoke/apply audit events are emitted by the use case,
-    /// NOT here.
-    fn save_managed(&self, items: &[PermissionGrant]) -> BoxFuture<'_, DomainResult<()>>;
 }
 
 #[cfg(test)]

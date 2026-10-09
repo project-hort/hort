@@ -33,7 +33,10 @@ use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_i
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
-use hort_http_core::limits::{BoundedPath, CARGO_PUBLISH_BODY_LIMIT};
+use hort_http_core::limits::{
+    publish_disabled_response, refuse_publishes_when_disabled, BoundedPath,
+    CARGO_PUBLISH_BODY_LIMIT,
+};
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 use hort_http_core::middleware::trust::RequestTrust;
 
@@ -82,19 +85,40 @@ pub(crate) mod serve;
 /// The default ([`CARGO_PUBLISH_BODY_LIMIT`] — 200 MiB) is large enough
 /// for nearly every real crate; blocks runaway uploads. Without an
 /// explicit override, axum's default 2 MiB limit rejects any non-
-/// trivial crate, so the limit must be set at the route layer. Not
-/// driven by `HORT_PUBLISH_BODY_MAX_SIZE` — see
-/// `hort_http_core::limits` for the rationale.
+/// trivial crate, so the limit must be set at the route layer. A *size*
+/// set through `HORT_PUBLISH_BODY_MAX_SIZE` does not move this ceiling,
+/// but a zero one does close this route — see
+/// `hort_http_core::limits::cargo_publish_body_limit`, which the
+/// composition root applies before calling
+/// [`cargo_routes_with_publish_limit`].
 pub fn cargo_routes() -> Router<Arc<AppContext>> {
     cargo_routes_with_publish_limit(CARGO_PUBLISH_BODY_LIMIT)
 }
 
 /// Build the Cargo route tree with a custom publish body limit (in bytes).
 ///
-/// Tests use this to exercise the body-limit reject path without actually
-/// sending hundreds of megabytes.
-pub(crate) fn cargo_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
-    Router::new()
+/// `http.rs::build_router` calls this with
+/// `hort_http_core::limits::cargo_publish_body_limit(effective_shared_limit)`
+/// — this crate does not re-derive the size-versus-kill-switch split,
+/// it takes the resolved number. Tests use it to exercise the
+/// body-limit reject path without actually sending hundreds of
+/// megabytes.
+///
+/// A **size** is carried by `DefaultBodyLimit` alone: [`publish`]
+/// consumes the body through the buffering `Bytes` extractor, which
+/// consults the `DefaultBodyLimit` marker, so there is no streaming
+/// consumer that would need the value handed to it a second time as an
+/// `Extension` (contrast npm, whose publish decoder reads a raw `Body`).
+///
+/// **Zero** is the refuse-all-publishes kill switch rather than a
+/// ceiling, and it is answered by
+/// `hort_http_core::limits::refuse_publishes_when_disabled` — `503`,
+/// before the PUT reaches the handler — not by the body limit. Through
+/// the body limit a zero-byte publish was refused only because the
+/// publish envelope failed to parse, which is a property of cargo's
+/// payload grammar and not a promise the limit made.
+pub fn cargo_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> {
+    let routes = Router::new()
         .route("/{repo_key}/config.json", get(config_json))
         .route(
             "/{repo_key}/api/v1/crates/{name}/{version}/download",
@@ -113,7 +137,8 @@ pub(crate) fn cargo_routes_with_publish_limit(limit: usize) -> Router<Arc<AppCon
         .route(
             "/{repo_key}/{aa}/{bb}/{crate_name}",
             get(sparse_index_4plus),
-        )
+        );
+    refuse_publishes_when_disabled(routes, limit, publish_disabled_response)
 }
 
 // ---------------------------------------------------------------------------

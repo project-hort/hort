@@ -169,19 +169,25 @@ const CLAIM_PENDING_BY_KINDS_SQL: &str = "WITH oldest AS MATERIALIZED (\n\
 /// Not-before applied to a row the abandoned-lease sweep returns to
 /// `pending`.
 ///
-/// The same 30 seconds the dispatcher's `compute_backoff` starts from,
-/// and for the same reason its `return_to_pending` gives an
-/// undispatchable row a backoff at all: the sweeping replica is also a
-/// claiming replica, and a row released with a NULL lease is eligible on
-/// that same replica's very next poll. A worker killed by the task
-/// itself (an OOM on one oversized artifact) would then re-take the row
-/// immediately and die again, spending the whole attempt budget inside
-/// one sweep interval instead of across several.
+/// Exists for the same reason the dispatcher's `return_to_pending`
+/// gives an undispatchable row a backoff at all: the sweeping replica is
+/// also a claiming replica, and a row released with a NULL lease is
+/// eligible on that same replica's very next poll. A worker killed by
+/// the task itself (an OOM on one oversized artifact) would then re-take
+/// the row immediately and die again, spending the whole attempt budget
+/// inside one sweep interval instead of across several.
 ///
 /// Flat rather than exponential: the row has already waited a full lease
 /// plus the grace before it gets here, so the purpose of this delay is
 /// only to break the same-replica re-grab, and the attempt cap — not the
 /// spacing — is what bounds a crash loop.
+///
+/// Deliberately **not** the retry curve's first interval
+/// (`hort_app::retry_backoff::compute_backoff`, 60 s). That curve sets
+/// how long the system tolerates a dependency that keeps failing; this
+/// number only has to outlast one poll interval, and the lease plus its
+/// grace — half an hour at the defaults — has already supplied every
+/// bit of patience this row needs.
 const REQUEUE_BACKOFF: Duration = Duration::from_secs(30);
 
 /// `last_error` written onto a row the abandoned-lease sweep resolves.

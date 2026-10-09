@@ -3774,10 +3774,22 @@ with the per-kind reason.
 - `result="completed"` — handler returned
   `TaskOutcome::Completed`; `mark_completed` was called on the jobs row.
 - `result="failed_retry"` — handler returned
-  `TaskOutcome::Failed { retry: true }`; `reschedule` was called with
-  exponential backoff (base 30 s, cap 24 h).
-- `result="failed_terminal"` — handler returned
-  `TaskOutcome::Failed { retry: false }`; `mark_failed` was called.
+  `TaskOutcome::Failed { retry: true }` (or an `Err`, which the
+  dispatcher records as one) on a row that still had attempt budget
+  left; `reschedule` was called with the shared retry curve's wait for
+  that attempt (`hort_app::retry_backoff::compute_backoff` — 1, 5, 30,
+  then 60 minutes, the scan pipeline's own schedule). A five-attempt
+  budget therefore spans **96 minutes** from the first failure to the
+  terminal row.
+- `result="failed_terminal"` — `mark_failed` was called, so the row is
+  a terminal `failed` row carrying its last error. Two triggers reach
+  it: the handler returned `TaskOutcome::Failed { retry: false }`, or
+  it asked to be retried on a row whose `attempts` had reached the
+  dispatcher's attempt cap (`JOB_ATTEMPT_CAP`, 5 — the same number the
+  abandoned-lease sweep spends). The label reports what the dispatcher
+  did to the row, not what the handler asked for: a job that keeps
+  failing the same way counts `failed_retry` four times and
+  `failed_terminal` once, then stops being claimed.
 
 Note: for `kind="scan"`, `ScanTaskHandler::run` also calls
 `ScanOrchestrationUseCase::record_outcome` internally, which emits the
@@ -4686,22 +4698,29 @@ backend label on `hort_storage_operations_total`:
 
 - `ok` — re-computed SHA-256 matched the CAS key. No log (per-blob
   success is high-volume; metric is the dashboard signal).
-- `hash_mismatch` — re-computed SHA-256 differed from the CAS key.
-  Companion `CasIntegrityMismatch` domain event appended to a per-hash
-  synthetic artifact stream; companion `tracing::warn!` with
-  `content_hash`, `backend`, and `observed_hash`. **Flag only — the
-  scrubber never quarantines on mismatch** (the operator
-  decides the response).
+- `hash_mismatch` — the bytes did not hash to the CAS key. The digest
+  comes from whichever of the two comparisons reached a verdict: the
+  verifying reader's, recovered from the `CasIntegrityFailure` payload on
+  its EOF failure (the production path on both backends), or the
+  scrubber's own re-hash when the stream reached a clean EOF (a
+  `StoragePort` that does not verify). Companion `CasIntegrityMismatch`
+  domain event appended to a per-hash synthetic artifact stream; companion
+  `tracing::warn!` with `content_hash`, `backend`, `observed_hash` and the
+  configured `action`. The response is operator-chosen via
+  `HORT_CAS_SCRUB_ACTION_ON_MISMATCH`: `alert` (the default) is flag-only
+  and leaves the artifact row alone, `tombstone` additionally transitions
+  the artifact to `quarantine_status = 'rejected'`.
 - `missing` — the hash appeared in `list_all` but `get(&hash)` returned
   `NotFound`. A concurrent GC, a racing delete, or an inconsistent
   backend listing. Companion `tracing::warn!`.
 - `read_error` — either `list_all` yielded a `StreamItem::ReadError`
   (malformed key, EACCES on a shard directory) or the streaming read
-  from `get()` failed mid-flight. Companion `tracing::warn!`.
-  Integrity-reader EOF failures land here too, NOT under `hash_mismatch`
-  — the re-hash short-circuited and the scrubber has no observed digest
-  to attest; operators cross-reference
-  `hort_storage_integrity_failures_total`, which DID fire for that blob.
+  from `get()` failed **without an integrity verdict** — i.e. a genuine
+  backend failure, not corruption. Companion `tracing::warn!`. The
+  discriminator is the typed `CasIntegrityFailure` payload, not the
+  error's `io::ErrorKind`: a backend is free to raise `InvalidData` for
+  its own reasons, and classifying by kind would report every such
+  complaint as corruption (and escalate the exit code for it).
 
 **Exit code** (`hort-server scrub`): `0` when `result="hash_mismatch"`
 count for the run was zero, `1` otherwise. `missing` and `read_error`

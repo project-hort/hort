@@ -103,10 +103,18 @@ const FETCH_ATTEMPTS: u32 = 3;
 /// dual-commit path exhibiting the same symptom, and against clock/replica
 /// skew. A steady-state PERMISSIVE artifact (`quarantine_duration_secs ==
 /// 0`) shows the identical shape forever, so the window must stay short:
-/// generous enough for a couple of the dispatcher's own retries
-/// (`DEFAULT_BACKOFF_SECS = 30`, doubling) to land, short enough that a
-/// permissive artifact still resolves to its correct terminal decision
-/// within a few minutes, not indefinitely.
+/// generous enough for at least one of the dispatcher's own retries to
+/// land inside it, short enough that a permissive artifact still resolves
+/// to its correct terminal decision within a few minutes, not
+/// indefinitely.
+///
+/// The gate is the artifact's *age*, not a retry count, so the shared
+/// retry curve (`crate::retry_backoff::compute_backoff`) decides only
+/// how much of the attempt budget the window costs. At its 1/5/30/60-min
+/// shape a requeued verify re-runs at ~60 s — inside the window — and
+/// again at ~360 s, by which point the artifact is past it and the
+/// verdict is applied: two of five attempts spent, leaving budget for a
+/// genuine infrastructure failure afterwards.
 const PROVENANCE_ANCHOR_GRACE_SECS: i64 = 300;
 
 /// The verdict reached on an `Applied` run, surfaced to the task handler

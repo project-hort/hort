@@ -141,7 +141,12 @@ Coverage requirements vary by crate layer. Core crates contain the security-crit
 
 **DB-backed test isolation (parallel-safety contract).** The DB-backed suites have **three modes**, and a reviewer has to know which one a test is in:
 
-- **`test_support::isolated_db_from`** — creates and migrates a fresh `hort_test_<epoch>_<uuid>` database per call. This is the overwhelming majority of the harness: **61 files** (54 in `hort-adapters-postgres`, 7 in `hort-server`), usually reached through a module-local `maybe_pool()`.
+- **`test_support::isolated_db_from`** — creates and migrates a fresh `hort_test_<epoch>_<uuid>` database per call. This is the overwhelming majority of the harness: **66 files** (58 in `hort-adapters-postgres`, 8 in `hort-server`) as measured on 2026-10-08, usually reached through a module-local `maybe_pool()`. The figure moves whenever a DB test is added or relocated, so re-measure rather than trusting it:
+  ```bash
+  grep -rl 'isolated_db_from(' crates/*/src crates/*/tests --include='*.rs' \
+    | grep -v 'test_support\|db_tests_are_serialized\|db_gate_not_silent'
+  ```
+  (the two excluded guards name the helper as a pattern to scan for, not as a call).
 - **`test_support::shared_migrated_pool`** — connects to and migrates the shared `DATABASE_URL` target, for the few tests that deliberately exercise shared-DB behaviour (isolating them would defeat the point of the test): **4 files**, all in `hort-adapters-postgres`.
 - **A hand-rolled throwaway database on the `DATABASE_URL` target** — an `admin_pool()` (now `test_support::connect_or_panic`) plus the file's own `create_temp_db` / `drop_temp_db`, because these tests drive the migrator itself and so cannot be handed an already-migrated database: **5 files**, `hort-server/tests/migrate_{assert_current,harden_events,schema_compat,fleet_fence}.rs` and `hort-worker/tests/schema_compat_boot.rs`, 35 DB-backed tests. All 35 carry `#[serial(hort_pg_db)]`; until the sweep that added the guard below, only `migrate_fleet_fence.rs`'s 6 did, and the other 29 ran their `CREATE DATABASE` + full migration set (cluster-global `CREATE ROLE` included) unkeyed — they fell through the *wording* of the old rule, which named `hort-adapters-postgres` and so did not reach `hort-server` / `hort-worker`. There is also one test in a sixth file that hand-rolls a throwaway database inside an otherwise `isolated_db_from` file (`hort-adapters-postgres/tests/api_tokens_migration.rs::idempotent_after_rollback`, whose `DROP TABLE … CASCADE` cannot be let near a database anything else will reuse); a mode-by-file listing will not find it, which is why the guard scans functions.
 
@@ -412,7 +417,27 @@ corpus is real, that the one codec
 (`hort_adapters_postgres::quarantine_status_sql`) still defines both halves of
 its encode/decode pair, and that the read paths still decode through it — so a
 rename cannot make the scan vacuously green. Same blind spot as its siblings:
-a decode reached through a differently-named local helper) are pure
+a decode reached through a differently-named local helper),
+`cas_reads_are_verified` (ADR 0003's read-verification amendment — asserts
+that every `impl StoragePort for` under `crates/hort-adapters-*/src`
+constructs a `VerifyingReader` inside its own `get`. The wrap was hand-written
+at two sites with nothing holding it: a third adapter returning its backend's
+raw stream compiles, passes clippy and passes the suite, and the only thing it
+breaks is a guarantee no test stated — `VerifyingReader::poll_read` is the
+single production construction point of `CasIntegrityFailure`, so an adapter
+without the wrap makes at-rest corruption indistinguishable from a clean read
+for every consumer and `CasScrubUseCase` sweeps corrupt storage reporting
+success. **Function-scoped**, which is load-bearing rather than fastidious:
+both adapters carry a `get_range` doc comment naming `VerifyingReader` in
+order to say it does *not* apply there, so a file-scoped scan stays green
+after the wrap itself is deleted. The scope is derived — an outbound adapter
+lives in an `hort-adapters-*` crate (ADR 0008) and a `#[cfg(test)]` test
+double is excluded by how it is compiled, not by an entry — so there is **no
+allow-list**. Carries a counter-assertion pinning the two known production
+implementations by type and file, so renaming the port, the method or the
+reader cannot make it vacuously green. Blind spot: a `get` that delegates the
+wrap to a helper reads as unverified — a false positive, and a review
+conversation about where the wrap belongs) are pure
 source-/fixture-scan guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`

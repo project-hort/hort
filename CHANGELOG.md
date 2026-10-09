@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Read verification is a binding contract, not a convention at two sites**
+  (#341). The CAS-scrub classification fix under *Fixed* below made a
+  read-verification failure carry a typed
+  `CasIntegrityFailure { expected, computed }` verdict; nothing made the
+  verification itself mandatory. The wrap was hand-written in two files, and a
+  third storage adapter returning its backend's raw stream from
+  `StoragePort::get` compiled, passed clippy and passed the whole suite — while
+  violating no recorded decision, because ADR 0003 stated that reads are
+  content-addressed without ever stating that a failure is distinguishable from
+  an I/O failure or that it carries the digest the delivered bytes hashed to.
+
+  **ADR 0003 gains that half** (2026-10-08 amendment): the shape is
+  `CasIntegrityFailure`, its single production construction point is
+  `VerifyingReader::poll_read`, and a consumer may rely on exactly three
+  things — a clean EOF means the bytes hash to the key, a failure carrying the
+  payload is at-rest corruption with `computed` as the observed digest, and a
+  failure without one says nothing about integrity.
+
+  **`crates/hort-app/tests/cas_reads_are_verified.rs` holds it structurally**:
+  every `impl StoragePort for` under `crates/hort-adapters-*/src` constructs
+  the verifier inside its own `get`. DB-free, sub-second, no allow-list, and
+  function-scoped rather than file-scoped — which is load-bearing here, because
+  both adapters carry a `get_range` doc comment naming `VerifyingReader` in
+  order to say it does *not* apply there, so a file-scoped scan would stay
+  green after the wrap itself was deleted. One assertion covers both halves of
+  the contract because the verifier is the only production producer of the
+  verdict; a counter-assertion pins the two known implementations by type and
+  file, so renaming the port, the method or the reader cannot make the guard
+  vacuously green.
+
+  The scrub's own independent re-hash is unchanged and stays. With the guard in
+  place it is belt-and-braces rather than the load-bearing defence — removing
+  it is a separate decision that needs a measurement of what a full sweep
+  costs, and this change supplies none.
+
 - **A job row abandoned in `running` is recovered** (#306). A worker that died
   holding a claim used to leave its row on `status = 'running'` forever: both
   claim statements select `status = 'pending'` only, their `locked_until IS
@@ -45,13 +80,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   race, a paused container, a rolling upgrade whose older replicas do not
   renew at all).
 
-  The sweep is also where the retry budget is spent, because it is the only
-  code that runs for a row whose handler never returned — the scan
-  orchestrator's `attempts >= max_attempts` branch and the dispatcher's
-  `TaskOutcome::Failed` arms both require the handler to come back. A row at
-  the attempt cap is failed terminally instead of re-driven; for `kind='scan'`
-  that hands the artifact to the existing stranded-scan recovery, whose
-  predicate is a newest scan job in `failed`. Rows are never deleted: a late
+  The sweep is also where the retry budget is spent **for a row whose handler
+  never returned** — the scan orchestrator's `attempts >= max_attempts` branch
+  and the dispatcher's `TaskOutcome::Failed` arms both require the handler to
+  come back, so neither of them ever sees such a row. (The dispatcher's arms
+  now spend the same budget on the rows they *do* see; see *a returned failure
+  becomes terminal* below.) A row at the attempt cap is failed terminally
+  instead of re-driven; for `kind='scan'` that hands the artifact to the
+  existing stranded-scan recovery, whose predicate is a newest scan job in
+  `failed`. Rows are never deleted: a late
   completion from the original worker is an unconditional `UPDATE … WHERE id`
   and must still find a row. `attempts` is left alone by the sweep — the next
   claim charges it, exactly as for a `reschedule`d row.
@@ -184,6 +221,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A returned failure becomes terminal at the attempt cap** (#341). The task
+  dispatcher called `reschedule` for every `TaskOutcome::Failed { retry: true }`
+  and every handler `Err`, without consulting `job.attempts` and without
+  consulting the kind. `compute_backoff` bounded the *delay*; nothing bounded
+  the count. A job that failed the same way forever was re-driven forever and
+  never became the persistent, operator-visible `failed` row ADR 0028
+  describes to the operator — and for the destructive kinds the same accepted
+  job re-ran inside the same UTC day, because the day-unique key bounds a
+  second *enqueue* and not re-executions of the row that already exists.
+
+  The dispatcher now spends the same five-attempt budget the abandoned-lease
+  sweep and the scan orchestrator already shared, through the terminal
+  transition it already had for `retry: false`: at the cap the row is
+  `mark_failed` with the handler's own reason, counted as
+  `hort_admin_tasks_completed_total{result="failed_terminal"}` and logged at
+  ERROR with `attempts` and the cap. The budget is **uniform across kinds** —
+  a returned failure has no in-flight duplicate to fear, because the handler
+  returned, which is the question the sweep's kind list answers and this path
+  does not have to. No new configuration.
+
+- **A failing job's five attempts now span 96 minutes, not seven and a half**
+  (#341). The dispatcher's attempt cap gave a `jobs` row five executions; its
+  own backoff curve — 30 s, doubling — spent all five inside **7 m 30 s**. The
+  scan orchestrator spends the *same five attempts* over 96 minutes, so one
+  agreed number meant two windows an order of magnitude apart, and nothing in
+  either file made the disagreement visible. Any failure mode outlasting eight
+  minutes ended a row terminally: harmless for the tick kinds and the prefetch
+  family, where the next tick or pull re-derives the work, intended for the
+  destructive kinds, and permanent for the one-shot kinds that nothing
+  re-enqueues (`seed-import`, `wheel-metadata-backfill`,
+  `oci-membership-edge-backfill`, `service-account-rotation`,
+  `eventstore-checkpoint`) — a ten-minute database hiccup ended those until an
+  operator noticed.
+
+  The dispatcher now waits out **the scan pipeline's own curve — 1, 5, 30, then
+  60 minutes** — which is the same ~96 minutes for the same five attempts.
+  Matching the shape and not merely the span is the point: a different shape
+  reaching a similar total is exactly how two curves hid behind one shared
+  number. No new configuration (ADR 0016), no per-kind curve, and the attempt
+  cap is untouched at five.
+
+  **The curve now has one definition**, `hort_app::retry_backoff::compute_backoff`,
+  called by both the dispatcher and the scan orchestrator; the duplicate in
+  `scan_orchestration` is gone. The unreachable 24-hour delay ceiling went with
+  it — reaching it needed about twelve attempts, so it could not fire once the
+  chain was bounded at five, and the four-step curve's flat last arm caps
+  itself at 60 minutes by construction. The attempt budget, not a delay
+  ceiling, is what ends a retry chain.
+
+  What an operator sees: the first retry of a failed job moves from 30 s to
+  60 s, and a persistently failing row sits in the jobs table with a growing
+  retry delay for about an hour and a half before it goes `failed`, where it
+  previously went `failed` in under ten minutes. The number of executions does
+  not change.
+
 - **`HORT_RETENTION_STREAM_MODE=archive` is refused at startup while no
   cold-storage writer exists** (#333). Both `hort-server` and `hort-worker` now
   fail config parsing on the value, with a message naming the deferred
@@ -288,6 +380,112 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   effect before this.
 
 ### Fixed
+
+- **The CAS scrub classifies a real hash mismatch as a mismatch** (#341). Both
+  production storage adapters wrap every `get` in a streaming verifier, so a
+  corrupted blob failed the read at EOF before `CasScrubUseCase` could finish
+  its own re-hash. The scrub filed that as `read_errors`, which the CLI
+  documents and pins as observability-only — so `hort-server scrub` **exited
+  `0` over a present corrupted object**, the configured
+  `HORT_CAS_SCRUB_ACTION_ON_MISMATCH=tombstone` response never ran, and the
+  `CasIntegrityMismatch` audit event was never written. The scrub's own
+  mismatch branch was reachable only through a reader that does not verify,
+  i.e. not in the shipped composition at all; the test that appeared to cover
+  it drove a test double handing back raw wrong bytes.
+
+  The verifier's verdict now travels as data. A verifying read fails with an
+  `io::Error` carrying a `hort_domain::ports::storage::CasIntegrityFailure`
+  (`expected` + `computed`), and the scrub classifies from it: a corrupted blob
+  is a `hash_mismatch` carrying the observed digest, emits
+  `CasIntegrityMismatch`, and reaches the tombstone transition when the
+  operator configured one. A read failure that carries no verdict stays a
+  `read_error` — the discriminator is the typed payload, not
+  `io::ErrorKind::InvalidData`, which a backend may raise for its own reasons
+  and which cannot produce the observed digest the audit record needs.
+
+  **The exit-code posture is unchanged**: `mismatches > 0` escalates and
+  `missing` / `read_errors` / `shards_truncated` still do not. That decision
+  was only ever unsafe because corruption was landing in `read_errors`.
+
+  The scrub keeps hashing the bytes itself as well. It is not redundant with
+  the verifier: it is the only check that survives a `StoragePort` that does
+  not verify, because a verifier cannot detect its own absence. The test double
+  (`MockStoragePort::inject_tampered`) now honours the production read contract
+  — wrong bytes, then an EOF failure carrying the computed digest — so a future
+  regression cannot pass the suite the way this one did; the non-verifying
+  shape remains available as a separate, explicitly-named hook for the one test
+  that needs it.
+
+  This restores **one** of the two controls the standing CAS-integrity
+  acceptance rests on. The serving path is still open: same-length corrupted
+  bytes can complete as a successful HTTP/1 download because the verifier only
+  fails on a later EOF poll.
+
+- **The publish kill switch refuses the publish, not merely its body** (#341).
+  With the switch reaching all four hosted formats, the refusal itself was
+  still `DefaultBodyLimit::max(0)` — which rejects a body that has bytes in it
+  and admits one that does not. A Maven `.jar` `PUT` has no envelope that
+  could fail on empty input, so a zero-byte publish with the switch on was
+  **ingested**: an artifact row, an `ArtifactIngested`, a quarantine timer and
+  a scan job, out of a gate the operator believed shut. Cargo, npm and PyPI
+  refused the same request only as a side effect of their payload grammars
+  rejecting an empty envelope — a property of those grammars, never a promise
+  the limit made. `413 Payload Too Large` was also simply the wrong answer: on
+  a 0-byte request it tells the client something untrue.
+
+  A zero limit is now an explicit administrative hold, defined once in
+  `hort_http_core::limits::refuse_publishes_when_disabled` and applied by each
+  publish subtree. It answers **`503 Service Unavailable`** — this project's
+  recorded answer for "not serving this right now" — with **no `Retry-After`**,
+  because the hold has no deadline to quote (it ends when the operator changes
+  the configuration); the response body says so instead of a header implying
+  otherwise. The guard discriminates by **method**, not by route tree: `GET` /
+  `HEAD` keep serving artifacts while the switch is on, and `DELETE` keeps
+  working so a client can still cancel an upload session it cannot finish. An
+  over-size body against a configured non-zero ceiling is untouched and still
+  `413`, through the body limit, as a deliberately separate path.
+
+  **The switch now also closes the OCI push path** — the blob-upload
+  `POST`/`PATCH`/`PUT` dance and the manifest `PUT` — because the same
+  method-discriminating guard covers it; only a *size* leaves OCI alone (its
+  upload path bounds each chunk through its own session accounting). The
+  `/v2/*` refusal is served in the OCI Distribution `errors`-array envelope
+  (`UNAVAILABLE`), so docker and the containerd resolver surface the message
+  rather than an unexplained 503. `values.yaml`, `values.schema.json`, the
+  values and configuration references, the security explanation and the
+  add-a-format-handler how-to now describe this reach, and no operator-facing
+  sentence claims "all four" any more.
+
+  Observable changes beyond the Maven ingest: npm's and PyPI's limit-`0`
+  refusal moves from `413` to `503`, cargo's from `413` to `503`, and an npm
+  dist-tag `PUT` — whose own small per-route body limit previously won over
+  the router-wide one — is now held with the rest (a dist-tag write retargets
+  what `npm install` resolves to).
+
+- **The documented publish kill switch now reaches every hosted format** (#341).
+  `HORT_PUBLISH_BODY_MAX_SIZE=0` is documented — in the chart values, in the
+  configuration reference, and in the parser's own rationale for not rejecting
+  zero like every other optional size knob — as an explicit "refuse all
+  publishes" switch. The composition root handed the parsed value to npm and
+  PyPI only: cargo applied its own fixed 200 MiB ceiling and Maven hard-coded
+  the shared 300 MiB *default constant* on its PUT, so an operator who set `0`
+  during an incident closed two of the four hosted publish surfaces and left
+  cargo and Maven open, with nothing saying so. A kill switch that cannot be
+  trusted is worse than none: it changes what the operator does next — they
+  stop looking for another way to halt writes.
+
+  The fix splits the knob's two meanings and changes only the second. A
+  **size** now reaches Maven as well (it had no recorded reason to ignore the
+  override and already reached for the shared default), while cargo keeps its
+  fixed 200 MiB ceiling against any non-zero value — the recorded decision
+  that tuning the shared variable for Python wheels must not silently move
+  cargo's ceiling, which is about magnitude and still holds. **Zero** now
+  reaches all four, because zero is not a different ceiling. The split lives in
+  one place, `hort_http_core::limits::cargo_publish_body_limit`, and both
+  remaining formats gained the `*_routes_with_publish_limit(limit)` +
+  `*_routes()` pair npm and PyPI already had. Refusal was still the existing
+  body-limit path (`413`) on all four at this point — the next entry replaces
+  it, and also extends the switch's reach to the OCI push path.
 
 - **A stored quarantine status the domain cannot parse no longer decodes to the
   most permissive one** (#334). `artifacts.quarantine_status`'s CHECK accepts
@@ -1119,6 +1317,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what kept them from drifting apart again.
 
 ### Security
+
+- **An authority change commits with its audit event** (#341). Three gitops
+  apply branches wrote a security-relevant row, committed it, and appended the
+  attesting audit event in a *separate* call: permission grants
+  (`PgPermissionGrantRepository::save_managed`, then
+  `append_grouped_authorization_events` across possibly several streams), claim
+  mappings (same whole-partition shape), and OIDC issuers (one independently
+  committed `upsert` per issuer, with the event batch appended at the very
+  end). An append failure — or a process termination — after the row commit
+  left the grant, claim mapping or issuer **active with nothing in the
+  authorization stream attesting it**. Issuer rows are the sharpest case: a
+  serving validator reads `oidc_issuers` at validation time, so a surviving
+  replica acts on the new trust state while the stream is silent about it.
+
+  **The retry could not repair it**, which is what made this a defect rather
+  than a gap. The next apply derives its events from the *prior rows*, which
+  already hold the change, so it emits nothing — the claim-mapping branch said
+  so in its own comment, as expected behaviour. For issuers a reapply might
+  emit an `Updated` (the snapshot carries no persisted digest) but never the
+  original `Created` / `Deleted`, nor the record that the change had been live
+  without one.
+
+  The fix adopts the primitive the artifact, ref and artifact-group lifecycle
+  ports have used since `PgUnitOfWork` existed, at a fourth site:
+  `AuthorityLifecyclePort` (`PgAuthorityLifecycle`) takes the desired rows and
+  the audit batches in one call and commits both or neither. The
+  prior-vs-desired diff that derives the events is unchanged; the
+  whole-partition delete-and-reinsert is unchanged; the audit append simply
+  joins that transaction, so `EventStore::append` grows no transaction
+  parameter (ADR 0007) and the apply pipeline still sees only a port.
+
+  **The grouped multi-stream append is atomic too.** A grant reconcile routes
+  each row's event to its repository stream or to the global authorization
+  stream, so one reconcile spans several batches; they are appended on the
+  same unit of work, so a batch that fails part-way leaves **no** stream
+  audited. Previously each stream was its own append transaction and a
+  part-way failure left some repository streams audited and others not.
+
+  **Behaviour change an operator will notice:** an event-store failure during
+  a grant, claim-mapping or issuer apply now leaves the rows **unchanged** —
+  the apply fails closed instead of half-done. The apply-time JWKS warm-up
+  moves after the commit for the same reason (a cache warmed for an issuer
+  whose row rolled back would be a trust state nothing persisted); its failure
+  still does not fail the apply.
+
+  Four operator-visible log lines claimed a commit that had not happened yet
+  (`permission_grant` / `oidc_issuer` / `upstream_mapping` / `service_account`
+  `audit events committed`, all emitted *before* the append). All four now
+  emit after the append returns `Ok`.
+
+- **The authority contract covers every write, and the old path stops
+  compiling** (#341). Two gitops apply branches still carried the
+  commit-then-append shape the `AuthorityLifecyclePort` closed for grants,
+  claim mappings and issuers. **Upstream mappings** were the worst-shaped
+  member of the family: one independently committed `save_managed` *per
+  mapping*, and then a closing grouped append that was one transaction *per
+  stream*, so a part-way failure could leave some repositories' mappings live
+  and unattested while others were audited. A mapping names the upstream a
+  proxy repository will trust and fetch from, with its credential reference
+  and its TLS material, so a mapping that commits unattested is a changed
+  trust anchor the authorization stream is silent about — and a re-point is
+  invisible to the next apply, whose digest comparison reads the change as
+  already applied. **Service accounts** had the same shape one aggregate at a
+  time: a service account is a federated-identity trust anchor (ADR 0018),
+  its `federated_identities[].claims` decide which JWTs may assume it, and the
+  federation handler reads the aggregate at assume time. Both now commit their
+  rows and their audit events in one transaction, via
+  `commit_upstream_mappings` / `commit_service_accounts`.
+
+  **And the replaced write methods are gone from their traits**, so the
+  mistake is a compile error rather than a review rule — the same posture the
+  `pub(crate)` `AppContext` fields take against a format crate.
+  `PermissionGrantRepository`, `ClaimMappingRepository`,
+  `OidcIssuerRepository` and `ServiceAccountRepository` are now read-only
+  traits; `RepositoryUpstreamMappingRepository` keeps only its non-gitops
+  `upsert` / `delete` pair, the `managed_by = 'local'` admin CRUD surface,
+  which carries no digest, no provenance and no audit event. The statement
+  bodies live on as the adapters' `*_in_tx` helpers, reachable from the
+  authority adapter and each repository's own read path and nowhere else. A
+  write method with no caller that re-opens a closed audit-integrity finding
+  is not left reachable by convention.
+
+  Two smaller things fall out. The upstream-mapping branch no longer reads
+  `list_managed_by_gitops` three times per apply — one `list_all` snapshot
+  taken *before* any write resolves each mapping's surrogate id from its
+  `(repository_id, path_prefix)` identity, which is exactly what the adapter's
+  `ON CONFLICT … DO UPDATE` preserves; the pre-port shape needed a *post*-write
+  read to recover that id, and reading only the gitops partition would have
+  minted a fresh id for a `managed_by = 'local'` row the upsert adopts. And an
+  apply with an empty upstream-mapping or service-account plan now opens no
+  transaction at all.
+
+  **Behaviour change an operator will notice:** an event-store failure during
+  an upstream-mapping or service-account apply now leaves the rows
+  **unchanged** — the apply fails closed instead of half-done. The one write
+  that stays outside the transaction is the backing `users` row for a declared
+  `ServiceAccount`, which has to be durable before the SA row's FK can
+  reference it; an orphan backing user confers nothing, because the grant
+  reconcile materialises `GrantSubject::User(backing_user_id)` rows only for
+  service accounts resolved from the persisted SA aggregate, and the next
+  apply finds it by username and re-emits the same `ServiceAccountCreated`.
+
+- **The chart's unrestricted-egress Job exception now selects only this
+  release's Jobs** (#341). `networkpolicy-migrate-job.yaml` renders a
+  NetworkPolicy granting unrestricted egress (`egress: - {}` — every
+  destination, every port) to the pre-install migrate / bootstrap / pre-pull
+  Jobs, which must reach Postgres and the kube-apiserver before the app pod
+  and its deny-all egress policy exist. Its `podSelector` tested **only
+  whether the `hort-server.io/job` label key exists**, and carried none of the
+  chart's name/instance labels — so **any** pod in the namespace that set that
+  label to anything at all was selected. A principal who may create or label a
+  Pod but may *not* touch NetworkPolicies therefore took the unrestricted
+  allowance by writing one label, and in a namespace whose own policy denies
+  egress reached the destinations that policy meant to block; patching the
+  label onto an existing restricted pod did the same. Two releases of this
+  chart in one namespace also granted each other's Jobs egress.
+
+  The `podSelector` now ANDs `hort-server.selectorLabels` (this release's
+  `app.kubernetes.io/{name,instance}`) onto the existing `Exists` clause. No
+  legitimate pod loses the allowance: every Job / CronJob / DaemonSet /
+  `helm test` pod template in the chart already carries both labels, verified
+  by evaluating the rendered selector against every rendered pod template —
+  including under `nameOverride` / `fullnameOverride` and a non-default
+  release name. The app pods are still excluded by the `Exists` clause alone,
+  so their deny-all egress is untouched, and `networkPolicy.enabled: false`
+  still disables both policies.
+
+  **Whether this Job egress should be narrower than release scope is
+  deliberately left open** — that is a chart-owner decision about CIDRs the
+  chart does not know, not part of this fix.
+
+  Two documentation claims the selector did not support are corrected rather
+  than left standing: the template's "selects exactly the Job/CronJob pods"
+  comment and `values.yaml`'s Job-only sentence both now say *this release's*.
+  The advice both places gave an operator who wants tighter Job egress —
+  layer a second, narrower policy over this one — was **wrong and is
+  deleted**: NetworkPolicy allowances are additive (as the same file's own
+  docstring explains twenty lines earlier), so a second policy can only add,
+  never subtract this rule's `to: []`. The one real lever — narrowing `to:` on
+  this rule itself, by a chart fork or a `--post-renderer` patch — is now what
+  both places say, together with the note that the app `egress` posture never
+  reaches these pods at all. The pointer into `control-plane-tiers.md` went
+  with it: that document has no Job-egress narrowing guidance to find.
+
+  **`scripts/test-helm-templates.sh` now asserts the scope rather than the
+  label key.** The assertion that let this ship checked only that
+  `key: hort-server.io/job` appeared in the rendered policy, which passes at
+  every scope. The replacement derives both sides from the same render — it
+  reads the rendered `podSelector` and a named pod template's rendered pod
+  labels, then evaluates one against the other — so it fails in both
+  directions: a selector carrying no release identity fails outright, the app
+  Deployment and worker pod templates must come out *not* selected (which is
+  what fails if the `Exists` clause is dropped), and the migrate,
+  svc-token-bootstrap, pre-pull and CronJob pod templates must come out
+  selected (which is what fails if the selector tightens past them — swapping
+  `hort-server.selectorLabels` for `hort-server.labels` is one word and bricks
+  `helm install`, and no count-based grep notices).
+- **A running subscription delivers against its live row, not the one it was
+  spawned with** (#341). `PATCH /api/v1/subscriptions/:id` persisted the new
+  target and filter and notified the dispatcher, and the reconcile pass that
+  followed walked every active subscription — but the row itself was read only
+  at spawn and moved into the per-subscription task as an owned value. Every
+  consumer inside the task read that copy: the category/event-type match, the
+  wake predicate for a broadcast hint, and the target the send path resolved.
+  So the PATCH was acknowledged, the new row was visible through the API, and
+  delivery kept following the old one until the process restarted. A user
+  rotating away from a **compromised webhook URL** kept delivering full events
+  to the old receiver; a **narrowed** filter kept delivering the categories and
+  event types it removed, which is the security-relevant direction.
+
+  The fix is the one the owner principal already had: the reconcile pass
+  publishes the freshly listed row's delivery-shaping fields into an `ArcSwap`
+  the running task holds (`DeliveryShape` — `target` and `filter`), on every
+  pass rather than only on change, and the task loads it per event where it
+  already loads the principal and the RBAC evaluator. One event is therefore
+  decided against one consistent snapshot of all three, and a PATCHed target
+  or filter takes effect for the next delivered event — within one reconcile
+  interval, with no cancel, no respawn and no restart.
+
+  The published value is deliberately a projection of the row and not the row:
+  a task owns its own progress, and a republished `last_delivered_position` is
+  behind the task's in-memory cursor by up to the 5-minute progress debounce,
+  so re-seeding from it would re-deliver that window on every reconcile tick.
+  The cursor, the `state` column, the failure budget and the debouncer are not
+  reachable from the published type. Unchanged, and now written down: a filter
+  change applies **from the cursor forward** — narrowing takes effect for
+  everything not yet walked, while widening does not retroactively deliver
+  events the task already passed under the narrower filter (inherent to the
+  cursor-driven walk, ADR 0061). The target is not re-validated inside the
+  delivery walk either: the create/update path validates a webhook target,
+  SSRF/DNS guard included, before it is persisted, so a row that reached the
+  database was admitted and the hot path owes it no second DNS round trip.
 
 - **A published hort image or chart is now gated on the checks that were
   supposed to secure it** (#339). The public publish path ran three workflows

@@ -4,6 +4,13 @@
 //! as bytes flow through. At EOF the computed hash is compared to the
 //! expected `ContentHash` and the final `poll_read` yields an error on
 //! mismatch (ADR 0003).
+//!
+//! The mismatch is reported as a [`CasIntegrityFailure`] payload on that
+//! error, not merely as a formatted message: the reader is the only
+//! component that computes the observed digest, and `CasScrubUseCase`
+//! needs it as a value to classify the blob as a mismatch (with the
+//! observed digest in the `CasIntegrityMismatch` record) rather than as an
+//! unattributable read failure.
 
 use std::io;
 use std::pin::Pin;
@@ -12,6 +19,7 @@ use std::task::{Context, Poll};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, ReadBuf};
 
+use hort_domain::ports::storage::CasIntegrityFailure;
 use hort_domain::types::ContentHash;
 
 /// Wraps an inner `AsyncRead`, hashes every byte that flows through, and
@@ -74,13 +82,16 @@ impl<R: AsyncRead + Unpin> AsyncRead for VerifyingReader<R> {
                             if let Some(cb) = self.on_mismatch.take() {
                                 cb();
                             }
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "CAS integrity failure: expected {}, computed {}",
-                                    self.expected, computed
-                                ),
-                            )));
+                            // The verdict travels as a typed payload on the
+                            // error. Consumers must be able to tell this
+                            // apart from a backend read failure and to read
+                            // `computed` back out; a formatted message
+                            // would force them to parse it.
+                            return Poll::Ready(Err(CasIntegrityFailure {
+                                expected: self.expected.clone(),
+                                computed,
+                            }
+                            .into_io_error()));
                         }
                     }
                 } else {
@@ -280,5 +291,49 @@ mod tests {
             msg.contains(HELLO_WORLD_SHA256),
             "error should name computed hash, got: {msg}"
         );
+    }
+
+    /// The mismatch error carries the verdict as a *recoverable payload*,
+    /// not only as text. This is what lets `CasScrubUseCase` record a
+    /// `CasIntegrityMismatch` with the observed digest and reach the
+    /// tombstone path; recovering it by parsing the message would be the
+    /// alternative, and a message is not an interface.
+    #[tokio::test]
+    async fn mismatch_error_carries_the_verdict_as_a_recoverable_payload() {
+        let inner = Cursor::new(b"hello world".to_vec());
+        let mut reader = VerifyingReader::new(inner, hash(EMPTY_SHA256), None);
+
+        let mut out = Vec::new();
+        let err = reader.read_to_end(&mut out).await.unwrap_err();
+        let verdict =
+            CasIntegrityFailure::from_io_error(&err).expect("mismatch must carry the verdict");
+        assert_eq!(verdict.expected, hash(EMPTY_SHA256));
+        assert_eq!(verdict.computed, hash(HELLO_WORLD_SHA256));
+    }
+
+    /// An error raised by the *inner* reader passes through untouched and
+    /// carries no verdict — the verifier never attributes a backend
+    /// failure to corruption.
+    #[tokio::test]
+    async fn inner_reader_error_passes_through_without_a_verdict() {
+        struct FailingReader;
+        impl AsyncRead for FailingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "backend hung up",
+                )))
+            }
+        }
+
+        let mut reader = VerifyingReader::new(FailingReader, hash(HELLO_WORLD_SHA256), None);
+        let mut out = Vec::new();
+        let err = reader.read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        assert!(CasIntegrityFailure::from_io_error(&err).is_none());
     }
 }
