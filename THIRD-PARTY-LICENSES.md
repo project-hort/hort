@@ -100,7 +100,7 @@ the result instead.
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
 | flate2 | 1.1.10 | MIT | https://github.com/rust-lang/flate2-rs |
-| hyper | 1.11.1 | MIT | https://github.com/hyperium/hyper |
+| hyper | 1.12.0 | MIT | https://github.com/hyperium/hyper |
 | unicase | 2.9.0 | MIT | https://github.com/seanmonstar/unicase |
 | either | 1.15.0 | MIT | https://github.com/rayon-rs/either |
 | itertools | 0.10.5 | MIT | https://github.com/rust-itertools/itertools |
@@ -182,7 +182,7 @@ the result instead.
 | smallvec | 1.15.1 | MIT | https://github.com/servo/rust-smallvec |
 | ahash | 0.8.12 | MIT | https://github.com/tkaitchuck/ahash |
 | directories | 6.0.0 | MIT | https://github.com/soc/directories-rs |
-| want | 0.3.1 | MIT | https://github.com/seanmonstar/want |
+| want | 0.3.2 | MIT | https://github.com/seanmonstar/want |
 | block-buffer | 0.10.4 | MIT | https://github.com/RustCrypto/utils |
 | block-padding | 0.3.3 | MIT | https://github.com/RustCrypto/utils |
 | dirs-sys | 0.5.0 | MIT | https://github.com/dirs-dev/dirs-sys-rs |
@@ -305,11 +305,11 @@ the result instead.
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
-| serde_spanned | 1.1.1 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.1.6+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_datetime | 1.1.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_parser | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_writer | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| serde_spanned | 1.1.2 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.1.7+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_datetime | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_parser | 1.1.4+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_writer | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | num-conv | 0.2.1 | MIT | https://github.com/jhpratt/num-conv |
 | time-core | 0.1.8 | MIT | https://github.com/time-rs/time |
 | time-macros | 0.2.27 | MIT | https://github.com/time-rs/time |
@@ -5830,7 +5830,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### hyper 1.11.1 — MIT
+### hyper 1.12.0 — MIT
 
 Repository: https://github.com/hyperium/hyper
 
@@ -8482,7 +8482,7 @@ SOFTWARE.
 
 ```
 
-### want 0.3.1 — MIT
+### want 0.3.2 — MIT
 
 Repository: https://github.com/seanmonstar/want
 
@@ -12398,7 +12398,7 @@ SOFTWARE.
 
 ```
 
-### serde_spanned 1.1.1 — MIT
+### serde_spanned 1.1.2 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -12425,7 +12425,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.1.6+spec-1.1.0 — MIT
+### toml 1.1.7+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -12452,7 +12452,7 @@ SOFTWARE.
 
 ```
 
-### toml_datetime 1.1.1+spec-1.1.0 — MIT
+### toml_datetime 1.1.2+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -12479,7 +12479,7 @@ SOFTWARE.
 
 ```
 
-### toml_parser 1.1.3+spec-1.1.0 — MIT
+### toml_parser 1.1.4+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -12506,7 +12506,7 @@ SOFTWARE.
 
 ```
 
-### toml_writer 1.1.2+spec-1.1.0 — MIT
+### toml_writer 1.1.3+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
