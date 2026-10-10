@@ -306,9 +306,9 @@ the result instead.
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
 | serde_spanned | 1.1.2 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.1.7+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.1.8+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_datetime | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_parser | 1.1.4+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_parser | 1.1.5+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_writer | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | num-conv | 0.2.1 | MIT | https://github.com/jhpratt/num-conv |
 | time-core | 0.1.8 | MIT | https://github.com/time-rs/time |
@@ -390,7 +390,7 @@ the result instead.
 | windows_x86_64_gnu | 0.52.6 | MIT | https://github.com/microsoft/windows-rs |
 | windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
 | tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
-| tokio-util | 0.7.19 | MIT | https://github.com/tokio-rs/tokio |
+| tokio-util | 0.7.20 | MIT | https://github.com/tokio-rs/tokio |
 | tokio | 1.53.2 | MIT | https://github.com/tokio-rs/tokio |
 | simd-adler32 | 0.3.9 | MIT | https://github.com/mcountryman/simd-adler32 |
 | miniz_oxide | 0.9.1 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
@@ -12425,7 +12425,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.1.7+spec-1.1.0 — MIT
+### toml 1.1.8+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -12479,7 +12479,7 @@ SOFTWARE.
 
 ```
 
-### toml_parser 1.1.4+spec-1.1.0 — MIT
+### toml_parser 1.1.5+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -14730,7 +14730,7 @@ SOFTWARE.
 
 ```
 
-### tokio-util 0.7.19 — MIT
+### tokio-util 0.7.20 — MIT
 
 Repository: https://github.com/tokio-rs/tokio
 
