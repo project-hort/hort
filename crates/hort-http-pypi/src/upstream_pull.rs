@@ -39,7 +39,9 @@ use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::format_handler::{
+    require_https_metadata_url, FormatHandler, MetadataUrlSubject,
+};
 use hort_domain::types::checksum::UpstreamPublishedChecksum;
 use hort_domain::types::ArtifactCoords;
 // The tarball-pull recovers `url`, `digests.sha256`, and `upload_time`
@@ -695,23 +697,21 @@ fn checksum_from_entry(
 }
 
 /// Recover the genuine absolute upstream file URL from a per-version JSON
-/// projection [`PypiVersionFileInfo`]'s verbatim `url` field. Applies the
-/// SAME `https://` guard as the former `extract_upstream_file_url`
-/// helper — no downgrade target is ever promoted to a fetch URL.
+/// projection [`PypiVersionFileInfo`]'s verbatim `url` field. The scheme
+/// rule is [`require_https_metadata_url`] — the one definition of "a
+/// metadata-supplied download URL must be `https://`" — so no downgrade
+/// target is ever promoted to a fetch URL, and this path refuses exactly
+/// what the prefetch worker's fan-out refuses.
 ///
 /// A missing URL → "missing url field" `Validation`; a non-https URL →
-/// "non-https URL" `Validation`.
+/// the shared rule's `Validation`.
 fn url_from_entry(entry: &PypiVersionFileInfo, filename: &str) -> DomainResult<String> {
     let url = entry.url.as_deref().ok_or_else(|| {
         DomainError::Validation(format!(
             "upstream PyPI urls[] entry for {filename} is missing a string url field"
         ))
     })?;
-    if !url.starts_with("https://") {
-        return Err(DomainError::Validation(format!(
-            "upstream PyPI returned non-https URL: {url}"
-        )));
-    }
+    require_https_metadata_url(url, MetadataUrlSubject::PypiFileUrl)?;
     Ok(url.to_string())
 }
 
@@ -915,6 +915,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -996,8 +997,8 @@ mod tests {
     //
     // These pin the three load-bearing extractions the tarball-pull reads
     // off the per-version JSON projection: `checksum_from_entry` (drives
-    // the SAME audited `parse_upstream_checksum`), `url_from_entry` (same
-    // `https://` guard as `extract_upstream_file_url`), and
+    // the SAME audited `parse_upstream_checksum`), `url_from_entry` (the
+    // shared `require_https_metadata_url` scheme rule), and
     // `entry.upload_time` (parsed at projection time). The per-field PARSE
     // behaviour (upload_time RFC-3339 / sha256 hex-len / md5-only) lives in
     // the projector's own tests; these assert the consumer-layer contract.

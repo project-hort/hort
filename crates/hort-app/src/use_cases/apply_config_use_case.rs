@@ -4787,6 +4787,7 @@ mod tests {
                 mtls_key_ref: None,
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
+                allowed_realm_hosts: Vec::new(),
             },
         }
     }
@@ -5058,6 +5059,7 @@ mod tests {
                 mtls_key_ref: None,
                 ca_bundle_ref: None,
                 pinned_cert_sha256: None,
+                allowed_realm_hosts: Vec::new(),
             },
         }
     }

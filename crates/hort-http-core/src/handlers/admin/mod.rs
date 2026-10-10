@@ -1340,6 +1340,7 @@ mod tests {
                 location: "/etc/hort-secrets/ca-bundle.pem".into(),
             }),
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }

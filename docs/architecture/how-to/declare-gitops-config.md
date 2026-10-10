@@ -1040,6 +1040,89 @@ URL-rewriting sidecars): when one registry mounts another's content
 under a path prefix, the prefix belongs in declarative config, not in
 a proxy rewrite layer.
 
+### `kind: UpstreamMapping` — `spec.allowedRealmHosts`
+
+`spec.allowedRealmHosts: [String]` (default empty) names the hosts that
+may be given this mapping's credential as the `WWW-Authenticate` realm
+of a `bearer_challenge` exchange. **The mapping's own origin is always
+allowed and is never listed.**
+
+```yaml
+apiVersion: project-hort.de/v1
+kind: UpstreamMapping
+metadata:
+  name: dockerhub-authenticated
+spec:
+  repository: dockerhub-proxy
+  pathPrefix: ""
+  upstreamUrl: https://registry-1.docker.io
+  auth:
+    type: bearer_challenge
+  secretRef:                      # the credential this list guards
+    source: file
+    location: /run/secrets/dockerhub-pat
+  allowedRealmHosts:
+    - auth.docker.io              # Docker Hub's token service
+```
+
+**Why the operator has to answer this.** The realm arrives verbatim in
+the upstream's `WWW-Authenticate` response header, so it is
+upstream-controlled data — and the realm exchange is the one request
+that carries the credential, as
+`Authorization: Basic base64("oauth2:<secret>")`. hort already refuses a
+non-`https` realm and a realm resolving to a non-routable host, but
+those bound *where* the credential may travel, not *to whom*: a
+compromised or hijacked upstream can answer `401` naming any https,
+routable host it likes. Binding the realm silently to the mapping's own
+origin is not available as the fix, because off-origin realms are
+normal — `auth.docker.io` for `registry-1.docker.io`, and a GitLab
+container registry's `/jwt/auth` on its own host. So the allowance is
+the operator's to state.
+
+**It applies only to a credentialed exchange.** The list is consulted
+if and only if the mapping also carries a `secretRef`. An exchange with
+no credential has nothing a nominated realm could receive, so it keeps
+exactly its previous behaviour (the `https` and routability gates
+alone). That is why every anonymous pull-through proxy — including the
+`bearer_challenge` Docker Hub mappings shipped in this repository, whose
+realm is off-origin — needs no entry and is unaffected.
+
+**What breaks on upgrade, and for whom.** A mapping that is **both**
+credentialed **and** has an off-origin realm stops working until that
+realm's host is listed: the fetch fails with
+`hort_upstream_fetch_total{result="parse_error"}` and a server log line
+naming the mapping and the refused realm host. **Authenticated Docker
+Hub is the canonical case** — `registry-1.docker.io` with a PAT, whose
+realm is `auth.docker.io`. The remedy is the one line above:
+`allowedRealmHosts: [auth.docker.io]`. Nothing else changes: an
+anonymous mapping, and a credentialed mapping whose realm is on its own
+origin (most self-hosted registries — Harbor's `/service/token`, Zot, a
+registry serving `/token` itself), are untouched.
+
+**Validation.** Entries are bare hostnames: ASCII letters, digits, `.`
+and `-`, no empty label, no leading or trailing `.` or `-`. A scheme, a
+port, a path or an empty string is rejected at apply-config parse time
+with the accepted form in the message — those shapes could never match
+the host hort compares against, so accepting them would hand you a
+control you wrote and did not get. The field is also rejected on a
+mapping whose `auth.type` is not `bearer_challenge`, because no realm
+exists in those flows for it to govern
+([ADR 0015](../../adr/0015-apply-time-linter-inert-fields-and-naming.md)).
+It is **accepted** on a `bearer_challenge` mapping with no `secretRef`:
+its consumer comes into being the moment you add one, so the allowance
+may be declared first. The schema CHECK constraints
+`chk_repository_upstream_mappings_allowed_realm_hosts` and
+`chk_repository_upstream_mappings_realm_hosts_auth` mirror both rules.
+`hort-server validate-config` catches all of them offline.
+
+**The allowance is for a host, not for whatever that host redirects
+to.** A credentialed exchange at a listed realm runs on a client whose
+redirect policy refuses any hop that leaves the realm's own origin, so a
+listed realm answering `302` to somewhere else cannot carry the
+credential onward.
+
+---
+
 ### `kind: UpstreamMapping` — `spec.trustUpstreamPublishTime`
 
 `spec.trustUpstreamPublishTime: bool` (default `false`) admits this

@@ -51,7 +51,9 @@ use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::format_handler::{
+    require_https_metadata_url, FormatHandler, MetadataUrlSubject,
+};
 use hort_domain::types::checksum::UpstreamPublishedChecksum;
 use hort_domain::types::ArtifactCoords;
 use hort_formats::npm::projection::NpmVersionEntry;
@@ -340,9 +342,9 @@ pub(crate) async fn try_upstream_tarball_pull(
     };
 
     // 4. Recover the absolute tarball URL from the projection's verbatim
-    //    `dist.tarball` (`entry.tarball`). Apply the SAME `https://` guard
-    //    `extract_upstream_tarball_url` enforced (no downgrade target is
-    //    ever promoted to a fetch URL).
+    //    `dist.tarball` (`entry.tarball`). The scheme rule is the shared
+    //    `require_https_metadata_url` (no downgrade target is ever
+    //    promoted to a fetch URL).
     let tarball_url = match tarball_url_from_entry(entry, version) {
         Ok(u) => u,
         Err(e) => {
@@ -663,9 +665,11 @@ fn checksum_from_entry(
 }
 
 /// Recover the genuine upstream tarball URL from a projection
-/// [`NpmVersionEntry`]'s verbatim `dist.tarball` (`entry.tarball`),
-/// applying the SAME `https://` guard `extract_upstream_tarball_url`
-/// enforced (no downgrade target is ever promoted to a fetch URL).
+/// [`NpmVersionEntry`]'s verbatim `dist.tarball` (`entry.tarball`). The
+/// scheme rule is [`require_https_metadata_url`] — the one definition of
+/// "a metadata-supplied download URL must be `https://`" — so no
+/// downgrade target is ever promoted to a fetch URL, and this path
+/// refuses exactly what the prefetch worker's npm arm refuses.
 ///
 /// `entry.tarball` is the genuine upstream URL captured by the
 /// projector before any serve-time rewrite (ADR 0026 §9.1 invariant
@@ -677,11 +681,7 @@ fn tarball_url_from_entry(entry: &NpmVersionEntry, version: &str) -> DomainResul
             "upstream npm version {version} is missing dist.tarball"
         ))
     })?;
-    if !tarball.starts_with("https://") {
-        return Err(DomainError::Validation(format!(
-            "upstream npm returned non-https tarball URL: {tarball}"
-        )));
-    }
+    require_https_metadata_url(tarball, MetadataUrlSubject::NpmTarballUrl)?;
     Ok(tarball.to_string())
 }
 
@@ -696,8 +696,8 @@ fn tarball_url_from_entry(entry: &NpmVersionEntry, version: &str) -> DomainResul
 /// Strips a `?` or `#` suffix first (npm registries don't use them
 /// today, but the rule must survive a future change), then returns the
 /// segment after the final `/`. If the URL has no `/`, the entire
-/// string is returned (defensive — `extract_upstream_tarball_url`
-/// already enforces `https://` so this branch is unreachable in
+/// string is returned (defensive — `tarball_url_from_entry` has already
+/// enforced the `https://` scheme, so this branch is unreachable in
 /// practice). Returns a `Cow` so the common case (URL contains `/`)
 /// avoids an allocation; the trim case allocates once.
 fn tarball_basename(url: &str) -> std::borrow::Cow<'_, str> {
@@ -867,6 +867,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         });
@@ -932,6 +933,47 @@ mod tests {
     // longer owns the cache/mirror-key encoding (it resolves the
     // packument through `crate::packument::fetch_raw_with_cache`). The
     // encoding contract is pinned by that module's tests.
+
+    // ---- tarball_url_from_entry pinning -------------------------------------
+
+    /// The genuine absolute upstream URL passes; a plaintext downgrade
+    /// target and an absent `dist.tarball` are both refused as
+    /// `Validation`, which the caller maps to `TarballUrlInvalid` → 502.
+    /// Mirrors `hort-http-pypi`'s `url_from_entry_https_passes_non_https_rejected`.
+    #[test]
+    fn tarball_url_from_entry_https_passes_non_https_rejected() {
+        let ok = NpmVersionEntry {
+            version: "1.0.0".into(),
+            name_as_published: None,
+            tarball: Some("https://registry.npmjs.org/x/-/x-1.0.0.tgz".into()),
+            integrity: None,
+            shasum: None,
+            published_at: None,
+            manifest: serde_json::Map::new(),
+        };
+        assert_eq!(
+            tarball_url_from_entry(&ok, "1.0.0").unwrap(),
+            "https://registry.npmjs.org/x/-/x-1.0.0.tgz"
+        );
+
+        let http = NpmVersionEntry {
+            tarball: Some("http://insecure/x/-/x-1.0.0.tgz".into()),
+            ..ok.clone()
+        };
+        assert!(matches!(
+            tarball_url_from_entry(&http, "1.0.0"),
+            Err(DomainError::Validation(_))
+        ));
+
+        let missing = NpmVersionEntry {
+            tarball: None,
+            ..ok.clone()
+        };
+        assert!(matches!(
+            tarball_url_from_entry(&missing, "1.0.0"),
+            Err(DomainError::Validation(_))
+        ));
+    }
 
     // ---- tarball_basename pinning -------------------------------------------
 

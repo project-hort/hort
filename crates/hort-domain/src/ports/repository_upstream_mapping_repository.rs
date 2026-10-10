@@ -213,6 +213,41 @@ pub struct RepositoryUpstreamMapping {
     /// Validation: exactly 64 chars, charset `[0-9a-f]`. Schema CHECK
     /// mirrors the same regex.
     pub pinned_cert_sha256: Option<String>,
+    /// Hosts the operator consents to as the
+    /// `WWW-Authenticate` realm of a **credentialed** bearer-challenge
+    /// exchange, in addition to the mapping's own origin (which is
+    /// always allowed and is never written here).
+    ///
+    /// Bare hostnames — no scheme, no port, no path (`auth.docker.io`,
+    /// not `https://auth.docker.io/token`). Validated entry-by-entry by
+    /// [`allowed_realm_host_reason`], which the gitops validator calls
+    /// too so the apply-time rejection and this invariant are one rule.
+    ///
+    /// # Why the field exists
+    ///
+    /// The realm of a bearer-challenge exchange arrives verbatim in the
+    /// upstream's `WWW-Authenticate` header, so it is
+    /// upstream-controlled data, and the exchange is the request that
+    /// carries `Authorization: Basic base64("oauth2:<secret>")`. Scheme
+    /// and routability bound *where* that may go but not *to whom*: a
+    /// compromised upstream answering `401` with any https, routable
+    /// realm would otherwise receive the operator's credential. A
+    /// silent same-origin binding is not available as the close —
+    /// `auth.docker.io` for `registry-1.docker.io` and a GitLab
+    /// container registry's `/jwt/auth` are legitimate off-origin
+    /// realms — so the operator declares the hosts instead.
+    ///
+    /// # Empty is the default and stays correct for an anonymous
+    /// exchange
+    ///
+    /// The consuming gate (`hort-adapters-upstream-http`) applies this
+    /// list **iff** [`Self::secret_ref`] is `Some(_)`: an exchange with
+    /// no credential has nothing to leak and keeps the scheme +
+    /// routability gates alone. So an empty list never breaks a
+    /// public-registry proxy, and a non-empty list on a mapping with no
+    /// `secret_ref` is accepted (not inert — its consumer reads it the
+    /// moment a secret is added).
+    pub allowed_realm_hosts: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -247,6 +282,8 @@ pub struct RepositoryUpstreamMappingArgs {
     pub ca_bundle_ref: Option<SecretRef>,
     /// See [`RepositoryUpstreamMapping::pinned_cert_sha256`].
     pub pinned_cert_sha256: Option<String>,
+    /// See [`RepositoryUpstreamMapping::allowed_realm_hosts`].
+    pub allowed_realm_hosts: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -302,6 +339,64 @@ fn validate_upstream_name_prefix(prefix: &str) -> DomainResult<()> {
         }
     }
     Ok(())
+}
+
+/// Validate one [`RepositoryUpstreamMapping::allowed_realm_hosts`]
+/// entry. Returns `None` on accept, `Some(reason)` on reject.
+///
+/// **One definition, two callers.** The value-object constructor below
+/// and the gitops validator
+/// (`hort_config::upstream_mapping::validate_upstream_mapping`) both
+/// call this function rather than each spelling the rule. The sibling
+/// rules on this type — `validate_upstream_name_prefix`, the TLS
+/// invariants — are hand-maintained mirrors held together by an
+/// agreement corpus, and the drift that costs is the failure mode the
+/// mirrors exist to remove: a YAML that validates clean and then fails
+/// inside the constructor. `hort-config` already depends on
+/// `hort-domain`, so a shared function is available here and removes
+/// the drift surface instead of testing for it.
+///
+/// # The accepted form
+///
+/// A bare hostname: ASCII letters, digits, `.` and `-`, not starting or
+/// ending with `.` or `-`, no empty label. That rejects, by
+/// construction, every shape an operator reaches for by habit —
+/// `https://auth.docker.io` (scheme: `/` and `:`), `auth.docker.io:443`
+/// (port: `:`), `auth.docker.io/token` (path: `/`) and `""` — and the
+/// reason text names the accepted form so the message is the remedy.
+///
+/// The comparison the consumer performs is ASCII-case-insensitive (the
+/// RFC 6454 §4 host rule, as `credential_scope` applies it in the
+/// upstream-http adapter), so a mixed-case entry is accepted as written
+/// rather than being rejected or silently rewritten.
+///
+/// An IPv6 literal is **not** accepted: its URL host form is
+/// bracketed (`[::1]`) and the brackets and colons fall outside the
+/// charset. A realm on a bare IPv6 literal is not a shape any registry
+/// in the Docker token-spec family serves, and admitting it would mean
+/// carrying address parsing into a hostname list.
+pub fn allowed_realm_host_reason(host: &str) -> Option<String> {
+    const FORM: &str = "entries are bare hostnames — no scheme, no port, no path \
+                        (e.g. `auth.docker.io`)";
+    if host.is_empty() {
+        return Some(format!("{FORM}; got an empty string"));
+    }
+    if host.starts_with('.') || host.ends_with('.') || host.starts_with('-') || host.ends_with('-')
+    {
+        return Some(format!("{FORM}; `{host}` starts or ends with `.` or `-`"));
+    }
+    if host.split('.').any(str::is_empty) {
+        return Some(format!("{FORM}; `{host}` has an empty label"));
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Some(format!(
+            "{FORM}; `{host}` contains a character outside [A-Za-z0-9.-]"
+        ));
+    }
+    None
 }
 
 impl RepositoryUpstreamMapping {
@@ -399,6 +494,39 @@ impl RepositoryUpstreamMapping {
             validate_upstream_name_prefix(prefix)?;
         }
 
+        // `allowed_realm_hosts` names the hosts that may receive this
+        // mapping's credential as the realm of a bearer-challenge
+        // exchange. Two invariants, both mirrored by the gitops
+        // validator and by the schema CHECK constraints:
+        //
+        //   1. Only `BearerChallenge` has a realm at all. On
+        //      `Anonymous` or `Basic` there is no consumer that can
+        //      ever read the list, so accepting it would leave the
+        //      operator believing a control is in force that nothing
+        //      enforces (ADR 0015).
+        //   2. Every entry is a bare hostname. The consumer compares
+        //      against a URL's host, so a scheme, a port or a path in
+        //      the entry can never match — an entry that cannot match
+        //      is an allowance the operator wrote and did not get.
+        if !args.allowed_realm_hosts.is_empty()
+            && !matches!(args.upstream_auth, UpstreamAuth::BearerChallenge)
+        {
+            return Err(DomainError::Validation(
+                "RepositoryUpstreamMapping.allowed_realm_hosts is only read on a \
+                 bearer_challenge mapping — the realm it names exists only in \
+                 that flow. Drop the field, or switch upstream_auth to \
+                 bearer_challenge."
+                    .into(),
+            ));
+        }
+        for host in &args.allowed_realm_hosts {
+            if let Some(reason) = allowed_realm_host_reason(host) {
+                return Err(DomainError::Validation(format!(
+                    "RepositoryUpstreamMapping.allowed_realm_hosts: {reason}"
+                )));
+            }
+        }
+
         Ok(Self {
             id: args.id,
             repository_id: args.repository_id,
@@ -415,6 +543,7 @@ impl RepositoryUpstreamMapping {
             mtls_key_ref: args.mtls_key_ref,
             ca_bundle_ref: args.ca_bundle_ref,
             pinned_cert_sha256: args.pinned_cert_sha256,
+            allowed_realm_hosts: args.allowed_realm_hosts,
             created_at: args.created_at,
             updated_at: args.updated_at,
         })
@@ -534,6 +663,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -670,6 +800,7 @@ mod tests {
             mtls_key_ref,
             ca_bundle_ref,
             pinned_cert_sha256,
+            allowed_realm_hosts: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1059,5 +1190,194 @@ mod tests {
             m.upstream_name_prefix.as_deref(),
             Some("acme-internal_v2.0")
         );
+    }
+
+    // -- `allowed_realm_hosts` ---------------------------------------------
+    //
+    // The field names the hosts that may receive this mapping's
+    // credential as the realm of a bearer-challenge exchange. Two
+    // constructor invariants, both mirrored by the gitops validator
+    // (which calls `allowed_realm_host_reason` directly) and by the
+    // schema CHECK constraints in
+    // `031_upstream_mappings_allowed_realm_hosts.sql`.
+
+    fn args_with_realm_hosts(auth: UpstreamAuth, hosts: &[&str]) -> RepositoryUpstreamMappingArgs {
+        RepositoryUpstreamMappingArgs {
+            upstream_auth: auth,
+            allowed_realm_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            ..make_args("https://registry.example.com", false)
+        }
+    }
+
+    #[test]
+    fn constructor_accepts_bare_hostnames_on_a_bearer_challenge_mapping() {
+        let m = RepositoryUpstreamMapping::new(args_with_realm_hosts(
+            UpstreamAuth::BearerChallenge,
+            &[
+                "auth.docker.io",
+                "gitlab.example.com",
+                "registry-2",
+                "10.0.0.7",
+            ],
+        ))
+        .expect("bare hostnames must be accepted");
+        assert_eq!(
+            m.allowed_realm_hosts,
+            vec![
+                "auth.docker.io".to_string(),
+                "gitlab.example.com".to_string(),
+                "registry-2".to_string(),
+                "10.0.0.7".to_string(),
+            ],
+            "entries are stored as written — the consumer compares \
+             case-insensitively rather than normalising here"
+        );
+    }
+
+    #[test]
+    fn constructor_accepts_an_empty_list_on_every_auth_variant() {
+        // The default must never be a rejection: an empty list is what
+        // every mapping in the world has until an operator writes one.
+        for auth in [
+            UpstreamAuth::Anonymous,
+            UpstreamAuth::BearerChallenge,
+            UpstreamAuth::Basic {
+                username: "alice".into(),
+            },
+        ] {
+            RepositoryUpstreamMapping::new(args_with_realm_hosts(auth, &[]))
+                .expect("an empty allowed_realm_hosts is valid everywhere");
+        }
+    }
+
+    #[test]
+    fn constructor_accepts_realm_hosts_on_a_bearer_challenge_mapping_without_a_secret() {
+        // Deliberately NOT a rejection. The consumer — the credentialed
+        // realm exchange — comes into being the moment a secret is added
+        // to this same mapping, so the field is conditional rather than
+        // inert. Rejecting it here would force the operator to land the
+        // credential and the allowance in two separate applies, the
+        // first of which fails closed at fetch time.
+        let args = args_with_realm_hosts(UpstreamAuth::BearerChallenge, &["auth.docker.io"]);
+        assert!(args.secret_ref.is_none(), "the point of this test");
+        RepositoryUpstreamMapping::new(args)
+            .expect("an allowance may be declared before the credential it guards");
+    }
+
+    #[test]
+    fn constructor_rejects_realm_hosts_on_a_non_bearer_challenge_mapping() {
+        // ADR 0015: a field whose consumer cannot exist on this variant
+        // is rejected, not accepted-and-ignored.
+        for auth in [
+            UpstreamAuth::Anonymous,
+            UpstreamAuth::Basic {
+                username: "alice".into(),
+            },
+        ] {
+            let err = RepositoryUpstreamMapping::new(args_with_realm_hosts(
+                auth.clone(),
+                &["auth.docker.io"],
+            ))
+            .expect_err("only bearer_challenge has a realm");
+            match err {
+                DomainError::Validation(msg) => {
+                    assert!(
+                        msg.contains("allowed_realm_hosts") && msg.contains("bearer_challenge"),
+                        "the message must name the field and the variant \
+                         that reads it; got `{msg}`"
+                    );
+                }
+                other => panic!("expected Validation, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn constructor_rejects_a_scheme_a_port_a_path_or_an_empty_entry() {
+        // Every shape an operator reaches for by habit. Each is an
+        // allowance that could never match the host the consumer
+        // compares against, so accepting it would hand them a control
+        // they wrote and did not get.
+        for bad in [
+            "https://auth.docker.io",
+            "auth.docker.io:443",
+            "auth.docker.io/token",
+            "",
+            "auth..docker.io",
+            ".auth.docker.io",
+            "auth.docker.io.",
+            "-auth.docker.io",
+            "auth docker io",
+            "[::1]",
+            "user@auth.docker.io",
+        ] {
+            let err = RepositoryUpstreamMapping::new(args_with_realm_hosts(
+                UpstreamAuth::BearerChallenge,
+                &[bad],
+            ))
+            .err()
+            .unwrap_or_else(|| panic!("`{bad}` must be rejected, got Ok"));
+            assert!(
+                err.to_string().contains("allowed_realm_hosts"),
+                "the message must name the field; got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejection_message_shows_the_accepted_form() {
+        let err = RepositoryUpstreamMapping::new(args_with_realm_hosts(
+            UpstreamAuth::BearerChallenge,
+            &["https://auth.docker.io:443/token"],
+        ))
+        .expect_err("a URL is not a hostname");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bare hostnames")
+                && msg.contains("no scheme")
+                && msg.contains("no port")
+                && msg.contains("no path")
+                && msg.contains("auth.docker.io"),
+            "the message has to be the remedy — it must state the \
+             accepted form and show an example; got `{msg}`"
+        );
+    }
+
+    #[test]
+    fn allowed_realm_host_reason_accepts_and_rejects_exactly_the_documented_set() {
+        for good in [
+            "auth.docker.io",
+            "AUTH.Docker.IO",
+            "registry",
+            "a",
+            "10.0.0.7",
+            "my-registry.internal",
+        ] {
+            assert_eq!(
+                allowed_realm_host_reason(good),
+                None,
+                "`{good}` is a bare hostname"
+            );
+        }
+        for bad in [
+            "",
+            "https://x",
+            "x:443",
+            "x/y",
+            "x..y",
+            ".x",
+            "x.",
+            "-x",
+            "x-",
+            "x y",
+            "x_y",
+            "[::1]",
+            "ünicode.example",
+        ] {
+            assert!(
+                allowed_realm_host_reason(bad).is_some(),
+                "`{bad}` is not a bare hostname"
+            );
+        }
     }
 }

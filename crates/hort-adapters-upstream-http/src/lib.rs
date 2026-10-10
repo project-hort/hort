@@ -30,12 +30,30 @@
 //!   second 401 inside the same outer fetch invalidates and
 //!   re-exchanges exactly once. Works against Docker Hub, GHCR,
 //!   Quay, GitLab CR, Harbor, Nexus, ECR Public — every registry
-//!   that follows the Docker token spec.
+//!   that follows the Docker token spec. When the mapping carries a
+//!   `secret_ref`, the realm named by the upstream must be the
+//!   mapping's own origin or a host the operator listed in
+//!   `allowed_realm_hosts` — the realm is upstream-controlled data and
+//!   the exchange is the request that carries the credential. An
+//!   anonymous exchange keeps the scheme + routability gates alone,
+//!   because it has no credential to leak.
 //! - `UpstreamAuth::Basic { username }` — HTTP Basic with
 //!   credentials drawn from a [`SecretPort`] (see
 //!   `docs/architecture/how-to/wire-secrets.md`). The adapter resolves
 //!   the bytes via the supplied port at fetch time and drops the
 //!   resulting `SecretValue` after the header is built.
+//!
+//! Every strategy above is **bound to the mapping's own origin**. A
+//! request whose target differs from `mapping.upstream_url` in scheme,
+//! host or port (RFC 6454 §4) goes out anonymously and never triggers
+//! the bearer-challenge dance, whatever the mapping declares — the
+//! artifact path's request URL can be an absolute URL lifted out of
+//! upstream metadata, so the destination is upstream-controlled data
+//! and only the configured origin is a protection space the operator
+//! consented to. The cross-origin fetch itself still happens (npm and
+//! PyPI serve bytes from a different host than their metadata by
+//! design); only the credential stays behind. See
+//! `CredentialScope` / `credential_scope`.
 //!
 //! # Errors
 //!
@@ -85,7 +103,7 @@ pub use resolver::CachingResolver;
 use hort_net_egress::is_routable;
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -582,16 +600,43 @@ pub struct HttpUpstreamProxy {
     /// The explicit assumption is that rotation is a rare,
     /// operator-scheduled event.
     tls_client_cache: Arc<tokio::sync::RwLock<HashMap<Uuid, Client>>>,
-    /// Addresses both SSRF guards treat as routable in addition to the
-    /// real `is_routable` check: the per-hop redirect SSRF policy
-    /// ([`build_redirect_policy`]) and the connect-time DNS guard
-    /// ([`dns_guard::GuardedDnsResolver`], security audit finding INJ-1).
-    /// **Always empty in production** (built via [`HttpUpstreamProxy::new`]);
-    /// only the `#[cfg(test)]` constructor populates it with the wiremock
-    /// loopback `SocketAddr`s so the allow / hop-cap / host-name-on-loopback
-    /// test paths can run on loopback. Scoped private to this crate, never
-    /// re-exported.
+    /// Addresses the crate's SSRF guards treat as routable in addition
+    /// to the real `is_routable` check. Three consumers read this one
+    /// field: the per-hop redirect SSRF policy
+    /// ([`build_redirect_policy`]), the connect-time DNS guard
+    /// ([`dns_guard::GuardedDnsResolver`], security audit finding
+    /// INJ-1), and the two realm gates in
+    /// [`HttpUpstreamProxy::fetch_bearer_token`] (scheme and
+    /// routability) via [`HttpUpstreamProxy::realm_is_test_allowlisted`]
+    /// and [`check_ssrf_safe_allowing`].
+    /// **Always empty in production** (built via [`HttpUpstreamProxy::new`],
+    /// [`HttpUpstreamProxy::with_client`]); only the `#[cfg(test)]`
+    /// constructor populates it with the wiremock loopback `SocketAddr`s so
+    /// the allow / hop-cap / host-name-on-loopback / realm-exchange test
+    /// paths can run on loopback. Scoped private to this crate, never
+    /// re-exported — an operator-reachable way to seed it would re-open
+    /// every hole the three consumers close.
     redirect_test_allowlist: Arc<Vec<SocketAddr>>,
+    /// The shared transport posture with every redirect hop bound to
+    /// the origin of the URL the request was asked for
+    /// ([`HopBinding::RequestedOrigin`]), built on first use and reused
+    /// for the process lifetime.
+    ///
+    /// Exactly one request runs on it: a **credentialed** bearer-token
+    /// exchange whose realm is a foreign origin — the one exchange that
+    /// exists only because the operator named its host in
+    /// `allowed_realm_hosts`. The allowance is for one host, so the hop
+    /// that leaves it is not covered by it (see
+    /// [`HttpUpstreamProxy::origin_bound_exchange_client`]).
+    ///
+    /// Lazy rather than built in the constructors because most
+    /// deployments never reach it: every `BearerChallenge` mapping
+    /// without a `secret_ref` — which is all of them in a public-mirror
+    /// deployment — keeps running on `client`. The cost when it is
+    /// reached is one extra connection pool for the process lifetime,
+    /// amortised across every exchange (and bearer tokens are cached,
+    /// so exchanges are per-token-lifetime, not per-request).
+    exchange_client_origin_bound: Arc<tokio::sync::OnceCell<Client>>,
 }
 
 /// Build the outbound `reqwest::Client` for the supplied config.
@@ -629,6 +674,11 @@ fn build_client_inner(
         .redirect(build_redirect_policy(
             config.max_redirect_hops,
             redirect_test_allowlist.clone(),
+            // The shared client presents no identity and carries no
+            // pin, so a cross-origin hop here leaks nothing: the CDN
+            // redirect every public upstream relies on must keep
+            // working (`redirect_hop_to_routable_cdn_is_allowed`).
+            HopBinding::AnyOrigin,
         ));
 
     // Apply the process-wide extra CA bundle (ADR 0010) to the base
@@ -698,16 +748,18 @@ impl HttpUpstreamProxy {
             challenge_memo: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             tls_client_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             redirect_test_allowlist: Arc::new(Vec::new()),
+            exchange_client_origin_bound: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
-    /// Test-only constructor that seeds the per-hop redirect-policy
-    /// allowlist with addresses the SSRF re-check should treat as
-    /// routable in addition to the real `is_routable` check. Used
-    /// exclusively by the wiremock-based redirect tests, which bind on
-    /// loopback and would otherwise be (correctly) refused by the
-    /// policy. The allowlist is NOT exposed on the public production
-    /// config and is never re-globalized.
+    /// Test-only constructor that seeds the allowlist seam with
+    /// addresses the crate's SSRF re-checks should treat as routable in
+    /// addition to the real `is_routable` check. Used exclusively by the
+    /// wiremock-based tests — redirect hops, connect-time host-name
+    /// resolutions, and the `WWW-Authenticate` realm exchange — which
+    /// all bind on loopback and would otherwise be (correctly) refused.
+    /// The allowlist is NOT exposed on the public production config and
+    /// is never re-globalized.
     #[cfg(test)]
     fn new_with_redirect_test_allowlist(
         config: HttpUpstreamProxyConfig,
@@ -731,6 +783,7 @@ impl HttpUpstreamProxy {
             challenge_memo: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             tls_client_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             redirect_test_allowlist,
+            exchange_client_origin_bound: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -747,7 +800,14 @@ impl HttpUpstreamProxy {
     /// not a valid trust anchor). The failure is fatal at the per-mapping
     /// build site — the error propagates up and the cache entry is NOT
     /// written, allowing a retry on the next request.
-    fn base_client_builder(&self) -> DomainResult<reqwest::ClientBuilder> {
+    ///
+    /// `hops` is the one dimension on which a per-mapping client may
+    /// legitimately differ from `self.client` besides its TLS config:
+    /// a client that presents the mapping's identity binds every
+    /// redirect hop to the requested origin (see [`HopBinding`]). It is
+    /// a parameter rather than a field read because the answer is the
+    /// mapping's, and this builder never sees a mapping.
+    fn base_client_builder(&self, hops: HopBinding) -> DomainResult<reqwest::ClientBuilder> {
         // Per-mapping (TLS) clients get the same per-hop redirect SSRF
         // policy AND the same connect-time DNS guard as the base client so
         // the redirect-following surface and the dial-time DNS-rebind
@@ -763,6 +823,7 @@ impl HttpUpstreamProxy {
             .redirect(build_redirect_policy(
                 self.config.max_redirect_hops,
                 self.redirect_test_allowlist.clone(),
+                hops,
             ));
 
         // Apply process-wide extra CA bundle. Returns the builder unchanged
@@ -830,9 +891,13 @@ impl HttpUpstreamProxy {
 
         // `use_preconfigured_tls` swaps the entire TLS backend; pair it
         // with the shared base builder so timeouts / redirects / DNS
-        // policy stay aligned with `self.client`.
+        // policy stay aligned with `self.client`. The one deliberate
+        // divergence is the hop binding: a client that presents this
+        // mapping's certificate, or applies its leaf pin, may not follow
+        // a hop off the origin the request was asked for.
+        let hops = hop_binding_for(mapping);
         let client = self
-            .base_client_builder()?
+            .base_client_builder(hops)?
             .use_preconfigured_tls(rustls_config)
             .build()
             .map_err(|e| {
@@ -852,11 +917,69 @@ impl HttpUpstreamProxy {
             has_mtls = mapping.mtls_cert_ref.is_some(),
             has_pin = mapping.pinned_cert_sha256.is_some(),
             extra_ca_count,
+            hop_binding = ?hops,
             "built per-mapping TLS client; cached for process lifetime"
         );
         let mut guard = self.tls_client_cache.write().await;
         guard.insert(mapping.id, client.clone());
         Ok(client)
+    }
+
+    /// The shared transport posture with every redirect hop bound to
+    /// the requested origin — the client a **credentialed** realm
+    /// exchange at a foreign realm runs on.
+    ///
+    /// # Why this client exists at all
+    ///
+    /// Two independent decisions meet on this one request and neither
+    /// alone produces it:
+    ///
+    /// - [`ExchangeClient::Shared`] says the mapping's *TLS material*
+    ///   does not travel to a foreign realm (unit 6's reasoning: a leaf
+    ///   pin names a different leaf there and an mTLS identity is not
+    ///   ours to present). That hands the exchange `self.client`, whose
+    ///   redirect policy is [`HopBinding::AnyOrigin`] — correct for the
+    ///   shared client's normal traffic, because it presents nothing.
+    /// - `allowed_realm_hosts` says the *credential* may travel to this
+    ///   one foreign host because the operator named it. An allowance
+    ///   for one host is not an allowance for wherever that host
+    ///   redirects to.
+    ///
+    /// So the exchange needs the shared client's trust posture with the
+    /// per-mapping clients' hop binding, which is neither existing
+    /// client. [`Self::base_client_builder`] already takes the binding
+    /// as a parameter, so this is unit 7's pattern applied to a third
+    /// client rather than a second mechanism:
+    /// [`build_redirect_policy`]'s `RequestedOrigin` arm compares each
+    /// hop against `attempt.previous().first()` — the URL `send()` was
+    /// called with, which here *is* the allowed realm.
+    ///
+    /// # What it does not cover, deliberately
+    ///
+    /// A credentialed exchange whose realm is the mapping's **own**
+    /// origin takes the [`ExchangeClient::PerMapping`] arm and keeps
+    /// whatever hop binding [`hop_binding_for`] gives that mapping — so
+    /// a mapping with no TLS material, or with `ca_bundle_ref` alone,
+    /// can still follow a hop off its own origin on a credentialed
+    /// exchange. That case consults no allowance (the own origin is
+    /// implicit), reqwest strips `Authorization` across origins, and
+    /// which hops a `ca_bundle_ref`-only client may take is a decision
+    /// `hop_binding_for` documents and owns. Narrowing it is a change
+    /// to that decision, not a gap in this one.
+    async fn origin_bound_exchange_client(&self) -> DomainResult<Client> {
+        self.exchange_client_origin_bound
+            .get_or_try_init(|| async {
+                self.base_client_builder(HopBinding::RequestedOrigin)?
+                    .build()
+                    .map_err(|e| {
+                        classified_error(
+                            UpstreamErrorKind::NetworkError,
+                            &format!("origin-bound realm-exchange client build failed: {e}"),
+                        )
+                    })
+            })
+            .await
+            .cloned()
     }
 
     /// Compose the upstream URL.
@@ -1030,7 +1153,31 @@ fn parse_last_modified(value: Option<&str>) -> Option<DateTime<Utc>> {
 /// Refusal returns [`DomainError::Validation`] (mapped to
 /// `UpstreamErrorKind::ParseError` by the outer fetch metric — refusal
 /// is a content-validation outcome, not a network failure).
+///
+/// This is the strict form: it delegates to
+/// [`check_ssrf_safe_allowing`] with an empty allowlist, so the
+/// artifact / metadata callers keep exactly the behaviour they have
+/// always had. The routability decision itself lives in one place —
+/// `check_ssrf_safe_allowing` — so there is a single URL-validation
+/// routability predicate in this crate to read and to change.
 async fn check_ssrf_safe(url_str: &str) -> DomainResult<()> {
+    check_ssrf_safe_allowing(url_str, &[]).await
+}
+
+/// [`check_ssrf_safe`] with this crate's test-allowlist seam applied,
+/// mirroring [`dns_guard::GuardedDnsResolver::permit`]: a resolved
+/// address passes iff [`hort_net_egress::is_routable`] accepts it
+/// **or** it is listed in `allowlist`.
+///
+/// `allowlist` is empty on every production path. [`check_ssrf_safe`]
+/// passes `&[]` literally, and the only non-empty value that can exist
+/// in the process comes from
+/// `HttpUpstreamProxy::new_with_redirect_test_allowlist`, which is
+/// `#[cfg(test)]` and never re-exported. The seam lives here rather
+/// than in a second copy of the loop on purpose: one routability
+/// predicate, one place a reviewer has to read to know what the
+/// registry will dial.
+async fn check_ssrf_safe_allowing(url_str: &str, allowlist: &[SocketAddr]) -> DomainResult<()> {
     let parsed = url::Url::parse(url_str)
         .map_err(|e| DomainError::Validation(format!("invalid upstream URL: {e}")))?;
     let host = parsed
@@ -1042,7 +1189,7 @@ async fn check_ssrf_safe(url_str: &str) -> DomainResult<()> {
         DomainError::Validation(format!("upstream host {host} did not resolve: {e}"))
     })?;
     for addr in addrs {
-        if !is_routable(addr.ip()) {
+        if !is_routable(addr.ip()) && !allowlist.contains(&addr) {
             return Err(DomainError::Validation(format!(
                 "upstream artifact URL resolves to a non-routable address: \
                  host={host} ip={ip}",
@@ -1062,6 +1209,114 @@ async fn check_ssrf_safe(url_str: &str) -> DomainResult<()> {
 /// variant.
 const REDIRECT_SSRF_SENTINEL: &str = "hort-upstream-redirect-ssrf-blocked";
 
+/// Stable marker embedded in the refusal message for a redirect hop
+/// that left the origin the request was asked for while running on a
+/// client that presents the mapping's TLS identity
+/// ([`HopBinding::RequestedOrigin`]).
+///
+/// A distinct string from [`REDIRECT_SSRF_SENTINEL`] because it is a
+/// distinct refusal: the hop may be perfectly routable and public, and
+/// what is wrong with it is that it would present the operator's client
+/// certificate — or apply their leaf pin — to an origin they never
+/// configured. Both classify as [`UpstreamErrorKind::ParseError`] (the
+/// upstream's `Location` header is untrusted input, so a refusal is a
+/// content-validation outcome), so no new error variant or metric label
+/// is introduced; the separate marker is what lets an operator and a
+/// test tell the two refusals apart in logs.
+const REDIRECT_OFF_ORIGIN_SENTINEL: &str = "hort-upstream-redirect-off-origin-refused";
+
+/// Whether a redirect hop may leave the origin the request was asked
+/// for, for the client the hop is being followed on.
+///
+/// # Why this is a property of the client and not of the request
+///
+/// A client certificate cannot be withheld and cannot be stripped. The
+/// `Authorization` header is a per-request decision — reqwest drops it
+/// on a cross-origin hop (pinned by
+/// `cross_host_redirect_strips_authorization_header`), and
+/// [`credential_scope`] withholds it on a foreign initial request — but
+/// a certificate is presented during the handshake, to whatever host the
+/// hop names, before any application-level decision exists. A hop is
+/// therefore the only place the refusal can live, and the refusal has to
+/// be decided by what the *connection* carries.
+///
+/// # Refuse, never downgrade
+///
+/// The arms select a redirect *policy*, not a client: a cross-origin hop
+/// on an identity-bearing client is refused rather than silently
+/// re-issued on the shared client. Switching clients mid-chain would
+/// change the trust set underneath a connection the caller already
+/// reasoned about — the response would come back verified against a
+/// different root store than the one the operator configured for this
+/// mapping, with nothing in the outcome saying so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HopBinding {
+    /// Hops may cross origins, subject to the hop cap and the per-hop
+    /// routability re-check. This is the shared client — which presents
+    /// nothing and trusts only the system store plus the process-wide
+    /// `HORT_EXTRA_CA_BUNDLE` — and the per-mapping clients whose TLS
+    /// material says only *whom to trust* (see [`hop_binding_for`]).
+    AnyOrigin,
+    /// Every hop must stay on the origin of the URL this request was
+    /// asked for. Bound per request rather than per client: the target
+    /// is `attempt.previous().first()`, the URL the caller handed to
+    /// `send()`, so one cached per-mapping client stays correct for
+    /// every URL that mapping is fetched with.
+    ///
+    /// The requested URL *is* the mapping's own origin whenever this arm
+    /// is in force, and that is an interlock rather than a coincidence:
+    /// `fetch_with_challenge` selects the per-mapping client only for a
+    /// `CredentialScope::MappingOrigin` request, so a client carrying an
+    /// identity is never handed a foreign URL to begin with.
+    RequestedOrigin,
+}
+
+/// The hop binding a mapping's TLS material earns.
+///
+/// `mtls_cert_ref` / `mtls_key_ref` are an **identity**: a client
+/// certificate the connection presents, which authenticates us to
+/// whoever asks for it. `pinned_cert_sha256` is a statement about one
+/// origin's **leaf**, so off that origin it is at best meaningless and
+/// in practice a handshake failure. Either one binds every hop to the
+/// requested origin.
+///
+/// # A `ca_bundle_ref`-only mapping keeps `AnyOrigin`, deliberately
+///
+/// A CA bundle is what we are willing to *accept*, not something we
+/// *send*: no identity is presented and nothing of the operator's
+/// leaves the process, so a cross-origin hop there is a trust-set
+/// question rather than a leak. Two reasons settle it toward following:
+///
+/// - The shape it would break is real and common. A private registry
+///   (Harbor, Artifactory, Nexus) that answers a blob `GET` with a
+///   `302` to object storage on another host is the normal deployment,
+///   and the augmented root store — the operator's private CA *plus*
+///   the system roots — is exactly what makes that hop validate today.
+///   Refusing it would turn a working pull-through into a
+///   `parse_error` for no secret saved.
+/// - The hop keeps every control the shared client's hops keep: the hop
+///   cap, the per-hop routability re-check
+///   ([`dns_guard::addr_is_dialable`]), the connect-time DNS guard,
+///   reqwest's cross-origin `Authorization` strip, and the mandatory
+///   upstream checksum verification on the content itself (ADR 0006).
+///
+/// The residual this accepts: the private CA's signing power travels to
+/// an upstream-nominated origin, so a certificate that CA issued for
+/// that origin would be trusted there. Exploiting it needs the private
+/// CA to have signed for a host the attacker also controls the redirect
+/// to — a strictly smaller surface than handing over a client
+/// certificate, which needs nothing but a `Location` header.
+fn hop_binding_for(mapping: &RepositoryUpstreamMapping) -> HopBinding {
+    if mapping.mtls_cert_ref.is_some()
+        || mapping.mtls_key_ref.is_some()
+        || mapping.pinned_cert_sha256.is_some()
+    {
+        HopBinding::RequestedOrigin
+    } else {
+        HopBinding::AnyOrigin
+    }
+}
+
 /// Build the [`reqwest::redirect::Policy`] for the upstream artifact /
 /// metadata / manifest fetch clients.
 ///
@@ -1077,6 +1332,23 @@ const REDIRECT_SSRF_SENTINEL: &str = "hort-upstream-redirect-ssrf-blocked";
 /// redirect hop's resolved host and stops the chain with an error when
 /// any resolved address is non-routable, while still enforcing the hop
 /// **cap** (`max_redirect_hops`) the way `Policy::limited` did.
+///
+/// # The second refusal: a hop that leaves the requested origin
+///
+/// `binding` adds an independent leg that asks a different question. The
+/// routability leg asks "is this target internal?"; the origin leg asks
+/// "may *this client* talk to this target at all?". A public,
+/// attacker-nominated CDN passes the first and must fail the second when
+/// the client presents the mapping's client certificate or carries its
+/// leaf pin — reqwest strips `Authorization` across origins, but a
+/// certificate is presented at handshake time to whatever host the hop
+/// names and cannot be withheld after the fact. See [`HopBinding`] for
+/// which clients get which arm and [`hop_binding_for`] for why a
+/// `ca_bundle_ref`-only mapping keeps `AnyOrigin`.
+///
+/// Neither leg substitutes for the other, and the hop cap substitutes
+/// for neither: the cap bounds *how many* hops, the routability leg
+/// *where to*, the origin leg *on whose behalf*.
 ///
 /// # Implementation shape
 ///
@@ -1118,6 +1390,7 @@ const REDIRECT_SSRF_SENTINEL: &str = "hort-upstream-redirect-ssrf-blocked";
 fn build_redirect_policy(
     max_hops: usize,
     allowlist: Arc<Vec<SocketAddr>>,
+    binding: HopBinding,
 ) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt: reqwest::redirect::Attempt<'_>| {
         // Hop cap first, so an over-long chain is rejected independent
@@ -1126,6 +1399,49 @@ fn build_redirect_policy(
         // once `previous().len()` would exceed the limit).
         if attempt.previous().len() >= max_hops {
             return attempt.error(format!("upstream redirect exceeded hop cap of {max_hops}"));
+        }
+
+        // Origin binding before the routability resolve: a hop this
+        // client may not take at all does not need its host looked up,
+        // and the refusal below is the stronger one (an identity leak,
+        // not an internal-target pivot).
+        if binding == HopBinding::RequestedOrigin {
+            // `previous()[0]` is the URL `send()` was called with; the
+            // entries after it are hops already followed. The same
+            // origin triple `credential_scope` compares, applied to the
+            // hop against that requested URL — one origin comparison in
+            // this crate, now reading three decisions. A chain with no
+            // origin to bind to fails closed.
+            let requested = attempt.previous().first().map(url::Url::as_str);
+            let stays_home = matches!(
+                requested.map(|from| credential_scope(attempt.url().as_str(), from)),
+                Some(CredentialScope::MappingOrigin)
+            );
+            if !stays_home {
+                // reqwest's `Display` for a redirect error prints only
+                // "error following redirect for url (...)" and drops the
+                // cause, so without this line an operator cannot tell
+                // this refusal from a hop-cap breach or an SSRF block.
+                // Origins only — the path and query of an upstream
+                // `Location` are upstream-controlled, exactly as
+                // `request_origin_for_log` reasons for the withheld
+                // credential.
+                tracing::warn!(
+                    requested_origin = %requested.map_or_else(
+                        || "<no-origin>".to_string(),
+                        request_origin_for_log,
+                    ),
+                    hop_origin = %request_origin_for_log(attempt.url().as_str()),
+                    "upstream redirect hop refused: this client presents the \
+                     mapping's TLS identity, which does not travel off the \
+                     mapping's own origin"
+                );
+                return attempt.error(format!(
+                    "{REDIRECT_OFF_ORIGIN_SENTINEL}: redirect target left the \
+                     requested origin on a client carrying the mapping's TLS \
+                     identity"
+                ));
+            }
         }
 
         let next_url = attempt.url().clone();
@@ -1157,8 +1473,9 @@ fn build_redirect_policy(
 
         // Reject if ANY resolved address is non-routable and not in the
         // test allowlist — the attacker needs only one entry to pivot.
+        // One predicate, shared with the connect-time DNS guard.
         for addr in &addrs {
-            if !is_routable(addr.ip()) && !allowlist.contains(addr) {
+            if !dns_guard::addr_is_dialable(*addr, allowlist.as_slice()) {
                 tracing::warn!(
                     blocked_host = %host,
                     "upstream redirect hop blocked: resolves to a \
@@ -1190,32 +1507,230 @@ impl ToSocketAddrsOwned for (&str, u16) {
     }
 }
 
-/// True iff `realm_url`'s host is an IP literal that classifies as
-/// loopback. The realm scheme guard treats loopback hosts as the
-/// test-harness exemption to the `https`-only rule. A direct
-/// `IpAddr::is_loopback()` check is used — the OS already classifies
-/// `127.0.0.0/8` and `::1` as loopback, and the wiremock-test harness
-/// binds inside that range, so the test exemption stands without any
-/// operator-facing knob.
+/// Whether the mapping's credential may travel on one outbound request.
 ///
-/// Non-IP-literal hosts (e.g. `attacker.example.com`) never match —
-/// production attackers cannot smuggle in via a hostname that resolves
-/// to loopback because the comparison is on the URL's literal host
-/// token, not on a DNS resolution.
-fn realm_host_is_loopback(realm_url: &url::Url) -> bool {
-    let Some(host_str) = realm_url.host_str() else {
+/// # Three decisions, one comparison
+///
+/// The origin triple below is the whole of what distinguishes "the
+/// operator configured this destination" from "upstream data nominated
+/// it", so every decision that turns on that distinction reads this one
+/// function rather than spelling its own comparison:
+///
+/// 1. the `Authorization` header and the realm dance on the initial
+///    request (`fetch_with_challenge`, the original finding);
+/// 2. which `reqwest::Client` carries a content request — the mapping's
+///    TLS posture or the shared client (`fetch_with_challenge` again,
+///    since a client certificate is a stronger secret than the header
+///    it would have accompanied);
+/// 3. which realm exchange may run on the mapping's own client
+///    ([`ExchangeClient`]).
+///
+/// [`build_redirect_policy`]'s origin binding reads it a fourth time,
+/// comparing a redirect hop against the URL the request was asked for
+/// rather than against `mapping.upstream_url` — the same question about
+/// a different pair, which is why the arms are named after what the
+/// comparison *means* rather than after the header.
+///
+/// A mapping's credential belongs to the origin the operator configured
+/// (`mapping.upstream_url`) and to nothing else. The artifact path does
+/// not guarantee that: `resolve_artifact_url` accepts an absolute URL
+/// lifted straight out of upstream metadata (npm `dist.tarball`, PyPI
+/// `urls[].url`, the Cargo `dl`-composed URL), so the request target is
+/// upstream-controlled data. `check_ssrf_safe` runs on that URL, but it
+/// answers "is this destination internal?", which is a different
+/// question from "may this destination have our credential?" — a public,
+/// attacker-nominated host passes the first and must fail the second.
+///
+/// RFC 7235 §2.2 scopes an `Authorization` header to one protection
+/// space, and RFC 6454 §4 defines that space's identity as the
+/// (scheme, host, port) triple. This is the same rule reqwest already
+/// applies to redirect hops (see
+/// `cross_host_redirect_strips_authorization_header`), carried from
+/// redirects to the *initial* request of a metadata-supplied URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CredentialScope {
+    /// The request target is the mapping's own origin: the operator
+    /// configured this destination, so its credential may be attached
+    /// and the bearer-challenge dance may run against it.
+    MappingOrigin,
+    /// The request target is a different origin than the mapping's
+    /// `upstream_url`. The fetch still happens — npm and PyPI
+    /// legitimately serve artifact bytes from a different host than
+    /// their metadata host (`files.pythonhosted.org` against
+    /// `pypi.org`) — but it happens anonymously.
+    ForeignOrigin,
+}
+
+/// Classify `request_url` against the mapping's own `upstream_url` by
+/// origin: scheme, host (ASCII-case-insensitive) and port with
+/// default-port normalisation (RFC 6454 §4).
+///
+/// **Fail closed on a parse failure of either side.** `upstream_url` is
+/// operator configuration whose parseability is a value-object
+/// invariant (`RepositoryUpstreamMapping::new` rejects an unparseable
+/// URL and any scheme outside http/https), and the request URL is
+/// already parsed upstream of here on every path that can carry a
+/// foreign origin. A failure is therefore an invariant violation, not
+/// an expected input, and the safe reading of "I cannot tell which
+/// origin this is" is "not ours".
+///
+/// The triple is compared field-by-field rather than through
+/// `Url::origin()` on purpose: `origin()` folds `blob:` URLs onto their
+/// inner origin and hands every other non-special scheme a freshly
+/// serialised opaque origin, neither of which is a behaviour worth
+/// inheriting into a credential decision. The explicit comparison also
+/// keeps the ASCII-case-insensitive host rule visible at the decision
+/// site instead of resting on the `url` crate's parse-time
+/// normalisation.
+fn credential_scope(request_url: &str, mapping_upstream_url: &str) -> CredentialScope {
+    let (Ok(request), Ok(configured)) = (
+        url::Url::parse(request_url),
+        url::Url::parse(mapping_upstream_url),
+    ) else {
+        return CredentialScope::ForeignOrigin;
+    };
+    let same_host = match (request.host_str(), configured.host_str()) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        // A host-less URL has no protection space to match.
+        _ => false,
+    };
+    let same_origin = request.scheme().eq_ignore_ascii_case(configured.scheme())
+        && same_host
+        && request.port_or_known_default() == configured.port_or_known_default();
+    if same_origin {
+        CredentialScope::MappingOrigin
+    } else {
+        CredentialScope::ForeignOrigin
+    }
+}
+
+/// Which `reqwest::Client` carries the bearer-token exchange — the one
+/// request that sends the operator's credential as
+/// `Authorization: Basic base64("oauth2:<secret>")`.
+///
+/// The caller decides once, from [`credential_scope`] applied to the
+/// realm the upstream advertised, and hands the decision down; a
+/// carrier rather than a bare `bool` so neither arm can be selected
+/// without the data it needs, and so every call site reads as the
+/// trust decision it is.
+///
+/// A mapping's TLS material is the operator's statement about **who
+/// its own upstream origin is**: `ca_bundle_ref` adds that origin's
+/// private CA to the augmented root store, `mtls_cert_ref` /
+/// `mtls_key_ref` present a client identity to it, and
+/// `pinned_cert_sha256` replaces the certificate verifier with one
+/// that compares that origin's *leaf* thumbprint
+/// (`tls_config::PinningVerifier`). Which client the exchange runs on
+/// is therefore decided by the realm's origin, not by the content
+/// request's: the realm is where the credential actually travels.
+#[derive(Clone, Copy, Debug)]
+enum ExchangeClient<'m> {
+    /// The realm sits on the mapping's own origin — the common shape
+    /// for every self-hosted registry (Harbor's
+    /// `/service/token`, Zot, a GHCR-style `/token` on the registry
+    /// host itself), and the only shape a private, pinned or
+    /// mTLS-protected upstream can have. Run the exchange on
+    /// `client_for_mapping`, so the strictest control the operator
+    /// configured covers the request that carries the secret.
+    PerMapping(&'m RepositoryUpstreamMapping),
+    /// The realm is a different origin than `mapping.upstream_url`.
+    /// Run the exchange on the shared client.
+    ///
+    /// **This arm is load-bearing, not an optimisation.** Two
+    /// independent reasons, either one sufficient:
+    ///
+    /// - A `pinned_cert_sha256` is the thumbprint of the *upstream's*
+    ///   leaf. A foreign realm presents a different leaf, so the
+    ///   per-mapping client would refuse a legitimate exchange —
+    ///   `auth.docker.io` for `registry-1.docker.io` is the canonical
+    ///   case, and `<host>/jwt/auth` against a GitLab container
+    ///   registry on its own subdomain is the second.
+    /// - The mapping's mTLS identity must not be presented to a host
+    ///   the operator did not configure. A client certificate is an
+    ///   authenticated assertion of who we are; sending it to an
+    ///   upstream-nominated host is the same class of leak as sending
+    ///   the bearer credential there (`CredentialScope`), and the
+    ///   realm string arrives verbatim in a `WWW-Authenticate` header.
+    Shared,
+}
+
+/// Whether the operator wrote `realm`'s host into
+/// `mapping.allowed_realm_hosts`.
+///
+/// Host only, compared ASCII-case-insensitively — the RFC 6454 §4 host
+/// rule [`credential_scope`] applies, narrowed to the single component
+/// the operator surface spells. The field carries bare hostnames (no
+/// scheme, no port, no path; the value object and the gitops validator
+/// both reject anything else via
+/// `hort_domain::…::allowed_realm_host_reason`), so a host comparison
+/// is the whole of what an entry can say.
+///
+/// **The mapping's own origin is not consulted here.** The caller has
+/// already asked that question with [`credential_scope`] and only
+/// reaches this function for a foreign realm, which is why the implicit
+/// own-origin allowance never has to be written into the list.
+///
+/// Fail closed on an unparseable or host-less realm: an allowance is
+/// something an operator wrote down, and a realm no host can be read
+/// out of matches nothing they could have written.
+fn realm_host_is_operator_allowed(mapping: &RepositoryUpstreamMapping, realm: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(realm) else {
         return false;
     };
-    let Ok(host_ip): Result<std::net::IpAddr, _> = host_str.parse() else {
+    let Some(host) = parsed.host_str() else {
         return false;
     };
-    host_ip.is_loopback()
+    mapping
+        .allowed_realm_hosts
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host))
+}
+
+/// Render `realm`'s host — and only its host — for the realm-refusal
+/// log line.
+///
+/// The host is the exact token the operator would add to the mapping's
+/// `allowedRealmHosts` to permit this exchange, which is why this line
+/// carries the host rather than the origin
+/// [`request_origin_for_log`] renders: the line has to *be* the remedy.
+/// The path and query stay unlogged for the same reason they do there —
+/// a realm arrives verbatim in a `WWW-Authenticate` header and is
+/// upstream-controlled data.
+fn realm_host_for_log(realm: &str) -> String {
+    url::Url::parse(realm)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<no-host>".to_string())
+}
+
+/// Render `request_url`'s origin — and only its origin — for the
+/// credential-withheld log line. The path and query of a
+/// metadata-supplied URL are upstream-controlled and are deliberately
+/// not logged; the operator needs to know *which origin* was refused
+/// the credential, which is exactly the triple
+/// [`credential_scope`] compared.
+fn request_origin_for_log(request_url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(request_url) else {
+        return "<unparseable>".to_string();
+    };
+    match (parsed.host_str(), parsed.port_or_known_default()) {
+        (Some(host), Some(port)) => format!("{}://{host}:{port}", parsed.scheme()),
+        (Some(host), None) => format!("{}://{host}", parsed.scheme()),
+        (None, _) => "<no-host>".to_string(),
+    }
 }
 
 impl HttpUpstreamProxy {
     /// Resolve credentials for a mapping. Returns the
     /// `Authorization` header value to attach (or `None` for
     /// anonymous).
+    ///
+    /// `scope` is the caller's single per-request origin decision (see
+    /// [`CredentialScope`] and `fetch_with_challenge`). It is what keeps
+    /// this function from being URL-blind: a `ForeignOrigin` request
+    /// returns `None` before the challenge memo, the bearer cache or
+    /// the `SecretPort` is consulted at all, so the mapping's secret is
+    /// not even resolved for a destination it does not belong to.
     ///
     /// For `BearerChallenge` mappings this is *lazy*: it returns a
     /// cached bearer header iff the proxy has already learned the
@@ -1226,8 +1741,11 @@ impl HttpUpstreamProxy {
     async fn authorization_header(
         &self,
         mapping: &RepositoryUpstreamMapping,
-        _upstream_name: &str,
+        scope: CredentialScope,
     ) -> DomainResult<Option<String>> {
+        if scope == CredentialScope::ForeignOrigin {
+            return Ok(None);
+        }
         match &mapping.upstream_auth {
             UpstreamAuth::Anonymous => Ok(None),
             UpstreamAuth::BearerChallenge => {
@@ -1320,6 +1838,43 @@ impl HttpUpstreamProxy {
         }
     }
 
+    /// Whether the upstream-supplied realm's host/port is carried by
+    /// this crate's test-allowlist seam (`redirect_test_allowlist`).
+    ///
+    /// **Empty in production**, so this answers `false` on every
+    /// production path and both realm gates in
+    /// [`Self::fetch_bearer_token`] are strict: a non-`https` realm and
+    /// a non-routable realm are each refused before the credential is
+    /// touched. The seam exists because the wiremock harness advertises
+    /// its realm on `http://127.0.0.1:<ephemeral-port>`, and a dance
+    /// that cannot reach its own realm is not a test of the dance —
+    /// the same problem, and the same answer, as the per-hop redirect
+    /// policy ([`build_redirect_policy`]) and the connect-time DNS
+    /// guard ([`dns_guard::GuardedDnsResolver::permit`]), which read
+    /// this very field.
+    ///
+    /// **No DNS, by construction.** The `SocketAddr` is formed from an
+    /// IP-literal host plus `port_or_known_default()`; a domain host —
+    /// `localhost` and every other name that resolves to an
+    /// allowlisted address included — cannot form one and so cannot
+    /// match. An upstream controlling `WWW-Authenticate` therefore has
+    /// no reachable input to this predicate even in a seeded test
+    /// process.
+    fn realm_is_test_allowlisted(&self, realm_url: &url::Url) -> bool {
+        let ip = match realm_url.host() {
+            Some(url::Host::Ipv4(v4)) => IpAddr::V4(v4),
+            Some(url::Host::Ipv6(v6)) => IpAddr::V6(v6),
+            // A domain host would have to be resolved to be compared,
+            // and resolving is exactly what must not happen here.
+            _ => return false,
+        };
+        let Some(port) = realm_url.port_or_known_default() else {
+            return false;
+        };
+        self.redirect_test_allowlist
+            .contains(&SocketAddr::new(ip, port))
+    }
+
     /// Exchange a parsed `Challenge` for a bearer token at the
     /// realm endpoint.
     ///
@@ -1335,12 +1890,22 @@ impl HttpUpstreamProxy {
     /// header-format time and dropped (zeroized) before the realm
     /// response is read.
     ///
+    /// `on` names the client this exchange runs on — the caller's
+    /// single decision, made once from the realm's origin (see
+    /// [`ExchangeClient`]). This function never reaches for
+    /// `self.client` behind the caller's back: when the realm is the
+    /// mapping's own origin the exchange runs on the TLS posture the
+    /// operator configured for it, and only a realm on some other
+    /// origin — whose leaf that posture does not describe — falls back
+    /// to the shared client.
+    ///
     /// Lifetime: `expires_in.unwrap_or(300)` seconds, minus a 30s
     /// clock-skew slack, so an in-flight request never hands back
     /// a token the upstream sees as expired.
     async fn fetch_bearer_token(
         &self,
         challenge: &Challenge,
+        on: ExchangeClient<'_>,
         bearer_secret: Option<SecretValue>,
     ) -> DomainResult<CachedToken> {
         // Build the realm URL with optional service/scope query
@@ -1374,16 +1939,16 @@ impl HttpUpstreamProxy {
         // Reject any non-`https` scheme BEFORE building the request
         // and BEFORE the bearer_secret is touched.
         //
-        // Loopback test exemption: the wiremock-based test harness
-        // binds on http://127.0.0.1:<port>; the IP-literal check below
-        // recognises that range as loopback and lets the http:// realm
-        // through. Production attackers cannot smuggle in via a
-        // hostname (e.g. `attacker.example.com`) — the IP-parse fails
-        // for non-literal hosts, so the guard rejects unconditionally.
-        // The invariant (`realm="http://attacker/token"` rejected with
-        // `ParseError` BEFORE the bearer secret is touched) is
-        // preserved.
-        if url.scheme() != "https" && !realm_host_is_loopback(&url) {
+        // The one admitted exception is an address this crate's
+        // test-allowlist seam carries — empty in production and matched
+        // without DNS (see `realm_is_test_allowlisted`), so production
+        // refuses every non-`https` realm unconditionally, loopback IP
+        // literals included. The wiremock harness reaches its own
+        // `http://127.0.0.1:<port>` realm by seeding the seam, not by
+        // weakening the rule. The invariant
+        // (`realm="http://attacker/token"` rejected with `ParseError`
+        // BEFORE the bearer secret is touched) is preserved.
+        if url.scheme() != "https" && !self.realm_is_test_allowlisted(&url) {
             tracing::error!(
                 realm = %challenge.realm,
                 scheme = %url.scheme(),
@@ -1410,32 +1975,70 @@ impl HttpUpstreamProxy {
         // RFC1918, link-local, …) would still receive the
         // `Authorization: Basic base64(oauth2:<PAT>)` header below — an
         // SSRF + operator-credential-exfiltration sink driven entirely by
-        // the upstream-controlled `WWW-Authenticate` realm. Run the same
-        // routability check the artifact-fetch path uses (`check_ssrf_safe`
-        // → `is_routable`) BEFORE the secret is touched. The loopback
-        // exemption mirrors the scheme guard's: `realm_host_is_loopback`
-        // is true only for an IP-literal loopback host (the wiremock test
-        // harness binds `127.0.0.1`); loopback is therefore the only
-        // non-routable class allowed through, exactly as for the existing
-        // http-loopback scheme exemption. A production realm pointing at
-        // `localhost`/an internal hostname is not an IP-literal loopback,
-        // so it is resolved and rejected if non-routable.
-        if !realm_host_is_loopback(&url) {
-            if let Err(e) = check_ssrf_safe(url.as_str()).await {
-                tracing::error!(
-                    realm = %challenge.realm,
-                    error = %e,
-                    "rejecting realm resolving to a non-routable host — credential will not be sent"
-                );
-                drop(bearer_secret);
-                return Err(classified_error(
-                    UpstreamErrorKind::ParseError,
-                    &format!("realm host is SSRF-blocked (non-routable): {e}"),
-                ));
-            }
+        // the upstream-controlled `WWW-Authenticate` realm. Run the one
+        // URL-validation routability predicate the artifact-fetch path
+        // uses (`check_ssrf_safe_allowing` → `is_routable`) BEFORE the
+        // secret is touched, with this crate's test-allowlist seam
+        // applied exactly as `dns_guard::GuardedDnsResolver::permit`
+        // applies it — routable OR allowlisted. The seam is empty in
+        // production, so every non-routable realm is refused there:
+        // loopback, `localhost`, an internal hostname, IMDS, RFC1918.
+        if let Err(e) =
+            check_ssrf_safe_allowing(url.as_str(), self.redirect_test_allowlist.as_slice()).await
+        {
+            tracing::error!(
+                realm = %challenge.realm,
+                error = %e,
+                "rejecting realm resolving to a non-routable host — credential will not be sent"
+            );
+            drop(bearer_secret);
+            return Err(classified_error(
+                UpstreamErrorKind::ParseError,
+                &format!("realm host is SSRF-blocked (non-routable): {e}"),
+            ));
         }
 
-        let mut req = self.client.get(url);
+        // Resolve the client the caller selected. For
+        // `ExchangeClient::PerMapping` this is the same
+        // `client_for_mapping` resolution every content fetch performs
+        // — the mapping's `ca_bundle_ref`, mTLS identity and
+        // `pinned_cert_sha256` carry the request that is about to send
+        // `Authorization: Basic base64("oauth2:<secret>")`. It is
+        // resolved HERE, after both realm gates, so a failure cannot
+        // outlive the secret: the `drop` below precedes the `return`
+        // exactly as the two gates above do. A build failure keeps the
+        // exchange's existing failure shape — `client_for_mapping`
+        // returns an already-classified `DomainError`, and the caller
+        // turns any `Err` from this function into
+        // `hort_upstream_bearer_token_total{result="fetch_failed"}`.
+        let client = match on {
+            ExchangeClient::PerMapping(mapping) => match self.client_for_mapping(mapping).await {
+                Ok(c) => c,
+                Err(e) => {
+                    drop(bearer_secret);
+                    return Err(e);
+                }
+            },
+            // A credentialed exchange at a foreign realm is the one the
+            // operator's `allowed_realm_hosts` authorised, and it
+            // authorised exactly one host. The hop that leaves that
+            // host is not covered by the allowance, so this client
+            // refuses it — without the binding the list is a front door
+            // with an open window, since the allowed realm can answer
+            // `302` and carry the exchange onward.
+            ExchangeClient::Shared if bearer_secret.is_some() => {
+                match self.origin_bound_exchange_client().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        drop(bearer_secret);
+                        return Err(e);
+                    }
+                }
+            }
+            ExchangeClient::Shared => self.client.clone(),
+        };
+
+        let mut req = client.get(url);
         if let Some(secret) = bearer_secret.as_ref() {
             use base64::Engine as _;
             // Format the resolved secret as `oauth2:<secret>` per
@@ -1539,6 +2142,21 @@ fn map_reqwest_send_error(e: &reqwest::Error) -> DomainError {
         return classified_error(
             UpstreamErrorKind::ParseError,
             &format!("upstream fetch blocked (SSRF): {e}"),
+        );
+    }
+    // A hop refused because it left the requested origin while the
+    // client was carrying the mapping's TLS identity
+    // ([`HopBinding::RequestedOrigin`]). Same `ParseError`
+    // classification and the same reason — the upstream's `Location`
+    // header is untrusted input, so refusing it is a content-validation
+    // outcome — but a different detail string, because "blocked (SSRF)"
+    // would describe the wrong refusal: the target is typically public
+    // and routable and what was wrong with it is whose certificate it
+    // would have received.
+    if error_chain_contains(e, REDIRECT_OFF_ORIGIN_SENTINEL) {
+        return classified_error(
+            UpstreamErrorKind::ParseError,
+            &format!("upstream redirect left the requested origin: {e}"),
         );
     }
     let kind = if e.is_timeout() {
@@ -1658,35 +2276,114 @@ impl HttpUpstreamProxy {
     /// attempt because `reqwest::RequestBuilder` is not `Clone`.
     ///
     /// The flow:
+    /// 0. Classify `url` against the mapping's own origin
+    ///    ([`credential_scope`]). This is the single origin decision
+    ///    for the whole call and it gates all three legs below — the
+    ///    client in step 0b, the `Authorization` header in step 1, and
+    ///    the realm exchange in steps 3-7. Gating only one leg would
+    ///    not close anything: it would just move the operator's secret
+    ///    (or identity) from the initial request onto whichever leg
+    ///    stayed open.
+    /// 0b. Select the client the request runs on, from the same
+    ///    classification: the mapping's own TLS posture for its own
+    ///    origin, the shared client for a foreign one.
     /// 1. Resolve current `Authorization` (cache hit on
     ///    `BearerChallenge`, Basic for `Basic`, none for
-    ///    `Anonymous`).
-    /// 2. Send. If !401 OR mapping is not `BearerChallenge`, return
-    ///    the response (or classify as error if !success).
-    /// 3. On 401 + `BearerChallenge`: parse `WWW-Authenticate`. On
-    ///    parse failure surface `Unauthorized`. If we already had a
-    ///    cached token (auth.is_some()), invalidate.
-    /// 4. Resolve credential bytes for realm. On `Err`, surface
+    ///    `Anonymous` — and none for a `ForeignOrigin` request).
+    /// 2. Send. If !401 OR mapping is not `BearerChallenge` OR the
+    ///    request left the mapping's origin, return the response (or
+    ///    classify as error if !success).
+    /// 3. On 401 + `BearerChallenge` + same origin: parse
+    ///    `WWW-Authenticate`. On parse failure surface `Unauthorized`.
+    ///    If we already had a cached token (auth.is_some()),
+    ///    invalidate.
+    /// 4. The realm consent gate. A **credentialed** mapping whose
+    ///    realm is a foreign origin the operator has not named in
+    ///    `allowed_realm_hosts` ends the exchange here — before step 5
+    ///    touches the `SecretPort`, so the secret is never resolved for
+    ///    a destination the operator did not consent to. An exchange
+    ///    with no credential is unaffected.
+    /// 5. Resolve credential bytes for realm. On `Err`, surface
     ///    classified error (no silent anonymise).
-    /// 5. Exchange at realm. Populate caches.
-    /// 6. Re-issue with new Bearer. A second 401 surfaces
+    /// 6. Exchange at realm, on the client the realm's own origin
+    ///    selects ([`ExchangeClient`]): the mapping's TLS posture when
+    ///    the realm is the mapping's origin, the shared client when it
+    ///    is not. A credentialed exchange at a foreign realm runs on
+    ///    the origin-bound variant of the shared client, so the one
+    ///    host the operator allowed cannot redirect the credential
+    ///    onward. Populate caches.
+    /// 7. Re-issue with new Bearer. A second 401 surfaces
     ///    `Unauthorized` (at-most-one challenge round invariant).
+    ///
+    /// # Why the client is resolved here and is not a parameter
+    ///
+    /// It used to be one, decided by each of the five `UpstreamProxy`
+    /// entry points before any URL existed, and the parameter is what
+    /// let the TLS decision diverge from the credential decision: every
+    /// content path resolved `client_for_mapping(&mapping)` and then
+    /// fetched whatever `resolve_artifact_url` produced — including an
+    /// absolute, foreign-origin URL lifted out of upstream metadata
+    /// (npm `dist.tarball`, PyPI `urls[].url`, the Cargo `dl`-composed
+    /// URL). An upstream-nominated host therefore received the
+    /// mapping's client certificate, and the mapping's private CA set
+    /// and leaf pin were applied to a host they do not describe.
+    ///
+    /// This function is where the destination is known for every one of
+    /// those paths, so the decision is made here from the data rather
+    /// than travelling alongside it. There is no carrier type (unlike
+    /// [`ExchangeClient`], which must reach `fetch_bearer_token` with
+    /// the realm's verdict) because there is nothing to carry: the
+    /// predicate, the URL and the mapping are all in this frame, and a
+    /// caller that cannot pass a client cannot pass the wrong one.
     async fn fetch_with_challenge(
         &self,
-        client: &Client,
         mapping: &RepositoryUpstreamMapping,
-        upstream_name: &str,
         url: &str,
         kind_label: &'static str,
         extra_headers: &[(&'static str, String)],
     ) -> DomainResult<reqwest::Response> {
-        let auth = self.authorization_header(mapping, upstream_name).await?;
+        let scope = credential_scope(url, &mapping.upstream_url);
+        // One line per withheld credential. `Anonymous` mappings are
+        // excluded because nothing is withheld from them — the
+        // cross-origin artifact fetch is the normal, expected npm/PyPI
+        // shape and logging it would be noise that reads like a fault.
+        if scope == CredentialScope::ForeignOrigin
+            && !matches!(mapping.upstream_auth, UpstreamAuth::Anonymous)
+        {
+            tracing::info!(
+                upstream = %mapping.upstream_url,
+                request_origin = %request_origin_for_log(url),
+                "withholding upstream credential: request target is not the \
+                 mapping's own origin"
+            );
+        }
+
+        // The client is chosen by where the request goes, from the same
+        // classification. `client_for_mapping` is resolved only for the
+        // mapping's own origin — the destination its `ca_bundle_ref`,
+        // `mtls_cert_ref` / `mtls_key_ref` and `pinned_cert_sha256`
+        // were configured to describe. A foreign origin gets the shared
+        // client: the identity stays home, the private trust anchors
+        // are not extended to a host they do not describe, and the pin
+        // is not applied to a leaf it does not name (which would fail
+        // the fetch — an availability bug on top of the leak).
+        //
+        // Resolved before `authorization_header` so a mapping whose TLS
+        // material cannot be resolved or parsed fails without the
+        // credential ever being read out of the `SecretPort`.
+        let client = match scope {
+            CredentialScope::MappingOrigin => self.client_for_mapping(mapping).await?,
+            CredentialScope::ForeignOrigin => self.client.clone(),
+        };
+
+        let auth = self.authorization_header(mapping, scope).await?;
         let resp = self
-            .send_get(client, url, extra_headers, auth.as_deref())
+            .send_get(&client, url, extra_headers, auth.as_deref())
             .await?;
 
         if resp.status() != StatusCode::UNAUTHORIZED
             || !matches!(mapping.upstream_auth, UpstreamAuth::BearerChallenge)
+            || scope == CredentialScope::ForeignOrigin
         {
             return classify_response(resp, kind_label);
         }
@@ -1744,6 +2441,109 @@ impl HttpUpstreamProxy {
             );
         }
 
+        // Which origin the realm names. The same predicate as step 0 —
+        // `credential_scope` — applied to the destination this leg
+        // actually dials: the realm, which arrives verbatim in the
+        // upstream's `WWW-Authenticate` header rather than from `url`.
+        // Step 0 already established that `url` is the mapping's own
+        // origin (a `ForeignOrigin` request returned above and never
+        // reaches here), so what is still open at this point is only
+        // whether the *realm* is. Asked once; read twice below, by the
+        // consent gate and by the client selection.
+        let realm_scope = credential_scope(&challenge.realm, &mapping.upstream_url);
+
+        // ---- The realm consent gate ----
+        //
+        // The third realm gate, and the first of the three to run: a
+        // realm that the operator has not consented to ends the
+        // exchange HERE, before `SecretPort::resolve` below. Its two
+        // siblings — the `https` scheme gate and the routability gate —
+        // live in `fetch_bearer_token` and receive an already-resolved
+        // `SecretValue` they have to `drop`; this one is the only realm
+        // question answerable without the secret existing at all, so
+        // the earliest refusal is also the cheapest, and the secret is
+        // never read out of the port for a destination the operator did
+        // not name.
+        //
+        // What the gate adds over its siblings: scheme and routability
+        // bound *where* the credential may travel, not *to whom*. The
+        // realm arrives verbatim in the upstream's `WWW-Authenticate`
+        // header, so a compromised or hijacked upstream can answer
+        // `401` naming any https, routable host of its choosing and
+        // would otherwise receive `Authorization: Basic
+        // base64("oauth2:<secret>")` — the operator's credential for
+        // this mapping. A silent same-origin binding is not available
+        // as the close, because a realm legitimately lives off-origin
+        // (`auth.docker.io` for `registry-1.docker.io`; a GitLab
+        // container registry's `/jwt/auth`), so the operator declares
+        // the hosts instead.
+        //
+        // **It binds to the credentialed exchange, and that is
+        // load-bearing rather than an optimisation.** An exchange with
+        // no `secret_ref` sends no credential, so there is nothing for a
+        // nominated realm to receive; and every `bearer_challenge`
+        // mapping shipped in this repository is exactly that shape —
+        // four of them Docker Hub, whose realm is `auth.docker.io`, off
+        // the `registry-1.docker.io` origin. A gate on every exchange
+        // would therefore refuse the compose E2E's own mappings while
+        // protecting a credential that does not exist.
+        if mapping.secret_ref.is_some()
+            && realm_scope == CredentialScope::ForeignOrigin
+            && !realm_host_is_operator_allowed(mapping, &challenge.realm)
+        {
+            metrics::counter!(
+                METRIC_BEARER_TOKEN,
+                "format" => self.config.format_label.clone(),
+                "upstream" => upstream_label(mapping),
+                "result" => RESULT_FETCH_FAILED,
+            )
+            .increment(1);
+            tracing::error!(
+                mapping_id = %mapping.id,
+                upstream = %upstream_label(mapping),
+                realm_host = %realm_host_for_log(&challenge.realm),
+                "refusing the realm token exchange: the upstream named a realm \
+                 host this mapping does not allow to receive its credential. \
+                 Add that host to the mapping's `allowedRealmHosts` to permit \
+                 it; the mapping's own origin never needs listing"
+            );
+            // Classified as the sibling realm refusals are: the
+            // `WWW-Authenticate` header is untrusted input, so refusing
+            // what it names is a content-validation outcome, and it
+            // reuses the existing
+            // `hort_upstream_fetch_total{result="parse_error"}` row
+            // rather than introducing a kind for one gate.
+            return Err(classified_error(
+                UpstreamErrorKind::ParseError,
+                &format!(
+                    "realm host `{}` is not in this mapping's allowed_realm_hosts; \
+                     the credential will not be sent",
+                    realm_host_for_log(&challenge.realm)
+                ),
+            ));
+        }
+
+        // Which client carries the exchange — whose TLS posture may
+        // carry the operator's secret. Decided once, here, and handed
+        // down; `fetch_bearer_token` obeys it.
+        //
+        // `credential_scope`'s fail-closed arm answers `ForeignOrigin`
+        // on an unparseable URL, which here selects the *less* strict
+        // client — and cannot be reached as such. On a credentialed
+        // mapping the consent gate above has already refused an
+        // unparseable realm (no host can be read out of it, so it
+        // matches no allowance). On an uncredentialed one an
+        // unparseable realm fails `fetch_bearer_token`'s own
+        // `Url::parse` / `parse_with_params` with `ParseError` before
+        // the exchange is built, and an unparseable `upstream_url`
+        // makes step 0 `ForeignOrigin` for the content request, which
+        // returns above without ever reaching the dance (and the value
+        // object rejects such a URL at construction anyway).
+        let exchange_client = match realm_scope {
+            CredentialScope::MappingOrigin => ExchangeClient::PerMapping(mapping),
+            CredentialScope::ForeignOrigin => ExchangeClient::Shared,
+        };
+
         // Resolve credentials for the realm exchange via SecretPort.
         // On Err do NOT anonymise — surface as fetch_failed
         // (NetworkError-mapped). The `tracing::warn!` here is at the
@@ -1785,7 +2585,10 @@ impl HttpUpstreamProxy {
         };
 
         // Run the realm exchange.
-        let cached = match self.fetch_bearer_token(&challenge, bearer_secret).await {
+        let cached = match self
+            .fetch_bearer_token(&challenge, exchange_client, bearer_secret)
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 metrics::counter!(
@@ -1822,7 +2625,7 @@ impl HttpUpstreamProxy {
         // Retry the original request once with the new bearer.
         let retry_auth = format!("Bearer {}", cached.token);
         let resp2 = self
-            .send_get(client, url, extra_headers, Some(retry_auth.as_str()))
+            .send_get(&client, url, extra_headers, Some(retry_auth.as_str()))
             .await?;
         if resp2.status() == StatusCode::UNAUTHORIZED {
             // At-most-one challenge round invariant.
@@ -1853,7 +2656,6 @@ impl HttpUpstreamProxy {
 
     async fn do_fetch_blob(
         &self,
-        client: &Client,
         mapping: &RepositoryUpstreamMapping,
         upstream_name: &str,
         digest: &str,
@@ -1872,7 +2674,7 @@ impl HttpUpstreamProxy {
             "fetching blob"
         );
         let resp = self
-            .fetch_with_challenge(client, mapping, upstream_name, &url, "blob", &[])
+            .fetch_with_challenge(mapping, &url, "blob", &[])
             .await?;
         let declared_digest = resp
             .headers()
@@ -1901,7 +2703,6 @@ impl HttpUpstreamProxy {
 
     async fn do_fetch_artifact(
         &self,
-        client: &Client,
         mapping: &RepositoryUpstreamMapping,
         path: &str,
     ) -> DomainResult<ArtifactFetch> {
@@ -1913,7 +2714,7 @@ impl HttpUpstreamProxy {
         let url = self
             .resolve_artifact_url(&mapping.upstream_url, path)
             .await?;
-        self.fetch_artifact_url(client, mapping, path, &url).await
+        self.fetch_artifact_url(mapping, path, &url).await
     }
 
     /// Resolve `path` (relative or absolute) into an absolute URL,
@@ -1934,7 +2735,6 @@ impl HttpUpstreamProxy {
     /// its own dedicated unit tests.
     async fn fetch_artifact_url(
         &self,
-        client: &Client,
         mapping: &RepositoryUpstreamMapping,
         path_for_log: &str,
         url: &str,
@@ -1945,7 +2745,7 @@ impl HttpUpstreamProxy {
             "fetching artifact"
         );
         let resp = self
-            .fetch_with_challenge(client, mapping, "", url, "artifact", &[])
+            .fetch_with_challenge(mapping, url, "artifact", &[])
             .await?;
         // Cargo `.crate` tarballs are immutable on crates.io, so the
         // `Last-Modified` header ≈ upload time. The npm + PyPI
@@ -1970,7 +2770,6 @@ impl HttpUpstreamProxy {
 
     async fn do_fetch_metadata(
         &self,
-        client: &Client,
         mapping: &RepositoryUpstreamMapping,
         path: &str,
         accept: &[String],
@@ -1987,12 +2786,8 @@ impl HttpUpstreamProxy {
         } else {
             vec![("accept", accept.join(", "))]
         };
-        // `upstream_name` is unused for metadata — pass an empty string;
-        // `fetch_with_challenge` only uses it for tracing context and
-        // bearer-token cache keys (which key on realm/service/scope, not
-        // on this argument).
         let resp = self
-            .fetch_with_challenge(client, mapping, "", &url, "metadata", &extras)
+            .fetch_with_challenge(mapping, &url, "metadata", &extras)
             .await?;
         // Surface `Last-Modified` on the metadata outcome (mirrors the
         // blob / artifact paths) so npm / PyPI / cargo consumers can
@@ -2029,7 +2824,6 @@ impl HttpUpstreamProxy {
 
     async fn do_fetch_manifest(
         &self,
-        client: &Client,
         mapping: &RepositoryUpstreamMapping,
         upstream_name: &str,
         reference: &str,
@@ -2079,7 +2873,7 @@ impl HttpUpstreamProxy {
         let accept_header = accept_types.join(", ");
         let extras = [("accept", accept_header)];
         let resp = self
-            .fetch_with_challenge(client, mapping, upstream_name, &url, "manifest", &extras)
+            .fetch_with_challenge(mapping, &url, "manifest", &extras)
             .await?;
         let media_type = Some(
             resp.headers()
@@ -2147,7 +2941,6 @@ impl HttpUpstreamProxy {
     /// (the same backstop the manifest path uses) and parsed in memory.
     async fn do_fetch_referrers(
         &self,
-        client: &Client,
         mapping: &RepositoryUpstreamMapping,
         upstream_name: &str,
         digest: &str,
@@ -2171,14 +2964,7 @@ impl HttpUpstreamProxy {
             "application/vnd.oci.image.index.v1+json".to_string(),
         )];
         match self
-            .fetch_with_challenge(
-                client,
-                mapping,
-                upstream_name,
-                &referrers_url,
-                "referrers",
-                &extras,
-            )
+            .fetch_with_challenge(mapping, &referrers_url, "referrers", &extras)
             .await
         {
             Ok(resp) => {
@@ -2201,7 +2987,7 @@ impl HttpUpstreamProxy {
             }
             // Referrers API unsupported / no index → cosign tag scheme.
             Err(e) if classify_error(&e) == Some(UpstreamErrorKind::NotFound) => {
-                self.fetch_referrers_via_tag_scheme(client, mapping, upstream_name, digest)
+                self.fetch_referrers_via_tag_scheme(mapping, upstream_name, digest)
                     .await
             }
             Err(e) => Err(e),
@@ -2215,7 +3001,6 @@ impl HttpUpstreamProxy {
     /// is genuinely unsigned upstream → `Ok(Vec::new())`.
     async fn fetch_referrers_via_tag_scheme(
         &self,
-        client: &Client,
         mapping: &RepositoryUpstreamMapping,
         upstream_name: &str,
         digest: &str,
@@ -2241,14 +3026,7 @@ impl HttpUpstreamProxy {
             "application/vnd.oci.image.manifest.v1+json".to_string(),
         )];
         match self
-            .fetch_with_challenge(
-                client,
-                mapping,
-                upstream_name,
-                &sig_url,
-                "referrers",
-                &accept,
-            )
+            .fetch_with_challenge(mapping, &sig_url, "referrers", &accept)
             .await
         {
             Ok(resp) => {
@@ -2447,28 +3225,20 @@ impl UpstreamProxy for HttpUpstreamProxy {
             emit_insecure_if_opted_in(&self.config.format_label, &mapping);
             let upstream = upstream_label(&mapping);
             let started = Instant::now();
-            // Resolve the per-mapping TLS client (ADR 0010). The fetch
-            // path emits a single `hort_upstream_tls_handshake_total` row
-            // per call, classified from the eventual outcome.
-            let client = match self.client_for_mapping(&mapping).await {
-                Ok(c) => c,
-                Err(e) => {
-                    emit_tls_handshake_metric(&e);
-                    emit_metrics(
-                        &self.config.format_label,
-                        &upstream,
-                        KIND_BLOB,
-                        started.elapsed(),
-                        classify_error(&e)
-                            .map(|k| k.as_str())
-                            .unwrap_or(UpstreamErrorKind::NetworkError.as_str()),
-                    );
-                    return Err(e);
-                }
-            };
-            let result = self
-                .do_fetch_blob(&client, &mapping, &upstream_name, &digest)
-                .await;
+            // The per-mapping TLS client (ADR 0010) is resolved further
+            // down, in `fetch_with_challenge`, where the request URL
+            // exists: whether the mapping's own TLS posture may carry a
+            // request depends on where that request goes, and an entry
+            // point has no URL yet. A client-build failure therefore
+            // arrives here as an ordinary `Err` in `result` and is
+            // classified by the same two emissions below — it carries
+            // an `upstream:<kind>:` sentinel from `tls_config`, so the
+            // label is the TLS one either way.
+            //
+            // The fetch path emits a single
+            // `hort_upstream_tls_handshake_total` row per call,
+            // classified from the eventual outcome.
+            let result = self.do_fetch_blob(&mapping, &upstream_name, &digest).await;
             let elapsed = started.elapsed();
             emit_tls_handshake_metric_for_result(&result);
             let label = match &result {
@@ -2499,24 +3269,8 @@ impl UpstreamProxy for HttpUpstreamProxy {
             emit_insecure_if_opted_in(&self.config.format_label, &mapping);
             let upstream = upstream_label(&mapping);
             let started = Instant::now();
-            let client = match self.client_for_mapping(&mapping).await {
-                Ok(c) => c,
-                Err(e) => {
-                    emit_tls_handshake_metric(&e);
-                    emit_metrics(
-                        &self.config.format_label,
-                        &upstream,
-                        KIND_MANIFEST,
-                        started.elapsed(),
-                        classify_error(&e)
-                            .map(|k| k.as_str())
-                            .unwrap_or(UpstreamErrorKind::NetworkError.as_str()),
-                    );
-                    return Err(e);
-                }
-            };
             let result = self
-                .do_fetch_manifest(&client, &mapping, &upstream_name, &reference, &accept)
+                .do_fetch_manifest(&mapping, &upstream_name, &reference, &accept)
                 .await;
             let elapsed = started.elapsed();
             emit_tls_handshake_metric_for_result(&result);
@@ -2546,23 +3300,7 @@ impl UpstreamProxy for HttpUpstreamProxy {
             emit_insecure_if_opted_in(&self.config.format_label, &mapping);
             let upstream = upstream_label(&mapping);
             let started = Instant::now();
-            let client = match self.client_for_mapping(&mapping).await {
-                Ok(c) => c,
-                Err(e) => {
-                    emit_tls_handshake_metric(&e);
-                    emit_metrics(
-                        &self.config.format_label,
-                        &upstream,
-                        KIND_ARTIFACT,
-                        started.elapsed(),
-                        classify_error(&e)
-                            .map(|k| k.as_str())
-                            .unwrap_or(UpstreamErrorKind::NetworkError.as_str()),
-                    );
-                    return Err(e);
-                }
-            };
-            let result = self.do_fetch_artifact(&client, &mapping, &path).await;
+            let result = self.do_fetch_artifact(&mapping, &path).await;
             let elapsed = started.elapsed();
             emit_tls_handshake_metric_for_result(&result);
             let label = match &result {
@@ -2592,25 +3330,7 @@ impl UpstreamProxy for HttpUpstreamProxy {
             emit_insecure_if_opted_in(&self.config.format_label, &mapping);
             let upstream = upstream_label(&mapping);
             let started = Instant::now();
-            let client = match self.client_for_mapping(&mapping).await {
-                Ok(c) => c,
-                Err(e) => {
-                    emit_tls_handshake_metric(&e);
-                    emit_metrics(
-                        &self.config.format_label,
-                        &upstream,
-                        KIND_METADATA,
-                        started.elapsed(),
-                        classify_error(&e)
-                            .map(|k| k.as_str())
-                            .unwrap_or(UpstreamErrorKind::NetworkError.as_str()),
-                    );
-                    return Err(e);
-                }
-            };
-            let result = self
-                .do_fetch_metadata(&client, &mapping, &path, &accept)
-                .await;
+            let result = self.do_fetch_metadata(&mapping, &path, &accept).await;
             let elapsed = started.elapsed();
             emit_tls_handshake_metric_for_result(&result);
             let label = match &result {
@@ -2640,24 +3360,8 @@ impl UpstreamProxy for HttpUpstreamProxy {
             emit_insecure_if_opted_in(&self.config.format_label, &mapping);
             let upstream = upstream_label(&mapping);
             let started = Instant::now();
-            let client = match self.client_for_mapping(&mapping).await {
-                Ok(c) => c,
-                Err(e) => {
-                    emit_tls_handshake_metric(&e);
-                    emit_metrics(
-                        &self.config.format_label,
-                        &upstream,
-                        KIND_REFERRERS,
-                        started.elapsed(),
-                        classify_error(&e)
-                            .map(|k| k.as_str())
-                            .unwrap_or(UpstreamErrorKind::NetworkError.as_str()),
-                    );
-                    return Err(e);
-                }
-            };
             let result = self
-                .do_fetch_referrers(&client, &mapping, &upstream_name, &digest)
+                .do_fetch_referrers(&mapping, &upstream_name, &digest)
                 .await;
             let elapsed = started.elapsed();
             emit_tls_handshake_metric_for_result(&result);
@@ -2833,6 +3537,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -3655,16 +4360,42 @@ mod tests {
     }
 
     // -- fetch_bearer_token -------------------------------------------
+    //
+    // These pin the exchange's own mechanics — realm URL composition,
+    // the two realm gates, the token/`access_token` precedence,
+    // lifetime arithmetic — so they pass `ExchangeClient::Shared`,
+    // which is `self.client` and therefore the exact request shape
+    // these assertions were written against. *Which* client the
+    // exchange runs on is a separate decision with its own section
+    // ("Which client carries the bearer-token exchange"), driven
+    // through `fetch_with_challenge` because that is where the
+    // decision is made.
 
-    fn proxy_no_secrets(server: &MockServer) -> HttpUpstreamProxy {
-        // See `proxy_for` for the connect-time guard rationale. The
-        // `server` argument is retained for signature stability.
-        let _ = server;
+    /// A proxy that can reach a realm `server` advertises, with the
+    /// crate's test-allowlist seam seeded with `server`'s loopback
+    /// `SocketAddr`.
+    ///
+    /// Both realm gates in `fetch_bearer_token` are strict on an empty
+    /// seam — a non-`https` realm is refused on the scheme gate and a
+    /// loopback realm on the routability gate — and wiremock advertises
+    /// its realm on `http://127.0.0.1:<ephemeral-port>`. Seeding the
+    /// seam is how the harness reaches its own realm; every other
+    /// address keeps the production behaviour, which
+    /// `empty_seam_refuses_an_http_loopback_realm_and_never_calls_it`
+    /// and its `https` sibling pin. The `SecretPort` is the
+    /// always-`Err` stub, so these tests either pass `None` or hand
+    /// `fetch_bearer_token` a `SecretValue` directly.
+    fn proxy_with_realm_seam(server: &MockServer) -> HttpUpstreamProxy {
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
             ..HttpUpstreamProxyConfig::new("oci")
         };
-        HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
+        HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            cfg,
+            Arc::new(AnonymousFallbackPort),
+            vec![*server.address()],
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -3680,14 +4411,17 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: Some("svc".into()),
             scope: Some("sc".into()),
         };
         let before = Instant::now();
-        let cached = proxy.fetch_bearer_token(&challenge, None).await.unwrap();
+        let cached = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
+            .await
+            .unwrap();
         assert_eq!(cached.token, "xyz");
         // 300s - 30s slack = 270s budget; allow a 10s test-runtime slack.
         assert!(cached.expires_at > before + Duration::from_secs(260));
@@ -3705,14 +4439,17 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
         let before = Instant::now();
-        let cached = proxy.fetch_bearer_token(&challenge, None).await.unwrap();
+        let cached = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
+            .await
+            .unwrap();
         assert_eq!(cached.token, "abc");
         // 120s - 30s = 90s.
         assert!(cached.expires_at > before + Duration::from_secs(80));
@@ -3731,13 +4468,16 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
-        let cached = proxy.fetch_bearer_token(&challenge, None).await.unwrap();
+        let cached = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
+            .await
+            .unwrap();
         assert_eq!(cached.token, "primary");
     }
 
@@ -3751,14 +4491,17 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
         let before = Instant::now();
-        let cached = proxy.fetch_bearer_token(&challenge, None).await.unwrap();
+        let cached = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
+            .await
+            .unwrap();
         assert_eq!(cached.token, "x");
         // Default 300s - 30s slack = 270s.
         assert!(cached.expires_at > before + Duration::from_secs(260));
@@ -3783,7 +4526,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
@@ -3792,6 +4535,7 @@ mod tests {
         let cached = proxy
             .fetch_bearer_token(
                 &challenge,
+                ExchangeClient::Shared,
                 Some(SecretValue::from_bytes(b"secret-bytes".to_vec())),
             )
             .await
@@ -3817,13 +4561,16 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
-        let cached = proxy.fetch_bearer_token(&challenge, None).await.unwrap();
+        let cached = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
+            .await
+            .unwrap();
         assert_eq!(cached.token, "anon-token");
     }
 
@@ -3835,14 +4582,14 @@ mod tests {
             .respond_with(ResponseTemplate::new(401))
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
         let err = proxy
-            .fetch_bearer_token(&challenge, None)
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
             .await
             .err()
             .unwrap();
@@ -3857,14 +4604,14 @@ mod tests {
             .respond_with(ResponseTemplate::new(503))
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
         let err = proxy
-            .fetch_bearer_token(&challenge, None)
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
             .await
             .err()
             .unwrap();
@@ -3881,14 +4628,14 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
         let err = proxy
-            .fetch_bearer_token(&challenge, None)
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
             .await
             .err()
             .unwrap();
@@ -3929,7 +4676,7 @@ mod tests {
         // the same: the guard runs before the credential is touched.
         let secret = SecretValue::from_bytes(b"would-be-leaked-PAT".to_vec());
         let err = proxy
-            .fetch_bearer_token(&challenge, Some(secret))
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, Some(secret))
             .await
             .err()
             .expect("http:// realm must be rejected");
@@ -3966,7 +4713,7 @@ mod tests {
         };
         let secret = SecretValue::from_bytes(b"would-be-leaked-PAT".to_vec());
         let err = proxy
-            .fetch_bearer_token(&challenge, Some(secret))
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, Some(secret))
             .await
             .err()
             .expect("non-routable realm must be rejected before sending the credential");
@@ -3977,11 +4724,214 @@ mod tests {
         );
     }
 
+    // -- Realm gates on the production (empty) allowlist seam ---------
+    //
+    // Both realm gates used to carry a loopback exemption whose only
+    // justification was where the wiremock harness binds. The exemption
+    // admitted `http://127.0.0.1/...` and skipped the routability check
+    // for it, so the two refusals below could not be asserted at all —
+    // the gates had a hole exactly the shape of the test harness, and
+    // the request they guard is the one carrying
+    // `Authorization: Basic base64("oauth2:<PAT>")`. The harness now
+    // reaches its realm through the injected, production-empty
+    // allowlist seam instead (`proxy_with_realm_seam`), which is the
+    // same answer the per-hop redirect policy and the connect-time DNS
+    // guard already used for the same problem.
+    //
+    // Each test below runs a LIVE wiremock realm with `.expect(0)`, so
+    // "refused" is observed at the realm, not just inferred from the
+    // returned error.
+
+    /// Scheme gate, production seam: an `http://` realm on loopback —
+    /// precisely the class the deleted exemption admitted — is refused
+    /// with `ParseError` and the realm observes nothing.
+    #[tokio::test]
+    async fn empty_seam_refuses_an_http_loopback_realm_and_never_calls_it() {
+        let realm = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "must-never-be-issued",
+                "expires_in": 300,
+            })))
+            .expect(0)
+            .mount(&realm)
+            .await;
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(2),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        // Production constructor — empty seam.
+        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
+        let challenge = Challenge {
+            realm: format!("{}/realm", realm.uri()),
+            service: Some("svc".into()),
+            scope: Some("repository:foo:pull".into()),
+        };
+        let secret = SecretValue::from_bytes(b"would-be-leaked-PAT".to_vec());
+        let err = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, Some(secret))
+            .await
+            .err()
+            .expect("an http:// loopback realm must be refused on the production seam");
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "got {err:?}"
+        );
+        // Pin the SCHEME gate specifically. A loopback realm is also
+        // non-routable, so the routability gate below would refuse this
+        // same URL — welcome defence in depth, but it would make a
+        // classification-only assertion unable to tell the two gates
+        // apart, and the deleted exemption opened BOTH.
+        assert!(
+            format!("{err}").contains("realm URL must be https"),
+            "the scheme gate must be the refusal: got {err}"
+        );
+        assert!(
+            realm.received_requests().await.unwrap().is_empty(),
+            "the realm must observe nothing — that request is where the \
+             operator's credential would have travelled in plaintext"
+        );
+    }
+
+    /// Routability gate, production seam: an `https` realm on loopback
+    /// passes the scheme gate and must then be refused as non-routable,
+    /// with the same `ParseError` classification.
+    ///
+    /// The host is a live wiremock's loopback address, which speaks
+    /// plaintext: if the routability gate were absent the attempt would
+    /// surface as a TLS/transport failure (`NetworkError` / `CaUnknown`),
+    /// so the classification assertion — not merely the `is_err()` —
+    /// is what pins the gate.
+    #[tokio::test]
+    async fn empty_seam_refuses_an_https_loopback_realm_and_never_calls_it() {
+        let realm = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "must-never-be-issued",
+                "expires_in": 300,
+            })))
+            .expect(0)
+            .mount(&realm)
+            .await;
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(2),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        // Production constructor — empty seam.
+        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
+        let challenge = Challenge {
+            realm: format!("https://{}/realm", realm.address()),
+            service: Some("svc".into()),
+            scope: Some("repository:foo:pull".into()),
+        };
+        let secret = SecretValue::from_bytes(b"would-be-leaked-PAT".to_vec());
+        let err = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, Some(secret))
+            .await
+            .err()
+            .expect("an https loopback realm must be refused on the production seam");
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "a non-routable realm is a content-validation refusal, not a \
+             transport failure — a transport classification here means the \
+             routability gate did not run; got {err:?}"
+        );
+        // Pin the ROUTABILITY gate specifically: `https` already
+        // satisfies the scheme gate, so this is the only gate that can
+        // produce this message.
+        assert!(
+            format!("{err}").contains("realm host is SSRF-blocked"),
+            "the routability gate must be the refusal: got {err}"
+        );
+        assert!(
+            realm.received_requests().await.unwrap().is_empty(),
+            "the realm must observe nothing"
+        );
+    }
+
+    /// The seam must stay empty on every production constructor. If a
+    /// future edit seeds it — from config, from an env var, from a
+    /// `Default` — the two realm gates, the per-hop redirect policy and
+    /// the connect-time DNS guard all loosen at once, because all four
+    /// read this one field. This test is what notices.
+    #[test]
+    fn production_constructors_seed_an_empty_test_allowlist() {
+        let cfg = HttpUpstreamProxyConfig::new("oci");
+        let from_new =
+            HttpUpstreamProxy::new(cfg.clone(), Arc::new(AnonymousFallbackPort)).unwrap();
+        assert!(
+            from_new.redirect_test_allowlist.is_empty(),
+            "HttpUpstreamProxy::new must build an empty allowlist seam"
+        );
+        let shared = HttpUpstreamProxy::build_client(&cfg).expect("shared client builds");
+        let from_with_client =
+            HttpUpstreamProxy::with_client(shared, cfg, Arc::new(AnonymousFallbackPort));
+        assert!(
+            from_with_client.redirect_test_allowlist.is_empty(),
+            "HttpUpstreamProxy::with_client must build an empty allowlist seam"
+        );
+    }
+
+    /// The seam is matched without DNS: only an IP-literal realm host
+    /// whose `(ip, port_or_known_default)` pair is listed matches. A
+    /// domain host — `localhost` and every other name that resolves to
+    /// an allowlisted address included — cannot match, so an upstream
+    /// choosing the `WWW-Authenticate` realm has no reachable input to
+    /// the predicate even in a seeded process.
+    #[test]
+    fn realm_test_allowlist_matches_ip_literals_only_and_never_resolves() {
+        let v4: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let v6: SocketAddr = "[::1]:9443".parse().unwrap();
+        let proxy = HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            HttpUpstreamProxyConfig::new("oci"),
+            Arc::new(AnonymousFallbackPort),
+            vec![v4, v6],
+        )
+        .unwrap();
+        let matches = |u: &str| {
+            proxy.realm_is_test_allowlisted(&url::Url::parse(u).expect("test URL parses"))
+        };
+        assert!(matches("http://127.0.0.1:8080/realm"), "seeded v4 literal");
+        assert!(matches("http://[::1]:9443/realm"), "seeded v6 literal");
+        assert!(
+            !matches("http://127.0.0.1:8081/realm"),
+            "the port is part of the entry"
+        );
+        assert!(
+            !matches("http://127.0.0.2:8080/realm"),
+            "the address is part of the entry"
+        );
+        assert!(
+            !matches("http://localhost:8080/realm"),
+            "a domain host must never match — the predicate does not resolve"
+        );
+        assert!(
+            !matches("some-scheme://127.0.0.1/realm"),
+            "no port and no known default port means no SocketAddr to match"
+        );
+        assert!(!matches("file:///realm"), "a host-less URL cannot match");
+        // And the production posture of the same predicate.
+        let strict = HttpUpstreamProxy::new(
+            HttpUpstreamProxyConfig::new("oci"),
+            Arc::new(AnonymousFallbackPort),
+        )
+        .unwrap();
+        assert!(
+            !strict.realm_is_test_allowlisted(
+                &url::Url::parse("http://127.0.0.1:8080/realm").unwrap()
+            ),
+            "an empty seam admits nothing"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_bearer_token_accepts_https_realm() {
-        // Sanity check the inverse: an https:// realm is accepted (any
-        // existing positive test would prove this; the assertion lives
-        // here so both branches are in one place).
+        // The admitted-realm control for the two `empty_seam_*`
+        // refusals above.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/realm"))
@@ -3990,31 +4940,27 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        // Build the proxy using the existing wiremock allowlist path so
-        // the loopback connect is permitted.
-        let proxy = proxy_no_secrets(&server);
-        // wiremock's URI is http://; replace scheme to https just to
-        // demonstrate the realm-string path. We can't actually serve TLS
-        // in-test, so verify only that the guard does NOT reject https
-        // by exercising the existing positive test indirectly: a
-        // wiremock URI is http but produced by our test infrastructure
-        // and we accept that an http://127.0.0.1 realm is special-cased
-        // by the loopback IP-classifier check — i.e., the existing
-        // positive tests above use http://127.0.0.1 realms without this
-        // assertion failing because the production implementation only
-        // allows https:// for non-loopback hosts. To honour the
-        // production-only-https posture without breaking wiremock-based
-        // positive tests, `realm_host_is_loopback` returns true for any
-        // host that parses as a loopback IP literal — the existing
-        // positive tests prove the happy path works against http://
-        // wiremock realms. The OS-level `IpAddr::is_loopback()` classifier
-        // identifies the loopback range.
+        // wiremock cannot serve TLS in-process, so the realm this
+        // exercises is `http://127.0.0.1:<port>` reached through the
+        // seeded allowlist seam. What the assertion buys is the inverse
+        // of the two `empty_seam_*` refusals above: a realm the gates
+        // admit really does complete the exchange, so those refusals
+        // are refusals and not a dance that never worked. The
+        // `https`-scheme branch itself is covered by
+        // `empty_seam_refuses_an_https_loopback_realm_and_never_calls_it`
+        // (passes the scheme gate, stops on the routability gate) and
+        // by `fetch_bearer_token_rejects_http_realm_before_sending_credential`
+        // (the converse).
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
-        let cached = proxy.fetch_bearer_token(&challenge, None).await.unwrap();
+        let cached = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
+            .await
+            .unwrap();
         assert_eq!(cached.token, "ok");
     }
 
@@ -4032,13 +4978,16 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: Some("registry.docker.io".into()),
             scope: Some("repository:library/alpine:pull".into()),
         };
-        let cached = proxy.fetch_bearer_token(&challenge, None).await.unwrap();
+        let cached = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
+            .await
+            .unwrap();
         assert_eq!(cached.token, "ok");
     }
 
@@ -4057,13 +5006,16 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let proxy = proxy_no_secrets(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
             scope: None,
         };
-        let cached = proxy.fetch_bearer_token(&challenge, None).await.unwrap();
+        let cached = proxy
+            .fetch_bearer_token(&challenge, ExchangeClient::Shared, None)
+            .await
+            .unwrap();
         assert_eq!(cached.token, "ok");
     }
 
@@ -4113,7 +5065,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"blob-bytes".as_slice()))
             .mount(&server)
             .await;
-        let proxy = proxy_for(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
         let mut stream = proxy
             .fetch_blob(m, "p".into(), "sha256:abc".into())
@@ -4157,7 +5109,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"dh-blob".as_slice()))
             .mount(&server)
             .await;
-        let proxy = proxy_for(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
         let mut stream = proxy
             .fetch_blob(m, "library/alpine".into(), "sha256:dh".into())
@@ -4208,7 +5160,7 @@ mod tests {
             .expect(2)
             .mount(&server)
             .await;
-        let proxy = proxy_for(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
         // Cold-cache fetch.
         let _ = proxy
@@ -4293,7 +5245,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let proxy = proxy_for(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
         // Cold-cache fetch primes "first-tok".
         let mut s1 = proxy
@@ -4394,7 +5346,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let proxy = proxy_for(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
         // Prime.
         let mut s1 = proxy
@@ -4518,12 +5470,16 @@ mod tests {
             timeout: Duration::from_secs(2),
             ..HttpUpstreamProxyConfig::new("oci")
         };
-        let proxy = HttpUpstreamProxy::new(
+        // Seeded seam: the realm wiremock advertises is
+        // `http://127.0.0.1:<port>`, which both realm gates refuse on
+        // the production (empty) seam. See `proxy_with_realm_seam`.
+        let proxy = HttpUpstreamProxy::new_with_redirect_test_allowlist(
             cfg,
             Arc::new(StubSecretPort {
                 target: pat_ref.clone(),
                 value: b"my-pat".to_vec(),
             }),
+            vec![*server.address()],
         )
         .unwrap();
 
@@ -4900,7 +5856,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let proxy = proxy_for(&server);
+        let proxy = proxy_with_realm_seam(&server);
         let m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
         let err = proxy
             .fetch_blob(m, "p".into(), "sha256:r5xx".into())
@@ -5054,7 +6010,7 @@ mod tests {
                         .mount(&server)
                         .await;
 
-                    let proxy = proxy_for(&server);
+                    let proxy = proxy_with_realm_seam(&server);
                     let m = mapping(&server.uri(), "ghcr/", UpstreamAuth::BearerChallenge);
                     let _ = proxy
                         .fetch_blob(m.clone(), "p".into(), "sha256:m".into())
@@ -6367,12 +7323,12 @@ mod tests {
             "{}/files/files.pythonhosted.org/foo-1.0.tar.gz",
             server.uri()
         );
-        // The inner `fetch_artifact_url` takes the per-mapping client
-        // (ADR 0010); for an anonymous mapping with no TLS material,
-        // that's the proxy's default client.
-        let client = proxy.client.clone();
+        // `fetch_artifact_url` resolves its own client by destination:
+        // this URL is foreign to `https://pypi.org`, so the fetch runs
+        // on the shared client — and for a mapping with no TLS material
+        // that is the only client there has ever been.
         let mut stream = proxy
-            .fetch_artifact_url(&client, &m, &absolute, &absolute)
+            .fetch_artifact_url(&m, &absolute, &absolute)
             .await
             .expect("absolute-URL fetch should succeed")
             .stream;
@@ -7292,6 +8248,1704 @@ mod tests {
              (RFC 7235 §2.2 + reqwest documented contract); observed headers: {:?}",
             recorded_b[0].headers
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // Credential ↔ origin binding
+    //
+    // The cross-origin redirect strip above is reqwest's contract for a
+    // *redirect hop*. The initial request needs the same rule for its own
+    // reason: on the artifact path the request URL can be an absolute URL
+    // lifted out of upstream metadata (npm `dist.tarball`, PyPI
+    // `urls[].url`, the Cargo `dl`-composed URL), which
+    // `resolve_artifact_url` accepts after `check_ssrf_safe` alone.
+    // `check_ssrf_safe` answers "is this destination internal?"; a public,
+    // upstream-nominated host passes it and must still not receive the
+    // operator's credential (RFC 7235 §2.2 protection space, RFC 6454 §4
+    // origin).
+    //
+    // Both legs are covered because closing only the first moves the
+    // secret instead of withholding it: with the header suppressed but the
+    // challenge dance still reachable, a foreign `401` summons the realm
+    // exchange and the secret travels there instead.
+    //
+    //   - `cross_origin_artifact_url_is_fetched_without_the_mapping_credential`
+    //     — leg 1, and the proof the fetch itself is NOT forbidden.
+    //   - `same_origin_artifact_url_still_carries_the_mapping_credential`
+    //     — the over-reach guard, and what makes the absence assertion in
+    //     the test above non-vacuous (same proxy, same mapping shape, same
+    //     call; only the target origin differs).
+    //   - `cross_origin_401_on_bearer_challenge_mapping_never_reaches_the_realm`
+    //     — leg 2. The same-origin positive control for the dance is
+    //     `bearer_challenge_cold_cache_does_401_dance_then_succeeds_token_field`.
+    //
+    // Two `MockServer` instances are a cross-origin pair by port, per the
+    // RFC 6454 §4 reasoning recorded above the redirect test.
+    // ----------------------------------------------------------------------
+
+    /// A proxy whose `SecretPort` hands back `hunter2`, so a credentialed
+    /// mapping really does produce a header and an "absent header"
+    /// assertion is not observing a credential that was never built.
+    ///
+    /// Production posture: an empty allowlist seam, which is exactly
+    /// what `HttpUpstreamProxy::new` builds (pinned by
+    /// `production_constructors_seed_an_empty_test_allowlist`).
+    fn credentialed_proxy() -> HttpUpstreamProxy {
+        credentialed_proxy_allowing(&[])
+    }
+
+    /// [`credentialed_proxy`] with the crate's test-allowlist seam
+    /// seeded with `allow`.
+    ///
+    /// Needed by the leg-2 test below: its realm sits on
+    /// `http://127.0.0.1:<port>`, so on an empty seam the realm gates
+    /// in `fetch_bearer_token` would refuse the exchange and the test
+    /// would no longer be able to tell the credential ↔ origin binding
+    /// from the realm gates. Seeding the seam makes the origin binding
+    /// the only thing left that can stop the dance.
+    fn credentialed_proxy_allowing(allow: &[SocketAddr]) -> HttpUpstreamProxy {
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(2),
+            ..HttpUpstreamProxyConfig::new("npm")
+        };
+        let port = Arc::new(FixedSecretPort {
+            bytes: b"hunter2".to_vec(),
+        });
+        HttpUpstreamProxy::new_with_redirect_test_allowlist(cfg, port, allow.to_vec()).unwrap()
+    }
+
+    /// A mapping on `upstream_url` carrying a resolvable `secret_ref`.
+    fn credentialed_mapping(upstream_url: &str, auth: UpstreamAuth) -> RepositoryUpstreamMapping {
+        use hort_domain::ports::secret_port::SecretSource;
+        let mut m = mapping(upstream_url, "", auth);
+        m.secret_ref = Some(SecretRef {
+            source: SecretSource::EnvVar,
+            location: "HORT_CREDENTIAL_ORIGIN_TEST".into(),
+        });
+        m
+    }
+
+    fn basic_oauth2_mapping(upstream_url: &str) -> RepositoryUpstreamMapping {
+        credentialed_mapping(
+            upstream_url,
+            UpstreamAuth::Basic {
+                username: "oauth2".into(),
+            },
+        )
+    }
+
+    async fn drain_artifact(fetch: ArtifactFetch) -> Vec<u8> {
+        let mut stream = fetch.stream;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.expect("artifact chunk"));
+        }
+        bytes
+    }
+
+    /// The artifact tarball lives on the metadata-supplied host, not on
+    /// the mapping's own: the request must arrive there with no
+    /// `Authorization` header AND must still succeed — withholding the
+    /// credential is the whole change; forbidding the fetch would break
+    /// npm and PyPI pull-through, which serve bytes from
+    /// `files.pythonhosted.org`-style hosts by design.
+    #[tokio::test]
+    async fn cross_origin_artifact_url_is_fetched_without_the_mapping_credential() {
+        // The operator-configured origin. It must see zero requests —
+        // the absolute URL points somewhere else and must not be
+        // re-composed onto this base.
+        let configured = MockServer::start().await;
+        // The metadata-supplied origin (the `files.pythonhosted.org`
+        // role): same loopback IP, different ephemeral port.
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/packages/foo-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"foreign-bytes".as_slice()))
+            .expect(1)
+            .mount(&files)
+            .await;
+
+        let proxy = credentialed_proxy();
+        let m = basic_oauth2_mapping(&configured.uri());
+        let absolute = format!("{}/packages/foo-1.0.tar.gz", files.uri());
+
+        // `fetch_artifact_url` rather than the public `fetch_artifact`:
+        // wiremock binds loopback, which `check_ssrf_safe` refuses on the
+        // absolute-URL branch (that guard has its own tests). The inner
+        // fetch is where the credential decision lives.
+        let fetch = proxy
+            .fetch_artifact_url(&m, &absolute, &absolute)
+            .await
+            .expect("a cross-origin artifact URL must still be fetched");
+        assert_eq!(drain_artifact(fetch).await, b"foreign-bytes");
+
+        let recorded = files.received_requests().await.unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the metadata-supplied host must observe exactly one request"
+        );
+        assert!(
+            !recorded[0].headers.contains_key(AUTHORIZATION),
+            "the mapping's credential must not travel to an origin the \
+             operator did not configure; observed headers: {:?}",
+            recorded[0].headers
+        );
+        assert!(
+            configured.received_requests().await.unwrap().is_empty(),
+            "an absolute artifact URL must not be re-composed onto the \
+             mapping's base"
+        );
+    }
+
+    /// The over-reach guard for the test above: the same proxy, the same
+    /// mapping shape and the same call against the mapping's OWN origin
+    /// must still attach the credential, byte-for-byte.
+    #[tokio::test]
+    async fn same_origin_artifact_url_still_carries_the_mapping_credential() {
+        use base64::Engine as _;
+
+        let configured = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/packages/foo-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"own-origin-bytes".as_slice()))
+            .expect(1)
+            .mount(&configured)
+            .await;
+
+        let proxy = credentialed_proxy();
+        let m = basic_oauth2_mapping(&configured.uri());
+        // Absolute, not relative — so the only difference from the
+        // cross-origin test is the origin itself, not the URL shape.
+        let absolute = format!("{}/packages/foo-1.0.tar.gz", configured.uri());
+
+        let fetch = proxy
+            .fetch_artifact_url(&m, &absolute, &absolute)
+            .await
+            .expect("a same-origin artifact URL must be fetched");
+        assert_eq!(drain_artifact(fetch).await, b"own-origin-bytes");
+
+        let expected = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("oauth2:hunter2")
+        );
+        let recorded = configured.received_requests().await.unwrap();
+        assert_eq!(
+            recorded[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected.as_str()),
+            "the origin-binding check must not withhold the credential \
+             from the mapping's own origin"
+        );
+    }
+
+    /// Leg 2. A foreign `401` on a `BearerChallenge` mapping must not
+    /// start the realm dance: the realm endpoint is never called and the
+    /// outcome is the plain `Unauthorized` classification the
+    /// non-challenge path produces.
+    ///
+    /// The realm is advertised on the mapping's OWN origin, so nothing
+    /// but the credential ↔ origin binding stops the exchange: the
+    /// proxy is built with the realm's loopback `SocketAddr` seeded
+    /// into the test-allowlist seam, so BOTH realm gates (scheme and
+    /// routability) admit `http://127.0.0.1:<port>/realm`, and
+    /// `FixedSecretPort` resolves — an unguarded dance would reach the
+    /// realm carrying `Basic base64("oauth2:hunter2")`. Without the
+    /// seeding this assertion would be satisfied by the realm gates
+    /// instead and would stop testing the origin binding at all.
+    #[tokio::test]
+    async fn cross_origin_401_on_bearer_challenge_mapping_never_reaches_the_realm() {
+        let configured = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "must-never-be-issued",
+                "expires_in": 300,
+            })))
+            .expect(0)
+            .mount(&configured)
+            .await;
+
+        let files = MockServer::start().await;
+        // A well-formed Docker-token-spec challenge: the dance has
+        // everything it needs and must still not run.
+        let challenge = format!(
+            r#"Bearer realm="{}/realm",service="svc",scope="repository:p:pull""#,
+            configured.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/packages/foo-1.0.tar.gz"))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge.as_str()),
+            )
+            .expect(1)
+            .mount(&files)
+            .await;
+
+        let proxy = credentialed_proxy_allowing(&[*configured.address(), *files.address()]);
+        let m = credentialed_mapping(&configured.uri(), UpstreamAuth::BearerChallenge);
+        let absolute = format!("{}/packages/foo-1.0.tar.gz", files.uri());
+
+        // `ArtifactFetch` is not `Debug` (it carries a stream) — let-else
+        // rather than `expect_err`.
+        let Err(err) = proxy.fetch_artifact_url(&m, &absolute, &absolute).await else {
+            panic!("a cross-origin 401 must not be turned into a realm exchange");
+        };
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::Unauthorized),
+            "a foreign 401 must surface as Unauthorized, exactly as the \
+             non-challenge path classifies it; got {err}"
+        );
+
+        assert!(
+            configured.received_requests().await.unwrap().is_empty(),
+            "the realm must never be called for a request that left the \
+             mapping's origin — that exchange is where the operator's \
+             secret would have gone"
+        );
+        let recorded = files.received_requests().await.unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "no re-issue: the foreign host must see exactly one request"
+        );
+        assert!(
+            !recorded[0].headers.contains_key(AUTHORIZATION),
+            "leg 1 still applies on the challenge path; observed headers: {:?}",
+            recorded[0].headers
+        );
+    }
+
+    /// The origin triple, case and default-port normalisation, and the
+    /// fail-closed arms — the branches the wiremock tests above cannot
+    /// reach (they all run on loopback with explicit ports).
+    #[test]
+    fn credential_scope_compares_scheme_host_and_normalised_port() {
+        use CredentialScope::{ForeignOrigin, MappingOrigin};
+        let cases: &[(&str, &str, CredentialScope, &str)] = &[
+            (
+                "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz",
+                "https://registry.npmjs.org",
+                MappingOrigin,
+                "same origin, path ignored",
+            ),
+            (
+                "https://REGISTRY.npmjs.ORG/pkg.tgz",
+                "https://registry.npmjs.org",
+                MappingOrigin,
+                "host comparison is ASCII-case-insensitive",
+            ),
+            (
+                "https://registry.npmjs.org:443/pkg.tgz",
+                "https://registry.npmjs.org",
+                MappingOrigin,
+                "explicit default port equals the implied one",
+            ),
+            (
+                "https://files.pythonhosted.org/packages/foo.tar.gz",
+                "https://pypi.org",
+                ForeignOrigin,
+                "different host — the npm/PyPI shape this unit exists for",
+            ),
+            (
+                "https://registry.npmjs.org:8443/pkg.tgz",
+                "https://registry.npmjs.org",
+                ForeignOrigin,
+                "different port is a different protection space",
+            ),
+            (
+                "http://registry.npmjs.org/pkg.tgz",
+                "https://registry.npmjs.org",
+                ForeignOrigin,
+                "scheme downgrade is a different origin",
+            ),
+            (
+                "not-a-url",
+                "https://registry.npmjs.org",
+                ForeignOrigin,
+                "fail closed on an unparseable request URL",
+            ),
+            (
+                "https://registry.npmjs.org/pkg.tgz",
+                "registry.npmjs.org",
+                ForeignOrigin,
+                "fail closed on an unparseable upstream_url",
+            ),
+            (
+                "data:text/plain,x",
+                "data:text/plain,x",
+                ForeignOrigin,
+                "a host-less URL has no protection space to match, even \
+                 against itself",
+            ),
+        ];
+        for (request, configured, expected, why) in cases {
+            assert_eq!(
+                credential_scope(request, configured),
+                *expected,
+                "{why}: request={request} upstream_url={configured}"
+            );
+        }
+    }
+
+    /// The withheld-credential log line carries the origin and nothing
+    /// else — the path and query of a metadata-supplied URL are
+    /// upstream-controlled and must not be logged.
+    #[test]
+    fn request_origin_for_log_renders_origin_only() {
+        assert_eq!(
+            request_origin_for_log("https://files.pythonhosted.org/packages/secret-path.tar.gz"),
+            "https://files.pythonhosted.org:443"
+        );
+        assert_eq!(
+            request_origin_for_log("http://127.0.0.1:35717/packages/foo.tgz"),
+            "http://127.0.0.1:35717"
+        );
+        assert_eq!(request_origin_for_log("not-a-url"), "<unparseable>");
+        assert_eq!(request_origin_for_log("data:text/plain,x"), "<no-host>");
+    }
+
+    // ===================================================================
+    // Which client carries the bearer-token exchange
+    // ===================================================================
+    //
+    // A mapping's TLS material is the operator's statement about who
+    // its own upstream origin is: `ca_bundle_ref` adds that origin's
+    // private CA, `mtls_cert_ref` / `mtls_key_ref` present a client
+    // identity to it, and `pinned_cert_sha256` replaces the certificate
+    // verifier with one that compares that origin's leaf thumbprint.
+    // Every content fetch runs on that posture (`client_for_mapping`);
+    // the realm exchange is the request that carries the operator's
+    // credential, so it must run on it too — but only when the realm is
+    // the mapping's own origin, because a pin is a statement about one
+    // leaf and an mTLS identity must not be presented to a host the
+    // operator did not configure (see `ExchangeClient`).
+    //
+    // wiremock cannot serve TLS in-process, so these tests prove
+    // **client selection**, not handshake behaviour.
+    //
+    // They used to read selection off `tls_client_cache` presence: the
+    // content legs were driven on `proxy.client` explicitly, which left
+    // the exchange as the only thing that could write an entry. The
+    // content-client selection retired that technique — a same-origin
+    // content fetch now resolves `client_for_mapping` itself, so an
+    // entry appears either way and no longer tells the two legs apart
+    // (and `fetch_with_challenge` no longer takes a client to drive it
+    // with). The replacement is `seed_per_mapping_client`: a cached
+    // entry whose `User-Agent` differs from the proxy's, so *which*
+    // client carried a request is an assertion on the request wiremock
+    // recorded, per leg, instead of on a single process-wide fact.
+    // ===================================================================
+
+    /// The `User-Agent` a seeded per-mapping client is recognisable by
+    /// at the wire. Nothing in production sets a per-client agent; the
+    /// value matters only in that it differs from the proxy's
+    /// configured one.
+    const PER_MAPPING_UA: &str = "hort-test-per-mapping-client";
+
+    /// Seed `tls_client_cache[mapping_id]` with a client whose requests
+    /// are identifiable at the wire by their `User-Agent`.
+    ///
+    /// `client_for_mapping` hands a cache hit back verbatim, so after
+    /// this every request that runs on the per-mapping client arrives
+    /// carrying [`PER_MAPPING_UA`] and every request on the shared
+    /// client arrives carrying `proxy.config.user_agent`.
+    ///
+    /// Seeding skips the *build* — the PEM parse and rustls-config
+    /// assembly, which have their own tests above — and leaves the
+    /// *selection* running exactly as it does against a warm cache,
+    /// which is the thing under test. The seeded client is built
+    /// through the proxy's own `base_client_builder`, so it carries the
+    /// same timeout, DNS guard and redirect policy a real per-mapping
+    /// client would; only the TLS config (irrelevant over wiremock's
+    /// plaintext) and the agent differ.
+    async fn seed_per_mapping_client(proxy: &HttpUpstreamProxy, mapping_id: Uuid) {
+        let marked = proxy
+            .base_client_builder(HopBinding::AnyOrigin)
+            .expect("base client builder")
+            .user_agent(PER_MAPPING_UA)
+            .build()
+            .expect("marked per-mapping client builds");
+        proxy
+            .tls_client_cache
+            .write()
+            .await
+            .insert(mapping_id, marked);
+    }
+
+    /// The `User-Agent` wiremock recorded on `path_suffix`, so a test
+    /// can say which client carried it.
+    ///
+    /// One leg can be more than one request — the bearer dance hits the
+    /// content path twice, once credential-free and once with the
+    /// Bearer — and both must have run on the same client, so this
+    /// asserts a single distinct agent across the whole leg rather than
+    /// reading the first request's.
+    fn agent_of(requests: &[wiremock::Request], path_suffix: &str) -> String {
+        let agents: std::collections::BTreeSet<String> = requests
+            .iter()
+            .filter(|r| r.url.path().ends_with(path_suffix))
+            .map(|r| {
+                r.headers
+                    .get(reqwest::header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<absent>")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            agents.len(),
+            1,
+            "expected one client across every request on {path_suffix}, \
+             saw {agents:?}"
+        );
+        agents.into_iter().next().expect("one agent")
+    }
+
+    /// The content path these tests drive the dance on.
+    const DANCE_PATH: &str = "/v2/p/blobs/sha256:abc";
+
+    /// Matcher: the request carries no `Authorization` header. How the
+    /// harness tells the first (credential-free) attempt apart from the
+    /// Bearer retry on the same path.
+    fn without_authorization(req: &wiremock::Request) -> bool {
+        !req.headers.contains_key(AUTHORIZATION)
+    }
+
+    /// A `SecretPort` that serves both kinds of material one mapping
+    /// needs here: a real CA PEM for `ca_bundle_ref` (without it
+    /// `client_for_mapping` cannot build a per-mapping client at all)
+    /// and `hunter2` for the credential (without it the "the realm did
+    /// receive the credential" assertions would be observing a header
+    /// that was never built).
+    struct CaAndCredentialPort {
+        ca_pem: Vec<u8>,
+    }
+    impl SecretPort for CaAndCredentialPort {
+        fn resolve<'a>(
+            &'a self,
+            reference: &'a SecretRef,
+        ) -> BoxFuture<'a, DomainResult<SecretValue>> {
+            let bytes = if reference.location == "HORT_TEST_CA" {
+                self.ca_pem.clone()
+            } else {
+                b"hunter2".to_vec()
+            };
+            Box::pin(async move { Ok(SecretValue::from_bytes(bytes)) })
+        }
+    }
+
+    /// The credential the realm must (or must not) observe.
+    fn expected_realm_credential() -> String {
+        use base64::Engine as _;
+        format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("oauth2:hunter2")
+        )
+    }
+
+    /// A proxy whose `SecretPort` resolves the mapping's CA bundle and
+    /// credential, with the realm seam seeded with `allow` (the realm
+    /// gates refuse a loopback `http` realm on an empty seam — see
+    /// `proxy_with_realm_seam`).
+    fn exchange_client_proxy(ca_pem: &str, allow: &[SocketAddr]) -> HttpUpstreamProxy {
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(5),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            cfg,
+            Arc::new(CaAndCredentialPort {
+                ca_pem: ca_pem.as_bytes().to_vec(),
+            }),
+            allow.to_vec(),
+        )
+        .unwrap()
+    }
+
+    /// A `BearerChallenge` mapping carrying a credential and a TLS
+    /// field, so `client_for_mapping` takes the build-and-cache path
+    /// rather than the no-TLS fast path.
+    fn tls_bearer_mapping(upstream_url: &str) -> RepositoryUpstreamMapping {
+        let mut m = mapping(upstream_url, "", UpstreamAuth::BearerChallenge);
+        m.ca_bundle_ref = Some(secret_ref_env("HORT_TEST_CA"));
+        m.secret_ref = Some(secret_ref_env("HORT_EXCHANGE_CLIENT_TEST"));
+        m
+    }
+
+    /// Mount a complete 401 dance: `content` answers the
+    /// credential-free first attempt with a well-formed
+    /// `WWW-Authenticate` naming `realm_host`'s `/realm`, that realm
+    /// issues `exchange-tok`, and the Bearer retry on `content`
+    /// succeeds. Returns the content URL.
+    ///
+    /// The realm mock carries **no** credential matcher on purpose: a
+    /// missing credential must surface as a failed assertion on the
+    /// recorded request, not as a 404 the exchange reports as a realm
+    /// error (which would read identically to a dozen other faults).
+    async fn mount_bearer_dance(content: &MockServer, realm_host: &MockServer) -> String {
+        let challenge = format!(
+            r#"Bearer realm="{}/realm",service="svc",scope="repository:p:pull""#,
+            realm_host.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path(DANCE_PATH))
+            .and(without_authorization)
+            .respond_with(
+                ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge.as_str()),
+            )
+            .mount(content)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "exchange-tok",
+                "expires_in": 300,
+            })))
+            .mount(realm_host)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(DANCE_PATH))
+            .and(header(AUTHORIZATION, "Bearer exchange-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"dance-ok".as_slice()))
+            .mount(content)
+            .await;
+        format!("{}{DANCE_PATH}", content.uri())
+    }
+
+    /// The pin / private CA / mTLS identity must cover the one request
+    /// that carries the operator's credential. A realm on the mapping's
+    /// own origin — the only shape a self-hosted, pinned or
+    /// mTLS-protected registry can have — therefore runs the exchange
+    /// on `client_for_mapping`, observable here as the realm request
+    /// arriving with the seeded per-mapping agent.
+    #[tokio::test]
+    async fn credentialed_exchange_on_the_mappings_own_origin_uses_the_per_mapping_client() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        let server = MockServer::start().await;
+        let url = mount_bearer_dance(&server, &server).await;
+        let proxy = exchange_client_proxy(&fixture.ca_pem, &[*server.address()]);
+        let m = tls_bearer_mapping(&server.uri());
+        seed_per_mapping_client(&proxy, m.id).await;
+
+        let resp = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect("the dance must complete over the per-mapping client");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let recorded = server.received_requests().await.unwrap();
+
+        // The exchange really happened, and it carried the credential —
+        // without this the agent assertion below could be satisfied by
+        // a request that was not the credentialed exchange.
+        let realm_hits: Vec<_> = recorded
+            .iter()
+            .filter(|r| r.url.path() == "/realm")
+            .collect();
+        assert_eq!(realm_hits.len(), 1, "exactly one realm exchange");
+        assert_eq!(
+            realm_hits[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_realm_credential().as_str()),
+            "the exchange under test is the credentialed one"
+        );
+
+        assert_eq!(
+            agent_of(&recorded, "/realm"),
+            PER_MAPPING_UA,
+            "the credentialed exchange must run on the mapping's own TLS \
+             posture — the pin covers the request the secret travels on"
+        );
+        // And the content leg, on the same origin, is on it too — the
+        // content-client selection's positive arm, asserted here
+        // because this test already has a same-origin content request.
+        assert_eq!(
+            agent_of(&recorded, DANCE_PATH),
+            PER_MAPPING_UA,
+            "a content request on the mapping's own origin runs on the \
+             mapping's own client"
+        );
+    }
+
+    /// A realm on a different origin than `mapping.upstream_url` keeps
+    /// the shared client. This is load-bearing, not an optimisation: a
+    /// `pinned_cert_sha256` is the thumbprint of the *upstream's* leaf,
+    /// so pinning a foreign realm would refuse the legitimate
+    /// `auth.docker.io`-for-`registry-1.docker.io` exchange, and the
+    /// mapping's mTLS identity must not be presented to a host the
+    /// operator did not configure.
+    ///
+    /// The credential itself still travels (that is the Docker token
+    /// spec's own shape, and withholding it would break every
+    /// authenticated Docker Hub / GitLab CR pull-through); what stays
+    /// behind is the mapping's TLS material.
+    #[tokio::test]
+    async fn credentialed_exchange_at_a_foreign_realm_keeps_the_shared_client() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        // Two servers: the same loopback IP on different ephemeral
+        // ports is a cross-origin pair by RFC 6454 §4 (the reasoning
+        // recorded above `cross_host_redirect_strips_authorization_header`).
+        let upstream = MockServer::start().await;
+        let realm_host = MockServer::start().await;
+        let url = mount_bearer_dance(&upstream, &realm_host).await;
+        let proxy = exchange_client_proxy(
+            &fixture.ca_pem,
+            &[*upstream.address(), *realm_host.address()],
+        );
+        let mut m = tls_bearer_mapping(&upstream.uri());
+        // The realm consent gate is a different question from the one
+        // under test here, and on a credentialed mapping it has to be
+        // satisfied before any exchange runs at all: the realm is a
+        // foreign origin, so the operator must have named its host.
+        // Listing it is what leaves *which client* as the only open
+        // question — and the client the exchange then runs on is the
+        // origin-bound variant of the shared posture (same trust set,
+        // same agent, hops bound to the realm), which is why the agent
+        // assertion below still reads the shared client's agent.
+        m.allowed_realm_hosts = vec!["127.0.0.1".into()];
+
+        seed_per_mapping_client(&proxy, m.id).await;
+
+        let resp = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect("a foreign realm must remain reachable");
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let realm_hits = realm_host.received_requests().await.unwrap();
+        assert_eq!(realm_hits.len(), 1, "exactly one realm exchange");
+        assert_eq!(
+            realm_hits[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_realm_credential().as_str()),
+            "the credential still reaches the registry's own auth service \
+             — that is the Docker token spec's shape and the reason this \
+             branch exists at all"
+        );
+        assert_eq!(
+            agent_of(&realm_hits, "/realm"),
+            proxy.config.user_agent,
+            "no per-mapping client for a destination the operator did not \
+             configure: its pin names a different leaf and its mTLS \
+             identity is not ours to present there"
+        );
+        // Non-vacuity: the same proxy, the same mapping and the same
+        // call DID put the per-mapping client on the content leg, which
+        // is on the mapping's own origin. The realm's agent above is an
+        // observation about the destination, not about the seeding
+        // having failed.
+        assert_eq!(
+            agent_of(&upstream.received_requests().await.unwrap(), DANCE_PATH),
+            PER_MAPPING_UA,
+            "the content leg is on the mapping's own origin and must run \
+             on its own client"
+        );
+    }
+
+    /// Unit 1's property, re-asserted at the site where it would
+    /// regress: a request that left the mapping's origin never reaches
+    /// the exchange at all, so no client is selected, the realm is
+    /// never called and no credential leaves. A TLS-bearing mapping is
+    /// used so a selection that ran too early would be visible as a
+    /// cache entry.
+    #[tokio::test]
+    async fn a_foreign_request_selects_no_exchange_client_and_never_calls_the_realm() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        let upstream = MockServer::start().await;
+        let files = MockServer::start().await;
+        // The challenge is well-formed and the realm sits on the
+        // mapping's OWN origin, so nothing but the request's origin can
+        // stop the dance.
+        let challenge = format!(
+            r#"Bearer realm="{}/realm",service="svc",scope="repository:p:pull""#,
+            upstream.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "must-never-be-issued",
+                "expires_in": 300,
+            })))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(DANCE_PATH))
+            .respond_with(
+                ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge.as_str()),
+            )
+            .expect(1)
+            .mount(&files)
+            .await;
+
+        let proxy =
+            exchange_client_proxy(&fixture.ca_pem, &[*upstream.address(), *files.address()]);
+        let m = tls_bearer_mapping(&upstream.uri());
+        let foreign_url = format!("{}{DANCE_PATH}", files.uri());
+
+        let err = proxy
+            .fetch_with_challenge(&m, &foreign_url, "blob", &[])
+            .await
+            .expect_err("a foreign 401 must not become a realm exchange");
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::Unauthorized),
+            "got {err}"
+        );
+        assert!(
+            upstream.received_requests().await.unwrap().is_empty(),
+            "the realm must never be called for a request that left the \
+             mapping's origin"
+        );
+        // Unseeded on purpose: nothing may build a per-mapping client
+        // here. The content request is foreign, so the content-client
+        // selection hands it the shared client, and the exchange that
+        // would have selected one never runs. An empty cache is both
+        // facts at once.
+        let cache = proxy.tls_client_cache.read().await;
+        assert!(
+            cache.is_empty(),
+            "a foreign content request runs on the shared client and no \
+             exchange ran, so nothing selected the mapping's own client; \
+             got {} entries",
+            cache.len()
+        );
+        assert_eq!(
+            agent_of(&files.received_requests().await.unwrap(), DANCE_PATH),
+            proxy.config.user_agent,
+            "the foreign host must be talked to by the shared client"
+        );
+    }
+
+    /// A mapping with no TLS field at all: byte-identical to the
+    /// behaviour that predates the selection. `client_for_mapping`'s
+    /// fast path hands back the shared client and writes nothing, so
+    /// the exchange is the same request it always was.
+    #[tokio::test]
+    async fn exchange_for_a_mapping_without_tls_material_writes_no_cache_entry() {
+        let server = MockServer::start().await;
+        let url = mount_bearer_dance(&server, &server).await;
+        let proxy = exchange_client_proxy("unused-ca", &[*server.address()]);
+        let mut m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
+        m.secret_ref = Some(secret_ref_env("HORT_EXCHANGE_CLIENT_TEST"));
+
+        let resp = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect("the dance must complete unchanged");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let cache = proxy.tls_client_cache.read().await;
+        assert!(
+            cache.is_empty(),
+            "no TLS material on the mapping → no per-mapping client; got \
+             {} entries",
+            cache.len()
+        );
+    }
+
+    // ===================================================================
+    // Leg A — the content client is chosen by the request's destination
+    // ===================================================================
+    //
+    // `resolve_artifact_url` accepts an absolute URL lifted straight out
+    // of upstream metadata (npm `dist.tarball`, PyPI `urls[].url`, the
+    // Cargo `dl`-composed URL), so an artifact request's target is
+    // upstream-controlled data. Unit 1 stopped the mapping's
+    // *credential* from travelling there; its TLS material travelled
+    // anyway, because all five entry points resolved
+    // `client_for_mapping` before any URL existed. An attacker-nominated
+    // host therefore received the mapping's client certificate, and its
+    // pin and private CA set were applied to a host they do not
+    // describe.
+    //
+    // `credential_scope` now picks the client too, in
+    // `fetch_with_challenge` where the URL is. Observable as the
+    // exchange-client tests above describe: building a per-mapping
+    // client writes `tls_client_cache[mapping.id]`, so "ran on the
+    // shared client" is an absent entry and "ran on its own" is a
+    // present one. These tests deliberately do NOT seed the cache — an
+    // absent entry is the assertion, and seeding one would answer the
+    // question before the fetch.
+
+    /// A `Basic` mapping carrying both a credential and TLS material.
+    /// Both halves are load-bearing: the credential is what makes an
+    /// "attaches / does not attach `Authorization`" pair of assertions
+    /// non-vacuous (a cold `BearerChallenge` mapping sends no header on
+    /// its own origin either), and the `ca_bundle_ref` is what makes the
+    /// per-mapping client observable at all.
+    fn tls_basic_mapping(upstream_url: &str) -> RepositoryUpstreamMapping {
+        let mut m = mapping(
+            upstream_url,
+            "",
+            UpstreamAuth::Basic {
+                username: "oauth2".into(),
+            },
+        );
+        m.ca_bundle_ref = Some(secret_ref_env("HORT_TEST_CA"));
+        m.secret_ref = Some(secret_ref_env("HORT_CONTENT_CLIENT_TEST"));
+        m
+    }
+
+    /// A TLS-bearing mapping whose artifact URL is foreign: the fetch
+    /// runs on the shared client, so nothing builds a per-mapping client
+    /// and the cache stays empty. The fetch must still SUCCEED — npm and
+    /// PyPI serve artifact bytes from a different host than their
+    /// metadata host by design — and unit 1's property is re-asserted
+    /// here because this is the site where it would regress.
+    #[tokio::test]
+    async fn a_foreign_artifact_url_runs_on_the_shared_client() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        // The operator-configured origin: it must see zero requests.
+        let configured = MockServer::start().await;
+        // The metadata-supplied origin (the `files.pythonhosted.org`
+        // role): same loopback IP, different ephemeral port, which is a
+        // distinct origin by RFC 6454 §4.
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/packages/foo-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"foreign-bytes".as_slice()))
+            .expect(1)
+            .mount(&files)
+            .await;
+
+        let proxy =
+            exchange_client_proxy(&fixture.ca_pem, &[*configured.address(), *files.address()]);
+        let m = tls_basic_mapping(&configured.uri());
+        let absolute = format!("{}/packages/foo-1.0.tar.gz", files.uri());
+
+        // `fetch_artifact_url` rather than the public `fetch_artifact`:
+        // wiremock binds loopback, which `check_ssrf_safe` refuses on
+        // the absolute-URL branch (that guard has its own tests).
+        let fetch = proxy
+            .fetch_artifact_url(&m, &absolute, &absolute)
+            .await
+            .expect("a cross-origin artifact URL must still be fetched");
+        assert_eq!(drain_artifact(fetch).await, b"foreign-bytes");
+
+        {
+            let cache = proxy.tls_client_cache.read().await;
+            assert!(
+                cache.is_empty(),
+                "the mapping's TLS identity, private CA set and leaf pin \
+                 describe its own origin — none of them may be built for, \
+                 or presented to, a host the operator did not configure; \
+                 got {} entries",
+                cache.len()
+            );
+        }
+
+        let recorded = files.received_requests().await.unwrap();
+        assert_eq!(recorded.len(), 1, "exactly one request at the foreign host");
+        assert!(
+            !recorded[0].headers.contains_key(AUTHORIZATION),
+            "unit 1's property, re-asserted where the client selection \
+             could regress it; observed headers: {:?}",
+            recorded[0].headers
+        );
+        assert!(
+            configured.received_requests().await.unwrap().is_empty(),
+            "an absolute artifact URL must not be re-composed onto the \
+             mapping's base"
+        );
+    }
+
+    /// The over-reach guard for the test above: the same proxy, the same
+    /// mapping and the same call against the mapping's OWN origin must
+    /// still build and use the per-mapping client, and must still carry
+    /// the credential. Only the target origin differs.
+    #[tokio::test]
+    async fn a_same_origin_artifact_url_runs_on_the_per_mapping_client() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        let configured = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/packages/foo-1.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"own-origin-bytes".as_slice()))
+            .expect(1)
+            .mount(&configured)
+            .await;
+
+        let proxy = exchange_client_proxy(&fixture.ca_pem, &[*configured.address()]);
+        let m = tls_basic_mapping(&configured.uri());
+        // Absolute, not relative, so the only difference from the test
+        // above is the origin itself and not the URL shape.
+        let absolute = format!("{}/packages/foo-1.0.tar.gz", configured.uri());
+
+        let fetch = proxy
+            .fetch_artifact_url(&m, &absolute, &absolute)
+            .await
+            .expect("a same-origin artifact URL must be fetched");
+        assert_eq!(drain_artifact(fetch).await, b"own-origin-bytes");
+
+        {
+            let cache = proxy.tls_client_cache.read().await;
+            assert!(
+                cache.contains_key(&m.id),
+                "the destination is the one the operator configured the \
+                 TLS material for, so the fetch runs on it; cache held {} \
+                 entries",
+                cache.len()
+            );
+        }
+
+        let recorded = configured.received_requests().await.unwrap();
+        assert_eq!(
+            recorded[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_realm_credential().as_str()),
+            "the client selection must not have cost the credential on \
+             the mapping's own origin"
+        );
+    }
+
+    /// The population that must not notice this unit at all: a mapping
+    /// with no TLS field. `client_for_mapping`'s fast path hands back
+    /// the shared client and writes nothing, so BOTH destinations are
+    /// byte-identical to the behaviour that predates the selection —
+    /// same single client, same credential decision, same empty cache.
+    #[tokio::test]
+    async fn a_mapping_without_tls_material_is_unchanged_on_both_destinations() {
+        let configured = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"own".as_slice()))
+            .expect(1)
+            .mount(&configured)
+            .await;
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"foreign".as_slice()))
+            .expect(1)
+            .mount(&files)
+            .await;
+
+        let proxy = credentialed_proxy();
+        let m = basic_oauth2_mapping(&configured.uri());
+        let own = format!("{}/pkg.tgz", configured.uri());
+        let foreign = format!("{}/pkg.tgz", files.uri());
+
+        let own_fetch = proxy
+            .fetch_artifact_url(&m, &own, &own)
+            .await
+            .expect("same-origin fetch on a TLS-free mapping");
+        assert_eq!(drain_artifact(own_fetch).await, b"own");
+        let foreign_fetch = proxy
+            .fetch_artifact_url(&m, &foreign, &foreign)
+            .await
+            .expect("foreign fetch on a TLS-free mapping");
+        assert_eq!(drain_artifact(foreign_fetch).await, b"foreign");
+
+        let cache = proxy.tls_client_cache.read().await;
+        assert!(
+            cache.is_empty(),
+            "no TLS material on the mapping → no per-mapping client on \
+             either destination; got {} entries",
+            cache.len()
+        );
+        // The credential decision is unit 1's and is unchanged by the
+        // client selection sitting beside it.
+        assert!(
+            configured.received_requests().await.unwrap()[0]
+                .headers
+                .contains_key(AUTHORIZATION),
+            "the mapping's own origin still gets the credential"
+        );
+        assert!(
+            !files.received_requests().await.unwrap()[0]
+                .headers
+                .contains_key(AUTHORIZATION),
+            "a foreign origin still does not"
+        );
+    }
+
+    // ===================================================================
+    // Leg B — a redirect hop does not carry the identity off its origin
+    // ===================================================================
+    //
+    // reqwest strips `Authorization` across origins, so unit 1's header
+    // is safe on a hop. A client certificate is not: it is presented at
+    // handshake time to whatever host the hop names, before any
+    // application-level decision exists, and cannot be withheld
+    // afterwards. A same-origin artifact URL answering `302` to a CDN
+    // would therefore hand the mapping's mTLS identity to the CDN, and
+    // the per-hop policy checked only routability.
+    //
+    // The foreign target is a LIVE wiremock on `127.0.0.2` — the same
+    // loopback interface as `127.0.0.1`, so the hop *would* land, and
+    // its address is seeded into the test-allowlist seam so the
+    // routability leg admits it. The only thing left that can refuse the
+    // hop is the origin in the `Location` header, which is exactly what
+    // an attacker controls. `.expect(0)` asserts "never reached" at the
+    // target rather than inferring it from the error, and the
+    // `ca_bundle_ref`-only test below follows the same hop successfully,
+    // so the refusal is attributable to the identity and not to the
+    // hosts.
+
+    /// Stand up a wiremock on a loopback host literal DIFFERENT from the
+    /// `127.0.0.1` that `MockServer::start()` binds, so a cross-host hop
+    /// has a genuinely live target. No DNS is involved, so the test does
+    /// not depend on how any name resolves.
+    async fn server_on_foreign_loopback_host() -> MockServer {
+        let listener = std::net::TcpListener::bind("127.0.0.2:0")
+            .expect("127.0.0.2 is loopback — binding it must succeed");
+        MockServer::builder().listener(listener).start().await
+    }
+
+    /// A mapping presenting a client certificate, so
+    /// `client_for_mapping` builds its client with
+    /// [`HopBinding::RequestedOrigin`].
+    fn mtls_mapping(upstream_url: &str) -> RepositoryUpstreamMapping {
+        let mut m = mapping(upstream_url, "", UpstreamAuth::Anonymous);
+        m.mtls_cert_ref = Some(secret_ref_env("HORT_TEST_MTLS_CERT"));
+        m.mtls_key_ref = Some(secret_ref_env("HORT_TEST_MTLS_KEY"));
+        m
+    }
+
+    /// A mapping whose only TLS material is a private CA: it presents no
+    /// identity, so its hops keep [`HopBinding::AnyOrigin`].
+    fn ca_only_mapping(upstream_url: &str) -> RepositoryUpstreamMapping {
+        let mut m = mapping(upstream_url, "", UpstreamAuth::Anonymous);
+        m.ca_bundle_ref = Some(secret_ref_env("HORT_TEST_CA"));
+        m
+    }
+
+    /// A proxy whose `SecretPort` serves the fixture's leaf cert + key
+    /// (for [`mtls_mapping`]) and CA PEM (for [`ca_only_mapping`]), with
+    /// the redirect seam seeded so a loopback hop is
+    /// routability-admitted and the origin binding is the only thing
+    /// that can refuse it.
+    fn hop_binding_proxy(fixture: &TlsFixture, allow: &[SocketAddr]) -> HttpUpstreamProxy {
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(5),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            cfg,
+            Arc::new(StaticSecretPort {
+                ca_pem: Some(fixture.ca_pem.as_bytes().to_vec()),
+                cert_pem: Some(fixture.leaf_pem.as_bytes().to_vec()),
+                key_pem: Some(fixture.leaf_key_pem.as_bytes().to_vec()),
+            }),
+            allow.to_vec(),
+        )
+        .expect("proxy with the redirect seam")
+    }
+
+    /// Mount `302 Location: <location>` on `/pkg.tgz`.
+    async fn mount_redirect(server: &MockServer, location: &str) {
+        Mock::given(method("GET"))
+            .and(path("/pkg.tgz"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", location))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    /// The leak: a hop to a different host literal, on a client that
+    /// presents the mapping's client certificate, is refused — and the
+    /// foreign target is never reached.
+    #[tokio::test]
+    async fn a_cross_host_hop_is_refused_when_the_client_presents_a_certificate() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        let foreign = server_on_foreign_loopback_host().await;
+        Mock::given(method("GET"))
+            .and(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"never-served".as_slice()))
+            .expect(0)
+            .mount(&foreign)
+            .await;
+        let origin = MockServer::start().await;
+        mount_redirect(&origin, &format!("{}/elsewhere", foreign.uri())).await;
+
+        let proxy = hop_binding_proxy(&fixture, &[*origin.address(), *foreign.address()]);
+        let m = mtls_mapping(&origin.uri());
+
+        // `ArtifactFetch` carries a stream and is not `Debug`.
+        let Err(err) = proxy.fetch_artifact(m, "/pkg.tgz".into()).await else {
+            panic!(
+                "a hop off the requested origin must be refused, not \
+                 followed with the mapping's client certificate"
+            );
+        };
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "the refusal reuses the existing content-validation \
+             classification — the upstream's `Location` is untrusted \
+             input — and introduces no new error variant; got {err}"
+        );
+        assert!(
+            foreign.received_requests().await.unwrap().is_empty(),
+            "the hop target must never be connected to: a certificate is \
+             presented during the handshake, so 'refused after connecting' \
+             would be no refusal at all"
+        );
+    }
+
+    /// The binding is the origin triple, not the host: a hop to a
+    /// different port on the SAME host is refused too. Two `MockServer`
+    /// instances share `127.0.0.1` and differ only by ephemeral port,
+    /// which is a distinct origin by RFC 6454 §4 and the same triple
+    /// `credential_scope` compares for the credential.
+    #[tokio::test]
+    async fn a_same_host_different_port_hop_is_refused_when_the_client_presents_a_certificate() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        let other_port = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"never-served".as_slice()))
+            .expect(0)
+            .mount(&other_port)
+            .await;
+        let origin = MockServer::start().await;
+        mount_redirect(&origin, &format!("{}/elsewhere", other_port.uri())).await;
+
+        let proxy = hop_binding_proxy(&fixture, &[*origin.address(), *other_port.address()]);
+        let m = mtls_mapping(&origin.uri());
+
+        let Err(err) = proxy.fetch_artifact(m, "/pkg.tgz".into()).await else {
+            panic!("a hop to another port on the same host must be refused");
+        };
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "got {err}"
+        );
+        assert!(
+            other_port.received_requests().await.unwrap().is_empty(),
+            "another listener on the same host is another service — the \
+             operator configured one origin, not one machine"
+        );
+    }
+
+    /// The control: a hop that stays on the requested origin is still
+    /// followed, and the redirected body still reaches the caller. A
+    /// registry's own canonicalising rewrite must not become a refusal.
+    #[tokio::test]
+    async fn a_same_origin_hop_is_still_followed_when_the_client_presents_a_certificate() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"same-origin-hop".as_slice()))
+            .expect(1)
+            .mount(&origin)
+            .await;
+        mount_redirect(&origin, &format!("{}/final", origin.uri())).await;
+
+        let proxy = hop_binding_proxy(&fixture, &[*origin.address()]);
+        let m = mtls_mapping(&origin.uri());
+
+        let fetch = proxy
+            .fetch_artifact(m, "/pkg.tgz".into())
+            .await
+            .expect("a hop that stays on the requested origin must follow");
+        assert_eq!(drain_artifact(fetch).await, b"same-origin-hop");
+    }
+
+    /// The deliberate decision for a `ca_bundle_ref`-only mapping: the
+    /// cross-origin hop IS followed. No identity is presented — a root
+    /// store is what we accept, not what we send — and refusing it would
+    /// break the ordinary private-registry shape of a blob `GET`
+    /// answered with a `302` to object storage on another host, which
+    /// the augmented root store exists to make work. See
+    /// [`hop_binding_for`] for the full rationale and the residual.
+    ///
+    /// This is also the control for the two refusals above: the same
+    /// foreign loopback host, reached over the same seam, so what
+    /// refuses the hop there is the identity and not the hosts.
+    #[tokio::test]
+    async fn a_cross_host_hop_is_followed_for_a_ca_bundle_only_mapping() {
+        let fixture = make_tls_fixture("127.0.0.1");
+        let foreign = server_on_foreign_loopback_host().await;
+        Mock::given(method("GET"))
+            .and(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"cdn-bytes".as_slice()))
+            .expect(1)
+            .mount(&foreign)
+            .await;
+        let origin = MockServer::start().await;
+        mount_redirect(&origin, &format!("{}/elsewhere", foreign.uri())).await;
+
+        let proxy = hop_binding_proxy(&fixture, &[*origin.address(), *foreign.address()]);
+        let m = ca_only_mapping(&origin.uri());
+        let mapping_id = m.id;
+
+        let fetch = proxy
+            .fetch_artifact(m, "/pkg.tgz".into())
+            .await
+            .expect("a CA bundle presents no identity, so the hop follows");
+        assert_eq!(drain_artifact(fetch).await, b"cdn-bytes");
+        // And it really did run on a per-mapping client — otherwise this
+        // would be the shared client's `AnyOrigin` policy under test and
+        // would say nothing about the binding.
+        let cache = proxy.tls_client_cache.read().await;
+        assert!(
+            cache.contains_key(&mapping_id),
+            "the hop was followed on the mapping's own client"
+        );
+    }
+
+    /// The decision table, directly: which TLS material earns a bound
+    /// hop. The wiremock tests above cover the two ends; this pins every
+    /// arm, including the `mtls_key_ref`-without-cert shape the value
+    /// object's pairing rule forbids but which must not read as
+    /// identity-free if it ever arrives.
+    #[test]
+    fn hop_binding_follows_the_identity_and_the_pin_only() {
+        let base = mapping("https://registry.example.com", "", UpstreamAuth::Anonymous);
+        assert_eq!(hop_binding_for(&base), HopBinding::AnyOrigin);
+
+        let mut ca_only = base.clone();
+        ca_only.ca_bundle_ref = Some(secret_ref_env("HORT_TEST_CA"));
+        assert_eq!(
+            hop_binding_for(&ca_only),
+            HopBinding::AnyOrigin,
+            "a private CA is whom we trust, not what we present"
+        );
+
+        for mutate in [
+            (|m: &mut RepositoryUpstreamMapping| {
+                m.mtls_cert_ref = Some(secret_ref_env("HORT_TEST_MTLS_CERT"));
+            }) as fn(&mut RepositoryUpstreamMapping),
+            |m: &mut RepositoryUpstreamMapping| {
+                m.mtls_key_ref = Some(secret_ref_env("HORT_TEST_MTLS_KEY"));
+            },
+            |m: &mut RepositoryUpstreamMapping| {
+                m.pinned_cert_sha256 = Some("ab".repeat(32));
+            },
+        ] {
+            let mut m = base.clone();
+            mutate(&mut m);
+            assert_eq!(
+                hop_binding_for(&m),
+                HopBinding::RequestedOrigin,
+                "an identity or a leaf pin binds every hop to the \
+                 requested origin"
+            );
+            // …and it keeps binding when a CA bundle sits beside it.
+            m.ca_bundle_ref = Some(secret_ref_env("HORT_TEST_CA"));
+            assert_eq!(hop_binding_for(&m), HopBinding::RequestedOrigin);
+        }
+    }
+
+    // ===================================================================
+    // The realm consent gate — `allowed_realm_hosts`
+    // ===================================================================
+    //
+    // The realm of a bearer-challenge exchange arrives verbatim in the
+    // upstream's `WWW-Authenticate` header, and the exchange is the one
+    // request that carries `Authorization: Basic
+    // base64("oauth2:<secret>")`. The scheme and routability gates in
+    // `fetch_bearer_token` bound *where* that may travel; this gate
+    // bounds *to whom*, and only the operator can answer it — a realm
+    // legitimately lives off-origin (`auth.docker.io` for
+    // `registry-1.docker.io`).
+    //
+    // The gate binds to the **credentialed** exchange. The anonymous
+    // case below is not a courtesy: every `bearer_challenge` mapping in
+    // this repository is credential-free and four of them are Docker
+    // Hub, so a gate on every exchange would refuse the compose E2E's
+    // own mappings while protecting a credential that does not exist.
+    // ===================================================================
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `SecretPort` that counts resolutions, so a test can assert the
+    /// secret was **never read** rather than inferring it from an error
+    /// string. That assertion is what pins the gate's ordering: a gate
+    /// that refused after resolving would produce the same `Err`.
+    struct CountingSecretPort {
+        resolves: Arc<AtomicUsize>,
+    }
+    impl SecretPort for CountingSecretPort {
+        fn resolve<'a>(
+            &'a self,
+            _reference: &'a SecretRef,
+        ) -> BoxFuture<'a, DomainResult<SecretValue>> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(SecretValue::from_bytes(b"hunter2".to_vec())) })
+        }
+    }
+
+    /// A proxy whose `SecretPort` counts resolutions. `allow` seeds the
+    /// realm seam so a loopback `http` realm is reachable at all — the
+    /// scheme and routability gates would otherwise refuse it first and
+    /// the test would be observing the wrong refusal.
+    fn counting_realm_proxy(allow: &[SocketAddr]) -> (HttpUpstreamProxy, Arc<AtomicUsize>) {
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(5),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        let proxy = HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            cfg,
+            Arc::new(CountingSecretPort {
+                resolves: resolves.clone(),
+            }),
+            allow.to_vec(),
+        )
+        .expect("proxy with the realm seam");
+        (proxy, resolves)
+    }
+
+    /// A credentialed `BearerChallenge` mapping with no TLS material —
+    /// the shape the gate is about, and the shape four in-repo Docker
+    /// Hub mappings would have if an operator added a PAT.
+    fn credentialed_bearer_mapping(upstream_url: &str) -> RepositoryUpstreamMapping {
+        let mut m = mapping(upstream_url, "", UpstreamAuth::BearerChallenge);
+        m.secret_ref = Some(secret_ref_env("HORT_REALM_GATE_TEST"));
+        m
+    }
+
+    /// Mount the 401 leg only: the content path answers a
+    /// credential-free `GET` with a `WWW-Authenticate` naming
+    /// `realm_url`. Nothing mounts the Bearer retry, because a refused
+    /// exchange must never get that far. Returns the content URL.
+    async fn mount_challenge_only(content: &MockServer, realm_url: &str) -> String {
+        let challenge = format!(r#"Bearer realm="{realm_url}",service="svc""#);
+        Mock::given(method("GET"))
+            .and(path(DANCE_PATH))
+            .and(without_authorization)
+            .respond_with(
+                ResponseTemplate::new(401).insert_header("WWW-Authenticate", challenge.as_str()),
+            )
+            .mount(content)
+            .await;
+        format!("{}{DANCE_PATH}", content.uri())
+    }
+
+    /// Mount a realm that issues a token, with the supplied expectation
+    /// on how many times it may be hit.
+    async fn mount_realm(realm_host: &MockServer, hits: u64) {
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "exchange-tok",
+                "expires_in": 300,
+            })))
+            .expect(hits)
+            .mount(realm_host)
+            .await;
+    }
+
+    /// Mount the Bearer retry on the content path, so a completed dance
+    /// has somewhere to land.
+    async fn mount_bearer_retry(content: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path(DANCE_PATH))
+            .and(header(AUTHORIZATION, "Bearer exchange-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"dance-ok".as_slice()))
+            .mount(content)
+            .await;
+    }
+
+    /// The finding, closed. A credentialed mapping, a realm on a host
+    /// the operator never named: the exchange is refused, the realm is
+    /// never contacted (`.expect(0)`), and — the assertion that pins the
+    /// ordering — the `SecretPort` is never asked for the credential.
+    #[tokio::test]
+    async fn an_unlisted_off_origin_realm_is_refused_before_the_secret_is_resolved() {
+        let upstream = MockServer::start().await;
+        let realm_host = server_on_foreign_loopback_host().await;
+        mount_realm(&realm_host, 0).await;
+        let url = mount_challenge_only(&upstream, &format!("{}/realm", realm_host.uri())).await;
+
+        let (proxy, resolves) = counting_realm_proxy(&[*upstream.address(), *realm_host.address()]);
+        // No `allowed_realm_hosts`: the operator has consented to their
+        // own origin and to nothing else.
+        let m = credentialed_bearer_mapping(&upstream.uri());
+
+        let err = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect_err("an unlisted realm must not receive the credential");
+        // Asserted first because it is the strongest of the three and
+        // the only one a refusal placed *after* the secret resolution
+        // would not satisfy: the error and the untouched realm look the
+        // same either way.
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            0,
+            "the secret must never be read out of the SecretPort for a \
+             realm the operator did not name — a gate that refused after \
+             resolving would return the same error and leak the same \
+             credential on the next code path that forgets to"
+        );
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "the refusal reuses the classification its two sibling realm \
+             gates use — the `WWW-Authenticate` header is untrusted input \
+             — and introduces no new variant; got {err}"
+        );
+        assert!(
+            err.to_string().contains("127.0.0.2"),
+            "the refusal must name the realm host the operator would add \
+             to `allowedRealmHosts`; got {err}"
+        );
+        // `.expect(0)` on the realm is verified by wiremock at drop; the
+        // explicit read says the same thing where a reader looks for it.
+        assert!(
+            realm_host.received_requests().await.unwrap().is_empty(),
+            "the realm must never be contacted"
+        );
+    }
+
+    /// The same mapping, the same upstream, the same realm — with the
+    /// host listed. The dance completes and the credential arrives, so
+    /// the refusal above is the allowlist deciding and not the harness
+    /// failing to reach a loopback realm.
+    #[tokio::test]
+    async fn a_listed_off_origin_realm_completes_the_dance_with_the_credential() {
+        let upstream = MockServer::start().await;
+        let realm_host = server_on_foreign_loopback_host().await;
+        mount_realm(&realm_host, 1).await;
+        mount_bearer_retry(&upstream).await;
+        let url = mount_challenge_only(&upstream, &format!("{}/realm", realm_host.uri())).await;
+
+        let (proxy, resolves) = counting_realm_proxy(&[*upstream.address(), *realm_host.address()]);
+        let mut m = credentialed_bearer_mapping(&upstream.uri());
+        m.allowed_realm_hosts = vec!["127.0.0.2".into()];
+
+        let resp = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect("a listed realm must complete the dance");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            1,
+            "the credential is resolved exactly once, for the exchange"
+        );
+        let realm_hits = realm_host.received_requests().await.unwrap();
+        assert_eq!(realm_hits.len(), 1, "exactly one realm exchange");
+        assert_eq!(
+            realm_hits[0]
+                .headers
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some(expected_realm_credential().as_str()),
+            "the listed realm receives the credential — that is what the \
+             operator consented to"
+        );
+    }
+
+    /// The list is case-insensitive on the host, the RFC 6454 §4 rule
+    /// `credential_scope` applies to the same comparison. An entry the
+    /// operator typed in a different case is an allowance they wrote and
+    /// must get.
+    #[tokio::test]
+    async fn a_listed_realm_host_matches_case_insensitively() {
+        let m = {
+            let mut m = credentialed_bearer_mapping("https://registry.example.com");
+            m.allowed_realm_hosts = vec!["Auth.Docker.IO".into()];
+            m
+        };
+        assert!(realm_host_is_operator_allowed(
+            &m,
+            "https://auth.docker.io/token?service=registry.docker.io"
+        ));
+        assert!(
+            !realm_host_is_operator_allowed(&m, "https://auth.docker.io.evil.test/token"),
+            "a suffix match is not a host match"
+        );
+        assert!(
+            !realm_host_is_operator_allowed(&m, "not a url"),
+            "fail closed: a realm no host can be read out of matches no \
+             allowance"
+        );
+    }
+
+    /// The mapping's own origin is implicit and is never written in the
+    /// list: a credentialed mapping whose realm sits on its own origin
+    /// completes the dance with an **empty** list. This is the
+    /// self-hosted-registry shape (Harbor's `/service/token`, Zot, a
+    /// GHCR-style `/token` on the registry host itself).
+    #[tokio::test]
+    async fn an_own_origin_realm_is_allowed_with_an_empty_list() {
+        let server = MockServer::start().await;
+        mount_realm(&server, 1).await;
+        mount_bearer_retry(&server).await;
+        let url = mount_challenge_only(&server, &format!("{}/realm", server.uri())).await;
+
+        let (proxy, resolves) = counting_realm_proxy(&[*server.address()]);
+        let m = credentialed_bearer_mapping(&server.uri());
+        assert!(
+            m.allowed_realm_hosts.is_empty(),
+            "the point of this test is the empty list"
+        );
+
+        let resp = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect("the mapping's own origin needs no list entry");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resolves.load(Ordering::SeqCst), 1);
+        let realm_hits = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/realm")
+            .count();
+        assert_eq!(realm_hits, 1, "exactly one realm exchange");
+    }
+
+    /// The four-in-repo case: an **anonymous** `bearer_challenge`
+    /// mapping (no `secret_ref`) with an off-origin, unlisted realm is
+    /// unchanged — the dance completes. Every `bearer_challenge` mapping
+    /// shipped in this repository is this shape, four of them Docker Hub
+    /// against `auth.docker.io`, so if this test fails the design is
+    /// wrong and the compose E2E is broken, not the test.
+    #[tokio::test]
+    async fn an_anonymous_exchange_at_an_unlisted_off_origin_realm_is_unchanged() {
+        let upstream = MockServer::start().await;
+        let realm_host = server_on_foreign_loopback_host().await;
+        mount_realm(&realm_host, 1).await;
+        mount_bearer_retry(&upstream).await;
+        let url = mount_challenge_only(&upstream, &format!("{}/realm", realm_host.uri())).await;
+
+        let (proxy, resolves) = counting_realm_proxy(&[*upstream.address(), *realm_host.address()]);
+        // `mapping()` leaves `secret_ref` unset — an exchange with no
+        // credential has nothing a nominated realm could receive.
+        let m = mapping(&upstream.uri(), "", UpstreamAuth::BearerChallenge);
+        assert!(m.secret_ref.is_none() && m.allowed_realm_hosts.is_empty());
+
+        let resp = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect("an anonymous exchange keeps today's behaviour");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            0,
+            "there is no secret_ref to resolve"
+        );
+        let realm_hits = realm_host.received_requests().await.unwrap();
+        assert_eq!(realm_hits.len(), 1, "the realm exchange still runs");
+        assert!(
+            !realm_hits[0].headers.contains_key(AUTHORIZATION),
+            "and it is anonymous"
+        );
+    }
+
+    /// The window beside the front door: the operator listed one host,
+    /// so a `302` from that host onto a host they did not list is
+    /// refused, and the hop target is never contacted (`.expect(0)`).
+    /// Inherits unit 7's pattern — `HopBinding::RequestedOrigin` plus
+    /// `credential_scope` at the hop — on a third client rather than a
+    /// second mechanism.
+    #[tokio::test]
+    async fn an_allowed_realm_may_not_redirect_the_exchange_off_its_own_origin() {
+        let upstream = MockServer::start().await;
+        let realm_host = server_on_foreign_loopback_host().await;
+        // A third origin: the same loopback address as the realm but a
+        // different ephemeral port, which is a distinct origin by RFC
+        // 6454 §4 — and a host the operator did list, so what refuses
+        // the hop is the binding and not the allowlist a second time.
+        let hop_target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/elsewhere"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "attacker-tok",
+                "expires_in": 300,
+            })))
+            .expect(0)
+            .mount(&hop_target)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/elsewhere", hop_target.uri())),
+            )
+            .expect(1)
+            .mount(&realm_host)
+            .await;
+        let url = mount_challenge_only(&upstream, &format!("{}/realm", realm_host.uri())).await;
+
+        let (proxy, _resolves) = counting_realm_proxy(&[
+            *upstream.address(),
+            *realm_host.address(),
+            *hop_target.address(),
+        ]);
+        let mut m = credentialed_bearer_mapping(&upstream.uri());
+        // Both hosts listed. `127.0.0.1` is the hop target's host, so
+        // only the per-request origin binding can refuse the hop.
+        m.allowed_realm_hosts = vec!["127.0.0.2".into(), "127.0.0.1".into()];
+
+        let err = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect_err("a hop off the allowed realm's origin must be refused");
+        // Asserted first: it is the claim, and it is the one a
+        // `302`-following exchange breaks. Both outcomes produce an
+        // `Err` from this call, so reading the error alone would not
+        // tell a refused hop from a followed one whose token the
+        // content retry then rejected.
+        assert!(
+            hop_target.received_requests().await.unwrap().is_empty(),
+            "an allowance for one host is not an allowance for wherever \
+             that host redirects to — the target must never be contacted"
+        );
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "same content-validation classification as the other hop \
+             refusals; got {err}"
+        );
+    }
+
+    /// The control for the test above: with the same client and the same
+    /// seam, a `302` that stays on the allowed realm's own origin IS
+    /// followed. Without this the refusal could be the exchange having
+    /// lost the ability to follow redirects at all.
+    #[tokio::test]
+    async fn an_allowed_realm_may_still_redirect_the_exchange_within_its_own_origin() {
+        let upstream = MockServer::start().await;
+        let realm_host = server_on_foreign_loopback_host().await;
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/realm-v2", realm_host.uri())),
+            )
+            .expect(1)
+            .mount(&realm_host)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/realm-v2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "exchange-tok",
+                "expires_in": 300,
+            })))
+            .expect(1)
+            .mount(&realm_host)
+            .await;
+        mount_bearer_retry(&upstream).await;
+        let url = mount_challenge_only(&upstream, &format!("{}/realm", realm_host.uri())).await;
+
+        let (proxy, _resolves) =
+            counting_realm_proxy(&[*upstream.address(), *realm_host.address()]);
+        let mut m = credentialed_bearer_mapping(&upstream.uri());
+        m.allowed_realm_hosts = vec!["127.0.0.2".into()];
+
+        let resp = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect("a realm's own canonicalising redirect must still follow");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     // ===================================================================

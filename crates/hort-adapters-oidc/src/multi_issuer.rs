@@ -37,9 +37,12 @@
 //!
 //! # HTTP client layering
 //!
-//! The HTTP client (extra-CA layering, redirect cap, timeout, TLS
-//! version pin) and the body-capped GET helper are shared with
-//! `OidcProvider` via `crate::internal`. The full discovery +
+//! The HTTP client (extra-CA layering, the same-host redirect policy —
+//! per-hop host binding plus the 3-hop cap — timeout, TLS version pin)
+//! and the body-capped GET helper are shared with `OidcProvider` via
+//! `crate::internal`. One client serves every configured issuer; the
+//! redirect binding is per request, so that sharing is safe (see
+//! `internal::same_host_redirect_policy`). The full discovery +
 //! key-rotation audit flow lives on `OidcProvider`; this validator
 //! does NOT emit `OidcKeyRotated` events — rotation observation is the
 //! user-login adapter's job; the federation path lives on the issuer's
@@ -532,12 +535,15 @@ impl MultiIssuerJwksValidator {
 
         // Bind the discovery-supplied `jwks_uri` to the issuer's own host
         // (same-host binding) BEFORE the fetch. The check is additive:
-        // the TLS pin + redirect cap on `self.http` (built by
-        // `internal::build_http_client`) are unchanged. A rejection
-        // collapses to the same deny reason + metric as any other
-        // JWKS-fetch failure on this path (`UnknownKid` / `fetch_failed`);
-        // no new wire error or metric. The routability leg was dropped
-        // post-E2E (it rejected the internal-IdP case);
+        // the TLS pin + the same-host redirect policy on `self.http`
+        // (built by `internal::build_http_client`) are unchanged. This
+        // check owns the DECLARED url; `internal::same_host_redirect_policy`
+        // owns every hop the fetch then takes, per request — which is why
+        // one shared `http` is correct for all configured issuers. A
+        // rejection collapses to the same deny reason + metric as any
+        // other JWKS-fetch failure on this path (`UnknownKid` /
+        // `fetch_failed`); no new wire error or metric. The routability
+        // leg was dropped post-E2E (it rejected the internal-IdP case);
         // see `internal::check_jwks_uri_bound`.
         if let Err(e) = internal::check_jwks_uri_bound(&issuer.issuer_url, &discovery.jwks_uri) {
             emit_jwks_refresh(issuer_label, context.fetch_failed_result());
@@ -1417,6 +1423,97 @@ yDp6g/51WjALM10lhGCQasE=
         );
         // The `.expect(0)` on the jwks mock is verified on drop: the
         // guard short-circuited before any request reached server B.
+    }
+
+    /// Multi-issuer path, per-hop binding: issuer A's JWKS fetch must not
+    /// follow a redirect to issuer **B**'s host — even though B is itself
+    /// an operator-configured, trusted issuer in the same repository.
+    ///
+    /// This is the test that proves the binding is **per request, not per
+    /// client**. `MultiIssuerJwksValidator` holds ONE `reqwest::Client`
+    /// for every configured issuer, so a client-level binding could not
+    /// name a host at all, and an issuer-set-level binding ("any trusted
+    /// issuer's host is fine") would admit exactly this hop. The binding
+    /// target is the URL *this* request was asked for, so A's fetch is
+    /// bound to A.
+    ///
+    /// **Guard isolation**: B serves a VALID JWKS under the same `kid`
+    /// the token presents, so following the hop would make the token
+    /// VALIDATE — key material for A sourced from B. B's mocks assert
+    /// ZERO hits, so "never reached" is asserted at B rather than
+    /// inferred from the deny reason.
+    #[tokio::test]
+    async fn validate_refuses_a_jwks_hop_from_one_issuer_to_another() {
+        // Issuer B — a complete, trusted issuer on a DIFFERENT host
+        // literal, serving keys that would satisfy the token.
+        let server_b = internal::start_server_on_foreign_loopback_host().await;
+        let base_b = server_b.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base_b,
+                "jwks_uri": format!("{base_b}/jwks"),
+            })))
+            .expect(0)
+            .mount(&server_b)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(jwks_body()))
+            .expect(0)
+            .mount(&server_b)
+            .await;
+
+        // Issuer A — declares a `jwks_uri` on its own host (so the
+        // pre-fetch binding passes), then redirects the fetch to B.
+        let server_a = MockServer::start().await;
+        let base_a = server_a.uri();
+        assert_ne!(
+            internal::host_of(&base_a),
+            internal::host_of(&base_b),
+            "the two issuers must sit on different host literals"
+        );
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base_a,
+                "jwks_uri": format!("{base_a}/jwks"),
+            })))
+            .mount(&server_a)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{base_b}/jwks").as_str()),
+            )
+            .expect(1)
+            .mount(&server_a)
+            .await;
+
+        // BOTH issuers are configured and trusted — one validator, one
+        // shared `http` client across the two.
+        let repo = StaticIssuerRepo::new(vec![
+            issuer("idp-a", &base_a, vec!["hort-server"], vec![JwtAlg::Rs256]),
+            issuer("idp-b", &base_b, vec!["hort-server"], vec![JwtAlg::Rs256]),
+        ]);
+        let v = validator(repo);
+
+        let claims = FederationTestClaims::defaults(&base_a, "hort-server");
+        let token = sign_rs256(&claims, DEFAULT_KID, TEST_PRIV_PEM);
+
+        let err = v
+            .validate_impl(&token)
+            .await
+            .expect_err("issuer A's fetch must not source keys from issuer B");
+        assert_eq!(
+            err,
+            FederationDenyReason::UnknownKid,
+            "an off-host jwks hop must reuse the existing federation \
+             JWKS-fetch deny classification, not a new variant"
+        );
+        server_b.verify().await;
+        server_a.verify().await;
     }
 
     #[tokio::test]
