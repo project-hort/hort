@@ -1654,6 +1654,41 @@ enum ExchangeClient<'m> {
     Shared,
 }
 
+/// The credential a bearer-token exchange is authorised to send — the
+/// mapping it belongs to plus where its bytes live, and **not** the
+/// bytes themselves.
+///
+/// A carrier rather than a bare `Option<&SecretRef>` for the same
+/// reason [`ExchangeClient`] is one rather than a `bool`: the arm that
+/// needs the mapping cannot be selected without it. Both fields are
+/// read only by the resolution in
+/// [`HttpUpstreamProxy::fetch_bearer_token`] — `secret_ref` to resolve,
+/// `mapping` for the `format` / `upstream` labels its two log lines
+/// carry.
+///
+/// **`Some` means a credential exists**, which is what lets
+/// `fetch_bearer_token` read `credential.is_some()` as "this exchange
+/// will carry the operator's secret" when it picks the client. A
+/// `&RepositoryUpstreamMapping` alone cannot say that — a mapping with
+/// no `secret_ref` is an anonymous exchange — so the only constructor
+/// is [`Self::for_mapping`], which answers that question once.
+#[derive(Clone, Copy, Debug)]
+struct RealmCredential<'m> {
+    mapping: &'m RepositoryUpstreamMapping,
+    secret_ref: &'m SecretRef,
+}
+
+impl<'m> RealmCredential<'m> {
+    /// `Some` iff `mapping` carries a `secret_ref` — the one condition
+    /// under which there is a credential to resolve at all.
+    fn for_mapping(mapping: &'m RepositoryUpstreamMapping) -> Option<Self> {
+        mapping.secret_ref.as_ref().map(|secret_ref| Self {
+            mapping,
+            secret_ref,
+        })
+    }
+}
+
 /// Whether the operator wrote `realm`'s host into
 /// `mapping.allowed_realm_hosts`.
 ///
@@ -1878,17 +1913,27 @@ impl HttpUpstreamProxy {
     /// Exchange a parsed `Challenge` for a bearer token at the
     /// realm endpoint.
     ///
-    /// `bearer_secret`, when supplied, carries the resolved bytes of
-    /// the mapping's `secret_ref`. By the GitHub PAT
-    /// convention adopted across GHCR / GitLab CR / Harbor, the
-    /// secret is sent to the realm as
+    /// `credential`, when supplied, names the mapping's `secret_ref`
+    /// — not its bytes. **This function resolves it, and it does so
+    /// only after every refusal is behind it**: the `https` scheme
+    /// gate, the routability gate and the client build below all run
+    /// first, and the operator's realm consent gate has already run in
+    /// the caller. A `SecretPort::resolve` is a traced access to the
+    /// operator's secret backend, so a refusal that followed one would
+    /// let an upstream drive reads of the operator's credential through
+    /// the `WWW-Authenticate` header it controls — and those reads look
+    /// like routine resolutions in the audit log.
+    ///
+    /// By the GitHub PAT convention adopted across GHCR / GitLab CR /
+    /// Harbor, the resolved secret is sent to the realm as
     /// `Authorization: Basic base64("oauth2:<secret>")` — the
     /// `oauth2` literal username matches GHCR's documented flow and
     /// is accepted by GitLab CR and Harbor as well. When
-    /// `bearer_secret` is `None` the realm is hit anonymously
+    /// `credential` is `None` the realm is hit anonymously
     /// (public-image flow). The `SecretValue` is consumed at
     /// header-format time and dropped (zeroized) before the realm
-    /// response is read.
+    /// response is read — the one `drop` in this function, and the only
+    /// one it needs, because no earlier return has a secret in scope.
     ///
     /// `on` names the client this exchange runs on — the caller's
     /// single decision, made once from the realm's origin (see
@@ -1906,7 +1951,7 @@ impl HttpUpstreamProxy {
         &self,
         challenge: &Challenge,
         on: ExchangeClient<'_>,
-        bearer_secret: Option<SecretValue>,
+        credential: Option<RealmCredential<'_>>,
     ) -> DomainResult<CachedToken> {
         // Build the realm URL with optional service/scope query
         // parameters. Use `Url::parse_with_params` only when at
@@ -1937,7 +1982,7 @@ impl HttpUpstreamProxy {
         // would otherwise cause the proxy to send
         // `Authorization: Basic base64(oauth2:<PAT>)` over plaintext.
         // Reject any non-`https` scheme BEFORE building the request
-        // and BEFORE the bearer_secret is touched.
+        // and BEFORE the credential is resolved.
         //
         // The one admitted exception is an address this crate's
         // test-allowlist seam carries — empty in production and matched
@@ -1947,18 +1992,16 @@ impl HttpUpstreamProxy {
         // `http://127.0.0.1:<port>` realm by seeding the seam, not by
         // weakening the rule. The invariant
         // (`realm="http://attacker/token"` rejected with `ParseError`
-        // BEFORE the bearer secret is touched) is preserved.
+        // BEFORE the credential is resolved) is preserved.
         if url.scheme() != "https" && !self.realm_is_test_allowlisted(&url) {
             tracing::error!(
                 realm = %challenge.realm,
                 scheme = %url.scheme(),
                 "rejecting realm with non-https scheme — credential will not be sent"
             );
-            // Drop the secret bytes immediately. `Zeroizing<Vec<u8>>`
-            // wipes the buffer on scope exit; an early `drop` here
-            // means a panic later in the same function cannot resurrect
-            // them.
-            drop(bearer_secret);
+            // Nothing to drop: the credential is still a `SecretRef`
+            // at this point, so this refusal cannot leave secret bytes
+            // behind for a later panic to resurrect.
             return Err(classified_error(
                 UpstreamErrorKind::ParseError,
                 &format!(
@@ -1978,7 +2021,7 @@ impl HttpUpstreamProxy {
         // the upstream-controlled `WWW-Authenticate` realm. Run the one
         // URL-validation routability predicate the artifact-fetch path
         // uses (`check_ssrf_safe_allowing` → `is_routable`) BEFORE the
-        // secret is touched, with this crate's test-allowlist seam
+        // credential is resolved, with this crate's test-allowlist seam
         // applied exactly as `dns_guard::GuardedDnsResolver::permit`
         // applies it — routable OR allowlisted. The seam is empty in
         // production, so every non-routable realm is refused there:
@@ -1991,34 +2034,34 @@ impl HttpUpstreamProxy {
                 error = %e,
                 "rejecting realm resolving to a non-routable host — credential will not be sent"
             );
-            drop(bearer_secret);
             return Err(classified_error(
                 UpstreamErrorKind::ParseError,
                 &format!("realm host is SSRF-blocked (non-routable): {e}"),
             ));
         }
 
-        // Resolve the client the caller selected. For
+        // Resolve the client the caller selected — the last question
+        // that can refuse this exchange. For
         // `ExchangeClient::PerMapping` this is the same
         // `client_for_mapping` resolution every content fetch performs
         // — the mapping's `ca_bundle_ref`, mTLS identity and
         // `pinned_cert_sha256` carry the request that is about to send
-        // `Authorization: Basic base64("oauth2:<secret>")`. It is
-        // resolved HERE, after both realm gates, so a failure cannot
-        // outlive the secret: the `drop` below precedes the `return`
-        // exactly as the two gates above do. A build failure keeps the
+        // `Authorization: Basic base64("oauth2:<secret>")`.
+        //
+        // It is resolved HERE, after both realm gates and before the
+        // resolution below, for the same reason `fetch_with_challenge`
+        // resolves the *content* request's client before
+        // `authorization_header`: a mapping whose TLS material cannot
+        // be resolved or parsed fails without the credential ever being
+        // read out of the `SecretPort`. A build failure keeps the
         // exchange's existing failure shape — `client_for_mapping`
         // returns an already-classified `DomainError`, and the caller
         // turns any `Err` from this function into
         // `hort_upstream_bearer_token_total{result="fetch_failed"}`.
+        // A plain `?` is all each arm needs: there is no secret in
+        // scope yet for an early return to leave behind.
         let client = match on {
-            ExchangeClient::PerMapping(mapping) => match self.client_for_mapping(mapping).await {
-                Ok(c) => c,
-                Err(e) => {
-                    drop(bearer_secret);
-                    return Err(e);
-                }
-            },
+            ExchangeClient::PerMapping(mapping) => self.client_for_mapping(mapping).await?,
             // A credentialed exchange at a foreign realm is the one the
             // operator's `allowed_realm_hosts` authorised, and it
             // authorised exactly one host. The hop that leaves that
@@ -2026,16 +2069,69 @@ impl HttpUpstreamProxy {
             // refuses it — without the binding the list is a front door
             // with an open window, since the allowed realm can answer
             // `302` and carry the exchange onward.
-            ExchangeClient::Shared if bearer_secret.is_some() => {
-                match self.origin_bound_exchange_client().await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        drop(bearer_secret);
-                        return Err(e);
-                    }
-                }
+            ExchangeClient::Shared if credential.is_some() => {
+                self.origin_bound_exchange_client().await?
             }
             ExchangeClient::Shared => self.client.clone(),
+        };
+
+        // ---- The credential is resolved HERE, and only here ----
+        //
+        // Every question that can refuse this exchange has now been
+        // answered: the `https` scheme gate, the routability gate and
+        // the client build above, plus — in `fetch_with_challenge`,
+        // which has the mapping and the parsed challenge in one frame —
+        // the operator's realm consent gate. A `SecretPort::resolve` is
+        // a traced access to the operator's secret backend (the
+        // adapter-side `hort_secret_resolve_total{result=…}` counter
+        // fires and the `info!` below names the source), so a refusal
+        // placed after one would let an upstream drive reads of the
+        // operator's credential out of Vault through the
+        // `WWW-Authenticate` header it controls, for requests hort then
+        // refuses — each read indistinguishable in the operator's audit
+        // log from a resolution that served a real fetch.
+        //
+        // The ordering is also why no refusal above has anything to
+        // `drop`: a gate cannot outlive a secret that does not exist
+        // yet. The single `drop` further down is the only one this
+        // function needs, and it drops a secret that by then is real.
+        //
+        // On `Err` do NOT anonymise — surface as `fetch_failed`
+        // (NetworkError-mapped). The `warn!` is at this layer for
+        // operator triage; the adapter-side
+        // `hort_secret_resolve_total{result=…}` counter already fires,
+        // and the caller's `Err` arm fires the one
+        // `hort_upstream_bearer_token_total{result="fetch_failed"}`
+        // increment this failure produces.
+        let bearer_secret: Option<SecretValue> = match credential {
+            None => None,
+            Some(RealmCredential {
+                mapping,
+                secret_ref,
+            }) => match self.secret_port.resolve(secret_ref).await {
+                Ok(value) => {
+                    tracing::info!(
+                        format = %self.config.format_label,
+                        upstream = %upstream_label(mapping),
+                        secret_source = secret_source_label(secret_ref.source),
+                        "resolved mapping credential"
+                    );
+                    Some(value)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        format = %self.config.format_label,
+                        upstream = %upstream_label(mapping),
+                        secret_source = secret_source_label(secret_ref.source),
+                        location = %secret_ref.location,
+                        "secret resolution failed for mapping with configured secret_ref"
+                    );
+                    return Err(classified_error(
+                        UpstreamErrorKind::NetworkError,
+                        &format!("SecretPort resolve failed: {e}"),
+                    ));
+                }
+            },
         };
 
         let mut req = client.get(url);
@@ -2299,20 +2395,23 @@ impl HttpUpstreamProxy {
     ///    invalidate.
     /// 4. The realm consent gate. A **credentialed** mapping whose
     ///    realm is a foreign origin the operator has not named in
-    ///    `allowed_realm_hosts` ends the exchange here — before step 5
-    ///    touches the `SecretPort`, so the secret is never resolved for
-    ///    a destination the operator did not consent to. An exchange
-    ///    with no credential is unaffected.
-    /// 5. Resolve credential bytes for realm. On `Err`, surface
-    ///    classified error (no silent anonymise).
-    /// 6. Exchange at realm, on the client the realm's own origin
+    ///    `allowed_realm_hosts` ends the exchange here — before
+    ///    anything has touched the `SecretPort`, so the secret is never
+    ///    resolved for a destination the operator did not consent to.
+    ///    An exchange with no credential is unaffected.
+    /// 5. Exchange at realm, on the client the realm's own origin
     ///    selects ([`ExchangeClient`]): the mapping's TLS posture when
     ///    the realm is the mapping's origin, the shared client when it
     ///    is not. A credentialed exchange at a foreign realm runs on
     ///    the origin-bound variant of the shared client, so the one
     ///    host the operator allowed cannot redirect the credential
-    ///    onward. Populate caches.
-    /// 7. Re-issue with new Bearer. A second 401 surfaces
+    ///    onward. What travels down is the mapping's
+    ///    [`RealmCredential`] — a reference, not resolved bytes;
+    ///    `fetch_bearer_token` performs the one `SecretPort::resolve`
+    ///    after its own two realm gates and its client build have
+    ///    passed, and surfaces a resolution `Err` as a classified
+    ///    error (no silent anonymise). Populate caches.
+    /// 6. Re-issue with new Bearer. A second 401 surfaces
     ///    `Unauthorized` (at-most-one challenge round invariant).
     ///
     /// # Why the client is resolved here and is not a parameter
@@ -2454,16 +2553,21 @@ impl HttpUpstreamProxy {
 
         // ---- The realm consent gate ----
         //
-        // The third realm gate, and the first of the three to run: a
-        // realm that the operator has not consented to ends the
-        // exchange HERE, before `SecretPort::resolve` below. Its two
-        // siblings — the `https` scheme gate and the routability gate —
-        // live in `fetch_bearer_token` and receive an already-resolved
-        // `SecretValue` they have to `drop`; this one is the only realm
-        // question answerable without the secret existing at all, so
-        // the earliest refusal is also the cheapest, and the secret is
-        // never read out of the port for a destination the operator did
-        // not name.
+        // The first of the three realm gates to run, and the only one
+        // that lives here: a realm the operator has not consented to
+        // ends the exchange HERE. Its two siblings — the `https` scheme
+        // gate and the routability gate — run inside
+        // `fetch_bearer_token`, ahead of the single
+        // `SecretPort::resolve` that function performs, so all three
+        // refusals precede the resolution and none of them reads the
+        // operator's credential out of the port for a destination it is
+        // about to refuse.
+        //
+        // This one stays here rather than joining its siblings because
+        // it is the operator's *consent* decision and needs `mapping`
+        // and the parsed challenge in one frame, which is this one.
+        // Pushing it down would put a consent question inside the
+        // function that performs the exchange.
         //
         // What the gate adds over its siblings: scheme and routability
         // bound *where* the credential may travel, not *to whom*. The
@@ -2544,49 +2648,22 @@ impl HttpUpstreamProxy {
             CredentialScope::ForeignOrigin => ExchangeClient::Shared,
         };
 
-        // Resolve credentials for the realm exchange via SecretPort.
-        // On Err do NOT anonymise — surface as fetch_failed
-        // (NetworkError-mapped). The `tracing::warn!` here is at the
-        // consumer layer for operator triage; the adapter-side
-        // `hort_secret_resolve_total{result=…}` counter already fires.
-        let bearer_secret: Option<SecretValue> = match mapping.secret_ref.as_ref() {
-            None => None,
-            Some(secret_ref) => match self.secret_port.resolve(secret_ref).await {
-                Ok(value) => {
-                    tracing::info!(
-                        format = %self.config.format_label,
-                        upstream = %upstream_label(mapping),
-                        secret_source = secret_source_label(secret_ref.source),
-                        "resolved mapping credential"
-                    );
-                    Some(value)
-                }
-                Err(e) => {
-                    metrics::counter!(
-                        METRIC_BEARER_TOKEN,
-                        "format" => self.config.format_label.clone(),
-                        "upstream" => upstream_label(mapping),
-                        "result" => RESULT_FETCH_FAILED,
-                    )
-                    .increment(1);
-                    tracing::warn!(
-                        format = %self.config.format_label,
-                        upstream = %upstream_label(mapping),
-                        secret_source = secret_source_label(secret_ref.source),
-                        location = %secret_ref.location,
-                        "secret resolution failed for mapping with configured secret_ref"
-                    );
-                    return Err(classified_error(
-                        UpstreamErrorKind::NetworkError,
-                        &format!("SecretPort resolve failed: {e}"),
-                    ));
-                }
-            },
-        };
-
-        // Run the realm exchange.
+        // Run the realm exchange. What travels down is the mapping's
+        // credential *reference*, not its bytes:
+        // `fetch_bearer_token` performs the one `SecretPort::resolve`
+        // after its own two realm gates and its client build have
+        // passed, so no realm refusal reads the operator's secret out
+        // of the port. A resolution failure returns `Err` from that
+        // call and lands in the arm below, which fires the same single
+        // `hort_upstream_bearer_token_total{…,result="fetch_failed"}`
+        // increment this failure has always produced — it must NOT
+        // anonymise, and the arm's `return` is what guarantees that.
         let cached = match self
-            .fetch_bearer_token(&challenge, exchange_client, bearer_secret)
+            .fetch_bearer_token(
+                &challenge,
+                exchange_client,
+                RealmCredential::for_mapping(mapping),
+            )
             .await
         {
             Ok(c) => c,
@@ -4382,9 +4459,17 @@ mod tests {
     /// seam is how the harness reaches its own realm; every other
     /// address keeps the production behaviour, which
     /// `empty_seam_refuses_an_http_loopback_realm_and_never_calls_it`
-    /// and its `https` sibling pin. The `SecretPort` is the
-    /// always-`Err` stub, so these tests either pass `None` or hand
-    /// `fetch_bearer_token` a `SecretValue` directly.
+    /// and its `https` sibling pin.
+    ///
+    /// The `SecretPort` is the always-`Err` stub. `fetch_bearer_token`
+    /// resolves the credential itself, so that is not incidental: a
+    /// test here either passes `None` (anonymous, the port is never
+    /// reached) or a [`RealmCredential`] the port refuses — which is
+    /// what makes the realm-refusal tests below pin the *ordering*. A
+    /// resolution placed ahead of a gate would surface this stub's
+    /// `NetworkError` instead of the `ParseError` they assert.
+    /// [`proxy_with_realm_seam_resolving`] is the variant for the one
+    /// test whose assertion is the credential on the wire.
     fn proxy_with_realm_seam(server: &MockServer) -> HttpUpstreamProxy {
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
@@ -4396,6 +4481,37 @@ mod tests {
             vec![*server.address()],
         )
         .unwrap()
+    }
+
+    /// [`proxy_with_realm_seam`] whose `SecretPort` resolves any ref to
+    /// `bytes` — for the one test whose assertion is the credential
+    /// that reaches the realm. `fetch_bearer_token` resolves the
+    /// mapping's `secret_ref` itself, so a test that wants a credential
+    /// on the wire has to give the proxy a port that can serve one.
+    fn proxy_with_realm_seam_resolving(server: &MockServer, bytes: &[u8]) -> HttpUpstreamProxy {
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(2),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            cfg,
+            Arc::new(FixedSecretPort {
+                bytes: bytes.to_vec(),
+            }),
+            vec![*server.address()],
+        )
+        .unwrap()
+    }
+
+    /// A `BearerChallenge` mapping on `upstream_url` carrying a
+    /// `secret_ref` — the input [`RealmCredential::for_mapping`] needs
+    /// to answer `Some`, which is how these tests hand
+    /// `fetch_bearer_token` a credential now that it will not take
+    /// resolved bytes.
+    fn realm_credential_mapping(upstream_url: &str) -> RepositoryUpstreamMapping {
+        let mut m = mapping(upstream_url, "", UpstreamAuth::BearerChallenge);
+        m.secret_ref = Some(secret_ref_env("HORT_REALM_EXCHANGE_TEST"));
+        m
     }
 
     #[tokio::test]
@@ -4526,7 +4642,12 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let proxy = proxy_with_realm_seam(&server);
+        // The proxy's own `SecretPort` serves the bytes now — the
+        // exchange resolves the mapping's `secret_ref` itself rather
+        // than being handed a `SecretValue`. The `Authorization` the
+        // realm must see is unchanged: `base64("oauth2:secret-bytes")`.
+        let proxy = proxy_with_realm_seam_resolving(&server, b"secret-bytes");
+        let m = realm_credential_mapping(&server.uri());
         let challenge = Challenge {
             realm: format!("{}/realm", server.uri()),
             service: None,
@@ -4536,7 +4657,7 @@ mod tests {
             .fetch_bearer_token(
                 &challenge,
                 ExchangeClient::Shared,
-                Some(SecretValue::from_bytes(b"secret-bytes".to_vec())),
+                RealmCredential::for_mapping(&m),
             )
             .await
             .unwrap();
@@ -4669,14 +4790,19 @@ mod tests {
             service: Some("svc".into()),
             scope: Some("repository:foo:pull".into()),
         };
-        // Construct a SecretValue so the test would-also-fail-loud if
-        // the implementation forwards the secret to the (non-https)
-        // realm. The bytes must NOT appear on any wire — there is no
-        // wire to send them on, but the regression-test discipline is
-        // the same: the guard runs before the credential is touched.
-        let secret = SecretValue::from_bytes(b"would-be-leaked-PAT".to_vec());
+        // Hand the exchange a credential so the test fails loud on a
+        // gate placed after the resolution: this proxy's `SecretPort`
+        // always `Err`s, so an exchange that resolved first would
+        // surface `NetworkError` here instead of the `ParseError`
+        // asserted below. The guard runs before the credential is
+        // resolved at all, so no bytes are ever drawn out of the port.
+        let m = realm_credential_mapping("https://registry.example.com");
         let err = proxy
-            .fetch_bearer_token(&challenge, ExchangeClient::Shared, Some(secret))
+            .fetch_bearer_token(
+                &challenge,
+                ExchangeClient::Shared,
+                RealmCredential::for_mapping(&m),
+            )
             .await
             .err()
             .expect("http:// realm must be rejected");
@@ -4711,9 +4837,13 @@ mod tests {
             service: Some("svc".into()),
             scope: Some("repository:foo:pull".into()),
         };
-        let secret = SecretValue::from_bytes(b"would-be-leaked-PAT".to_vec());
+        let m = realm_credential_mapping("https://registry.example.com");
         let err = proxy
-            .fetch_bearer_token(&challenge, ExchangeClient::Shared, Some(secret))
+            .fetch_bearer_token(
+                &challenge,
+                ExchangeClient::Shared,
+                RealmCredential::for_mapping(&m),
+            )
             .await
             .err()
             .expect("non-routable realm must be rejected before sending the credential");
@@ -4768,9 +4898,13 @@ mod tests {
             service: Some("svc".into()),
             scope: Some("repository:foo:pull".into()),
         };
-        let secret = SecretValue::from_bytes(b"would-be-leaked-PAT".to_vec());
+        let m = realm_credential_mapping(&realm.uri());
         let err = proxy
-            .fetch_bearer_token(&challenge, ExchangeClient::Shared, Some(secret))
+            .fetch_bearer_token(
+                &challenge,
+                ExchangeClient::Shared,
+                RealmCredential::for_mapping(&m),
+            )
             .await
             .err()
             .expect("an http:// loopback realm must be refused on the production seam");
@@ -4827,9 +4961,13 @@ mod tests {
             service: Some("svc".into()),
             scope: Some("repository:foo:pull".into()),
         };
-        let secret = SecretValue::from_bytes(b"would-be-leaked-PAT".to_vec());
+        let m = realm_credential_mapping(&realm.uri());
         let err = proxy
-            .fetch_bearer_token(&challenge, ExchangeClient::Shared, Some(secret))
+            .fetch_bearer_token(
+                &challenge,
+                ExchangeClient::Shared,
+                RealmCredential::for_mapping(&m),
+            )
             .await
             .err()
             .expect("an https loopback realm must be refused on the production seam");
@@ -5547,7 +5685,18 @@ mod tests {
             timeout: Duration::from_secs(2),
             ..HttpUpstreamProxyConfig::new("oci")
         };
-        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AlwaysNone)).unwrap();
+        // Seeded seam. The realm `challenge_header` advertises is
+        // `http://127.0.0.1:<port>`, which the scheme gate refuses on
+        // the production (empty) seam — and that refusal would preempt
+        // the resolution failure this test is about, since the gates
+        // now run first. Seeding the seam makes the broken `SecretPort`
+        // the only thing left that can end the exchange.
+        let proxy = HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            cfg,
+            Arc::new(AlwaysNone),
+            vec![*server.address()],
+        )
+        .unwrap();
         let mut m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
         m.secret_ref = Some(SecretRef {
             source: SecretSource::EnvVar,
@@ -5598,7 +5747,18 @@ mod tests {
             timeout: Duration::from_secs(2),
             ..HttpUpstreamProxyConfig::new("oci")
         };
-        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AlwaysErr)).unwrap();
+        // Seeded seam. The realm `challenge_header` advertises is
+        // `http://127.0.0.1:<port>`, which the scheme gate refuses on
+        // the production (empty) seam — and that refusal would preempt
+        // the resolution failure this test is about, since the gates
+        // now run first. Seeding the seam makes the broken `SecretPort`
+        // the only thing left that can end the exchange.
+        let proxy = HttpUpstreamProxy::new_with_redirect_test_allowlist(
+            cfg,
+            Arc::new(AlwaysErr),
+            vec![*server.address()],
+        )
+        .unwrap();
         let mut m = mapping(&server.uri(), "", UpstreamAuth::BearerChallenge);
         m.secret_ref = Some(SecretRef {
             source: SecretSource::File,
@@ -9565,8 +9725,13 @@ mod tests {
     /// secret was **never read** rather than inferring it from an error
     /// string. That assertion is what pins the gate's ordering: a gate
     /// that refused after resolving would produce the same `Err`.
+    ///
+    /// `fail` makes every resolution `Err` while still counting it —
+    /// the broken-secret-backend case, where "it was asked exactly
+    /// once" is as much of the observation as the failure itself.
     struct CountingSecretPort {
         resolves: Arc<AtomicUsize>,
+        fail: bool,
     }
     impl SecretPort for CountingSecretPort {
         fn resolve<'a>(
@@ -9574,7 +9739,14 @@ mod tests {
             _reference: &'a SecretRef,
         ) -> BoxFuture<'a, DomainResult<SecretValue>> {
             self.resolves.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move { Ok(SecretValue::from_bytes(b"hunter2".to_vec())) })
+            let fail = self.fail;
+            Box::pin(async move {
+                if fail {
+                    Err(DomainError::Invariant("secret backend unavailable".into()))
+                } else {
+                    Ok(SecretValue::from_bytes(b"hunter2".to_vec()))
+                }
+            })
         }
     }
 
@@ -9583,6 +9755,19 @@ mod tests {
     /// scheme and routability gates would otherwise refuse it first and
     /// the test would be observing the wrong refusal.
     fn counting_realm_proxy(allow: &[SocketAddr]) -> (HttpUpstreamProxy, Arc<AtomicUsize>) {
+        realm_proxy_counting_resolves(allow, false)
+    }
+
+    /// [`counting_realm_proxy`] whose every resolution fails — a
+    /// credentialed mapping pointed at a secret backend that is down.
+    fn failing_realm_proxy(allow: &[SocketAddr]) -> (HttpUpstreamProxy, Arc<AtomicUsize>) {
+        realm_proxy_counting_resolves(allow, true)
+    }
+
+    fn realm_proxy_counting_resolves(
+        allow: &[SocketAddr],
+        fail: bool,
+    ) -> (HttpUpstreamProxy, Arc<AtomicUsize>) {
         let resolves = Arc::new(AtomicUsize::new(0));
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(5),
@@ -9592,6 +9777,7 @@ mod tests {
             cfg,
             Arc::new(CountingSecretPort {
                 resolves: resolves.clone(),
+                fail,
             }),
             allow.to_vec(),
         )
@@ -9946,6 +10132,187 @@ mod tests {
             .await
             .expect("a realm's own canonicalising redirect must still follow");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // ===================================================================
+    // Every realm refusal precedes the one `SecretPort::resolve`
+    // ===================================================================
+    //
+    // A `SecretPort::resolve` is a **traced access** to the operator's
+    // secret backend: the adapter fires
+    // `hort_secret_resolve_total{result=…}` and the proxy logs an
+    // `info!` naming the secret's source. So an exchange that resolves
+    // and only then refuses the realm lets an upstream drive reads of
+    // the operator's credential out of Vault — as often as it likes,
+    // through the `WWW-Authenticate` header it controls, for requests
+    // hort then refuses — with each read indistinguishable from a
+    // routine resolution in the operator's audit log.
+    //
+    // Three refusals can end a credentialed exchange, and the assertion
+    // for each is the same one: the counting `SecretPort` was asked
+    // **zero** times. An `Err` alone cannot tell the orderings apart,
+    // and neither can an untouched realm.
+    //
+    //   1. the operator did not allow the realm host —
+    //      `an_unlisted_off_origin_realm_is_refused_before_the_secret_is_resolved`
+    //      above, which also serves as this set's control: it shares
+    //      this stub and this harness, and the `… completes_the_dance
+    //      _with_the_credential` test beside it observes the same stub
+    //      counting to exactly 1, so a zero here is a refusal and not a
+    //      stub that never counts.
+    //   2. the realm is plaintext — below.
+    //   3. the realm is non-routable — below.
+    //
+    // Both tests below list the realm's host in `allowedRealmHosts` so
+    // gate 1 passes: what refuses them has to be the gate each one
+    // names, and the error message assertion pins which.
+    // ===================================================================
+
+    /// The realm is `http://`, so the credential would travel in
+    /// plaintext. Refused — and the secret is never read out of the
+    /// port, which is the claim a classification-only assertion cannot
+    /// make.
+    #[tokio::test]
+    async fn a_plaintext_realm_is_refused_before_the_secret_is_resolved() {
+        let upstream = MockServer::start().await;
+        let realm_host = server_on_foreign_loopback_host().await;
+        mount_realm(&realm_host, 0).await;
+        // `uri()` is `http://127.0.0.2:<port>`, and the seam below
+        // carries only the upstream — so the scheme gate refuses.
+        let url = mount_challenge_only(&upstream, &format!("{}/realm", realm_host.uri())).await;
+
+        let (proxy, resolves) = counting_realm_proxy(&[*upstream.address()]);
+        let mut m = credentialed_bearer_mapping(&upstream.uri());
+        m.allowed_realm_hosts = vec!["127.0.0.2".into()];
+
+        let err = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect_err("a plaintext realm must not receive the credential");
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            0,
+            "the credential must never be read out of the SecretPort for a \
+             realm that cannot carry it — a refusal placed after the \
+             resolution returns this same error while still handing the \
+             upstream a read of the operator's secret per 401"
+        );
+        assert!(
+            err.to_string().contains("realm URL must be https"),
+            "the scheme gate must be the refusal: got {err}"
+        );
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "got {err}"
+        );
+        assert!(
+            realm_host.received_requests().await.unwrap().is_empty(),
+            "the realm must observe nothing"
+        );
+    }
+
+    /// The realm is `https` but its host is non-routable (here a
+    /// loopback literal on the production-empty seam; in production the
+    /// class includes IMDS `169.254.169.254` and RFC1918). Refused, and
+    /// again no resolution.
+    #[tokio::test]
+    async fn a_non_routable_realm_is_refused_before_the_secret_is_resolved() {
+        let upstream = MockServer::start().await;
+        let realm_host = server_on_foreign_loopback_host().await;
+        mount_realm(&realm_host, 0).await;
+        // `https` on the realm's own address: the scheme gate passes
+        // and only the routability gate can refuse, which is what the
+        // message assertion below pins.
+        let url = mount_challenge_only(
+            &upstream,
+            &format!("https://{}/realm", realm_host.address()),
+        )
+        .await;
+
+        let (proxy, resolves) = counting_realm_proxy(&[*upstream.address()]);
+        let mut m = credentialed_bearer_mapping(&upstream.uri());
+        m.allowed_realm_hosts = vec!["127.0.0.2".into()];
+
+        let err = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect_err("a non-routable realm must not receive the credential");
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            0,
+            "an SSRF-blocked realm is refused before the credential is \
+             resolved, so an upstream naming IMDS cannot drive reads of \
+             the operator's secret"
+        );
+        assert!(
+            err.to_string().contains("realm host is SSRF-blocked"),
+            "the routability gate must be the refusal: got {err}"
+        );
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "a non-routable realm is a content-validation refusal, not a \
+             transport failure; got {err}"
+        );
+        assert!(
+            realm_host.received_requests().await.unwrap().is_empty(),
+            "the realm must observe nothing"
+        );
+    }
+
+    /// The other half of the contract the hoist must not disturb: once
+    /// every gate has passed, a resolution that *fails* surfaces as
+    /// `fetch_failed` (`NetworkError`-classified) and the exchange does
+    /// **not** fall back to hitting the realm anonymously. Operator-
+    /// wired secret resolution is fail-fast.
+    ///
+    /// The realm here is live, listed and reachable through the seam, so
+    /// "no anonymous exchange happened" is observed at the realm
+    /// (`.expect(0)` plus the explicit read) rather than inferred from
+    /// the returned error — an anonymous fallback would have produced a
+    /// token and a `200`, not an `Err`, so the error alone would say it
+    /// too; the point is that nothing reached the realm at all.
+    #[tokio::test]
+    async fn a_resolution_failure_surfaces_fetch_failed_and_never_anonymises() {
+        let upstream = MockServer::start().await;
+        let realm_host = server_on_foreign_loopback_host().await;
+        mount_realm(&realm_host, 0).await;
+        mount_bearer_retry(&upstream).await;
+        let url = mount_challenge_only(&upstream, &format!("{}/realm", realm_host.uri())).await;
+
+        let (proxy, resolves) = failing_realm_proxy(&[*upstream.address(), *realm_host.address()]);
+        let mut m = credentialed_bearer_mapping(&upstream.uri());
+        m.allowed_realm_hosts = vec!["127.0.0.2".into()];
+
+        let err = proxy
+            .fetch_with_challenge(&m, &url, "blob", &[])
+            .await
+            .expect_err("a failed secret resolution must not be anonymised away");
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::NetworkError),
+            "a secret-backend failure is an infrastructure-dependency \
+             failure, and the caller turns this `Err` into \
+             `hort_upstream_bearer_token_total{{result=\"fetch_failed\"}}`; \
+             got {err}"
+        );
+        assert!(
+            err.to_string().contains("SecretPort resolve failed"),
+            "the resolution must be what failed: got {err}"
+        );
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            1,
+            "asked exactly once — there is no retry and no second \
+             resolution path"
+        );
+        assert!(
+            realm_host.received_requests().await.unwrap().is_empty(),
+            "the realm must see no request at all after the failure — an \
+             anonymous retry here would silently downgrade a credentialed \
+             upstream to a public one"
+        );
     }
 
     // ===================================================================
