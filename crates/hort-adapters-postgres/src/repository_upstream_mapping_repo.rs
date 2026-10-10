@@ -68,6 +68,7 @@ const SELECT_COLS: &str = r#"
     upstream_auth_type, secret_ref, managed_by, managed_by_digest,
     insecure_upstream_url, trust_upstream_publish_time,
     mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
+    allowed_realm_hosts,
     created_at, updated_at
 "#;
 
@@ -139,6 +140,11 @@ struct UpstreamMappingRow {
     mtls_key_ref: Option<serde_json::Value>,
     ca_bundle_ref: Option<serde_json::Value>,
     pinned_cert_sha256: Option<String>,
+    /// Hosts the operator consents to as the realm of a credentialed
+    /// bearer-challenge exchange. `NOT NULL DEFAULT '{}'` in the
+    /// schema, so an absent allowance decodes as the empty list rather
+    /// than as `None`-means-what.
+    allowed_realm_hosts: Vec<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -229,6 +235,7 @@ fn row_to_mapping(row: UpstreamMappingRow) -> DomainResult<RepositoryUpstreamMap
         mtls_key_ref,
         ca_bundle_ref,
         pinned_cert_sha256: row.pinned_cert_sha256,
+        allowed_realm_hosts: row.allowed_realm_hosts,
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
@@ -304,10 +311,11 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                        managed_by, managed_by_digest,
                        insecure_upstream_url, trust_upstream_publish_time,
                        mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
+                       allowed_realm_hosts,
                        created_at, updated_at
                    ) VALUES (
                        $1, $2, $3, $4, $5, $6, $7, 'local', NULL, $8, $9,
-                       $10, $11, $12, $13, $14, $15
+                       $10, $11, $12, $13, $14, $15, $16
                    )
                    ON CONFLICT (repository_id, path_prefix) DO UPDATE SET
                        upstream_url                = EXCLUDED.upstream_url,
@@ -322,6 +330,7 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
                        mtls_key_ref                = EXCLUDED.mtls_key_ref,
                        ca_bundle_ref               = EXCLUDED.ca_bundle_ref,
                        pinned_cert_sha256          = EXCLUDED.pinned_cert_sha256,
+                       allowed_realm_hosts         = EXCLUDED.allowed_realm_hosts,
                        updated_at                  = NOW()"#,
             )
             .bind(mapping.id)
@@ -337,6 +346,7 @@ impl RepositoryUpstreamMappingRepository for PgRepositoryUpstreamMappingRepo {
             .bind(mtls_key_ref_json)
             .bind(ca_bundle_ref_json)
             .bind(mapping.pinned_cert_sha256.as_deref())
+            .bind(mapping.allowed_realm_hosts.as_slice())
             .bind(mapping.created_at)
             .bind(mapping.updated_at)
             .execute(&self.pool)
@@ -470,10 +480,11 @@ where
                upstream_auth_type, secret_ref,
                managed_by, managed_by_digest,
                insecure_upstream_url, trust_upstream_publish_time,
-               mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256
+               mtls_cert_ref, mtls_key_ref, ca_bundle_ref, pinned_cert_sha256,
+               allowed_realm_hosts
            ) VALUES (
                $1, $2, $3, $4, $5, $6, $7, 'gitops', $8, $9, $10,
-               $11, $12, $13, $14
+               $11, $12, $13, $14, $15
            )
            ON CONFLICT (repository_id, path_prefix) DO UPDATE SET
                upstream_url                = EXCLUDED.upstream_url,
@@ -488,6 +499,7 @@ where
                mtls_key_ref                = EXCLUDED.mtls_key_ref,
                ca_bundle_ref               = EXCLUDED.ca_bundle_ref,
                pinned_cert_sha256          = EXCLUDED.pinned_cert_sha256,
+               allowed_realm_hosts         = EXCLUDED.allowed_realm_hosts,
                updated_at                  = NOW()"#,
     )
     .bind(mapping.id)
@@ -504,6 +516,7 @@ where
     .bind(mtls_key_ref_json)
     .bind(ca_bundle_ref_json)
     .bind(mapping.pinned_cert_sha256.as_deref())
+    .bind(mapping.allowed_realm_hosts.as_slice())
     .execute(exec)
     .await
     .map_err(|e| {
@@ -651,6 +664,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -758,6 +772,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -790,6 +805,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -1677,6 +1693,231 @@ mod tests {
             row.trust_upstream_publish_time,
             "save_managed must persist trust_upstream_publish_time"
         );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Column-to-field threading for `allowed_realm_hosts`, DB-free.
+    /// The schema's `NOT NULL DEFAULT '{}'` means an undeclared
+    /// allowance decodes as the empty list, never as an absent value a
+    /// consumer has to interpret.
+    #[test]
+    fn row_to_mapping_preserves_allowed_realm_hosts() {
+        let mut row = synthetic_row(None);
+        row.upstream_auth_type = AUTH_BEARER_CHALLENGE.into();
+        row.allowed_realm_hosts = vec!["auth.docker.io".into(), "gitlab.example.com".into()];
+        let m = row_to_mapping(row).expect("decode must succeed");
+        assert_eq!(
+            m.allowed_realm_hosts,
+            vec![
+                "auth.docker.io".to_string(),
+                "gitlab.example.com".to_string()
+            ]
+        );
+    }
+
+    /// The domain constructor is the last line of defence on the read
+    /// path too: a row that reached the table with an allowance on an
+    /// auth type that has no realm (out-of-band SQL bypassing the
+    /// schema CHECK) surfaces as a typed `DomainError::Validation`
+    /// rather than becoming a mapping the fetch path reads an
+    /// unenforceable list off.
+    #[test]
+    fn row_to_mapping_rejects_realm_hosts_on_an_auth_type_with_no_realm() {
+        let mut row = synthetic_row(None);
+        assert_eq!(row.upstream_auth_type, AUTH_ANONYMOUS);
+        row.allowed_realm_hosts = vec!["auth.docker.io".into()];
+        let err = row_to_mapping(row).expect_err("anonymous has no realm");
+        assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+    }
+
+    /// Round-trip through the `managed_by = 'gitops'` write — the only
+    /// production writer of this column — and back out through
+    /// `list_managed_by_gitops`, which is the query the fetch path's
+    /// resolver cache is filled from.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn save_managed_round_trips_allowed_realm_hosts() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgRepositoryUpstreamMappingRepo::new(pool.clone());
+
+        let mut m = make_managed_mapping(
+            repo,
+            "",
+            "https://upstream.example.com",
+            UpstreamAuth::BearerChallenge,
+            [0x5a; 32],
+        );
+        m.allowed_realm_hosts = vec!["auth.docker.io".into(), "gitlab.example.com".into()];
+        save_managed_in_tx(&pool, &m).await.expect("save_managed");
+
+        let listed = adapter.list_managed_by_gitops().await.unwrap();
+        let row = listed
+            .into_iter()
+            .find(|r| r.repository_id == repo)
+            .expect("seeded gitops row must be listed");
+        assert_eq!(
+            row.allowed_realm_hosts,
+            vec![
+                "auth.docker.io".to_string(),
+                "gitlab.example.com".to_string()
+            ],
+            "save_managed must persist allowed_realm_hosts in order"
+        );
+
+        // And the allowance can be withdrawn: an empty list on a
+        // re-apply clears the column rather than leaving the previous
+        // allowance in force.
+        m.allowed_realm_hosts.clear();
+        save_managed_in_tx(&pool, &m).await.expect("re-save");
+        let listed = adapter.list_managed_by_gitops().await.unwrap();
+        let row = listed
+            .into_iter()
+            .find(|r| r.repository_id == repo)
+            .expect("row still listed");
+        assert!(
+            row.allowed_realm_hosts.is_empty(),
+            "withdrawing the allowance must clear the column"
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// Round-trip through the `managed_by = 'local'` upsert, the other
+    /// writer on this port.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn allowed_realm_hosts_round_trips_through_upsert() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let adapter = PgRepositoryUpstreamMappingRepo::new(pool.clone());
+
+        let mut m = make_managed_mapping(
+            repo,
+            "",
+            "https://upstream.example.com",
+            UpstreamAuth::BearerChallenge,
+            [0x5b; 32],
+        );
+        m.managed_by = ManagedBy::Local;
+        m.managed_by_digest = None;
+        m.allowed_realm_hosts = vec!["auth.docker.io".into()];
+        adapter.upsert(m).await.expect("upsert");
+
+        let listed = adapter.list_for_repository(repo).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].allowed_realm_hosts,
+            vec!["auth.docker.io".to_string()]
+        );
+
+        cleanup_repo(&pool, repo).await;
+    }
+
+    /// The schema CHECKs mirror the value object, so out-of-band SQL
+    /// cannot write an allowance the fetch path would read and could
+    /// never act on. Two independent guards: the per-entry hostname
+    /// form, and "only `bearer_challenge` has a realm".
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn check_constraint_rejects_malformed_allowed_realm_hosts() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+
+        for (hosts, auth, reason) in [
+            (vec!["https://auth.docker.io"], "bearer_challenge", "scheme"),
+            (vec!["auth.docker.io:443"], "bearer_challenge", "port"),
+            (vec!["auth.docker.io/token"], "bearer_challenge", "path"),
+            (vec![""], "bearer_challenge", "empty entry"),
+            (vec!["auth..docker.io"], "bearer_challenge", "empty label"),
+            (vec![".auth.docker.io"], "bearer_challenge", "leading dot"),
+            (
+                vec!["-auth.docker.io"],
+                "bearer_challenge",
+                "leading hyphen",
+            ),
+            (
+                vec!["auth.docker.io-"],
+                "bearer_challenge",
+                "trailing hyphen",
+            ),
+            (
+                vec!["ok.example", "bad:443"],
+                "bearer_challenge",
+                "one bad entry among good ones",
+            ),
+            (
+                vec!["auth.docker.io"],
+                "anonymous",
+                "an auth type with no realm",
+            ),
+            (
+                vec!["auth.docker.io"],
+                "basic",
+                "an auth type with no realm",
+            ),
+        ] {
+            let res = sqlx::query(
+                r#"INSERT INTO repository_upstream_mappings (
+                       id, repository_id, path_prefix, upstream_url,
+                       upstream_auth_type, allowed_realm_hosts
+                   ) VALUES ($1, $2, $3, $4, $5, $6)"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(format!("ck-{}", Uuid::new_v4().simple()))
+            .bind("https://registry.example.com")
+            .bind(auth)
+            .bind(&hosts)
+            .execute(&pool)
+            .await;
+            assert!(
+                res.is_err(),
+                "DB CHECK must reject allowed_realm_hosts={hosts:?} on \
+                 auth `{auth}` ({reason})"
+            );
+        }
+
+        // Counter-assertion: the guards are not rejecting everything.
+        // A bare hostname on a `bearer_challenge` row inserts cleanly,
+        // and so does the empty list on every auth type.
+        sqlx::query(
+            r#"INSERT INTO repository_upstream_mappings (
+                   id, repository_id, path_prefix, upstream_url,
+                   upstream_auth_type, allowed_realm_hosts
+               ) VALUES ($1, $2, $3, $4, 'bearer_challenge', $5)"#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(repo)
+        .bind(format!("ok-{}", Uuid::new_v4().simple()))
+        .bind("https://registry.example.com")
+        .bind(vec!["auth.docker.io".to_string(), "a".to_string()])
+        .execute(&pool)
+        .await
+        .expect("a bare hostname list on bearer_challenge must insert");
+        for auth in ["anonymous", "bearer_challenge"] {
+            sqlx::query(
+                r#"INSERT INTO repository_upstream_mappings (
+                       id, repository_id, path_prefix, upstream_url,
+                       upstream_auth_type, allowed_realm_hosts
+                   ) VALUES ($1, $2, $3, $4, $5, '{}')"#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(repo)
+            .bind(format!("ok-{}", Uuid::new_v4().simple()))
+            .bind("https://registry.example.com")
+            .bind(auth)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the empty list must insert on `{auth}`: {e}"));
+        }
 
         cleanup_repo(&pool, repo).await;
     }

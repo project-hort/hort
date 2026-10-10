@@ -2,7 +2,8 @@ use base64::Engine as _;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::format_handler::{
-    DependencySpec, FormatHandler, MetadataStrategy, VersionDiscovery,
+    require_https_metadata_url, DependencySpec, FormatHandler, MetadataStrategy,
+    MetadataUrlSubject, VersionDiscovery,
 };
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{
@@ -941,11 +942,13 @@ impl VersionDiscovery for NpmFormatHandler {
     /// checksum walk is — the 50 MiB packument never lands in a
     /// `serde_json::Value` tree), under the streaming plausibility cap.
     ///
-    /// The URL must be `https://` — `http://`, a missing scheme, or any
-    /// other scheme is rejected as `Validation` so no downgrade target is
-    /// ever promoted to a fetch URL. Error taxonomy mirrors the checksum
-    /// walk: missing-version-in-coords, no-versions-object,
-    /// version-not-found, missing-`dist.tarball`, non-https, input-size cap.
+    /// The scheme rule is not spelled here: the resolved URL goes through
+    /// [`require_https_metadata_url`], the one definition of "a
+    /// metadata-supplied download URL must be `https://`", so this method
+    /// and every other consumer of that rule refuse the same set for the
+    /// same reason. Error taxonomy mirrors the checksum walk:
+    /// missing-version-in-coords, no-versions-object, version-not-found,
+    /// missing-`dist.tarball`, non-https, input-size cap.
     fn resolve_download_url_from_metadata(
         &self,
         body: &mut dyn std::io::Read,
@@ -995,11 +998,7 @@ impl VersionDiscovery for NpmFormatHandler {
             }
         };
 
-        if !tarball.starts_with("https://") {
-            return Err(DomainError::Validation(format!(
-                "upstream npm returned non-https tarball URL: {tarball}"
-            )));
-        }
+        require_https_metadata_url(&tarball, MetadataUrlSubject::NpmTarballUrl)?;
 
         Ok(tarball)
     }
@@ -1101,11 +1100,11 @@ fn encode_npm_purl_name(name: &str) -> String {
 /// canonical shape on `registry.npmjs.org` is
 /// `https://registry.npmjs.org/{pkg}/-/{pkg}-{version}.tgz`, but mirrors and
 /// scoped packages produce other valid origins; the only invariant enforced
-/// here is the `https://` prefix.
+/// on the origin is the scheme.
 ///
-/// The URL is required to begin with `https://`. `http://`, missing scheme,
-/// or any other scheme is rejected as a `Validation` error so we never
-/// promote a downgrade-attack target to a fetch URL.
+/// That scheme check is [`require_https_metadata_url`] — the single
+/// definition of the rule, shared with every other consumer of a
+/// metadata-supplied download URL rather than re-spelled here.
 ///
 /// `max_bytes` is the per-format input-size ceiling. The caller must pass
 /// [`NpmFormatHandler::metadata_expected_max_bytes`]; the parameter is
@@ -1169,11 +1168,7 @@ pub fn extract_upstream_tarball_url(
             ))
         })?;
 
-    if !tarball.starts_with("https://") {
-        return Err(DomainError::Validation(format!(
-            "upstream npm returned non-https tarball URL: {tarball}"
-        )));
-    }
+    require_https_metadata_url(tarball, MetadataUrlSubject::NpmTarballUrl)?;
 
     Ok(tarball.to_string())
 }

@@ -26,6 +26,85 @@ pub enum MetadataStrategy {
     HashReference { inline_threshold_bytes: usize },
 }
 
+// ---------------------------------------------------------------------------
+// The https rule for a metadata-supplied download URL
+// ---------------------------------------------------------------------------
+
+/// Which upstream-metadata field a download URL was recovered from — the
+/// context [`require_https_metadata_url`] needs in order to say what it
+/// refused.
+///
+/// A closed set rather than two `&str` parameters: the refusal wording is
+/// part of the contract the wire mapping and the operator-facing logs read,
+/// and a caller that could pass any string could spell it differently at
+/// each site. That divergence is the whole failure this rule exists to end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataUrlSubject {
+    /// PyPI's per-version JSON manifest `urls[].url`.
+    PypiFileUrl,
+    /// npm's packument `versions[<version>].dist.tarball`.
+    NpmTarballUrl,
+}
+
+impl MetadataUrlSubject {
+    /// The refusal clause, rendered into
+    /// `upstream {clause}: {url}`. Each arm reproduces verbatim the
+    /// message its format's call sites produced before they shared one
+    /// rule, so no log search or wire assertion changes.
+    fn refusal_clause(self) -> &'static str {
+        match self {
+            Self::PypiFileUrl => "PyPI returned non-https URL",
+            Self::NpmTarballUrl => "npm returned non-https tarball URL",
+        }
+    }
+}
+
+/// **The** https rule for a download URL recovered from upstream metadata:
+/// a URL that is not `https://` is never promoted to a fetch URL.
+///
+/// `http://`, a missing scheme, and any other scheme are all refused as
+/// [`DomainError::Validation`] — the error type every call site already
+/// produced, so the per-format wire mappings
+/// (`UpstreamPullError::TarballUrlInvalid` → 502, PyPI's
+/// `ParseError` → 502) are untouched.
+///
+/// # Why this lives in the domain layer
+///
+/// The rule has three kinds of consumer and they sit in three different
+/// crates: the format handlers that parse the metadata
+/// (`hort-formats`), the inbound adapters that re-derive the URL off their
+/// own projections (`hort-http-npm`, `hort-http-pypi`), and the
+/// application layer's prefetch task handlers, which resolve the same URL
+/// with no request behind them (`hort-app`). ADR 0008 forbids `hort-app`
+/// depending on an `hort-http-*` crate, so a format crate cannot host it;
+/// the rule is a pure, I/O-free predicate over a string, so the domain
+/// layer — which every one of those three already depends on — can.
+///
+/// All five copies of this check that lived at call sites are gone, and
+/// `crates/hort-app/tests/https_rule_is_single_sourced.rs` is what keeps
+/// the next one from appearing: the consumer that had no copy was
+/// precisely the one with no request behind it, which is how the gap
+/// stayed invisible.
+///
+/// # Scope — what this rule is NOT
+///
+/// It governs a URL that arrived inside an **upstream metadata document**.
+/// It is not the operator-declared-configuration rule
+/// (`hort-config`'s `upstream_url` / `issuer_url` validation), and it is
+/// not an "is this an absolute URL?" test — cargo's index `dl` field
+/// deliberately admits `http://` today, and promoting that to an
+/// https-only rule would be a new operator contract rather than the
+/// closing of a gap.
+pub fn require_https_metadata_url(url: &str, subject: MetadataUrlSubject) -> DomainResult<()> {
+    if url.starts_with("https://") {
+        return Ok(());
+    }
+    Err(DomainError::Validation(format!(
+        "upstream {}: {url}",
+        subject.refusal_clause()
+    )))
+}
+
 /// Discovering a format's upstream-published versions and resolving their
 /// download URLs — the **VersionDiscovery** capability group (ADR 0005).
 ///
@@ -988,6 +1067,103 @@ mod tests {
     use super::*;
     use crate::entities::repository::RepositoryFormat;
     use crate::types::ArtifactCoords;
+
+    // -- require_https_metadata_url -----------------------------------------
+
+    /// An `https://` URL passes for every subject. The rule is about the
+    /// scheme and nothing else — host, port, path and query are the
+    /// upstream's business.
+    #[test]
+    fn https_metadata_url_is_accepted_for_every_subject() {
+        for subject in [
+            MetadataUrlSubject::PypiFileUrl,
+            MetadataUrlSubject::NpmTarballUrl,
+        ] {
+            assert!(require_https_metadata_url(
+                "https://files.pythonhosted.org/packages/ab/x-1.0.tar.gz",
+                subject
+            )
+            .is_ok());
+            assert!(require_https_metadata_url("https://h:8443/a?b=c#d", subject).is_ok());
+        }
+    }
+
+    /// The two refusal messages are reproduced verbatim from the call
+    /// sites that each used to spell their own copy of this check. They
+    /// are what operators grep for and what the per-format wire mappings
+    /// carry into a 502 `cause`, so they are part of the contract — not
+    /// incidental wording.
+    #[test]
+    fn non_https_metadata_url_is_refused_with_the_format_s_own_wording() {
+        let err = require_https_metadata_url(
+            "http://insecure/x-1.0.tar.gz",
+            MetadataUrlSubject::PypiFileUrl,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert_eq!(
+            err.to_string(),
+            DomainError::Validation(
+                "upstream PyPI returned non-https URL: http://insecure/x-1.0.tar.gz".to_string()
+            )
+            .to_string()
+        );
+
+        let err = require_https_metadata_url(
+            "http://insecure/x/-/x-1.0.0.tgz",
+            MetadataUrlSubject::NpmTarballUrl,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert_eq!(
+            err.to_string(),
+            DomainError::Validation(
+                "upstream npm returned non-https tarball URL: http://insecure/x/-/x-1.0.0.tgz"
+                    .to_string()
+            )
+            .to_string()
+        );
+    }
+
+    /// Not just `http://`: a missing scheme, a protocol-relative URL, a
+    /// non-web scheme and the empty string are all refused. A prefix test
+    /// is only safe if "anything that is not https" is the refused set —
+    /// `//evil/x` and `x.tgz` resolve against whatever base the fetching
+    /// client happens to hold.
+    #[test]
+    fn every_non_https_shape_is_refused_not_only_http() {
+        for url in [
+            "",
+            "x-1.0.tar.gz",
+            "//files.example/x-1.0.tar.gz",
+            "ftp://files.example/x-1.0.tar.gz",
+            "file:///etc/passwd",
+            "HTTPS://files.example/x-1.0.tar.gz",
+            " https://files.example/x-1.0.tar.gz",
+        ] {
+            assert!(
+                require_https_metadata_url(url, MetadataUrlSubject::PypiFileUrl).is_err(),
+                "{url:?} must be refused"
+            );
+        }
+    }
+
+    /// The subject enum is a closed set with distinct renderings, so a
+    /// future third format cannot silently inherit another's wording.
+    #[test]
+    fn metadata_url_subjects_render_distinctly() {
+        assert_ne!(
+            MetadataUrlSubject::PypiFileUrl.refusal_clause(),
+            MetadataUrlSubject::NpmTarballUrl.refusal_clause()
+        );
+        assert_ne!(
+            MetadataUrlSubject::PypiFileUrl,
+            MetadataUrlSubject::NpmTarballUrl
+        );
+        let copied = MetadataUrlSubject::NpmTarballUrl;
+        assert_eq!(copied, MetadataUrlSubject::NpmTarballUrl);
+        let _ = format!("{copied:?}");
+    }
 
     /// Compile-time assertion that `FormatHandler` is dyn-compatible.
     #[test]

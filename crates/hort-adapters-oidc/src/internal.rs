@@ -6,13 +6,17 @@
 //! - [`build_http_client`] — the canonical `reqwest::Client` builder used
 //!   by every OIDC outbound HTTP request. Centralises:
 //!   - extra-CA-bundle layering (ADR 0010),
-//!   - redirect cap of 3 hops,
+//!   - the redirect policy: every hop stays on the host of the URL the
+//!     fetch was asked for, within a cap of 3 hops
+//!     ([`same_host_redirect_policy`]),
 //!   - per-client timeout,
 //!   - TLS version pin: TLS 1.3 preferred, TLS 1.2 accepted
 //!     (BSI TR-02102-2, ADR 0010).
 //! - [`get_capped_body`] — streaming GET with a hard byte cap on the
 //!   response body (closes the OOM vector where a malicious or
 //!   misconfigured IdP returns an unbounded body).
+//! - [`hosts_match`] — the crate's single host-equality predicate, shared
+//!   by the pre-fetch `jwks_uri` binding and the per-hop redirect binding.
 //! - [`HTTP_DEFAULT_TIMEOUT`] / [`HTTP_MAX_REDIRECTS`] /
 //!   [`OUTBOUND_TLS_MIN_VERSION`] / [`OUTBOUND_TLS_MAX_VERSION`] —
 //!   constants shared across both adapters.
@@ -34,6 +38,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use hort_config::ExtraTrustAnchors;
+use tracing::warn;
 
 use crate::extra_ca::{self, ExtraCaApplyError};
 
@@ -51,6 +56,10 @@ pub(crate) const HTTP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Three hops is enough for a legitimate proxy / canonicalising rewrite
 /// at the IdP and tight enough to refuse a redirect-storm attack.
 /// reqwest's default of 10 is too generous.
+///
+/// The cap bounds *how many* hops; it says nothing about *where* they
+/// point — that is [`same_host_redirect_policy`]'s host leg, which the
+/// cap is nested inside. Neither property substitutes for the other.
 pub(crate) const HTTP_MAX_REDIRECTS: usize = 3;
 
 /// Outbound TLS version floor — pinned to TLS 1.2 per BSI TR-02102-2 §3
@@ -65,10 +74,145 @@ pub(crate) const OUTBOUND_TLS_MIN_VERSION: reqwest::tls::Version = reqwest::tls:
 /// Outbound TLS version ceiling — TLS 1.3.
 pub(crate) const OUTBOUND_TLS_MAX_VERSION: reqwest::tls::Version = reqwest::tls::Version::TLS_1_3;
 
-/// Build the canonical OIDC `reqwest::Client` with extra-CA, redirect cap,
-/// timeout, and TLS-version pin all layered consistently. Used by both
-/// the `OidcProvider` (single-issuer user-login) and the
-/// `MultiIssuerJwksValidator` (workload federation).
+/// The crate's single host-equality predicate.
+///
+/// Both OIDC host bindings ask the same question, so they are one
+/// comparison with one rationale:
+///
+/// 1. [`check_jwks_uri_bound`] — does the discovery-declared `jwks_uri`
+///    sit on the issuer's host?
+/// 2. [`same_host_redirect_policy`] — does this redirect hop sit on the
+///    host of the URL the fetch was asked for?
+///
+/// Two host comparisons with the same intent is how the two halves of one
+/// property drift apart; there is exactly one here, with exactly two call
+/// sites.
+///
+/// **Hosts, not URLs.** A legitimate discovery document, or an IdP's own
+/// internal rewrite, may serve the same host on a different scheme, port
+/// or path — a *different host* is the vector. Callers therefore pass
+/// parsed `Url::host_str()` values, never raw URL strings.
+///
+/// **Case-insensitive.** `url::Url` already lower-cases registered domain
+/// names during parsing; `eq_ignore_ascii_case` on top means an IDNA /
+/// mixed-case edge cannot slip a near-miss host through.
+fn hosts_match(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// The OIDC redirect policy: **every hop stays on the host of the URL the
+/// fetch was asked for**, within [`HTTP_MAX_REDIRECTS`] hops.
+///
+/// # Why the hop cap alone was not enough
+///
+/// [`check_jwks_uri_bound`] binds the discovery-*declared* `jwks_uri` to
+/// the issuer's host, but it can only see a URL — it cannot see a
+/// redirect. A bare `Policy::limited(n)` is the mirror image: it counts
+/// hops and is blind to hosts. So a `302` from the issuer's own host (or
+/// from anything that can answer for it) moved the fetch to any host at
+/// all within the cap, and the keys that decide every token's validity
+/// were then read from there. Neither half owned the property; this
+/// policy owns it across the two.
+///
+/// # Both OIDC fetches are covered
+///
+/// Discovery *and* JWKS go out on the client built by
+/// [`build_http_client`] — [`get_capped_body`] on the multi-issuer path,
+/// `OidcProvider::get_capped_body` on the single-issuer one — so one
+/// policy covers both, and that is deliberate rather than incidental.
+/// Discovery matters as much as JWKS: the discovery document is what
+/// *declares* `jwks_uri`, the token endpoint and the rest, so a discovery
+/// response fetched from a foreign host is an attacker-authored
+/// description of the issuer.
+///
+/// # Per request, not per client
+///
+/// The binding target is `attempt.previous().first()` — the URL **this
+/// request** was asked for — not a host baked into the client at build
+/// time. reqwest clones its redirect state per request (`tower_http`'s
+/// `FollowRedirect::call` clones the policy, so the chain a closure sees
+/// belongs to one request), which is what makes a single shared client
+/// correct for many issuers: `MultiIssuerJwksValidator` holds ONE `http`
+/// for every configured issuer, and issuer A's fetch is bound to A's own
+/// host without A's identity ever reaching this closure. A client-level
+/// or issuer-set-level binding could not express that — the issuer set is
+/// all operator-configured, so a set-level binding would happily source
+/// A's key material from B.
+///
+/// # Outcome shape
+///
+/// A cross-host attempt fails the redirect with [`reqwest::Error`] of kind
+/// `Redirect`, so the caller's `send().await` returns `Err` and
+/// [`get_capped_body`] classifies it as [`CappedBodyError::FetchFailed`] —
+/// which both paths already map onto their existing JWKS-fetch rejection
+/// (single-issuer → `OidcValidationError::IdpUnavailable`; multi-issuer →
+/// `FederationDenyReason::UnknownKid`). No new error variant, no new
+/// metric, no new wire shape.
+///
+/// Failing the redirect is load-bearing and NOT interchangeable with
+/// `Attempt::stop()`: `stop()` hands the 3xx back as a successful
+/// response, and `Response::error_for_status()` errors only on 4xx/5xx —
+/// a 3xx passes it. The refusal would then reach the body parser, be
+/// reported as a parse error rather than a fetch failure, and the
+/// redirect response's own body would be read as if it were the discovery
+/// document or the JWKS.
+///
+/// The hop cap is unchanged and still reqwest's own
+/// `Policy::limited(HTTP_MAX_REDIRECTS)`, delegated to below via the
+/// documented `Policy::redirect` wrapping hook — same construction, same
+/// `TooManyRedirects` error. The two refusals are distinguishable by how
+/// deep the chain got: a cross-host refusal stops at the first hop, a cap
+/// breach only after three were followed.
+///
+/// # No routability leg
+///
+/// A hop that stays on the issuer's host is exactly as internal as the
+/// issuer itself, and in the canonical deployment the IdP *is* internal
+/// (Keycloak in-cluster on an RFC 1918 address) — so an address-based
+/// control rejects the operator's own issuer and nothing else. See
+/// [`check_jwks_uri_bound`]'s `# Why no routability leg`. A redirect to a
+/// *different* internal service is precisely what the same-host binding
+/// refuses, without consulting an address.
+fn same_host_redirect_policy() -> reqwest::redirect::Policy {
+    let hop_cap = reqwest::redirect::Policy::limited(HTTP_MAX_REDIRECTS);
+    reqwest::redirect::Policy::custom(move |attempt| {
+        // `previous()[0]` is the URL the caller asked for; the entries
+        // after it are the hops already taken. A chain with no origin to
+        // bind to, or a hop URL with no host component, fails closed.
+        let requested_host = attempt.previous().first().and_then(|u| u.host_str());
+        let redirect_host = attempt.url().host_str();
+        let on_requested_host = match (requested_host, redirect_host) {
+            (Some(requested), Some(next)) => hosts_match(requested, next),
+            _ => false,
+        };
+        if !on_requested_host {
+            // reqwest's `Display` for a redirect error prints only
+            // "error following redirect for url (...)" — the cause lives
+            // in `source()` — so without this line the operator cannot
+            // tell a host refusal from a cap breach. Mirrors the
+            // `warn!` both call sites already emit for the pre-fetch
+            // `jwks_uri` rejection. Hosts only, so nothing upstream-
+            // controlled beyond a hostname reaches the log; no credential
+            // ever rides an OIDC discovery/JWKS fetch in the first place.
+            warn!(
+                requested_host,
+                redirect_host, "oidc fetch refused a redirect off the requested host"
+            );
+            // The cause rides as the `source()` of a `Redirect`-kind
+            // `reqwest::Error`, the same place reqwest puts its own
+            // `TooManyRedirects` — not as a new variant on any error type
+            // this crate exposes.
+            return attempt.error("redirect target is not on the requested host");
+        }
+        hop_cap.redirect(attempt)
+    })
+}
+
+/// Build the canonical OIDC `reqwest::Client` with extra-CA, the same-host
+/// redirect policy (host binding + 3-hop cap), timeout, and TLS-version
+/// pin all layered consistently. Used by both the `OidcProvider`
+/// (single-issuer user-login) and the `MultiIssuerJwksValidator`
+/// (workload federation).
 ///
 /// `extra_trust_anchors`: when `Some`, every certificate in the bundle is
 /// added to the underlying trust store via
@@ -93,7 +237,7 @@ pub(crate) fn build_http_client(
         extra_ca::apply_to_reqwest_builder(reqwest::Client::builder(), extra_trust_anchors)?;
     builder
         .timeout(HTTP_DEFAULT_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::limited(HTTP_MAX_REDIRECTS))
+        .redirect(same_host_redirect_policy())
         .min_tls_version(OUTBOUND_TLS_MIN_VERSION)
         .max_tls_version(OUTBOUND_TLS_MAX_VERSION)
         .build()
@@ -209,17 +353,24 @@ pub(crate) enum JwksUriCheckError {
 /// their own existing JWKS-fetch error classification.
 ///
 /// The check is **additive**: it runs in addition to — and does not
-/// weaken — the TLS-version pin and redirect cap layered by
-/// [`build_http_client`]. One control, before the fetch:
+/// weaken — the TLS-version pin and the same-host redirect policy layered
+/// by [`build_http_client`]. One control, before the fetch:
 ///
 /// **Same-host binding.** `jwks_uri`'s HOST must equal `issuer_url`'s
-/// HOST, compared case-insensitively per URL host semantics. We compare
-/// the parsed `host_str()` values (hostnames), NOT the raw URL strings —
-/// a discovery document legitimately serves `jwks_uri` on a different
-/// scheme/port/path than the issuer URL, but a *different host* is the
-/// SSRF vector. `url::Url::host_str` already lower-cases registered
-/// domain names during parsing; we additionally `eq_ignore_ascii_case`
-/// so an IDNA / mixed-case edge cannot slip a near-miss host through.
+/// HOST, via the crate's one host predicate [`hosts_match`] — which
+/// documents why the comparison is host-only and case-insensitive, and is
+/// the same predicate [`same_host_redirect_policy`] applies per hop.
+///
+/// # What this check does and does not reach
+///
+/// It binds the *declared* URL. It cannot see a redirect — by the time a
+/// `302` arrives the fetch is already in flight. The property "the JWKS
+/// is read from the issuer's host" is therefore owned by two controls
+/// together, and both are required:
+///
+/// 1. this function, on the URL the discovery document declares, and
+/// 2. [`same_host_redirect_policy`], on every hop of the fetch that
+///    follows.
 ///
 /// # Why no routability leg
 ///
@@ -230,11 +381,13 @@ pub(crate) enum JwksUriCheckError {
 /// internal (Keycloak in-cluster at an RFC 1918 address): the legitimate
 /// issuer's own host resolves internally, so the routability leg rejected
 /// every auth attempt with `idp_unavailable`. Given the same-host binding
-/// — which pins the fetch to the issuer's own host, so a compromised
-/// discovery document cannot redirect it to an arbitrary internal service
-/// — `is_routable` only ever rejects the operator's own trusted issuer
-/// host for negligible security benefit. Same-host binding is the
-/// load-bearing SSRF control; routability is not.
+/// — which, together with the per-hop binding in
+/// [`same_host_redirect_policy`], pins the fetch to the issuer's own host
+/// so a compromised discovery document can redirect it neither by
+/// declaration nor by `Location` header — `is_routable` only ever rejects
+/// the operator's own trusted issuer host for negligible security
+/// benefit. Same-host binding is the load-bearing SSRF control;
+/// routability is not.
 ///
 /// The function does no I/O, so it is synchronous.
 pub(crate) fn check_jwks_uri_bound(
@@ -254,7 +407,8 @@ pub(crate) fn check_jwks_uri_bound(
         .ok_or_else(|| JwksUriCheckError::Unparsable("jwks_uri has no host component".into()))?;
 
     // ----- Same-host binding (the load-bearing SSRF control) ---------------
-    if !issuer_host.eq_ignore_ascii_case(jwks_host) {
+    // One predicate, shared with the per-hop redirect binding.
+    if !hosts_match(issuer_host, jwks_host) {
         return Err(JwksUriCheckError::OffHost {
             issuer_host: issuer_host.to_string(),
             jwks_host: jwks_host.to_string(),
@@ -272,6 +426,38 @@ pub(crate) fn check_jwks_uri_bound(
     }
 
     Ok(())
+}
+
+/// Test-only: stand up a wiremock on a loopback host literal DIFFERENT
+/// from the `127.0.0.1` that `MockServer::start()` uses, so a redirect
+/// across host literals has a genuinely LIVE target. Both suites'
+/// hop-binding tests bind to it, which is why it lives here rather than
+/// twice.
+///
+/// `127.0.0.2` is the same loopback interface as `127.0.0.1`, so a hop to
+/// it would land; the only thing that refuses it is the host literal in
+/// the `Location` header — exactly the thing an attacker controls. No DNS
+/// is involved, so the test does not depend on how `localhost` resolves.
+#[cfg(test)]
+pub(crate) async fn start_server_on_foreign_loopback_host() -> wiremock::MockServer {
+    let listener = std::net::TcpListener::bind("127.0.0.2:0")
+        .expect("127.0.0.2 is loopback — binding it must succeed");
+    wiremock::MockServer::builder()
+        .listener(listener)
+        .start()
+        .await
+}
+
+/// Test-only: the host literal of a mock server's base URI, so a test can
+/// assert that two servers differ (or agree) on the one thing the hop
+/// binding looks at.
+#[cfg(test)]
+pub(crate) fn host_of(uri: &str) -> String {
+    url::Url::parse(uri)
+        .expect("mock server uri parses")
+        .host_str()
+        .expect("mock server uri has a host")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -370,6 +556,100 @@ mod tests {
             .await
             .expect_err("5xx must surface as FetchFailed");
         assert!(matches!(err, CappedBodyError::FetchFailed(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // `same_host_redirect_policy`: every hop stays on the host of the URL
+    // the fetch was asked for. Asserted at the helper boundary, so the
+    // classification (`CappedBodyError::FetchFailed`) is pinned where both
+    // adapters consume it. The foreign target is a LIVE wiremock on
+    // `127.0.0.2` carrying `.expect(0)`.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_capped_body_refuses_a_redirect_off_the_requested_host() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let foreign = start_server_on_foreign_loopback_host().await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("foreign-body"))
+            .expect(0)
+            .mount(&foreign)
+            .await;
+
+        let server = MockServer::start().await;
+        assert_ne!(
+            host_of(&server.uri()),
+            host_of(&foreign.uri()),
+            "the two mock servers must sit on different host literals"
+        );
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/keys", foreign.uri()).as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_http_client(None).expect("client builds");
+        let err = get_capped_body(&client, &format!("{}/keys", server.uri()), 1024)
+            .await
+            .expect_err("a hop off the requested host must be refused");
+        match err {
+            CappedBodyError::FetchFailed(detail) => {
+                // The refusal FAILS the redirect, so it arrives on the
+                // `send()` error path. It must not arrive as a response:
+                // `error_for_status()` passes a 3xx, so an
+                // `Attempt::stop()` here would hand the redirect's own
+                // body to the JWKS/discovery parser and report the
+                // refusal as a parse error.
+                assert!(
+                    detail.starts_with("request failed:"),
+                    "off-host refusal must surface on the send() error path, got: {detail}"
+                );
+                assert!(
+                    detail.contains("error following redirect"),
+                    "the failure must be reqwest's redirect kind, got: {detail}"
+                );
+            }
+            other => panic!("expected FetchFailed, got {other:?}"),
+        }
+        foreign.verify().await;
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_capped_body_follows_a_same_host_redirect() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/keys"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/keys/live", server.uri()).as_str()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/keys/live"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("same-host-body"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_http_client(None).expect("client builds");
+        let out = get_capped_body(&client, &format!("{}/keys", server.uri()), 1024)
+            .await
+            .expect("a same-host redirect must still be followed");
+        assert_eq!(&out[..], b"same-host-body");
+        server.verify().await;
     }
 
     // -----------------------------------------------------------------

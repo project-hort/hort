@@ -393,6 +393,12 @@ fn build_upstream_mapping_from_spec(
         mtls_key_ref: env.spec.mtls_key_ref.clone(),
         ca_bundle_ref: env.spec.ca_bundle_ref.clone(),
         pinned_cert_sha256: env.spec.pinned_cert_sha256.clone(),
+        // Hosts the operator consents to as the realm of a credentialed
+        // bearer-challenge exchange. Carried through verbatim; the
+        // per-envelope validator has already rejected a non-hostname
+        // entry and a non-`bearer_challenge` mapping that declares any,
+        // and the value-object constructor below re-checks both.
+        allowed_realm_hosts: env.spec.allowed_realm_hosts.clone(),
         created_at: now,
         updated_at: now,
     })?;
@@ -1016,6 +1022,7 @@ mod tests {
                 mtls_key_ref: spec.mtls_key_ref,
                 ca_bundle_ref: spec.ca_bundle_ref,
                 pinned_cert_sha256: spec.pinned_cert_sha256,
+                allowed_realm_hosts: Vec::new(),
                 created_at: now,
                 updated_at: now,
             })?;
@@ -1271,5 +1278,88 @@ mod tests {
         h.uc.preflight_validate(&desired, &env_oidc())
             .await
             .expect_err("the boot preflight must refuse the same bundle");
+    }
+
+    /// End-to-end through the apply: a `bearer_challenge` mapping
+    /// declaring `allowedRealmHosts` lands with that list on the
+    /// persisted row. This is the half that makes the field non-inert —
+    /// the adapter's realm consent gate reads exactly this list off
+    /// exactly this row (ADR 0015).
+    #[tokio::test]
+    async fn apply_upstream_mapping_threads_allowed_realm_hosts_to_persisted_row() {
+        let h = build_harness();
+        let mut mapping_env = upstream_mapping_env(
+            "oci-mirror-dockerhub",
+            "oci-mirror-e2e",
+            "dockerhub/",
+            "https://registry-1.docker.io",
+        );
+        mapping_env.spec.auth.r#type = "bearer_challenge".into();
+        mapping_env.spec.allowed_realm_hosts = vec!["auth.docker.io".into()];
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+            upstream_mappings: vec![mapping_env],
+            ..Default::default()
+        };
+
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+
+        let listed = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].allowed_realm_hosts,
+            vec!["auth.docker.io".to_string()],
+            "the apply pipeline must thread allowedRealmHosts through to \
+             the row the fetch path reads"
+        );
+    }
+
+    /// The default: a mapping that declares nothing lands with an empty
+    /// list, which is what keeps every in-repo `bearer_challenge`
+    /// mapping (four of them Docker Hub, all credential-free) working
+    /// untouched.
+    #[tokio::test]
+    async fn apply_upstream_mapping_defaults_allowed_realm_hosts_to_empty() {
+        let h = build_harness();
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-mirror-e2e", "proxy")],
+            upstream_mappings: vec![upstream_mapping_env(
+                "oci-mirror-dockerhub",
+                "oci-mirror-e2e",
+                "dockerhub/",
+                "https://registry-1.docker.io",
+            )],
+            ..Default::default()
+        };
+
+        h.uc.apply(desired, env_oidc()).await.unwrap();
+
+        let listed = h.upstream.list_managed_by_gitops().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].allowed_realm_hosts.is_empty(),
+            "an undeclared allowance is the empty list, not a surprise"
+        );
+    }
+
+    /// The constructor is the apply's last line of defence: a spec that
+    /// somehow reached stage 3 with an allowance on an auth type that
+    /// has no realm is refused there, not written. The per-envelope
+    /// validator rejects it first (`hort-config`'s
+    /// `validate_allowed_realm_hosts`); this asserts the re-check so a
+    /// future bypass of validate_* surfaces as a refused apply rather
+    /// than as a row nothing enforces.
+    #[test]
+    fn build_upstream_mapping_from_spec_rejects_realm_hosts_without_a_realm() {
+        let mut env = upstream_mapping_env("u", "r", "", "https://registry.example.com");
+        assert_eq!(env.spec.auth.r#type, "anonymous");
+        env.spec.allowed_realm_hosts = vec!["auth.docker.io".into()];
+        let err =
+            build_upstream_mapping_from_spec(&env, Uuid::new_v4(), Uuid::new_v4(), &[7u8; 32])
+                .expect_err("anonymous has no realm to allow");
+        assert!(
+            err.to_string().contains("allowed_realm_hosts"),
+            "the refusal must name the field; got {err}"
+        );
     }
 }

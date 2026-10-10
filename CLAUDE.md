@@ -329,13 +329,15 @@ cargo deny check                                           # advisories+bans+lic
 It runs the full local suite — every crate's `--lib` unit tests AND every
 `tests/` integration target. DB-gated tests self-skip without `DATABASE_URL`,
 so no database is needed: a bare `cargo test --workspace` runs every DB-free
-test and early-returns from the rest (measured: 12,368 passed / 9 ignored /
-0 failed, identical to the same command *with* `DATABASE_URL` set).
+test and early-returns from the rest (measured 2026-10-10 on
+`agent/343-audit-block-5`: 13,086 passed / 10 ignored / 0 failed, identical to
+the same command *with* `DATABASE_URL` set — the totals move with every test
+added, so re-measure rather than quoting these).
 **A self-skipped DB-gated test reports `ok`, not `ignored`** — libtest has no
 dynamic-ignore verdict, so the skip is an early `return` from a test that counts
 as passed. The `ignored` column therefore says nothing about how many DB tests
-ran: none of those 9 is DB-gated (5 slow-seeding, 2 broker test-infra TODOs,
-2 doc-tests). An earlier wording here promised
+ran: none of those 10 is DB-gated (5 slow-seeding, 2 broker test-infra TODOs,
+3 doc-tests). An earlier wording here promised
 `ignored, requires DATABASE_URL`; that described the pre-self-skip `#[ignore]`
 world, which the conversion to runtime self-skip retired.
 
@@ -437,7 +439,22 @@ allow-list**. Carries a counter-assertion pinning the two known production
 implementations by type and file, so renaming the port, the method or the
 reader cannot make it vacuously green. Blind spot: a `get` that delegates the
 wrap to a helper reads as unverified — a false positive, and a review
-conversation about where the wrap belongs) are pure
+conversation about where the wrap belongs),
+`https_rule_is_single_sourced` (pins that "a download URL recovered from an
+upstream metadata document must be `https://`" has exactly one definition,
+`hort_domain::ports::format_handler::require_https_metadata_url`, by
+rejecting every other https-exclusive scheme comparison in the
+upstream-metadata → fetch pipeline — `hort-domain`, `hort-formats`,
+`hort-http-*`, `hort-app`, scoped by ADR 0008's layering rather than
+enumerated, with **no allow-list** and counter-assertions on both the
+definition and the per-file call-site census, because the rule had been
+re-typed per consumer five times and the sixth consumer, the autonomous
+prefetch path with no 502 behind it, carried no copy at all. A statement
+that also names `http://` is an "is this absolute?" test and deliberately
+not a hit, which is what keeps cargo's `http://`-tolerant index `dl` field
+out of scope; blind spots are a comparison assembled through a macro or
+spelled on a parsed `Url::scheme()` instead of a string prefix, and a sixth
+copy landing in a crate outside the pipeline) are pure
 source-/fixture-scan guards — no database, sub-second — enforcing structural invariants that a
 rename or a stray `use` silently breaks. (A stale keyspace registry once shipped
 undetected because the gate then ran only `--lib`.) Because `cargo test --workspace`

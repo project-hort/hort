@@ -26,6 +26,12 @@
 //!                                     # mapping so a single internal
 //!                                     # plaintext mirror does not silently
 //!                                     # widen posture for other upstreams.
+//!   # allowedRealmHosts:              # hosts that may be named as the
+//!   #   - auth.docker.io              # WWW-Authenticate realm of a
+//!                                     # CREDENTIALED bearer_challenge
+//!                                     # exchange. Bare hostnames; the
+//!                                     # mapping's own origin is always
+//!                                     # allowed and is never listed.
 //! ```
 //!
 //! # Identity
@@ -38,6 +44,7 @@
 
 use std::path::Path;
 
+use hort_domain::ports::repository_upstream_mapping_repository::allowed_realm_host_reason;
 use hort_domain::ports::secret_port::SecretRef;
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +156,32 @@ pub struct UpstreamMappingSpec {
     /// construction time; the schema CHECK mirrors the same regex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_cert_sha256: Option<String>,
+    /// Hosts that may be named as the `WWW-Authenticate` realm of a
+    /// **credentialed** bearer-challenge exchange, in addition to this
+    /// mapping's own origin (always allowed, never listed here).
+    /// Default empty.
+    ///
+    /// Bare hostnames only — no scheme, no port, no path. Each entry is
+    /// checked by the domain's `allowed_realm_host_reason`, the same
+    /// function the value-object constructor calls, so this validator
+    /// and the constructor cannot drift.
+    ///
+    /// The realm arrives verbatim in the upstream's response header, so
+    /// it is upstream-controlled data, and the exchange is the request
+    /// that carries `Authorization: Basic base64("oauth2:<secret>")`.
+    /// The adapter's gate applies this list **iff** [`Self::secret_ref`]
+    /// is set: an anonymous exchange has no credential to leak and keeps
+    /// the scheme + routability gates alone, which is why an empty list
+    /// is a safe default for every public-registry proxy.
+    ///
+    /// Rejected at apply time on a mapping whose `auth.type` is not
+    /// `bearer_challenge` — nothing there can ever read it
+    /// ([ADR 0015](../../docs/adr/0015-apply-time-linter-inert-fields-and-naming.md)).
+    /// **Accepted** on a `bearer_challenge` mapping with no
+    /// `secretRef`: that consumer exists and reads the list the moment
+    /// a secret is added, so the field is conditional, not inert.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_realm_hosts: Vec<String>,
 }
 
 /// `serde(skip_serializing_if)` predicate for the default-`false`
@@ -342,6 +375,58 @@ fn validate_tls_material(spec: &UpstreamMappingSpec, name: &str) -> Vec<Validati
     errors
 }
 
+/// Gitops-side realm-allowlist validation. Two rules, both mirrors of
+/// `RepositoryUpstreamMapping::new`:
+///
+///  1. the list is only readable on a `bearer_challenge` mapping, so a
+///     non-empty list on any other `auth.type` is rejected rather than
+///     accepted-and-ignored (ADR 0015);
+///  2. every entry is a bare hostname.
+///
+/// Rule 2 calls the domain's own [`allowed_realm_host_reason`] rather
+/// than restating it. The sibling mirrors on this type
+/// (`validate_upstream_name_prefix`, [`validate_tls_material`]) are
+/// hand-maintained copies kept honest by an agreement corpus; the
+/// failure they exist to prevent is a YAML that validates clean and then
+/// fails inside the constructor, and sharing the function removes that
+/// surface rather than testing for it.
+///
+/// A mapping with no `secretRef` is **not** rejected. The field's
+/// consumer is the credentialed realm exchange, which comes into being
+/// the moment a secret is added to the same mapping; refusing the
+/// allowance until then would force the operator to land the credential
+/// and the allowance in two applies, with the first of them being the
+/// one that fails closed at fetch time.
+fn validate_allowed_realm_hosts(spec: &UpstreamMappingSpec, name: &str) -> Vec<ValidationError> {
+    let kind = Kind::UpstreamMapping;
+    let mut errors = Vec::new();
+    if spec.allowed_realm_hosts.is_empty() {
+        return errors;
+    }
+    if spec.auth.r#type != AUTH_BEARER_CHALLENGE {
+        errors.push(ValidationError::Invalid {
+            kind,
+            name: name.to_string(),
+            detail: format!(
+                "spec.allowedRealmHosts is only read on an `auth.type: \
+                 {AUTH_BEARER_CHALLENGE}` mapping — the realm it names exists \
+                 only in that flow. Drop the field, or switch auth.type to \
+                 {AUTH_BEARER_CHALLENGE}."
+            ),
+        });
+    }
+    for host in &spec.allowed_realm_hosts {
+        if let Some(reason) = allowed_realm_host_reason(host) {
+            errors.push(ValidationError::Invalid {
+                kind,
+                name: name.to_string(),
+                detail: format!("spec.allowedRealmHosts: {reason}"),
+            });
+        }
+    }
+    errors
+}
+
 /// Per-spec validation. Returns every violation rather than first-wins.
 pub fn validate_upstream_mapping(env: &Envelope<UpstreamMappingSpec>) -> Vec<ValidationError> {
     let mut errors = Vec::new();
@@ -435,6 +520,12 @@ pub fn validate_upstream_mapping(env: &Envelope<UpstreamMappingSpec>) -> Vec<Val
     // decidable from one envelope, so per-spec validation is the earliest
     // place the verdict exists and the only one that is provably pre-write.
     errors.extend(validate_tls_material(&env.spec, &name));
+
+    // Realm allowlist — same pre-write reasoning as the TLS mirror
+    // above: both rules are decidable from this one envelope, so this is
+    // the earliest place the verdict exists and the only one that is
+    // provably before the first write of the bundle.
+    errors.extend(validate_allowed_realm_hosts(&env.spec, &name));
 
     let auth_type = env.spec.auth.r#type.as_str();
     if !AUTH_VARIANTS.contains(&auth_type) {
@@ -855,6 +946,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
         };
         let yaml_out =
             serde_yaml_ng::to_string(&spec).expect("default spec must serialise to YAML");
@@ -1277,5 +1369,195 @@ spec:
             validate_upstream_mapping(&env).is_empty(),
             "the maximal https TLS combination must stay accepted"
         );
+    }
+
+    // -- `allowedRealmHosts` -------------------------------------------
+    //
+    // The hosts that may be named as the `WWW-Authenticate` realm of a
+    // credentialed bearer-challenge exchange. Rejected on an auth type
+    // that has no realm (ADR 0015 — the consumer cannot exist there),
+    // accepted without a `secretRef` (the consumer comes into being the
+    // moment one is added), and entry-by-entry a bare hostname.
+
+    fn realm_hosts_yaml(auth_type: &str, hosts: &[&str], secret: bool) -> String {
+        let list = if hosts.is_empty() {
+            String::new()
+        } else {
+            let entries: String = hosts
+                .iter()
+                .map(|h| format!("\n    - \"{h}\""))
+                .collect::<Vec<_>>()
+                .join("");
+            format!("\n  allowedRealmHosts:{entries}")
+        };
+        let secret_ref = if secret {
+            "\n  secretRef:\n    source: env_var\n    location: UPSTREAM_PAT"
+        } else {
+            ""
+        };
+        format!(
+            "
+  repository: r
+  pathPrefix: x/
+  upstreamUrl: https://x.example.com
+  auth:
+    type: {auth_type}{secret_ref}{list}
+"
+        )
+    }
+
+    #[test]
+    fn validate_accepts_realm_hosts_on_a_credentialed_bearer_challenge_mapping() {
+        let body = realm_hosts_yaml("bearer_challenge", &["auth.docker.io"], true);
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes())
+            .expect("the envelope must parse");
+        assert_eq!(
+            env.spec.allowed_realm_hosts,
+            vec!["auth.docker.io".to_string()]
+        );
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "the canonical authenticated-Docker-Hub shape must validate clean"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_realm_hosts_without_a_secret_ref() {
+        // Deliberately accepted: the field's consumer is the
+        // credentialed exchange, which exists the moment a secret is
+        // added to this same mapping. Rejecting it here would force the
+        // operator to land the credential and the allowance in two
+        // applies, the first of which fails closed at fetch time.
+        let body = realm_hosts_yaml("bearer_challenge", &["auth.docker.io"], false);
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        assert!(env.spec.secret_ref.is_none(), "the point of this test");
+        assert!(
+            validate_upstream_mapping(&env).is_empty(),
+            "an allowance may be declared before the credential it \
+             guards; got {:?}",
+            validate_upstream_mapping(&env)
+        );
+    }
+
+    #[test]
+    fn validate_rejects_realm_hosts_on_an_auth_type_with_no_realm() {
+        for (auth, secret) in [("anonymous", false), ("basic", true)] {
+            let mut body = realm_hosts_yaml(auth, &["auth.docker.io"], secret);
+            if auth == "basic" {
+                body = body.replace("    type: basic", "    type: basic\n    username: alice");
+            }
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let errs = validate_upstream_mapping(&env);
+            assert!(
+                errs.iter()
+                    .any(|e| e.to_string().contains("allowedRealmHosts")
+                        && e.to_string().contains("bearer_challenge")),
+                "`{auth}` has no realm, so the field has no reachable \
+                 consumer and must be rejected rather than ignored; got \
+                 {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_scheme_a_port_a_path_or_an_empty_realm_host() {
+        for bad in [
+            "https://auth.docker.io",
+            "auth.docker.io:443",
+            "auth.docker.io/token",
+            "",
+        ] {
+            let body = realm_hosts_yaml("bearer_challenge", &[bad], true);
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let errs = validate_upstream_mapping(&env);
+            let joined = errs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            assert!(
+                joined.contains("allowedRealmHosts"),
+                "`{bad}` must be rejected and the message must name the \
+                 field; got {joined}"
+            );
+            assert!(
+                joined.contains("bare hostnames")
+                    && joined.contains("no scheme")
+                    && joined.contains("no port")
+                    && joined.contains("no path")
+                    && joined.contains("auth.docker.io"),
+                "the message must show the accepted form, so the \
+                 rejection is the remedy; got {joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_collects_every_bad_realm_host_rather_than_first_wins() {
+        let body = realm_hosts_yaml(
+            "bearer_challenge",
+            &["https://a.example", "b.example:443", "good.example"],
+            true,
+        );
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        let errs = validate_upstream_mapping(&env);
+        assert_eq!(
+            errs.iter()
+                .filter(|e| e.to_string().contains("allowedRealmHosts"))
+                .count(),
+            2,
+            "collect-all, like the rest of this validator; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn realm_hosts_skip_serialize_when_empty() {
+        // Digest stability: an operator's existing YAML must keep
+        // producing the same canonicalised-spec digest, so the empty
+        // default must not appear on the wire. Same invariant as
+        // `insecureUpstreamUrl` / `trustUpstreamPublishTime`.
+        let body = realm_hosts_yaml("bearer_challenge", &[], false);
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        assert!(env.spec.allowed_realm_hosts.is_empty());
+        let out = serde_yaml_ng::to_string(&env.spec).expect("spec serialises");
+        assert!(
+            !out.contains("allowedRealmHosts"),
+            "the empty default must skip-serialize; got:\n{out}"
+        );
+
+        // …and a non-empty list does round-trip.
+        let body = realm_hosts_yaml("bearer_challenge", &["auth.docker.io"], false);
+        let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+        let out = serde_yaml_ng::to_string(&env.spec).expect("spec serialises");
+        assert!(out.contains("allowedRealmHosts"), "got:\n{out}");
+        assert!(out.contains("auth.docker.io"), "got:\n{out}");
+    }
+
+    /// The gitops validator and the value-object constructor reach the
+    /// same verdict on every case, because they call the same function.
+    /// The sibling mirrors on this type are hand-maintained copies held
+    /// together by a corpus; this asserts the stronger property that
+    /// there is only one rule to agree with.
+    #[test]
+    fn the_validator_and_the_constructor_share_one_realm_host_rule() {
+        for host in [
+            "auth.docker.io",
+            "https://auth.docker.io",
+            "auth.docker.io:443",
+            "auth.docker.io/token",
+            "",
+            "a..b",
+        ] {
+            let body = realm_hosts_yaml("bearer_challenge", &[host], true);
+            let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
+            let validator_rejects = validate_upstream_mapping(&env)
+                .iter()
+                .any(|e| e.to_string().contains("allowedRealmHosts"));
+            let domain_rejects = allowed_realm_host_reason(host).is_some();
+            assert_eq!(
+                validator_rejects, domain_rejects,
+                "the two must agree on `{host}`"
+            );
+        }
     }
 }

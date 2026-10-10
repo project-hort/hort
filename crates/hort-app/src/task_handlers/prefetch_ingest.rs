@@ -23,6 +23,12 @@
 //!    `versions[ver].dist.tarball` from the already-fetched packument
 //!    ([`FormatHandler::resolve_download_url_from_metadata`]); PyPI
 //!    fans out from the per-version JSON manifest `urls[]`.
+//!    For npm and PyPI the resolved URL then passes the shared
+//!    [`require_https_metadata_url`] rule — the same one the inbound
+//!    pull-through paths apply — so this handler, which has no request
+//!    behind it, refuses a downgrade target exactly as they do. cargo's
+//!    index `dl` field deliberately admits `http://` and is not subject
+//!    to it.
 //! 5. Per URL: [`UpstreamProxy::fetch_artifact`] →
 //!    [`IngestUseCase::ingest_verified`] (the
 //!    `UpstreamPublished` arm — the checksum is the integrity
@@ -86,7 +92,9 @@ use uuid::Uuid;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::format_handler::{
+    require_https_metadata_url, FormatHandler, MetadataUrlSubject,
+};
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::repository_upstream_mapping_repository::RepositoryUpstreamMappingRepository;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
@@ -877,6 +885,30 @@ async fn npm_resolve_and_pull(ctx: &LeafCtx<'_>, summary: &mut LeafSummary) {
         }
     };
 
+    // The scheme rule for a metadata-supplied download URL, applied by the
+    // CONSUMER rather than assumed of the producer. `NpmFormatHandler`'s
+    // `resolve_download_url_from_metadata` applies the same rule, so with
+    // that handler wired the refusal lands one layer earlier; the
+    // `VersionDiscovery` port contract does not oblige it to, and this is
+    // the only thing between a resolver that forgets and
+    // `fetch_artifact`. Non-fatal per URL — the leaf still completes, the
+    // refused tarball counts as attempted-and-failed, and nothing is
+    // fetched.
+    if let Err(err) = require_https_metadata_url(&tarball_url, MetadataUrlSubject::NpmTarballUrl) {
+        tracing::warn!(
+            error = %err,
+            repository = %ctx.repo.key,
+            package = %ctx.parsed.package,
+            version = %ctx.parsed.version,
+            url = %tarball_url,
+            "prefetch (npm): metadata-supplied tarball URL refused; no fetch",
+        );
+        summary.urls_attempted += 1;
+        summary.urls_failed += 1;
+        summary.any_hard_failure = true;
+        return;
+    }
+
     fetch_and_ingest_one(ctx, coords, tarball_url, upstream_checksum, summary).await;
 }
 
@@ -1325,6 +1357,30 @@ async fn pypi_per_distribution_fanout(
         let Some(url) = entry.get("url").and_then(|v| v.as_str()) else {
             continue;
         };
+
+        // The scheme rule for a metadata-supplied download URL, applied on
+        // the autonomous path too: this fan-out reads `urls[].url` straight
+        // off the manifest and is the one PyPI consumer with no request
+        // behind it, so until the rule was shared it could hand a `http://`
+        // distribution straight to `fetch_artifact`. Non-fatal per URL —
+        // the refused distribution counts as attempted-and-failed and the
+        // rest of the cohort still ingests.
+        if let Err(err) = require_https_metadata_url(url, MetadataUrlSubject::PypiFileUrl) {
+            tracing::warn!(
+                error = %err,
+                repository = %repo.key,
+                package = %parsed.package,
+                version = %parsed.version,
+                filename = %filename,
+                %url,
+                "prefetch (pypi): metadata-supplied distribution URL refused; \
+                 no fetch, continuing with next distribution",
+            );
+            summary.urls_attempted += 1;
+            summary.urls_failed += 1;
+            summary.any_hard_failure = true;
+            continue;
+        }
 
         // Build per-distribution coords. The path comes from the single SSOT
         // constructor (`simple/{normalized}/{filename}`), which both keys the
@@ -2029,6 +2085,74 @@ mod tests {
         }
     }
 
+    /// PyPI dispatch stub. The per-version JSON manifest lives at
+    /// `/pypi/{normalized}/{version}/json`; `parse_upstream_checksum`
+    /// re-reads that manifest and returns the `digests.sha256` of the
+    /// `urls[]` entry whose `filename` matches the basename of
+    /// `coords.path` — the filename→digest join the real PyPI handler
+    /// performs, reduced to what `pypi_per_distribution_fanout` drives.
+    ///
+    /// No `VersionDiscovery`: PyPI has no config-doc or `dist.tarball`
+    /// single-URL resolution step at all. The per-distribution download
+    /// URL is read directly off the manifest entry by the fan-out
+    /// itself, which is why the fan-out is the only place a PyPI
+    /// download URL can be altered.
+    struct PypiDispatchStub;
+    impl FormatHandler for PypiDispatchStub {
+        fn format_key(&self) -> &str {
+            "pypi"
+        }
+        fn parse_download_path(&self, _path: &str) -> DomainResult<ArtifactCoords> {
+            unreachable!("not exercised by the dispatch test")
+        }
+        fn normalize_name(&self, name: &str) -> String {
+            // PEP 503 is lowercase + collapse `[-_.]+` -> `-`; the
+            // dispatch fixtures only need the lowercase arm.
+            name.to_lowercase()
+        }
+        fn build_artifact_logical_path(
+            &self,
+            name: &str,
+            _version: &str,
+            filename: Option<&str>,
+        ) -> DomainResult<String> {
+            let filename = filename
+                .ok_or_else(|| DomainError::Validation("pypi requires a filename".into()))?;
+            Ok(format!("simple/{}/{filename}", self.normalize_name(name)))
+        }
+        fn upstream_checksum_metadata_path(&self, coords: &ArtifactCoords) -> Option<String> {
+            let version = coords.version.as_deref().unwrap_or_default();
+            Some(format!(
+                "/pypi/{}/{version}/json",
+                self.normalize_name(&coords.name)
+            ))
+        }
+        fn parse_upstream_checksum(
+            &self,
+            body: &mut dyn std::io::Read,
+            coords: &ArtifactCoords,
+        ) -> DomainResult<UpstreamPublishedChecksum> {
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(body, &mut buf)
+                .map_err(|e| DomainError::Validation(format!("read per-version JSON: {e}")))?;
+            let doc: serde_json::Value = serde_json::from_slice(&buf)
+                .map_err(|e| DomainError::Validation(format!("per-version JSON: {e}")))?;
+            let wanted = coords.path.rsplit('/').next().unwrap_or(&coords.path);
+            let digest_hex = doc
+                .get("urls")
+                .and_then(|v| v.as_array())
+                .into_iter()
+                .flatten()
+                .find(|entry| entry.get("filename").and_then(|f| f.as_str()) == Some(wanted))
+                .and_then(|entry| entry.pointer("/digests/sha256"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    DomainError::Validation(format!("no sha256 urls[] entry for {wanted}"))
+                })?;
+            UpstreamPublishedChecksum::new(HashAlgorithm::Sha256, digest_hex.to_string())
+        }
+    }
+
     /// Maven dispatch stub. `hort-app` cannot dev-depend on `hort-formats`
     /// (cycle — see the leaf-path guard tests above), so
     /// `build_artifact_logical_path` here reproduces JUST the validation
@@ -2116,13 +2240,21 @@ mod tests {
         r
     }
 
+    /// The `upstream_url` every `seed_catchall` mapping in this module
+    /// carries. Named rather than inlined because the pass-through tests
+    /// below assert their fixture URL is on a *different* origin than
+    /// this one — an assertion that has to read the same value the
+    /// mapping was built from, or it stops meaning anything the day this
+    /// literal changes.
+    const DISPATCH_MAPPING_UPSTREAM_URL: &str = "https://index.crates.io";
+
     async fn seed_catchall(mappings: &Arc<MockRepositoryUpstreamMappingRepository>, repo_id: Uuid) {
         let now = Utc::now();
         let mapping = RepositoryUpstreamMapping::new(RepositoryUpstreamMappingArgs {
             id: Uuid::new_v4(),
             repository_id: repo_id,
             path_prefix: String::new(),
-            upstream_url: "https://index.crates.io".to_string(),
+            upstream_url: DISPATCH_MAPPING_UPSTREAM_URL.to_string(),
             upstream_name_prefix: None,
             upstream_auth: UpstreamAuth::Anonymous,
             secret_ref: None,
@@ -2134,6 +2266,7 @@ mod tests {
             mtls_key_ref: None,
             ca_bundle_ref: None,
             pinned_cert_sha256: None,
+            allowed_realm_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         })
@@ -2958,6 +3091,354 @@ mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    // -- the metadata-supplied absolute URL reaches the proxy unchanged ----
+    //
+    // The autonomous pull path — a cron tick or a cascade leaf, with no
+    // user request behind it — resolves its download URL out of UPSTREAM
+    // metadata. npm's `versions[ver].dist.tarball`, the cargo
+    // `config.json` `dl` composition and each PyPI `urls[]` entry are
+    // absolute URLs the *upstream* chose, and nothing constrains one of
+    // them to the mapping's own host. The credential decision for such a
+    // request belongs to `HttpUpstreamProxy` (`credential_scope` there,
+    // pinned by its own
+    // `cross_origin_artifact_url_is_fetched_without_the_mapping_credential`);
+    // for that decision to be about the host the metadata actually
+    // named, THIS layer has to hand the adapter that URL verbatim.
+    //
+    // These three tests own exactly that link and nothing more. The
+    // header itself is deliberately not asserted here: the handler holds
+    // an `Arc<dyn UpstreamProxy>` and cannot observe HTTP, so a
+    // header assertion at this layer would only be re-reading a mock.
+    //
+    // Mechanism, no new recorder: `MockUpstreamProxy` keys its artifact
+    // fixtures by `(path_prefix, path)` and errors on a miss. Seeding the
+    // body ONLY under the absolute foreign URL makes the ingest succeed
+    // iff `fetch_artifact` was called with that exact string —
+    // re-composing it onto `mapping.upstream_url`, trimming it to a
+    // path, or appending to it all miss, and a miss surfaces as
+    // `urls_failed`, not `urls_succeeded`.
+
+    /// Assert `url` is on a different host than the catch-all mapping's
+    /// `upstream_url`, so each pass-through test below is genuinely
+    /// about a cross-origin URL. Without this, an edit to
+    /// `DISPATCH_MAPPING_UPSTREAM_URL` or to a fixture host would
+    /// quietly turn all three into same-origin tests that still pass and
+    /// no longer say anything about the credential-origin rule.
+    fn assert_foreign_to_the_catchall_mapping(url: &str) {
+        let fixture = url::Url::parse(url).expect("fixture URL parses");
+        let mapping = url::Url::parse(DISPATCH_MAPPING_UPSTREAM_URL).expect("mapping URL parses");
+        assert_ne!(
+            fixture.host_str(),
+            mapping.host_str(),
+            "{url} must be on a host the mapping does not own \
+             ({DISPATCH_MAPPING_UPSTREAM_URL}), or this test proves nothing",
+        );
+    }
+
+    /// Run the leaf handler and assert the one coordinate it drives
+    /// ingested successfully, with nothing failed and no short-circuit.
+    /// Shared by all three pass-through tests because the verdict is the
+    /// same in each: `seeded_url` is the only artifact fixture in the
+    /// mock, so the single success can only have come from a lookup hit
+    /// under that exact string.
+    async fn assert_passthrough_ingest_succeeded(
+        handler: &PrefetchIngestHandler,
+        params: &serde_json::Value,
+        seeded_url: &str,
+    ) {
+        let outcome = handler.run(params, make_context()).await.expect("Ok");
+        let summary = match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(
+            summary["urls_succeeded"], 1,
+            "{seeded_url} is the only seeded artifact fixture, so a hit means the \
+             handler passed the metadata-supplied absolute URL to the proxy \
+             unchanged: {summary}"
+        );
+        assert_eq!(summary["urls_failed"], 0, "{summary}");
+        assert_eq!(summary["short_circuited"], false, "{summary}");
+    }
+
+    /// npm: the packument's `versions[ver].dist.tarball` names an
+    /// absolute URL on a host the mapping does not own. The artifact is
+    /// seeded ONLY under that exact string — and the mapping's own base
+    /// is seeded with nothing at all — so a successful ingest is proof
+    /// `fetch_artifact` received the packument's URL verbatim.
+    #[tokio::test]
+    async fn prefetch_npm_passes_the_metadata_absolute_url_to_the_proxy_unchanged() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Npm);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let body = b"foreign-origin-tarball-bytes".to_vec();
+        let cksum = sha256_hex(&body);
+        let tarball =
+            "https://tarballs.foreign-origin.example/express/-/express-4.18.2.tgz".to_string();
+        assert_foreign_to_the_catchall_mapping(&tarball);
+
+        proxy.insert_metadata("", "/express", b"packument-unused-by-stub".to_vec());
+        proxy.insert_artifact("", &tarball, body);
+
+        let handler = build_dispatch_handler(
+            repos,
+            proxy,
+            mappings,
+            "npm",
+            Arc::new(NpmDispatchStub {
+                cksum_hex: cksum,
+                tarball: tarball.clone(),
+                fail_resolve: false,
+            }),
+        );
+
+        assert_passthrough_ingest_succeeded(
+            &handler,
+            &leaf_params(repo.id, "express", "4.18.2"),
+            &tarball,
+        )
+        .await;
+    }
+
+    /// cargo: the index `config.json` `dl` field is upstream data, so the
+    /// URL composed from it can land on a host the mapping does not own.
+    /// The composed string — not the index host, not the mapping's base —
+    /// is the only seeded artifact fixture.
+    #[tokio::test]
+    async fn prefetch_cargo_passes_the_dl_composed_absolute_url_to_the_proxy_unchanged() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Cargo);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let body = b"foreign-origin-crate-bytes".to_vec();
+        let cksum = sha256_hex(&body);
+        let dl_base = "https://downloads.foreign-origin.example/crates";
+        // What `CargoDispatchStub::compose_download_url_from_config`
+        // produces from that `dl` (`{dl}/{name}/{version}/download`).
+        let download_url = format!("{dl_base}/serde/1.0.0/download");
+        assert_foreign_to_the_catchall_mapping(&download_url);
+
+        proxy.insert_metadata("", "/se/rd/serde", b"ndjson-unused-by-stub".to_vec());
+        proxy.insert_metadata(
+            "",
+            "/config.json",
+            format!(r#"{{"dl":"{dl_base}","api":"https://crates.io"}}"#).into_bytes(),
+        );
+        proxy.insert_artifact("", &download_url, body);
+
+        let handler = build_dispatch_handler(
+            repos,
+            proxy,
+            mappings,
+            "cargo",
+            Arc::new(CargoDispatchStub { cksum_hex: cksum }),
+        );
+
+        assert_passthrough_ingest_succeeded(
+            &handler,
+            &leaf_params(repo.id, "serde", "1.0.0"),
+            &download_url,
+        )
+        .await;
+    }
+
+    /// PyPI: a `urls[]` entry's `url` is read straight off the
+    /// per-version manifest and handed to `fetch_artifact`, so the
+    /// fan-out is the one place that URL could be altered. The entry
+    /// names a host the mapping does not own and is the only seeded
+    /// artifact fixture.
+    ///
+    /// The fixture URL is `https://` deliberately: how the worker treats
+    /// a scheme-less `urls[].url` is a separate question, and this test
+    /// must neither pre-empt nor depend on its answer.
+    #[tokio::test]
+    async fn prefetch_pypi_passes_the_metadata_absolute_url_to_the_proxy_unchanged() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Pypi);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let body = b"foreign-origin-wheel-bytes".to_vec();
+        let filename = "flask-2.0.0-py3-none-any.whl";
+        let dist_url = format!("https://files.foreign-origin.example/packages/ab/cd/{filename}");
+        assert_foreign_to_the_catchall_mapping(&dist_url);
+
+        let manifest = json!({
+            "urls": [{
+                "filename": filename,
+                "url": dist_url,
+                "digests": { "sha256": sha256_hex(&body) },
+            }],
+        });
+        proxy.insert_metadata(
+            "",
+            "/pypi/flask/2.0.0/json",
+            manifest.to_string().into_bytes(),
+        );
+        proxy.insert_artifact("", &dist_url, body);
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "pypi", Arc::new(PypiDispatchStub));
+
+        assert_passthrough_ingest_succeeded(
+            &handler,
+            &leaf_params(repo.id, "flask", "2.0.0"),
+            &dist_url,
+        )
+        .await;
+    }
+
+    // -- the https rule on the autonomous path -----------------------------
+    //
+    // Both tests seed the refused URL as a FULLY FETCHABLE artifact fixture
+    // whose digest matches, so "it failed" can only mean the rule refused it
+    // before any fetch. A test that left the http URL unseeded would be
+    // green against a handler that fetched it and lost to the mock's
+    // not-found default — i.e. against the very defect.
+
+    /// PyPI: one `urls[]` entry on `http://`, one on `https://`. The
+    /// refused distribution counts as attempted-and-failed and the rest of
+    /// the cohort still ingests — the handler's documented non-fatal-per-URL
+    /// contract, not a short-circuit.
+    #[tokio::test]
+    async fn prefetch_pypi_refuses_a_non_https_distribution_url_and_ingests_the_rest() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Pypi);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let sdist = b"flask-sdist-bytes".to_vec();
+        let wheel = b"flask-wheel-bytes".to_vec();
+        let sdist_name = "flask-2.0.0.tar.gz";
+        let wheel_name = "flask-2.0.0-py3-none-any.whl";
+        // The sdist is advertised on plaintext http; the wheel on https.
+        let sdist_url = format!("http://files.example/packages/ab/cd/{sdist_name}");
+        let wheel_url = format!("https://files.example/packages/ef/01/{wheel_name}");
+
+        let manifest = json!({
+            "urls": [
+                {
+                    "filename": sdist_name,
+                    "url": sdist_url,
+                    "digests": { "sha256": sha256_hex(&sdist) },
+                },
+                {
+                    "filename": wheel_name,
+                    "url": wheel_url,
+                    "digests": { "sha256": sha256_hex(&wheel) },
+                },
+            ],
+        });
+        proxy.insert_metadata(
+            "",
+            "/pypi/flask/2.0.0/json",
+            manifest.to_string().into_bytes(),
+        );
+        // Both distributions are seeded and fetchable. The sdist must still
+        // fail, which can only happen before the fetch.
+        proxy.insert_artifact("", &sdist_url, sdist);
+        proxy.insert_artifact("", &wheel_url, wheel);
+
+        let handler =
+            build_dispatch_handler(repos, proxy, mappings, "pypi", Arc::new(PypiDispatchStub));
+
+        let outcome = handler
+            .run(&leaf_params(repo.id, "flask", "2.0.0"), make_context())
+            .await
+            .expect("Ok");
+        let summary = match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(summary["urls_attempted"], 2, "{summary}");
+        assert_eq!(
+            summary["urls_succeeded"], 1,
+            "the https wheel still ingests — a per-URL refusal must not take \
+             the cohort down with it: {summary}"
+        );
+        assert_eq!(
+            summary["urls_failed"], 1,
+            "the http sdist is seeded and fetchable, so a failure here is the \
+             scheme rule refusing it before the fetch: {summary}"
+        );
+        assert_eq!(
+            summary["short_circuited"], false,
+            "a refused URL is non-fatal per URL, not a short-circuit: {summary}"
+        );
+    }
+
+    /// npm: the packument's `dist.tarball` is `http://`. npm resolves one
+    /// URL per leaf, so the refusal leaves nothing to ingest — but it is
+    /// still counted as attempted-and-failed rather than short-circuited,
+    /// because the handler *did* resolve a URL and then refused it.
+    #[tokio::test]
+    async fn prefetch_npm_refuses_a_non_https_dist_tarball_without_fetching_it() {
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let proxy = Arc::new(MockUpstreamProxy::new());
+        let mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+
+        let repo = dispatch_repo(RepositoryFormat::Npm);
+        repos.insert(repo.clone());
+        seed_catchall(&mappings, repo.id).await;
+
+        let body = b"plaintext-origin-tarball-bytes".to_vec();
+        let cksum = sha256_hex(&body);
+        let tarball = "http://tarballs.example/express/-/express-4.18.2.tgz".to_string();
+
+        proxy.insert_metadata("", "/express", b"packument-unused-by-stub".to_vec());
+        // Seeded and fetchable, with a checksum the stub agrees with: had the
+        // handler fetched it, the leaf would report a success.
+        proxy.insert_artifact("", &tarball, body);
+
+        let handler = build_dispatch_handler(
+            repos,
+            proxy,
+            mappings,
+            "npm",
+            Arc::new(NpmDispatchStub {
+                cksum_hex: cksum,
+                tarball: tarball.clone(),
+                fail_resolve: false,
+            }),
+        );
+
+        let outcome = handler
+            .run(&leaf_params(repo.id, "express", "4.18.2"), make_context())
+            .await
+            .expect("Ok");
+        let summary = match outcome {
+            TaskOutcome::Completed { result_summary } => result_summary,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+        assert_eq!(summary["urls_attempted"], 1, "{summary}");
+        assert_eq!(
+            summary["urls_succeeded"], 0,
+            "the tarball is seeded and fetchable, so a zero here is the scheme \
+             rule refusing it before the fetch: {summary}"
+        );
+        assert_eq!(summary["urls_failed"], 1, "{summary}");
+        assert_eq!(
+            summary["short_circuited"], false,
+            "the URL resolved and was then refused — that is a per-URL \
+             failure, not a resolution short-circuit: {summary}"
+        );
     }
 
     // -- terminal-completion severity --------------------------------------

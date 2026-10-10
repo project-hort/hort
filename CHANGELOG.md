@@ -1318,6 +1318,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **An upstream credential is bound to its mapping's own origin** (#343). On
+  the artifact path the request URL is not always the operator's: `npm`'s
+  `dist.tarball`, PyPI's `urls[].url` and the Cargo `dl`-composed URL are
+  absolute URLs read out of *upstream metadata*, and `resolve_artifact_url`
+  accepted them after `check_ssrf_safe` alone. That check is correct and
+  answers a different question — "is this destination internal?" is not "may
+  this destination have our credential?", and a public, upstream-nominated host
+  passes the first. `authorization_header` then attached the mapping's Basic
+  credential (or a cached bearer) with no URL in hand to object with.
+
+  **Both legs are closed, because closing one only moves the secret.** A
+  foreign `401` on a `BearerChallenge` mapping used to run the whole challenge
+  dance against the *foreign* host's `WWW-Authenticate` realm and exchange the
+  operator's secret there; suppressing the header on the initial request while
+  leaving that dance reachable would have changed which request carried the
+  secret, not whether one did. `fetch_with_challenge` now computes one
+  `CredentialScope` per call from the request URL and `mapping.upstream_url`
+  and gates both the header and the challenge branch on it. A cross-origin
+  `401` surfaces as the plain `Unauthorized` classification the non-challenge
+  path already produced.
+
+  The comparison is the RFC 6454 §4 origin triple — scheme, host
+  (ASCII-case-insensitive), port with default-port normalisation — and it fails
+  closed: an unparseable URL on either side yields no credential.
+  `upstream_url`'s parseability is a value-object invariant, so a failure there
+  is a broken invariant rather than an input to accommodate. It is the same
+  rule reqwest applies to a redirect hop (pinned by
+  `cross_host_redirect_strips_authorization_header`), carried back onto the
+  *initial* request.
+
+  **The cross-origin fetch is not forbidden** — npm and PyPI serve artifact
+  bytes from a different host than their metadata (`files.pythonhosted.org`
+  against `pypi.org`) and pull-through depends on it. Only the credential stays
+  behind. A withheld credential emits one `tracing::info!` carrying the
+  mapping's `upstream_url` and the request target's **origin**; the
+  metadata-supplied path and query are upstream-controlled and are not logged.
+  No new metric, label or configuration knob.
+
 - **An authority change commits with its audit event** (#341). Three gitops
   apply branches wrote a security-relevant row, committed it, and appended the
   attesting audit event in a *separate* call: permission grants
