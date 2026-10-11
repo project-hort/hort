@@ -31,7 +31,7 @@ hort's authoritative discovery status (`DiscoveryVersionStatus.kind`):
 | `kind` | Meaning | Comment |
 |---|---|---|
 | `quarantined` | inside the time window | ⏳ retryable — re-run after `quarantine_until` |
-| `quarantined_awaiting_release` | window elapsed, no release authority fired (ADR 0007) | 🟠 **stuck** — a timed retry won't help; needs a curator waive / admin override |
+| `quarantined_awaiting_release` | window elapsed, no release authority fired (ADR 0007) | 🟠 **stuck** — a timed retry won't help; needs a curator waive |
 | `rejected` / `scan_indeterminate` | scanned & blocked | 🔴 do not retry — the gate working as intended |
 | `unknown` | not yet ingested | ❔ prefetch didn't cover it; ingests on first fetch |
 | _(none of the above)_ | network / lockfile drift / missing crate | gate stays red; not quarantine-related |

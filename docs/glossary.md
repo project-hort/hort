@@ -23,6 +23,25 @@ default branch (`main`) — a final release's promotion MR closes every
 issue whose fix already rested in `ready-for-staging` or `in-uat`, often
 many at once. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
 
+### Curator (`Permission::Curate`)
+
+The domain's decision authority over held artifacts: waiving a hold,
+blocking an artifact, re-evaluating one, and managing finding exclusions.
+Distinct in *kind* from `Permission::Admin`, which carries the technical and
+operative actions (gitops status, effective config, the provenance-misrejection
+repair) — a verdict about an artifact is a curation decision, a structurally
+invalid state being withdrawn is not. `Admin` is a superset of `Curate` at the
+gate (`CurateOrAdminPrincipal` admits either), so an admin never needs an
+explicit curate grant.
+
+**A curator is not necessarily an IdP user.** The sanctioned shape of a
+maintainer's named curator credential is a PAT-only `kind: ServiceAccount` with
+a standalone `curate` grant (`maintainer-curator` in the deployed gitops
+config), so `TokenKind::ServiceAccount` does **not** mean "a pipeline". What
+keeps automation out of domain decisions is the grant an operator does *not*
+make — [ADR 0055](adr/0055-write-authorized-hold-read-generalised.md) rejected a
+`curate` grant for CI — not a token-kind check.
+
 ### Enforcement mode
 
 A `ScanPolicy` field (`enforcement: reject | record`) deciding what a
@@ -63,6 +82,29 @@ staging, decoupled from a `main` release cut. Entered only once an alpha tag
 has been cut whose commit is confirmed (`git merge-base --is-ancestor`) to
 contain the issue's merge — not merely once some alpha exists. See
 [UAT](#uat) and [ADR 0048](adr/0048-release-branch-staging-strategy.md) D5.
+
+### Manual release
+
+An `ArtifactReleased` a human authorized — `released_by ∈ {Admin, Curator}` —
+as opposed to an **automatic** release, where the system did:
+`Timer` (the observation window elapsed and the axes cleared) or
+`PolicyReEvaluation` (a policy change re-judged the stored evidence). The
+partition is load-bearing rather than descriptive: a manual release carries
+`released_by_user_id` + a justification (≤ 512 bytes, mandatory) and outweighs a
+later blocking scan verdict, while an automatic one is re-blocked by it.
+`PolicyReEvaluation` counts as automatic deliberately — the policy did not
+absolve the artifact, it re-judged it under the evidence of the day.
+
+Curation re-blocks either kind: the protection is scan-axis-wide, not
+axis-wide.
+
+A manual release is bounded by what the curator's instrument can reach, not by
+severity. Comparing an artifact's content hash against the publisher's own
+release page answers the question a signature answers, so a curator may release
+across the scan, curation and provenance axes — including a missing or
+disproved signature. It cannot reach a **corruption** tombstone: there the
+stored bytes do not match the content hash naming them, so no external
+attestation confirms anything and `VerifyingReader` fails the read regardless.
 
 ### Ready-for-staging
 

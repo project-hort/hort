@@ -2877,8 +2877,9 @@ pub async fn build_app_context(
     // Composes:
     //   - `event_publisher` — single per-call audit append site
     //   - `artifact_repo` + `lifecycle` — atomic state-transition write
-    //     path through `commit_transition_with_score` (mirrors
-    //     `QuarantineUseCase::admin_release`)
+    //     path through `commit_transition_with_score` (the same
+    //     chokepoint every per-artifact state transition in `hort-app`
+    //     commits through)
     //   - `policy_projections` — held for future per-row deadline
     //     resolution
     //   - the three Pg curation list repos — read surfaces

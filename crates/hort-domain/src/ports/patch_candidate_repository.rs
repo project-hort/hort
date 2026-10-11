@@ -16,8 +16,10 @@
 //! # Authority
 //!
 //! The use case in `hort-app` gates this port behind
-//! `CallerPrivileges::require_admin` — same authz as the existing
-//! `POST /admin/quarantine/:artifact_id/release` endpoint.
+//! `CallerPrivileges::require_admin`. The release the listing feeds is
+//! the curator's — `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`,
+//! behind `Permission::Curate` OR `Permission::Admin` — so an admin
+//! reading the queue can act on it with the same credential.
 //!
 //! # Domain DTO discipline
 //!

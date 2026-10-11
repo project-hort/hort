@@ -1,7 +1,7 @@
 //! Integration tests for `hort-cli curation exclude-finding`.
 //!
-//! Four scenarios mirror the mockito test pattern from
-//! `tests/admin_quarantine_release.rs`:
+//! Four scenarios follow the mockito test pattern this crate's
+//! `tests/` share (see `tests/curation_waive.rs`):
 //!
 //! 1. `exclude_finding_happy_path_table` — 201 Created → table prints
 //!    "excluded <cve> on policy <id> (exclusion_id <uuid>)", exit 0.

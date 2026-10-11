@@ -18,8 +18,8 @@
 //!   metric, no event). `scan_indeterminate` is treated the same as
 //!   `rejected` for protection — a terminal-failure artifact is
 //!   evidence, not GC fodder (ADR 0007;
-//!   `ScanIndeterminate` recovery is admin-only). `none` / `released`
-//!   are eligible.
+//!   `ScanIndeterminate` recovery is an explicit manual release).
+//!   `none` / `released` are eligible.
 //! - **inv 7 — scan-data freshness gate (per-artifact).** Before a
 //!   *security-driven* predicate evaluates, **this artifact's own**
 //!   most-recent `ScanCompleted.stored_at` on its `artifact:<id>`

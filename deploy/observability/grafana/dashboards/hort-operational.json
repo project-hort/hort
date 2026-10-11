@@ -1966,7 +1966,7 @@
       "id": 61,
       "type": "timeseries",
       "title": "Quarantine released by reason",
-      "description": "hort_quarantine_released_total \u2014 timer / admin / policy_re_evaluation.",
+      "description": "hort_quarantine_released_total \u2014 timer / curator / policy_re_evaluation. admin is historical only: the manual release is the curator's, and that series stopped growing when the admin route was removed.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

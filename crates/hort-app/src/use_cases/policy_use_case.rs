@@ -52,9 +52,9 @@ use hort_domain::types::{ArtifactCoords, PageRequest};
 use crate::error::AppResult;
 use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
-    emit_curation_decision, emit_policy_evaluation, emit_policy_reevaluation_result,
+    emit_curation_decision, emit_policy_evaluation, emit_policy_reevaluation_result, emit_release,
     increment_policy_reevaluation_enqueue_failed, policy_decision_point,
-    set_policy_reevaluation_population, CurationDecisionLabel, CurationDecisionResult,
+    set_policy_reevaluation_population, values, CurationDecisionLabel, CurationDecisionResult,
     PolicyEvaluationResult, PolicyReEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
@@ -1986,7 +1986,11 @@ impl PolicyUseCase {
     /// admin operation that bumped the artifact stream after the
     /// pairing, or the domain re-check denying the release).
     /// The caller logs the warn and increments the appropriate counter
-    /// only on `true`.
+    /// only on `true`. The release arm additionally ticks
+    /// `hort_quarantine_released_total{reason=policy_re_evaluation}`
+    /// here rather than at the caller, because only this scope can see
+    /// both which companion event `re_evaluate` produced and whether
+    /// its append won.
     ///
     /// The `ExpectedVersion` comes from `paired` — fixed by the one read
     /// the verdict was derived from, not by a read taken here. A
@@ -2035,6 +2039,14 @@ impl PolicyUseCase {
                 }
             };
 
+        // Which arm was taken is decided by the companion event that is
+        // about to be appended, not by the caller's `new_status`: the
+        // entity re-derives the observation-window boundary against its
+        // own `Utc::now()`, so a pass that computed `ResetToReleased`
+        // can still land on the re-quarantine arm. Only the release arm
+        // is a release, and it counts only once the append below wins.
+        let releases = matches!(companion_event, DomainEvent::ArtifactReleased(_));
+
         let re_evaluated = ArtifactReEvaluated {
             artifact_id,
             policy_id,
@@ -2078,7 +2090,23 @@ impl PolicyUseCase {
             )
             .await
         {
-            Ok(_) => true,
+            Ok(_) => {
+                if releases {
+                    // One tick per released artifact, exactly as the
+                    // timer sweep ticks per artifact and not per pass:
+                    // a bulk re-evaluation releasing seven artifacts
+                    // ticks seven times. Placed inside the `Ok` arm
+                    // because a lost append released nothing — the
+                    // function returns `false` on conflict, and a tick
+                    // before the commit would count a release that did
+                    // not happen. `re_evaluate`'s release arm is
+                    // `ReleaseReason::PolicyReEvaluation` by
+                    // construction, so the reason label and the
+                    // appended event cannot disagree.
+                    emit_release(values::REASON_POLICY_RE_EVALUATION);
+                }
+                true
+            }
             Err(DomainError::Conflict(msg)) => {
                 tracing::warn!(
                     artifact_id = %artifact_id,
@@ -7342,6 +7370,218 @@ mod tests {
             1,
             "one observation per candidate: the stored findings and the \
              append's version must come from the same read"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // `hort_quarantine_released_total` — the re-evaluation release is
+    // counted.
+    //
+    // The counter is about RELEASES, whatever authority issued them, so
+    // the third authority has to appear on it alongside the timer sweep
+    // and the curator's waive. The three tests below pin the reason
+    // label, the arm, and the position relative to the append — the
+    // same properties the manual release's pair pins in
+    // `curation_use_case`
+    // (`waive_happy_path_emits_quarantine_released_total_with_curator_reason`
+    // and `waive_denied_does_not_emit_quarantine_released_total`).
+    // ------------------------------------------------------------------
+
+    /// Helper — read every `hort_quarantine_released_total` increment
+    /// from a `capture_metrics` snapshot as `(reason, count)` pairs in
+    /// emission order. Same local-duplication rationale as
+    /// [`read_curation_decisions`]: the curation tests have an identical
+    /// reader, and duplicating it keeps these tests off a private fn in
+    /// another module.
+    fn read_quarantine_released(snap: metrics_util::debugging::Snapshot) -> Vec<(String, u64)> {
+        use metrics_util::debugging::DebugValue;
+        use metrics_util::MetricKind;
+
+        let mut out = Vec::new();
+        for (key, _u, _d, value) in snap.into_vec() {
+            if key.kind() != MetricKind::Counter
+                || key.key().name() != "hort_quarantine_released_total"
+            {
+                continue;
+            }
+            let reason = key
+                .key()
+                .labels()
+                .find(|l| l.key() == "reason")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            let count = match value {
+                DebugValue::Counter(n) => n,
+                other => panic!("expected Counter, got {other:?}"),
+            };
+            out.push((reason, count));
+        }
+        out
+    }
+
+    /// A loosen pass that releases one artifact ticks
+    /// `hort_quarantine_released_total{reason=policy_re_evaluation}`
+    /// exactly once — one tick per released artifact, exactly as the
+    /// timer sweep ticks per artifact and not per pass.
+    ///
+    /// Fixture is the serial control half of
+    /// [`loosen_release_does_not_commit_over_a_scan_verdict_that_landed_mid_derivation`],
+    /// which already pins that this shape commits the release; the
+    /// third test below reuses its interleaved half for the
+    /// lost-append case, so "ticks once" and "ticks zero" differ in
+    /// nothing but whether the append won.
+    #[test]
+    fn loosen_release_emits_quarantine_released_total_with_policy_re_evaluation_reason() {
+        use crate::metrics::capture_metrics;
+
+        let mut committed = 0usize;
+        let snap = capture_metrics(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, events, projections, artifacts, lifecycle, _storage) =
+                    make_interleaving_harness();
+                let policy_id = Uuid::new_v4();
+                let repo_id = Uuid::new_v4();
+                let mut p = sample_projection(policy_id, 4);
+                p.severity_threshold = SeverityThreshold::Low;
+                projections.insert(p);
+                let _artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+                artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+                artifacts.seed_active_for_policy(policy_id, vec![]);
+
+                uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+                    .await;
+
+                committed = lifecycle.committed_transitions().len();
+            });
+        });
+
+        assert_eq!(committed, 1, "premise: the release commits");
+        assert_eq!(
+            read_quarantine_released(snap),
+            vec![("policy_re_evaluation".to_string(), 1)],
+            "the re-evaluation release must tick the release counter once, \
+             with reason=policy_re_evaluation"
+        );
+    }
+
+    /// The re-quarantine arm is not a release and ticks nothing. Same
+    /// fixture as
+    /// [`add_exclusion_re_eval_pass_resets_artifact_to_quarantined_when_clean_and_window_in_future`]
+    /// (clean scan, observation window still open), which pins that the
+    /// companion event is `ArtifactQuarantined`. The artifact stays
+    /// held — downloads blocked — so counting it as a release would
+    /// overstate what the operator's dashboard says was let out.
+    #[test]
+    fn loosen_re_quarantine_does_not_emit_quarantine_released_total() {
+        use crate::metrics::capture_metrics;
+
+        let mut companion = None;
+        let snap = capture_metrics(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, events, projections, artifacts, lifecycle) =
+                    make_use_case_with_re_eval_harness();
+                let policy_id = Uuid::new_v4();
+                let repo_id = Uuid::new_v4();
+                let mut p = sample_projection(policy_id, 4);
+                p.severity_threshold = SeverityThreshold::Low;
+                projections.insert(p);
+
+                // Anchor = now → the computed deadline (anchor + the 24h
+                // policy duration) is still in the future, so a clean
+                // scan re-quarantines rather than releasing.
+                let mut artifact = rejected_artifact_for_repo(repo_id, "xz-utils");
+                artifact.quarantine_window_start = Some(Utc::now());
+                let artifact_id = artifact.id;
+                artifacts.insert(artifact);
+                events.seed_stream(
+                    StreamId::artifact(artifact_id),
+                    vec![
+                        persisted_scan_completed(artifact_id, 1, 0),
+                        persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+                    ],
+                );
+                artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+
+                add_exclusion_then_run_pass(&uc, policy_id).await;
+
+                let transitions = lifecycle.committed_transitions();
+                assert_eq!(transitions.len(), 1, "premise: the re-quarantine commits");
+                companion = Some(transitions[0].1.events[1].event.clone());
+            });
+        });
+
+        assert!(
+            matches!(companion, Some(DomainEvent::ArtifactQuarantined(_))),
+            "premise: the committed companion is a re-quarantine, got {companion:?}"
+        );
+        assert!(
+            read_quarantine_released(snap).is_empty(),
+            "the re-quarantine arm released nothing and must not tick \
+             hort_quarantine_released_total"
+        );
+    }
+
+    /// A release whose append LOSES its optimistic-concurrency race
+    /// released nothing and ticks nothing. This is what holds the
+    /// emission inside `commit_re_evaluation`'s `Ok` arm: a tick placed
+    /// beside the `re_evaluate` call, or at the caller's
+    /// `ResetToReleased` branch, would count this artifact as released
+    /// while it stays `Rejected`.
+    ///
+    /// Fixture is the interleaved half of
+    /// [`loosen_release_does_not_commit_over_a_scan_verdict_that_landed_mid_derivation`]:
+    /// a blocking scan verdict commits between the evidence read and the
+    /// release append, so the append carries the pre-verdict version and
+    /// loses.
+    #[test]
+    fn loosen_release_that_loses_the_append_does_not_emit_quarantine_released_total() {
+        use crate::metrics::capture_metrics;
+
+        let mut committed = 1usize;
+        let mut status = None;
+        let snap = capture_metrics(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, events, projections, artifacts, lifecycle, _storage) =
+                    make_interleaving_harness();
+                let policy_id = Uuid::new_v4();
+                let repo_id = Uuid::new_v4();
+                let mut p = sample_projection(policy_id, 4);
+                p.severity_threshold = SeverityThreshold::Low;
+                projections.insert(p);
+                let artifact_id = seed_rejected_with_scan(&artifacts, &events, repo_id, 0);
+                artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+                artifacts.seed_active_for_policy(policy_id, vec![]);
+
+                // The concurrent writer: a blocking scan and the
+                // rejection it drove, landing right after the pairing's
+                // read. The derivation still decides to release.
+                events.set_stream_after_next_read(
+                    StreamId::artifact(artifact_id),
+                    vec![
+                        persisted_scan_completed(artifact_id, 0, 0),
+                        persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+                        persisted_scan_completed(artifact_id, 9, 2),
+                        persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 3),
+                    ],
+                );
+
+                uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+                    .await;
+
+                committed = lifecycle.committed_transitions().len();
+                status = artifacts.get(artifact_id).map(|a| a.quarantine_status);
+            });
+        });
+
+        assert_eq!(committed, 0, "premise: the release append loses");
+        assert_eq!(
+            status,
+            Some(QuarantineStatus::Rejected),
+            "premise: the artifact stays Rejected"
+        );
+        assert!(
+            read_quarantine_released(snap).is_empty(),
+            "a release whose append lost counts no release"
         );
     }
 }

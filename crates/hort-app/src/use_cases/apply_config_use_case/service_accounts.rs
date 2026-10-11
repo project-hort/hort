@@ -826,7 +826,7 @@ mod tests {
 
     // Synchronous `#[test]` driving the async `apply` via a
     // current-thread runtime's `block_on` — mirrors
-    // `quarantine_use_case.rs`'s `admin_release_success_log_carries_user_id`
+    // `quarantine_use_case.rs`'s `record_scan_result_log_carries_correlation_id`
     // shape. A `#[tokio::test]` would hold the serialization
     // `MutexGuard` across the `.await` (clippy `await_holding_lock`);
     // `block_on` keeps the guard on the synchronous stack so it is

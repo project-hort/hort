@@ -12,9 +12,9 @@ use hort_domain::entities::scan_policy::{
 use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, timer_actor};
 use hort_domain::events::{
-    Actor, ApiActor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PersistedEvent,
-    PolicyEvaluated, PolicyResult, PolicyViolation, ReleaseReason, ScanAssessment, ScanCompleted,
-    SeveritySummary, StreamId, NO_POLICY,
+    Actor, ArtifactBecameVulnerable, DomainEvent, IngestSource, PersistedEvent, PolicyEvaluated,
+    PolicyResult, PolicyViolation, ReleaseReason, ScanAssessment, ScanCompleted, SeveritySummary,
+    StreamId, NO_POLICY,
 };
 use hort_domain::policy::scan_delta::compute_added_findings;
 use hort_domain::policy::{
@@ -48,17 +48,17 @@ use hort_domain::ports::repo_security_score_repository::ScoreDelta;
 
 use crate::error::{AppError, AppResult};
 use crate::metrics::{
-    emit_artifact_became_vulnerable, emit_policy_evaluation, emit_policy_violations, labels,
+    emit_artifact_became_vulnerable, emit_policy_evaluation, emit_policy_violations, emit_release,
     policy_decision_point, values, PolicyEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::release_clearance::provenance_clearance_from;
 use crate::use_cases::scan_history;
-use crate::use_cases::{ArtifactAtVersion, CallerPrivileges, OverCapStream};
+use crate::use_cases::{ArtifactAtVersion, OverCapStream};
 
 /// The static authority-kind label for the timer-release
 /// `info!` line. Only the four timer-authorities reach this:
-/// `AdminOverride` / `PolicyReEvaluation` never pair with
+/// `PolicyReEvaluation` / `CuratorWaiver` never pair with
 /// `ReleaseReason::Timer` (they would be rejected by the domain
 /// predicate before producing an event), and the resolver only ever
 /// returns `ScanSucceeded` / `ScanCleared` / `ScanWaived` /
@@ -70,11 +70,10 @@ fn release_authority_label(authz: ReleaseAuthorization) -> &'static str {
         ReleaseAuthorization::ScanCleared => "scan_cleared",
         ReleaseAuthorization::ScanWaived => "scan_waived",
         ReleaseAuthorization::ScanRecorded => "scan_recorded",
-        ReleaseAuthorization::AdminOverride => "admin_override",
         ReleaseAuthorization::PolicyReEvaluation => "policy_re_evaluation",
-        // Curator-waive surface label. The
-        // `QuarantineUseCase` release paths do not currently construct
-        // this token (curator-waive is `CurationUseCase`'s
+        // The manual release's label. The
+        // `QuarantineUseCase` release paths never construct
+        // this token (the manual release is `CurationUseCase::waive`'s
         // surface); the arm is required for exhaustive-match.
         ReleaseAuthorization::CuratorWaiver => "curator_waiver",
     }
@@ -305,15 +304,6 @@ fn provenance_mode_of(policy: Option<&ScanPolicyProjection>) -> ProvenanceMode {
     policy.map(|p| p.provenance_mode).unwrap_or_default()
 }
 
-/// Emit `hort_quarantine_released_total` with the given reason.
-fn emit_release(reason: &'static str) {
-    metrics::counter!(
-        "hort_quarantine_released_total",
-        labels::REASON => reason,
-    )
-    .increment(1);
-}
-
 /// Map per-finding values onto the `scan_findings` projection row
 /// shape. `scan_id` correlates the rows with the
 /// `ScanCompleted` event in the same atomic batch.
@@ -467,7 +457,7 @@ impl QuarantineUseCase {
     /// Construct a fully-wired `QuarantineUseCase`. Threads the
     /// storage port the dual-write path (`record_scan_result`)
     /// requires; non-scan paths (`quarantine_artifact`,
-    /// `admin_release`, `release_expired`) don't read it but it must
+    /// `release_expired`) don't read it but it must
     /// still be supplied so a composition root can never accidentally
     /// end up on the misuse path that surfaced as
     /// `DomainError::Invariant("QuarantineUseCase missing
@@ -544,7 +534,9 @@ impl QuarantineUseCase {
     ///   actor parameter (same pattern as `record_scan_result`).
     /// - **Admin-initiated quarantine** (manual hold on a suspicious
     ///   artifact) → separate `admin_quarantine` method with `ApiActor` +
-    ///   `CallerPrivileges`, following the `admin_release` pattern.
+    ///   `CallerPrivileges`, following the `CurationUseCase::waive`
+    ///   pattern (privilege gate → paired load → domain transition →
+    ///   `commit_transition_with_score`).
     #[tracing::instrument(skip(self))]
     pub async fn quarantine_artifact(
         &self,
@@ -1832,103 +1824,6 @@ impl QuarantineUseCase {
         ))
     }
 
-    /// Admin override: release a quarantined artifact regardless of scan results.
-    ///
-    /// Requires admin privilege. The emitted
-    /// [`DomainEvent::ArtifactReleased`] carries
-    /// `released_by_user_id = Some(actor.user_id)` and the operator-
-    /// supplied `justification` so the override is attributable in
-    /// the audit log. The HTTP boundary is responsible for rejecting
-    /// empty / oversize justifications before the call reaches this
-    /// method; the domain validation here is the second gate
-    /// (`ArtifactReleased::validate` enforces the variant invariant
-    /// and the 512-byte cap on `justification`).
-    #[tracing::instrument(skip(self, privileges, justification))]
-    pub async fn admin_release(
-        &self,
-        artifact_id: Uuid,
-        actor: ApiActor,
-        privileges: CallerPrivileges,
-        justification: String,
-    ) -> AppResult<()> {
-        if let Err(e) = privileges.require_admin() {
-            tracing::info!(artifact_id = %artifact_id, user_id = %actor.user_id, "admin_release denied: not admin");
-            return Err(e);
-        }
-
-        let stream_id = StreamId::artifact(artifact_id);
-        let correlation_id = Uuid::new_v4();
-        let user_id = actor.user_id;
-
-        // Version paired with the load: `Artifact::release`'s
-        // deny-by-default predicate decides from the state this load
-        // observed, so the append has to be ordered against the same
-        // observation.
-        let mut paired = ArtifactAtVersion::load(
-            &*self.artifacts,
-            &*self.events,
-            artifact_id,
-            OverCapStream::Tolerate,
-        )
-        .await?;
-        let expected_version = paired.expected_version();
-        // Capture the prior status BEFORE mutation so
-        // the projector can compute the (prior → released) delta.
-        let prior_status = paired.artifact().quarantine_status;
-        let repository_id = paired.artifact().repository_id;
-        // Admin override is the AdminOverride authority;
-        // it pairs with ReleaseReason::Admin in the deny-by-default
-        // release predicate. The source-state guard now also accepts
-        // ScanIndeterminate so an admin can clear a stuck-scanner
-        // artifact directly.
-        let mut event_payload = paired.artifact_mut().release(
-            ReleaseReason::Admin,
-            ReleaseAuthorization::AdminOverride,
-            // Admin overrides ignore the provenance param
-            // regardless, so `NotRequired` is semantically correct here.
-            ProvenanceClearance::NotRequired,
-        )?;
-        // Populate the attribution fields before append. `release()`
-        // returns a skeleton event with both fields `None`; the
-        // variant invariant for `Admin` requires both `Some`. Domain
-        // `validate()` runs at the event-store boundary; populating
-        // here keeps the entity free of API-layer concerns while
-        // still making the override attributable.
-        event_payload.released_by_user_id = Some(user_id);
-        event_payload.justification = Some(justification);
-
-        let score_delta = RepoSecurityScoreProjector::compute_released_delta(prior_status);
-        let artifact = paired.into_artifact();
-
-        self.lifecycle
-            .commit_transition_with_score(
-                &artifact,
-                AppendEvents {
-                    stream_id,
-                    expected_version,
-                    events: vec![EventToAppend::new(DomainEvent::ArtifactReleased(
-                        event_payload,
-                    ))],
-                    correlation_id,
-                    causation_id: None,
-                    actor: Actor::Api(actor),
-                },
-                None, // admin_release does not overwrite ingest metadata
-                Some((repository_id, score_delta)),
-            )
-            .await?;
-
-        emit_release(values::REASON_ADMIN);
-
-        tracing::info!(
-            artifact_id = %artifact_id,
-            user_id = %user_id,
-            reason = "admin",
-            "admin released quarantined artifact"
-        );
-        Ok(())
-    }
-
     /// Release artifacts whose quarantine period has expired.
     ///
     /// No actor parameter — uses `timer_actor()` internally (C2).
@@ -2546,33 +2441,6 @@ mod tests {
         Option<SharedString>,
         DebugValue,
     );
-
-    fn assert_release_counter(entries: &[MetricEntry], expected_reason: &str, expected_value: u64) {
-        let found = entries.iter().find(|(ck, _, _, _)| {
-            ck.kind() == MetricKind::Counter
-                && ck.key().name() == "hort_quarantine_released_total"
-                && ck
-                    .key()
-                    .labels()
-                    .any(|l| l.key() == "reason" && l.value() == expected_reason)
-        });
-        match found {
-            Some((_, _, _, DebugValue::Counter(got))) => assert_eq!(
-                *got, expected_value,
-                "hort_quarantine_released_total{{reason={expected_reason}}} had {got}"
-            ),
-            Some(_) => panic!("release metric is not a counter"),
-            None => {
-                let seen: Vec<&str> = entries
-                    .iter()
-                    .map(|(ck, _, _, _)| ck.key().name())
-                    .collect();
-                panic!(
-                    "hort_quarantine_released_total{{reason={expected_reason}}} not found; seen: {seen:?}"
-                );
-            }
-        }
-    }
 
     // -- Use-case factory -----------------------------------------------------
 
@@ -3654,7 +3522,7 @@ mod tests {
     /// `PolicyEvaluated(Fail)` commit exactly as on a reject, and only
     /// the transition is withheld.
     #[tokio::test]
-    async fn record_scan_result_does_not_re_block_an_admin_released_artifact() {
+    async fn record_scan_result_does_not_re_block_an_artifact_released_by_admin() {
         let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
         let artifact_id = seed_released_artifact(
             &artifacts,
@@ -5772,100 +5640,6 @@ spec:
         // tier above threshold; cve.rs accumulates one violation per
         // non-zero tier above threshold.
         assert_eq!(reject_event.reason, policy_event.violations[0].message);
-    }
-
-    // -- admin_release tests -------------------------------------------------
-
-    /// Justification used by `admin_release` happy-path tests.
-    /// 80-byte free text — well under the 512-byte cap, includes a
-    /// realistic CVE-acceptance phrasing so the assertions on the
-    /// emitted event read meaningfully.
-    fn sample_justification() -> String {
-        "CVE-2026-XXXX accepted: false-positive after manual review on 2026-04-30".into()
-    }
-
-    #[test]
-    fn admin_release_success() {
-        let actor = api_actor();
-        let snap = capture_metrics(|| {
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                let (uc, artifacts, _events, lifecycle, repositories, _projections) =
-                    make_use_case();
-                let artifact_id = seed_artifact_with_repo(
-                    &artifacts,
-                    &repositories,
-                    QuarantineStatus::Quarantined,
-                );
-
-                uc.admin_release(
-                    artifact_id,
-                    actor.clone(),
-                    admin_privileges(),
-                    sample_justification(),
-                )
-                .await
-                .unwrap();
-
-                let transitions = lifecycle.committed_transitions();
-                assert_eq!(transitions.len(), 1);
-                let (saved_artifact, batch, _metadata) = &transitions[0];
-                assert!(matches!(
-                    &batch.events[0].event,
-                    DomainEvent::ArtifactReleased(_)
-                ));
-                assert_eq!(batch.actor, Actor::Api(actor.clone()));
-                assert_eq!(saved_artifact.quarantine_status, QuarantineStatus::Released);
-
-                // Assert the emitted event is attributable:
-                // released_by_user_id matches the actor's user_id and
-                // justification carries the operator-supplied text.
-                let DomainEvent::ArtifactReleased(release_event) = &batch.events[0].event else {
-                    panic!("expected ArtifactReleased")
-                };
-                assert_eq!(release_event.released_by, ReleaseReason::Admin);
-                assert_eq!(release_event.released_by_user_id, Some(actor.user_id));
-                assert_eq!(release_event.justification, Some(sample_justification()));
-            });
-        });
-
-        let entries = snap.into_vec();
-        assert_release_counter(&entries, "admin", 1);
-    }
-
-    #[tokio::test]
-    async fn admin_release_without_admin_forbidden() {
-        let (uc, artifacts, _events, _lifecycle, repositories, _projections) = make_use_case();
-        let artifact_id =
-            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
-
-        let err = uc
-            .admin_release(
-                artifact_id,
-                api_actor(),
-                unprivileged(),
-                sample_justification(),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("admin"));
-    }
-
-    #[tokio::test]
-    async fn admin_release_non_quarantined_fails() {
-        let (uc, artifacts, _events, _lifecycle, repositories, _projections) = make_use_case();
-        let artifact_id =
-            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
-
-        let err = uc
-            .admin_release(
-                artifact_id,
-                api_actor(),
-                admin_privileges(),
-                sample_justification(),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("cannot release"));
     }
 
     // -- release_expired tests (real release authority, ADR 0007) -------------
@@ -9094,7 +8868,7 @@ spec:
     /// `release_authority_label` maps every
     /// [`ReleaseAuthorization`] arm. The four timer authorities
     /// (`ScanSucceeded` / `ScanCleared` / `ScanWaived` /
-    /// `ScanRecorded`) are the live mapping; the `AdminOverride` /
+    /// `ScanRecorded`) are the live mapping; the
     /// `PolicyReEvaluation` / `CuratorWaiver` arms are an
     /// exhaustive-match guard (never reached on the timer path) and are
     /// pinned here so the 100%-coverage `hort-app` requirement holds
@@ -9121,10 +8895,6 @@ spec:
         assert_eq!(
             release_authority_label(ReleaseAuthorization::ScanRecorded),
             "scan_recorded"
-        );
-        assert_eq!(
-            release_authority_label(ReleaseAuthorization::AdminOverride),
-            "admin_override"
         );
         assert_eq!(
             release_authority_label(ReleaseAuthorization::PolicyReEvaluation),
@@ -9702,18 +9472,38 @@ spec:
 
     // -- audit-log completeness ------------------------------------------------
     //
-    // AUDIT-info-1: `admin_release` SUCCESS log line must include `user_id`
-    //   (the DENIAL branch already does); SOC operators correlate by user_id
-    //   across denial+success.
     // AUDIT-info-2: `record_scan_result` (system_actor path) and
     //   `release_expired` (timer_actor path) log lines must include
     //   `correlation_id` — the value is already minted on the event, the
     //   log line was missing it.
     //
-    // The capture infrastructure mirrors `repository_access.rs`'s
+    // One holding test per half. This list is the index a reviewer trusts,
+    // so it states how strong each assertion is, not merely that one
+    // exists:
+    //
+    //   - `record_scan_result`'s "scan-result evaluated" line —
+    //     `record_scan_result_log_carries_correlation_id`, below. A
+    //     **presence** check against the flattened line this module's
+    //     `(Level, String)` capture produces, not an equality on the field.
+    //   - `release_expired`'s "released expired artifact" success line —
+    //     `audit_info_2_release_expired_success_log_carries_the_appended_correlation_id`,
+    //     below. An **equality**: the field holds the correlation id that
+    //     candidate's append carried. It runs on
+    //     `test_support::tracing_capture`, whose per-field capture is what
+    //     makes the equality expressible at all.
+    //
+    // Held by neither: `record_scan_result`'s fast-path release re-emits
+    // the same "released expired artifact" message (distinguished by
+    // `source = "scan_complete_fast_path"`) and carries `correlation_id` in
+    // code, but no test asserts that line's field.
+    //
+    // The capture infrastructure below mirrors `repository_access.rs`'s
     // `Write-grant denial log assertion` block — see the comments there
     // for why `Interest::sometimes()`, the global passthrough subscriber,
-    // and the serialising mutex are all required.
+    // and the serialising mutex are all required. The shared harness is the
+    // same machinery keyed by field name; it is reached by path, because
+    // this module defines its own `install_audit_passthrough_subscriber`
+    // and the bare name resolves here.
 
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::Registry;
@@ -9814,7 +9604,7 @@ spec:
         rt.block_on(async {
             let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
 
-            let admin_released = seed_released_artifact(
+            let released_by_admin = seed_released_artifact(
                 &artifacts,
                 &repositories,
                 &projections,
@@ -9838,7 +9628,7 @@ spec:
                 SeverityThreshold::High,
             ));
 
-            for artifact_id in [admin_released, curator_released, already_rejected] {
+            for artifact_id in [released_by_admin, curator_released, already_rejected] {
                 uc.record_scan_result(
                     artifact_id,
                     "trivy".into(),
@@ -9898,54 +9688,6 @@ spec:
         );
     }
 
-    /// AUDIT-info-1: `admin_release` success info-log carries `user_id`,
-    /// matching the denial branch's shape so SOC can correlate.
-    #[test]
-    fn admin_release_success_log_carries_user_id() {
-        install_audit_passthrough_subscriber();
-        let _serial = AUDIT_TRACING_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let layer = AuditCapturingLayer::default();
-        let captured = layer.records.clone();
-        let subscriber = Registry::default().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
-
-        let actor = api_actor();
-        let actor_user_id = actor.user_id;
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let (uc, artifacts, _events, _lifecycle, repositories, _projections) = make_use_case();
-            let artifact_id =
-                seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
-            uc.admin_release(
-                artifact_id,
-                actor.clone(),
-                admin_privileges(),
-                sample_justification(),
-            )
-            .await
-            .unwrap();
-        });
-
-        let records = captured.lock().unwrap();
-        let success_event = records
-            .iter()
-            .find(|(_, msg)| msg.contains("admin released quarantined artifact"))
-            .expect("expected admin_release success info log");
-        let msg = &success_event.1;
-        assert!(
-            msg.contains(&actor_user_id.to_string()),
-            "admin_release success log must carry user_id (AUDIT-info-1): {msg}"
-        );
-    }
-
     /// AUDIT-info-2 (system_actor path): `record_scan_result`'s info log
     /// includes `correlation_id`. We exercise the Reject branch (critical
     /// finding under the default policy) so the structured log line fires.
@@ -10000,6 +9742,99 @@ spec:
         );
     }
 
+    /// AUDIT-info-2 on the timer path: `release_expired`'s success line
+    /// emits `correlation_id` carrying the id that candidate's append
+    /// carried — the value an operator joins the log line to the
+    /// `ArtifactReleased` event by.
+    ///
+    /// Asserted as an **equality on the field**, which is why it runs on
+    /// `test_support::tracing_capture` rather than this file's flattening
+    /// `(Level, String)` capture. The sweep mints the correlation id per
+    /// candidate (`Uuid::new_v4()` inside the loop — it is never a caller
+    /// argument, and `AppendEvents::correlation_id` is server-generated by
+    /// contract), so the only honest claim is that the line's field holds
+    /// *that* id, and a rendered line cannot be asked for one field's
+    /// value: the same line carries `artifact_id` too, so a substring check
+    /// for a uuid stays green exactly when `correlation_id` is the field
+    /// that went missing.
+    ///
+    /// The field rides the event, not `release_expired`'s
+    /// `#[tracing::instrument]` span — which is what puts it in reach of a
+    /// capture that implements `on_event` alone.
+    ///
+    /// Selected by `target` + `message`, then pinned to a count of one:
+    /// `record_scan_result`'s fast-path release re-emits the same message
+    /// (distinguished in production by `source = "scan_complete_fast_path"`),
+    /// so the count is what proves the captured line is this sweep's.
+    ///
+    /// Synchronous `#[test]` driving the async sweep through a current-thread
+    /// runtime's `block_on` inside the capture closure: the capture's
+    /// serialising guard must not cross an `.await`, and an event emitted on
+    /// another thread would never reach the buffer.
+    #[test]
+    fn audit_info_2_release_expired_success_log_carries_the_appended_correlation_id() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let (appended_correlation_id, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (uc, artifacts, event_store, lifecycle, repositories, _projections) =
+                    make_use_case();
+                let artifact_id = seed_artifact_with_repo(
+                    &artifacts,
+                    &repositories,
+                    QuarantineStatus::Quarantined,
+                );
+                seed_stream_with_scan_completed(&event_store, artifact_id);
+
+                let released = uc
+                    .release_expired(vec![artifact_id])
+                    .await
+                    .expect("the sweep must not error")
+                    .released;
+                assert_eq!(
+                    released,
+                    vec![artifact_id],
+                    "the seeded ScanCompleted authorizes exactly this release"
+                );
+
+                // The append's correlation id is the assertion's target: the
+                // log line is only useful if it names the id the released
+                // event actually carries.
+                let transitions = lifecycle.committed_transitions();
+                assert_eq!(transitions.len(), 1, "one candidate, one append");
+                transitions[0].1.correlation_id
+            })
+        });
+
+        let success: Vec<_> = captured
+            .iter()
+            .filter(|e| {
+                e.level == tracing::Level::INFO
+                    && e.message() == "released expired artifact"
+                    && e.target
+                        .starts_with("hort_app::use_cases::quarantine_use_case")
+            })
+            .collect();
+        assert_eq!(
+            success.len(),
+            1,
+            "expected exactly the timer sweep's success info line; captured {captured:#?}"
+        );
+
+        let expected = appended_correlation_id.to_string();
+        assert_eq!(
+            success[0].field("correlation_id"),
+            Some(expected.as_str()),
+            "AUDIT-info-2: the timer release's success line must carry correlation_id = the \
+             id that candidate's append carried; saw {:#?}",
+            success[0]
+        );
+    }
+
     // -- score-projection wiring tests ------------------------------------------
 
     #[tokio::test]
@@ -10029,33 +9864,12 @@ spec:
         assert!(delta.last_scan_at.is_none());
     }
 
-    #[tokio::test]
-    async fn admin_release_threads_released_delta_with_prior_quarantined() {
-        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
-        let artifact_id =
-            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
-        uc.admin_release(
-            artifact_id,
-            api_actor(),
-            admin_privileges(),
-            "ok by ops".into(),
-        )
-        .await
-        .unwrap();
-
-        let deltas = lifecycle.score_deltas();
-        assert_eq!(deltas.len(), 1);
-        let (_repo, delta) = &deltas[0];
-        assert_eq!(delta.quarantined_delta, -1);
-        assert_eq!(delta.released_delta, 1);
-        assert_eq!(delta.rejected_delta, 0);
-    }
-
     /// Fail-closed: a candidate with no authority
     /// (no `ScanCompleted`, no `scan_backends:[]` policy) is not
     /// released, so no score delta is threaded. The released path's
     /// delta is covered by `release_expired_releases_via_scan_succeeded`
-    /// / `admin_release_threads_released_delta_with_prior_quarantined`.
+    /// and by the scan-result fast path's
+    /// `quarantined_delta = -1 / released_delta = +1` assertion.
     #[tokio::test]
     async fn release_expired_fail_closed_threads_no_delta() {
         let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
@@ -10266,9 +10080,16 @@ spec:
     /// Fail-closed: when no authority is constructible
     /// (no `ScanCompleted`, no `scan_backends:[]` waiver), the timer
     /// sweep skips the artifact and logs a fail-closed skip line — it
-    /// does NOT log the "released expired artifact" success line. The
-    /// success-line + correlation_id assertions are covered by
-    /// `release_expired_info_log_carries_resolved_authority_kind`.
+    /// does NOT log the "released expired artifact" success line.
+    ///
+    /// What that success line itself says is asserted elsewhere, one claim
+    /// per test: `release_expired_info_log_carries_resolved_authority_kind`
+    /// asserts the resolved authority kind (`authority=scan_succeeded` /
+    /// `authority=scan_waived`) and nothing else, and
+    /// `audit_info_2_release_expired_success_log_carries_the_appended_correlation_id`
+    /// asserts the `correlation_id` field's value. Neither stands in for the
+    /// other: with the `correlation_id` field deleted from the production
+    /// line, the authority-kind test stays green.
     #[test]
     fn release_expired_fail_closed_logs_skip() {
         install_audit_passthrough_subscriber();

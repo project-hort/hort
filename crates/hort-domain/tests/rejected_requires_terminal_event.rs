@@ -139,8 +139,7 @@ fn classify(event: QuarantineEvent) -> RejectedArmVerdict {
         // ── never reach Rejected (see quarantine_transitions::classify) ──
         QuarantineEvent::Quarantine => Unreachable,
         QuarantineEvent::RecordCleanScan => Unreachable,
-        QuarantineEvent::ReleaseCuratorWaiver => Unreachable,
-        QuarantineEvent::ReleaseGeneral => Unreachable,
+        QuarantineEvent::Release => Unreachable,
         QuarantineEvent::CascadeProvenanceClearance => Unreachable,
         QuarantineEvent::FailScanIndeterminate => Unreachable,
         // Leaves Rejected (Quarantined/Released), never reaches it.
@@ -280,8 +279,7 @@ fn exercise(event: QuarantineEvent) -> Vec<DomainEvent> {
         }
         QuarantineEvent::Quarantine
         | QuarantineEvent::RecordCleanScan
-        | QuarantineEvent::ReleaseCuratorWaiver
-        | QuarantineEvent::ReleaseGeneral
+        | QuarantineEvent::Release
         | QuarantineEvent::CascadeProvenanceClearance
         | QuarantineEvent::FailScanIndeterminate
         | QuarantineEvent::ReEvaluate

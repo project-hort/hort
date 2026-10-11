@@ -4,16 +4,25 @@
 //! - `GET    /repositories/:key`                          — look up a repo's UUID by key
 //! - `GET    /repositories/:key/effective-config`         — resolved repo config (read-only)
 //! - `GET    /gitops/apply-status`                        — this process's boot apply (read-only)
-//! - `GET    /quarantine/patch-candidates`                — list patch-candidate surface
-//! - `POST   /quarantine/:artifact_id/release`            — admin override release
+//! - `GET    /quarantine/patch-candidates`                — list patch-candidate surface (curator-or-admin)
 //! - `POST   /quarantine/provenance-misrejections/repair` — one-shot repair of D6's illegal state (dry-run by default)
 //!
 //! Mounted under `/api/v1/admin` by [`crate::router::build_router`].
-//! Every handler
-//! in this module declares [`AdminPrincipal`] as its first extractor — it
-//! enforces `Permission::Admin` before the handler body runs
-//! and emits `hort_authz_decisions_total{permission=admin, …}` from exactly
-//! one spot. Handler bodies contain zero inline `rbac.authorize(...)` calls.
+//! Every handler in this module declares an authorization extractor as its
+//! first extractor, which enforces the permission before the handler body
+//! runs and emits `hort_authz_decisions_total` from exactly one spot.
+//! Handler bodies contain zero inline `rbac.authorize(...)` calls.
+//!
+//! The extractor is [`AdminPrincipal`] for every route here except
+//! `GET /quarantine/patch-candidates`, which declares
+//! [`CurateOrAdminPrincipal`] and so ticks the metric under
+//! `permission=curate`. That one exception is not a weakening of the
+//! admin tree: the listing is the read that grounds the manual release,
+//! and the release is the curator's (ADR 0007, "One authority owns the
+//! manual release"). The path stays `/api/v1/admin/...` because the
+//! curator decision routes it feeds are admin-prefixed too
+//! (`/api/v1/admin/curation/*`) — the prefix is a mount point, not an
+//! authority statement.
 //!
 //! Server startup (`cli::serve::run_async`) refuses to boot under
 //! `HORT_AUTH_PROVIDER=disabled` — the admin surface is mounted unconditionally
@@ -65,7 +74,7 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
     RepositoryUpstreamMapping, UpstreamAuth,
 };
 
-use crate::authz::AdminPrincipal;
+use crate::authz::{AdminPrincipal, CurateOrAdminPrincipal};
 use crate::context::AppContext;
 use crate::error::ApiError;
 
@@ -95,13 +104,6 @@ pub mod policies;
 /// module's own docs for why the admin gate rather than the curator one.
 pub mod provenance_misrejections;
 
-/// Maximum byte length of the operator-supplied justification on
-/// `POST /admin/quarantine/:artifact_id/release`. Mirrors the
-/// 512-byte cap enforced by [`hort_domain::events::ArtifactReleased::validate`]
-/// — the boundary check returns 400 with a clear message before the
-/// request reaches the use case.
-const MAX_RELEASE_JUSTIFICATION_BYTES: usize = 512;
-
 /// Build the admin route tree. Mount under `/admin` in the top-level router.
 pub fn admin_routes() -> Router<Arc<AppContext>> {
     Router::new()
@@ -125,23 +127,21 @@ pub fn admin_routes() -> Router<Arc<AppContext>> {
         // deltas. Reads an in-memory snapshot; touches no port, so it
         // answers even when the database is unhealthy.
         .route("/gitops/apply-status", get(get_gitops_apply_status))
-        // Admin-only read of the patch-candidate
-        // quarantine surface. Mounted before `post_quarantine_release`
-        // so the `/quarantine/*` routes group by path. The handler is
-        // gated by the `AdminPrincipal` extractor (same as
-        // `post_quarantine_release` below); the use-case-side
-        // `require_admin()` is a no-op defence-in-depth check.
+        // Curator-or-admin read of the patch-candidate quarantine
+        // surface — the one route in this tree NOT gated by
+        // `AdminPrincipal`. The release an operator reaches from this
+        // queue is the curator's
+        // `POST /admin/curation/quarantine/{artifact_id}/waive` — one
+        // authority owns the manual release (ADR 0007), so there is no
+        // release route in this tree, and an authority that may decide
+        // must be able to read the findings that ground the decision.
+        // The handler is gated by the `CurateOrAdminPrincipal`
+        // extractor, whose Curate-then-Admin precedence admits an admin
+        // without an explicit `curate` grant; the use-case-side
+        // `require_curate_or_admin()` is a no-op defence-in-depth check.
         .route(
             "/quarantine/patch-candidates",
             get(get_quarantine_patch_candidates),
-        )
-        // Admin override
-        // release with attribution. The handler requires a non-empty,
-        // ≤ 512-byte `justification` in the JSON body so the emitted
-        // `ArtifactReleased` event identifies who and why.
-        .route(
-            "/quarantine/{artifact_id}/release",
-            post(post_quarantine_release),
         )
         // One-shot corrective path for the artifacts the pre-amendment
         // provenance arm stranded in an illegal terminal state (ADR 0039's
@@ -526,7 +526,7 @@ async fn get_gitops_apply_status(
 }
 
 // ---------------------------------------------------------------------------
-// Admin-only read of the patch-candidate surface
+// Curator-or-admin read of the patch-candidate surface
 // ---------------------------------------------------------------------------
 
 /// Query parameters for `GET /admin/quarantine/patch-candidates`.
@@ -534,7 +534,7 @@ async fn get_gitops_apply_status(
 /// `repository` filters to a single repository identified by its
 /// **stable key** (e.g. `npm-proxy`) — the
 /// playbook and the hort-cli surface both pass `--repo <key>`. Absent →
-/// admin-wide scope. The handler resolves the key to a `Uuid` via
+/// unscoped: every repository. The handler resolves the key to a `Uuid` via
 /// `RepositoryRepository::find_by_key`; a missing key surfaces as 404
 /// with a structured `{"error":"repository_not_found","key":...}`
 /// body. `Uuid`-shaped values are NOT accepted — keys are the
@@ -631,7 +631,7 @@ impl PatchCandidateDto {
 }
 
 async fn get_quarantine_patch_candidates(
-    admin: AdminPrincipal,
+    principal: CurateOrAdminPrincipal,
     State(ctx): State<Arc<AppContext>>,
     Query(query): Query<PatchCandidatesQuery>,
 ) -> Result<Response, ApiError> {
@@ -683,18 +683,26 @@ async fn get_quarantine_patch_candidates(
         repository_key_for_metric,
     };
 
-    // The AdminPrincipal extractor already enforced Permission::Admin
-    // at the request edge; pass `is_admin: true` so the use-case-side
-    // gate is a no-op rather than a duplicate authz call. The use
-    // case is the canonical info-log emission site for this read
-    // — the handler does not log at info-level itself.
+    // `CurateOrAdminPrincipal` proved either Curate or Admin satisfies
+    // the gate — it does not report which leg won, by design. Set
+    // `is_curator = true` so the use-case-side
+    // `require_curate_or_admin()` is a no-op rather than a duplicate
+    // authz call (defence in depth — the use case keeps its gate
+    // engaged for non-HTTP callers, and it is the canonical info-log
+    // emission site for this read, so the handler does not log at
+    // info-level itself). Mirrors the curation queue handler
+    // (`admin/curation/queue.rs`), the listing this surface is the
+    // sibling of: `is_admin` stays `false` because nothing downstream
+    // of here needs admin-only authority, and claiming it would make an
+    // admin-shaped privilege out of a gate that only proved
+    // curate-or-admin.
     let actor = ApiActor {
-        user_id: admin.0.user_id,
+        user_id: principal.0.user_id,
     };
     let privileges = CallerPrivileges {
-        is_admin: true,
+        is_admin: false,
         is_reviewer: false,
-        is_curator: false,
+        is_curator: true,
         writable_repository_ids: Vec::new(),
     };
 
@@ -781,77 +789,6 @@ async fn get_scanner_workers(
             .collect(),
     };
     Ok((StatusCode::OK, Json(body)).into_response())
-}
-
-// ---------------------------------------------------------------------------
-// Admin override release with attribution
-// ---------------------------------------------------------------------------
-
-/// Request DTO for `POST /admin/quarantine/:artifact_id/release`.
-///
-/// `justification` is operator-supplied free text recorded in the
-/// emitted `ArtifactReleased` event so audit consumers can reconstruct
-/// the override decision. It MUST be non-empty and ≤ 512 bytes —
-/// rejected with 400 at the boundary so the use case never sees
-/// invalid input. The size limit mirrors the domain-layer cap
-/// (`ArtifactReleased::validate`).
-#[derive(Debug, Deserialize)]
-struct AdminReleaseRequest {
-    justification: String,
-}
-
-async fn post_quarantine_release(
-    admin: AdminPrincipal,
-    State(ctx): State<Arc<AppContext>>,
-    Path(artifact_id): Path<Uuid>,
-    Json(body): Json<AdminReleaseRequest>,
-) -> Result<Response, ApiError> {
-    // Boundary validation — empty or oversize justification surfaces
-    // as 400 BEFORE we touch the use case. Trim is intentional:
-    // whitespace-only input is the same UX failure mode as empty
-    // (operators copy-pasting an accidental newline), and the
-    // event-store auditor reading "    " as a justification is the
-    // same negative outcome as missing.
-    let trimmed = body.justification.trim();
-    if trimmed.is_empty() {
-        return Err(ApiError(AppError::Domain(DomainError::Validation(
-            "justification must not be empty".into(),
-        ))));
-    }
-    // Cap is on byte length (not char count) to match the domain
-    // 512-byte invariant exactly. UTF-8 multibyte sequences count
-    // as their byte length.
-    if body.justification.len() > MAX_RELEASE_JUSTIFICATION_BYTES {
-        return Err(ApiError(AppError::Domain(DomainError::Validation(
-            format!(
-                "justification exceeds {MAX_RELEASE_JUSTIFICATION_BYTES} bytes (got {})",
-                body.justification.len()
-            ),
-        ))));
-    }
-
-    // The AdminPrincipal extractor already enforced Permission::Admin
-    // at the request edge; pass `is_admin: true` so the use-case-side
-    // gate is a no-op rather than a duplicate authz call. The use
-    // case is the single emission point for the audit log line, so
-    // we keep `require_admin()` engaged inside the use case for
-    // defence-in-depth (a future caller that bypasses this handler
-    // can't accidentally skip the gate).
-    let actor = ApiActor {
-        user_id: admin.0.user_id,
-    };
-    let privileges = CallerPrivileges {
-        is_admin: true,
-        is_reviewer: false,
-        is_curator: false,
-        writable_repository_ids: Vec::new(),
-    };
-
-    ctx.quarantine_use_case
-        .admin_release(artifact_id, actor, privileges, body.justification)
-        .await?;
-
-    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -1769,210 +1706,41 @@ mod tests {
     // (parsed-but-never-wired); authenticated upstreams use the
     // `UpstreamMappingSpec` kind's own `secret_ref`.
 
-    // ----- POST /admin/quarantine/:id/release — admin override release ----
-
-    use hort_app::use_cases::test_support::{sample_artifact, sample_repository};
-    use hort_domain::entities::artifact::QuarantineStatus;
-
-    /// Build a router that exposes `/admin` and returns the
-    /// `MockPorts` so tests can seed an artifact + repo before
-    /// exercising `POST /admin/quarantine/:id/release`.
-    fn release_harness() -> (Router, crate::test_support::MockPorts, Arc<AppContext>) {
-        let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
-        let (base, mocks) = build_mock_ctx(metrics_handle);
-
-        let idp = Arc::new(MockIdentityProvider::new());
-        let authenticate = Arc::new(AuthenticateUseCase::new(
-            idp as Arc<dyn IdentityProvider>,
-            mocks.users.clone() as Arc<dyn UserRepository>,
-            Vec::new(),
-        ));
-        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
-            Vec::new(),
-        )));
-        let ctx = with_auth(
-            &base,
-            crate::context::AuthContext::Enabled {
-                authenticate,
-                rbac,
-                // Admin handler
-                // tests don't exercise the WWW-Authenticate selector.
-                issuer_url: None,
-            },
-        );
-        let router = Router::new()
-            .nest("/admin", admin_routes())
-            .with_state(ctx.clone());
-        (router, mocks, ctx)
-    }
-
-    /// Construct `POST /admin/quarantine/<id>/release` with the
-    /// supplied JSON body and an optional pre-inserted admin
-    /// principal. When `principal` is `None`, the AdminPrincipal
-    /// extractor surfaces 500 (router-wiring bug per existing
-    /// admin_get test pattern).
-    fn release_post(
-        artifact_id: Uuid,
-        body: &str,
-        principal: Option<CallerPrincipal>,
-    ) -> Request<Body> {
-        let mut req = Request::post(format!("/admin/quarantine/{artifact_id}/release"))
-            .header("content-type", "application/json")
-            .body(Body::from(body.to_owned()))
-            .unwrap();
-        if let Some(p) = principal {
-            crate::middleware::auth::test_support::inject_principal(&mut req, p);
-        }
-        req
-    }
-
-    /// Seed a quarantined artifact + matching repository row in the
-    /// mocks. Returns the artifact id so the test can drive the
-    /// release route.
-    fn seed_quarantined(mocks: &crate::test_support::MockPorts) -> Uuid {
-        let artifact = sample_artifact(QuarantineStatus::Quarantined);
-        let mut repo = sample_repository();
-        repo.id = artifact.repository_id;
-        let id = artifact.id;
-        mocks.artifacts.insert(artifact);
-        mocks.repositories.insert(repo);
-        id
-    }
-
-    /// Happy path: admin caller, valid body, quarantined artifact →
-    /// 204 NO CONTENT and the use case emits `ArtifactReleased`
-    /// with `released_by_user_id` + `justification` populated.
-    #[tokio::test]
-    async fn admin_release_happy_path_returns_204() {
-        let (router, mocks, _ctx) = release_harness();
-        let artifact_id = seed_quarantined(&mocks);
-
-        let principal = principal_with_claims(&["admin"]);
-        let admin_user_id = principal.user_id;
-
-        let body = r#"{"justification":"CVE-2026-XXXX accepted: false-positive"}"#;
-        let response = router
-            .oneshot(release_post(artifact_id, body, Some(principal)))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-        // Verify the use case actually emitted the ArtifactReleased
-        // event with the admin attribution. The lifecycle mock
-        // captures every commit_transition.
-        let transitions = mocks.lifecycle.committed_transitions();
-        assert_eq!(transitions.len(), 1);
-        let (_saved, batch, _meta) = &transitions[0];
-        let event = &batch.events[0].event;
-        match event {
-            hort_domain::events::DomainEvent::ArtifactReleased(e) => {
-                assert_eq!(e.released_by, hort_domain::events::ReleaseReason::Admin);
-                assert_eq!(e.released_by_user_id, Some(admin_user_id));
-                assert_eq!(
-                    e.justification,
-                    Some("CVE-2026-XXXX accepted: false-positive".into())
-                );
-                assert!(e.validate().is_ok());
-            }
-            other => panic!("expected ArtifactReleased, got {other:?}"),
-        }
-    }
-
-    /// Empty justification → 400 BEFORE the use case is touched.
-    /// The lifecycle mock must not record any commit.
-    #[tokio::test]
-    async fn admin_release_empty_justification_returns_400() {
-        let (router, mocks, _ctx) = release_harness();
-        let artifact_id = seed_quarantined(&mocks);
-
-        let body = r#"{"justification":""}"#;
-        let response = router
-            .oneshot(release_post(
-                artifact_id,
-                body,
-                Some(principal_with_claims(&["admin"])),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        // Use case is never called on a 400 — proves the boundary
-        // gate fires before the application layer.
-        assert!(mocks.lifecycle.committed_transitions().is_empty());
-    }
-
-    /// Whitespace-only justification → 400. Operator hits Enter
-    /// in a textarea or copy-pastes a stray newline; the response
-    /// shape matches an empty body.
-    #[tokio::test]
-    async fn admin_release_whitespace_justification_returns_400() {
-        let (router, mocks, _ctx) = release_harness();
-        let artifact_id = seed_quarantined(&mocks);
-
-        let body = r#"{"justification":"   \n\t  "}"#;
-        let response = router
-            .oneshot(release_post(
-                artifact_id,
-                body,
-                Some(principal_with_claims(&["admin"])),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(mocks.lifecycle.committed_transitions().is_empty());
-    }
-
-    /// 513-byte justification → 400. One byte over the cap is
-    /// rejected; the at-cap case is covered by the domain
-    /// validation tests in `events/tests.rs`.
-    #[tokio::test]
-    async fn admin_release_oversize_justification_returns_400() {
-        let (router, mocks, _ctx) = release_harness();
-        let artifact_id = seed_quarantined(&mocks);
-
-        let oversized = "x".repeat(513);
-        let body = format!(r#"{{"justification":"{oversized}"}}"#);
-        let response = router
-            .oneshot(release_post(
-                artifact_id,
-                &body,
-                Some(principal_with_claims(&["admin"])),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(mocks.lifecycle.committed_transitions().is_empty());
-    }
-
-    /// Non-admin caller → 403. The AdminPrincipal extractor
-    /// short-circuits before the handler body runs; the request
-    /// body is never parsed.
-    #[tokio::test]
-    async fn admin_release_non_admin_returns_403() {
-        let (router, mocks, _ctx) = release_harness();
-        let artifact_id = seed_quarantined(&mocks);
-
-        let body = r#"{"justification":"valid"}"#;
-        let response = router
-            .oneshot(release_post(
-                artifact_id,
-                body,
-                Some(principal_with_claims(&["reader"])),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(mocks.lifecycle.committed_transitions().is_empty());
-    }
-
     // ----- GET /admin/quarantine/patch-candidates ------
 
+    use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::repository::RepositoryFormat;
     use hort_domain::entities::scan_policy::SeverityThreshold;
     use hort_domain::ports::patch_candidate_repository::PatchCandidate;
 
+    /// A global (`repository_id: None`) `Permission::Curate` grant held
+    /// by anyone carrying the `curate` claim. This is the deployed
+    /// `maintainer-curator` shape — a standalone global `curate` grant
+    /// and no admin authority. Mirrors `curate_claim_grant()` in
+    /// `admin/curation/queue.rs`.
+    fn curate_claim_grant() -> PermissionGrant {
+        PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::Claims(vec!["curate".into()]),
+            repository_id: None,
+            permission: Permission::Curate,
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+            created_at: Utc::now(),
+        }
+    }
+
     /// Build a router for the patch-candidate endpoint. Returns the
     /// router and the full mocks struct so tests can seed
     /// `mocks.patch_candidates` and assert recorded filters.
+    ///
+    /// The evaluator carries exactly one grant — the global `curate`
+    /// claim grant above. Nothing in it grants `Admin`, so an
+    /// `["admin"]`-claim principal passes only through
+    /// `RbacEvaluator`'s admin short-circuit: that is what makes
+    /// `patch_candidates_admin_without_curate_grant_returns_200` a real
+    /// test of the extractor's Curate-then-Admin precedence rather than
+    /// a second curator test wearing a different claim name.
     fn patch_candidates_harness() -> (Router, crate::test_support::MockPorts) {
         let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
         let (base, mocks) = build_mock_ctx(metrics_handle);
@@ -1983,9 +1751,9 @@ mod tests {
             mocks.users.clone() as Arc<dyn UserRepository>,
             Vec::new(),
         ));
-        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
-            Vec::new(),
-        )));
+        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            curate_claim_grant(),
+        ])));
         let ctx = with_auth(
             &base,
             crate::context::AuthContext::Enabled {
@@ -1999,7 +1767,7 @@ mod tests {
     }
 
     /// Build `GET /admin/quarantine/patch-candidates[?<query>]` with an
-    /// optional admin principal injected into request extensions.
+    /// optional principal injected into request extensions.
     fn patch_candidates_get(query: &str, principal: Option<CallerPrincipal>) -> Request<Body> {
         let path = if query.is_empty() {
             "/admin/quarantine/patch-candidates".to_string()
@@ -2248,12 +2016,112 @@ mod tests {
         );
     }
 
-    /// Non-admin principal → 403 FORBIDDEN. The `AdminPrincipal`
-    /// extractor short-circuits before the handler body runs; the
-    /// `PatchCandidateUseCase::list` is never reached and the mock
-    /// repo records no calls.
+    /// Curator-only principal → 200 with the seeded rows. The
+    /// acceptance criterion of the gate change: a caller holding only
+    /// `Permission::Curate` (the deployed `maintainer-curator` shape)
+    /// reads the surface that grounds the release it already owns.
+    ///
+    /// Asserts the full projected field set, not just the status —
+    /// widening the gate must serve the curator the same response an
+    /// admin gets, not a redacted one. The per-field anti-enumeration
+    /// argument is about exactly this list.
     #[tokio::test]
-    async fn patch_candidates_non_admin_returns_403_and_does_not_call_repo() {
+    async fn patch_candidates_curator_only_returns_200_with_seeded_rows() {
+        let (router, mocks) = patch_candidates_harness();
+        let repo_id = Uuid::new_v4();
+        let c1 = sample_patch_candidate(repo_id);
+        mocks.patch_candidates.seed(vec![c1.clone()]);
+
+        let response = router
+            .oneshot(patch_candidates_get(
+                "",
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a global Curate holder must reach the listing",
+        );
+
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let arr = v["candidates"].as_array().expect("candidates array");
+        assert_eq!(arr.len(), 1);
+        let r0 = &arr[0];
+        assert_eq!(
+            r0["quarantined_artifact_id"],
+            c1.quarantined_artifact_id.to_string()
+        );
+        assert_eq!(r0["quarantined_version"], "4.17.21");
+        assert_eq!(r0["quarantined_status"], "quarantined");
+        assert_eq!(r0["repository_id"], repo_id.to_string());
+        assert_eq!(r0["repository_key"], "npm-main");
+        assert_eq!(r0["format"], "npm");
+        assert_eq!(r0["package_name"], "lodash");
+        assert_eq!(
+            r0["vulnerable_artifact_id"],
+            c1.vulnerable_artifact_id.to_string()
+        );
+        assert_eq!(r0["vulnerable_version"], "4.17.20");
+        assert_eq!(r0["vulnerable_finding_count"], 3);
+        assert_eq!(r0["vulnerable_max_severity"], "high");
+
+        assert_eq!(
+            mocks.patch_candidates.calls().len(),
+            1,
+            "the curator's request must reach the use case, not be \
+             short-circuited into an empty envelope",
+        );
+    }
+
+    /// An admin WITHOUT an explicit `curate` grant still gets 200. The
+    /// harness evaluator holds only a `curate`-claim grant, so this
+    /// principal cannot satisfy the extractor's first leg by subject
+    /// match — it passes through `RbacEvaluator`'s admin short-circuit
+    /// on the Curate evaluation. Pins that the widening did not cost
+    /// admins their access and that no explicit admin branch is needed
+    /// in the handler.
+    #[tokio::test]
+    async fn patch_candidates_admin_without_curate_grant_returns_200() {
+        let (router, mocks) = patch_candidates_harness();
+        mocks
+            .patch_candidates
+            .seed(vec![sample_patch_candidate(Uuid::new_v4())]);
+
+        let response = router
+            .oneshot(patch_candidates_get(
+                "",
+                Some(principal_with_claims(&["admin"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            mocks.patch_candidates.calls().len(),
+            1,
+            "the admin fall-back leg must reach the use case"
+        );
+    }
+
+    /// A caller holding neither `Curate` nor `Admin` → the SAME denial
+    /// as before the widening: 403 with the static
+    /// `{"error":"insufficient permissions"}` envelope, the use case
+    /// never reached, and no row count or repository name anywhere in
+    /// the body.
+    ///
+    /// Status AND body are both asserted deliberately. The
+    /// anti-enumeration posture of this surface is that an unauthorized
+    /// caller learns nothing — not whether candidates exist, not which
+    /// repositories hold them, not whether the gate denied on the
+    /// Curate leg or the Admin one. `CurateOrAdminPrincipal` and
+    /// `AdminPrincipal` both reject through the same
+    /// `forbidden_response()` constant, so the observable outcome is
+    /// byte-identical to what this caller saw before; pinning the bytes
+    /// is what keeps that true under a future edit to either extractor.
+    #[tokio::test]
+    async fn patch_candidates_neither_curate_nor_admin_returns_403_insufficient_permissions() {
         let (router, mocks) = patch_candidates_harness();
         // Seed a row so the assertion proves the body wasn't executed
         // (otherwise an empty result would be ambiguous between "use
@@ -2270,10 +2138,180 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            br#"{"error":"insufficient permissions"}"#,
+            "the denial envelope must stay the static, information-free \
+             constant both authz extractors share",
+        );
+
         assert!(
             mocks.patch_candidates.calls().is_empty(),
-            "AdminPrincipal short-circuit must not reach the use case"
+            "the extractor short-circuit must not reach the use case"
         );
+    }
+
+    /// A curator whose `curate` grant is scoped to ONE repository gets
+    /// 403, not a global listing.
+    ///
+    /// This is the fact the surface's anti-enumeration posture rests on,
+    /// so it is pinned here rather than inferred. The listing is
+    /// unscoped by default (`?repository` absent → every repository),
+    /// and the argument that makes serving it to a curator safe is that
+    /// a *global* `Curate` grant is already global decision authority
+    /// over exactly the artifacts it names. A repository-scoped curator
+    /// has no such authority, and must not get the global read: that
+    /// would be a discovery surface for repositories they cannot act on
+    /// (ADR 0021 / ADR 0045).
+    ///
+    /// What makes it fail closed is that `CurateOrAdminPrincipal`
+    /// evaluates `Permission::Curate` with `repository_id: None`, and a
+    /// repo-scoped grant does not match a `None` argument
+    /// (`RbacEvaluator::authorize`'s repository-scoping rule). An edit
+    /// that threaded a repository id into that extractor, or that
+    /// relaxed the scoping rule, would widen this listing from
+    /// "global authority reads globally" to "local authority reads
+    /// globally" — and would fail here.
+    #[tokio::test]
+    async fn patch_candidates_repository_scoped_curator_returns_403() {
+        let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+        let (base, mocks) = build_mock_ctx(metrics_handle);
+
+        let idp = Arc::new(MockIdentityProvider::new());
+        let authenticate = Arc::new(AuthenticateUseCase::new(
+            idp as Arc<dyn IdentityProvider>,
+            mocks.users.clone() as Arc<dyn UserRepository>,
+            Vec::new(),
+        ));
+        // The ONLY difference from `patch_candidates_harness()`: this
+        // grant names a repository instead of being global.
+        let scoped_repo = Uuid::new_v4();
+        let mut grant = curate_claim_grant();
+        grant.repository_id = Some(scoped_repo);
+        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            grant,
+        ])));
+        let ctx = with_auth(
+            &base,
+            crate::context::AuthContext::Enabled {
+                authenticate,
+                rbac,
+                issuer_url: None,
+            },
+        );
+        let router = Router::new().nest("/admin", admin_routes()).with_state(ctx);
+
+        mocks
+            .patch_candidates
+            .seed(vec![sample_patch_candidate(scoped_repo)]);
+
+        // Not even for the repository the grant names: the listing takes
+        // no repository from the caller's authority, so there is no
+        // request shape that turns a scoped grant into access here.
+        for query in ["", &format!("repository={scoped_repo}")] {
+            let response = router
+                .clone()
+                .oneshot(patch_candidates_get(
+                    query,
+                    Some(principal_with_claims(&["curate"])),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "a repository-scoped curate grant must not open the \
+                 unscoped listing (query={query:?})",
+            );
+        }
+
+        assert!(
+            mocks.patch_candidates.calls().is_empty(),
+            "the extractor must deny before the use case is reached"
+        );
+    }
+
+    /// The CLI follows without changing. `hort-cli admin quarantine
+    /// list-patch-candidates --repo <key> --limit <n>` assembles exactly
+    /// the path and query string this test sends
+    /// (`crates/hort-cli/src/admin/quarantine/list_patch_candidates.rs`
+    /// builds `/api/v1/admin/quarantine/patch-candidates?repository=…&limit=…`,
+    /// and `crates/hort-cli/tests/admin_quarantine_list.rs` pins that
+    /// path as its `ROUTE` constant). Driving the real router with that
+    /// wire form under a curator-only principal is what verifies the
+    /// command against the new authority — as opposed to inspecting the
+    /// CLI, which carries no authority logic of its own and would prove
+    /// nothing either way.
+    ///
+    /// Asserts the response deserialises into the CLI's own row shape,
+    /// so a server-side field rename would fail here rather than at
+    /// runtime in an operator's terminal.
+    #[tokio::test]
+    async fn patch_candidates_cli_wire_form_serves_a_curator_only_caller() {
+        use hort_app::use_cases::test_support::sample_repository;
+        let (router, mocks) = patch_candidates_harness();
+        let scoped_repo = Uuid::new_v4();
+
+        let mut row = sample_repository();
+        row.id = scoped_repo;
+        row.key = "npm-proxy".into();
+        mocks.repositories.insert(row);
+        mocks
+            .patch_candidates
+            .seed(vec![sample_patch_candidate(scoped_repo)]);
+
+        let response = router
+            .oneshot(patch_candidates_get(
+                "repository=npm-proxy&limit=50",
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the CLI's exact wire form must serve a curator-only caller",
+        );
+
+        // Both query parameters threaded through under the curator
+        // principal — the widening must not silently drop the filter.
+        let calls = mocks.patch_candidates.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].repository_id, Some(scoped_repo));
+        assert_eq!(calls[0].limit, 50);
+        assert_eq!(
+            calls[0].repository_key_for_metric.as_deref(),
+            Some("npm-proxy")
+        );
+
+        // The CLI's row shape, field for field. `quarantined_until` is
+        // the one `Option<DateTime>`; the rest are the strings and
+        // counts the table renderer reads.
+        let bytes = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let r0 = &v["candidates"][0];
+        for field in &[
+            "quarantined_artifact_id",
+            "quarantined_version",
+            "quarantined_status",
+            "quarantined_until",
+            "repository_id",
+            "repository_key",
+            "format",
+            "package_name",
+            "vulnerable_artifact_id",
+            "vulnerable_version",
+            "vulnerable_finding_count",
+            "vulnerable_max_severity",
+        ] {
+            assert!(
+                !r0[*field].is_null(),
+                "the CLI reads `{field}` off every row; a curator must \
+                 receive the same 12-field projection an admin does",
+            );
+        }
     }
 
     // ----- GET /admin/users/:user_id/effective-permissions ----
