@@ -34,11 +34,23 @@ use super::artifact::QuarantineStatus;
 // ---------------------------------------------------------------------------
 
 /// One entry point into the [`QuarantineStatus`] state machine — one
-/// variant per guard method on [`Artifact`](super::artifact::Artifact),
-/// except [`Self::ReleaseCuratorWaiver`] / [`Self::ReleaseGeneral`], which
-/// split `Artifact::release`'s single method into its two source-state
-/// guards (the curator-waiver pairing is narrower than every other
-/// `(reason, authz)` pairing — see `Artifact::release`).
+/// variant per guard method on [`Artifact`](super::artifact::Artifact).
+///
+/// [`Self::Release`] was two variants (`ReleaseCuratorWaiver` /
+/// `ReleaseGeneral`) for as long as the curator's manual release
+/// accepted a narrower source-state set than every other pairing. Once
+/// one authority came to own the manual release and the requirement
+/// became the source state rather than a second permission tier
+/// (ADR 0007, "One authority owns the manual release"), both halves
+/// accepted exactly `Quarantined` and `ScanIndeterminate` — so the
+/// split stated nothing a single row does not, and *which* authorities
+/// may trigger the event is the row's `required_triggers`, where every
+/// other event's extra predicates already live. The manual authority
+/// then gained `Rejected` on the axes it reaches, so the per-pairing
+/// source-state sets are no longer identical — and that is handled the
+/// same way, by the `Rejected` row's `required_triggers`, rather than
+/// by resurrecting the split: a reader asking "which states does a
+/// curator waive reach?" reads one event's rows, not two events'.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QuarantineEvent {
     /// `Artifact::quarantine`.
@@ -55,10 +67,17 @@ pub enum QuarantineEvent {
     BlockByCurator,
     /// `Artifact::tombstone_from_corruption`.
     TombstoneFromCorruption,
-    /// `Artifact::release`, the `(ReleaseReason::Curator, ReleaseAuthorization::CuratorWaiver)` pairing.
-    ReleaseCuratorWaiver,
-    /// `Artifact::release`, every other `(reason, authz)` pairing.
-    ReleaseGeneral,
+    /// `Artifact::release` — every `(reason, authz)` pairing, from
+    /// `Quarantined` or `ScanIndeterminate`. The curator's manual
+    /// release is one of them: a curator trusted to override findings a
+    /// policy weighed is not the weaker authority for the case where no
+    /// verdict was reached at all (ADR 0007, "One authority owns the
+    /// manual release"). `Rejected` is a source state for the **manual**
+    /// pairing alone, and only on an axis the curator's instrument
+    /// reaches — the two extra conjuncts are this event's
+    /// `required_triggers` on that row, not a second event variant (ADR
+    /// 0007, "The axis boundary for a `Rejected` artifact").
+    Release,
     /// `Artifact::cascade_provenance_clearance`.
     CascadeProvenanceClearance,
     /// `Artifact::fail_scan_indeterminate`.
@@ -98,8 +117,7 @@ impl QuarantineEvent {
         QuarantineEvent::RejectFromScanPolicyRetroactive,
         QuarantineEvent::BlockByCurator,
         QuarantineEvent::TombstoneFromCorruption,
-        QuarantineEvent::ReleaseCuratorWaiver,
-        QuarantineEvent::ReleaseGeneral,
+        QuarantineEvent::Release,
         QuarantineEvent::CascadeProvenanceClearance,
         QuarantineEvent::FailScanIndeterminate,
         QuarantineEvent::ReEvaluate,
@@ -118,8 +136,7 @@ impl QuarantineEvent {
             Self::RejectFromScanPolicyRetroactive => "reject_from_scan_policy_retroactive",
             Self::BlockByCurator => "block_by_curator",
             Self::TombstoneFromCorruption => "tombstone_from_corruption",
-            Self::ReleaseCuratorWaiver => "release (curator waiver)",
-            Self::ReleaseGeneral => "release (general)",
+            Self::Release => "release",
             Self::CascadeProvenanceClearance => "cascade_provenance_clearance",
             Self::FailScanIndeterminate => "fail_scan_indeterminate",
             Self::ReEvaluate => "re_evaluate",
@@ -207,14 +224,17 @@ pub fn classify(event: QuarantineEvent, state: QuarantineStatus) -> Cell {
             ScanIndeterminate => Allowed(&[Rejected]),
             Rejected => Forbidden,
         },
-        QuarantineEvent::ReleaseCuratorWaiver => match state {
-            Quarantined => Allowed(&[Released]),
-            NoneSt | Released | Rejected | ScanIndeterminate => Forbidden,
-        },
-        QuarantineEvent::ReleaseGeneral => match state {
+        // `Rejected` is admissible with two extra conjuncts the method
+        // enforces (the row's `required_triggers`): the pairing must be
+        // the manual `(Curator, CuratorWaiver)` one — the unattended
+        // timer and policy arms are refused there — and the recorded
+        // rejection reason must be one `is_curator_overridable` admits.
+        // Same shape `RejectFromScan` uses for its `Released` cell.
+        QuarantineEvent::Release => match state {
             Quarantined => Allowed(&[Released]),
             ScanIndeterminate => Allowed(&[Released]),
-            NoneSt | Released | Rejected => Forbidden,
+            Rejected => Allowed(&[Released]),
+            NoneSt | Released => Forbidden,
         },
         QuarantineEvent::CascadeProvenanceClearance => match state {
             Quarantined => Allowed(&[Quarantined]),
@@ -394,32 +414,22 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         required_triggers: &[],
     },
     QuarantineTransitionRow {
-        event: QuarantineEvent::ReleaseCuratorWaiver,
+        event: QuarantineEvent::Release,
         from: QuarantineStatus::Quarantined,
         to: &[QuarantineStatus::Released],
-        required_triggers: &["reason == Curator && authz == CuratorWaiver"],
+        required_triggers: RELEASE_TRIGGERS,
     },
     QuarantineTransitionRow {
-        event: QuarantineEvent::ReleaseGeneral,
-        from: QuarantineStatus::Quarantined,
-        to: &[QuarantineStatus::Released],
-        required_triggers: &[
-            "authorized only for (Timer, ScanSucceeded|ScanCleared|ScanWaived|ScanRecorded) \
-             with provenance cleared/not-required, (Admin, AdminOverride), or \
-             (PolicyReEvaluation, PolicyReEvaluation) — every other (reason, authz) \
-             pair is denied at the authorization step, independent of source state",
-        ],
-    },
-    QuarantineTransitionRow {
-        event: QuarantineEvent::ReleaseGeneral,
+        event: QuarantineEvent::Release,
         from: QuarantineStatus::ScanIndeterminate,
         to: &[QuarantineStatus::Released],
-        required_triggers: &[
-            "authorized only for (Timer, ScanSucceeded|ScanCleared|ScanWaived|ScanRecorded) \
-             with provenance cleared/not-required, (Admin, AdminOverride), or \
-             (PolicyReEvaluation, PolicyReEvaluation) — every other (reason, authz) \
-             pair is denied at the authorization step, independent of source state",
-        ],
+        required_triggers: RELEASE_TRIGGERS,
+    },
+    QuarantineTransitionRow {
+        event: QuarantineEvent::Release,
+        from: QuarantineStatus::Rejected,
+        to: &[QuarantineStatus::Released],
+        required_triggers: RELEASE_FROM_REJECTED_TRIGGERS,
     },
     QuarantineTransitionRow {
         event: QuarantineEvent::CascadeProvenanceClearance,
@@ -497,6 +507,39 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
              NotRequired are refused",
         ],
     },
+];
+
+/// Who may trigger [`QuarantineEvent::Release`] — the pairing rule every
+/// source state shares, stated once so the two row sets below cannot
+/// drift on it.
+const RELEASE_PAIRING_TRIGGER: &str =
+    "authorized only for (Timer, ScanSucceeded|ScanCleared|ScanWaived|ScanRecorded) \
+     with provenance cleared/not-required, (Curator, CuratorWaiver) — the one \
+     manual authority — or (PolicyReEvaluation, PolicyReEvaluation); every other \
+     (reason, authz) pair is denied at the authorization step, independent of \
+     source state, ReleaseReason::Admin included (no path mints it)";
+
+/// Who may trigger [`QuarantineEvent::Release`] from the two states every
+/// pairing reaches. This list — not a second event variant — is where the
+/// table states which authorities reach it.
+const RELEASE_TRIGGERS: &[&str] = &[RELEASE_PAIRING_TRIGGER];
+
+/// The same pairing rule plus the two conjuncts that make `Rejected` the
+/// manual authority's own source state (ADR 0007, "The axis boundary for a
+/// `Rejected` artifact").
+const RELEASE_FROM_REJECTED_TRIGGERS: &[&str] = &[
+    RELEASE_PAIRING_TRIGGER,
+    "only (Curator, CuratorWaiver) reaches this source state — (Timer, _) and \
+     (PolicyReEvaluation, PolicyReEvaluation) are refused with InvalidState here, \
+     because an override of a recorded verdict is a human decision taken with that \
+     verdict in view and both of those run unattended; the unattended exit from a \
+     rejection stays ReEvaluate",
+    "rejection_reason must be curator-overridable (Scanner | ScanPolicyRetroactive | \
+     Curator | CurationRetroactive | Provenance — see \
+     hort_domain::entities::artifact::is_curator_overridable); Corruption, Admin and \
+     None are refused with InvalidState, the message naming the axis. The caller must \
+     have re-hydrated the reason from the latest ArtifactRejected, as ReEvaluate's \
+     eligibility guard already requires",
 ];
 
 const COMPLETE_PROVENANCE_TRIGGERS: &[&str] = &[

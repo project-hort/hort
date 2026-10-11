@@ -207,7 +207,7 @@ content until the timer releases it.
 
 The release path is not driven by a clean scan — that is the invariant
 [event-sourcing.md](../explanation/event-sourcing.md) calls out
-explicitly. Only the background timer, an admin override, or a
+explicitly. Only the background timer, the curator's manual release, or a
 policy re-evaluation transitions the artifact to `Released`.
 
 ## Step 8 — The download path (mirror image)

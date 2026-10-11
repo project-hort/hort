@@ -496,21 +496,26 @@ distinct mechanism) is unchanged.
   kind without emitting these events are explicitly out of scope for
   this release; if/when added they MUST emit the matching event.
 
-### `ArtifactReleased` carries `admin_id` + justification
+### `ArtifactReleased` carries the deciding user + justification
 
-- **Control:** Manual quarantine release requires a `justification`
-  body field (≤ 512 bytes) and stamps the `admin_id` of the releasing
-  caller into the `ArtifactReleased` event. Auditors can reconstruct
-  who released what and why.
+- **Control:** The manual quarantine release requires a `justification`
+  body field (≤ 512 bytes) and stamps the `released_by_user_id` of the
+  deciding caller into the `ArtifactReleased` event. Auditors can
+  reconstruct who released what and why. There is exactly one such
+  route — the curator's waive (ADR 0007, "One authority owns the manual
+  release") — so there is no second surface with its own cap to keep in
+  step.
 - **Chart default:** unconditional in the binary.
 - **Operator action required:** no — the HTTP DTO change is
   client-side; the chart only needs the binary version.
 - **Verify post-install:**
   ```bash
-  # Empty body -> 400; with justification -> 200, event carries admin_id.
+  # Empty body -> 400; with justification -> 200, event carries
+  # released_by_user_id. `Permission::Curate` OR `Permission::Admin`.
   curl -i -X POST -H "Authorization: Bearer $TOKEN" \
+    -H 'Content-Type: application/json' \
     -d '{"justification":"SOC ticket #123"}' \
-    http://<svc-or-ingress>/quarantine/<id>/release
+    http://<svc-or-ingress>/api/v1/admin/curation/quarantine/<id>/waive
   ```
 - **Relaxation:** none. The validator rejects empty / oversize
   justifications at the use-case boundary.

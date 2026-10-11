@@ -9085,3 +9085,217 @@ mod tests {
         assert_ne!(unkeyed[0], unkeyed[1]);
     }
 }
+
+// ===========================================================================
+// Tracing capture harness for the named audit-log invariants.
+// ===========================================================================
+
+/// Capture harness for asserting that **a named audit invariant's field is
+/// actually emitted**.
+///
+/// Several use cases carry an invariant of the form "the success line of this
+/// security-relevant operation names the acting identity" (`AUDIT-info-1`:
+/// `CurationUseCase::waive`'s success line carries `actor_id`) or "…carries
+/// the correlation id" (`AUDIT-info-2`). Such an invariant lives entirely in
+/// a `tracing::info!` field list, which nothing else in the suite reads — so
+/// without a capture subscriber, an edit that drops the field is green. This
+/// module is the one place that machinery lives, so the next use case needing
+/// the assertion does not grow another private copy of it.
+///
+/// # What it captures
+///
+/// Each event's `target`, `level` and rendered fields — including `message`,
+/// which `tracing` records as an ordinary field. Fields are kept as a **map,
+/// not a flattened string**, so an assertion can say *this field equals this
+/// value* instead of *this text appears somewhere on the line*. The
+/// difference is load-bearing for an audit assertion: a sibling field often
+/// renders the same uuid (`waive` logs `artifact_id` beside `actor_id`), and
+/// a longer field name contains the asserted one as a substring
+/// (`filter_actor_id` contains `actor_id`), so a flattened-string check stays
+/// green exactly when the field under assertion is gone.
+///
+/// # Limits — what is NOT in scope
+///
+/// - **Only what this test's own subscriber sees.** The capture is a
+///   thread-local default subscriber installed for the duration of
+///   [`tracing_capture::capture_audit_events`]'s closure. An event emitted on
+///   another thread — a spawned task, a multi-thread runtime's worker — never
+///   reaches the buffer, which is why the closure drives async code on a
+///   current-thread runtime's `block_on`.
+/// - **Events only, never span fields.** `#[tracing::instrument]` puts a
+///   function's arguments on a *span*; this layer implements `on_event`
+///   alone. A field that exists only because of the `instrument` attribute
+///   will not appear here. That is the honest scope — a consumer reading one
+///   log line sees that event's own fields — but it means an invariant meant
+///   to ride the span needs a different harness, not this one.
+/// - **No filtering at all.** Every event from every crate in the process
+///   lands in the buffer, so select the line under assertion by `target` and
+///   message rather than indexing into it.
+#[cfg(test)]
+pub mod tracing_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Registry;
+
+    /// One captured `tracing` event.
+    #[derive(Debug, Clone)]
+    pub struct CapturedEvent {
+        /// The event's target — `module_path!()` of the emitting callsite
+        /// unless the macro overrode it. Asserting on it pins that the
+        /// captured line is the production module's and not a test helper's.
+        pub target: String,
+        pub level: tracing::Level,
+        /// Rendered fields keyed by field name. `%x` and `?x` values render
+        /// through `Display` / `Debug` exactly as a `fmt` subscriber would
+        /// print them, and the format string arrives under the name
+        /// `message`.
+        pub fields: BTreeMap<String, String>,
+    }
+
+    impl CapturedEvent {
+        /// The rendered value of `name`, or `None` when the line carries no
+        /// such field. An audit assertion wants exactly this distinction: a
+        /// missing field and an empty one are different failures.
+        pub fn field(&self, name: &str) -> Option<&str> {
+            self.fields.get(name).map(String::as_str)
+        }
+
+        /// The event's message, or `""` for a field-only event.
+        pub fn message(&self) -> &str {
+            self.field("message").unwrap_or_default()
+        }
+    }
+
+    /// `Layer` recording every event it is offered into a shared buffer.
+    #[derive(Clone, Default)]
+    pub struct AuditCapturingLayer {
+        pub events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for AuditCapturingLayer
+    where
+        S: tracing::Subscriber,
+    {
+        /// Force per-event re-evaluation instead of letting the global
+        /// callsite cache decide once and for all that nobody listens.
+        /// `tracing` caches the first `Interest` observed per callsite, and
+        /// under libtest's parallelism that first observation can come from
+        /// a sibling test firing the same callsite while this test's
+        /// thread-local subscriber is not yet installed.
+        /// `Interest::sometimes()` opts into per-event `enabled()`, so the
+        /// cache cannot lock the capture out.
+        fn register_callsite(
+            &self,
+            _meta: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(
+            &self,
+            _meta: &tracing::Metadata<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) -> bool {
+            true
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_string(),
+                    level: *event.metadata().level(),
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    /// Renders each field into the map. `record_debug` is `Visit`'s only
+    /// required method and every other value type defaults to it, so the two
+    /// impls below cover the whole field taxonomy; the `record_str` override
+    /// exists only to keep a string value free of `Debug`'s quotes.
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    /// The one lock serialising captures.
+    ///
+    /// `tracing` caches per-callsite `Interest` **globally**, so installing a
+    /// subscriber on one thread while another fires the same callsite races.
+    /// It is deliberately private and reachable only through
+    /// [`capture_audit_events`]: two independent serialisations do not
+    /// compose into one order, so a second lock beside this one would let a
+    /// test holding only that lock run against a test holding only this one.
+    static AUDIT_TRACING_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// Install, once per process, a global subscriber that returns
+    /// `Interest::sometimes()` for every callsite.
+    ///
+    /// This poisons the global callsite-interest cache with `sometimes`,
+    /// which forces `tracing` to consult the **current** thread-local
+    /// subscriber on every event instead of trusting a once-cached `Never`
+    /// from whichever thread reached the callsite first. Without it, a
+    /// capture races against parallel siblings firing the same callsite
+    /// under the no-op default subscriber, and loses.
+    pub fn install_audit_passthrough_subscriber() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            let global_subscriber = Registry::default().with(AuditCapturingLayer::default());
+            // A sibling crate may already hold the global slot; the
+            // thread-local `with_default` re-ask below still gets us the
+            // `sometimes()` cache entry.
+            let _ = tracing::subscriber::set_global_default(global_subscriber);
+        });
+    }
+
+    /// Run `body` with a capturing subscriber installed and return its value
+    /// alongside every event the subscriber saw.
+    ///
+    /// `body` is synchronous on purpose: the serialising guard is a
+    /// `std::sync::Mutex` guard and must not cross an `.await` (clippy's
+    /// `await_holding_lock` would block the build), so a test drives async
+    /// code with a current-thread runtime's `block_on` *inside* the closure.
+    pub fn capture_audit_events<R>(body: impl FnOnce() -> R) -> (R, Vec<CapturedEvent>) {
+        install_audit_passthrough_subscriber();
+        let _serial = AUDIT_TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+
+        let layer = AuditCapturingLayer::default();
+        let captured = Arc::clone(&layer.events);
+        let subscriber = Registry::default().with(layer);
+        let outcome = tracing::subscriber::with_default(subscriber, || {
+            // After the thread-local default is in place, force every
+            // callsite's interest to be re-evaluated so the layer's
+            // `register_callsite` runs before the event under assertion
+            // fires.
+            tracing::callsite::rebuild_interest_cache();
+            body()
+        });
+
+        let events = std::mem::take(&mut *captured.lock().unwrap_or_else(PoisonError::into_inner));
+        (outcome, events)
+    }
+}

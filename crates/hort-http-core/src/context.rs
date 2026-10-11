@@ -307,12 +307,14 @@ pub struct AppContext {
     /// collapse, and conflict detection (`status IN
     /// ('pending','running')`) all live inside the use case.
     pub manual_rescan_use_case: Arc<ManualRescanUseCase>,
-    /// Admin-only read of the patch-candidate
+    /// Curator-or-admin read of the patch-candidate
     /// quarantine surface (`GET /admin/quarantine/patch-candidates`).
-    /// The use case enforces `Permission::Admin` (defence in depth —
-    /// the `AdminPrincipal` extractor enforces the same gate at the
-    /// request edge) and clamps `filter.limit` at 500 before reaching
-    /// the adapter.
+    /// The use case enforces `Permission::Curate` OR `Permission::Admin`
+    /// (defence in depth — the `CurateOrAdminPrincipal` extractor
+    /// enforces the same gate at the request edge) and clamps
+    /// `filter.limit` at 500 before reaching the adapter. The gate
+    /// matches the manual release this listing feeds, which one
+    /// authority owns (ADR 0007).
     pub patch_candidate_use_case: Arc<PatchCandidateUseCase>,
     /// Admin-only read of the `scanner_registry` worker table
     /// (`GET /api/v1/admin/workers`). The use case enforces

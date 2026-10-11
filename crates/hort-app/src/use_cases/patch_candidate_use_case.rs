@@ -1,7 +1,15 @@
 //! `PatchCandidateUseCase`.
 //!
-//! Admin-only read of the patch-candidate quarantine surface. See
+//! Curator-or-admin read of the patch-candidate quarantine surface. See
 //! `docs/architecture/how-to/quarantine-patch-release.md`.
+//!
+//! The gate matches the decision this listing feeds. The manual release
+//! an operator reaches from this queue is `CurationUseCase::waive`,
+//! held by `Permission::Curate` (ADR 0007, "One authority owns the
+//! manual release"); a caller who may decide but may not read the
+//! findings that ground the decision is that same rule applied by
+//! halves, so the read carries the decision's gate rather than a
+//! stricter one.
 
 use std::sync::Arc;
 
@@ -35,7 +43,7 @@ impl PatchCandidateUseCase {
         Self { repo }
     }
 
-    /// List patch candidates visible to an admin.
+    /// List patch candidates visible to a curator or an admin.
     #[tracing::instrument(skip(self, privileges))]
     pub async fn list(
         &self,
@@ -47,8 +55,8 @@ impl PatchCandidateUseCase {
         // Resolved once up-front from the handler-supplied hint
         // (`filter.repository_key_for_metric`) so every emission below
         // (denied / invalid / error / ok) carries the same label.
-        // `None` → `_all` sentinel for admin-wide scope; `Some(key)` →
-        // the resolved key emitted verbatim.
+        // `None` → `_all` sentinel for unscoped (every-repository)
+        // reads; `Some(key)` → the resolved key emitted verbatim.
         // `"unknown"` is not reachable from the HTTP handler because
         // `find_by_key` failures surface as 404 before the use case
         // runs — the sentinel stays reserved for future non-HTTP paths.
@@ -58,15 +66,18 @@ impl PatchCandidateUseCase {
             .unwrap_or_else(|| values::REPOSITORY_ALL.to_string());
 
         // 1. Authz first — denials never reach validation, never reach the repo.
-        //    Inline-log-then-return mirrors `QuarantineUseCase::admin_release`
-        //    at crates/hort-app/src/use_cases/quarantine_use_case.rs:815-818.
-        //    Carry the filter shape so the audit trail captures the attempt.
-        if let Err(e) = privileges.require_admin() {
+        //    The gate is the same one `CurationUseCase::waive` applies —
+        //    the release this listing feeds — so the authority that may
+        //    decide is the authority that may read the findings grounding
+        //    the decision. Inline-log-then-return mirrors that use case's
+        //    privilege gate. Carry the filter shape so the audit trail
+        //    captures the attempt.
+        if let Err(e) = privileges.require_curate_or_admin() {
             tracing::info!(
                 actor_id = %actor.user_id,
                 filter_repository_id = ?filter.repository_id,
                 filter_limit = filter.limit,
-                "patch-candidate list denied: not admin",
+                "patch-candidate list denied: missing curate/admin",
             );
             emit_patch_candidates_listed(&repo_label, PatchCandidateListResult::Denied);
             return Err(e);
@@ -106,7 +117,7 @@ impl PatchCandidateUseCase {
         tracing::info!(
             actor_id = %actor.user_id,
             candidate_count = candidates.len(),
-            "admin queried patch-candidate quarantine surface",
+            "curator or admin queried patch-candidate quarantine surface",
         );
         emit_patch_candidates_listed(&repo_label, PatchCandidateListResult::Ok);
 
@@ -187,6 +198,21 @@ mod tests {
         }
     }
 
+    /// Curator-only privileges — a global `Permission::Curate` holder
+    /// with no admin authority, which is the shape of the deployed
+    /// `maintainer-curator` service account. Mirrors the file-local
+    /// helper in `curation_use_case.rs`; `test_support` carries
+    /// `admin_privileges` / `reviewer_privileges` / `unprivileged` but
+    /// no curator constructor.
+    fn curator_privileges() -> CallerPrivileges {
+        CallerPrivileges {
+            is_admin: false,
+            is_reviewer: false,
+            is_curator: true,
+            writable_repository_ids: vec![],
+        }
+    }
+
     fn sample_candidate() -> PatchCandidate {
         use chrono::{DateTime, Utc};
         use hort_domain::entities::artifact::QuarantineStatus;
@@ -256,13 +282,64 @@ mod tests {
         assert_eq!(out[1], c2);
     }
 
-    // ---------- 403: non-admin denial ------------------------------------
-
-    /// Reviewer-only callers (not admin) are rejected with Forbidden BEFORE
-    /// the repo is called — admin parity with the
-    /// release endpoint.
+    /// Curator-only caller (global `Curate`, no admin) reaches the repo
+    /// and gets its rows back. This is the acceptance criterion of the
+    /// gate change: the authority that owns the manual release
+    /// (`CurationUseCase::waive`) can read the findings that ground the
+    /// decision. Calls the use case directly — no HTTP edge — so the
+    /// use-case-side gate is what is under test, not the extractor.
     #[tokio::test]
-    async fn list_non_admin_reviewer_returns_forbidden_and_does_not_call_repo() {
+    async fn list_curator_only_happy_path_returns_rows() {
+        let repo = Arc::new(MockRepo::new());
+        let c1 = sample_candidate();
+        repo.seed(vec![c1.clone()]);
+
+        let uc = PatchCandidateUseCase::new(repo.clone());
+        let out = uc
+            .list(
+                api_actor(),
+                curator_privileges(),
+                PatchCandidateFilter::default(),
+            )
+            .await
+            .expect("a global Curate holder may read the surface it decides on");
+
+        assert_eq!(out.len(), 1, "curator sees the repo rows verbatim");
+        assert_eq!(out[0], c1);
+        assert_eq!(repo.calls().len(), 1, "repo must be called exactly once");
+    }
+
+    /// A caller holding BOTH flags passes. Pins that the two arms of
+    /// `require_curate_or_admin()` are an OR, not an XOR — an admin who
+    /// also carries an explicit `curate` grant is not locked out.
+    #[tokio::test]
+    async fn list_curator_and_admin_together_is_allowed() {
+        let repo = Arc::new(MockRepo::new());
+        let uc = PatchCandidateUseCase::new(repo.clone());
+
+        let privileges = CallerPrivileges {
+            is_admin: true,
+            is_reviewer: false,
+            is_curator: true,
+            writable_repository_ids: vec![],
+        };
+        uc.list(api_actor(), privileges, PatchCandidateFilter::default())
+            .await
+            .expect("curate + admin together must pass");
+
+        assert_eq!(repo.calls().len(), 1);
+    }
+
+    // ---------- 403: neither-curate-nor-admin denial ---------------------
+
+    /// Reviewer-only callers hold neither `Curate` nor `Admin` and are
+    /// rejected with Forbidden BEFORE the repo is called. Pins that
+    /// widening the gate from `require_admin` to
+    /// `require_curate_or_admin` admitted exactly the curator and
+    /// nothing else: `is_reviewer` is a separate flag and must not
+    /// satisfy either arm.
+    #[tokio::test]
+    async fn list_reviewer_only_returns_forbidden_and_does_not_call_repo() {
         let repo = Arc::new(MockRepo::new());
         let uc = PatchCandidateUseCase::new(repo.clone());
 
@@ -285,8 +362,8 @@ mod tests {
     }
 
     /// Fully unprivileged caller is also rejected. Same code path as
-    /// reviewer-only, but pins the explicit `is_reviewer = false` arm
-    /// of `require_admin()` for branch coverage.
+    /// reviewer-only, but pins the both-flags-false arm of
+    /// `require_curate_or_admin()` for branch coverage.
     #[tokio::test]
     async fn list_unprivileged_returns_forbidden_and_does_not_call_repo() {
         let repo = Arc::new(MockRepo::new());
@@ -435,7 +512,7 @@ mod tests {
             labels.get("repository"),
             Some(&expected_repository),
             "repository label must match the documented semantics \
-             (_all sentinel when admin-wide, resolved key when scoped)"
+             (_all sentinel when unscoped, resolved key when scoped)"
         );
         assert_eq!(
             labels.get("result"),
@@ -498,9 +575,10 @@ mod tests {
         assert_patch_candidates_listed_emitted_once(snapshotter.snapshot(), "_all", "ok");
     }
 
-    /// Non-admin caller emits `result=denied` *before* the early return.
+    /// A caller holding neither `Curate` nor `Admin` emits
+    /// `result=denied` *before* the early return.
     #[test]
-    fn list_emits_metric_with_result_denied_on_non_admin() {
+    fn list_emits_metric_with_result_denied_on_neither_curate_nor_admin() {
         use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
@@ -526,6 +604,38 @@ mod tests {
         // Denied path must NOT call the repo — pinned alongside the
         // metric assertion so a refactor that swaps the order surfaces.
         assert!(repo.calls().is_empty(), "denied path must not call repo");
+    }
+
+    /// Curator-only happy path emits the same `result=ok` /
+    /// `repository="_all"` pair as the admin one. Pins that widening the
+    /// gate did not introduce a second, differently-labelled success
+    /// path — the counter's taxonomy stays the documented closed set of
+    /// four and does not gain an authority dimension.
+    #[test]
+    fn list_emits_metric_with_result_ok_for_curator_only_caller() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let repo = Arc::new(MockRepo::new());
+        repo.seed(vec![sample_candidate()]);
+        let uc = PatchCandidateUseCase::new(repo);
+
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(uc.list(
+                    api_actor(),
+                    curator_privileges(),
+                    PatchCandidateFilter::default(),
+                ))
+                .expect("curator happy path");
+        });
+
+        assert_patch_candidates_listed_emitted_once(snapshotter.snapshot(), "_all", "ok");
     }
 
     /// `filter.limit > MAX_LIMIT` emits `result=invalid`; repo never

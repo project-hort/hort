@@ -951,7 +951,7 @@
       "id": 18,
       "type": "timeseries",
       "title": "Quarantine: triggered vs released",
-      "description": "hort_quarantine_triggered_total / hort_quarantine_released_total.",
+      "description": "hort_quarantine_triggered_total / hort_quarantine_released_total. Released splits by reason \u2014 timer / curator / policy_re_evaluation (admin is historical only).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

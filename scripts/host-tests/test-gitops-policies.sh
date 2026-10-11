@@ -591,7 +591,8 @@ fi
 #     schedules retro candidates on `creates` and `tightenings`;
 #     `Block → Allow` is a *weakening* and produces no retroactive
 #     events. Asserts (i) the rejected artifact STAYS `rejected`
-#     (admin explicit release is the only unblock path), (ii)
+#     (no manual release reverses it — `rejected` is not a source
+#     state for a release), (ii)
 #     `decision_point=curation_retroactive` ticks observed in 6b
 #     are unchanged.
 #
@@ -964,8 +965,9 @@ EOF
     write_override "$STAGE_ROOT/config"
     restart_with_overlay
 
-    # Artifact stays rejected — admin explicit release is the only
-    # unblock path (architect-skill quarantine invariant 3).
+    # Artifact stays rejected — no manual release reverses it
+    # (`rejected` is not a release source state; architect-skill
+    # quarantine invariant 3).
     POST_WEAKEN_STATUS="$(psql_one "SELECT quarantine_status FROM artifacts WHERE id = '${PREV_ARTIFACT_ID}';")"
     if [ "$POST_WEAKEN_STATUS" = "rejected" ]; then
         assert_pass "artifact stays 'rejected' after rule weakening (Block → Allow does NOT auto-unblock)"

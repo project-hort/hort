@@ -22,8 +22,10 @@ it had never executed anywhere (the cargo gate masked it), so nothing caught it.
    (c) do for the probe crate: authenticated GET of
    `${CRATES_PROXY_URL}/api/v1/crates/${RECORD_VULN_CRATE}/${RECORD_VULN_VERSION}/download`
    (200 = already released, 503 = ingested and quarantined), locate the artifact row via `psql`
-   by `(repository_id, name, version)`, `POST /api/v1/admin/quarantine/<id>/release` with the
-   admin token, then confirm one authenticated re-download returns 200. Factor the (b)/(c)
+   by `(repository_id, name, version)`,
+   `POST /api/v1/admin/curation/quarantine/<id>/waive` with the admin token (the one
+   manual release, `Permission::Curate` OR `Permission::Admin` — ADR 0007), then confirm
+   one authenticated re-download returns 200. Factor the (b)/(c)
    mechanics into a helper (`warm_and_release_via_proxy <crate> <version>`) used by both (c) and
    (h0) — three copies would be the duplication the guidelines forbid.
 2. After (h0), confirm the virtual index now serves the version: authenticated GET of the

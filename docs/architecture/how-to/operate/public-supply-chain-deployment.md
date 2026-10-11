@@ -452,9 +452,16 @@ hort-cli admin quarantine list-patch-candidates
 # Locate the artifact; note its id (UUID) for use in the state-specific steps below.
 ```
 
-### State: `Quarantined` — curator waiver
+### State: `Quarantined` or `ScanIndeterminate` — curator waiver
 
-The `maintainer-curator` token covers this case. Retrieve it from the password
+The `maintainer-curator` token covers both cases, and it is the only
+credential this runbook needs for an early release: one authority owns the
+manual release and what it requires is the source state rather than a second
+permission tier
+([ADR 0007](../../../adr/0007-fail-closed-quarantine-release-predicate.md),
+"One authority owns the manual release"). `ScanIndeterminate` — the scanner
+failed terminally (network outage, OOM, …) — is reached by the same command
+as `Quarantined`. Retrieve the token from the password
 manager (do not store it in `.cargo/config.toml` or any developer config — it is
 sensitive).
 
@@ -477,56 +484,6 @@ hort-cli list-versions <repo> <package>
 
 Re-authenticate as the dev token afterward; do not leave the curator token active
 in the session.
-
-### State: `ScanIndeterminate` — ad-hoc admin token
-
-`ScanIndeterminate` means the scanner failed terminally (network outage, OOM,
-etc.). The curator token is insufficient; `Permission::Admin` is required.
-**`issue-svc-token` unconditionally rejects `--permission=admin`** — service
-accounts are strictly non-admin (ADR 0038) — so the break-glass admin path is
-the dedicated, DSN-gated `bootstrap-session` command instead, which mints a
-short-lived (≤1 h, ADR 0013 cap), non-service-account, full-cap token:
-
-```bash
-# On the VPS — note: hort-server must be running, and this requires
-# HORT_TOKEN_ALLOW_ADMIN=true (an issuance-time gate you set in your shell
-# for this command only — the running hort-server does NOT need it set).
-# Podman flavor:
-podman exec -e HORT_TOKEN_ALLOW_ADMIN=true hort-server \
-  hort-server admin bootstrap-session --ttl 1h
-
-# Native flavor:
-HORT_TOKEN_ALLOW_ADMIN=true hort-server admin bootstrap-session --ttl 1h
-```
-
-Paste the token into `hort-cli auth login --paste`, release the artifact via the
-admin quarantine endpoint, then immediately revoke the token:
-
-```bash
-hort-cli admin quarantine release <artifact_id> \
-  --justification "ScanIndeterminate: scanner outage, manually verified clean, admin release authorized"
-
-# Revoke — replace <token_id> with the id from bootstrap-session's output
-# (a normal api_tokens row; same revocation path as any other token).
-# No hort-cli subcommand exists for token revocation; use the admin REST API
-# directly (supply the bootstrap-session token as HORT_TOKEN):
-curl -s -X DELETE \
-  -H "Authorization: Bearer $HORT_TOKEN" \
-  https://registry.hort.rs/api/v1/admin/tokens/<token_id>
-# Expected: 204 No Content
-```
-
-Confirm the token is gone by checking that it no longer works:
-
-```bash
-# Re-authenticate as the dev token
-hort-cli auth login --paste   # paste the maintainer-dev hort_svc_* token
-hort-cli auth status
-# Expected: dev service-account identity with read permission
-```
-
-No standing full-admin token exists on this instance (ADR 0013). The ad-hoc
-mint-and-revoke pattern is the correct procedure, not a workaround.
 
 ### State: `Rejected` — scan exclusion
 
@@ -552,6 +509,13 @@ has also elapsed, the artifact transitions to `Released`.
 
 ### Credential hygiene reminders
 
+- **No standing full-admin token exists on this instance**
+  ([ADR 0013](../../../adr/0013-idp-authoritative-cli-sessions.md)), and this runbook no
+  longer needs one: every early release goes through the `maintainer-curator`
+  token. The ad-hoc `bootstrap-session` mint-and-revoke dance the
+  `ScanIndeterminate` case used to require is retired — one authority owns the
+  manual release, so there is no state left that only an admin credential can
+  move.
 - The `maintainer-curator` token can release held (possibly malicious) artifacts
   early, bypassing the observation window. Store it in a password manager;
   do not commit it or paste it into CI.

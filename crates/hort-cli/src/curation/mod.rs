@@ -8,7 +8,8 @@
 //!
 //! - `waive <artifact_id> --justification <text>` →
 //!   POST `/api/v1/admin/curation/quarantine/:artifact_id/waive`
-//!   (releases a `Quarantined` artifact with curator attribution).
+//!   (manual release of a `Quarantined` or `ScanIndeterminate`
+//!   artifact, with curator attribution).
 //! - `block artifact <artifact_id> --justification <text>` →
 //!   POST `/api/v1/admin/curation/quarantine/:artifact_id/block`
 //!   (single-artifact curator block).
@@ -84,12 +85,12 @@ pub struct CurationArgs {
 /// `curation` sub-subcommands.
 #[derive(Subcommand, Debug)]
 pub enum CurationCommand {
-    /// Waive a quarantined artifact — release with curator attribution.
+    /// Waive a held artifact — release with curator attribution.
     ///
     /// Emits `ArtifactReleased { authority: CuratorWaiver, reason:
-    /// Curator }`. Source-state guard: `Quarantined` only (the use case
-    /// rejects `ScanIndeterminate`; that authority stays admin-only).
-    /// `--justification` is required (≤ 512 bytes).
+    /// Curator }`. Source states: `Quarantined` or `ScanIndeterminate`
+    /// (the stuck-scanner case). `--justification` is required
+    /// (≤ 512 bytes).
     Waive(waive::WaiveArgs),
 
     /// Block one or more artifacts — `Quarantined`/`Released` →

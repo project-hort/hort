@@ -1,7 +1,9 @@
 //! `CurationUseCase` (`waive` + `block`).
 //!
 //! Curator decision authority over quarantined / non-terminal artifacts.
-//! Mirrors `QuarantineUseCase::admin_release` structurally: privilege
+//! `waive` is **the** manual release (ADR 0007, "One authority owns the
+//! manual release"). Its shape is the one every per-artifact decision
+//! path in this layer uses: privilege
 //! check → optimistic-concurrency stream read → state transition →
 //! atomic event-append + projection-delta via the same
 //! `ArtifactLifecyclePort::commit_transition_with_score` chokepoint.
@@ -62,13 +64,17 @@ use hort_domain::types::PageRequest;
 
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
-use crate::metrics::{emit_curation_decision, CurationDecisionLabel, CurationDecisionResult};
+use crate::metrics::{
+    emit_curation_decision, emit_release, values, CurationDecisionLabel, CurationDecisionResult,
+};
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::release_clearance::resolve_curation_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
-use crate::use_cases::{rejected_reevaluation, ArtifactAtVersion, CallerPrivileges, OverCapStream};
+use crate::use_cases::{
+    rejected_reevaluation, scan_history, ArtifactAtVersion, CallerPrivileges, OverCapStream,
+};
 
 /// Maximum justification length in BYTES.
 /// Mirrors `MAX_JUSTIFICATION_LEN` semantics on `ArtifactReleased::validate`.
@@ -257,9 +263,12 @@ impl CurationUseCase {
     }
 
     /// Validate justification — non-empty, ≤512 bytes. Mirrors the
-    /// boundary check `admin_release`'s HTTP layer performs; this
+    /// boundary check the HTTP layer performs
+    /// (`handlers::admin::curation::MAX_JUSTIFICATION_BYTES`); this
     /// helper is the use-case-side gate so a `CurationUseCase` consumer
-    /// (CLI, HTTP, or future SDK) gets the same validation.
+    /// (CLI, HTTP, or future SDK) gets the same validation, and it is
+    /// the one cap on the manual release — there is no second constant
+    /// for the same rule.
     fn validate_justification(justification: &str) -> AppResult<()> {
         if justification.is_empty() {
             return Err(AppError::Domain(DomainError::Validation(
@@ -544,15 +553,49 @@ impl CurationUseCase {
         Ok(entries)
     }
 
-    /// Curator-driven release of a `Quarantined` artifact.
+    /// Curator-driven manual release of a held artifact.
     ///
-    /// Mirrors `QuarantineUseCase::admin_release`. Source-state guard
-    /// is `Quarantined` ONLY — curator does NOT clear stuck-scanner
-    /// artifacts (`ScanIndeterminate`), which stays admin-only.
+    /// **The** manual release — there is no second surface for it. It
+    /// reaches `Quarantined` and `ScanIndeterminate`: the curator
+    /// holds the domain's authority, so a curator who may override
+    /// findings a policy weighed may also clear a stuck scanner, where no
+    /// verdict was reached at all (ADR 0007, "One authority owns the
+    /// manual release"). `Artifact::release` is the guard; every other
+    /// state answers 409 (ADR 0025).
+    ///
+    /// It also reaches **`Rejected`**, on the axes the curator's
+    /// instrument reaches — scan, curation and provenance, never the
+    /// corruption tombstone (ADR 0007, "The axis boundary for a
+    /// `Rejected` artifact"). The axis verdict is
+    /// `hort_domain::entities::artifact::is_curator_overridable`, a
+    /// sibling of `is_scan_clearable` rather than a widening of it, so an
+    /// unattended policy re-evaluation still cannot clear a curator's own
+    /// block (ADR 0041 invariant #6(a)). A refused axis answers 409 with
+    /// the axis named in the message.
+    ///
+    /// `Artifact::release` reads the axis off `Artifact::rejection_reason`,
+    /// which the projection row does **not** persist (the Postgres mapper
+    /// hydrates it `None`) — so this method re-derives it from the latest
+    /// `ArtifactRejected` on the artifact's stream before calling in,
+    /// exactly as the re-evaluation path does for the same field and the
+    /// same reason. The derivation is read off the SAME stream read that
+    /// fixed the `ExpectedVersion` this call's append carries, so a verdict
+    /// committed since the pairing fails the append rather than being
+    /// overridden on a stale reason; and it insists on a complete stream
+    /// (`ArtifactAtVersion::evidence`), because a reverse scan over a
+    /// truncated prefix would answer about the *oldest* rejection — a
+    /// corruption tombstone that scrolled out of the window would read as
+    /// the scan rejection that preceded it.
     ///
     /// Audit: emits `ArtifactReleased { authority: CuratorWaiver,
     /// released_by_user_id: Some(actor.user_id), justification:
     /// Some(_), reason: Curator, … }`.
+    ///
+    /// Metrics, on success: one
+    /// `hort_curation_decisions_total{decision=waive, repository, result=ok}`
+    /// tick (the decision) AND one
+    /// `hort_quarantine_released_total{reason=curator}` tick (the
+    /// release). Failure branches emit only the decision counter.
     #[tracing::instrument(skip(self, privileges, justification))]
     pub async fn waive(
         &self,
@@ -628,11 +671,42 @@ impl CurationUseCase {
         // `waive` call).
         let repo_label = self.repository_access.metric_label(repository_id).await;
 
-        // 3) Domain transition. Source-state guard inside
-        //    `Artifact::release` rejects every non-`Quarantined`
-        //    state. The deny-by-default release
-        //    predicate (ADR 0007) accepts only
-        //    `(Curator, CuratorWaiver)` for this authority.
+        // 3) Re-hydrate the rejection reason for a `Rejected` artifact —
+        //    the axis `Artifact::release` decides the override on. The
+        //    projection row does not carry the column (the Postgres
+        //    mapper hydrates it `None`), so an un-hydrated entity would
+        //    read as the illegal reason-less rejection and refuse every
+        //    override. Only for `Rejected`: it is the one source state
+        //    whose verdict depends on it, and `evidence()` refuses an
+        //    over-cap stream, which the ordinary `Quarantined` waive has
+        //    no reason to be exposed to.
+        if prior_status == QuarantineStatus::Rejected {
+            let reason = match paired.evidence() {
+                Ok(stream) => scan_history::last_rejection_reason(stream),
+                Err(e) => {
+                    let result = classify_append_error(&e);
+                    tracing::info!(
+                        artifact_id = %artifact_id,
+                        actor_id = %user_id,
+                        outcome = result.as_str(),
+                        "curation waive rejected: the artifact's stream cannot be read to \
+                         its tail, so the rejection axis the override is decided on cannot \
+                         be established"
+                    );
+                    emit_curation_decision(CurationDecisionLabel::Waive, Some(&repo_label), result);
+                    return Err(e);
+                }
+            };
+            paired.artifact_mut().rejection_reason = reason;
+        }
+
+        // 4) Domain transition. The source-state guard inside
+        //    `Artifact::release` accepts `Quarantined`,
+        //    `ScanIndeterminate` and `Rejected` (the last one for this
+        //    pairing alone, and only on an overridable axis) and refuses
+        //    every other state. The deny-by-default release predicate
+        //    (ADR 0007) accepts only `(Curator, CuratorWaiver)` for this
+        //    authority.
         let mut event_payload = match paired.artifact_mut().release(
             ReleaseReason::Curator,
             ReleaseAuthorization::CuratorWaiver,
@@ -702,13 +776,24 @@ impl CurationUseCase {
             Some(&repo_label),
             CurationDecisionResult::Ok,
         );
+        // Both counters fire, because they answer different questions.
+        // `hort_curation_decisions_total` counts curator *decisions*
+        // (waive / block / exclude / unexclude, including the ones that
+        // release nothing); `hort_quarantine_released_total` counts
+        // *releases*, whatever authority issued them. This is the only
+        // manual release, so it is the only place the `curator` reason
+        // can be ticked — a counter named `quarantine_released_total`
+        // that misses a release kind is the half-truth an operator
+        // builds an alert on. Emitted after the commit: an attempt that
+        // never appended must not show up as a release.
+        emit_release(values::REASON_CURATOR);
 
         tracing::info!(
             artifact_id = %artifact_id,
             actor_id = %user_id,
             correlation_id = %correlation_id,
             outcome = "ok",
-            "curator waived quarantined artifact"
+            "curator waived artifact"
         );
         Ok(())
     }
@@ -1920,13 +2005,242 @@ mod tests {
         assert!(lifecycle.committed_transitions().is_empty());
     }
 
-    /// Source-state guard: `waive` rejects non-`Quarantined` states.
-    /// `ScanIndeterminate` stays admin-only via `admin_release`.
+    /// Source-state guard: `waive` reaches `ScanIndeterminate` too, and
+    /// the released event keeps full curator attribution there (ADR 0007,
+    /// "One authority owns the manual release").
     #[tokio::test]
-    async fn waive_non_quarantined_source_state_rejected() {
+    async fn waive_from_scan_indeterminate_releases_with_attribution() {
         let (uc, artifacts, events, lifecycle) = make_use_case();
         let artifact_id =
             seed_artifact_with_stream(&artifacts, &events, QuarantineStatus::ScanIndeterminate);
+        let actor = api_actor();
+
+        uc.waive(
+            artifact_id,
+            actor.clone(),
+            curator_privileges(),
+            sample_justification(),
+        )
+        .await
+        .expect("a curator may clear a stuck scanner");
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        assert_eq!(batch.events.len(), 1);
+        let DomainEvent::ArtifactReleased(ev) = &batch.events[0].event else {
+            panic!("expected ArtifactReleased; got {:?}", batch.events[0].event);
+        };
+        assert_eq!(ev.released_by, ReleaseReason::Curator);
+        assert_eq!(ev.released_by_user_id, Some(actor.user_id));
+        assert_eq!(ev.justification, Some(sample_justification()));
+    }
+
+    /// A `Rejected` artifact whose stream carries **no**
+    /// `ArtifactRejected` is refused: the re-hydrated reason is `None`,
+    /// which is D6's illegal reason-less state rather than an open door.
+    /// The refusal is the caller-reachable state precondition
+    /// `DomainError::InvalidState` (409, ADR 0025) — never `Invariant`
+    /// (500).
+    ///
+    /// This is also the fail-closed shape of the hydration itself: the
+    /// mock repository hands back the entity exactly as it was inserted,
+    /// `rejection_reason` included, where the Postgres mapper would hand
+    /// back `None`. If this method stopped re-deriving the reason from the
+    /// stream, the fixture's entity-level `Some(Scanner)` would release
+    /// here — so the test pins the derivation against the *stream*, not
+    /// against whatever the row happened to carry.
+    #[tokio::test]
+    async fn waive_from_rejected_without_a_terminal_event_is_invalid_state_not_invariant() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_stream(&artifacts, &events, QuarantineStatus::Rejected);
+        let err = uc
+            .waive(
+                artifact_id,
+                api_actor(),
+                curator_privileges(),
+                sample_justification(),
+            )
+            .await
+            .unwrap_err();
+        let AppError::Domain(DomainError::InvalidState(msg)) = &err else {
+            panic!("expected InvalidState (409) so the route does not answer 500, got: {err:?}");
+        };
+        assert!(
+            msg.contains("no recorded reason"),
+            "the 409 must say what is missing: {msg}"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// Seed a `Rejected` artifact whose stream carries a terminal
+    /// `ArtifactRejected{reason}` — the shape the production path
+    /// re-derives the override axis from.
+    fn seed_rejected_on_axis(
+        artifacts: &Arc<MockArtifactRepository>,
+        events: &Arc<MockEventStore>,
+        reason: RejectionReason,
+    ) -> Uuid {
+        let artifact = sample_artifact(QuarantineStatus::Rejected);
+        let artifact_id = artifact.id;
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                persisted_artifact_rejected(artifact_id, reason, 1),
+            ],
+        );
+        artifacts.insert(artifact);
+        artifact_id
+    }
+
+    /// The override, end to end: one test per admitted axis, each
+    /// asserting the committed transition is `Released`, the event names
+    /// the curator and carries the attribution the application layer
+    /// populates, and the saved entity carries **no** stale rejection
+    /// reason.
+    async fn assert_waive_overrides(reason: RejectionReason) {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact_id = seed_rejected_on_axis(&artifacts, &events, reason.clone());
+        let actor = api_actor();
+
+        uc.waive(
+            artifact_id,
+            actor.clone(),
+            curator_privileges(),
+            sample_justification(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("a curator may override a {reason:?} rejection: {e:?}"));
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        assert_eq!(
+            saved.rejection_reason, None,
+            "the committed entity must not carry a stale rejection reason — the next \
+             policy pass would read it"
+        );
+        assert_eq!(batch.events.len(), 1);
+        let DomainEvent::ArtifactReleased(ev) = &batch.events[0].event else {
+            panic!("expected ArtifactReleased; got {:?}", batch.events[0].event);
+        };
+        assert_eq!(ev.released_by, ReleaseReason::Curator);
+        assert_eq!(ev.released_by_user_id, Some(actor.user_id));
+        assert_eq!(ev.justification, Some(sample_justification()));
+    }
+
+    #[tokio::test]
+    async fn waive_overrides_a_scanner_rejection() {
+        assert_waive_overrides(RejectionReason::Scanner).await;
+    }
+
+    #[tokio::test]
+    async fn waive_overrides_a_scan_policy_retroactive_rejection() {
+        assert_waive_overrides(RejectionReason::ScanPolicyRetroactive).await;
+    }
+
+    /// The case the capability exists for: a curator could block and
+    /// could not unblock. A *different* curator's release is admitted —
+    /// the authority is the role, and the releasing curator's id is what
+    /// the event records.
+    #[tokio::test]
+    async fn waive_overrides_a_curator_block_by_another_curator() {
+        assert_waive_overrides(RejectionReason::Curator {
+            curator_id: Uuid::from_u128(0xB10C),
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn waive_overrides_a_retroactive_curation_rejection() {
+        assert_waive_overrides(RejectionReason::CurationRetroactive {
+            rule_id: Uuid::from_u128(0xEE),
+        })
+        .await;
+    }
+
+    /// The provenance axis: what the curator verifies out of band — this
+    /// content hash against the publisher's release page — answers the
+    /// same question the signature answers, in both directions.
+    #[tokio::test]
+    async fn waive_overrides_a_provenance_rejection() {
+        assert_waive_overrides(RejectionReason::Provenance).await;
+    }
+
+    /// The corruption tombstone is the one axis the override never
+    /// reaches, and the 409 names it so the operator learns *why* rather
+    /// than *that*.
+    #[tokio::test]
+    async fn waive_refuses_a_corruption_tombstone_naming_the_axis() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact_id = seed_rejected_on_axis(&artifacts, &events, RejectionReason::Corruption);
+        let err = uc
+            .waive(
+                artifact_id,
+                api_actor(),
+                curator_privileges(),
+                sample_justification(),
+            )
+            .await
+            .unwrap_err();
+        let AppError::Domain(DomainError::InvalidState(msg)) = &err else {
+            panic!("expected InvalidState (409), got: {err:?}");
+        };
+        assert!(
+            msg.contains("corruption"),
+            "the 409 must name the refused axis: {msg}"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// `RejectionReason::Admin` has no production minting path, and no
+    /// override path either — asserted here so a stream that somehow
+    /// carries one does not become a release.
+    #[tokio::test]
+    async fn waive_refuses_an_admin_rejection_naming_the_axis() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact_id = seed_rejected_on_axis(&artifacts, &events, RejectionReason::Admin);
+        let err = uc
+            .waive(
+                artifact_id,
+                api_actor(),
+                curator_privileges(),
+                sample_justification(),
+            )
+            .await
+            .unwrap_err();
+        let AppError::Domain(DomainError::InvalidState(msg)) = &err else {
+            panic!("expected InvalidState (409), got: {err:?}");
+        };
+        assert!(msg.contains("admin"), "the 409 must name the axis: {msg}");
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// An over-cap stream refuses the override rather than overriding on
+    /// a guessed axis. The whole decision rests on the LATEST
+    /// `ArtifactRejected`, and over the oldest prefix of a breached
+    /// stream "the latest" is whichever one the read happened to reach —
+    /// a corruption tombstone that scrolled out of the window would read
+    /// as the scan rejection before it and release bytes that do not
+    /// match their hash. Only `Rejected` pays this cost; the ordinary
+    /// `Quarantined` waive reads no evidence and is unaffected.
+    #[tokio::test]
+    async fn waive_from_rejected_refuses_a_stream_past_the_event_cap() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact = sample_artifact(QuarantineStatus::Rejected);
+        let artifact_id = artifact.id;
+        let stream_id = StreamId::artifact(artifact_id);
+        let over_cap: Vec<_> = (0..201)
+            .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
+            .collect();
+        events.set_stream(&stream_id, over_cap);
+        artifacts.insert(artifact);
+
         let err = uc
             .waive(
                 artifact_id,
@@ -1937,8 +2251,76 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("release"),
-            "expected domain release-guard error, got: {err}"
+            err.to_string().contains("200-event cap"),
+            "the refusal must name the cap it is enforcing; got {err}"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// An over-cap stream does **not** refuse the ordinary waive: a
+    /// `Quarantined` artifact's release reads no evidence, so the cost of
+    /// the axis derivation falls only where the axis matters.
+    #[tokio::test]
+    async fn waive_from_quarantined_tolerates_a_stream_past_the_event_cap() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact = sample_artifact(QuarantineStatus::Quarantined);
+        let artifact_id = artifact.id;
+        let stream_id = StreamId::artifact(artifact_id);
+        let over_cap: Vec<_> = (0..201)
+            .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
+            .collect();
+        events.set_stream(&stream_id, over_cap);
+        artifacts.insert(artifact);
+
+        uc.waive(
+            artifact_id,
+            api_actor(),
+            curator_privileges(),
+            sample_justification(),
+        )
+        .await
+        .expect("the ordinary waive derives nothing from the stream");
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+    }
+
+    /// The reverse scan the axis is derived from must see the stream's
+    /// tail. A corruption tombstone *after* a scan rejection is what the
+    /// override must refuse — and reading a truncated oldest-prefix would
+    /// find the scan rejection and release corrupt bytes, which is why
+    /// the derivation goes through `ArtifactAtVersion::evidence` and the
+    /// latest `ArtifactRejected` wins.
+    #[tokio::test]
+    async fn waive_reads_the_latest_rejection_not_the_first() {
+        let (uc, artifacts, events, lifecycle) = make_use_case();
+        let artifact = sample_artifact(QuarantineStatus::Rejected);
+        let artifact_id = artifact.id;
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+                persisted_artifact_rejected(artifact_id, RejectionReason::Corruption, 2),
+            ],
+        );
+        artifacts.insert(artifact);
+
+        let err = uc
+            .waive(
+                artifact_id,
+                api_actor(),
+                curator_privileges(),
+                sample_justification(),
+            )
+            .await
+            .unwrap_err();
+        let AppError::Domain(DomainError::InvalidState(msg)) = &err else {
+            panic!("expected InvalidState (409), got: {err:?}");
+        };
+        assert!(
+            msg.contains("corruption"),
+            "the later tombstone is the live verdict, not the scan rejection before it: \
+             {msg}"
         );
         assert!(lifecycle.committed_transitions().is_empty());
     }
@@ -1965,6 +2347,78 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("concurrent"));
         assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    // -- AUDIT-info-1 ---------------------------------------------------
+    //
+    // AUDIT-info-1: **the manual release's success log line carries the
+    //   acting `user_id`.** `waive` is the one manual-release surface
+    //   (ADR 0007), the denial branches already carry `actor_id`, and an
+    //   operator correlates a curator's denied and succeeded decisions by
+    //   that field — so the success line losing it is a silent audit
+    //   regression nothing else in the suite would see.
+    //
+    // The capture machinery is `use_cases::test_support::tracing_capture`;
+    // its doc comment states what it does and does not see.
+
+    /// AUDIT-info-1 on the surviving path: `waive`'s success line emits
+    /// `actor_id` carrying the acting user's id.
+    ///
+    /// Asserted on the **field**, not on the rendered line. The same line
+    /// also carries `artifact_id`, and this file's listing paths log
+    /// `filter_actor_id`, so a substring check for the uuid — or for
+    /// `actor_id=` — can stay green precisely when the field under
+    /// assertion is the one that went missing.
+    ///
+    /// Synchronous `#[test]` driving the async `waive` through a
+    /// current-thread runtime's `block_on` inside the capture closure: the
+    /// capture's serialising guard must not cross an `.await`, and an event
+    /// emitted on another thread would not reach the buffer.
+    #[test]
+    fn audit_info_1_waive_success_log_carries_acting_user_id() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let actor = api_actor();
+        let acting_user_id = actor.user_id;
+
+        let (_, events) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (uc, artifacts, store, _lifecycle) = make_use_case();
+                let artifact_id =
+                    seed_artifact_with_stream(&artifacts, &store, QuarantineStatus::Quarantined);
+                uc.waive(
+                    artifact_id,
+                    actor.clone(),
+                    curator_privileges(),
+                    sample_justification(),
+                )
+                .await
+                .expect("waive should succeed");
+            });
+        });
+
+        let success = events
+            .iter()
+            .find(|e| e.level == tracing::Level::INFO && e.message() == "curator waived artifact")
+            .unwrap_or_else(|| panic!("expected waive's success info line; captured {events:#?}"));
+
+        let expected = acting_user_id.to_string();
+        assert_eq!(
+            success.field("actor_id"),
+            Some(expected.as_str()),
+            "AUDIT-info-1: waive's success line must carry actor_id = the acting user's id; \
+             saw {success:#?}"
+        );
+        assert!(
+            success
+                .target
+                .starts_with("hort_app::use_cases::curation_use_case"),
+            "the captured line must be the use case's own, not a test helper's: {success:#?}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2784,6 +3238,179 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // The decision log's completeness (ADR 0007, "One authority owns
+    // the manual release").
+    //
+    // `list_decisions` discriminates a curator release on the event
+    // PAYLOAD: the Postgres adapter's predicate is
+    // `event_data->'data'->>'released_by' = 'Curator'`
+    // (`crates/hort-adapters-postgres/src/curation_decisions_repository.rs`,
+    // whose own DB-backed suite pins the JSONB shape). The listing is
+    // therefore complete exactly as long as EVERY manual release
+    // appends `ReleaseReason::Curator` — nothing enforces that from the
+    // adapter's side, and the asymmetry was real while a second,
+    // admin-authority release surface existed: it appended
+    // `ReleaseReason::Admin`, which this predicate does not match, so
+    // those releases never appeared in the curator's decision log. With
+    // one manual release left, completeness holds by construction, and
+    // the test below is what says so.
+    // ------------------------------------------------------------------
+
+    /// Fixed `occurred_at` for derived entries — the adapter reads the
+    /// envelope's `stored_at`, which the in-memory mocks do not model.
+    /// No assertion below depends on it.
+    fn derived_occurred_at() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_700_000_000, 0).expect("constant timestamp")
+    }
+
+    /// A [`CurationDecisionsRepository`] that DERIVES its listing from
+    /// the events the use case actually committed, applying the
+    /// production discriminator in its enum form (`released_by ==
+    /// ReleaseReason::Curator`) and mapping the row the way the SQL
+    /// does: `kind = waive`, `actor_id` and `correlation_id` from the
+    /// events envelope, `artifact_id` and `justification` from the
+    /// payload.
+    ///
+    /// Why not [`MockCurationDecisionsRepository`]: a canned-Vec stub
+    /// cannot answer "does this release appear in the listing?" — it
+    /// answers with whatever the test handed it, so the discriminator
+    /// is never exercised. This double answers yes only if the release
+    /// really carried the curator authority tag.
+    ///
+    /// The `filter` is ignored (every test using this double passes the
+    /// default filter): filter semantics are SQL-side and are covered
+    /// by the adapter's own suite. What is under test here is which
+    /// events qualify as decisions at all.
+    struct CommittedDecisionsRepository {
+        lifecycle: Arc<MockArtifactLifecycle>,
+    }
+
+    impl CurationDecisionsRepository for CommittedDecisionsRepository {
+        fn list_decisions<'a>(
+            &'a self,
+            _filter: CurationDecisionFilter,
+        ) -> BoxFuture<'a, DomainResult<Vec<CurationDecisionEntry>>> {
+            let mut out = Vec::new();
+            for (_artifact, batch, _metadata) in self.lifecycle.committed_transitions() {
+                let Actor::Api(ref actor) = batch.actor else {
+                    // Not an API-authenticated append — no curator
+                    // decision can ride it.
+                    continue;
+                };
+                for to_append in &batch.events {
+                    let DomainEvent::ArtifactReleased(ref released) = to_append.event else {
+                        continue;
+                    };
+                    if released.released_by != ReleaseReason::Curator {
+                        continue;
+                    }
+                    out.push(CurationDecisionEntry {
+                        event_id: to_append.event_id,
+                        kind: CurationDecisionKind::Waive,
+                        actor_id: actor.user_id,
+                        artifact_id: Some(released.artifact_id),
+                        policy_id: None,
+                        cve_id: None,
+                        justification: released.justification.clone().unwrap_or_default(),
+                        correlation_id: batch.correlation_id,
+                        occurred_at: derived_occurred_at(),
+                    });
+                }
+            }
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    /// Variant of [`make_use_case`] whose decisions repository derives
+    /// its listing from the committed events rather than replaying a
+    /// canned Vec.
+    #[allow(clippy::type_complexity)]
+    fn make_use_case_with_committed_decisions() -> (
+        CurationUseCase,
+        Arc<MockArtifactRepository>,
+        Arc<MockEventStore>,
+    ) {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let events = Arc::new(MockEventStore::new());
+        let lifecycle = Arc::new(MockArtifactLifecycle::new(artifacts.clone()));
+        let decisions_repo = Arc::new(CommittedDecisionsRepository {
+            lifecycle: lifecycle.clone(),
+        });
+        let uc = CurationUseCase::new(
+            crate::event_store_publisher::wrap_for_test(events.clone()),
+            artifacts.clone(),
+            lifecycle,
+            Arc::new(MockPolicyProjectionRepository::new()),
+            Arc::new(MockCurationQueueRepository::new()),
+            decisions_repo,
+            Arc::new(MockCurationExclusionsRepository::new()),
+            default_repository_access(),
+            Arc::new(MockCurationRuleRepository::new()),
+            Arc::new(MockStoragePort::new()),
+        );
+        (uc, artifacts, events)
+    }
+
+    /// Every manual release appears in the curator's decision log —
+    /// from BOTH source states the one manual release reaches.
+    ///
+    /// `ScanIndeterminate` is the load-bearing half: it is the state a
+    /// stuck scanner leaves behind, reachable only through the manual
+    /// release, and the one a second release authority would have been
+    /// most tempting to add for. A release from there that did not
+    /// carry `ReleaseReason::Curator` would commit, succeed, and be
+    /// absent from the decision log the curator audits — which is
+    /// exactly what the retired admin surface did.
+    #[tokio::test]
+    async fn manual_release_appears_in_list_decisions_from_both_source_states() {
+        for status in [
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::ScanIndeterminate,
+        ] {
+            let (uc, artifacts, events) = make_use_case_with_committed_decisions();
+            let artifact_id = seed_artifact_with_stream(&artifacts, &events, status);
+            let actor = api_actor();
+
+            uc.waive(
+                artifact_id,
+                actor.clone(),
+                curator_privileges(),
+                sample_justification(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("waive from {status:?} should succeed: {e}"));
+
+            let entries = uc
+                .list_decisions(
+                    actor.clone(),
+                    curator_privileges(),
+                    CurationDecisionFilter::default(),
+                )
+                .await
+                .expect("curator may read the decision log");
+
+            assert_eq!(
+                entries.len(),
+                1,
+                "the manual release from {status:?} must appear exactly once in the \
+                 decision log; got {entries:?}"
+            );
+            let entry = &entries[0];
+            assert_eq!(entry.kind, CurationDecisionKind::Waive);
+            assert_eq!(
+                entry.artifact_id,
+                Some(artifact_id),
+                "decision log row must name the released artifact ({status:?})"
+            );
+            assert_eq!(
+                entry.actor_id, actor.user_id,
+                "decision log row must name the deciding curator ({status:?})"
+            );
+            assert_eq!(entry.justification, sample_justification());
+        }
+    }
+
+    // ------------------------------------------------------------------
     // list_exclusions
     // ------------------------------------------------------------------
 
@@ -3177,6 +3804,128 @@ mod tests {
         // the cardinality anti-pattern.
         assert!(!r.contains("-"), "UUID must not leak into label: {r}");
         assert_eq!(res, "ok");
+    }
+
+    // ------------------------------------------------------------------
+    // `hort_quarantine_released_total` — the manual release is counted.
+    //
+    // The counter is about RELEASES, whatever authority issued them;
+    // `hort_curation_decisions_total` is about curator DECISIONS
+    // (waive / block / exclude / unexclude), most of which release
+    // nothing. The manual release has to appear on both, and the
+    // emitter is shared with the timer and re-evaluation paths
+    // (`crate::metrics::emit_release`) so the metric name is
+    // spelled once.
+    // ------------------------------------------------------------------
+
+    /// Helper — read every `hort_quarantine_released_total` increment
+    /// from a `DebuggingRecorder` snapshot as `(reason, count)` pairs in
+    /// emission order. Sibling of [`read_curation_decisions`].
+    fn read_quarantine_released(snap: metrics_util::debugging::Snapshot) -> Vec<(String, u64)> {
+        use metrics_util::debugging::DebugValue;
+        use metrics_util::MetricKind;
+
+        let mut out = Vec::new();
+        for (key, _u, _d, value) in snap.into_vec() {
+            if key.kind() != MetricKind::Counter
+                || key.key().name() != "hort_quarantine_released_total"
+            {
+                continue;
+            }
+            let reason = key
+                .key()
+                .labels()
+                .find(|l| l.key() == "reason")
+                .map(|l| l.value().to_string())
+                .unwrap_or_default();
+            let count = match value {
+                DebugValue::Counter(n) => n,
+                other => panic!("expected Counter, got {other:?}"),
+            };
+            out.push((reason, count));
+        }
+        out
+    }
+
+    /// A successful `waive` ticks
+    /// `hort_quarantine_released_total{reason=curator}` exactly once.
+    /// Mirrors
+    /// [`waive_happy_path_emits_metric_with_resolved_repository_key`]'s
+    /// harness (`DebuggingRecorder` + a current-thread runtime inside
+    /// the recorder scope, so the emission happens on the thread the
+    /// local recorder is installed on) — that test is the other half of
+    /// the pair, asserting the same call's
+    /// `hort_curation_decisions_total` tick. Two tests rather than one:
+    /// `Snapshotter::snapshot` drains the counters it reports, so one
+    /// snapshot cannot be read twice.
+    #[test]
+    fn waive_happy_path_emits_quarantine_released_total_with_curator_reason() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let (uc, artifacts, events, _lifecycle) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_stream(&artifacts, &events, QuarantineStatus::Quarantined);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(uc.waive(
+                    artifact_id,
+                    api_actor(),
+                    curator_privileges(),
+                    sample_justification(),
+                ))
+                .expect("waive should succeed");
+        });
+
+        assert_eq!(
+            read_quarantine_released(snapshotter.snapshot()),
+            vec![("curator".to_string(), 1)],
+            "the one manual release must tick the release counter once, with reason=curator"
+        );
+    }
+
+    /// An attempt that released nothing must not look like a release:
+    /// the privilege denial returns before any append, so
+    /// `hort_quarantine_released_total` stays untouched while the
+    /// decision counter records the denial (pinned by
+    /// [`waive_denied_emits_metric_with_all_sentinel_pre_lookup`]).
+    /// This is what holds the emission at its post-commit position — a
+    /// tick placed beside the privilege gate would make denied attempts
+    /// indistinguishable from releases on an operator's dashboard.
+    #[test]
+    fn waive_denied_does_not_emit_quarantine_released_total() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let (uc, artifacts, events, _lifecycle) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_stream(&artifacts, &events, QuarantineStatus::Quarantined);
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(uc.waive(
+                    artifact_id,
+                    api_actor(),
+                    unprivileged(),
+                    sample_justification(),
+                ))
+                .expect_err("unprivileged waive must fail");
+        });
+
+        assert!(
+            read_quarantine_released(snapshotter.snapshot()).is_empty(),
+            "a denied waive released nothing and must not tick \
+             hort_quarantine_released_total"
+        );
     }
 
     /// `block(BlockTarget::Artifact)` happy path: one tick with the

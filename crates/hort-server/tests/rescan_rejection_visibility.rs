@@ -47,7 +47,7 @@
 //! unconditionally, and from `Released` only when the prior release
 //! was automatic (`ReleaseOrigin::permits_scan_reblock` — an explicit
 //! Admin/Curator release outweighs a later scan verdict;
-//! `reject_from_scan_refuses_an_admin_released_artifact` and
+//! `reject_from_scan_refuses_an_artifact_released_by_admin` and
 //! `reject_from_scan_from_rejected_fails` pin both halves in
 //! `hort-domain`). `Released` is therefore not a *stable* pre-state for
 //! this smoke — whether it transitions depends on a stream fact the

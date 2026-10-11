@@ -1,7 +1,7 @@
 //! Integration tests for `hort-cli curation waive`.
 //!
-//! Four scenarios mirror the mockito test pattern from
-//! `tests/admin_quarantine_release.rs`:
+//! Four scenarios follow the mockito test pattern this crate's
+//! `tests/` share (see `tests/admin_quarantine_list.rs`):
 //!
 //! 1. `waive_happy_path_table` — 200 OK → table prints "waived
 //!    artifact <id>", exit 0.
@@ -22,7 +22,7 @@ use hort_cli::config::{EffectiveConfig, OutputFormat};
 use hort_cli::curation::waive::{run_with_output, WaiveArgs};
 
 // ---------------------------------------------------------------------------
-// Shared helpers (mirrors tests/admin_quarantine_release.rs)
+// Shared helpers (the shape every `tests/` file in this crate uses)
 // ---------------------------------------------------------------------------
 
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {

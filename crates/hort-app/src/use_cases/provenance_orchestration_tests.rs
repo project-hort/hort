@@ -1353,10 +1353,14 @@ async fn required_descendant_with_bad_signature_still_rejects() {
 // inbound edge during exactly the interval where a `Required` scope with a
 // window shorter than the push resolves `window_open == false`. Both
 // disjuncts were then false and the blob terminally rejected itself as
-// `Unsigned` — unreachable by `reevaluate` (scan-clearable only), by `waive`
-// (Quarantined only), by the admin override (`ReleaseGeneral` forbids
-// `Rejected`) and by the cascade (which forbids `Rejected` too). Servability
-// of a correctly signed image then depended on client push order.
+// `Unsigned` — unreachable by `reevaluate` (scan-clearable only), by the
+// cascade (which forbids `Rejected`) and, at the time, by the manual
+// release too. The manual release has since gained the provenance axis
+// (ADR 0007, "The axis boundary for a `Rejected` artifact"), but that is a
+// curator's attended override and not a path the push-order race can take
+// by itself: servability of a correctly signed image would still depend on
+// client push order plus a human noticing. The hold is what makes it
+// depend on neither.
 //
 // `is_constituent` survives as the hold's LABEL, not its gate: the hold is
 // unconditional now, and the classification only says what the artifact is

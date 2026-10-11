@@ -93,13 +93,35 @@ pub struct AdminPrincipal(pub CallerPrincipal);
 /// operation in scope (compile-time failure rather than 403 at runtime).
 ///
 /// **Scope is per-route, NOT a broadening of the existing
-/// [`AdminPrincipal`] gate.** Mounting the existing `/admin/quarantine/...`
-/// or `/admin/users/.../effective-permissions` routes behind this extractor
-/// would broaden the global admin gate to also accept curators — that is
-/// out of scope: `Permission::Curate` is the
-/// day-to-day decision authority over quarantined / rejected artifacts
-/// and is strictly less than `Admin`. Use this extractor only on the
-/// curation decision routes.
+/// [`AdminPrincipal`] gate.** `Permission::Curate` is the day-to-day
+/// decision authority over quarantined / rejected artifacts and is
+/// strictly less than `Admin`; mounting an admin route behind this
+/// extractor because it happens to sit under `/api/v1/admin/...` would
+/// broaden the global admin gate by accident. Each route carries this
+/// extractor only when its *own* authority is the curator's.
+///
+/// Three route groups qualify today:
+///
+/// - the curation decision routes (`/api/v1/admin/curation/...`);
+/// - the finding-exclusion writes
+///   (`/api/v1/admin/policies/{policy_id}/exclusions[/{cve_id}]`);
+/// - `GET /api/v1/admin/quarantine/patch-candidates` — the read that
+///   grounds the manual release. The release is the curator's (ADR 0007,
+///   "One authority owns the manual release"), and an authority that may
+///   decide but may not read the findings behind the decision is that
+///   rule applied by halves. Its anti-enumeration posture (ADR 0021 /
+///   ADR 0045) holds because a *global* `Curate` grant is already global
+///   decision authority over every artifact the listing names — both the
+///   quarantined row (which `/api/v1/admin/curation/queue` already serves
+///   to this extractor) and its released vulnerable sibling, which
+///   `block_by_curator` may reject from `Released`
+///   (`hort_domain::entities::quarantine_transitions`).
+///
+/// The remaining admin reads — `GET /admin/repositories/{key}`,
+/// `/effective-config`, `/gitops/apply-status`,
+/// `/users/{user_id}/effective-permissions`, `/workers` — are technical
+/// and operative rather than curatorial, and stay on [`AdminPrincipal`]
+/// by the same rule.
 ///
 /// Payload is the validated [`CallerPrincipal`] for downstream logging /
 /// audit (the use case still takes `ApiActor { user_id }` directly).

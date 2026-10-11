@@ -3,7 +3,9 @@
 This guide is for operators who hold a quarantine policy on an upstream-
 facing repository and need to act on the case where the quarantined
 artifact is a **fix** for a vulnerability in a version that hort
-is already serving. It covers the `hort-cli admin quarantine` workflow, the
+is already serving. It covers the review queue
+(`hort-cli admin quarantine list-patch-candidates`), the release that
+acts on it (`hort-cli curation waive`), the
 audit trail produced, and the alternative "fast-patch repository" pattern
 including the per-format transparency limits.
 
@@ -64,6 +66,16 @@ nothing, the quarantine window completes, the artifact is released, and
 your consumers pick up the fix at that point. The override below is for
 the case where waiting is not acceptable.
 
+This listing requires `Permission::Curate` — the same permission as the
+release in §3, so the credential that decides is the credential that
+reads the findings behind the decision, and the four commands in §4 run
+start to finish on one token. An admin caller satisfies the same gate
+without holding an explicit `curate` grant. The route stays under
+`/api/v1/admin/...` (`GET /api/v1/admin/quarantine/patch-candidates`),
+as do the curator decision routes themselves (`/api/v1/admin/curation/*`)
+— the prefix is where the control plane is mounted, not a statement about
+which permission it needs.
+
 ---
 
 ## 3. The decision
@@ -80,9 +92,27 @@ override**. You are saying:
 
 Who should make the call: someone who can verify the upstream publish
 signature, the upstream maintainer's identity, the changelog, and the
-public advisory — not a CI pipeline. The release endpoint requires
-`Permission::Admin`; do not bind an `hort_svc_*` service token with that
-permission and call it from automation.
+public advisory — not a CI pipeline. The release requires
+`Permission::Curate`: the manual release is a curation decision, held by
+one authority
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)'s
+one-authority amendment; an admin caller satisfies the same gate).
+
+**What keeps a pipeline off this route is the grant you do not make.**
+Not a check on the token's kind — the sanctioned shape of a maintainer's
+own curator credential *is* a PAT-only `kind: ServiceAccount` with a
+standalone global `curate` grant (`maintainer-curator` in the deployed
+gitops config,
+`deploy/ansible/files/gitops/auth/service-accounts/maintainer-curator.yaml`),
+so `kind: ServiceAccount` does not mean "a pipeline" and the route
+deliberately does not inspect `token_kind`. The rule is
+[ADR 0055](../../adr/0055-write-authorized-hold-read-generalised.md)'s:
+a `curate` grant for CI is rejected — *"hands CI standing authority over
+other people's artifacts to solve a problem about its own"*. Grant
+`curate` to named human operators, review the grants as the control they
+are, and keep release automation on `write` (service accounts cannot hold
+admin at all —
+[ADR 0038](../../adr/0038-admin-identity-model.md)).
 
 What you are **not** signing up for: the scan still ran (and either
 completed clean, completed with its own findings, or is still pending).
@@ -109,10 +139,11 @@ hort-cli admin quarantine list-patch-candidates --repo npm-proxy --output json \
 npm view lodash@4.17.21 --registry https://registry.npmjs.org \
   | grep -E 'dist|integrity|signatures'
 
-# 3. Release the quarantined artifact. --justification is REQUIRED and
+# 3. Release the quarantined artifact. This is `curation waive` — the
+#    one manual release (ADR 0007). --justification is REQUIRED and
 #    is recorded in the ArtifactReleased event's `justification` field
 #    (max 512 bytes, non-empty after trimming whitespace).
-hort-cli admin quarantine release <quarantined_artifact_id> \
+hort-cli curation waive <quarantined_artifact_id> \
   --justification "lodash@4.17.21 fixes CVE-2024-XXXX (prototype pollution
                    reported in GHSA-...); verified upstream npm signature
                    2026-05-11; risk-accepted by security@example.com"
@@ -124,21 +155,20 @@ hort-cli admin quarantine list-patch-candidates --repo npm-proxy
 ```
 
 The `ArtifactReleased` event for step 3 carries:
-- `released_by = Admin`
-- `released_by_user_id = <your user UUID>` (from the admin token used)
+- `released_by = Curator`
+- `released_by_user_id = <your user UUID>` (from the token used)
 - `justification = "<the text you supplied>"`
 
 Both `released_by_user_id` and `justification` are present iff
-`released_by ∈ {Admin, Curator}` — the curator-waiver endpoint
-(`POST /api/v1/admin/curation/quarantine/:artifact_id/waive`, day-to-day
-non-admin release authority, `Quarantined`-only source state) emits the
-same attribution shape as the admin path this guide walks through; the
-timer-sweep release
-path produces an `ArtifactReleased` with both fields `None`, and the
-policy-re-evaluation path (when an exclusion is added and the
+`released_by ∈ {Admin, Curator}`. `Curator` is what the one manual
+release records today; `Admin` appears only on events written before
+ADR 0007's one-authority amendment, and the stream is append-only
+(ADR 0002), so a forensic reader still has to read it. The timer-sweep
+release path produces an `ArtifactReleased` with both fields `None`, and
+the policy-re-evaluation path (when an exclusion is added and the
 observation window has elapsed) also produces both `None`. This
-contrast is what makes the two human-attributed release paths
-forensically distinguishable from the two automatic ones.
+contrast is what makes the human-attributed release path forensically
+distinguishable from the two automatic ones.
 
 ---
 
@@ -223,7 +253,7 @@ treats both repos as independent proxy pipelines.
 
 ### 5.4 When to prefer the per-artifact override instead
 
-The `hort-cli admin quarantine release` flow in §4 keeps consumers on
+The `hort-cli curation waive` flow in §4 keeps consumers on
 **one** registry URL. They never see a config change. The operator pays
 the cost (one CLI invocation per fix) instead of pushing the cost to
 every consumer. This is the right default for the common case.
@@ -257,8 +287,14 @@ window with a human-gated override would not have.
 
 The audit-trail invariant in `ArtifactReleased` is the
 load-bearing piece of this story. Every early release in the system has
-a named human attached. There is no automated principal that holds
-`Permission::Admin` and can shortcut the gate; if you discover an
+a named human attached. What keeps an automated principal from
+shortcutting the gate is the grant nobody makes — a `curate` grant for
+CI is rejected on the record
+([ADR 0055](../../adr/0055-write-authorized-hold-read-generalised.md)) —
+so the control is the grant review, not a property of the token: audit
+*who* holds `curate` the way you would audit who holds a signing key. And
+no service account can hold `Permission::Admin` at all
+([ADR 0038](../../adr/0038-admin-identity-model.md)); if you discover an
 `hort_svc_*` token in your deployment with admin scope, treat it as a
 configuration error and rotate it.
 

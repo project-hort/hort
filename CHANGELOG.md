@@ -221,6 +221,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **One authority owns the manual release: the curator** (#345). Releasing a
+  held artifact by hand used to be two surfaces for one transition — an
+  admin-gated `POST /api/v1/admin/quarantine/<id>/release` with
+  `hort-cli admin quarantine release`, and the curator's
+  `POST /api/v1/admin/curation/quarantine/<id>/waive` with
+  `hort-cli curation waive`. They differed in exactly three things: the
+  permission, the source state the curator's half refused
+  (`ScanIndeterminate`, the stuck-scanner case), and the `released_by`
+  discriminator. Effect, attribution, the event type and re-blockability were
+  identical.
+
+  **The admin route and CLI command are gone, and the curator's reach is
+  wider.** Admin serves technical and operative actions; the curator holds the
+  domain's authority, so the curator who may override findings a policy
+  weighed may also act where no verdict was reached at all. `hort-cli curation
+  waive <artifact_id> --justification '…'` now releases a `Quarantined`
+  **and** a `ScanIndeterminate` artifact. `Rejected` stays terminal for it, and
+  answers `409` as before (ADR 0025).
+
+  **Operator impact.**
+
+  - Replace any `hort-cli admin quarantine release <id> --justification '…'`
+    with `hort-cli curation waive <id> --justification '…'`, and any
+    `POST /api/v1/admin/quarantine/<id>/release` with
+    `POST /api/v1/admin/curation/quarantine/<id>/waive`. There is no alias and
+    no deprecation shim: the removed route answers `404`. One path is the
+    point — a second surface is what this change removes.
+  - **The release counter follows.** `hort_quarantine_released_total` now ticks
+    `reason="curator"` for every manual release and no longer ticks
+    `reason="admin"` — a curator waive previously incremented nothing on it, so
+    an alert on total releases was under-counting manual ones. Historical
+    `admin` series are untouched and still queryable: the series stops growing,
+    it is not deleted. A rule that wants every manual release across the
+    retention window should match `reason=~"curator|admin"`.
+  - **The read that grounds the decision moved with it.**
+    `GET /api/v1/admin/quarantine/patch-candidates` and
+    `hort-cli admin quarantine list-patch-candidates` now accept
+    `Permission::Curate` as well as `Admin`, so the four commands of the
+    patch-release playbook run start to finish on one curator token. The path
+    and the command name are unchanged. A denied request on that route no
+    longer contributes to `hort_authz_denials_total` — the curate-or-admin gate
+    produces two decisions and one denial, so no single `reason` label would be
+    truthful; a dashboard keyed on its `permission="admin"` denials will read
+    zero.
+  - **No credential change is needed.** The waive gate is `Permission::Curate`
+    **or** `Permission::Admin`, so an admin token that worked on the old route
+    works on the new one. A `curate` grant is the narrower credential, and
+    granting it to CI stays refused on the record (ADR 0055).
+  - `hort-cli admin quarantine` keeps `list-patch-candidates`; only the
+    `release` subcommand is gone. The patch-candidate queue is still the
+    review surface — the release that acts on a listed row is now the waive.
+  - **The break-glass admin-token procedure is retired.** The public
+    supply-chain runbook's `ScanIndeterminate` case used to require minting a
+    DSN-gated, ≤1 h `bootstrap-session` admin token, releasing, and revoking
+    it. The standing `maintainer-curator` credential now covers that state, so
+    the procedure is deleted rather than re-pointed, and the deployment still
+    holds no standing full-admin token (ADR 0013).
+  - **Nothing on the audit trail is rewritten.** The stream is append-only
+    (ADR 0002): `ArtifactReleased { released_by: Admin }` events written before
+    this change still read back as manual, human-attributed releases, and a
+    fresh scan verdict still cannot re-block an artifact one of them released.
+    `ReleaseReason::Admin` keeps its place in the vocabulary with no path that
+    mints it; new manual releases record `Curator`. A dashboard or SIEM query
+    that filters on `released_by = 'admin'` will stop matching new events and
+    should also accept `curator`.
+
+  Decision and rationale: ADR 0007, *"One authority owns the manual release"*.
+
 - **A returned failure becomes terminal at the attempt cap** (#341). The task
   dispatcher called `reschedule` for every `TaskOutcome::Failed { retry: true }`
   and every handler `Err`, without consulting `job.attempts` and without

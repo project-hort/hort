@@ -147,13 +147,13 @@ Behaviour on mismatch is operator-chosen via
 | Action | What happens on mismatch | Operator response |
 |---|---|---|
 | `alert` (default) | Emit `CasIntegrityMismatch` event + `tracing::warn!` + bump `hort_cas_scrub_checks_total{result="hash_mismatch"}`. The blob remains readable. | Investigate; decide whether to restore from backup, hard-delete, or keep the data. The artifact's `quarantine_status` is unchanged. |
-| `tombstone` | Additionally emit `ArtifactCorrupted` **and its `ArtifactRejected{Corruption}` companion**, and transition the artifact through the existing quarantine state machine to `quarantine_status = 'rejected'` via `ArtifactLifecyclePort::commit_transition` (one append, so the status is never `rejected` without the event explaining it — ADR 0039's 2026-09-12 amendment, D6). | Subsequent download attempts are blocked at the application layer (the same existing quarantine error the rejected state already produces). The artifact surfaces in the curation queue with reason `corruption`. To recover from a false positive — e.g. operator restores the blob from a known-good backup — issue `POST /quarantine/:artifact_id/release`; a re-scan will not clear it, since a clean verdict over the wrong bytes says nothing about the right ones. |
+| `tombstone` | Additionally emit `ArtifactCorrupted` **and its `ArtifactRejected{Corruption}` companion**, and transition the artifact through the existing quarantine state machine to `quarantine_status = 'rejected'` via `ArtifactLifecyclePort::commit_transition` (one append, so the status is never `rejected` without the event explaining it — ADR 0039's 2026-09-12 amendment, D6). | Subsequent download attempts are blocked at the application layer (the same existing quarantine error the rejected state already produces). The artifact surfaces in the curation queue with reason `corruption`. There is no manual release out of it: the curator's waive reaches a `rejected` artifact on the axes the curator owns (scan, curation, provenance) but **never** the corruption axis, so it answers `409` here (ADR 0025), and ADR 0007 records the corruption axis as the one a manual release never reaches even where the state would allow one — a re-scan will not clear it either, since a clean verdict over the wrong bytes says nothing about the right ones. Recovering a false positive means re-ingesting the restored blob. |
 
 **Why `tombstone` reuses `Rejected` rather than introducing a new
 state.** Corruption is structurally identical to a disqualifying scan
 finding: permanently bad content, time does not reverse it. The
-existing `Rejected` semantics — sticky, requires admin override —
-match the corruption response exactly. A new `Tombstoned` state
+existing `Rejected` semantics — sticky, and not reachable by any
+manual release — match the corruption response exactly. A new `Tombstoned` state
 would have the same downstream behaviour with twice the audit-tooling
 surface.
 

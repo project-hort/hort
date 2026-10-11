@@ -255,14 +255,22 @@ call's inputs + decision:
   only production path that emits `permission="delete"`. Cancel/finalize
   of an in-flight upload deliberately stays on `permission="write"`.
   `curate` covers the `CurateOrAdminPrincipal`
-  extractor that gates the HTTP decision endpoints under
-  `/api/v1/admin/curation/...`. A decision lights up
+  extractor. It gates the HTTP decision endpoints under
+  `/api/v1/admin/curation/...`, the finding-exclusion writes under
+  `/api/v1/admin/policies/{policy_id}/exclusions`, and
+  `GET /api/v1/admin/quarantine/patch-candidates` — the read that
+  grounds the manual release, which carries the release's own gate
+  (ADR 0007). A decision lights up
   `permission="curate"` regardless of whether the underlying
   authority was `Permission::Curate` or `Permission::Admin` (the
   extractor accepts either) — the label tracks "decisions on the
   curator surface", not "which authority the evaluator consulted".
-  An admin-only caller hitting `/api/v1/admin/curation/...` ticks
-  `curate=allow`, NOT `admin=allow`.
+  An admin-only caller hitting any of those routes ticks
+  `curate=allow`, NOT `admin=allow`. The patch-candidate listing moved
+  onto this label when its gate widened; a dashboard that counted it
+  under `permission="admin"` sees that series drop, and because this
+  extractor is absent from `hort_authz_denials_total` (see below) a
+  denied listing request no longer contributes a `reason` there.
 
 `hort_authz_denials_total` is the **deny-only sibling** of the decision
 counter, carrying WHICH leg of the two-leg authorization AND
@@ -1341,7 +1349,7 @@ SERVICE_ACCOUNT_ALL}`.
 | `hort_api_token_used_audit_dropped` | counter | `result` | — | `throttled`, `append_error` |
 | `hort_download_duration_seconds` | histogram | `format` | seconds | — |
 | `hort_quarantine_triggered_total` | counter | `format`, `repository` | — | — |
-| `hort_quarantine_released_total` | counter | `reason` | — | `reason` ∈ `timer`, `admin`, `policy_re_evaluation` |
+| `hort_quarantine_released_total` | counter | `reason` | — | `reason` ∈ `timer`, `curator`, `policy_re_evaluation` (a historical `admin` value is retired and no longer emitted — the manual release is the curator's, so `curator` replaced it) |
 
 **`IngestResult` semantics:**
 
@@ -2329,7 +2337,7 @@ fetch port is called:
   softer here at 13 values; further splitting would push past the
   architect-doc per-metric ceiling (5–10) without operator-actionable
   benefit (both terminal states share the same handling: "no
-  automated path forward; needs human curator/admin override").
+  automated path forward; needs a human curator decision").
 - `internal` (`hort_prefetch_self_service_total` ONLY) — Hort-side
   infrastructure failure: a DB / jobs-port / `package_version_status`
   error, including a `jobs_trigger_source_check` constraint violation.
@@ -3206,7 +3214,7 @@ the OSV bulk diff).
 | `hort_policy_reevaluation_artifacts_total` | counter | `result` | — | `result ∈ {released, re_held, unchanged}` — per-artifact terminal outcome of an async scan-policy re-evaluation pass (ADR 0041 Item 3). One increment per in-scope artifact the pass reached a verdict for. NO high-cardinality labels (`policy_id` / `artifact_id` forbidden). |
 | `hort_policy_reevaluation_population` | gauge | (none) | artifacts | set once at the completion of a `policy-reevaluation` pass to the in-scope population it walked (loosen + tighten); the **completeness** signal — a partial pass (loosen-list truncation, a tighten-page read failure) reports the population it actually walked, so a population/counter gap is observable rather than silent |
 | `hort_policy_reevaluation_enqueue_failed_total` | counter | (none) | — | incremented when a gate-affecting policy mutation committed but its async `policy-reevaluation` pass failed to enqueue (the best-effort enqueue swallowed the error so the mutation still succeeds). The **alertable signal that a pass never ran** — the `_artifacts_total` / `_population` metrics emit only at pass completion, so a swallowed enqueue is otherwise invisible. For a TIGHTEN, the now-non-compliant population stays downloadable until a later gate-affecting mutation re-enqueues or the operator re-applies the policy; alert on a non-zero rate. Bare counter (no labels — the failed `policy_id` / `trigger` is on the warn-level log line). |
-| `hort_patch_candidates_listed_total` | counter | `repository`, `result` | — | `repository ∈ {"_all", <key>}` for v1: `_all` for admin-wide scope (no `?repository` filter), the resolved repository key when the handler successfully resolved `?repository=<key>` to a row. `"unknown"` is reserved for future non-HTTP / dispatcher paths — the HTTP handler short-circuits to 404 on lookup failure before reaching the use case. `result ∈ {ok, denied, invalid, error}` |
+| `hort_patch_candidates_listed_total` | counter | `repository`, `result` | — | `repository ∈ {"_all", <key>}` for v1: `_all` for an unscoped read (no `?repository` filter), the resolved repository key when the handler successfully resolved `?repository=<key>` to a row. `"unknown"` is reserved for future non-HTTP / dispatcher paths — the HTTP handler short-circuits to 404 on lookup failure before reaching the use case. `result ∈ {ok, denied, invalid, error}` |
 
 Source of truth for the result enums:
 - `hort_app::metrics::TriggerSourceLabel` for `hort_scan_jobs_enqueued_total.trigger_source`. Mirrors `hort_domain::ports::jobs_repository::TriggerSource` (the SQL wire form). The two MUST agree — a drift is enforced as a compile-equality test.
@@ -3311,22 +3319,26 @@ gate; the counter and histogram below are the operator-visible
 breakdown.
 
 **`hort_patch_candidates_listed_total` result semantics** (closed
-taxonomy of 4; one emission per admin call to
+taxonomy of 4; one emission per call to
 [`PatchCandidateUseCase::list`](../crates/hort-app/src/use_cases/patch_candidate_use_case.rs).
 The `repository` label is the resolved repository key when the HTTP
 handler successfully looked up `?repository=<key>` via
 `RepositoryRepository::find_by_key` and threaded it onto
 `PatchCandidateFilter::repository_key_for_metric`, or the `_all`
-sentinel when the request had no `?repository` filter (admin-wide
-scope). `"unknown"` is reserved for future non-HTTP / dispatcher
+sentinel when the request had no `?repository` filter (unscoped — every
+repository). `"unknown"` is reserved for future non-HTTP / dispatcher
 callers — the HTTP handler short-circuits to 404 on lookup failure
 before invoking the use case, so the use-case-side metric only ever
-sees `_all` or a resolved key in v1):
+sees `_all` or a resolved key in v1. The taxonomy carries no authority
+dimension: a curator call and an admin call are indistinguishable in
+these labels, and the deny leg that produced a `denied` tick is on the
+log line, not the series):
 
-- `ok` — admin call succeeded; repo returned a `Vec<PatchCandidate>`
+- `ok` — the call succeeded; repo returned a `Vec<PatchCandidate>`
   (possibly empty). Emitted on the success path after the audit log
   fires.
-- `denied` — `require_admin()` rejected the caller. Emitted *before*
+- `denied` — `require_curate_or_admin()` rejected the caller: neither
+  `Permission::Curate` nor `Permission::Admin`. Emitted *before*
   the early return so dashboards count attempted-but-forbidden
   invocations distinctly from input-validation failures. Repo is
   never called.
@@ -3596,7 +3608,7 @@ and a future direct-invoke path stay representable. Cardinality: 3 values.
   allowed-unsigned `no_attestation` no-op. The hold is **indefinite**
   (ADR 0039 D4): the window is not a signing deadline, and the only exits
   are a signature (directly or via the §11 cascade) or an operator
-  authority — admin release, curator waiver, deletion. Watch the standing
+  authority — a curator waiver or deletion. Watch the standing
   population via the projection surface (the admin curation queue today;
   retention's overview once it exists) — this counter counts verify
   *events*, not the standing population.
@@ -3952,8 +3964,8 @@ same change (architect anti-pattern checklist).
 **`decision` semantics** (closed taxonomy of 5):
 
 - `waive` — `CurationUseCase::waive`. Curator-driven release
-  of a quarantined or held artifact, mirroring `admin_release`. One
-  tick per call.
+  of a quarantined or held artifact — the manual release authority
+  (ADR 0007). One tick per call.
 - `block` — `CurationUseCase::block`. Curator-driven
   rejection. For `BlockTarget::Artifact` emits one tick per call; for
   `BlockTarget::VersionList` (continue-on-error)
@@ -4113,7 +4125,7 @@ emit nothing):
   `quarantined`; GC-protected, not evaluated.
 - `skipped_rejected` — the artifact is `rejected` or
   `scan_indeterminate` (evidence / terminal-failure); content stays
-  until manual admin override, not evaluated.
+  until a curator decision or deletion, not evaluated.
 - `error` — a port read (`read_stream` / `list_findings` /
   `append_expired`) failed for this pair. The sweep records it and
   continues with the next pair (one bad row never aborts the pass;

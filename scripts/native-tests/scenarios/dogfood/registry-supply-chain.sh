@@ -12,7 +12,7 @@
 #   (a) Anonymous pull from crates-proxy → 401/403/404 (private, not anonymously readable).
 #   (b) Authenticated pull from crates-proxy → triggers ingest, returns 503 + Retry-After
 #       while the artifact is quarantined.
-#   (c) Admin-release the quarantined artifact → re-pull succeeds (200 download).
+#   (c) Waive the quarantined artifact as curator → re-pull succeeds (200 download).
 #   (d) Anonymous pull of hort-oci repository probe → succeeds (public).
 #   (e) cargo publish a tiny test crate to hort-crates (admin token), then
 #       anonymous fetch → succeeds (public hosted, quarantineDuration: 0s).
@@ -246,9 +246,13 @@ warm_and_release_via_proxy() {
 
     [ -n "$artifact_id" ] || return 0
 
-    # Release via admin API (POST /api/v1/admin/quarantine/<id>/release).
+    # Release via the curation API
+    # (POST /api/v1/admin/curation/quarantine/<id>/waive) — the one
+    # manual release (ADR 0007, "One authority owns the manual
+    # release"). Gated by `Permission::Curate` OR `Permission::Admin`,
+    # so the Keycloak admin token fetched above passes unchanged.
     local release_url release_tmp release_code
-    release_url="${HORT_URL%/}/api/v1/admin/quarantine/${artifact_id}/release"
+    release_url="${HORT_URL%/}/api/v1/admin/curation/quarantine/${artifact_id}/waive"
     release_tmp="$(mktemp)"
     release_code="$(curl -sS -o "$release_tmp" -w '%{http_code}' --max-time 15 \
         -X POST "$release_url" \
@@ -260,10 +264,10 @@ warm_and_release_via_proxy() {
 
     case "$release_code" in
         200|204)
-            pass "${label} admin release call succeeded (HTTP ${release_code})"
+            pass "${label} curator waive call succeeded (HTTP ${release_code})"
             ;;
         *)
-            fail "${label} admin release expected 200/204" \
+            fail "${label} curator waive expected 200/204" \
                 "got HTTP ${release_code}; body: $(head -3 "$release_tmp" 2>/dev/null)"
             ;;
     esac
@@ -306,7 +310,7 @@ warm_and_release_via_proxy() {
 }
 
 log ""
-log "--- (b)+(c) Authenticated pull from crates-proxy -> quarantine -> admin release -> re-download"
+log "--- (b)+(c) Authenticated pull from crates-proxy -> quarantine -> curator waive -> re-download"
 
 # Use a well-known small crate with a pinned version to keep the test
 # deterministic. `serde` 1.0.100 is a stable, widely-cached leaf.

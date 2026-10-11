@@ -2,8 +2,12 @@
 //!
 //! Wire contract: `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`
 //! (`hort-http-core::handlers::admin::curation::waive`).
-//! Source-state guard is `Quarantined` only (curator does NOT clear
-//! `ScanIndeterminate` artifacts; admin authority only).
+//! Source states are `Quarantined`, `ScanIndeterminate` and — on the
+//! axes the curator owns (scan, curation, provenance) — `Rejected`. One
+//! authority owns the manual release, so the curator clears a stuck
+//! scanner and overrides a rejection it has the instrument to judge; a
+//! corruption tombstone is never reachable (ADR 0007, "One authority
+//! owns the manual release").
 //!
 //! The endpoint returns `200 OK` with no body on success; on
 //! continue-on-error / domain-state errors it returns 4xx with the

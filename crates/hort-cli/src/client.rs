@@ -181,8 +181,9 @@ impl AkClient {
 
     /// POST to `path` with `body` serialised as JSON; succeed on any 2xx
     /// without attempting to deserialise the response body. Used by
-    /// endpoints that return 204 No Content (e.g.
-    /// `POST /admin/quarantine/:artifact_id/release`).
+    /// endpoints that answer with an empty body (e.g.
+    /// `POST /admin/curation/quarantine/:artifact_id/waive`, which
+    /// answers 200 with nothing in it).
     ///
     /// On non-2xx, surfaces the same error shape as
     /// [`post`](Self::post): "HTTP <status>: <body text>".

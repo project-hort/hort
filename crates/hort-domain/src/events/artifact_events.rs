@@ -562,7 +562,13 @@ impl ArtifactReleased {
 pub enum ReleaseReason {
     /// Quarantine period expired (background sweep).
     Timer,
-    /// Admin explicitly released despite findings.
+    /// Admin explicitly released despite findings. **No path mints
+    /// this any more** — one authority owns the manual release and it
+    /// is the curator's (ADR 0007, "One authority owns the manual
+    /// release"); the reason stays in the vocabulary because the stream
+    /// is append-only (ADR 0002), historical events carry it, and
+    /// [`crate::entities::artifact::ReleaseOrigin::permits_scan_reblock`]
+    /// must keep honouring the decision behind one.
     Admin,
     /// Policy re-evaluation after exclusion removed the block.
     PolicyReEvaluation,
@@ -924,11 +930,14 @@ impl ProvenanceRejected {
 /// transitions the artifact to
 /// [`QuarantineStatus::Rejected`](crate::entities::artifact::QuarantineStatus::Rejected),
 /// reusing the existing vocabulary rather than introducing a fourth
-/// status value. The admin-release override
-/// (`POST /quarantine/:artifact_id/release`) provides the human-review
-/// escape hatch for false-positive corruption (e.g. operator restored
-/// the blob from a known-good backup). The policy-re-evaluation override
-/// path is N/A — no policy can resolve a content-hash divergence.
+/// status value. **No manual release withdraws it**: `Rejected` is not a
+/// source state for `Artifact::release`, and ADR 0007 records the
+/// corruption axis as the one a manual release never reaches even where
+/// the state allows one — bytes that disagree with the hash naming them
+/// make the curator's own instrument (this content hash against the
+/// publisher's release page) answer about content hort does not hold.
+/// The policy-re-evaluation override path is N/A for the same kind of
+/// reason — no policy can resolve a content-hash divergence.
 ///
 /// **No PII or admin actor.** The scrub is a system-initiated cron job;
 /// the actor on the persisted-event envelope is `Actor::Internal(System)`.
@@ -1075,9 +1084,19 @@ pub enum RejectionReason {
     /// **Not scan-clearable (ADR 0041 invariant #6(a)).** Bytes that do
     /// not match their content hash do not become servable because a scan
     /// later passed — there is nothing a scanner can observe that bears on
-    /// a hash mismatch at all. The admin-release override remains the
-    /// human-review escape hatch for a false positive (e.g. the operator
-    /// restored the blob from a known-good backup).
+    /// a hash mismatch at all.
+    ///
+    /// **And not overridable by a human either** — this is the one
+    /// rejection axis the manual release never reaches
+    /// ([`is_curator_overridable`](crate::entities::artifact::is_curator_overridable),
+    /// ADR 0007's axis boundary). The out-of-band comparison a curator can
+    /// perform — this content hash against the publisher's release page —
+    /// confirms nothing here, because the bytes hort holds are by
+    /// definition not the bytes that hash names, and the storage adapters'
+    /// `VerifyingReader` fails the read regardless (ADR 0003's
+    /// read-verification amendment). An override would not be a risky
+    /// decision but a meaningless one. Recovering a false positive means
+    /// re-ingesting the restored blob.
     Corruption,
 }
 

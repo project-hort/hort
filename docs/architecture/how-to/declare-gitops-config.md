@@ -1865,10 +1865,16 @@ the rule are walked and re-evaluated.
 
 **Asymmetric semantics — this is not optional.** Rule **deletion**
 or **weakening** (Block → Warn → Allow) does NOT auto-unblock
-artifacts that were retroactively rejected. Rejection is sticky;
-admin explicit release via `POST /quarantine/:artifact_id/release`
-is the only way to un-reject (architect-skill quarantine invariant
-3, mirroring scan-driven rejection). The smoke at
+artifacts that were retroactively rejected. Nothing *automatic* reverses
+a rejection: the rule change applies to what is evaluated after it, and
+the already-rejected artifacts stay rejected until a human decides
+otherwise. What a human may do is the curator's manual release, which as
+of ADR 0007's 2026-10-11 amendment reaches a `curation_retroactive`
+rejection — the curator owns that axis, so an authority that may block
+may unblock — with attribution and a justification on the event. A
+corruption tombstone is never reachable that way (architect-skill
+quarantine invariant
+3). The smoke at
 `scripts/host-tests/test-gitops-policies.sh` phase 6c asserts
 this explicitly — a Block→Allow rewrite must produce zero
 `curation_retroactive` metric ticks AND leave previously-rejected

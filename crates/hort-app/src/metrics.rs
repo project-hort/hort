@@ -1,8 +1,13 @@
-//! # hort-app::metrics — label names, value constants, result enums
+//! # hort-app::metrics — label names, value constants, result enums, emitters
 //!
-//! This module owns the metric label names and result enum taxonomies emitted
-//! by the application (use case) layer. It intentionally contains no emission
-//! code — only canonical string constants and enums.
+//! This module owns the metric vocabulary of the application (use case)
+//! layer — the label names, the enumerable label-value constants and the
+//! result enum taxonomies — *and* the `emit_*` functions that spell it.
+//! Keeping both here is what makes each metric name a single literal in the
+//! workspace: a use case calls the emitter, so a typo cannot fork a series,
+//! and an emitter shared by several use cases (`emit_release`, ticked by the
+//! timer, curator and re-evaluation release paths) needs no `pub(crate)`
+//! reach into a sibling module.
 //!
 //! The canonical metric catalog lives at `docs/metrics-catalog.md`. Every
 //! string in this module corresponds to a row in that catalog. A new metric
@@ -207,9 +212,21 @@ pub mod values {
 
     /// Quarantine-release reason: timer-driven expiry.
     pub const REASON_TIMER: &str = "timer";
-    /// Quarantine-release reason: administrator action.
+    /// Quarantine-release reason: the curator's manual release
+    /// (`CurationUseCase::waive`) — the one manual release surface
+    /// (ADR 0007, "One authority owns the manual release").
+    pub const REASON_CURATOR: &str = "curator";
+    /// Quarantine-release reason: administrator action. **Retired — no
+    /// production path emits it.** The admin release route was removed
+    /// when the curator became the single manual-release authority; the
+    /// constant stays so the catalog and this module still recognise
+    /// the label value on series recorded before that (mirrors the
+    /// catalog's retired-value convention).
     pub const REASON_ADMIN: &str = "admin";
-    /// Quarantine-release reason: policy re-evaluation after an exclusion.
+    /// Quarantine-release reason: the scan-policy re-evaluation release
+    /// (`PolicyUseCase::commit_re_evaluation`), which appends
+    /// `ArtifactReleased { PolicyReEvaluation }` and ticks
+    /// `hort_quarantine_released_total` once per released artifact.
     pub const REASON_POLICY_RE_EVALUATION: &str = "policy_re_evaluation";
 
     /// Sentinel emitted for the `repository` label when
@@ -3245,6 +3262,36 @@ pub fn emit_curation_decision(
     .increment(1);
 }
 
+// ---------------------------------------------------------------------------
+// Quarantine release counter
+// ---------------------------------------------------------------------------
+
+/// Emit `hort_quarantine_released_total` with the given reason.
+///
+/// The counter is about releases, not about any one use case, so the
+/// three authorities that release an artifact share this emitter: the
+/// timer paths in `QuarantineUseCase` tick it with
+/// [`values::REASON_TIMER`], the one manual release
+/// (`CurationUseCase::waive`) with [`values::REASON_CURATOR`], and the
+/// scan-policy re-evaluation release
+/// (`PolicyUseCase::commit_re_evaluation`) with
+/// [`values::REASON_POLICY_RE_EVALUATION`]. One emitter, one
+/// metric-name literal — a second
+/// `metrics::counter!("hort_quarantine_released_total", …)` spelled at
+/// a call site is how a typo becomes a silently separate time series.
+///
+/// Every caller ticks **after** its append succeeds and **per released
+/// artifact**: a sweep that releases seven artifacts ticks seven times,
+/// and an attempt whose append lost its optimistic-concurrency race
+/// released nothing and ticks nothing.
+pub fn emit_release(reason: &'static str) {
+    metrics::counter!(
+        "hort_quarantine_released_total",
+        labels::REASON => reason,
+    )
+    .increment(1);
+}
+
 /// Per-ecosystem outcome label of `hort_advisory_diff_processed_total`.
 /// One emission per ecosystem per advisory-watch tick
 /// from inside the OSV adapter's bulk loop. Closed taxonomy of 4.
@@ -4393,6 +4440,11 @@ mod tests {
     #[test]
     fn value_reason_timer_is_timer() {
         assert_eq!(values::REASON_TIMER, "timer");
+    }
+
+    #[test]
+    fn value_reason_curator_is_curator() {
+        assert_eq!(values::REASON_CURATOR, "curator");
     }
 
     #[test]

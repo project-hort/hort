@@ -360,22 +360,20 @@ pub enum ReleaseAuthorization {
     /// `record` un-gates the scan axis, never the provenance or
     /// curation ones.
     ScanRecorded,
-    /// Admin explicitly released despite indeterminate/rejected/no-scan
-    /// state. Attribution is populated at the call site
-    /// (`released_by_user_id` + `justification` on the event).
-    AdminOverride,
     /// Post-exclusion policy re-evaluation removed the block (the
     /// existing `re_evaluate()` path; kept distinct so the predicate
     /// does not have to special-case `Rejected`).
     PolicyReEvaluation,
-    /// A curator (`Permission::Curate`) issued an
-    /// early release ("waive") of a quarantined artifact. Pairs ONLY
-    /// with [`ReleaseReason::Curator`] in the deny-by-default predicate;
-    /// the source-state guard is **narrower** than admin
-    /// (`Quarantined` only — `ScanIndeterminate` stays admin-only).
-    /// Attribution lives on the event (released-by user + justification),
-    /// not on the authorization tag, so the variant carries no inline
-    /// data.
+    /// A curator (`Permission::Curate`) issued a manual release
+    /// ("waive"). Pairs ONLY with [`ReleaseReason::Curator`] in the
+    /// deny-by-default predicate, and accepts `Quarantined` **and**
+    /// `ScanIndeterminate`: admin serves technical and operative
+    /// actions while the curator holds the domain's authority, so a
+    /// curator who may override findings a policy weighed may also act
+    /// where no verdict was reached at all (ADR 0007, "One authority
+    /// owns the manual release"). Attribution lives on the event
+    /// (released-by user + justification), not on the authorization
+    /// tag, so the variant carries no inline data.
     CuratorWaiver,
 }
 
@@ -753,8 +751,9 @@ impl Artifact {
     /// Accepts `Released` **iff `prior_release.permits_scan_reblock()`** —
     /// iff the artifact got there automatically. Rejects `Rejected`
     /// (terminal — the artifact is already blocked) and
-    /// `ScanIndeterminate` (its own terminal scan-failure state, admin-only
-    /// exit). (The `quarantineDuration: 0` permissive-mode contract — see
+    /// `ScanIndeterminate` (its own terminal scan-failure state, whose
+    /// only exit is an explicit manual release). (The
+    /// `quarantineDuration: 0` permissive-mode contract — see
     /// `docs/architecture/explanation/scanning-pipeline.md`.)
     ///
     /// # Why `Released` is conditional rather than refused outright
@@ -769,12 +768,25 @@ impl Artifact {
     /// that newly finds a CRITICAL in a timer-released artifact blocks
     /// it, and the same scan against an admin-released one does not.
     ///
-    /// The protection is **scan-axis-wide, not axis-wide**: curation can
-    /// still re-block a manually released artifact
+    /// What is outweighed is **a fresh scan's verdict under the policy
+    /// that stood when the human released** — not the scan axis as a
+    /// whole. Curation can still re-block a manually released artifact
     /// ([`Self::reject_from_retroactive_curation`] remains valid from
     /// `Released`), and so can the curator, the corruption tombstone and
-    /// a provenance disproof. Only a scan verdict is outweighed, because
-    /// a scan verdict is what the operator overrode.
+    /// a provenance disproof.
+    ///
+    /// And so can a **policy tighten**:
+    /// [`Self::reject_from_scan_policy_retroactive`] accepts `Released`
+    /// without consulting `prior_release` at all, by deliberate
+    /// asymmetry. A manual release accepts the findings *against the
+    /// standard in force at that moment*; tightening the policy is the
+    /// operator changing that standard, an act at least as deliberate as
+    /// the waiver, so the waiver does not carry forward to it. A second
+    /// scan under an unchanged policy is the case where nothing new was
+    /// decided and the human's judgement stands. The re-hold stays
+    /// correctable: `ScanPolicyRetroactive` is scan-clearable
+    /// ([`is_scan_clearable`]), so excluding the finding or
+    /// loosening the policy re-evaluates the artifact out of `Rejected`.
     ///
     /// `prior_release` is a **verified fact resolved by the application
     /// layer** from the artifact's own stream — the domain performs no
@@ -905,7 +917,8 @@ impl Artifact {
     /// - [`QuarantineStatus::Rejected`] — already blocked (idempotent skip;
     ///   a re-evaluation that finds it still-failing is a no-op).
     /// - [`QuarantineStatus::ScanIndeterminate`] — terminal scan-failure
-    ///   state (ADR 0007); admin-only exit, never re-held by a policy pass.
+    ///   state (ADR 0007); its exit is an explicit manual release, never
+    ///   a policy pass.
     pub fn reject_from_scan_policy_retroactive(
         &mut self,
         outcome: &ScanOutcome,
@@ -974,12 +987,17 @@ impl Artifact {
     ///   same convention `tombstone_from_corruption` and
     ///   `fail_scan_indeterminate` use for their idempotent-skip
     ///   branches).
-    /// - `ScanIndeterminate` — terminal scan-failure state (ADR 0007);
-    ///   admin-only exit. Only `None | Quarantined | Released` are
-    ///   accepted source states. Mirrors the
-    ///   curator-waive narrowing: curator authority is
-    ///   intentionally narrower than admin (clearing a stuck scanner
-    ///   stays admin-only on both the release and the block side).
+    /// - `ScanIndeterminate` — terminal scan-failure state (ADR 0007),
+    ///   whose only exit is an explicit manual release. Only
+    ///   `None | Quarantined | Released` are accepted source states.
+    ///   This is NOT a narrowing of curator authority against admin —
+    ///   the curator's manual *release* reaches `ScanIndeterminate`
+    ///   (ADR 0007, "One authority owns the manual release"). It is
+    ///   that a block there would decide nothing: `is_downloadable`
+    ///   already admits only `None | Released`, so a
+    ///   `ScanIndeterminate` artifact is withheld before any curator
+    ///   acts, and only the three non-terminal states have a download
+    ///   decision left to change.
     ///
     /// Emits `ArtifactRejected { rejected_by: Curator { curator_id },
     /// reason }`. The `reason` is the curator-supplied justification
@@ -1110,10 +1128,49 @@ impl Artifact {
         ])
     }
 
-    /// Release after quarantine period expires or by admin override.
-    /// Valid from `Quarantined` or `ScanIndeterminate` (the wide guard
-    /// lets an admin clear a
-    /// stuck-scanner artifact without a state dance).
+    /// Release after the quarantine period expires, or by a manual
+    /// decision. Valid from `Quarantined` or `ScanIndeterminate` for
+    /// every `(reason, authz)` pairing, the curator's included — the
+    /// wide guard is what lets a manual release clear a stuck-scanner
+    /// artifact without a state dance.
+    ///
+    /// # `Rejected` is a source state for the manual authority alone
+    ///
+    /// A recorded rejection is reachable only by
+    /// `(ReleaseReason::Curator, ReleaseAuthorization::CuratorWaiver)`,
+    /// and only on an axis [`is_curator_overridable`] admits. Two
+    /// conjuncts beyond the state check, both refused with
+    /// [`DomainError::InvalidState`] (409, ADR 0025 — an operator can POST
+    /// a waive against an artifact in any state, so both are
+    /// caller-reachable):
+    ///
+    /// 1. **The pairing.** `(Timer, …)` and
+    ///    `(PolicyReEvaluation, PolicyReEvaluation)` are refused from
+    ///    `Rejected` exactly as before this authority existed. An
+    ///    override is a human decision taken with the verdict in view;
+    ///    the timer sweep and the policy pass run unattended and must
+    ///    never acquire one. `Rejected`'s unattended exit is
+    ///    [`Self::re_evaluate`] and its ADR 0041 eligibility, untouched.
+    /// 2. **The axis.** `Corruption`, `Admin` and a `None` reason are
+    ///    refused, with the axis named in the message so the operator
+    ///    learns *why* and not merely *that* — see
+    ///    [`is_curator_overridable`] for each arm's reasoning.
+    ///
+    /// **The caller must have re-hydrated `rejection_reason` from the
+    /// stream before calling with a `Rejected` artifact** — the same
+    /// contract [`Self::re_evaluate`] carries, for the same reason: the
+    /// projection row does not persist the column (the Postgres mapper
+    /// hydrates it `None`), so the reason lives on the latest
+    /// [`ArtifactRejected`] and the application layer reads it from there
+    /// (`scan_history::last_rejection_reason`). An un-hydrated `None`
+    /// reads as the illegal reason-less state and is refused —
+    /// fail-closed, never fail-open.
+    ///
+    /// On a successful override `rejection_reason` returns to `None`: a
+    /// `Released` artifact carrying a stale rejection reason is an illegal
+    /// state, and the next policy pass would read it. Same clearing
+    /// [`Self::re_evaluate`] and
+    /// [`Self::repair_provenance_misrejection`] already perform.
     ///
     /// **Fail-closed predicate (ADR 0007).** The release is
     /// authorized only by an explicit, typed [`ReleaseAuthorization`]
@@ -1133,34 +1190,38 @@ impl Artifact {
     /// `justification = None`. The
     /// [`crate::events::ArtifactReleased::validate`] invariant requires
     /// `Admin` / `Curator` to carry both fields — the application
-    /// layer (`QuarantineUseCase::admin_release` /
-    /// `CurationUseCase::waive`) is responsible for populating them
-    /// from the verified `ApiActor` and the HTTP-supplied justification
-    /// before the event is appended. `release_expired` (timer sweep)
-    /// emits `Timer` and leaves both fields `None`, satisfying the
-    /// system-driven invariant.
+    /// layer (`CurationUseCase::waive`, the one manual release path) is
+    /// responsible for populating them from the verified `ApiActor` and
+    /// the HTTP-supplied justification before the event is appended.
+    /// `release_expired` (timer sweep) emits `Timer` and leaves both
+    /// fields `None`, satisfying the system-driven invariant.
+    /// [`ReleaseReason::Admin`] has no minting path left (ADR 0007,
+    /// "One authority owns the manual release") and its arm below is
+    /// unauthorized for every authority, but the validator still
+    /// governs the historical events that carry it.
     pub fn release(
         &mut self,
         reason: ReleaseReason,
         authz: ReleaseAuthorization,
         provenance: ProvenanceClearance,
     ) -> DomainResult<ArtifactReleased> {
-        // Source-state guard: releasable only from Quarantined or
-        // ScanIndeterminate. (Rejected exits via re_evaluate(); None/
-        // Released are not releasable.) The curator
-        // surface is **narrower**: a `(Curator, CuratorWaiver)`
-        // release accepts `Quarantined` ONLY. `ScanIndeterminate`
-        // stays admin-only — clearing a stuck scanner requires the
-        // broader admin authority.
-        let release_event = match (&reason, authz) {
-            (ReleaseReason::Curator, ReleaseAuthorization::CuratorWaiver) => {
-                QuarantineEvent::ReleaseCuratorWaiver
-            }
-            _ => QuarantineEvent::ReleaseGeneral,
-        };
-        let source_state_ok =
-            quarantine_transitions::allowed_targets(release_event, self.quarantine_status)
-                .is_some();
+        // Source-state guard: Quarantined, ScanIndeterminate and
+        // Rejected. (None/Released have nothing to release.) One event
+        // covers every `(reason, authz)` pairing, the curator's
+        // included: one authority owns the manual release, and what it
+        // requires is the source state rather than a second permission
+        // tier — a curator trusted to decide with a verdict in view is
+        // not the weaker authority for the stuck-scanner case, where
+        // there is no verdict to see (ADR 0007, "One authority owns the
+        // manual release"). Which authorities may trigger it is the
+        // table row's `required_triggers`, enforced at the
+        // authorization step below and — for `Rejected` — at the two
+        // conjuncts immediately after this guard.
+        let source_state_ok = quarantine_transitions::allowed_targets(
+            QuarantineEvent::Release,
+            self.quarantine_status,
+        )
+        .is_some();
         if !source_state_ok {
             // Caller-reachable state precondition (an operator can POST
             // release/waive against an artifact in any state) → InvalidState
@@ -1171,28 +1232,86 @@ impl Artifact {
             )));
         }
 
+        // `Rejected` is reachable by the MANUAL authority alone, and only
+        // on an axis the curator's instrument reaches (ADR 0007, "The axis
+        // boundary for a `Rejected` artifact"). Both conjuncts are
+        // caller-reachable state preconditions → InvalidState (409), never
+        // Invariant (500).
+        if self.quarantine_status == QuarantineStatus::Rejected {
+            // (1) The pairing. The timer sweep and the policy pass run
+            // unattended; an override of a recorded verdict is a human
+            // decision taken with that verdict in view, so they are
+            // refused here exactly as the source-state guard refused
+            // them before `Rejected` became a release source state at
+            // all. `Rejected`'s unattended exit stays `re_evaluate`.
+            if !matches!(
+                (&reason, authz),
+                (ReleaseReason::Curator, ReleaseAuthorization::CuratorWaiver)
+            ) {
+                return Err(DomainError::InvalidState(format!(
+                    "cannot release artifact in state {}: only a curator's manual waive \
+                     overrides a recorded rejection — ({reason:?}, {authz:?}) is an \
+                     unattended authority, and the unattended exit from a rejection is \
+                     a re-judgement of the evidence (ADR 0041 invariant #6), not an \
+                     override",
+                    self.quarantine_status
+                )));
+            }
+            // (2) The axis. `rejection_reason` is the reason the
+            // aggregate already holds — re-hydrated from the latest
+            // `ArtifactRejected` by the caller, exactly as
+            // `re_evaluate`'s eligibility guard requires (the projection
+            // row does not persist the column). No stream read here: the
+            // domain stays pure.
+            if !is_curator_overridable(self.rejection_reason.as_ref()) {
+                // Name the axis, so the operator learns *why* rather than
+                // *that*. `wire_kind` is the same operator-facing
+                // discriminator the curation queue renders, so the
+                // message and the queue row agree.
+                let axis = match self.rejection_reason.as_ref() {
+                    Some(reason) => format!("a {} rejection", reason.wire_kind()),
+                    None => "a rejection with no recorded reason".to_string(),
+                };
+                return Err(DomainError::InvalidState(format!(
+                    "cannot release artifact in state {}: a curator's waive does not reach \
+                     {axis}. The waive reaches the scan, curation and provenance axes, \
+                     because on each of them the curator's own comparison — this content \
+                     hash against the publisher's release page — answers the question the \
+                     rejection asked. It cannot reach bytes that disagree with the hash \
+                     naming them (corruption: the comparison confirms nothing and the read \
+                     fails verification regardless, so recovery means re-ingesting the \
+                     restored blob), a rejection no production path mints (admin does not \
+                     make domain verdicts), or a rejection with no recorded reason at all",
+                    self.quarantine_status
+                )));
+            }
+        }
+
         // FAIL-CLOSED PREDICATE (ADR 0007). A timer-driven release
         // (ReleaseReason::Timer) is authorized ONLY by ScanSucceeded,
         // ScanCleared, ScanWaived or ScanRecorded (the four scan-axis
         // authorities: the scan found nothing / the scan's verdict
         // permitted what it found / the operator waived scanning / the
         // operator declared the verdict non-gating).
-        // AdminOverride / PolicyReEvaluation / CuratorWaiver
-        // are operator / system / curator authorities and pair with
+        // PolicyReEvaluation / CuratorWaiver
+        // are system / curator authorities and pair with
         // their own ReleaseReason.
         // A computed deadline `<= now()` alone is NOT a release
         // authority — the window is never read here; expiry is the
         // sweep's *candidacy* signal, not its *authorization*.
         // The `(Curator, CuratorWaiver)` pair is
-        // the single allow row for the curator-waive surface; every
-        // other cross pair involving either variant is denied
-        // (deny-by-default preserved).
+        // the single allow row for the whole manual-release surface;
+        // every other cross pair involving either variant is denied
+        // (deny-by-default preserved). `ReleaseReason::Admin` has no
+        // allow row at all: no path mints it any more, and the arm
+        // below keeps it denied rather than deleting a reason the
+        // append-only stream still carries (ADR 0002).
         // ADR 0027: the timer arm carries a provenance
         // AND-precondition. A
         // `(Timer, ScanSucceeded|ScanCleared|ScanWaived|ScanRecorded)` release
         // is authorized only when `provenance ∈ {NotRequired, Cleared}` —
         // a `Pending` (Required mode, not yet a `ProvenanceVerified`)
-        // candidate stays quarantined (fail-closed). The Admin / Curator /
+        // candidate stays quarantined (fail-closed). The Curator /
         // PolicyReEval arms IGNORE the provenance param — explicit
         // overrides are never blocked by provenance (the AND-precondition
         // is on the timer arm only, never a new `ReleaseAuthorization`).
@@ -1219,7 +1338,10 @@ impl Artifact {
             // still stays quarantined.
             (ReleaseReason::Timer, ReleaseAuthorization::ScanRecorded) => provenance_clears_timer,
             (ReleaseReason::Timer, _) => false,
-            (ReleaseReason::Admin, ReleaseAuthorization::AdminOverride) => true,
+            // No authority pairs with `Admin`. The reason stays in the
+            // vocabulary because the stream is append-only and past
+            // releases carry it; minting a new one is what this arm
+            // refuses.
             (ReleaseReason::Admin, _) => false,
             (ReleaseReason::PolicyReEvaluation, ReleaseAuthorization::PolicyReEvaluation) => true,
             (ReleaseReason::PolicyReEvaluation, _) => false,
@@ -1239,6 +1361,14 @@ impl Artifact {
         }
 
         self.quarantine_status = QuarantineStatus::Released;
+        // A `Released` artifact carrying a rejection reason is an illegal
+        // state: the column feeds the eligibility guards, and the next
+        // policy pass would read it as a live rejection. Cleared
+        // unconditionally rather than only on the override arm — the
+        // assignment states the invariant instead of relying on the
+        // field's incoming value, exactly as `re_evaluate` and
+        // `repair_provenance_misrejection` do.
+        self.rejection_reason = None;
         Ok(ArtifactReleased {
             artifact_id: self.id,
             released_by: reason,
@@ -1856,11 +1986,16 @@ impl Artifact {
 /// storage backend returns and reports what it finds *in* them, which says
 /// nothing about whether they are the bytes this artifact's content hash
 /// names. A clean verdict over corrupt bytes is a clean verdict over
-/// somebody else's content. The escape hatch for a false positive is the
-/// admin release (e.g. the operator restored the blob from a known-good
-/// backup), not a re-scan. Before the corruption axis had a variant this
-/// refusal happened by accident — the column was left `None`, and `None`
-/// already fails here; it is now stated rather than inherited.
+/// somebody else's content. **No manual release reaches it either** — see
+/// [`is_curator_overridable`], which refuses it for a reason of its own:
+/// the out-of-band comparison a curator can perform confirms nothing about
+/// bytes that disagree with the hash naming them, and the storage
+/// adapters' `VerifyingReader` fails the read regardless (ADR 0003's
+/// read-verification amendment). Recovering a false positive
+/// means re-ingesting the restored blob, not clearing a flag. Before the
+/// corruption axis had a variant this refusal happened by accident — the
+/// column was left `None`, and `None` already fails here; it is now stated
+/// rather than inherited.
 pub fn is_scan_clearable(reason: Option<&RejectionReason>) -> bool {
     match reason {
         Some(RejectionReason::Scanner) | Some(RejectionReason::ScanPolicyRetroactive) => true,
@@ -1870,6 +2005,102 @@ pub fn is_scan_clearable(reason: Option<&RejectionReason>) -> bool {
         | Some(RejectionReason::Provenance)
         | Some(RejectionReason::Corruption)
         | None => false,
+    }
+}
+
+/// May a human on the **curation axis** override this rejection — i.e.
+/// does the one manual release ([`Artifact::release`] under
+/// `(ReleaseReason::Curator, ReleaseAuthorization::CuratorWaiver)`) reach
+/// the axis the artifact was rejected on (ADR 0007, "One authority owns
+/// the manual release", subsection "The axis boundary for a `Rejected`
+/// artifact")?
+///
+/// # A sibling of [`is_scan_clearable`], never a widening of it
+///
+/// The two answer different questions. [`is_scan_clearable`] asks *"can a
+/// re-judgement of the evidence clear this?"* and is consulted by
+/// [`Artifact::re_evaluate`], which runs **unattended** off a policy pass.
+/// This one asks *"may a human on the curation axis override this?"*.
+/// Widening `is_scan_clearable` to cover the curator's reach would let a
+/// *policy re-evaluation* silently clear a curator's own block and a
+/// provenance disproof — exactly what ADR 0041's invariant #6(a) forbids:
+/// a forged signature does not become acceptable because a scan later
+/// passed, and nothing a scan observes bears on a curation decision. A
+/// curator's override is not a re-judgement of the evidence, so it gets
+/// its own predicate and `is_scan_clearable` keeps its narrow answer.
+///
+/// Both matches are exhaustive and **wildcard-free**, so an eighth
+/// [`RejectionReason`] is a compile error in both and has to be
+/// classified on each axis deliberately.
+///
+/// # Why the scan and curation axes are in
+///
+/// Both are verdicts about findings, and a curator is the authority
+/// trusted to weigh findings: `Scanner` / `ScanPolicyRetroactive` are the
+/// scanner's and the policy's reading of them, `Curator` /
+/// `CurationRetroactive` are a curator's own and a curation rule's. An
+/// authority that may block may unblock; without this the curator could
+/// block and never undo it.
+///
+/// # Why `Provenance` is in
+///
+/// This is the arm a later reader will want to reverse, so the reasoning
+/// is here rather than in a commit message. What a curator verifies out of
+/// band — **this content hash against the publisher's own release page** —
+/// answers exactly the question a signature answers, which is attribution.
+/// The instrument works in **both** directions, and that is what makes it
+/// an instrument rather than a loophole:
+///
+/// - A third party who attached a broken signature to a *genuine*
+///   artifact leaves the bytes genuine, and the comparison confirms them.
+///   That case is an availability gap today, not a risk.
+/// - An attacker who modified the artifact and signed it with their own
+///   key fails that same comparison, so the curator does not override.
+///
+/// The artifact is already *identified* — by its content hash, and on a
+/// pull-through path by a verified upstream checksum (ADR 0006). What
+/// provenance adds is attribution, and the comparison above is precisely
+/// the information a "a curator can hold nothing relevant here" premise
+/// claimed could not exist.
+///
+/// # Why `Corruption` is out, permanently
+///
+/// The stored bytes do not match the content hash naming them. So
+/// whatever the publisher attests, the bytes hort holds are **not those
+/// bytes**: the curator's comparison can confirm nothing, and the storage
+/// adapters' `VerifyingReader` fails the read regardless (ADR 0003's
+/// read-verification amendment). That is the difference between a risky
+/// override and a meaningless one — refused permanently, not pending a
+/// mechanism. Recovering a false positive means re-ingesting the restored
+/// blob.
+///
+/// # Why `Admin` is out
+///
+/// Not a severity judgement: no production path mints
+/// [`RejectionReason::Admin`] at all (every construction in the tree is
+/// inside a `#[cfg(test)]` module), which is the enum-level statement of
+/// the same decision ADR 0007 records on the release side — **admin does
+/// not make domain verdicts**. There is no admin rejection in the field to
+/// override, so this predicate adds no path to one. The variant stays in
+/// the vocabulary because the stream is append-only (ADR 0002).
+///
+/// # Why `None` is out
+///
+/// A `Rejected` artifact with no recorded reason is the illegal state ADR
+/// 0039's 2026-09-12 amendment (D6) names — a terminal status with nothing
+/// on the stream to audit it by — not an open door. Its corrective exit is
+/// [`Artifact::repair_provenance_misrejection`], which proves the stream
+/// contradicts the rejection before undoing it; a release that guessed
+/// from an absent reason would override whatever axis actually condemned
+/// the artifact.
+pub fn is_curator_overridable(reason: Option<&RejectionReason>) -> bool {
+    match reason {
+        Some(RejectionReason::Scanner)
+        | Some(RejectionReason::ScanPolicyRetroactive)
+        | Some(RejectionReason::Curator { .. })
+        | Some(RejectionReason::CurationRetroactive { .. })
+        | Some(RejectionReason::Provenance) => true,
+        Some(RejectionReason::Admin) | Some(RejectionReason::Corruption) | None => false,
     }
 }
 
@@ -2259,7 +2490,7 @@ mod tests {
     /// decision outweighs every later scan verdict — and the refusal
     /// must not mutate, so the caller can still record the findings.
     #[test]
-    fn reject_from_scan_refuses_an_admin_released_artifact() {
+    fn reject_from_scan_refuses_an_artifact_released_by_admin() {
         let mut a = released_artifact();
         let err = a
             .reject_from_scan(
@@ -2295,11 +2526,57 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
     }
 
+    /// A release an admin granted before the one-authority amendment
+    /// (ADR 0007) is still on the stream, and the stream is append-only
+    /// (ADR 0002): reading it back must still resolve a **manual**
+    /// release and must still refuse a later scan verdict. This goes
+    /// through serde deliberately — the event-store adapter hands the
+    /// application layer a `DomainEvent` deserialised from the stored
+    /// payload, so the wire form of `released_by` is the thing a future
+    /// change could break, not the enum arm. `ReleaseReason::Admin` has
+    /// no minting path left; what this pins is the reading.
+    #[test]
+    fn a_historical_release_by_admin_read_back_from_a_stream_still_refuses_a_scan_reblock() {
+        let artifact_id = Uuid::from_u128(0xAD);
+        let user_id = Uuid::from_u128(0xBEEF);
+        // Byte-for-byte the payload the adapter stored for an
+        // admin-granted release: externally-tagged `DomainEvent`, with
+        // `released_by` as the bare variant name.
+        let stored = serde_json::json!({
+            "ArtifactReleased": {
+                "artifact_id": artifact_id,
+                "released_by": "Admin",
+                "released_by_user_id": user_id,
+                "justification": "CVE-2026-0005 accepted after manual review",
+            }
+        });
+        let decoded: DomainEvent =
+            serde_json::from_value(stored).expect("a stored admin release still decodes");
+        let DomainEvent::ArtifactReleased(event) = decoded else {
+            panic!("expected ArtifactReleased, got {decoded:?}")
+        };
+        assert_eq!(event.released_by, ReleaseReason::Admin);
+        event
+            .validate()
+            .expect("the historical event still satisfies its own variant invariant");
+
+        // Resolved as a manual release: the scan axis may not re-block it.
+        let origin = ReleaseOrigin::Released(event.released_by);
+        assert!(!origin.permits_scan_reblock());
+
+        let mut a = released_artifact();
+        let err = a
+            .reject_from_scan("CVE-2026-0006".into(), origin)
+            .expect_err("a release an admin granted outweighs a later scan verdict");
+        assert!(matches!(err, DomainError::Invariant(_)));
+        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+    }
+
     /// The protection is scan-axis-wide, not axis-wide: curation still
     /// re-blocks a manually released artifact. Pinned here beside the
     /// scan-axis refusal so the asymmetry cannot be "tidied up".
     #[test]
-    fn retroactive_curation_still_re_blocks_an_admin_released_artifact() {
+    fn retroactive_curation_still_re_blocks_an_artifact_released_by_admin() {
         let mut a = released_artifact();
         a.reject_from_retroactive_curation(Uuid::from_u128(0xC0), "curation hit".into())
             .expect("curation keeps its ability to re-block a manually released artifact");
@@ -2327,7 +2604,8 @@ mod tests {
     }
 
     /// `ScanIndeterminate` keeps today's behaviour too: its own terminal
-    /// scan-failure state, admin-only exit (ADR 0007).
+    /// scan-failure state, exited only by an explicit manual release
+    /// (ADR 0007).
     #[test]
     fn reject_from_scan_from_scan_indeterminate_fails() {
         let mut a = sample_artifact();
@@ -2473,10 +2751,12 @@ mod tests {
     //   None | Quarantined | Released → Rejected (any non-terminal state).
     //   Rejected → DomainError::Invariant (the use-case layer treats
     //   this as an idempotent no-op short-circuit).
-    // ScanIndeterminate is a TERMINAL scan-failure state (ADR 0007;
-    // admin-only exit — curator authority is narrower) and is
-    // therefore NOT a valid block_by_curator source state: only the
-    // three non-terminal states are accepted.
+    // ScanIndeterminate is a TERMINAL scan-failure state (ADR 0007) and
+    // is therefore NOT a valid block_by_curator source state: only the
+    // three non-terminal states are accepted. Not a narrowing against
+    // admin — the curator's manual release does reach it; a block
+    // there would simply decide nothing, since the state is already
+    // not downloadable.
 
     #[test]
     fn block_by_curator_from_none_succeeds() {
@@ -2542,12 +2822,12 @@ mod tests {
     #[test]
     fn block_by_curator_from_scan_indeterminate_fails() {
         // ScanIndeterminate is a terminal scan-failure state
-        // (ADR 0007; admin-only exit); only
-        // None | Quarantined | Released are accepted source states.
-        // Mirrors the curator-waive surface: curator authority is
-        // **narrower** than admin — clearing a stuck scanner stays
-        // admin-only on the release side; symmetrically here the block
-        // side does not widen to ScanIndeterminate either.
+        // (ADR 0007); only None | Quarantined | Released are accepted
+        // source states. The curator's manual RELEASE does reach
+        // ScanIndeterminate (ADR 0007, "One authority owns the manual
+        // release"); the block side does not, because a block there
+        // changes no download decision — the state is already
+        // withheld.
         let mut a = scan_indeterminate_artifact();
         let result = a.block_by_curator(Uuid::new_v4(), "should not block".into());
         assert!(matches!(result, Err(DomainError::Invariant(_))));
@@ -2741,22 +3021,6 @@ mod tests {
     }
 
     #[test]
-    fn release_from_scan_indeterminate_admin_override_succeeds() {
-        // The widened source-state guard: an admin can clear a
-        // stuck-scanner artifact directly from ScanIndeterminate.
-        let mut a = scan_indeterminate_artifact();
-        let event = a
-            .release(
-                ReleaseReason::Admin,
-                ReleaseAuthorization::AdminOverride,
-                ProvenanceClearance::NotRequired,
-            )
-            .unwrap();
-        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
-        assert_eq!(event.released_by, ReleaseReason::Admin);
-    }
-
-    #[test]
     fn release_from_none_fails_source_state_guard() {
         let mut a = sample_artifact();
         assert!(matches!(
@@ -2775,26 +3039,315 @@ mod tests {
         let mut a = released_artifact();
         assert!(matches!(
             a.release(
-                ReleaseReason::Admin,
-                ReleaseAuthorization::AdminOverride,
+                ReleaseReason::Timer,
+                ReleaseAuthorization::ScanSucceeded,
                 ProvenanceClearance::NotRequired
             ),
             Err(DomainError::InvalidState(_))
         ));
     }
 
-    #[test]
-    fn release_from_rejected_fails_source_state_guard() {
-        // Rejected exits via re_evaluate(), never release().
+    // --- Rejected: the manual authority's own source state ----------------
+    //
+    // ADR 0007, "The axis boundary for a `Rejected` artifact". One test per
+    // admitted reason rather than a loop, so a predicate that only answers
+    // for the first one cannot pass the set. Each asserts the status moved,
+    // the event names the curator as the authority, and the rejection
+    // reason was cleared — a `Released` artifact carrying a stale reason is
+    // an illegal state the next policy pass would read. Attribution
+    // (`released_by_user_id` / `justification`) is the application layer's
+    // to populate, which `CurationUseCase::waive`'s own tests assert; the
+    // entity emits the skeleton with both `None`.
+
+    /// Build a `Rejected` artifact whose rejection reason is `reason` —
+    /// re-hydrated the way the application layer hydrates it from the
+    /// latest `ArtifactRejected` before calling in.
+    fn rejected_with(reason: Option<RejectionReason>) -> Artifact {
         let mut a = rejected_artifact();
-        assert!(matches!(
-            a.release(
-                ReleaseReason::PolicyReEvaluation,
-                ReleaseAuthorization::PolicyReEvaluation,
-                ProvenanceClearance::NotRequired
-            ),
-            Err(DomainError::InvalidState(_))
-        ));
+        a.rejection_reason = reason;
+        a
+    }
+
+    fn curator_waive(a: &mut Artifact) -> DomainResult<ArtifactReleased> {
+        a.release(
+            ReleaseReason::Curator,
+            ReleaseAuthorization::CuratorWaiver,
+            // The curator arm ignores the provenance param — an explicit
+            // override is never blocked by the provenance gate (ADR 0027;
+            // the AND-precondition is on the timer arm alone). `Pending`
+            // is passed deliberately, to prove it.
+            ProvenanceClearance::Pending,
+        )
+    }
+
+    fn assert_curator_override_succeeded(a: &Artifact, event: &ArtifactReleased) {
+        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+        assert_eq!(event.artifact_id, a.id);
+        assert_eq!(event.released_by, ReleaseReason::Curator);
+        assert_eq!(
+            a.rejection_reason, None,
+            "a successful override must clear the rejection reason — a Released \
+             artifact carrying one is an illegal state"
+        );
+    }
+
+    /// A scan rejection whose findings still block. Before this authority
+    /// existed it had **no** exit at all: `re_evaluate` clears a scan
+    /// rejection only when the re-judged evidence no longer blocks.
+    #[test]
+    fn release_from_rejected_curator_overrides_a_scanner_rejection() {
+        let mut a = rejected_with(Some(RejectionReason::Scanner));
+        let event = curator_waive(&mut a).expect("a curator may override a scan rejection");
+        assert_curator_override_succeeded(&a, &event);
+    }
+
+    /// A retroactive scan-policy tighten re-held the artifact (ADR 0041).
+    #[test]
+    fn release_from_rejected_curator_overrides_a_scan_policy_retroactive_rejection() {
+        let mut a = rejected_with(Some(RejectionReason::ScanPolicyRetroactive));
+        let event =
+            curator_waive(&mut a).expect("a curator may override a retroactive scan re-hold");
+        assert_curator_override_succeeded(&a, &event);
+    }
+
+    /// The case the whole unit exists for: a curator could block and could
+    /// not unblock. The blocking curator's id is on the rejection and a
+    /// different curator's release is equally admitted — the authority is
+    /// the role, not the individual.
+    #[test]
+    fn release_from_rejected_curator_overrides_a_curator_block() {
+        let blocking_curator = Uuid::from_u128(0xB10C);
+        let mut a = rejected_with(Some(RejectionReason::Curator {
+            curator_id: blocking_curator,
+        }));
+        let event = curator_waive(&mut a).expect("a curator may undo a curator's own block");
+        assert_curator_override_succeeded(&a, &event);
+    }
+
+    /// A retroactive curation rule matched during gitops apply.
+    #[test]
+    fn release_from_rejected_curator_overrides_a_retroactive_curation_rejection() {
+        let mut a = rejected_with(Some(RejectionReason::CurationRetroactive {
+            rule_id: Uuid::from_u128(0xEE),
+        }));
+        let event =
+            curator_waive(&mut a).expect("a curator may override a retroactive curation hit");
+        assert_curator_override_succeeded(&a, &event);
+    }
+
+    /// The arm a later reader will want to reverse. What the curator
+    /// verifies out of band — this content hash against the publisher's
+    /// release page — answers exactly the question a signature answers, in
+    /// both directions: a broken signature over genuine bytes is confirmed
+    /// by the comparison, and an attacker's own-key signature over modified
+    /// bytes fails it.
+    #[test]
+    fn release_from_rejected_curator_overrides_a_provenance_rejection() {
+        let mut a = rejected_with(Some(RejectionReason::Provenance));
+        let event = curator_waive(&mut a).expect("a curator may override a provenance disproof");
+        assert_curator_override_succeeded(&a, &event);
+    }
+
+    /// The corruption tombstone is the one axis the override never
+    /// reaches, and the refusal is a caller-reachable state precondition
+    /// (`InvalidState` → 409, ADR 0025) whose message names the axis.
+    #[test]
+    fn release_from_rejected_refuses_a_corruption_tombstone() {
+        let mut a = rejected_with(Some(RejectionReason::Corruption));
+        let err = curator_waive(&mut a).expect_err("corruption is never overridable");
+        let DomainError::InvalidState(msg) = &err else {
+            panic!("expected InvalidState (409), not {err:?} — an operator can POST a waive");
+        };
+        assert!(
+            msg.contains("corruption"),
+            "the refusal must name the axis so the operator learns why: {msg}"
+        );
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Corruption));
+    }
+
+    /// `RejectionReason::Admin` has no override arm, and not because an
+    /// admin rejection is graver: no production path mints one at all, so
+    /// there is nothing in the field to override. Admin does not make
+    /// domain verdicts.
+    #[test]
+    fn release_from_rejected_refuses_an_admin_rejection() {
+        let mut a = rejected_with(Some(RejectionReason::Admin));
+        let err = curator_waive(&mut a).expect_err("admin rejections get no override path");
+        let DomainError::InvalidState(msg) = &err else {
+            panic!("expected InvalidState (409), not {err:?}");
+        };
+        assert!(
+            msg.contains("admin"),
+            "the refusal must name the axis: {msg}"
+        );
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+    }
+
+    /// A `Rejected` artifact with no recorded reason is the illegal state
+    /// D6 names, not an open door — and it is also what an un-hydrated
+    /// `rejection_reason` looks like, so the refusal is what keeps the
+    /// guard fail-closed when a caller forgets to re-derive the reason.
+    #[test]
+    fn release_from_rejected_refuses_a_reason_less_rejection() {
+        let mut a = rejected_with(None);
+        let err = curator_waive(&mut a).expect_err("a reason-less rejection is not an open door");
+        let DomainError::InvalidState(msg) = &err else {
+            panic!("expected InvalidState (409), not {err:?}");
+        };
+        assert!(
+            msg.contains("no recorded reason"),
+            "the refusal must say what is missing: {msg}"
+        );
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+    }
+
+    /// The widening must not leak to the unattended arms: the timer sweep
+    /// and the policy re-evaluation still refuse `Rejected` for every
+    /// authority and **every overridable reason**, which is the version of
+    /// this sweep that can actually fail — a reason-less fixture would
+    /// pass it by accident. `Rejected`'s unattended exit stays
+    /// `re_evaluate` and its ADR 0041 eligibility.
+    #[test]
+    fn release_from_rejected_refuses_every_unattended_pairing() {
+        let overridable = [
+            RejectionReason::Scanner,
+            RejectionReason::ScanPolicyRetroactive,
+            RejectionReason::Curator {
+                curator_id: Uuid::from_u128(0xC0),
+            },
+            RejectionReason::CurationRetroactive {
+                rule_id: Uuid::from_u128(0xEE),
+            },
+            RejectionReason::Provenance,
+        ];
+        let unattended = [ReleaseReason::Timer, ReleaseReason::PolicyReEvaluation];
+        let authorities = [
+            ReleaseAuthorization::ScanSucceeded,
+            ReleaseAuthorization::ScanCleared,
+            ReleaseAuthorization::ScanWaived,
+            ReleaseAuthorization::ScanRecorded,
+            ReleaseAuthorization::PolicyReEvaluation,
+            ReleaseAuthorization::CuratorWaiver,
+        ];
+        for reason in &overridable {
+            assert!(
+                is_curator_overridable(Some(reason)),
+                "fixture guard: {reason:?} must be overridable, or this sweep passes \
+                 for the wrong reason"
+            );
+            for release_reason in unattended {
+                for authz in authorities {
+                    let mut a = rejected_with(Some(reason.clone()));
+                    let err = a
+                        .release(release_reason, authz, ProvenanceClearance::NotRequired)
+                        .expect_err("an unattended authority never overrides a rejection");
+                    assert!(
+                        matches!(err, DomainError::InvalidState(_)),
+                        "({release_reason:?}, {authz:?}) from Rejected({reason:?}) must be \
+                         InvalidState (409), got {err:?}"
+                    );
+                    assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+                    assert_eq!(a.rejection_reason.as_ref(), Some(reason));
+                }
+            }
+        }
+    }
+
+    /// `(Curator, …)` with the wrong authority token is refused at the
+    /// pairing conjunct too — the manual authority is the pair, not the
+    /// reason alone.
+    #[test]
+    fn release_from_rejected_refuses_a_curator_reason_without_the_waiver_authority() {
+        for authz in [
+            ReleaseAuthorization::ScanSucceeded,
+            ReleaseAuthorization::ScanCleared,
+            ReleaseAuthorization::ScanWaived,
+            ReleaseAuthorization::ScanRecorded,
+            ReleaseAuthorization::PolicyReEvaluation,
+        ] {
+            let mut a = rejected_with(Some(RejectionReason::Scanner));
+            let err = a
+                .release(
+                    ReleaseReason::Curator,
+                    authz,
+                    ProvenanceClearance::NotRequired,
+                )
+                .expect_err("only (Curator, CuratorWaiver) reaches a Rejected artifact");
+            assert!(
+                matches!(err, DomainError::InvalidState(_)),
+                "(Curator, {authz:?}) from Rejected must be InvalidState, got {err:?}"
+            );
+            assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        }
+    }
+
+    /// `ReleaseReason::Admin` still mints nothing, in the new source state
+    /// as in the old ones.
+    #[test]
+    fn release_from_rejected_refuses_the_retired_admin_reason() {
+        let mut a = rejected_with(Some(RejectionReason::Scanner));
+        let err = a
+            .release(
+                ReleaseReason::Admin,
+                ReleaseAuthorization::CuratorWaiver,
+                ProvenanceClearance::NotRequired,
+            )
+            .expect_err("no path mints an admin release");
+        assert!(matches!(err, DomainError::InvalidState(_)));
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+    }
+
+    /// `re_evaluate` is untouched by the override: a curator's own block
+    /// is still not scan-clearable, so an unattended policy pass cannot
+    /// clear it. This is the test that fails if someone "simplifies" the
+    /// unit by widening `is_scan_clearable` instead (ADR 0041 invariant
+    /// #6(a)).
+    #[test]
+    fn re_evaluate_still_refuses_a_curator_block_the_waive_can_override() {
+        let reason = RejectionReason::Curator {
+            curator_id: Uuid::from_u128(0xB10C),
+        };
+        assert!(
+            is_curator_overridable(Some(&reason)),
+            "the curator's waive reaches this reason"
+        );
+        assert!(
+            !is_scan_clearable(Some(&reason)),
+            "...and a scan re-judgement must still not"
+        );
+        let mut a = rejected_with(Some(reason.clone()));
+        a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+        let err = a
+            .re_evaluate(
+                Utc::now(),
+                ProvenanceClearance::NotRequired,
+                CurationClearance::Cleared,
+            )
+            .expect_err("a policy re-evaluation never clears a curator's block");
+        assert!(matches!(err, DomainError::Invariant(_)));
+        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(a.rejection_reason, Some(reason));
+    }
+
+    /// Same, for the provenance axis — ADR 0041 invariant #6(a) verbatim:
+    /// a forged signature does not become acceptable because a scan later
+    /// passed, even though a curator's out-of-band comparison may clear it.
+    #[test]
+    fn re_evaluate_still_refuses_a_provenance_rejection_the_waive_can_override() {
+        assert!(is_curator_overridable(Some(&RejectionReason::Provenance)));
+        assert!(!is_scan_clearable(Some(&RejectionReason::Provenance)));
+        let mut a = rejected_with(Some(RejectionReason::Provenance));
+        a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
+        let err = a
+            .re_evaluate(
+                Utc::now(),
+                ProvenanceClearance::Cleared,
+                CurationClearance::Cleared,
+            )
+            .expect_err("a scan re-judgement never clears a provenance disproof");
+        assert!(matches!(err, DomainError::Invariant(_)));
+        assert_eq!(a.rejection_reason, Some(RejectionReason::Provenance));
     }
 
     // --- Deny-by-default authorization predicate (every (reason,authz)) ---
@@ -2824,24 +3377,6 @@ mod tests {
     }
 
     #[test]
-    fn release_timer_admin_override_denied() {
-        // The fail-closed centerpiece: a timer must NEVER release on
-        // anything other than ScanSucceeded / ScanWaived. AdminOverride
-        // paired with a Timer reason is denied.
-        let mut a = quarantined_artifact();
-        let err = a
-            .release(
-                ReleaseReason::Timer,
-                ReleaseAuthorization::AdminOverride,
-                ProvenanceClearance::NotRequired,
-            )
-            .unwrap_err();
-        assert!(matches!(err, DomainError::Invariant(_)));
-        // State unchanged — the timer did NOT release it.
-        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
-    }
-
-    #[test]
     fn release_timer_policy_re_evaluation_denied() {
         let mut a = quarantined_artifact();
         assert!(matches!(
@@ -2855,16 +3390,37 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
     }
 
+    /// `ReleaseReason::Admin` has no allow row left: one authority owns
+    /// the manual release and it is the curator's (ADR 0007, "One
+    /// authority owns the manual release"). The reason stays in the
+    /// vocabulary because the stream is append-only (ADR 0002) and past
+    /// releases carry it — what went is the ability to mint one, and
+    /// this is the test that says so for *every* authority rather than
+    /// for the one token that used to pair with it.
     #[test]
-    fn release_admin_admin_override_authorized() {
-        let mut a = quarantined_artifact();
-        assert!(a
-            .release(
-                ReleaseReason::Admin,
-                ReleaseAuthorization::AdminOverride,
-                ProvenanceClearance::NotRequired
-            )
-            .is_ok());
+    fn release_admin_denied_for_every_authority() {
+        for authz in [
+            ReleaseAuthorization::ScanSucceeded,
+            ReleaseAuthorization::ScanCleared,
+            ReleaseAuthorization::ScanWaived,
+            ReleaseAuthorization::ScanRecorded,
+            ReleaseAuthorization::PolicyReEvaluation,
+            ReleaseAuthorization::CuratorWaiver,
+        ] {
+            let mut a = quarantined_artifact();
+            assert!(
+                matches!(
+                    a.release(
+                        ReleaseReason::Admin,
+                        authz,
+                        ProvenanceClearance::NotRequired
+                    ),
+                    Err(DomainError::Invariant(_))
+                ),
+                "(Admin, {authz:?}) must be denied — no path mints an admin release"
+            );
+            assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        }
     }
 
     #[test]
@@ -2945,19 +3501,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn release_policy_re_evaluation_admin_override_denied() {
-        let mut a = quarantined_artifact();
-        assert!(matches!(
-            a.release(
-                ReleaseReason::PolicyReEvaluation,
-                ReleaseAuthorization::AdminOverride,
-                ProvenanceClearance::NotRequired
-            ),
-            Err(DomainError::Invariant(_))
-        ));
-    }
-
     /// The quarantine window is NEVER read in `release()` — expiry is
     /// the sweep's *candidacy* signal, not its *authorization*. Proven
     /// by: an expired-window artifact with no scan authority is NOT
@@ -2972,7 +3515,7 @@ mod tests {
         let err = a
             .release(
                 ReleaseReason::Timer,
-                ReleaseAuthorization::AdminOverride,
+                ReleaseAuthorization::PolicyReEvaluation,
                 ProvenanceClearance::NotRequired,
             )
             .unwrap_err();
@@ -3003,7 +3546,7 @@ mod tests {
     // The timer arm carries a provenance AND-precondition:
     //   (Timer, ScanSucceeded|ScanWaived) && provenance in {NotRequired,Cleared} => release
     //   (Timer, ScanSucceeded|ScanWaived) && Pending => deny (stay quarantined)
-    // The Admin / Curator / PolicyReEval arms IGNORE the provenance param
+    // The Curator / PolicyReEval arms IGNORE the provenance param
     // (explicit overrides are unaffected — no new ReleaseAuthorization).
 
     /// `(Timer, ScanSucceeded, Pending)` is denied — a `Required`-mode
@@ -3099,24 +3642,10 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
     }
 
-    /// Admin override releases regardless of the provenance param — pass
-    /// `Pending` and confirm it still releases (the override arm ignores
-    /// provenance; explicit Admin/Curator/PolicyReEval releases are never
+    /// Curator waiver releases regardless of the provenance param — pass
+    /// `Pending` and confirm it still releases (the manual arm ignores
+    /// provenance; explicit Curator/PolicyReEval releases are never
     /// blocked by the provenance gate).
-    #[test]
-    fn release_admin_override_ignores_provenance_pending() {
-        let mut a = quarantined_artifact();
-        assert!(a
-            .release(
-                ReleaseReason::Admin,
-                ReleaseAuthorization::AdminOverride,
-                ProvenanceClearance::Pending,
-            )
-            .is_ok());
-        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
-    }
-
-    /// Curator waiver releases regardless of the provenance param.
     #[test]
     fn release_curator_waiver_ignores_provenance_pending() {
         let mut a = quarantined_artifact();
@@ -3157,8 +3686,8 @@ mod tests {
             ProvenanceClearance::Pending,
         ] {
             for authz in [
-                ReleaseAuthorization::AdminOverride,
                 ReleaseAuthorization::PolicyReEvaluation,
+                ReleaseAuthorization::CuratorWaiver,
             ] {
                 let mut a = quarantined_artifact();
                 assert!(
@@ -3354,7 +3883,7 @@ mod tests {
             assert!(matches!(
                 a.release(
                     ReleaseReason::Timer,
-                    ReleaseAuthorization::AdminOverride,
+                    ReleaseAuthorization::PolicyReEvaluation,
                     clearance,
                 ),
                 Err(DomainError::Invariant(_))
@@ -3728,10 +4257,10 @@ mod tests {
 
     // -- Curator + CuratorWaiver release pair -------------------------------
 
-    /// The curator-waive pair is the single allow row
-    /// for the curator variants. Mirrors the `(Admin, AdminOverride)` shape:
-    /// a curator-issued release transitions a `Quarantined` artifact to
-    /// `Released` via the explicit typed authorization token.
+    /// The curator-waive pair is the single allow row for the whole
+    /// manual-release surface: a curator-issued release transitions a
+    /// `Quarantined` artifact to `Released` via the explicit typed
+    /// authorization token.
     #[test]
     fn release_curator_curator_waiver_authorized() {
         let mut a = quarantined_artifact();
@@ -3745,8 +4274,8 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
         assert_eq!(event.artifact_id, a.id);
         assert_eq!(event.released_by, ReleaseReason::Curator);
-        // Attribution is populated by the application layer (the same
-        // pattern as admin_release). The entity
+        // Attribution is populated by the application layer
+        // (`CurationUseCase::waive`). The entity
         // emits the event with attribution fields `None`; the use case
         // is responsible for the released_by_user_id +
         // justification before the event is appended.
@@ -3772,9 +4301,11 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
     }
 
-    /// `(Admin, CuratorWaiver)` is denied: admin pairs ONLY
-    /// with `AdminOverride`. A curator waiver under the admin reason tag
-    /// is a mis-construction the deny-by-default predicate rejects.
+    /// `(Admin, CuratorWaiver)` is denied: a curator waiver under the
+    /// admin reason tag is a mis-construction the deny-by-default
+    /// predicate rejects. `Admin` pairs with nothing at all now, which
+    /// `release_admin_denied_for_every_authority` states in full; this
+    /// arm keeps the cross-pair census over the curator token complete.
     #[test]
     fn release_admin_curator_waiver_denied() {
         let mut a = quarantined_artifact();
@@ -3835,23 +4366,6 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
     }
 
-    /// `(Curator, AdminOverride)` is denied: admin override is
-    /// the admin authority's token; a curator-reason event must carry
-    /// `CuratorWaiver`, never `AdminOverride`.
-    #[test]
-    fn release_curator_admin_override_denied() {
-        let mut a = quarantined_artifact();
-        assert!(matches!(
-            a.release(
-                ReleaseReason::Curator,
-                ReleaseAuthorization::AdminOverride,
-                ProvenanceClearance::NotRequired
-            ),
-            Err(DomainError::Invariant(_))
-        ));
-        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
-    }
-
     /// `(Curator, PolicyReEvaluation)` is denied.
     #[test]
     fn release_curator_policy_re_evaluation_denied() {
@@ -3869,41 +4383,59 @@ mod tests {
 
     // --- Source-state guard for the curator pair ---
 
-    /// The curator surface is **narrower** than admin:
-    /// `CuratorWaiver` accepts source state `Quarantined` only.
-    /// `ScanIndeterminate` stays admin-only (clearing a stuck scanner
-    /// requires the broader admin authority).
+    /// The curator reaches the stuck-scanner state too: `CuratorWaiver`
+    /// accepts `Quarantined` **and** `ScanIndeterminate`, because one
+    /// authority owns the manual release and its requirement is the
+    /// source state, not a second permission tier (ADR 0007, "One
+    /// authority owns the manual release").
     #[test]
-    fn release_curator_curator_waiver_from_scan_indeterminate_denied() {
+    fn release_curator_curator_waiver_from_scan_indeterminate_succeeds() {
         let mut a = scan_indeterminate_artifact();
-        assert!(matches!(
-            a.release(
+        let event = a
+            .release(
                 ReleaseReason::Curator,
                 ReleaseAuthorization::CuratorWaiver,
-                ProvenanceClearance::NotRequired
-            ),
-            Err(DomainError::InvalidState(_))
-        ));
-        // State unchanged — the curator did NOT clear the stuck scanner.
-        assert_eq!(a.quarantine_status, QuarantineStatus::ScanIndeterminate);
+                ProvenanceClearance::NotRequired,
+            )
+            .expect("a curator may clear a stuck scanner");
+        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+        assert_eq!(event.released_by, ReleaseReason::Curator);
+        // The entity emits the attribution skeleton; `CurationUseCase::waive`
+        // populates both fields before the append (the `Curator` variant
+        // invariant requires them).
+        assert_eq!(event.released_by_user_id, None);
+        assert_eq!(event.justification, None);
     }
 
-    /// Curator cannot un-reject. `Rejected` is terminal:
-    /// neither curator-waive NOR `admin_release` exits it (both go through
-    /// this source-state guard). Only the finding-exclusion re-evaluation
-    /// path (`re_evaluate`) exits `Rejected`. See ADR 0025 / 0007.
+    /// `Rejected` **is** a curator-waive source state, on the axes the
+    /// curator's instrument reaches (ADR 0007's axis boundary). The
+    /// per-axis verdicts — five admitted, three refused with the axis
+    /// named — are in the "Rejected: the manual authority's own source
+    /// state" block above; this one pins only that the state itself is
+    /// reachable for the manual pairing and unreachable for the
+    /// unattended ones, so the two facts stay legible side by side with
+    /// the `None` / `Released` refusals below.
     #[test]
-    fn release_curator_curator_waiver_from_rejected_denied() {
+    fn release_curator_curator_waiver_from_rejected_is_the_override() {
         let mut a = rejected_artifact();
+        a.release(
+            ReleaseReason::Curator,
+            ReleaseAuthorization::CuratorWaiver,
+            ProvenanceClearance::NotRequired,
+        )
+        .expect("the scan-rejected fixture is on an overridable axis");
+        assert_eq!(a.quarantine_status, QuarantineStatus::Released);
+
+        let mut b = rejected_artifact();
         assert!(matches!(
-            a.release(
-                ReleaseReason::Curator,
-                ReleaseAuthorization::CuratorWaiver,
+            b.release(
+                ReleaseReason::PolicyReEvaluation,
+                ReleaseAuthorization::PolicyReEvaluation,
                 ProvenanceClearance::NotRequired
             ),
             Err(DomainError::InvalidState(_))
         ));
-        assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(b.quarantine_status, QuarantineStatus::Rejected);
     }
 
     /// `None` is not a curator-waive source state (nothing
@@ -4103,8 +4635,8 @@ mod tests {
         let mut a = quarantined_artifact();
         // No ScanSucceeded / ScanWaived authority is constructible.
         for authz in [
-            ReleaseAuthorization::AdminOverride,
             ReleaseAuthorization::PolicyReEvaluation,
+            ReleaseAuthorization::CuratorWaiver,
         ] {
             assert!(matches!(
                 a.release(
@@ -4118,15 +4650,18 @@ mod tests {
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
     }
 
-    /// Inv #3 — admin override is a valid `ScanIndeterminate` exit
-    /// (the findings path `reject_from_scan` is disjoint and unchanged).
+    /// Inv #3 — the curator's manual release is a valid
+    /// `ScanIndeterminate` exit, and since one authority owns that
+    /// release it is the only one (ADR 0007, "One authority owns the
+    /// manual release"). The findings path `reject_from_scan` is
+    /// disjoint and unchanged.
     #[test]
-    fn invariant_3_scan_indeterminate_releases_via_admin_override() {
+    fn invariant_3_scan_indeterminate_releases_via_curator_waiver() {
         let mut a = scan_indeterminate_artifact();
         assert!(a
             .release(
-                ReleaseReason::Admin,
-                ReleaseAuthorization::AdminOverride,
+                ReleaseReason::Curator,
+                ReleaseAuthorization::CuratorWaiver,
                 ProvenanceClearance::NotRequired
             )
             .is_ok());
@@ -4143,8 +4678,8 @@ mod tests {
     #[test]
     fn invariant_3_scan_indeterminate_timer_without_scan_authority_denied() {
         for authz in [
-            ReleaseAuthorization::AdminOverride,
             ReleaseAuthorization::PolicyReEvaluation,
+            ReleaseAuthorization::CuratorWaiver,
         ] {
             let mut b = scan_indeterminate_artifact();
             assert!(matches!(
@@ -4511,6 +5046,108 @@ mod tests {
         assert_eq!(clearable, vec!["scanner", "scan_policy_retroactive"]);
     }
 
+    // -- is_curator_overridable (ADR 0007's axis boundary) ------------------
+    //
+    // The sibling predicate `Artifact::release` consults for a `Rejected`
+    // source state. A different question from `is_scan_clearable` — "may a
+    // human on the curation axis override this?" rather than "can a
+    // re-judgement of the evidence clear this?" — which is why it is a
+    // second predicate and not a widening: widening the other one would
+    // let an unattended policy pass clear a curator's block.
+
+    #[test]
+    fn is_curator_overridable_admits_the_scan_and_curation_axes() {
+        assert!(is_curator_overridable(Some(&RejectionReason::Scanner)));
+        assert!(is_curator_overridable(Some(
+            &RejectionReason::ScanPolicyRetroactive
+        )));
+        assert!(is_curator_overridable(Some(&RejectionReason::Curator {
+            curator_id: Uuid::new_v4(),
+        })));
+        assert!(is_curator_overridable(Some(
+            &RejectionReason::CurationRetroactive {
+                rule_id: Uuid::new_v4(),
+            }
+        )));
+    }
+
+    /// The instrument reaches a missing signature and a disproved one
+    /// alike: the comparison a curator performs — this content hash
+    /// against the publisher's release page — answers the same question
+    /// the signature answers, and it fails for an attacker's own-key
+    /// signature over modified bytes.
+    #[test]
+    fn is_curator_overridable_admits_the_provenance_axis() {
+        assert!(is_curator_overridable(Some(&RejectionReason::Provenance)));
+    }
+
+    #[test]
+    fn is_curator_overridable_refuses_corruption_admin_and_none() {
+        // The bytes are not the bytes the hash names, so the curator's
+        // comparison confirms nothing and the read fails verification
+        // regardless (ADR 0003).
+        assert!(!is_curator_overridable(Some(&RejectionReason::Corruption)));
+        // No production path mints an admin rejection — admin does not
+        // make domain verdicts — so there is nothing to override.
+        assert!(!is_curator_overridable(Some(&RejectionReason::Admin)));
+        // A `Rejected` artifact with no recorded reason is D6's illegal
+        // state, not an open door; it is also what an un-hydrated
+        // `rejection_reason` looks like.
+        assert!(!is_curator_overridable(None));
+    }
+
+    /// The overridable set is exactly these five, asserted over the
+    /// domain's own variant list rather than a copy — so a future
+    /// `RejectionReason` wrongly admitted fails a test as well as forcing
+    /// the wildcard-free `match` to be edited.
+    #[test]
+    fn is_curator_overridable_admits_exactly_the_three_axes() {
+        let overridable: Vec<&'static str> = RejectionReason::ALL_KIND_SAMPLES
+            .iter()
+            .filter(|r| is_curator_overridable(Some(r)))
+            .map(RejectionReason::wire_kind)
+            .collect();
+        assert_eq!(
+            overridable,
+            vec![
+                "scanner",
+                "curation_retroactive",
+                "scan_policy_retroactive",
+                "curator",
+                "provenance",
+            ]
+        );
+    }
+
+    /// The two predicates are **different** questions, and the difference
+    /// is exactly the curation and provenance axes. Pinned as a relation
+    /// rather than two lists, so a change that collapses them into one
+    /// answer fails here even if both per-reason lists were edited to
+    /// match.
+    #[test]
+    fn the_curator_override_is_strictly_wider_than_scan_clearability() {
+        let only_the_curator: Vec<&'static str> = RejectionReason::ALL_KIND_SAMPLES
+            .iter()
+            .filter(|r| is_curator_overridable(Some(r)) && !is_scan_clearable(Some(r)))
+            .map(RejectionReason::wire_kind)
+            .collect();
+        assert_eq!(
+            only_the_curator,
+            vec!["curation_retroactive", "curator", "provenance"],
+            "the curation and provenance axes are overridable by a human and not by a \
+             re-judgement of the evidence — that gap IS why there are two predicates"
+        );
+        assert!(
+            RejectionReason::ALL_KIND_SAMPLES
+                .iter()
+                .chain(std::iter::once(&RejectionReason::Scanner))
+                .all(|r| !is_scan_clearable(Some(r)) || is_curator_overridable(Some(r))),
+            "every scan-clearable reason is also curator-overridable: an artifact a \
+             policy loosen could release must not be unreachable to the human who \
+             could have decided the same thing"
+        );
+    }
+
     // -- State machine: reject_from_scan_policy_retroactive (ADR 0041) ------
     //
     // The tighten direction of continuous enforcement. The caller computes
@@ -4660,8 +5297,8 @@ mod tests {
 
     #[test]
     fn reject_from_scan_policy_retroactive_from_scan_indeterminate_fails_without_mutating() {
-        // Terminal scan-failure state (ADR 0007); admin-only exit, never
-        // re-held by a policy pass.
+        // Terminal scan-failure state (ADR 0007); exited by an explicit
+        // manual release, never re-held by a policy pass.
         let mut a = scan_indeterminate_artifact();
         let result = a.reject_from_scan_policy_retroactive(&reject_outcome(), "x".into());
         assert!(matches!(result, Err(DomainError::Invariant(_))));

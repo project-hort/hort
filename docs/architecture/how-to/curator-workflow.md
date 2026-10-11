@@ -17,27 +17,37 @@ and [security.md](../explanation/security.md).
 
 ## 1. The curator role
 
-`Permission::Curate` is the day-to-day decision role for security /
-release-team operators who triage artifacts in `Quarantined` or
-`Rejected` state. It is **narrower than `Permission::Admin`** by
-design:
+`Permission::Curate` is the decision authority over held artifacts —
+the role security / release-team operators act in when they triage what
+quarantine-by-default is holding or what the scanner has rejected. It is
+**narrower in reach** than `Permission::Admin` (it opens the curation
+decision surface and nothing else) and it is **the** authority on that
+surface:
 
-| Authority                        | `Permission::Curate` | `Permission::Admin`              |
-| -------------------------------- | -------------------- | -------------------------------- |
-| Waive a `Quarantined` artifact   | yes                  | yes                              |
-| Waive a `ScanIndeterminate`      | **no** (admin-only)  | yes (broader source-state guard) |
-| Block any non-terminal artifact  | yes                  | yes                              |
-| Bulk-block via explicit version list | yes              | yes                              |
-| Exclude / unexclude a CVE finding | yes                 | yes                              |
-| All other admin endpoints        | no                   | yes                              |
+| Authority                            | `Permission::Curate` | `Permission::Admin` |
+| ------------------------------------ | -------------------- | ------------------- |
+| Waive a held artifact (release it)   | yes                  | yes                 |
+| Block any non-terminal artifact      | yes                  | yes                 |
+| Bulk-block via explicit version list | yes                  | yes                 |
+| Exclude / unexclude a CVE finding    | yes                  | yes                 |
+| All other admin endpoints            | no                   | yes                 |
 
-The narrower source-state guard on waive is intentional. `ScanIndeterminate`
-means the scanner could not complete (a terminal scan failure, not a
-clean result); releasing such an artifact requires the broader
-deliberation that `admin_release` represents (the broader role, the
-emergency escalation context). Curator-waive serves the common case:
-"the scan was clean, advisory-lag residual risk is acceptable for this
-specific artifact, release it before the window completes."
+An admin passes the same gate (`CurateOrAdminPrincipal` admits either
+permission), so an admin never needs an explicit curate grant — but
+nothing on this surface *requires* admin. The manual release reaches
+`Quarantined`, `ScanIndeterminate` and — on the axes §4.1
+enumerates — `Rejected`; §4 is the state rule.
+
+**The split is one of kind, not of tiers** (see
+[the glossary](../../glossary.md) and
+[ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)'s
+one-authority amendment): admin carries the technical and operative
+actions — gitops status, effective config, withdrawing a structurally
+invalid state — while a verdict about an artifact is a curation
+decision. A curator already decides with findings in view — a held
+artifact may carry findings its policy weighed — and the same authority
+covers the case where the scanner reached no verdict at all. There is no
+second, broader manual release to escalate to.
 
 The role is **claim-based** (see
 [`operate/claim-based-rbac.md`](operate/claim-based-rbac.md)).
@@ -115,8 +125,9 @@ layout, validation behaviour, and idempotency contract.
 
 `Permission::Curate` does **not** confer:
 
-- `Permission::Admin` (any of the admin endpoints, including the
-  emergency `admin_release` path that accepts `ScanIndeterminate`)
+- `Permission::Admin` (any of the admin endpoints — gitops status,
+  effective config, repository and policy management, the
+  provenance-misrejection repair)
 - `Permission::AdminTaskInvoke` (running admin background tasks)
 - `Permission::Write` / `Permission::Read` on repositories (a curator
   who needs to inspect artifact content downloads it as themselves;
@@ -124,22 +135,30 @@ layout, validation behaviour, and idempotency contract.
 - Any ability to **modify** policy thresholds, repositories, or upstream
   mappings (those remain admin-only)
 
-If an operator needs more authority than curator, the correct flow is
-to assume an admin session via `hort-cli auth login --admin` (see
+If an operator needs authority this role does not carry, the correct
+flow is to assume an admin session via `hort-cli auth login --admin`
+(see
 [`using-hort-cli-with-admin-ops.md`](using-hort-cli-with-admin-ops.md)),
-not to widen the curator grant.
+not to widen the curator grant. That is a step sideways onto the
+technical/operative surface, not a step up: no artifact verdict needs
+it.
 
 ---
 
 ## 2. The three decision flows
 
-### 2.1 Waive — release a `Quarantined` artifact early
+### 2.1 Waive — release a held artifact early
 
 **Use it when:** the scan completed clean, the observation window is
 still running, and the cost of waiting (downstream consumers stuck on
 an older version with a known issue, a critical patch that fixes a
 deployed CVE, an urgent dependency-of-a-dependency unblock) outweighs
 the marginal risk-reduction of the remaining window.
+
+The same command is the release path for an artifact the scanner could
+not assess (`ScanIndeterminate`) — a harder decision, not a different
+authority. §4 carries the state rule and what the decision commits you
+to.
 
 **Pre-flight check:** look at the queue listing first.
 
@@ -176,15 +195,25 @@ ArtifactReleased {
 }
 ```
 
-The audit log distinguishes curator-waive from `admin_release` via the
-`released_by` discriminator; both populate `released_by_user_id` +
-`justification`, so a single query against the event stream
-reconstructs every human-authority release with its attribution.
+`released_by: Curator` with a populated `released_by_user_id` +
+`justification` is what distinguishes a human release from the two
+automatic ones (`Timer` and `PolicyReEvaluation` leave both fields
+`None`), so a single query against the event stream reconstructs every
+human-authority release with its attribution. A stream may also carry
+`released_by: Admin` from before one authority owned the manual release
+— the log is append-only
+([ADR 0002](../../adr/0002-event-sourced-artifact-lifecycle.md)), and
+such an event reads as the same kind of decision: a named operator
+released this artifact on purpose.
 
-**Source-state guard reminder:** if `quarantine_status` is
-`ScanIndeterminate` (not `Quarantined`), the waive returns `400` — that
-artifact requires `admin_release`. The queue listing carries the
-status; check it before issuing.
+**Source-state guard reminder:** the waive releases a held artifact —
+`Quarantined` or `ScanIndeterminate` — and overrides a `Rejected` one on
+the axes §4.1 enumerates. A state it cannot release from answers
+`409 Conflict`
+([ADR 0025](../../adr/0025-state-precondition-violations-return-409.md)),
+with the state in the message. The queue listing carries the status;
+check it before issuing, because the status is also what tells you
+*which* decision you are making (see §4).
 
 ### 2.2 Block — reject a non-terminal artifact
 
@@ -378,37 +407,150 @@ re-evaluations); the cascade emits `Released → Rejected` or
 
 ---
 
-## 4. `admin_release` vs `curator-waive` — when to escalate
+## 4. The manual release — one authority, one state rule
 
-The two paths are **structurally distinct**, not interchangeable
-authority levels.
+There is **one** manual release, and the curator holds it. What changes
+with the artifact's state is not who may decide — it is *what you are
+deciding*.
 
-| Concern                              | curator-waive                          | admin_release                                  |
-| ------------------------------------ | -------------------------------------- | ---------------------------------------------- |
-| Required permission                  | `Curate` or `Admin`                    | `Admin`                                        |
-| Source-state guard                   | `Quarantined` only                     | Any non-terminal state, **incl. `ScanIndeterminate`** |
-| Justification cap (≤ 512 bytes)      | yes, required                          | yes, required                                  |
-| `released_by` discriminator          | `ReleaseReason::Curator`               | `ReleaseReason::Admin`                         |
-| `released_by_user_id` populated      | curator's user_id                      | admin's user_id                                |
-| Use case                             | "scan was clean, accept advisory lag"  | "scanner failed, accept the broader risk"      |
+| Source state         | What a waive means there                                                                                                                                              |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Quarantined`        | A verdict exists — clean, or findings the policy weighed and permitted — and you are shortening the remaining observation window. The common case.                     |
+| `ScanIndeterminate`  | **No** verdict exists: the scanner could not complete. You are releasing on evidence from outside hort, so the window is not the thing you are overriding.             |
+| `None`, `Released`   | Nothing to release — the artifact is already downloadable. Answered `409`.                                                                                            |
+| `Rejected`           | A verdict exists and it **blocked**. You are overriding that verdict, not a window — on the axes §4.1 enumerates, and never on the corruption axis. The procedure is §4.1.                   |
 
-**Escalate to `admin_release` when:**
+**A harder case deserves more deliberation, not a different endpoint.**
+Cross-team coordination, a post-incident review, a policy exception
+that has to survive the audit cycle — none of those is a second
+authority to escalate to; they are the work you do *before* issuing the
+waive, and the justification is where that work is recorded. Releasing
+a `ScanIndeterminate` artifact is the clearest case: with no verdict to
+weigh, everything that justifies the release is out-of-band evidence
+(the upstream publish, the maintainer's identity, the changelog, the
+advisory), and the person who gathered it is the person who should
+decide.
 
-- the artifact is `ScanIndeterminate` (curator cannot waive it);
-- the decision genuinely needs the broader admin context (cross-team
-  coordination, post-incident review, a policy exception that survives
-  the audit cycle).
+**What a waive is.** It is a risk-accepted, attributed override — your
+identity and reason enter the immutable log so a later incident response
+can reconstruct who decided and why. From `Quarantined` what you
+override is a **time gate**; from `Rejected` it is a **verdict**, which
+is a materially larger decision and the reason §4.1 exists. The queue
+row carries the status and the finding count, so you know which of the
+two you are making before you act.
 
-**Stay on curator-waive when:**
+**What a waive is not.** It is not a posture: if you find yourself
+waiving every ingest from one repository, encode that once in policy
+(§5) instead of N times in the audit log. And it is not a way to make
+findings go away — the findings stay on the stream, the override is
+recorded next to them, and if the finding is a false positive the
+cheaper and more durable fix is to exclude it (§2.3), which re-judges
+every artifact it affects instead of just this one.
 
-- the scan completed clean and you're shortening the observation window
-  for a specific artifact;
-- the decision is one of many (curator is the role designed for
-  per-artifact day-to-day decisions — that's its whole point).
+**Re-blocking afterwards.** A release you granted is a decision about
+*this* artifact, so a **fresh scan's** verdict does not undo it: that
+protection is keyed on who released the artifact, and it is scan-axis
+wide rather than axis-wide
+([ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md)'s
+one-authority amendment carries the partition). Everything else still
+reaches a released artifact — a curator block, a retroactive curation
+rule, a provenance disproof, the CAS integrity tombstone (§2.2) — and
+so does a `ScanPolicy` **tighten**, which re-judges the whole population
+from stored findings and does not ask how an artifact came to be
+released (§6). Waiving an artifact does not exempt it from a later
+policy decision about the class it belongs to.
 
-The choice is recorded in the `released_by` discriminator on the event,
-so future auditors see whether each release went through the broader
-or the narrower path.
+### 4.1 Overriding a `Rejected` artifact — which axes, and what to record
+
+A `Rejected` artifact was condemned by a verdict, and `rejected` is
+reached on **four** axes. The waive reaches three of them. Which axis
+condemned the artifact is the `REJECT_REASON` column of the queue row
+(`hort-cli curation queue --status rejected`, filterable with
+`--reason <kind>`), and it is the only thing that decides whether the
+override is available:
+
+| `REJECT_REASON` on the queue row     | Axis          | Waive reaches it |
+| ------------------------------------ | ------------- | ---------------- |
+| `scanner`, `scan_policy_retroactive` | scan          | yes              |
+| `curator`, `curation_retroactive`    | curation      | yes              |
+| `provenance`                         | provenance    | yes              |
+| `corruption`                         | CAS integrity | **never**        |
+
+**Why those three and not the fourth.** The boundary is what *your*
+instrument can reach, not a ranking of severities. The instrument is the
+comparison your job is built on: **this content hash against the
+publisher's own release page**. On the scan and curation axes you are
+weighing findings, which is the decision the role exists for. On the
+provenance axis that comparison answers exactly the question a signature
+answers — attribution — and it answers it in both directions: a third
+party who attached a broken signature to a genuine artifact leaves the
+bytes genuine and the comparison confirms them, while an attacker who
+modified the artifact and signed it with their own key fails the same
+comparison, so you do not override. On the corruption axis the
+comparison confirms nothing, because the bytes hort holds are by
+definition not the bytes that hash names — see
+[cas-storage.md](../explanation/cas-storage.md)'s scrub table for the
+recovery, which is re-ingesting the restored blob, not a release.
+
+The queue's `--reason` filter also accepts `admin`, which the waive
+refuses — but no path in hort writes an `admin` rejection, because admin
+carries the technical and operative actions and a verdict about an
+artifact is a curation decision (§1). If you ever see one on a queue
+row, that is worth a bug report, not a waive.
+
+**The procedure.**
+
+```sh
+# 1. Find the artifact and read its axis off the REJECT_REASON column.
+hort-cli curation queue --status rejected --repo npm-proxy
+
+# 2. Perform the comparison the axis calls for, out of band. For
+#    provenance that is this artifact's content hash against the
+#    publisher's own release page / release artifact list. For a scan or
+#    curation rejection it is the findings themselves: read them, decide
+#    whether this deployment's exposure makes them acceptable, and
+#    record what made that true.
+
+# 3. Issue the override — the same command as any other waive.
+hort-cli curation waive <artifact_id> \
+  --justification "sha256:<hash> matches the signed release listing at
+                    https://example.org/releases/v1.2.3 (checked
+                    2026-10-11); upstream signing key rotation broke the
+                    attestation, not the artifact. Risk accepted by
+                    security@example.com, ticket SEC-4312"
+```
+
+**What the justification must record.** On this path it is the whole
+audit trail of a decision that overrode a block, so it carries more than
+"urgent". Name:
+
+- **the comparison you actually performed**, with the content hash and
+  the external source you compared it against (URL, release listing,
+  signed manifest), and the date you did it;
+- **why the rejection was wrong or acceptable** — a broken attestation
+  over genuine bytes, a finding that does not apply to how this artifact
+  is deployed, a curation rule that over-matched;
+- **who accepted the risk**, by name or team, and the out-of-band record
+  (ticket, incident, review) that holds the rest.
+
+"Verified upstream" without the hash and the source is not a record of
+anything; a later incident response cannot re-perform a comparison it
+cannot see.
+
+**A corruption tombstone answers `409`,** with the axis named in the
+message, and no justification changes that. It is not a permissions
+problem and not a missing feature: there is nothing an override could
+decide, because the bytes are not the artifact's bytes and the read
+would fail verification even if the status said `released`
+([ADR 0003](../../adr/0003-streaming-enforced-cas.md)'s
+read-verification amendment). Restore the blob and re-ingest it.
+
+**After the override** the artifact is `released`, its rejection reason
+is cleared, and the ordinary rules of §4's *Re-blocking afterwards*
+apply — including that a **fresh scan** verdict will not re-block it,
+because you decided with the findings in view. A `ScanPolicy` tighten, a
+curator block, a retroactive curation rule, a provenance disproof and
+the CAS tombstone all still reach it.
 
 ---
 

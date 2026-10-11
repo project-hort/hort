@@ -830,8 +830,11 @@ impl CallerPrivileges {
     /// `Permission::Curate` is the day-to-day decision authority over
     /// quarantined / rejected artifacts and finding-exclusions;
     /// `Permission::Admin` is a strict superset by design (admins can do
-    /// everything a curator can, plus more — including `admin_release`
-    /// of `ScanIndeterminate` artifacts, which curator cannot).
+    /// everything a curator can, plus the technical and operative
+    /// surfaces that carry no curator route at all — gitops
+    /// apply-status, effective-config reads, the
+    /// provenance-misrejection repair, all mounted behind
+    /// `AdminPrincipal`).
     /// Accept either authority so an admin is not forced to also carry
     /// the curator permission to perform a curator action.
     ///

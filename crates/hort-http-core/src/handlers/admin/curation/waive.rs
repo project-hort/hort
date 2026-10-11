@@ -1,13 +1,20 @@
 //! `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`.
 //!
-//! Curator-driven release of a `Quarantined` artifact. Mirrors the
-//! shape of `POST /admin/quarantine/:artifact_id/release`
-//! (the admin override) but emits the curator-attributed
-//! [`ArtifactReleased`](hort_domain::events::ArtifactReleased) variant
-//! (`authority = CuratorWaiver`, `reason = Curator`) rather than the
-//! admin variant. Source-state guard is `Quarantined` ONLY — curator
-//! does NOT clear `ScanIndeterminate` artifacts; that authority stays
-//! admin-only.
+//! Curator-driven manual release of a held artifact — **the** manual
+//! release, and the only route that performs one (ADR 0007, "One
+//! authority owns the manual release"). Emits the curator-attributed
+//! [`ArtifactReleased`](hort_domain::events::ArtifactReleased)
+//! (`authority = CuratorWaiver`, `reason = Curator`). Source states are
+//! `Quarantined`, `ScanIndeterminate` and `Rejected`; `None` and
+//! `Released` answer 409 — there is nothing there to release (ADR 0025).
+//!
+//! A `Rejected` artifact is reachable only on the axes the curator's
+//! instrument reaches — scan, curation and provenance, never the
+//! corruption tombstone (ADR 0007, "The axis boundary for a `Rejected`
+//! artifact"). A refused axis is also a 409, and the body carries the
+//! axis name so the operator learns *why* rather than *that*. The route
+//! itself is unchanged: this is the same one manual release, decided
+//! entirely in `Artifact::release`.
 //!
 //! Status-code mapping:
 //! - `200 OK` — success
@@ -86,8 +93,10 @@ pub async fn post_waive(
     // Defence-in-depth boundary check. The use case also enforces the
     // same cap via `CurationUseCase::validate_justification`; the handler
     // fires first so an oversize body never reaches the application
-    // layer. Trim mirrors `admin_release`'s handling — whitespace-only
-    // input is the same UX failure as empty.
+    // layer. Trim is intentional — whitespace-only input is the same UX
+    // failure as empty (an operator copy-pasting a stray newline), and
+    // an auditor reading "    " as a justification is the same negative
+    // outcome as a missing one.
     let trimmed = body.justification.trim();
     if trimmed.is_empty() {
         return Err(ApiError(AppError::Domain(DomainError::Validation(
@@ -387,10 +396,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// ADR 0025 — waiving a non-`Quarantined` artifact (the curator
-    /// source-state guard inside `Artifact::release`) is a caller-reachable
-    /// state precondition → **409 Conflict** carrying the real message, NOT
-    /// an opaque 500. `DomainError::InvalidState` → 409 (see `error.rs`);
+    /// ADR 0025 — waiving an artifact in a state the authority does not
+    /// reach (the source-state guard inside `Artifact::release`, which
+    /// admits `Quarantined`, `ScanIndeterminate` and `Rejected`, leaving
+    /// `None` and `Released` with nothing to release) is a
+    /// caller-reachable state precondition → **409 Conflict** carrying the
+    /// real message, NOT an opaque 500. `DomainError::InvalidState` → 409
+    /// (see `error.rs`);
     /// the use case classifies it `conflict` for the metric label via
     /// `classify_append_error`. (Plain `Conflict`/409 still also covers
     /// event-store optimistic-concurrency version conflicts; the two are
@@ -398,8 +410,8 @@ mod tests {
     #[tokio::test]
     async fn waive_non_quarantined_artifact_returns_409_invalid_state() {
         let (router, mocks) = harness();
-        // Seed an artifact already in `None` (released) state — the
-        // source-state guard rejects every non-Quarantined.
+        // Seed an artifact in `None` — never held, so there is nothing
+        // to release and the source-state guard refuses it.
         let artifact = sample_artifact(QuarantineStatus::None);
         let mut repo = sample_repository();
         repo.id = artifact.repository_id;
