@@ -439,7 +439,7 @@ the result instead.
 | serde_core | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_derive | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_html_form | 0.2.8 | MIT | https://github.com/jplatte/serde_html_form |
-| serde_json | 1.0.151 | MIT | https://github.com/serde-rs/json |
+| serde_json | 1.0.152 | MIT | https://github.com/serde-rs/json |
 | serde_nanos | 0.1.4 | MIT | https://github.com/caspervonb/serde_nanos |
 | serde_path_to_error | 0.1.20 | MIT | https://github.com/dtolnay/path-to-error |
 | serde_repr | 0.1.20 | MIT | https://github.com/dtolnay/serde-repr |
@@ -16199,7 +16199,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde_json 1.0.151 — MIT
+### serde_json 1.0.152 — MIT
 
 Repository: https://github.com/serde-rs/json
 
