@@ -1,7 +1,7 @@
 # 0007 — Fail-closed quarantine release predicate
 
 - **Status:** Accepted
-- **Enforced by:** the background sweep releases an artifact only when `quarantine_until <= now()` **AND** the application layer can supply a recognised release authority; the predicate accepts exactly six `(reason, authority)` pairs (five as originally decided, plus `ScanRecorded` — see the 2026-08-21 amendment) and denies every other. The predicate is implemented in `Artifact::release` (`crates/hort-domain/src/entities/artifact.rs`) with exhaustive per-authority tests; the architect anti-pattern *scanner clean → immediate release* is a review hard-block.
+- **Enforced by:** the background sweep releases an artifact only when `quarantine_until <= now()` **AND** the application layer can supply a recognised release authority; the predicate accepts exactly seven `(reason, authority)` pairs (five as originally decided, plus `ScanRecorded` — 2026-08-21 — and `ScanCleared` — 2026-10-11) and denies every other. The predicate is implemented in `Artifact::release` (`crates/hort-domain/src/entities/artifact.rs`) with exhaustive per-authority tests; the architect anti-pattern *scanner clean → immediate release* is a review hard-block.
 - **Supersedes:** —
 
 ## Context
@@ -14,7 +14,7 @@ Quarantine is the observation window that lets a scan run and lets a malicious p
 
 Downloads are blocked while `quarantine_status = 'quarantined'`, regardless of the timestamp — the **status** is the gate, the **timestamp** is only the sweep's candidacy filter.
 
-The background sweep transitions an artifact to `released` only when `quarantine_until <= now()` **AND** a release authority is available. The release predicate accepts **exactly five authorities** (six as of the 2026-08-21 `ScanRecorded` amendment below) and denies every other `(reason, authority)` pair:
+The background sweep transitions an artifact to `released` only when `quarantine_until <= now()` **AND** a release authority is available. The release predicate accepts **exactly five authorities** (seven as of the 2026-08-21 `ScanRecorded` and 2026-10-11 `ScanCleared` amendments below) and denies every other `(reason, authority)` pair:
 
 1. `ScanSucceeded` — a successful `ScanCompleted` on the artifact stream.
 2. `ScanWaived` — the resolved `ScanPolicy` declares `scan_backends: []`.
@@ -22,8 +22,9 @@ The background sweep transitions an artifact to `released` only when `quarantine
 4. `CuratorWaiver` — curator waive (`Quarantined`-state only).
 5. `PolicyReEvaluation` — post-exclusion policy re-evaluation.
 6. `ScanRecorded` — the artifact was scanned and the resolved `ScanPolicy` declares `enforcement: record` (added by the 2026-08-21 amendment below; not part of the original five).
+7. `ScanCleared` — the artifact was scanned, its findings exist, and the policy verdict recorded beside the scan did **not** block. Distinct from `ScanSucceeded`, which asserts an empty finding list, and from `ScanRecorded`, which asserts the operator declared a *blocking* verdict non-gating (added by the 2026-10-11 amendment below; not part of the original five).
 
-`ScanCompleted(clean)` does **not** clear `quarantine_until` or set `released`. `ScanCompleted(findings)` immediately sets `rejected` (time never reverses this). A scan job that exhausts retries fails closed — see the exhaustion split below.
+`ScanCompleted(clean)` does **not** clear `quarantine_until` or set `released`. `ScanCompleted(findings)` sets `rejected` **iff the policy verdict recorded beside it blocks** — the finding list is evidence, the `PolicyEvaluated` verdict is the decision (2026-10-11 amendment). Where it does block, time never reverses it. A scan job that exhausts retries fails closed — see the exhaustion split below.
 
 ### "A successful `ScanCompleted`" means the latest verdict, not mere presence (issue #108, amended 2026-08-05; human-approved via `workflow::ready`)
 
@@ -175,6 +176,50 @@ the same terms as a clean-scan one, and the inline fast-path release in
 `record_scan_result` mints `ScanRecorded` (not `ScanSucceeded`) for it — the
 same token the sweep's `resolve_release_authority` would mint for the same
 artifact.
+
+### A seventh authority: `ScanCleared` — findings are evidence, the verdict is the decision (issue #344, amended 2026-10-11)
+
+The release authority was derived in two places from two different facts. The
+scan-time fast path asked "did the policy block?" (`!violations.is_empty()`);
+the release sweep asked "did the scanner find anything?"
+(`finding_count == 0`), under a comment claiming it mirrored the resolver it
+contradicted. Both were wrong, in opposite directions, and the same artifact
+therefore released or hung forever depending on whether its scan completed
+**after** or **inside** its observation window — a behaviour no decision ever
+took, and the arithmetic of a divergence rather than a rule.
+
+**The sentence above is where it began.** "`ScanCompleted(findings)`
+immediately sets `rejected`" stopped being true when `enforcement: record`
+shipped, and was never true for findings below the configured threshold; it
+made the finding *count* the authority where the *policy* decides. It is
+corrected in the Decision above by the same amendment that adds this authority.
+
+The rule, as decided: an artifact whose latest scan carries findings
+**exclusively below** the configured threshold is released when the observation
+window ends, regardless of when that scan ran; the earliest release is the end
+of the window and the latest is the arrival of a non-blocking verdict. Without
+a scan result nothing releases (fail closed).
+
+Three consequences. **The verdict is recorded**: every `record_scan_result`
+appends a `PolicyEvaluated` — `Pass` or `Fail` — beside the `ScanCompleted`, so
+the durable record answers "what was decided?" without re-running the
+evaluator. **One predicate reads it**: both paths call `latest_scan_standing`,
+which takes the first verdict after the latest `ScanCompleted` and keeps "no
+observation" and "superseded by a later rejection" distinct from "holds", so
+`enforcement: record` can never un-gate a missing observation or another axis's
+rejection. **And the authority says what it checked**: `ScanCleared` exists
+because widening `ScanSucceeded` would have produced correct releases with a
+permanently false premise — that token asserts an empty finding list, and a
+release log reading `authority = scan_succeeded` over an artifact with findings
+is a record no operator can trust. It carries the same provenance
+AND-precondition as the other three timer authorities: a recorded,
+non-blocking scan verdict says nothing about provenance.
+
+The precondition behind all three was **#264** (fixed in 0.14.0): the Trivy
+adapter wrote every artifact as `<sha256>.bin`, Trivy matched no analyzer, and
+the empty finding list was recorded as a clean scan — for 54 days and 26,267
+scans. The authority rule was therefore never exercised against a non-empty
+finding list before, which is why a divergence this old surfaced only now.
 
 ### Read-path bounded-await pattern (issue #65, amended 2026-07-20)
 

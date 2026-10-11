@@ -167,6 +167,37 @@ The rule holds on both paths, for two different reasons, and both halves are loa
 
 Coverage % is necessary but **not sufficient**: a DB-backed test that is correct serially but interferes with a concurrently-running sibling is a defect, not passing.
 
+### A test double that round-trips must refuse what production refuses
+
+`MockEventStore` (`crates/hort-app/src/use_cases/test_support.rs`) is used by
+nine crates, and it **round-trips**: `read_stream` serves what `append`
+accepted. So a test seeds events there, production code reads them back, and a
+decision is asserted over them — which makes the double's acceptance criteria
+part of every such test's premise.
+
+The production adapter validates: every `EventStore::append` goes through
+`validate_and_serialize` (`crates/hort-adapters-postgres/src/event_store.rs`),
+which calls `DomainEvent::validate()` on every event in the batch and then
+enforces a 64 KB serialised cap. **An event the double accepts and the adapter
+would reject is an event no producer in the system can write**, and a test
+standing on one proves a behaviour production cannot show.
+
+This is measured, not theoretical. The authority-derivation corpus for the
+release gate held `ScanCompleted` events whose `finding_count` disagreed with
+their `severity_summary` sum — which `validate()` rejects — because the fixture
+built the summary from the count with a different rule. The five sites seeded
+the store directly, so nothing checked them, and the two release paths appeared
+to agree *because the fixture made them agree*. The divergence that cost a
+production incident survived behind impossible events.
+
+The rule is therefore scoped by round-tripping, not by "every double": a double
+whose `append` discards the batch (several local ones error or ignore it, and
+their `read_stream` is `unreachable!`) cannot host a corpus, because nothing
+reads it back. **A double that serves `read_stream` from what it accepted calls
+`validate()` on append and returns the error.** When adding such a double, do
+the same; when a fixture starts failing because of it, the fixture was building
+an event the system cannot produce.
+
 **Enforcement: `crates/hort-app/tests/db_tests_are_serialized.rs`**, a DB-free sub-second source scan in the same family as `db_gate_not_silent` — so `cargo test --workspace` runs it automatically. It reports every test function (inline `#[cfg(test)]` *and* `crates/*/tests/`) that reaches `test_support::{isolated_db_from, shared_migrated_pool, connect_or_panic}` — directly or through a same-file helper, transitively — or opens a raw `PgPool::connect` / `PgConnection::connect*`, and carries no `#[serial(hort_pg_db)]`. **It has no allow-list, by design**: a site that genuinely should not carry the key is a review conversation, not an exemption entry. Its blind spot is the one every source scan has — a helper in *another* file, or a connection opened through a macro — so the review check survives alongside it (see the architect Implementation Review Checklist).
 
 ### Code comments: state the invariant, never the provenance

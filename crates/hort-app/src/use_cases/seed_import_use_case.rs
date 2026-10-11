@@ -427,7 +427,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Duration;
-    use hort_domain::entities::artifact::QuarantineStatus;
+    use hort_domain::entities::artifact::{QuarantineStatus, ReleaseOrigin};
     use hort_domain::entities::repository::Repository;
     use hort_domain::entities::scan_policy::{
         NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
@@ -761,7 +761,10 @@ mod tests {
         // (scan still gates). If seed-import had landed `Released`, the
         // transition would fail.
         let rejected = a
-            .reject_from_scan("simulated dirty scan finding".to_string())
+            .reject_from_scan(
+                "simulated dirty scan finding".to_string(),
+                ReleaseOrigin::NeverReleased,
+            )
             .expect("reject_from_scan must accept a seed-imported Quarantined artifact");
         assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
         assert_eq!(rejected.artifact_id, a.id);

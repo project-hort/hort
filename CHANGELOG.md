@@ -381,6 +381,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An artifact whose findings the policy did not block is released** (#344).
+  `ScanCompleted` carrying a non-empty finding list set `rejected` terminally,
+  whatever the `PolicyEvaluated` verdict recorded beside it said — so a
+  repository whose policy admits low-severity findings never released the
+  artifacts those findings belonged to, and the only way out was an admin
+  override. The finding list is evidence; the policy verdict is the decision.
+  The release gate now derives its authority from **one** pure function that
+  the fast path and the quarantine sweep share, and that function answers with
+  the authority it actually checked: the new `ScanCleared` (findings exist, the
+  verdict passed) beside `ScanSucceeded` (a finding-free scan), `ScanRecorded`
+  (`enforcement: record`), `ScanWaived` (no scan backend configured *and* no
+  observation standing), and the three manual authorities. A release the timer
+  or a policy re-evaluation granted stays re-blockable by a later retroactive
+  verdict; an admin or curator release does not, because a human weighed the
+  same evidence. `MockEventStore` now validates on append like the production
+  adapter, which is what made the divergence visible: the corpus behind the old
+  agreement held `ScanCompleted` events no producer in the system can write.
+
 - **The CAS scrub classifies a real hash mismatch as a mismatch** (#341). Both
   production storage adapters wrap every `get` in a streaming verifier, so a
   corrupted blob failed the read at EOF before `CasScrubUseCase` could finish

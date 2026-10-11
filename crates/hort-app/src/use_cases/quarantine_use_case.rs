@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{
-    Artifact, ProvenanceClearance, QuarantineStatus, ReleaseAuthorization,
+    Artifact, ProvenanceClearance, QuarantineStatus, ReleaseAuthorization, ReleaseOrigin,
 };
 use hort_domain::entities::scan_policy::{
     ExclusionProjection, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
@@ -53,18 +53,21 @@ use crate::metrics::{
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::release_clearance::provenance_clearance_from;
+use crate::use_cases::scan_history;
 use crate::use_cases::{ArtifactAtVersion, CallerPrivileges, OverCapStream};
 
 /// The static authority-kind label for the timer-release
-/// `info!` line. Only the three timer-authorities reach this:
+/// `info!` line. Only the four timer-authorities reach this:
 /// `AdminOverride` / `PolicyReEvaluation` never pair with
 /// `ReleaseReason::Timer` (they would be rejected by the domain
 /// predicate before producing an event), and the resolver only ever
-/// returns `ScanSucceeded` / `ScanWaived` / `ScanRecorded`. The
+/// returns `ScanSucceeded` / `ScanCleared` / `ScanWaived` /
+/// `ScanRecorded`. The
 /// remaining arms are an exhaustive-match guard, not a reachable path.
 fn release_authority_label(authz: ReleaseAuthorization) -> &'static str {
     match authz {
         ReleaseAuthorization::ScanSucceeded => "scan_succeeded",
+        ReleaseAuthorization::ScanCleared => "scan_cleared",
         ReleaseAuthorization::ScanWaived => "scan_waived",
         ReleaseAuthorization::ScanRecorded => "scan_recorded",
         ReleaseAuthorization::AdminOverride => "admin_override",
@@ -75,6 +78,231 @@ fn release_authority_label(authz: ReleaseAuthorization) -> &'static str {
         // surface); the arm is required for exhaustive-match.
         ReleaseAuthorization::CuratorWaiver => "curator_waiver",
     }
+}
+
+/// Which scan-axis authority a **clearing** standing justifies — the
+/// one place the two release paths split `ScanSucceeded` from
+/// `ScanCleared`, so which path got there first can never decide which
+/// token the release is audited under.
+///
+/// The standing itself is [`scan_history::latest_scan_standing`]'s
+/// answer and is never re-derived here; this only reads the finding bit
+/// the clearing answer carries.
+///
+/// `None` for a standing that does not clear. There is exactly one
+/// caller — step 1 of [`scan_axis_release_authority`] — and it is the
+/// ladder that continues, not the release path: each path used to walk
+/// its own remaining steps from here, which is how the two came to mint
+/// different tokens for the same evidence.
+fn clearing_scan_authority(standing: scan_history::ScanStanding) -> Option<ReleaseAuthorization> {
+    match standing {
+        // Nothing was found. `ScanSucceeded` asserts exactly that, and
+        // keeps asserting only that.
+        scan_history::ScanStanding::Clears {
+            findings_present: false,
+        } => Some(ReleaseAuthorization::ScanSucceeded),
+        // Findings exist and the verdict recorded beside the scan
+        // permitted them. `ScanSucceeded` would be a false premise here
+        // — it claims an empty finding list — and the release is just
+        // as authorized under the token that states what was actually
+        // checked.
+        scan_history::ScanStanding::Clears {
+            findings_present: true,
+        } => Some(ReleaseAuthorization::ScanCleared),
+        // Spelled out rather than wildcarded: a future `ScanStanding`
+        // variant must be a compile error here, not a silent `None`
+        // that holds artifacts the gate should have released.
+        scan_history::ScanStanding::Holds
+        | scan_history::ScanStanding::Unobserved
+        | scan_history::ScanStanding::Superseded => None,
+    }
+}
+
+/// The scan axis of the timer-release gate (ADR 0007) — **the one place
+/// either release path selects a [`ReleaseAuthorization`]**.
+///
+/// Pure, and total over its two facts: the artifact's scan standing
+/// ([`scan_history::latest_scan_standing`], the single definition of
+/// "does the latest scan verdict block?") and its resolved
+/// `ScanPolicy`. Nothing else is consulted — in particular not the
+/// quarantine window, so expiry can never become a release authority.
+///
+/// Both release paths reach it with those two facts already in hand,
+/// which is the whole reason it is a function and not two ladders:
+///
+/// - [`QuarantineUseCase::resolve_release_authority`] gathers them for
+///   the `release_expired` sweep — the standing from the candidate's
+///   complete stream, the policy from the projection repository;
+/// - the scan-time inline fast path in
+///   [`QuarantineUseCase::record_scan_result`] passes the standing of
+///   the batch it is about to append and the policy that produced the
+///   verdict inside it.
+///
+/// They did each walk their own steps, and it showed: the fast path had
+/// no waiver arm at all and ended at `unwrap_or(ScanRecorded)`, while
+/// this ladder read the waiver ahead of the `record` arm. One artifact
+/// under `scan_backends: []` + `enforcement: record` with a blocking
+/// verdict therefore released as `scan_recorded` when its scan landed
+/// after its observation window and as `scan_waived` when it landed
+/// inside it — the same evidence audited under two tokens, chosen by
+/// scan timing.
+///
+/// # Evidence outranks a declaration
+///
+/// A release authority must state what was actually checked (ADR
+/// 0007's authority enumeration). The ladder's two non-clearing
+/// tokens assert different kinds of thing: `ScanRecorded` names
+/// evidence that exists ("the scan ran and its verdict is recorded,
+/// not gating"), `ScanWaived` names a missing requirement ("nothing
+/// was scanned here, and the operator requires nothing"). So where an
+/// observation exists the evidence-based statement is the only honest
+/// one — and where the evidence blocks with no mode un-gating it,
+/// neither token is honest and the ladder answers `None`.
+///
+/// Steps 2 and 3 are therefore **disjoint by construction**, not
+/// merely ordered: step 2 requires
+/// [`scan_history::ScanStanding::observation_stands`] and step 3
+/// requires the absence of any observation, so no artifact satisfies
+/// both and their relative order decides nothing. That is the point —
+/// the order is what the two paths above disagreed about, and an
+/// invariant nobody has to preserve cannot be broken by the next
+/// reader who finds the arms in an order that reads better.
+///
+/// Steps 1 and 2 CAN both hold — a clearing verdict under
+/// `enforcement: record` — and there step 1 wins, by the same rule: a
+/// verdict that cleared is audited as what it checked, never as one
+/// the operator declined to act on.
+///
+/// 1. The latest scan's verdict CLEARS the artifact
+///    ([`scan_history::ScanStanding::Clears`]) ⇒ the authority
+///    [`clearing_scan_authority`] resolves for it —
+///    [`ReleaseAuthorization::ScanSucceeded`] when the scan found
+///    nothing, [`ReleaseAuthorization::ScanCleared`] when it found
+///    things the verdict permitted. That means: the LATEST
+///    `ScanCompleted` on the stream has a `PolicyEvaluated` verdict
+///    beside it that did not block, AND no `ArtifactRejected` appears
+///    LATER on the stream than that `ScanCompleted`. Mere *presence* of
+///    a `ScanCompleted` is NOT sufficient — the rejecting-scan branch
+///    of `record_scan_result` ALSO emits `ScanCompleted`, first in its
+///    batch, immediately before the `ArtifactRejected` that makes the
+///    verdict terminal. A presence-only check would treat that dirty
+///    scan's own rejection record as a release authority for the very
+///    artifact it just condemned. (Terminal scanner *execution* failure
+///    is a different event, `ScanIndeterminate` — that one genuinely
+///    never satisfies this predicate, since it isn't a `ScanCompleted`
+///    at all.) The two tokens are what keeps `authority =
+///    scan_succeeded` meaning a finding-free scan: a release decided on
+///    a *permitting verdict* is audited as `scan_cleared` instead, so
+///    neither token is ever recorded over evidence it does not
+///    describe.
+/// 2. Else, if the resolved policy declares `enforcement: record` AND
+///    the scan observation still stands
+///    ([`scan_history::ScanStanding::observation_stands`] — a
+///    `ScanCompleted` exists with no later `ArtifactRejected`) ⇒
+///    [`ReleaseAuthorization::ScanRecorded`]. The scan ran and its
+///    dirty verdict is recorded rather than gating. This arm reads the
+///    SAME standing step 1 does, keyed on the other projection of it:
+///    `record` un-gates the *verdict*, never the *observation*, so
+///    quarantine invariant 2 (a never-successfully-scanned artifact
+///    never releases on the timer alone) stays true under `record` too.
+/// 3. Else, if the artifact has NO scan evidence at all
+///    ([`scan_history::ScanStanding::Unobserved`] — not one
+///    `ScanCompleted` anywhere on its stream) AND the policy exists
+///    with `scan_backends == []` (the operator declared this scope
+///    unscanned) ⇒ [`ReleaseAuthorization::ScanWaived`]. Both halves
+///    are required because the token asserts both: an operator
+///    emptying the backend list does not un-scan an artifact that was
+///    already scanned, so a waiver authorizes nothing where an
+///    observation stands.
+/// 4. Else ⇒ `None` — no authority is constructible; the candidate
+///    stays quarantined. An *absent* policy is **not** a waiver:
+///    `DefaultPolicy` governs an unconfigured repo and it scans (never
+///    auto-release a never-successfully-scanned artifact).
+///
+/// `ScanWaived` therefore means exactly *"no scan evidence exists, and
+/// none is required"* — both halves literally, which is what step 3's
+/// `Unobserved` requirement buys. Every standing that does carry a
+/// `ScanCompleted` is answered elsewhere: a clearing verdict at step
+/// 1, a recorded blocking verdict at step 2, and the rest at step 4 —
+/// a blocking verdict under `reject`, a legacy verdict that cannot be
+/// read ([`scan_history::ScanStanding::Holds`]), a scan superseded by
+/// a later rejection ([`scan_history::ScanStanding::Superseded`],
+/// which `Artifact::release` refuses on the source state in any
+/// case). The waiver widens nothing and no ordering has to hold it
+/// narrow.
+fn scan_axis_release_authority(
+    standing: scan_history::ScanStanding,
+    policy: Option<&ScanPolicyProjection>,
+) -> Option<ReleaseAuthorization> {
+    // Step 1 — the latest verdict does not block. Which of the two
+    // clearing authorities applies is `clearing_scan_authority`'s
+    // answer.
+    if let Some(authz) = clearing_scan_authority(standing) {
+        return Some(authz);
+    }
+
+    // Step 2 — `enforcement: record`. Step 1 could mint neither
+    // clearing authority (the latest verdict blocks, or is a
+    // pre-verdict-event dirty scan whose verdict cannot be read); the
+    // operator has nonetheless declared that a scan verdict does not
+    // gate publication for this scope. `observation_stands()` is the
+    // conjunction this arm needs and no more: a `ScanCompleted` must
+    // exist on the artifact's own stream (a never-scanned artifact is
+    // NEVER released by this arm — quarantine invariant 2 is untouched
+    // by the enforcement mode), and no `ArtifactRejected` may appear
+    // later than it (a curation- or provenance-rejected artifact is not
+    // un-blocked by a scan-axis authority).
+    let record_mode = matches!(policy, Some(p) if p.enforcement == ScanEnforcement::Record);
+    if record_mode && standing.observation_stands() {
+        return Some(ReleaseAuthorization::ScanRecorded);
+    }
+
+    // Step 3 — the operator's waiver, and the one standing it may
+    // authorize a release for. `ScanWaived` asserts that no scan
+    // evidence exists; a declaration cannot make that true of an
+    // artifact whose own `ScanCompleted` is on its stream, whatever
+    // the operator has since removed from the backend list. So the
+    // arm reads the standing as well as the policy, and the standing
+    // it requires is the only one with nothing on the stream at all.
+    let no_scan_evidence = match standing {
+        // `latest_scan_standing` returns this exactly when the
+        // evidence holds no `ScanCompleted` — the waiver's own
+        // premise, and the case it exists for.
+        scan_history::ScanStanding::Unobserved => true,
+        // All three carry a `ScanCompleted`, so the waiver's premise
+        // is false of them: `Clears` was answered at step 1, `Holds`
+        // at step 2 wherever `record` applies and at step 4 where it
+        // does not (a verdict the gate cannot act on holds the
+        // artifact; it does not become a waived one), and
+        // `Superseded` is a scan a later rejection overtook — no
+        // scan-axis token lifts a rejection from another axis, this
+        // one included. Spelled out rather than wildcarded, for the
+        // same reason `clearing_scan_authority` is: a future
+        // `ScanStanding` variant must be a compile error here, not a
+        // silent widening of the waiver over evidence nobody has
+        // looked at yet.
+        scan_history::ScanStanding::Clears { .. }
+        | scan_history::ScanStanding::Holds
+        | scan_history::ScanStanding::Superseded => false,
+    };
+    if no_scan_evidence && matches!(policy, Some(p) if p.scan_backends.is_empty()) {
+        return Some(ReleaseAuthorization::ScanWaived);
+    }
+
+    None
+}
+
+/// The effective [`ProvenanceMode`] a resolved policy declares — its
+/// own, or the [`ProvenanceMode`] default where no policy applies
+/// (provenance never gates an unconfigured repo's release; the scan
+/// gate still does).
+///
+/// One expression, three callers, because all three have to agree:
+/// `record_scan_result`'s inline fast path, the `release_expired`
+/// sweep's provenance leg, and the read-path candidacy check. A
+/// default spelled per caller is a default two of them can drift from.
+fn provenance_mode_of(policy: Option<&ScanPolicyProjection>) -> ProvenanceMode {
+    policy.map(|p| p.provenance_mode).unwrap_or_default()
 }
 
 /// Emit `hort_quarantine_released_total` with the given reason.
@@ -225,6 +453,14 @@ struct ScanResultContext<'a> {
     /// the append that commits it cannot be decided from two different
     /// observations of the stream.
     fast_path_provenance: ProvenanceClearance,
+    /// Who last released this artifact, resolved from the same paired
+    /// stream — the precondition `Artifact::reject_from_scan` applies to
+    /// a `Released` source state. Carried here for the same reason
+    /// `fast_path_provenance` is: the fact and the append that acts on
+    /// it must come from one observation of the stream, or an
+    /// `ArtifactReleased` landing in between would be decided against a
+    /// version this append does not carry.
+    prior_release: ReleaseOrigin,
 }
 
 impl QuarantineUseCase {
@@ -362,11 +598,15 @@ impl QuarantineUseCase {
     /// Non-rejecting verdict path (clean scan, or a `record`-mode
     /// blocking verdict) — see [`Self::record_scan_result`] steps 8+.
     /// Mutates `artifact` via [`Artifact::record_clean_scan`], builds
-    /// the `ScanCompleted` (+ optional `ArtifactBecameVulnerable` /
-    /// `PolicyEvaluated(Fail)` / event-driven fast-path
+    /// the `ScanCompleted` + `PolicyEvaluated` (+ optional
+    /// `ArtifactBecameVulnerable` / event-driven fast-path
     /// `ArtifactReleased`) batch, commits it, and emits the post-commit
     /// logs/metrics. Returns whether `ArtifactBecameVulnerable` was
     /// pushed (`became_vulnerable_pushed`).
+    ///
+    /// The `PolicyEvaluated` is unconditional and carries `Fail` for a
+    /// `record`-mode blocking verdict, `Pass` otherwise — see the
+    /// one-verdict-one-event invariant stated at the append.
     ///
     /// `record_clean_scan` is the state guard for a scan observation
     /// that does not transition the artifact — which a clean verdict
@@ -423,28 +663,52 @@ impl QuarantineUseCase {
             ctx.prior.as_ref().map(|(_, ts)| *ts),
         )?;
 
-        // Under `enforcement: record` the verdict is audited with the
-        // SAME `PolicyEvaluated(Fail, violations)` event the reject
-        // branch appends — the operator's queryable record of "this
-        // artifact violates the policy" must not depend on whether the
-        // policy chose to act on it. What is withheld is only the
+        // INVARIANT — exactly ONE `PolicyEvaluated` per scan verdict:
+        // `Pass` or `Fail`, never both and never none. The two verdict
+        // paths each append their single one unconditionally (the
+        // reject path appends `Fail`; this one appends whichever of the
+        // two the non-rejecting verdict reached), and both ride the
+        // SAME batch as the `ScanCompleted` they belong to. So a reader
+        // of the stream can answer "was a verdict reached on this scan,
+        // and what was it?" from the verdict event itself. Do not make
+        // this append conditional: a verdict that is absent from the
+        // stream is indistinguishable from a scan that never ran, which
+        // is what forces a consumer to re-derive the decision from
+        // `ScanCompleted.finding_count` — a count that says how many
+        // findings there were, never whether they blocked.
+        //
+        // `Fail` whenever violations were recorded. Under
+        // `enforcement: record` the verdict is audited with the SAME
+        // `PolicyEvaluated(Fail, violations)` event the reject branch
+        // appends — the operator's queryable record of "this artifact
+        // violates the policy" must not depend on whether the policy
+        // chose to act on it. What is withheld is only the
         // `ArtifactRejected` companion.
-        if findings_recorded {
-            let policy_event = PolicyEvaluated {
-                artifact_id: ctx.artifact_id,
-                policy_id: ctx
-                    .policy
-                    .as_ref()
-                    .map(|p| p.policy_id)
-                    .unwrap_or(NO_POLICY),
-                result: PolicyResult::Fail,
-                violations: violations.clone(),
-            };
-            policy_event.validate()?;
-            events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
-                policy_event,
-            )));
-        }
+        //
+        // `Pass` otherwise, carrying the (empty) violation list. The
+        // empty-findings case is deliberately NOT special-cased: "the
+        // verdict was reached and nothing blocked" is the same
+        // statement whether the finding list was empty or merely
+        // harmless. This mirrors the promotion path, which has always
+        // recorded a passing gate as a `PolicyEvaluated(Pass)` event.
+        let policy_event = PolicyEvaluated {
+            artifact_id: ctx.artifact_id,
+            policy_id: ctx
+                .policy
+                .as_ref()
+                .map(|p| p.policy_id)
+                .unwrap_or(NO_POLICY),
+            result: if findings_recorded {
+                PolicyResult::Fail
+            } else {
+                PolicyResult::Pass
+            },
+            violations: violations.clone(),
+        };
+        policy_event.validate()?;
+        events_vec.push(EventToAppend::new(DomainEvent::PolicyEvaluated(
+            policy_event,
+        )));
 
         // Event-driven fast-path release (ADR 0007).
         //
@@ -458,9 +722,11 @@ impl QuarantineUseCase {
         // elapsed; this collapses the latency from "up to one sweep
         // interval" to zero.
         //
-        // Uses the EXISTING accepted pair `(ReleaseReason::Timer,
-        // ReleaseAuthorization::ScanSucceeded)` the `release_expired`
-        // sweep already uses — no new authorization. The atomicity
+        // Uses the EXISTING accepted timer pairs the `release_expired`
+        // sweep already uses — `ScanSucceeded` for a finding-free scan,
+        // `ScanCleared` for one whose verdict permitted its findings,
+        // `ScanRecorded` under `enforcement: record`; no authority is
+        // introduced here that the sweep cannot also mint. The atomicity
         // invariant is the batch: a reader rebuilding the projection
         // from the event store MUST see `[ScanCompleted,
         // ArtifactReleased]` as one append, never a
@@ -489,27 +755,47 @@ impl QuarantineUseCase {
                 })
                 .unwrap_or(false);
 
-        // Tracks whether the inline release ACTUALLY fired (vs.
-        // candidacy alone). The post-commit metric + `info!` below gate
-        // on this, not on `fast_path_fires`, so a release suppressed by
-        // the provenance gate is not mis-reported.
-        let mut fast_path_released = false;
-        // Which scan-axis authority applies (ADR 0007). A clean scan
-        // mints `ScanSucceeded`; a `record`-mode verdict that carried
-        // violations must NOT — that authority asserts `finding_count
-        // == 0`, which is false here. `ScanRecorded` is its own audited
-        // authority so the release event and the `authority` log field
-        // say honestly which one released the artifact. Both carry the
-        // same provenance AND-precondition, re-verified inside
-        // `release`. This mirrors `resolve_release_authority`, which
-        // the sweep uses for the same artifact when the window has not
-        // yet elapsed at scan time.
-        let authority = if findings_recorded {
-            ReleaseAuthorization::ScanRecorded
-        } else {
-            ReleaseAuthorization::ScanSucceeded
-        };
-        if fast_path_fires {
+        // Which authority the inline release ACTUALLY committed under
+        // (vs. candidacy alone) — `None` until it fires. The post-commit
+        // metric + `info!` below read this, not `fast_path_fires`, so a
+        // release suppressed by the provenance gate is not mis-reported,
+        // and the logged `authority` is by construction the one the
+        // committed `ArtifactReleased` was authorized by.
+        let mut fast_path_released: Option<ReleaseAuthorization> = None;
+        // Which scan-axis authority applies (ADR 0007), decided by the
+        // SAME ladder the `release_expired` sweep uses — asked here of
+        // the batch this append is about to commit, which is the tail of
+        // the stream the sweep would have read one commit later, and of
+        // the resolved policy that produced the verdict inside it. One
+        // function, both paths: before it, this path had no waiver arm
+        // at all and ended at `unwrap_or(ScanRecorded)` while the
+        // sweep's ladder read the waiver ahead of its `record` arm, so
+        // the same artifact's release was audited under a token chosen
+        // by whether its scan finished after or inside its observation
+        // window.
+        //
+        // Each authority is its own audited statement, so the
+        // `authority` log field says which one released the artifact,
+        // and all of them carry the same provenance AND-precondition,
+        // re-verified inside `release`.
+        //
+        // `None` is unreachable from here, and fail-closed if that ever
+        // changes. This batch opens with its own `ScanCompleted` (pushed
+        // unconditionally above) and carries the verdict reached on it
+        // beside that, so the standing is `Clears` or `Holds` — never
+        // either no-verdict-to-read answer — and the rejecting verdict
+        // is a different function which never releases inline. A
+        // `Holds` standing here means the verdict blocked without
+        // rejecting, which only `enforcement: record` produces
+        // (`evaluate_scan_result` maps a blocking action under
+        // `reject`, and under the absent-policy default, to
+        // `ScanOutcome::Reject`), so the ladder's `record` arm answers
+        // for it.
+        let authority = scan_axis_release_authority(
+            scan_history::latest_scan_standing(events_vec.iter().map(|e| &e.event)),
+            ctx.policy.as_ref(),
+        );
+        if let (true, Some(authority)) = (fast_path_fires, authority) {
             // Release-predicate invariant preserved (ADR 0007 + ADR
             // 0027): the timer arm carries the SAME provenance
             // AND-precondition the `release_expired` sweep applies.
@@ -525,12 +811,13 @@ impl QuarantineUseCase {
                     events_vec.push(EventToAppend::new(DomainEvent::ArtifactReleased(
                         release_event,
                     )));
-                    fast_path_released = true;
+                    fast_path_released = Some(authority);
                 }
                 Err(_) => {
                     // Fail-closed (ADR 0007 + ADR 0027): the only way
                     // the predicate denies a `(Timer,
-                    // ScanSucceeded|ScanRecorded)` release from a
+                    // ScanSucceeded|ScanCleared|ScanRecorded)` release
+                    // from a
                     // `Quarantined` candidate is a `Pending` provenance
                     // clearance (Required mode, not yet verified).
                     // Suppress the inline release — the clean
@@ -597,7 +884,7 @@ impl QuarantineUseCase {
         // Gated on `fast_path_released` (the release actually fired),
         // NOT `fast_path_fires` (mere candidacy) — a release suppressed
         // by the provenance gate must not increment the counter.
-        if fast_path_released {
+        if let Some(authority) = fast_path_released {
             emit_release(values::REASON_TIMER);
             tracing::info!(
                 artifact_id = %ctx.artifact_id,
@@ -648,14 +935,20 @@ impl QuarantineUseCase {
     /// logs/metrics. Returns whether `ArtifactBecameVulnerable` was
     /// pushed (`became_vulnerable_pushed`).
     ///
-    /// A re-scan that re-derives a reject on an artifact ALREADY
-    /// terminal (`Rejected` / `Released`) is a recoverable, idempotent
-    /// re-scan: we still record the fresh `ScanCompleted` + findings
-    /// below (so a manual rescan refreshes the stored result instead of
-    /// silently doing nothing), but skip the duplicate `ArtifactRejected`
-    /// event and the score re-count. Propagating the already-terminal
+    /// A re-scan that re-derives a reject on an artifact the domain
+    /// refuses to transition — an already-`Rejected` one, or one an
+    /// operator explicitly released
+    /// ([`ReleaseOrigin::permits_scan_reblock`]) — is a recoverable,
+    /// idempotent re-scan: we still record the fresh `ScanCompleted` +
+    /// findings below (so a manual rescan refreshes the stored result
+    /// instead of silently doing nothing), but skip the
+    /// `ArtifactRejected` event and the score re-count. Propagating the
     /// invariant instead would fail the job and loop it forever (the
     /// original churn bug).
+    ///
+    /// A `Timer`- or `PolicyReEvaluation`-released artifact is NOT in
+    /// that set: the verdict re-blocks it on the ordinary
+    /// fresh-transition path.
     async fn handle_reject_verdict(
         &self,
         artifact: &mut Artifact,
@@ -671,29 +964,58 @@ impl QuarantineUseCase {
             .map(|v| v.message.clone())
             .unwrap_or_else(|| "policy evaluation rejected scan result".to_string());
 
-        // Transition to `Rejected`. A re-scan that re-derives a reject on
-        // an artifact ALREADY terminal (`Rejected` / `Released`) is a
-        // recoverable, idempotent re-scan: we still record the fresh
-        // `ScanCompleted` + findings below (so a manual rescan refreshes
-        // the stored result instead of silently doing nothing), but skip
-        // the duplicate `ArtifactRejected` event and the score re-count.
-        // Propagating the already-terminal invariant instead would fail
+        // Transition to `Rejected`. The domain refuses two different
+        // things here, and both are recoverable: an artifact already
+        // terminal for the scan axis (`Rejected` / `ScanIndeterminate`),
+        // and an artifact an operator explicitly released, whose
+        // decision outweighs this verdict
+        // (`ReleaseOrigin::permits_scan_reblock`). In both cases we still
+        // record the fresh `ScanCompleted` + findings below (so a manual
+        // rescan refreshes the stored result instead of silently doing
+        // nothing) and skip only the `ArtifactRejected` event and the
+        // score re-count. Propagating the invariant instead would fail
         // the job and loop it forever (the original churn bug).
+        //
+        // A `Released` artifact released by the TIMER or by a policy
+        // re-evaluation is no longer refused: the verdict re-blocks it,
+        // takes the fresh-transition path below, and sweeps the refcount
+        // rows and the upstream index exactly as a first-time reject
+        // does — the artifact genuinely stopped being servable.
         let already_terminal;
-        let reject_event = match artifact.reject_from_scan(reason) {
+        let reject_event = match artifact.reject_from_scan(reason, ctx.prior_release) {
             Ok(ev) => {
                 already_terminal = false;
                 Some(ev)
             }
             Err(DomainError::Invariant(msg)) => {
                 already_terminal = true;
-                tracing::debug!(
-                    artifact_id = %ctx.artifact_id,
-                    status = %artifact.quarantine_status,
-                    reason = %msg,
-                    "re-scan of already-terminal artifact: recording fresh \
-                     findings, skipping duplicate reject + score re-count"
-                );
+                // Which refusal was it? An operator reading this line has
+                // to be able to tell "a human released this artifact, so
+                // the scan does not get to block it" from "there was
+                // nothing left to transition". `Released` is an
+                // admissible source state now, so a refusal FROM
+                // `Released` can only be the operator protection — and
+                // the origin alone is not the discriminator, because an
+                // admin-released artifact that a curation rule later
+                // blocked is `Rejected`, i.e. already terminal.
+                if artifact.quarantine_status == QuarantineStatus::Released {
+                    tracing::debug!(
+                        artifact_id = %ctx.artifact_id,
+                        status = %artifact.quarantine_status,
+                        released_by = %ctx.prior_release,
+                        reason = %msg,
+                        "scan verdict withheld: an explicit operator release outweighs it; \
+                         recording fresh findings, skipping reject + score re-count"
+                    );
+                } else {
+                    tracing::debug!(
+                        artifact_id = %ctx.artifact_id,
+                        status = %artifact.quarantine_status,
+                        reason = %msg,
+                        "re-scan of already-terminal artifact: recording fresh \
+                         findings, skipping duplicate reject + score re-count"
+                    );
+                }
                 None
             }
             Err(e) => return Err(AppError::Domain(e)),
@@ -853,7 +1175,10 @@ impl QuarantineUseCase {
     ///    CAS via [`StoragePort::put`] → `findings_blob` hash.
     /// 7. Build the event batch:
     ///    - `ScanCompleted` always.
-    ///    - `PolicyEvaluated(Fail) + ArtifactRejected` on Reject.
+    ///    - `PolicyEvaluated` always — exactly one per verdict,
+    ///      `Fail` (carrying the violations) when the verdict recorded
+    ///      violations, `Pass` (empty violations) when it did not.
+    ///    - `ArtifactRejected` beside that `Fail` on Reject.
     ///    - `ArtifactBecameVulnerable` when a prior scan existed AND
     ///      the delta is non-empty.
     /// 8. Atomically persist via the lifecycle port's
@@ -986,13 +1311,16 @@ impl QuarantineUseCase {
         // `NotRequired` for `provenance_mode ∈ {Off, VerifyIfPresent}`;
         // under `Required`, `Cleared` iff a `ProvenanceVerified` is on
         // the stream, else `Pending` (fail-closed).
-        let fast_path_provenance = provenance_clearance_from(
-            stream,
-            policy
-                .as_ref()
-                .map(|p| p.provenance_mode)
-                .unwrap_or_default(),
-        );
+        let fast_path_provenance =
+            provenance_clearance_from(stream, provenance_mode_of(policy.as_ref()));
+
+        // Who last released this artifact — read off the SAME paired
+        // stream, for the same reason the provenance leg above is. A
+        // `Released` artifact is re-blockable by this verdict iff that
+        // release was automatic; an explicit Admin/Curator release
+        // outweighs it. The domain applies the rule
+        // (`ReleaseOrigin::permits_scan_reblock`); this is only the read.
+        let prior_release = scan_history::latest_release_origin(stream);
 
         let mut artifact = paired.into_artifact();
 
@@ -1069,6 +1397,7 @@ impl QuarantineUseCase {
             policy,
             sbom,
             fast_path_provenance,
+            prior_release,
         };
 
         // `became_vulnerable_pushed` mirrors the bool returned by
@@ -1388,120 +1717,54 @@ impl QuarantineUseCase {
         Ok(matches!(clearance, ProvenanceClearance::Pending))
     }
 
-    /// Timer-release authority resolution (ADR 0007).
+    /// Timer-release authority resolution for the `release_expired`
+    /// sweep (ADR 0007) — the **fact-gathering** half of the gate.
     ///
-    /// Construct the timer-release authority for a candidate, **fail
-    /// closed**. The candidacy filter (`quarantine_until <= now()`) is
-    /// the *caller's* concern and is NEVER consulted here — this helper
-    /// looks only at the artifact's event stream and resolved scan policy,
-    /// so expiry can never become a release authority.
+    /// Reads the two facts [`scan_axis_release_authority`] decides from
+    /// and hands them to it; the ladder itself, its order and its
+    /// fail-closed `None` all live there, shared with the scan-time
+    /// inline fast path in [`Self::record_scan_result`]. This method
+    /// adds nothing to the decision, which is the point: the candidacy
+    /// filter (`quarantine_until <= now()`) is the *caller's* concern
+    /// and is NEVER consulted on either side of the split, so expiry can
+    /// never become a release authority.
     ///
-    /// `stream` is the artifact's **complete** event stream, read by the
-    /// caller through
+    /// `persisted` is the artifact's **complete** event stream, read by
+    /// the caller through
     /// [`read_artifact_stream`](crate::use_cases::read_artifact_stream).
-    /// Completeness is load-bearing for both halves of step 1 below: over
-    /// an oldest-prefix of the stream, "the latest `ScanCompleted`" is a
-    /// superseded verdict and the `ArtifactRejected` that condemned the
-    /// artifact sits in the part that was not read, so a stale clean scan
-    /// would mint `ScanSucceeded` for a rejected artifact. Taking the
-    /// stream as a parameter also keeps the sweep at one read per
-    /// candidate for this gate, and puts the refusal of an unreadable
-    /// stream at the one place that can skip the candidate without
-    /// abandoning the rest of the pass.
+    /// Completeness is load-bearing for both halves of the ladder's step
+    /// 1: over an oldest-prefix of the stream, "the latest
+    /// `ScanCompleted`" is a superseded verdict and the
+    /// `ArtifactRejected` that condemned the artifact sits in the part
+    /// that was not read, so a stale clean scan would mint
+    /// `ScanSucceeded` for a rejected artifact. Taking the stream as a
+    /// parameter also keeps the sweep at one read per candidate for this
+    /// gate, and puts the refusal of an unreadable stream at the one
+    /// place that can skip the candidate without abandoning the rest of
+    /// the pass.
     ///
-    /// Order:
-    /// 1. A **successful** [`DomainEvent::ScanCompleted`] on the artifact
-    ///    stream ⇒ [`ReleaseAuthorization::ScanSucceeded`]. "Successful"
-    ///    (issue #108 H3 / ADR 0007) means: the LATEST `ScanCompleted` on
-    ///    the stream carries `finding_count == 0`, AND no
-    ///    `ArtifactRejected` appears LATER on the stream than that
-    ///    `ScanCompleted`. Mere *presence* of a `ScanCompleted` is NOT
-    ///    sufficient — the rejecting-scan branch of `record_scan_result`
-    ///    ALSO emits `ScanCompleted` (with `finding_count > 0`), first in
-    ///    its batch, immediately before the `ArtifactRejected` that makes
-    ///    the verdict terminal. A presence-only check would treat that
-    ///    dirty scan's own rejection record as a release authority for
-    ///    the very artifact it just condemned. (Terminal scanner
-    ///    *execution* failure is a different event, `ScanIndeterminate`
-    ///    — that one genuinely never satisfies this predicate, since it
-    ///    isn't a `ScanCompleted` at all; the conflation this comment
-    ///    used to make was between "the scanner ran" and "the artifact
-    ///    passed", not between execution failure and success.)
-    /// 2. Else, resolve the artifact's `ScanPolicy`; if it exists AND
-    ///    `scan_backends == []` (operator declared this scope unscanned)
-    ///    ⇒ [`ReleaseAuthorization::ScanWaived`].
-    /// 3. Else, if the resolved policy declares `enforcement: record`
-    ///    AND a `ScanCompleted` exists on the artifact stream with no
-    ///    later `ArtifactRejected` ⇒
-    ///    [`ReleaseAuthorization::ScanRecorded`]. The scan ran and its
-    ///    dirty verdict is recorded rather than gating. The
-    ///    `ScanCompleted`-must-exist clause is load-bearing: it keeps
-    ///    quarantine invariant 2 (a never-successfully-scanned artifact
-    ///    never releases on the timer alone) true under `record` too —
-    ///    the mode un-gates the *verdict*, never the *observation*.
-    /// 4. Else ⇒ `None` — no authority is constructible; the candidate
-    ///    stays quarantined. An *absent* policy is **not** a waiver:
-    ///    `DefaultPolicy` governs an unconfigured repo and it scans
-    ///    (never auto-release a never-successfully-scanned
-    ///    artifact).
-    async fn resolve_release_authority(
-        &self,
+    /// `policy` is the **caller's** resolved active policy, not one
+    /// read here: `release_expired` resolves it once per candidate and
+    /// hands the same answer to this gate and to the provenance leg,
+    /// which is what keeps the sweep at one
+    /// [`resolve_active_policy_for_repo`] per candidate — one fewer
+    /// than before the two gates shared it, and pinned by
+    /// `release_expired_resolves_the_policy_once_per_candidate`.
+    ///
+    /// What is deliberately NOT done is resolving it lazily, on the
+    /// arms that read it. The ladder is a pure function of (standing,
+    /// policy); deciding whether one of its inputs will be needed
+    /// before calling it means asking a copy of step 1's question
+    /// outside the ladder, which is exactly the second decision site
+    /// this split exists to remove. Taking the policy as a parameter
+    /// is what makes the unconditional read cheap instead of a cost to
+    /// be avoided.
+    fn resolve_release_authority(
         persisted: &[PersistedEvent],
-        repository_id: Uuid,
-    ) -> AppResult<Option<ReleaseAuthorization>> {
-        // The LATEST ScanCompleted's index (stream order — `read_stream`
-        // returns ascending `stream_position`), so "no ArtifactRejected
-        // later than it" can be checked over exactly the suffix after it.
-        let latest_scan_completed =
-            persisted
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(idx, e)| match &e.event {
-                    DomainEvent::ScanCompleted(sc) => Some((idx, sc)),
-                    _ => None,
-                });
-        if let Some((idx, scan_completed)) = latest_scan_completed {
-            let rejected_after = persisted[idx + 1..]
-                .iter()
-                .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_)));
-            if scan_completed.finding_count == 0 && !rejected_after {
-                return Ok(Some(ReleaseAuthorization::ScanSucceeded));
-            }
-        }
-
-        let policy =
-            resolve_active_policy_for_repo(&*self.policy_projections, repository_id).await?;
-        if matches!(policy.as_ref(), Some(p) if p.scan_backends.is_empty()) {
-            return Ok(Some(ReleaseAuthorization::ScanWaived));
-        }
-
-        // Step 3 — `enforcement: record`. The artifact WAS scanned and
-        // its latest verdict is dirty, so step 1 could not mint
-        // `ScanSucceeded`; the operator has nonetheless declared that a
-        // scan verdict does not gate publication for this scope. Both
-        // facts are required: a `ScanCompleted` must exist on the
-        // artifact's own stream (a never-scanned artifact is NEVER
-        // released by this arm — quarantine invariant 2 is untouched by
-        // the enforcement mode), and no `ArtifactRejected` may appear
-        // later than it (a curation- or provenance-rejected artifact is
-        // not un-blocked by a scan-axis authority).
-        let record_mode = matches!(
-            policy.as_ref(),
-            Some(p) if p.enforcement == ScanEnforcement::Record
-        );
-        if record_mode {
-            if let Some((idx, _)) = latest_scan_completed {
-                let rejected_after = persisted[idx + 1..]
-                    .iter()
-                    .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_)));
-                if !rejected_after {
-                    return Ok(Some(ReleaseAuthorization::ScanRecorded));
-                }
-            }
-        }
-
-        Ok(None)
+        policy: Option<&ScanPolicyProjection>,
+    ) -> Option<ReleaseAuthorization> {
+        let standing = scan_history::latest_scan_standing(persisted.iter().map(|e| &e.event));
+        scan_axis_release_authority(standing, policy)
     }
 
     /// Compute the provenance side of the
@@ -1543,33 +1806,30 @@ impl QuarantineUseCase {
     }
 
     /// Same clearance, decided over a stream the caller already paired
-    /// with the version its append will carry.
+    /// with the version its append will carry, and over the policy the
+    /// caller already resolved.
     ///
     /// This is the form every release-gating caller in this use case
-    /// uses; [`Self::read_path_provenance_clearance`] keeps the read in
+    /// uses — both of them pure, both fed the same two facts, which is
+    /// why neither reads a port;
+    /// [`Self::read_path_provenance_clearance`] keeps the reads in
     /// front of it for the read-path candidacy check, which appends
     /// nothing and so has no version to be consistent with.
-    async fn provenance_clearance_for(
-        &self,
+    fn provenance_clearance_for(
         stream: &[PersistedEvent],
-        repository_id: Uuid,
-    ) -> AppResult<ProvenanceClearance> {
-        Ok(provenance_clearance_from(
-            stream,
-            self.provenance_mode_for(repository_id).await?,
-        ))
+        policy: Option<&ScanPolicyProjection>,
+    ) -> ProvenanceClearance {
+        provenance_clearance_from(stream, provenance_mode_of(policy))
     }
 
     /// The repository's effective [`ProvenanceMode`] — the resolved
     /// active policy's, or the default when no policy applies.
     async fn provenance_mode_for(&self, repository_id: Uuid) -> AppResult<ProvenanceMode> {
-        Ok(
+        Ok(provenance_mode_of(
             resolve_active_policy_for_repo(&*self.policy_projections, repository_id)
                 .await?
-                .as_ref()
-                .map(|p| p.provenance_mode)
-                .unwrap_or_default(),
-        )
+                .as_ref(),
+        ))
     }
 
     /// Admin override: release a quarantined artifact regardless of scan results.
@@ -1703,11 +1963,24 @@ impl QuarantineUseCase {
     /// when the application layer can prove a release authority for the
     /// candidate:
     ///
-    /// - a successful `ScanCompleted` exists on the artifact stream ⇒
+    /// - the artifact's latest `ScanCompleted` found nothing and
+    ///   nothing has rejected it since ⇒
     ///   [`ReleaseAuthorization::ScanSucceeded`], OR
-    /// - the resolved `ScanPolicy` has `scan_backends == []` (scanning
-    ///   explicitly waived by operator policy) ⇒
+    /// - that scan found things and the verdict recorded beside it did
+    ///   not block them ⇒ [`ReleaseAuthorization::ScanCleared`], OR
+    /// - the scan observation stands and the resolved policy declares
+    ///   `enforcement: record` ⇒
+    ///   [`ReleaseAuthorization::ScanRecorded`], OR
+    /// - the artifact has never been scanned at all AND the resolved
+    ///   `ScanPolicy` has `scan_backends == []` (scanning explicitly
+    ///   waived by operator policy) ⇒
     ///   [`ReleaseAuthorization::ScanWaived`].
+    ///
+    /// Listed in [`scan_axis_release_authority`]'s order. The last two
+    /// no longer describe any artifact in common — a waiver authorizes
+    /// nothing where a scan observation stands — so the token a release
+    /// is audited under follows from the evidence alone, never from
+    /// which arm a reader happened to put first.
     ///
     /// Otherwise **no authority is constructed and the artifact stays
     /// quarantined** — the candidate is skipped, the sweep continues.
@@ -1788,15 +2061,28 @@ impl QuarantineUseCase {
             let prior_status = paired.artifact().quarantine_status;
             let repository_id = paired.artifact().repository_id;
 
+            // The candidate's resolved policy, read ONCE and handed to
+            // both release gates below. Both are pure functions of
+            // (stream, policy) — the provenance leg reads
+            // `provenance_mode`, the scan-axis ladder reads
+            // `enforcement` and `scan_backends` — so a second read
+            // could only ever return the same answer at the cost of
+            // another `list_active`, and a policy committing between
+            // the two reads would have the gates deciding one
+            // candidate under two different policies. Mirrors the
+            // inline fast path in `record_scan_result`, which resolves
+            // one policy and feeds its verdict, its provenance leg and
+            // its ladder from it.
+            let policy =
+                resolve_active_policy_for_repo(&*self.policy_projections, repository_id).await?;
+
             // Compute the provenance side of
             // the gate per candidate (ADR 0027), BEFORE the release-authority
             // guard below. `NotRequired` for Off/VerifyIfPresent; `Required`
             // → `Cleared` iff a `ProvenanceVerified` event exists, else
             // `Pending` (fail-closed — denies the timer arm). This
             // computation does not depend on release authority.
-            let provenance = self
-                .provenance_clearance_for(persisted, repository_id)
-                .await?;
+            let provenance = Self::provenance_clearance_for(persisted, policy.as_ref());
 
             // S4 — terminal decision at window expiry (design §2 S4).
             //
@@ -1901,10 +2187,7 @@ impl QuarantineUseCase {
             // authority, fail-closed (ADR 0007). No authority ⇒ skip; the
             // artifact stays quarantined. quarantine_until is
             // candidacy-only and is never consulted here.
-            let Some(authz) = self
-                .resolve_release_authority(persisted, repository_id)
-                .await?
-            else {
+            let Some(authz) = Self::resolve_release_authority(persisted, policy.as_ref()) else {
                 // Counted only when provenance already cleared — one of
                 // the two provenance buckets has claimed this candidate
                 // otherwise, and the three counts are mutually exclusive
@@ -2620,19 +2903,39 @@ mod tests {
         events.set_stream(&stream_id, vec![quarantined, scan_completed]);
     }
 
-    /// Build a `ScanCompleted` [`PersistedEvent`] at `position` —
-    /// `finding_count == 0` is the clean/successful shape,
-    /// `finding_count > 0` is the dirty shape a rejecting scan ALSO
+    /// Build a `ScanCompleted` [`PersistedEvent`] at `position`
+    /// carrying `severity` — a zero summary is the clean/successful
+    /// shape, anything else is the dirty shape a rejecting scan ALSO
     /// emits (first in its batch, before the paired `ArtifactRejected`).
-    /// Shared by the issue #108 H3 authority-derivation matrix tests
-    /// below, which (unlike [`seed_stream_with_scan_completed`]) need
-    /// full control over which events land at which position.
+    /// Shared by the authority-derivation matrix tests below, which
+    /// (unlike [`seed_stream_with_scan_completed`]) need full control
+    /// over which events land at which position.
+    ///
+    /// **The per-tier counts are the input and `finding_count` is their
+    /// sum**, which is what [`ScanCompleted::validate`] requires and
+    /// what makes "three findings" and "three CRITICAL findings"
+    /// different statements. This fixture used to take a bare count and
+    /// set `critical: u32::from(count > 0)`: every non-zero call site
+    /// therefore described a BLOCKING scan — so "findings present, none
+    /// above the threshold" had no representation in the corpus at all
+    /// — and the event it built claimed `finding_count: 3` over a
+    /// one-finding summary, a `ScanCompleted` no producer in the system
+    /// could ever append.
     fn scan_completed_event(
         artifact_id: Uuid,
         position: u64,
-        finding_count: u32,
+        severity: SeveritySummary,
     ) -> PersistedEvent {
         let stream_id = StreamId::artifact(artifact_id);
+        // The sum, not a separately-supplied count: `ScanCompleted`
+        // rejects any event where the two disagree, so deriving it is
+        // what keeps this fixture inside the shapes production can
+        // actually append.
+        let finding_count = severity.critical
+            + severity.high
+            + severity.medium
+            + severity.low
+            + severity.negligible;
         PersistedEvent {
             event_id: Uuid::new_v4(),
             stream_id,
@@ -2642,13 +2945,7 @@ mod tests {
                 artifact_id,
                 scanner: "trivy".into(),
                 finding_count,
-                severity_summary: SeveritySummary {
-                    critical: u32::from(finding_count > 0),
-                    high: 0,
-                    medium: 0,
-                    low: 0,
-                    negligible: 0,
-                },
+                severity_summary: severity,
                 findings_blob: if finding_count > 0 {
                     Some("f".repeat(64).parse().unwrap())
                 } else {
@@ -2687,10 +2984,30 @@ mod tests {
         }
     }
 
+    /// The sweep's scan-axis answer for one stream, resolved the way
+    /// [`QuarantineUseCase::release_expired`] resolves it: the active
+    /// policy for the repository, then the ladder. Both inputs are
+    /// stated here rather than hidden behind a method that reads the
+    /// port, because the sweep no longer has one — its loop body
+    /// resolves the policy once and feeds both release gates from it.
+    async fn sweep_release_authority(
+        projections: &Arc<MockPolicyProjectionRepository>,
+        stream: &[PersistedEvent],
+        repository_id: Uuid,
+    ) -> Option<ReleaseAuthorization> {
+        let policy = resolve_active_policy_for_repo(&**projections, repository_id)
+            .await
+            .expect("the mock projection repository resolves");
+        QuarantineUseCase::resolve_release_authority(stream, policy.as_ref())
+    }
+
     /// Seed an active repo-scoped policy whose
     /// `scan_backends` is empty: the operator declared this repo
     /// un-scanned by design. `release_expired` resolves this policy and
-    /// constructs `ReleaseAuthorization::ScanWaived`.
+    /// constructs `ReleaseAuthorization::ScanWaived` — for a candidate
+    /// with no `ScanCompleted` on its stream. The waiver is half of
+    /// that token's premise, never all of it, so a test that also seeds
+    /// a scan is seeding a candidate this policy does NOT release.
     fn seed_scan_waived_policy(
         projections: &Arc<MockPolicyProjectionRepository>,
         repository_id: Uuid,
@@ -2771,6 +3088,53 @@ mod tests {
             added_by_actor_id: None,
             expires_at: None,
         }
+    }
+
+    /// Assert the leading pair of a non-rejecting verdict's batch:
+    /// `ScanCompleted` first, then the one `PolicyEvaluated(Pass)` the
+    /// verdict produced. The two always ride the SAME append — a reader
+    /// rebuilding the projection never sees a scan whose verdict has
+    /// not landed. Returns whatever follows (the fast-path
+    /// `ArtifactReleased`, when it fired) so the caller asserts its own
+    /// tail; an empty slice means the verdict pair was the whole batch.
+    ///
+    /// Not for a RE-scan that delta-detected new findings: there an
+    /// `ArtifactBecameVulnerable` is pushed between the two and the
+    /// pair is no longer adjacent. Every caller below is a first scan.
+    fn assert_passing_verdict_prefix(events: &[EventToAppend]) -> &[EventToAppend] {
+        let shape = || {
+            events
+                .iter()
+                .map(|e| e.event.event_type())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            events.len() >= 2,
+            "expected at least ScanCompleted + PolicyEvaluated(Pass), got {:?}",
+            shape()
+        );
+        assert!(
+            matches!(&events[0].event, DomainEvent::ScanCompleted(_)),
+            "ScanCompleted must be the batch's first event, got {:?}",
+            shape()
+        );
+        let DomainEvent::PolicyEvaluated(p) = &events[1].event else {
+            panic!(
+                "a non-rejecting verdict appends its PolicyEvaluated beside the \
+                 ScanCompleted it was reached on, got {:?}",
+                shape()
+            );
+        };
+        assert_eq!(
+            p.result,
+            PolicyResult::Pass,
+            "a verdict that recorded no violations passed"
+        );
+        assert!(
+            p.violations.is_empty(),
+            "a passing verdict records no violations"
+        );
+        &events[2..]
     }
 
     // -- Tests ----------------------------------------------------------------
@@ -3121,6 +3485,389 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // An automatic release is re-blockable; an explicit one is not.
+    //
+    // The scan axis may re-block an artifact the TIMER (or a policy
+    // re-evaluation) released, and may never re-block one an Admin or
+    // Curator released on purpose. `record_scan_result` resolves who
+    // released the artifact from the same paired stream its append is
+    // versioned against; `Artifact::reject_from_scan` applies the rule.
+    // -----------------------------------------------------------------
+
+    /// Build an `ArtifactReleased` [`PersistedEvent`] at `position`,
+    /// honouring the event's variant invariant (an operator release
+    /// carries attribution; a system-driven one must not).
+    fn released_event(artifact_id: Uuid, position: u64, reason: ReleaseReason) -> PersistedEvent {
+        let operator = matches!(reason, ReleaseReason::Admin | ReleaseReason::Curator);
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(artifact_id),
+            stream_position: position,
+            global_position: position + 1,
+            event: DomainEvent::ArtifactReleased(hort_domain::events::ArtifactReleased {
+                artifact_id,
+                released_by: reason,
+                released_by_user_id: operator.then(Uuid::new_v4),
+                justification: operator.then(|| "operator override".to_string()),
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
+    /// Seed a `Released` artifact + its repo + an enforcing repo-scoped
+    /// policy (threshold `High`, so a single CRITICAL finding breaches
+    /// it), and a stream whose tail is the `ArtifactReleased{reason}`
+    /// that put it there. The shape every artifact in a released
+    /// population has.
+    fn seed_released_artifact(
+        artifacts: &Arc<MockArtifactRepository>,
+        repositories: &Arc<MockRepositoryRepository>,
+        projections: &Arc<MockPolicyProjectionRepository>,
+        events: &Arc<MockEventStore>,
+        reason: ReleaseReason,
+    ) -> Uuid {
+        let artifact_id =
+            seed_artifact_with_repo(artifacts, repositories, QuarantineStatus::Released);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::High,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                released_event(artifact_id, 1, reason),
+            ],
+        );
+        artifact_id
+    }
+
+    /// One CRITICAL finding — over the seeded `High` threshold.
+    fn one_critical_finding() -> Vec<Finding> {
+        findings_from_summary(&SeveritySummary {
+            critical: 1,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        })
+    }
+
+    /// Acceptance: a `Timer`-released artifact whose next scan breaches
+    /// the threshold is BLOCKED. Nobody reviewed this artifact — the
+    /// window merely elapsed — so the first blocking verdict reached on
+    /// it is the first judgement anyone has made, and it stands.
+    #[tokio::test]
+    async fn record_scan_result_re_blocks_a_timer_released_artifact() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id = seed_released_artifact(
+            &artifacts,
+            &repositories,
+            &projections,
+            &events,
+            ReleaseReason::Timer,
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            one_critical_finding(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved_artifact, batch, _metadata) = &transitions[0];
+        assert_eq!(
+            saved_artifact.quarantine_status,
+            QuarantineStatus::Rejected,
+            "a timer-released artifact must be re-blocked by an over-threshold verdict"
+        );
+        assert_eq!(
+            saved_artifact.rejection_reason,
+            Some(hort_domain::events::RejectionReason::Scanner)
+        );
+        let rejected = batch
+            .events
+            .iter()
+            .find_map(|e| match &e.event {
+                DomainEvent::ArtifactRejected(r) => Some(r),
+                _ => None,
+            })
+            .expect("the re-block must append the scan axis's own ArtifactRejected");
+        assert_eq!(
+            rejected.rejected_by,
+            hort_domain::events::RejectionReason::Scanner,
+            "the re-block is a scan-axis rejection, carrying the scanner reason"
+        );
+        assert!(
+            !rejected.reason.is_empty(),
+            "the event must carry the violation message the verdict produced"
+        );
+    }
+
+    /// Acceptance: a `PolicyReEvaluation`-released artifact is blocked.
+    /// The deliberate reading — the pass re-judged the artifact under
+    /// the evidence of its day, it did not absolve it.
+    #[tokio::test]
+    async fn record_scan_result_re_blocks_a_policy_reevaluation_released_artifact() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id = seed_released_artifact(
+            &artifacts,
+            &repositories,
+            &projections,
+            &events,
+            ReleaseReason::PolicyReEvaluation,
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            one_critical_finding(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        let (saved_artifact, batch, _metadata) = &transitions[0];
+        assert_eq!(saved_artifact.quarantine_status, QuarantineStatus::Rejected);
+        assert!(batch
+            .events
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_))));
+    }
+
+    /// Acceptance: an `Admin`-released artifact is NOT blocked by the
+    /// same scan — the explicit operator decision outweighs the verdict.
+    /// The fresh evidence is still recorded: the `ScanCompleted` and the
+    /// `PolicyEvaluated(Fail)` commit exactly as on a reject, and only
+    /// the transition is withheld.
+    #[tokio::test]
+    async fn record_scan_result_does_not_re_block_an_admin_released_artifact() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id = seed_released_artifact(
+            &artifacts,
+            &repositories,
+            &projections,
+            &events,
+            ReleaseReason::Admin,
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            one_critical_finding(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved_artifact, batch, _metadata) = &transitions[0];
+        assert_eq!(
+            saved_artifact.quarantine_status,
+            QuarantineStatus::Released,
+            "an explicit admin release outweighs every later scan verdict"
+        );
+        assert!(
+            !batch
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_))),
+            "no ArtifactRejected may be appended for a protected artifact"
+        );
+        // The evidence is recorded regardless — the verdict is withheld,
+        // not the scan result.
+        assert!(matches!(
+            &batch.events[0].event,
+            DomainEvent::ScanCompleted(_)
+        ));
+        let DomainEvent::PolicyEvaluated(p) = &batch.events[1].event else {
+            panic!("expected PolicyEvaluated as the second event");
+        };
+        assert_eq!(p.result, PolicyResult::Fail);
+        assert!(!p.violations.is_empty());
+    }
+
+    /// Acceptance: a `Curator`-released artifact is NOT blocked either —
+    /// `Permission::Curate` is the other explicit human release.
+    #[tokio::test]
+    async fn record_scan_result_does_not_re_block_a_curator_released_artifact() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id = seed_released_artifact(
+            &artifacts,
+            &repositories,
+            &projections,
+            &events,
+            ReleaseReason::Curator,
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            one_critical_finding(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        let (saved_artifact, batch, _metadata) = &transitions[0];
+        assert_eq!(saved_artifact.quarantine_status, QuarantineStatus::Released);
+        assert!(!batch
+            .events
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_))));
+    }
+
+    /// A `Released` artifact whose stream carries NO `ArtifactReleased`
+    /// records no operator decision to honour, so the verdict blocks it.
+    /// (The release-side mirror of D6's illegal state; blocking is also
+    /// the fail-closed direction on a serving gate.)
+    #[tokio::test]
+    async fn record_scan_result_re_blocks_a_released_artifact_with_no_release_event() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Released);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::High,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![dummy_persisted_event(&stream_id, artifact_id, 0)],
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            one_critical_finding(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (saved_artifact, batch, _metadata) = &lifecycle.committed_transitions()[0];
+        assert_eq!(saved_artifact.quarantine_status, QuarantineStatus::Rejected);
+        assert!(batch
+            .events
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_))));
+    }
+
+    /// The protection follows the LATEST release: an artifact the timer
+    /// released, a curation rule re-blocked and an admin then released
+    /// again is protected by the admin's decision.
+    #[tokio::test]
+    async fn record_scan_result_honours_the_latest_release_not_the_first() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Released);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::High,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                released_event(artifact_id, 1, ReleaseReason::Timer),
+                rejected_event(artifact_id, 2),
+                released_event(artifact_id, 3, ReleaseReason::Admin),
+            ],
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            one_critical_finding(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (saved_artifact, batch, _metadata) = &lifecycle.committed_transitions()[0];
+        assert_eq!(
+            saved_artifact.quarantine_status,
+            QuarantineStatus::Released,
+            "the admin release that came after the timer release is the one that governs"
+        );
+        assert!(!batch
+            .events
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_))));
+    }
+
+    /// A `Rejected` artifact is still refused whatever its stream says
+    /// about an earlier automatic release: the state row forbids it, the
+    /// fresh findings are recorded, and no duplicate `ArtifactRejected`
+    /// is appended.
+    #[tokio::test]
+    async fn record_scan_result_still_refuses_an_already_rejected_artifact() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Rejected);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::High,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                released_event(artifact_id, 1, ReleaseReason::Timer),
+                rejected_event(artifact_id, 2),
+            ],
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            one_critical_finding(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (saved_artifact, batch, _metadata) = &lifecycle.committed_transitions()[0];
+        assert_eq!(saved_artifact.quarantine_status, QuarantineStatus::Rejected);
+        assert!(
+            !batch
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_))),
+            "an already-terminal re-scan records the findings and skips the duplicate reject"
+        );
+        assert!(matches!(
+            &batch.events[0].event,
+            DomainEvent::ScanCompleted(_)
+        ));
+    }
+
+    // -----------------------------------------------------------------
     // `enforcement: record` — the scan-result path.
     //
     // Same evidence, same verdict, same audit event; only the
@@ -3336,11 +4083,21 @@ mod tests {
             .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_))),);
     }
 
-    /// A CLEAN scan under `enforcement: record` is still clean — no
-    /// `PolicyEvaluated` is appended for a verdict with no violations,
-    /// so `record` does not spam the audit trail on the happy path.
+    /// A scan with findings none of which breach the threshold, under
+    /// `enforcement: record`: the verdict carries no violations, so the
+    /// batch is `ScanCompleted` + `PolicyEvaluated(Pass)` — the same
+    /// verdict event the `Fail` path appends, with the same policy
+    /// attribution and an empty violation list.
+    ///
+    /// This test previously asserted the OPPOSITE — that a clean verdict
+    /// appends no `PolicyEvaluated` "so `record` does not spam the audit
+    /// trail on the happy path". That absence was the defect, not the
+    /// behaviour: a reader of the stream could not tell a scan whose
+    /// verdict passed from a scan whose verdict was never reached, which
+    /// is what forced the release gate to re-derive the decision from
+    /// `ScanCompleted.finding_count`.
     #[tokio::test]
-    async fn record_scan_result_record_enforcement_clean_scan_emits_no_policy_evaluated() {
+    async fn record_scan_result_record_enforcement_clean_scan_emits_policy_evaluated_pass() {
         let (uc, artifacts, _events, lifecycle, repositories, projections) = make_use_case();
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
@@ -3351,6 +4108,7 @@ mod tests {
         );
         policy.enforcement = ScanEnforcement::Record;
         policy.quarantine_duration_secs = 24 * 3600;
+        let policy_id = policy.policy_id;
         projections.insert(policy);
 
         // A `high` finding under a Critical threshold — below the bar,
@@ -3373,18 +4131,196 @@ mod tests {
         .unwrap();
 
         let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
         let (saved_artifact, batch, _metadata) = &transitions[0];
-        assert!(
-            !batch
-                .events
-                .iter()
-                .any(|e| matches!(e.event, DomainEvent::PolicyEvaluated(_))),
-            "a clean verdict appends no PolicyEvaluated, in either enforcement mode"
+        // The verdict rides the SAME batch as the `ScanCompleted` it
+        // was reached on — a reader rebuilding the projection never
+        // sees a scan whose verdict has not landed yet.
+        assert_eq!(
+            batch.events.len(),
+            2,
+            "expected ScanCompleted + PolicyEvaluated(Pass), got {:?}",
+            batch.events.iter().map(|e| &e.event).collect::<Vec<_>>()
         );
+        // `ScanCompleted` is untouched by the verdict record: it still
+        // counts ALL findings, including the ones that did not block.
+        // The verdict sits beside the count, it does not reinterpret it.
+        let DomainEvent::ScanCompleted(scan) = &batch.events[0].event else {
+            panic!("expected ScanCompleted as the first event");
+        };
+        assert_eq!(scan.finding_count, 1);
+        assert_eq!(scan.severity_summary.high, 1);
+        let DomainEvent::PolicyEvaluated(p) = &batch.events[1].event else {
+            panic!("expected PolicyEvaluated as the second event");
+        };
+        assert_eq!(p.artifact_id, artifact_id);
+        assert_eq!(
+            p.result,
+            PolicyResult::Pass,
+            "findings below the threshold mean the verdict passed"
+        );
+        assert!(
+            p.violations.is_empty(),
+            "a passing verdict records no violations"
+        );
+        // Same policy attribution the `Fail` path carries: the policy
+        // that actually governed the decision, not a sentinel.
+        assert_eq!(p.policy_id, policy_id);
         assert_eq!(
             saved_artifact.quarantine_status,
             QuarantineStatus::Quarantined
         );
+    }
+
+    /// A scan with NO findings at all also appends
+    /// `PolicyEvaluated(Pass)`. "The verdict was reached and nothing
+    /// blocked" is the same statement whether the finding list was
+    /// empty or merely harmless, so the empty list is not special-cased
+    /// — and the release gate therefore reads one verdict shape rather
+    /// than inferring one from an absence.
+    ///
+    /// No operator policy resolves here, which also pins the `Pass`
+    /// path's attribution on the fallback: `NO_POLICY`, the same
+    /// sentinel the reject path writes when the evaluator fell back to
+    /// `DefaultPolicy`.
+    #[tokio::test]
+    async fn record_scan_result_clean_scan_emits_policy_evaluated_pass() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved_artifact, batch, _metadata) = &transitions[0];
+        assert_eq!(
+            batch.events.len(),
+            2,
+            "expected ScanCompleted + PolicyEvaluated(Pass), got {:?}",
+            batch.events.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            &batch.events[0].event,
+            DomainEvent::ScanCompleted(_)
+        ));
+        let DomainEvent::PolicyEvaluated(p) = &batch.events[1].event else {
+            panic!("expected PolicyEvaluated as the second event");
+        };
+        assert_eq!(p.artifact_id, artifact_id);
+        assert_eq!(p.result, PolicyResult::Pass);
+        assert!(p.violations.is_empty());
+        assert_eq!(p.policy_id, NO_POLICY);
+        // `ScanCompleted` is untouched by this verdict record: the
+        // finding count still counts findings and nothing else.
+        let DomainEvent::ScanCompleted(scan) = &batch.events[0].event else {
+            unreachable!("asserted above");
+        };
+        assert_eq!(scan.finding_count, 0);
+        // A passing verdict does not transition the artifact; the
+        // observation window is still open (default 24h against a
+        // just-now anchor), so the inline release does not fire either.
+        assert_eq!(
+            saved_artifact.quarantine_status,
+            QuarantineStatus::Quarantined
+        );
+    }
+
+    /// The one-verdict-one-event invariant, asserted across the whole
+    /// verdict space in one place: every scan outcome —
+    /// `Clean` / `FindingsRecorded` / `Reject` — commits EXACTLY one
+    /// `PolicyEvaluated`, never zero and never two. Items downstream of
+    /// this (the release-authority derivation) read that event as the
+    /// record of the decision, so a path that skips it or doubles it is
+    /// a defect regardless of what the rest of the batch looks like.
+    #[tokio::test]
+    async fn record_scan_result_appends_exactly_one_policy_evaluated_per_verdict() {
+        // (threshold, enforcement, severity, expected verdict) — one row
+        // per `ScanOutcome` variant the evaluator can produce.
+        let cases = [
+            // No findings → Clean → Pass.
+            (
+                SeverityThreshold::Critical,
+                ScanEnforcement::Reject,
+                0,
+                PolicyResult::Pass,
+            ),
+            // One critical under a Critical threshold, `record` mode →
+            // FindingsRecorded → Fail, no ArtifactRejected.
+            (
+                SeverityThreshold::Critical,
+                ScanEnforcement::Record,
+                1,
+                PolicyResult::Fail,
+            ),
+            // Same evidence under `reject` mode → Reject → Fail.
+            (
+                SeverityThreshold::Critical,
+                ScanEnforcement::Reject,
+                1,
+                PolicyResult::Fail,
+            ),
+        ];
+
+        for (threshold, enforcement, criticals, expected) in cases {
+            let (uc, artifacts, _events, lifecycle, repositories, projections) = make_use_case();
+            let artifact_id =
+                seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+            let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+            let mut policy = projection(PolicyScope::Repository(repo_id), threshold);
+            policy.enforcement = enforcement;
+            // A live window, so the inline release cannot add an event
+            // and the count under test stays about the verdict.
+            policy.quarantine_duration_secs = 24 * 3600;
+            let policy_id = policy.policy_id;
+            projections.insert(policy);
+
+            let severity = SeveritySummary {
+                critical: criticals,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            };
+            uc.record_scan_result(
+                artifact_id,
+                "trivy".into(),
+                findings_from_summary(&severity),
+                ScanAssessment::Analysed,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1);
+            let (_saved, batch, _metadata) = &transitions[0];
+            let verdicts: Vec<_> = batch
+                .events
+                .iter()
+                .filter_map(|e| match &e.event {
+                    DomainEvent::PolicyEvaluated(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                verdicts.len(),
+                1,
+                "exactly one PolicyEvaluated per verdict \
+                 ({threshold:?}/{enforcement:?}/{criticals} criticals), got {:?}",
+                batch.events.iter().map(|e| &e.event).collect::<Vec<_>>()
+            );
+            assert_eq!(verdicts[0].result, expected);
+            assert_eq!(verdicts[0].policy_id, policy_id);
+        }
     }
 
     /// One critical CVE with no policy → DefaultPolicy::block_on_critical
@@ -3432,12 +4368,26 @@ mod tests {
         ));
 
         // PolicyEvaluated.policy_id is nil (no operator policy) and
-        // result is Fail with at least one violation.
-        if let DomainEvent::PolicyEvaluated(p) = &batch.events[1].event {
-            assert_eq!(p.policy_id, Uuid::nil());
-            assert_eq!(p.result, PolicyResult::Fail);
-            assert!(!p.violations.is_empty());
-        }
+        // result is Fail with at least one violation. Destructured
+        // rather than `if let`-tested: a shape change must fail this
+        // test, not skip its assertions.
+        let DomainEvent::PolicyEvaluated(p) = &batch.events[1].event else {
+            panic!("expected PolicyEvaluated as the second event");
+        };
+        assert_eq!(p.policy_id, Uuid::nil());
+        assert_eq!(p.result, PolicyResult::Fail);
+        assert!(!p.violations.is_empty());
+        // One verdict, one event — the `Pass` the non-rejecting path
+        // appends must never accompany this `Fail`.
+        assert_eq!(
+            batch
+                .events
+                .iter()
+                .filter(|e| matches!(e.event, DomainEvent::PolicyEvaluated(_)))
+                .count(),
+            1,
+            "a rejecting verdict appends exactly one PolicyEvaluated"
+        );
 
         // Actor is system; artifact ends in Rejected.
         assert_eq!(batch.actor, system_actor());
@@ -3542,11 +4492,10 @@ mod tests {
 
         let batches = events.appended_batches();
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].events.len(), 1);
-        assert!(matches!(
-            &batches[0].events[0].event,
-            DomainEvent::ScanCompleted(_)
-        ));
+        assert!(
+            assert_passing_verdict_prefix(&batches[0].events).is_empty(),
+            "a passing verdict commits ScanCompleted + PolicyEvaluated(Pass) and nothing else"
+        );
         // Clean path uses the events port directly — no commit_transition.
         assert_eq!(
             lifecycle.committed_transitions().len(),
@@ -3688,11 +4637,10 @@ mod tests {
         // `high` finding is below threshold → Clean.
         let batches = events.appended_batches();
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].events.len(), 1);
-        assert!(matches!(
-            &batches[0].events[0].event,
-            DomainEvent::ScanCompleted(_)
-        ));
+        assert!(
+            assert_passing_verdict_prefix(&batches[0].events).is_empty(),
+            "a passing verdict commits ScanCompleted + PolicyEvaluated(Pass) and nothing else"
+        );
         assert_eq!(
             lifecycle.committed_transitions().len(),
             1,
@@ -3889,11 +4837,10 @@ mod tests {
         // port, so a single commit_scan_result lands.
         let batches = events.appended_batches();
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].events.len(), 1);
-        assert!(matches!(
-            &batches[0].events[0].event,
-            DomainEvent::ScanCompleted(_)
-        ));
+        assert!(
+            assert_passing_verdict_prefix(&batches[0].events).is_empty(),
+            "a passing verdict commits ScanCompleted + PolicyEvaluated(Pass) and nothing else"
+        );
         assert_eq!(
             lifecycle.committed_transitions().len(),
             1,
@@ -4030,11 +4977,10 @@ spec:
 
         let batches = events.appended_batches();
         assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].events.len(), 1);
-        assert!(matches!(
-            &batches[0].events[0].event,
-            DomainEvent::ScanCompleted(_)
-        ));
+        assert!(
+            assert_passing_verdict_prefix(&batches[0].events).is_empty(),
+            "a passing verdict commits ScanCompleted + PolicyEvaluated(Pass) and nothing else"
+        );
         assert_eq!(
             lifecycle.committed_transitions().len(),
             1,
@@ -4227,22 +5173,23 @@ spec:
         .await
         .unwrap();
 
-        // Exactly one transactional commit, carrying BOTH events.
+        // Exactly one transactional commit, carrying ALL THREE events.
         let transitions = lifecycle.committed_transitions();
         assert_eq!(transitions.len(), 1);
         let (saved_artifact, batch, _metadata) = &transitions[0];
         assert_eq!(
             batch.events.len(),
-            2,
-            "fast-path: ScanCompleted + ArtifactReleased commit in ONE batch (atomicity invariant)"
+            3,
+            "fast-path: ScanCompleted + PolicyEvaluated(Pass) + ArtifactReleased commit in ONE \
+             batch (atomicity invariant)"
         );
-        assert!(
-            matches!(&batch.events[0].event, DomainEvent::ScanCompleted(_)),
-            "ScanCompleted must be the first event in the batch"
-        );
-        let released = match &batch.events[1].event {
+        // The verdict precedes the release it authorizes, in the same
+        // append — so no reader can observe the release without the
+        // verdict that permitted it.
+        let tail = assert_passing_verdict_prefix(&batch.events);
+        let released = match &tail[0].event {
             DomainEvent::ArtifactReleased(r) => r,
-            other => panic!("expected ArtifactReleased as second event; got {other:?}"),
+            other => panic!("expected ArtifactReleased after the verdict pair; got {other:?}"),
         };
         // Accepted pair: Timer + ScanSucceeded (the same pair the timer
         // sweep uses for elapsed-deadline-with-clean-scan releases).
@@ -4322,13 +5269,15 @@ spec:
                 let (saved_artifact, batch, _metadata) = &transitions[0];
                 assert_eq!(
                     batch.events.len(),
-                    1,
-                    "fail-closed: only ScanCompleted commits; the inline release is \
+                    2,
+                    "fail-closed: only the verdict pair commits; the inline release is \
                      suppressed because provenance is Pending (Required, not yet verified)"
                 );
+                // The scan's verdict still lands — provenance gates the
+                // RELEASE, not the record of what the scan decided.
                 assert!(
-                    matches!(&batch.events[0].event, DomainEvent::ScanCompleted(_)),
-                    "the single committed event is the clean ScanCompleted"
+                    assert_passing_verdict_prefix(&batch.events).is_empty(),
+                    "no ArtifactReleased accompanies the suppressed fast path"
                 );
                 assert_eq!(
                     saved_artifact.quarantine_status,
@@ -4385,16 +5334,14 @@ spec:
         let (saved_artifact, batch, _metadata) = &transitions[0];
         assert_eq!(
             batch.events.len(),
-            2,
-            "Required + provenance Cleared: ScanCompleted + ArtifactReleased commit in one batch"
+            3,
+            "Required + provenance Cleared: ScanCompleted + PolicyEvaluated(Pass) + \
+             ArtifactReleased commit in one batch"
         );
-        assert!(matches!(
-            &batch.events[0].event,
-            DomainEvent::ScanCompleted(_)
-        ));
-        let released = match &batch.events[1].event {
+        let tail = assert_passing_verdict_prefix(&batch.events);
+        let released = match &tail[0].event {
             DomainEvent::ArtifactReleased(r) => r,
-            other => panic!("expected ArtifactReleased; got {other:?}"),
+            other => panic!("expected ArtifactReleased after the verdict pair; got {other:?}"),
         };
         assert_eq!(released.released_by, ReleaseReason::Timer);
         assert_eq!(saved_artifact.quarantine_status, QuarantineStatus::Released);
@@ -4406,7 +5353,7 @@ spec:
     /// Artifact is `Quarantined` with `quarantine_window_start = now - 1h`
     /// and the default 24h window; the computed deadline (~23h in the
     /// future) has not elapsed, so the artifact stays `Quarantined`.
-    /// Only `ScanCompleted` is appended — no `ArtifactReleased`. The
+    /// Only the verdict pair is appended — no `ArtifactReleased`. The
     /// `release_expired` sweep handles release after the deadline passes.
     #[tokio::test]
     async fn clean_scan_deadline_future_stays_quarantined() {
@@ -4425,18 +5372,18 @@ spec:
         .await
         .unwrap();
 
-        // Exactly one transactional commit, carrying ONLY ScanCompleted.
+        // Exactly one transactional commit, carrying ONLY the verdict pair.
         let transitions = lifecycle.committed_transitions();
         assert_eq!(transitions.len(), 1);
         let (saved_artifact, batch, _metadata) = &transitions[0];
         assert_eq!(
             batch.events.len(),
-            1,
+            2,
             "deadline still future ⇒ NO ArtifactReleased in the batch; sweep handles it later"
         );
         assert!(
-            matches!(&batch.events[0].event, DomainEvent::ScanCompleted(_)),
-            "deadline-future clean path: only ScanCompleted lands"
+            assert_passing_verdict_prefix(&batch.events).is_empty(),
+            "deadline-future clean path: ScanCompleted + PolicyEvaluated(Pass) only"
         );
         for ev in &batch.events {
             assert!(
@@ -5031,6 +5978,64 @@ spec:
         assert_eq!(batch.actor, timer_actor());
     }
 
+    /// **One policy read per candidate**, pinned at the port.
+    ///
+    /// Both of the sweep's release gates are pure functions of (stream,
+    /// policy) — the provenance leg (ADR 0027) and the scan-axis ladder
+    /// (ADR 0007) — so `release_expired` resolves the policy once at the
+    /// top of its loop body and hands the same answer to both. Nothing
+    /// downstream of that read can disagree about which policy applied,
+    /// and nothing re-reads it.
+    ///
+    /// Two candidates, deliberately on opposite sides of the ladder: a
+    /// clean scan answered at step 1 (which reads no policy field at
+    /// all) and a never-scanned artifact answered at step 4. Each must
+    /// cost exactly one `list_active`, which is what rules out both
+    /// regressions at once — a per-leg resolve bills the clean
+    /// candidate twice, and a lazy resolve that skips the read when it
+    /// guesses the ladder will not need it bills it zero, by asking a
+    /// copy of step 1's question outside the ladder.
+    #[tokio::test]
+    async fn release_expired_resolves_the_policy_once_per_candidate() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let scanned =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        seed_stream_with_scan_completed(&events, scanned);
+        projections.insert(projection(
+            PolicyScope::Repository(artifacts.get(scanned).unwrap().repository_id),
+            SeverityThreshold::Critical,
+        ));
+        let unscanned =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        projections.insert(projection(
+            PolicyScope::Repository(artifacts.get(unscanned).unwrap().repository_id),
+            SeverityThreshold::Critical,
+        ));
+
+        let summary = uc.release_expired(vec![scanned, unscanned]).await.unwrap();
+
+        // The premise: both legs of the gate really ran for both
+        // candidates — one released, one was held fail-closed. A count
+        // taken over a sweep that skipped a candidate would prove
+        // nothing about that candidate's reads.
+        assert_eq!(
+            summary.released,
+            vec![scanned],
+            "the clean scan releases and the never-scanned artifact does not — otherwise \
+             this test is counting the reads of a sweep that did not decide anything"
+        );
+        assert_eq!(
+            summary.skipped_no_scan_authority, 1,
+            "the held candidate reached the scan-axis gate"
+        );
+        assert_eq!(
+            projections.list_active_call_count(),
+            2,
+            "one resolved policy per candidate, shared by the provenance leg and the \
+             scan-axis ladder"
+        );
+    }
+
     // -----------------------------------------------------------------
     // issue #108 H3 — release authority derives from the LATEST verdict,
     // not the mere presence of a ScanCompleted. The rejecting-scan branch
@@ -5055,7 +6060,11 @@ spec:
             &stream_id,
             vec![
                 dummy_persisted_event(&stream_id, artifact_id, 0),
-                scan_completed_event(artifact_id, 1, 3),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(3, SeverityThreshold::Critical),
+                ),
                 rejected_event(artifact_id, 2),
             ],
         );
@@ -5087,7 +6096,7 @@ spec:
             &stream_id,
             vec![
                 dummy_persisted_event(&stream_id, artifact_id, 0),
-                scan_completed_event(artifact_id, 1, 0),
+                scan_completed_event(artifact_id, 1, no_findings()),
                 rejected_event(artifact_id, 2),
             ],
         );
@@ -5151,7 +6160,7 @@ spec:
         let mut stream = vec![
             dummy_persisted_event(&stream_id, artifact_id, 0),
             // The stale clean verdict — inside any capped read.
-            scan_completed_event(artifact_id, 1, 0),
+            scan_completed_event(artifact_id, 1, no_findings()),
         ];
         stream.extend(filler_events(&stream_id, artifact_id, 2..201));
         // The rejection that supersedes it — outside a 200-event read.
@@ -5186,7 +6195,7 @@ spec:
 
         let mut stream = vec![
             dummy_persisted_event(&stream_id, artifact_id, 0),
-            scan_completed_event(artifact_id, 1, 0),
+            scan_completed_event(artifact_id, 1, no_findings()),
         ];
         stream.extend(filler_events(&stream_id, artifact_id, 2..199));
         // Last event of a stream that sits exactly ON the cap: still read.
@@ -5252,9 +6261,13 @@ spec:
             &stream_id,
             vec![
                 dummy_persisted_event(&stream_id, artifact_id, 0),
-                scan_completed_event(artifact_id, 1, 3),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(3, SeverityThreshold::Critical),
+                ),
                 rejected_event(artifact_id, 2),
-                scan_completed_event(artifact_id, 3, 0),
+                scan_completed_event(artifact_id, 3, no_findings()),
             ],
         );
 
@@ -5307,6 +6320,58 @@ spec:
         assert_eq!(ev.released_by, ReleaseReason::Timer);
     }
 
+    /// The same waiver, over a candidate whose own `ScanCompleted` is
+    /// on its stream carrying a verdict the gate cannot read — and it
+    /// authorizes nothing.
+    ///
+    /// The waiver is a statement about what the operator REQUIRES,
+    /// never about what the scanner DID: `scan_backends: []` says this
+    /// scope is un-scanned by design, which is false of an artifact
+    /// that has been scanned. `ScanWaived` claims "no scan evidence
+    /// exists, and none is required"; here the first half is false, so
+    /// no authority is constructible and the candidate stays
+    /// quarantined until a rescan records a verdict the gate can read.
+    ///
+    /// Reachable today, two ways, which is why this is a test and not
+    /// a note: a dirty `ScanCompleted` written before the scan path
+    /// appended its verdict unconditionally (the stream below), or a
+    /// scan that ran under `enforcement: record` before the policy
+    /// changed to `reject` with the backend list emptied. Either way
+    /// the artifact is still `quarantined`, so the sweep sees it.
+    #[tokio::test]
+    async fn release_expired_waiver_does_not_release_a_blocking_observation() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_scan_waived_policy(&projections, repo_id);
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(13, SeverityThreshold::High),
+                ),
+            ],
+        );
+
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
+
+        assert!(
+            released.is_empty(),
+            "a declaration that nothing is scanned cannot release an artifact that was \
+             scanned — the observation on its stream is what the gate must answer about"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
     // -----------------------------------------------------------------
     // `enforcement: record` — the `ScanRecorded` release authority.
     //
@@ -5330,7 +6395,11 @@ spec:
             &stream_id,
             vec![
                 dummy_persisted_event(&stream_id, artifact_id, 0),
-                scan_completed_event(artifact_id, 1, 3),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(3, SeverityThreshold::Critical),
+                ),
             ],
         );
 
@@ -5373,7 +6442,11 @@ spec:
             &stream_id,
             vec![
                 dummy_persisted_event(&stream_id, artifact_id, 0),
-                scan_completed_event(artifact_id, 1, 3),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(3, SeverityThreshold::Critical),
+                ),
             ],
         );
 
@@ -5428,7 +6501,11 @@ spec:
             &stream_id,
             vec![
                 dummy_persisted_event(&stream_id, artifact_id, 0),
-                scan_completed_event(artifact_id, 1, 3),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(3, SeverityThreshold::Critical),
+                ),
                 rejected_event(artifact_id, 2),
             ],
         );
@@ -5440,6 +6517,1207 @@ spec:
             .released;
 
         assert!(released.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // One predicate decides the scan axis — both release paths, in one
+    // place.
+    //
+    // The sweep and the scan-time inline fast path release the SAME
+    // artifact, and which of them decides depends only on whether the
+    // observation window had elapsed when the scan landed. They used to
+    // answer from two different facts: the sweep from the raw
+    // `ScanCompleted.finding_count`, the fast path from its own policy
+    // verdict. So an artifact whose findings did not breach the
+    // threshold released when its scan finished after the window and
+    // hung forever when it finished inside it — the measured production
+    // case, and a behaviour no document described, because it was not a
+    // rule but the arithmetic of a divergence.
+    //
+    // Both paths now read `scan_history::latest_scan_standing`. These
+    // tests sit together, rather than each beside its own path's
+    // siblings, so the agreement is visible at one place instead of
+    // inferred from two.
+    // -----------------------------------------------------------------
+
+    /// Build a `PolicyEvaluated` [`PersistedEvent`] at `position` — the
+    /// verdict event the scan path appends beside the `ScanCompleted`
+    /// it was reached on, and the fact the release gate reads.
+    fn policy_evaluated_event(
+        artifact_id: Uuid,
+        position: u64,
+        result: PolicyResult,
+    ) -> PersistedEvent {
+        let stream_id = StreamId::artifact(artifact_id);
+        PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id,
+            stream_position: position,
+            global_position: position + 1,
+            event: DomainEvent::PolicyEvaluated(PolicyEvaluated {
+                artifact_id,
+                policy_id: Uuid::new_v4(),
+                result,
+                violations: Vec::new(),
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        }
+    }
+
+    /// **The production case, as a test (sweep half).** Thirteen
+    /// findings, no CRITICAL, in a repository with the default
+    /// `enforcement: reject` and a `Critical` threshold: the verdict
+    /// recorded beside the scan passed, so the window's expiry releases
+    /// the artifact. The raw count the sweep used to read is 13, and it
+    /// refused this artifact on every cycle for as long as it ran.
+    ///
+    /// The authority is `ScanCleared` — the token for "the scan found
+    /// things and the verdict permitted them", asserted directly on the
+    /// resolver's return by
+    /// [`resolve_release_authority_names_scan_cleared_for_permitted_findings`]
+    /// below (the release event does not carry the authority, so there
+    /// is nothing to assert here beyond the release itself).
+    #[tokio::test]
+    async fn release_expired_releases_a_passing_verdict_with_findings() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // `projection()` is `enforcement: Reject` — so this release can
+        // only come from step 1, never from the `record` arm.
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(13, SeverityThreshold::High),
+                ),
+                policy_evaluated_event(artifact_id, 2, PolicyResult::Pass),
+            ],
+        );
+
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "findings that did not breach the threshold must not hold an artifact past its \
+             window — the gate reads the recorded verdict, not the finding count"
+        );
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        let DomainEvent::ArtifactReleased(ev) = &batch.events[0].event else {
+            panic!("ArtifactReleased expected");
+        };
+        assert_eq!(ev.released_by, ReleaseReason::Timer);
+    }
+
+    /// **The same artifact, scanned after its window had elapsed
+    /// (fast-path half).** Identical policy and identical findings; the
+    /// only difference is that the scan lands late, so the inline
+    /// release decides instead of the sweep. It must reach the same
+    /// answer — that agreement is the whole point of the shared
+    /// predicate, and its absence was the defect.
+    #[tokio::test]
+    async fn scan_fast_path_releases_a_passing_verdict_with_findings() {
+        let (uc, artifacts, _events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // `projection()` carries `quarantine_duration_secs: 0`, so the
+        // computed deadline collapses onto the anchor and the window has
+        // already elapsed when this scan result lands.
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+
+        let severity = SeveritySummary {
+            critical: 0,
+            high: 13,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        };
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&severity),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _metadata) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Released,
+            "the same findings, the same policy — only the scan's timing differs, and that \
+             must not decide whether the artifact is reachable"
+        );
+        // `ScanCompleted(13 findings)` + `PolicyEvaluated(Pass)` +
+        // `ArtifactReleased`, in that order and in one append: the
+        // verdict precedes the release it authorizes.
+        let tail = assert_passing_verdict_prefix(&batch.events);
+        let DomainEvent::ArtifactReleased(ev) = &tail[0].event else {
+            panic!("expected ArtifactReleased after the verdict pair");
+        };
+        assert_eq!(ev.released_by, ReleaseReason::Timer);
+        let DomainEvent::ScanCompleted(scan) = &batch.events[0].event else {
+            panic!("expected ScanCompleted first");
+        };
+        assert_eq!(
+            scan.finding_count, 13,
+            "the count is untouched — it is simply not what the gate reads"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // ... and the authority it releases under says what was checked.
+    //
+    // Both paths above release the SAME artifact for the SAME reason: a
+    // verdict that permitted the findings it saw. Neither releases it
+    // under `ScanSucceeded`, whose own contract is "the latest
+    // `ScanCompleted` carries `finding_count == 0`" — a premise this
+    // artifact has never satisfied. `ScanCleared` is that case's own
+    // authority; a finding-free scan keeps `ScanSucceeded`.
+    //
+    // The authority is asserted where it EXISTS, which is different on
+    // the two paths and on neither of them the event: the sweep returns
+    // it from `resolve_release_authority`, the fast path only ever
+    // surfaces it on the release `info!` line. The durable answer to
+    // "what was checked?" is the stream triple, pinned by
+    // `scan_cleared_release_leaves_the_verdict_triple_on_the_stream`.
+    // -----------------------------------------------------------------
+
+    /// Sweep half, at the resolver's return: a passing verdict over a
+    /// non-empty finding list resolves to `ScanCleared`.
+    #[tokio::test]
+    async fn resolve_release_authority_names_scan_cleared_for_permitted_findings() {
+        let (_uc, artifacts, _events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // `enforcement: Reject` — so this can only be step 1's answer,
+        // never the `record` arm's.
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        let stream = vec![
+            dummy_persisted_event(&stream_id, artifact_id, 0),
+            scan_completed_event(
+                artifact_id,
+                1,
+                findings_in_tier(13, SeverityThreshold::High),
+            ),
+            policy_evaluated_event(artifact_id, 2, PolicyResult::Pass),
+        ];
+
+        assert_eq!(
+            sweep_release_authority(&projections, &stream, repo_id).await,
+            Some(ReleaseAuthorization::ScanCleared),
+            "findings the verdict permitted must not be audited as a finding-free scan"
+        );
+    }
+
+    /// The control, same resolver: a finding-free scan still resolves to
+    /// `ScanSucceeded`. `ScanCleared` must cover its own case and not
+    /// one inch more — the token's value is that each of the two says
+    /// something the other does not.
+    #[tokio::test]
+    async fn resolve_release_authority_still_names_scan_succeeded_for_a_clean_scan() {
+        let (_uc, artifacts, _events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        let stream = vec![
+            dummy_persisted_event(&stream_id, artifact_id, 0),
+            scan_completed_event(artifact_id, 1, no_findings()),
+            policy_evaluated_event(artifact_id, 2, PolicyResult::Pass),
+        ];
+
+        assert_eq!(
+            sweep_release_authority(&projections, &stream, repo_id).await,
+            Some(ReleaseAuthorization::ScanSucceeded),
+            "a scan that found nothing is exactly what ScanSucceeded claims"
+        );
+    }
+
+    /// Fast-path half. The inline release returns no authority to a
+    /// caller and the event does not carry one, so the `authority`
+    /// field of the release `info!` line is where the minted token
+    /// exists on this path — and it is also what an operator reads.
+    /// Both cases ride one subscriber: the artifact with permitted
+    /// findings must log `scan_cleared`, the clean one `scan_succeeded`.
+    #[test]
+    fn scan_fast_path_info_log_names_the_authority_it_minted() {
+        install_audit_passthrough_subscriber();
+        let _serial = AUDIT_TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let layer = AuditCapturingLayer::default();
+        let captured = layer.records.clone();
+        let subscriber = Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (uc, artifacts, _events, _lifecycle, repositories, projections) = make_use_case();
+
+            // `projection()` carries `quarantine_duration_secs: 0`, so
+            // both windows have already elapsed when the scan lands and
+            // the inline release decides for both artifacts.
+            let with_findings =
+                seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+            projections.insert(projection(
+                PolicyScope::Repository(artifacts.get(with_findings).unwrap().repository_id),
+                SeverityThreshold::Critical,
+            ));
+            let clean =
+                seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+            projections.insert(projection(
+                PolicyScope::Repository(artifacts.get(clean).unwrap().repository_id),
+                SeverityThreshold::Critical,
+            ));
+
+            let high_only = SeveritySummary {
+                critical: 0,
+                high: 13,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            };
+            uc.record_scan_result(
+                with_findings,
+                "trivy".into(),
+                findings_from_summary(&high_only),
+                ScanAssessment::Analysed,
+                None,
+            )
+            .await
+            .unwrap();
+            uc.record_scan_result(
+                clean,
+                "trivy".into(),
+                Vec::new(),
+                ScanAssessment::Analysed,
+                None,
+            )
+            .await
+            .unwrap();
+        });
+
+        let records = captured.lock().unwrap();
+        let release_lines: Vec<&String> = records
+            .iter()
+            .filter(|(lvl, msg)| {
+                *lvl == tracing::Level::INFO
+                    && msg.contains("released expired artifact")
+                    && msg.contains("scan_complete_fast_path")
+            })
+            .map(|(_, msg)| msg)
+            .collect();
+        assert_eq!(
+            release_lines.len(),
+            2,
+            "both artifacts release inline; saw {records:?}"
+        );
+        assert!(
+            release_lines
+                .iter()
+                .any(|msg| msg.contains("authority=scan_cleared")),
+            "the permitted-findings release must be audited as scan_cleared; \
+             saw {release_lines:?}"
+        );
+        assert!(
+            release_lines
+                .iter()
+                .any(|msg| msg.contains("authority=scan_succeeded")),
+            "the clean release keeps scan_succeeded; saw {release_lines:?}"
+        );
+    }
+
+    /// **The durable audit answer, as a test.** An operator asking
+    /// "what was checked before this artifact became reachable?" six
+    /// months later has no log line left to read — the answer has to be
+    /// recoverable from the stream, and it is: `ScanCompleted` (with its
+    /// finding count) → `PolicyEvaluated{Pass}` → `ArtifactReleased`
+    /// with `released_by: Timer`, in that order and in ONE append.
+    ///
+    /// Read off the batches the event store was handed for this
+    /// artifact's stream, which for a freshly-seeded artifact IS its
+    /// whole stream: the mock records appends rather than folding them
+    /// into the map `read_stream` serves, so `appended_batches()` is the
+    /// durable record here and `read_stream` would answer about the
+    /// seeded prefix only.
+    ///
+    /// Deliberately NOT asserted on the event's fields: `ArtifactReleased`
+    /// carries `artifact_id` / `released_by` / `released_by_user_id` /
+    /// `justification` and no authority, and must not start carrying one
+    /// — the ordered triple is the record, and the `authority` token is
+    /// the live signal beside it.
+    #[tokio::test]
+    async fn scan_cleared_release_leaves_the_verdict_triple_on_the_stream() {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+
+        let high_only = SeveritySummary {
+            critical: 0,
+            high: 13,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        };
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&high_only),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let stream_id = StreamId::artifact(artifact_id);
+        let stream: Vec<DomainEvent> = events
+            .appended_batches()
+            .into_iter()
+            .filter(|batch| batch.stream_id == stream_id)
+            .flat_map(|batch| batch.events.into_iter().map(|e| e.event))
+            .collect();
+        let shape: Vec<&str> = stream.iter().map(DomainEvent::event_type).collect();
+        assert_eq!(
+            shape,
+            vec!["ScanCompleted", "PolicyEvaluated", "ArtifactReleased"],
+            "the stream must answer 'what was checked' without a log line"
+        );
+        let DomainEvent::ScanCompleted(scan) = &stream[0] else {
+            panic!("expected ScanCompleted first");
+        };
+        assert_eq!(
+            scan.finding_count, 13,
+            "the durable record keeps the finding count the authority no longer over-claims"
+        );
+        let DomainEvent::PolicyEvaluated(verdict) = &stream[1] else {
+            panic!("expected PolicyEvaluated second");
+        };
+        assert_eq!(
+            verdict.result,
+            PolicyResult::Pass,
+            "the verdict that authorized the release is the one recorded beside the scan"
+        );
+        let DomainEvent::ArtifactReleased(release) = &stream[2] else {
+            panic!("expected ArtifactReleased third");
+        };
+        assert_eq!(release.artifact_id, artifact_id);
+        assert_eq!(release.released_by, ReleaseReason::Timer);
+    }
+
+    /// A latest verdict that BLOCKS releases under neither path. Sweep
+    /// half: a `PolicyEvaluated(Fail)` beside the latest scan, no later
+    /// rejection, `enforcement: reject` — no authority is constructible
+    /// and the candidate stays quarantined.
+    #[tokio::test]
+    async fn release_expired_denies_a_blocking_latest_verdict() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(13, SeverityThreshold::High),
+                ),
+                policy_evaluated_event(artifact_id, 2, PolicyResult::Fail),
+            ],
+        );
+
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
+
+        assert!(
+            released.is_empty(),
+            "a blocking verdict is a blocking verdict whatever the finding count says"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// Fast-path half of the same property: a verdict that blocks under
+    /// `enforcement: reject` takes the rejecting branch, which appends
+    /// no inline release at all — even though the window had already
+    /// elapsed when the scan landed.
+    #[tokio::test]
+    async fn scan_fast_path_denies_a_blocking_latest_verdict() {
+        let (uc, artifacts, _events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+
+        let severity = SeveritySummary {
+            critical: 1,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        };
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&severity),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _metadata) = &transitions[0];
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Rejected);
+        assert!(
+            !batch
+                .events
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactReleased(_))),
+            "an elapsed window must not release a blocking verdict inline"
+        );
+    }
+
+    /// Neither does an artifact with no `ScanCompleted` at all — and a
+    /// `PolicyEvaluated(Pass)` on its own is NOT a substitute. The
+    /// promotion gate writes exactly that event to the artifact's own
+    /// stream, so "a passing verdict exists" and "a scan was observed"
+    /// have to stay separate questions: `enforcement: reject` here, and
+    /// quarantine invariant 2 holds regardless of the mode.
+    ///
+    /// The fast path has no counterpart case: it reaches the authority
+    /// decision only from a batch that opens with the `ScanCompleted` it
+    /// is committing.
+    #[tokio::test]
+    async fn release_expired_denies_a_verdict_with_no_scan_completed() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                policy_evaluated_event(artifact_id, 1, PolicyResult::Pass),
+            ],
+        );
+
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
+
+        assert!(
+            released.is_empty(),
+            "a passing verdict with nothing scanned is not a release authority — the gate \
+             needs the observation, not just a policy decision"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
+    /// The legacy satisfier, pinned. A `ScanCompleted{finding_count: 0}`
+    /// with **no** `PolicyEvaluated` beside it is an artifact scanned
+    /// before the scan path appended its verdict unconditionally. It
+    /// still releases: a zero finding count is the only evidence left
+    /// that nothing blocked, and it is sufficient — no threshold in any
+    /// policy blocks on an empty finding list. There is no backfill;
+    /// the leg retires itself as those artifacts are rescanned.
+    #[tokio::test]
+    async fn release_expired_releases_a_legacy_clean_scan_with_no_recorded_verdict() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(artifact_id, 1, no_findings()),
+            ],
+        );
+
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
+
+        assert_eq!(
+            released,
+            vec![artifact_id],
+            "a clean scan written before the verdict event existed must keep releasing"
+        );
+        assert_eq!(lifecycle.committed_transitions().len(), 1);
+    }
+
+    /// The other half of the legacy population, and the cost of having
+    /// no backfill stated as a test: findings, no verdict, `enforcement:
+    /// reject`. The count cannot say whether they blocked, so the gate
+    /// holds the artifact — the pre-change behaviour for this stream
+    /// shape, unchanged. It releases on its next rescan, which records a
+    /// verdict.
+    #[tokio::test]
+    async fn release_expired_holds_a_legacy_dirty_scan_with_no_recorded_verdict() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        projections.insert(projection(
+            PolicyScope::Repository(repo_id),
+            SeverityThreshold::Critical,
+        ));
+        let stream_id = StreamId::artifact(artifact_id);
+        events.set_stream(
+            &stream_id,
+            vec![
+                dummy_persisted_event(&stream_id, artifact_id, 0),
+                scan_completed_event(
+                    artifact_id,
+                    1,
+                    findings_in_tier(13, SeverityThreshold::High),
+                ),
+            ],
+        );
+
+        let released = uc
+            .release_expired(vec![artifact_id])
+            .await
+            .unwrap()
+            .released;
+
+        assert!(
+            released.is_empty(),
+            "an unreadable verdict is one the gate must not act on; the rescan that records \
+             one is what releases this artifact"
+        );
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+    // -----------------------------------------------------------------
+    // The scan-axis cross-table.
+    //
+    // The tests above pin the two paths one case at a time. This is the
+    // same question asked of every combination at once — (finding count
+    // × severity relative to the threshold × `enforcement` mode ×
+    // window elapsed or not when the scan landed) — with the two paths'
+    // answers compared to EACH OTHER rather than only to an expected
+    // value. That comparison is the property worth having: it fails on
+    // a future re-divergence, not merely on today's symptom, and it
+    // cannot be satisfied by two implementations that agree today.
+    //
+    // Two things the earlier corpus could not do, and this table does:
+    //
+    // 1. **The fixture states the tier at the call site.** "Thirteen
+    //    findings, none above the threshold" is a row here, written as
+    //    one. The `ScanCompleted` fixture used to take a bare count and
+    //    derive `critical: u32::from(count > 0)`, so every non-zero
+    //    call site described a CRITICAL and the clearing branch's
+    //    `finding_count` condition only ever ran in the false
+    //    direction; reaching the true direction then took a second
+    //    fixture that rewrote the first one's summary after the fact,
+    //    which is a shape no call site can read a decision out of.
+    // 2. **The sweep half reads what the scan path wrote.** Each row
+    //    runs `record_scan_result` with the observation window still
+    //    open, settles the batch it committed onto the artifact's
+    //    stream (`settle_appended_events_into_stream`), and only then
+    //    sweeps. There is no hand-built stream in the sweep half, so no
+    //    fixture stands between the two paths to make them agree.
+    //
+    // 3. **`scan_backends: []` is crossed too**, and it is the
+    //    dimension the table was written without. The waiver and the
+    //    `enforcement: record` arm are the pair the two release paths
+    //    disagreed about while each walked its own steps: the sweep
+    //    read the waiver first, the fast path had no waiver arm at all
+    //    and ended at `unwrap_or(ScanRecorded)`. A `Quarantined`
+    //    artifact under `enforcement: record` AND `scan_backends: []`
+    //    whose verdict blocks therefore released under `scan_waived`
+    //    when its scan landed inside its observation window and under
+    //    `scan_recorded` when it landed after — both paths released it,
+    //    so only the audited token diverged, but it was chosen by scan
+    //    timing, which is the property this table exists to forbid. The
+    //    row below pins the answer: `scan_recorded` on both paths,
+    //    because a token must state what was actually checked and the
+    //    scan ran. The two arms no longer overlap at all — the waiver
+    //    requires that nothing was scanned — so the row now records a
+    //    settled question rather than a preference between two
+    //    applicable answers.
+    // -----------------------------------------------------------------
+
+    /// What one release path concluded about the scan axis for one row.
+    ///
+    /// Read from the path's own output — the batch it committed and the
+    /// release `info!` line it emitted — never recomputed from the
+    /// production expression under test.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ScanAxisVerdict {
+        /// Did this path release the artifact?
+        released: bool,
+        /// The `authority` token on the release line. That line is the
+        /// only place EITHER path surfaces the minted authority (the
+        /// `ArtifactReleased` event deliberately carries none), and it
+        /// is what an operator reads. `None` ⇔ nothing was released.
+        authority: Option<String>,
+    }
+
+    /// One row: the evidence, the policy, and the verdict BOTH paths
+    /// must reach.
+    struct ScanAxisRow {
+        /// Row name — printed in every failure message.
+        name: &'static str,
+        /// The decision boundary this row crosses. Prose, because the
+        /// value of the row is which side of which boundary it sits on.
+        boundary: &'static str,
+        /// The scanner's output. Every row seeds a `Critical`
+        /// threshold, so the tier here IS "severity relative to the
+        /// threshold".
+        findings: SeveritySummary,
+        enforcement: ScanEnforcement,
+        /// Did the operator declare this scope un-scanned
+        /// (`scan_backends: []`)? The dimension the two release paths
+        /// read in opposite orders against the `enforcement: record`
+        /// arm, and so the one that decided which token a release was
+        /// audited under.
+        scan_waived: bool,
+        /// The authority the sweep's resolver must return for this row.
+        /// Asserted at the enum, where the sweep actually produces it.
+        authority: Option<ReleaseAuthorization>,
+        /// The audited token both paths' release line must carry.
+        /// Stated independently of [`Self::authority`] rather than
+        /// derived through `release_authority_label`: a test that
+        /// borrows production's mapping cannot see two labels swapped.
+        authority_label: Option<&'static str>,
+    }
+
+    /// Every reachable combination of the four dimensions, against a
+    /// `Critical` threshold — plus a second below-threshold tier, so
+    /// "the verdict cleared" is not read off one severity bucket.
+    /// `None` authority ⇔ the row must not release.
+    fn scan_axis_rows() -> Vec<ScanAxisRow> {
+        vec![
+            ScanAxisRow {
+                name: "clean / reject",
+                boundary: "finding_count == 0 — the clearing arm's finding bit is FALSE, so \
+                           the authority asserts an empty finding list",
+                findings: no_findings(),
+                enforcement: ScanEnforcement::Reject,
+                scan_waived: false,
+                authority: Some(ReleaseAuthorization::ScanSucceeded),
+                authority_label: Some("scan_succeeded"),
+            },
+            ScanAxisRow {
+                name: "clean / record",
+                boundary: "the clearing arm precedes the `record` arm: a verdict that cleared \
+                           is audited as what it checked, never as an un-gated one",
+                findings: no_findings(),
+                enforcement: ScanEnforcement::Record,
+                scan_waived: false,
+                authority: Some(ReleaseAuthorization::ScanSucceeded),
+                authority_label: Some("scan_succeeded"),
+            },
+            ScanAxisRow {
+                name: "13 high / reject",
+                boundary: "finding_count > 0 with a CLEARING verdict — the other direction \
+                           of the condition inside the `if let`, and the case a bare-count \
+                           fixture cannot state",
+                findings: findings_in_tier(13, SeverityThreshold::High),
+                enforcement: ScanEnforcement::Reject,
+                scan_waived: false,
+                authority: Some(ReleaseAuthorization::ScanCleared),
+                authority_label: Some("scan_cleared"),
+            },
+            ScanAxisRow {
+                name: "13 high / record",
+                boundary: "the same clearing verdict under the other enforcement mode: \
+                           `record` must not relabel a release the verdict already authorized",
+                findings: findings_in_tier(13, SeverityThreshold::High),
+                enforcement: ScanEnforcement::Record,
+                scan_waived: false,
+                authority: Some(ReleaseAuthorization::ScanCleared),
+                authority_label: Some("scan_cleared"),
+            },
+            ScanAxisRow {
+                name: "4 medium / reject",
+                boundary: "the same side of the threshold reached from a second tier: what \
+                           clears is the recorded verdict, not a particular severity bucket",
+                findings: findings_in_tier(4, SeverityThreshold::Medium),
+                enforcement: ScanEnforcement::Reject,
+                scan_waived: false,
+                authority: Some(ReleaseAuthorization::ScanCleared),
+                authority_label: Some("scan_cleared"),
+            },
+            ScanAxisRow {
+                name: "1 critical / reject",
+                boundary: "the threshold itself: a verdict that BLOCKS constructs no \
+                           authority on either path",
+                findings: findings_in_tier(1, SeverityThreshold::Critical),
+                enforcement: ScanEnforcement::Reject,
+                scan_waived: false,
+                authority: None,
+                authority_label: None,
+            },
+            ScanAxisRow {
+                name: "1 critical / record",
+                boundary: "the enforcement boundary: the same blocking verdict, un-gated by \
+                           `record` and audited as the recorded verdict it is",
+                findings: findings_in_tier(1, SeverityThreshold::Critical),
+                enforcement: ScanEnforcement::Record,
+                scan_waived: false,
+                authority: Some(ReleaseAuthorization::ScanRecorded),
+                authority_label: Some("scan_recorded"),
+            },
+            ScanAxisRow {
+                name: "1 critical / record / scan_backends:[]",
+                boundary: "a recorded blocking verdict inside a scope the operator \
+                           declared un-scanned — the row the two paths disagreed about \
+                           for as long as each walked its own steps. `scan_recorded` is \
+                           the only honest token: `scan_waived` would claim no scan \
+                           evidence exists for an artifact whose scan is on its own \
+                           stream, which is also why the waiver arm no longer reaches \
+                           this row at all",
+                findings: findings_in_tier(1, SeverityThreshold::Critical),
+                enforcement: ScanEnforcement::Record,
+                scan_waived: true,
+                authority: Some(ReleaseAuthorization::ScanRecorded),
+                authority_label: Some("scan_recorded"),
+            },
+        ]
+    }
+
+    /// Seed the row's policy: a `Critical` threshold (so the tier of
+    /// the findings decides whether the verdict blocks), the row's
+    /// enforcement mode, and an observation window that either has
+    /// already elapsed when the scan lands or has not.
+    /// `window_elapsed_at_scan_time` argument for the fast-path half:
+    /// the deadline is already behind the scan, so the inline release
+    /// decides.
+    const WINDOW_ELAPSED: bool = true;
+    /// ... and for the sweep half: the deadline is still ahead, so the
+    /// scan commits no release and `release_expired` decides later.
+    const WINDOW_OPEN: bool = false;
+
+    fn seed_cross_table_policy(
+        projections: &Arc<MockPolicyProjectionRepository>,
+        repository_id: Uuid,
+        row: &ScanAxisRow,
+        window_elapsed_at_scan_time: bool,
+    ) {
+        let mut p = projection(
+            PolicyScope::Repository(repository_id),
+            SeverityThreshold::Critical,
+        );
+        p.enforcement = row.enforcement;
+        // The waiver is a statement about what the operator requires,
+        // never about what the scanner did: a waived scope whose scan
+        // nonetheless completed (a backend removed from the policy
+        // after the job was enqueued, a manual rescan) still has its
+        // verdict on the stream — which is why every row here that
+        // waives scanning is still a row ABOUT a scan, and why the
+        // waiver arm answers for none of them.
+        if row.scan_waived {
+            p.scan_backends = vec![];
+        }
+        // `sample_artifact` anchors the window at `now`, so a zero
+        // duration collapses the deadline onto the anchor (already
+        // elapsed) and an hour puts it out of reach of this test.
+        p.quarantine_duration_secs = if window_elapsed_at_scan_time { 0 } else { 3600 };
+        projections.insert(p);
+    }
+
+    /// Fold the batches the event store was handed for `artifact_id`'s
+    /// stream onto the end of that stream, and return the result.
+    ///
+    /// `MockEventStore::append` records a batch without folding it into
+    /// the map `read_stream` serves, so "the scan committed, then the
+    /// sweep read the stream one tick later" is a sequence a test has
+    /// to settle explicitly. Settling it — rather than hand-building
+    /// the post-scan stream — is what makes the sweep half of the
+    /// cross-table read the scan path's OWN output: the two halves
+    /// share evidence, not a fixture's idea of it.
+    fn settle_appended_events_into_stream(
+        events: &Arc<MockEventStore>,
+        artifact_id: Uuid,
+    ) -> Vec<PersistedEvent> {
+        let stream_id = StreamId::artifact(artifact_id);
+        let mut settled = events.stream_snapshot(&stream_id);
+        for batch in events
+            .appended_batches()
+            .into_iter()
+            .filter(|b| b.stream_id == stream_id)
+        {
+            for event in batch.events {
+                let position = u64::try_from(settled.len()).expect("fixture stream fits u64");
+                settled.push(PersistedEvent {
+                    event_id: event.event_id,
+                    stream_id: stream_id.clone(),
+                    stream_position: position,
+                    global_position: position + 1,
+                    event: event.event,
+                    correlation_id: batch.correlation_id,
+                    causation_id: None,
+                    actor: batch.actor.clone(),
+                    event_version: 1,
+                    stored_at: Utc::now(),
+                });
+            }
+        }
+        events.set_stream(&stream_id, settled.clone());
+        settled
+    }
+
+    /// Captured `(level, rendered fields)` pairs — the
+    /// [`AuditCapturingLayer`]'s buffer.
+    type CapturedRecords = Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>;
+
+    /// The `authority` token on the release `info!` line emitted for
+    /// `artifact_id`, or `None` when no release was logged for it.
+    ///
+    /// Both paths emit the same message with the same `artifact_id`
+    /// field (the fast-path line adds `source=scan_complete_fast_path`
+    /// beside it), which is what lets one buffer answer for both: each
+    /// half of a row drives its own freshly-seeded artifact, so the id
+    /// alone says which path a line came from. The uniqueness
+    /// assertion is a second claim rather than part of that one —
+    /// either path commits at most one release per artifact, so two
+    /// lines for one id would mean a release was decided twice.
+    fn captured_release_authority(records: &CapturedRecords, artifact_id: Uuid) -> Option<String> {
+        let needle = format!("artifact_id={artifact_id}");
+        let lines: Vec<String> = records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(level, msg)| {
+                *level == tracing::Level::INFO
+                    && msg.contains("released expired artifact")
+                    && msg.contains(&needle)
+            })
+            .map(|(_, msg)| msg.clone())
+            .collect();
+        assert!(
+            lines.len() <= 1,
+            "one artifact, at most one release: saw {lines:?}"
+        );
+        lines.first().map(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("authority="))
+                .unwrap_or_else(|| panic!("a release line must name its authority: {line}"))
+                .to_string()
+        })
+    }
+
+    /// Drive one row's **fast-path** half: the observation window has
+    /// already elapsed when the scan result lands, so the inline
+    /// release in `record_scan_result` decides.
+    async fn fast_path_half(row: &ScanAxisRow, records: &CapturedRecords) -> ScanAxisVerdict {
+        let (uc, artifacts, _events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_cross_table_policy(&projections, repo_id, row, WINDOW_ELAPSED);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&row.findings),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "row {}: a scan result commits exactly one batch",
+            row.name
+        );
+        let (saved, batch, _meta) = &transitions[0];
+        let released = batch
+            .events
+            .iter()
+            .any(|e| matches!(e.event, DomainEvent::ArtifactReleased(_)));
+        assert_eq!(
+            released,
+            saved.quarantine_status == QuarantineStatus::Released,
+            "row {}: the committed status and the committed events must tell the same \
+             story — an `ArtifactReleased` without the transition (or the reverse) is a \
+             projection a reader could not rebuild",
+            row.name
+        );
+        ScanAxisVerdict {
+            released,
+            authority: captured_release_authority(records, artifact_id),
+        }
+    }
+
+    /// Drive one row's **sweep** half: the same evidence, written while
+    /// the observation window was still open, so nothing releases
+    /// inline and `release_expired` decides one tick later — over the
+    /// events the scan path itself committed.
+    ///
+    /// Also asserts the authority at the sweep's resolver, which is the
+    /// one place either path returns it to a caller.
+    async fn sweep_half(row: &ScanAxisRow, records: &CapturedRecords) -> ScanAxisVerdict {
+        let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        seed_cross_table_policy(&projections, repo_id, row, WINDOW_OPEN);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings_from_summary(&row.findings),
+            ScanAssessment::Analysed,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The premise of this half, asserted rather than assumed: with
+        // the window still open the scan commits no release, so every
+        // release observed below is the sweep's.
+        let stream = settle_appended_events_into_stream(&events, artifact_id);
+        assert!(
+            !stream
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactReleased(_))),
+            "row {}: an open window must not release inline — this half would then be \
+             measuring the fast path twice",
+            row.name
+        );
+
+        assert_eq!(
+            sweep_release_authority(&projections, &stream, repo_id).await,
+            row.authority,
+            "row {} ({}): the sweep's resolver",
+            row.name,
+            row.boundary
+        );
+
+        let summary = uc.release_expired(vec![artifact_id]).await.unwrap();
+        ScanAxisVerdict {
+            released: summary.released.contains(&artifact_id),
+            authority: captured_release_authority(records, artifact_id),
+        }
+    }
+
+    /// **The cross-table.** Every row, both paths, compared to each
+    /// other and to the row's expectation.
+    ///
+    /// One test rather than one per cell because the authority exists
+    /// on the fast path only as a field of its release `info!` line,
+    /// and capturing that needs a thread-local subscriber the whole
+    /// table can share.
+    #[test]
+    fn scan_axis_cross_table_both_paths_agree() {
+        install_audit_passthrough_subscriber();
+        let _serial = AUDIT_TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let layer = AuditCapturingLayer::default();
+        let records = layer.records.clone();
+        let subscriber = Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let rows = scan_axis_rows();
+        let observed = rt.block_on(async {
+            let mut observed = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let fast = fast_path_half(row, &records).await;
+                let sweep = sweep_half(row, &records).await;
+                observed.push((fast, sweep));
+            }
+            observed
+        });
+
+        for (row, (fast, sweep)) in rows.iter().zip(observed) {
+            // The property: which path decided must not change the
+            // answer. Asserted BEFORE the expectation, because this is
+            // the half that survives someone "fixing" the table.
+            assert_eq!(
+                fast, sweep,
+                "row {} ({}): the two release paths disagree — the same artifact would \
+                 release or hang depending only on whether its scan finished after or \
+                 inside its observation window",
+                row.name, row.boundary
+            );
+            // Release-ness is derived from the expected label rather
+            // than stated twice: both paths log the authority on every
+            // release and on nothing else, so "released under no
+            // authority" and "held under some authority" are not
+            // states a row could legitimately expect.
+            let expected = ScanAxisVerdict {
+                released: row.authority_label.is_some(),
+                authority: row.authority_label.map(str::to_string),
+            };
+            assert_eq!(
+                fast, expected,
+                "row {} ({}): wrong verdict on the scan axis",
+                row.name, row.boundary
+            );
+        }
+    }
+
+    /// The release-origin partition, in the same table's terms — "an
+    /// automatic release is re-blockable, an explicit one is not" meets
+    /// "and neither one is a scan-axis release authority afterwards".
+    ///
+    /// A rescan ABOVE the threshold against an already-`Released`
+    /// artifact:
+    ///
+    /// - `Timer`-released ⇒ re-blocked. Nobody reviewed the artifact;
+    ///   the window merely elapsed, so the first blocking verdict
+    ///   reached on it is the first judgement anyone has made.
+    /// - `Admin`-released ⇒ NOT re-blocked. The explicit operator
+    ///   decision outweighs the verdict, and the fresh evidence is
+    ///   recorded without the transition.
+    ///
+    /// Both halves then agree on the scan axis, which is the part the
+    /// per-case tests above do not assert and the part a reader of the
+    /// authority matrix needs: **"not re-blocked" is not "released on
+    /// the scan axis"**. For the admin-released artifact the verdict
+    /// blocks, so neither clearing token is constructible and
+    /// `enforcement: reject` offers no other; for the timer-released
+    /// one its own `ArtifactRejected` supersedes its own scan. Neither
+    /// is a candidate the sweep will release.
+    #[tokio::test]
+    async fn rescan_above_threshold_against_a_released_artifact_authorizes_no_release() {
+        for (origin, expected_status, expect_reject_event) in [
+            (ReleaseReason::Timer, QuarantineStatus::Rejected, true),
+            (ReleaseReason::Admin, QuarantineStatus::Released, false),
+        ] {
+            let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+            let artifact_id =
+                seed_released_artifact(&artifacts, &repositories, &projections, &events, origin);
+            let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+
+            uc.record_scan_result(
+                artifact_id,
+                "trivy".into(),
+                one_critical_finding(),
+                ScanAssessment::Analysed,
+                None,
+            )
+            .await
+            .unwrap();
+
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1, "{origin:?}: one commit per scan");
+            let (saved, batch, _meta) = &transitions[0];
+            assert_eq!(
+                saved.quarantine_status, expected_status,
+                "{origin:?}: the release-origin partition decides the re-block"
+            );
+            assert_eq!(
+                batch
+                    .events
+                    .iter()
+                    .any(|e| matches!(e.event, DomainEvent::ArtifactRejected(_))),
+                expect_reject_event,
+                "{origin:?}: the ArtifactRejected must follow the transition it records"
+            );
+            assert!(
+                !batch
+                    .events
+                    .iter()
+                    .any(|e| matches!(e.event, DomainEvent::ArtifactReleased(_))),
+                "{origin:?}: a blocking verdict releases nothing inline, whoever released \
+                 the artifact before it"
+            );
+
+            let stream = settle_appended_events_into_stream(&events, artifact_id);
+            assert_eq!(
+                sweep_release_authority(&projections, &stream, repo_id).await,
+                None,
+                "{origin:?}: a blocking verdict is not a scan-axis release authority — \
+                 'the scan did not re-block it' must never read as 'the scan released it'"
+            );
+            assert!(
+                uc.release_expired(vec![artifact_id])
+                    .await
+                    .unwrap()
+                    .released
+                    .is_empty(),
+                "{origin:?}: and the sweep agrees"
+            );
+        }
     }
 
     /// Item 4 (issue #15) — an image-INDEX artifact rides the generic
@@ -6814,12 +9092,18 @@ spec:
     }
 
     /// `release_authority_label` maps every
-    /// [`ReleaseAuthorization`] arm. The two timer authorities
-    /// (`ScanSucceeded`/`ScanWaived`) are the live mapping; the
-    /// `AdminOverride`/`PolicyReEvaluation` arms are an
+    /// [`ReleaseAuthorization`] arm. The four timer authorities
+    /// (`ScanSucceeded` / `ScanCleared` / `ScanWaived` /
+    /// `ScanRecorded`) are the live mapping; the `AdminOverride` /
+    /// `PolicyReEvaluation` / `CuratorWaiver` arms are an
     /// exhaustive-match guard (never reached on the timer path) and are
     /// pinned here so the 100%-coverage `hort-app` requirement holds
     /// without a reachable production caller for them.
+    ///
+    /// The list is the whole point of the test name, so it is the whole
+    /// enum: `ScanRecorded` and `CuratorWaiver` were absent from it
+    /// while the function already mapped them, which made "every arm" a
+    /// claim nothing checked.
     #[test]
     fn release_authority_label_maps_every_arm() {
         assert_eq!(
@@ -6827,8 +9111,16 @@ spec:
             "scan_succeeded"
         );
         assert_eq!(
+            release_authority_label(ReleaseAuthorization::ScanCleared),
+            "scan_cleared"
+        );
+        assert_eq!(
             release_authority_label(ReleaseAuthorization::ScanWaived),
             "scan_waived"
+        );
+        assert_eq!(
+            release_authority_label(ReleaseAuthorization::ScanRecorded),
+            "scan_recorded"
         );
         assert_eq!(
             release_authority_label(ReleaseAuthorization::AdminOverride),
@@ -6838,6 +9130,187 @@ spec:
             release_authority_label(ReleaseAuthorization::PolicyReEvaluation),
             "policy_re_evaluation"
         );
+        assert_eq!(
+            release_authority_label(ReleaseAuthorization::CuratorWaiver),
+            "curator_waiver"
+        );
+    }
+
+    /// `clearing_scan_authority` over every [`scan_history::ScanStanding`]
+    /// — the one place the two release paths split `ScanSucceeded` from
+    /// `ScanCleared`, so the split is pinned once here rather than twice
+    /// through the paths that call it.
+    ///
+    /// The three non-clearing standings resolve to `None`: a blocking
+    /// verdict, a never-scanned artifact and a superseded scan are all
+    /// cases the clearing authorities must never cover, and the rest of
+    /// [`scan_axis_release_authority`]'s ladder decides what happens
+    /// next.
+    #[test]
+    fn clearing_scan_authority_maps_every_standing() {
+        assert_eq!(
+            clearing_scan_authority(scan_history::ScanStanding::Clears {
+                findings_present: false
+            }),
+            Some(ReleaseAuthorization::ScanSucceeded),
+            "a finding-free clearing scan is the narrow claim ScanSucceeded makes"
+        );
+        assert_eq!(
+            clearing_scan_authority(scan_history::ScanStanding::Clears {
+                findings_present: true
+            }),
+            Some(ReleaseAuthorization::ScanCleared),
+            "findings the verdict permitted must not be audited as scan_succeeded"
+        );
+        for standing in [
+            scan_history::ScanStanding::Holds,
+            scan_history::ScanStanding::Unobserved,
+            scan_history::ScanStanding::Superseded,
+        ] {
+            assert_eq!(
+                clearing_scan_authority(standing),
+                None,
+                "{standing:?} does not clear, so it justifies neither clearing authority"
+            );
+        }
+    }
+
+    /// The ladder's **whole** decision surface, at the enum: every
+    /// [`scan_history::ScanStanding`] against every reachable shape of
+    /// the resolved policy. The cross-table asserts the same answers
+    /// through two use-case paths and a tracing subscriber; this
+    /// asserts them where they are made, and as a grid rather than a
+    /// list of interesting cases so a reader can see that nothing was
+    /// left out.
+    ///
+    /// Read down the two **waived** columns — where the declaration
+    /// "this scope is un-scanned" meets what the stream actually says:
+    ///
+    /// - a **clearing** verdict is answered at step 1 (rows 1-2), the
+    ///   waiver never consulted: the token names the evidence, and a
+    ///   waiver cannot relabel a release the verdict itself authorized.
+    /// - a **blocking or unreadable** verdict (`Holds`, row 3) takes
+    ///   `ScanRecorded` under `record` and **nothing at all** under
+    ///   `reject`. `ScanWaived` would claim no scan evidence exists,
+    ///   which is false of an artifact whose own `ScanCompleted` is on
+    ///   its stream; an operator emptying the backend list does not
+    ///   un-scan what was already scanned.
+    /// - a **superseded** observation (row 5) is the same answer for
+    ///   the same reason, with a rejection in place of the verdict: no
+    ///   scan-axis token lifts a rejection from another axis, and the
+    ///   waiver is a scan-axis token.
+    /// - a **missing** observation (row 4) is the waiver's own case and
+    ///   the only one it has: nothing was scanned, nothing is required.
+    ///
+    /// So the two waived columns differ from each other on exactly one
+    /// row — row 3, where `record` has a verdict to un-gate — and the
+    /// waiver fires on exactly one row of the grid. Restoring an
+    /// unconditional step 3 (the waiver reading the policy alone, as it
+    /// did) turns three cells red: `Holds` × `reject+waived` and both
+    /// of `Superseded`'s waived cells. Reversing steps 2 and 3 turns
+    /// none red, because the two arms are disjoint — step 2 needs an
+    /// observation that stands and step 3 needs no observation at all.
+    #[test]
+    fn scan_axis_release_authority_is_exhaustive_and_prefers_evidence() {
+        use scan_history::ScanStanding;
+
+        /// A resolved policy carrying the two fields the ladder reads.
+        /// Every other field is irrelevant by construction — the ladder
+        /// takes no other input — which is the claim this fixture makes
+        /// by varying only these two.
+        fn policy_with(
+            enforcement: ScanEnforcement,
+            scan_backends: Vec<String>,
+        ) -> ScanPolicyProjection {
+            let mut p = projection(
+                PolicyScope::Repository(Uuid::new_v4()),
+                SeverityThreshold::Critical,
+            );
+            p.enforcement = enforcement;
+            p.scan_backends = scan_backends;
+            p
+        }
+        let scanning = || vec!["trivy".to_string()];
+        let reject_scanning = policy_with(ScanEnforcement::Reject, scanning());
+        let record_scanning = policy_with(ScanEnforcement::Record, scanning());
+        let reject_waived = policy_with(ScanEnforcement::Reject, vec![]);
+        let record_waived = policy_with(ScanEnforcement::Record, vec![]);
+
+        // Grid rows.
+        let standings = [
+            (
+                "Clears{clean}",
+                ScanStanding::Clears {
+                    findings_present: false,
+                },
+            ),
+            (
+                "Clears{findings}",
+                ScanStanding::Clears {
+                    findings_present: true,
+                },
+            ),
+            ("Holds", ScanStanding::Holds),
+            ("Unobserved", ScanStanding::Unobserved),
+            ("Superseded", ScanStanding::Superseded),
+        ];
+        // Grid columns. "absent" is the unconfigured repo, which
+        // `DefaultPolicy` governs and which scans — never a waiver.
+        let policies = [
+            ("absent", None),
+            ("reject+scanning", Some(&reject_scanning)),
+            ("record+scanning", Some(&record_scanning)),
+            ("reject+waived", Some(&reject_waived)),
+            ("record+waived", Some(&record_waived)),
+        ];
+
+        const SUCCEEDED: Option<ReleaseAuthorization> = Some(ReleaseAuthorization::ScanSucceeded);
+        const CLEARED: Option<ReleaseAuthorization> = Some(ReleaseAuthorization::ScanCleared);
+        const RECORDED: Option<ReleaseAuthorization> = Some(ReleaseAuthorization::ScanRecorded);
+        const WAIVED: Option<ReleaseAuthorization> = Some(ReleaseAuthorization::ScanWaived);
+        const HELD: Option<ReleaseAuthorization> = None;
+
+        // One cell per (standing, policy); no cell derived from another.
+        let expected: [[Option<ReleaseAuthorization>; 5]; 5] = [
+            // Clears{clean}    — step 1, whatever the policy says.
+            [SUCCEEDED, SUCCEEDED, SUCCEEDED, SUCCEEDED, SUCCEEDED],
+            // Clears{findings} — step 1's other token, likewise.
+            [CLEARED, CLEARED, CLEARED, CLEARED, CLEARED],
+            // Holds            — the verdict blocks (or cannot be read).
+            //                    `record` un-gates it; a waiver does
+            //                    not, because the scan still happened.
+            [HELD, HELD, RECORDED, HELD, RECORDED],
+            // Unobserved       — never scanned; `record` has nothing to
+            //                    un-gate, so quarantine invariant 2
+            //                    holds, and the waiver's own premise
+            //                    ("no scan evidence exists") is true of
+            //                    this standing and of no other.
+            [HELD, HELD, HELD, WAIVED, WAIVED],
+            // Superseded      — a rejection landed after the scan; no
+            //                    scan-axis token lifts another axis,
+            //                    the waiver's included.
+            [HELD, HELD, HELD, HELD, HELD],
+        ];
+
+        // Counter-assertion: the grid is not vacuous. All four
+        // scan-axis tokens AND the fail-closed answer appear in it, so
+        // a ladder that collapsed to one answer could not pass.
+        for token in [SUCCEEDED, CLEARED, RECORDED, WAIVED, HELD] {
+            assert!(
+                expected.iter().flatten().any(|cell| *cell == token),
+                "the grid must exercise {token:?}, or it proves nothing about it"
+            );
+        }
+
+        for ((standing_name, standing), row) in standings.iter().zip(expected) {
+            for ((policy_name, policy), cell) in policies.iter().zip(row) {
+                assert_eq!(
+                    scan_axis_release_authority(*standing, *policy),
+                    cell,
+                    "{standing_name} × {policy_name}"
+                );
+            }
+        }
     }
 
     // -- record_scan_indeterminate tests --------------------------------------
@@ -7308,6 +9781,121 @@ spec:
             let global_subscriber = Registry::default().with(global_layer);
             let _ = tracing::subscriber::set_global_default(global_subscriber);
         });
+    }
+
+    /// Acceptance: **the log says which of the two reasons applied.** The
+    /// scan path withholds its `ArtifactRejected` for two unrelated
+    /// reasons, and an operator reading the line has to be able to tell
+    /// them apart: "a human released this artifact, so the scan does not
+    /// get to block it" is a policy outcome someone may want to revisit;
+    /// "there was nothing left to transition" is a no-op. The protected
+    /// line also names WHICH authority released it, so the operator knows
+    /// who to go ask.
+    ///
+    /// Three artifacts, one subscriber, the same breaching verdict for
+    /// each: admin-released, curator-released, and already-`Rejected`.
+    #[test]
+    fn withheld_reject_debug_log_distinguishes_its_two_reasons() {
+        install_audit_passthrough_subscriber();
+        let _serial = AUDIT_TRACING_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let layer = AuditCapturingLayer::default();
+        let captured = layer.records.clone();
+        let subscriber = Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (uc, artifacts, events, _lifecycle, repositories, projections) = make_use_case();
+
+            let admin_released = seed_released_artifact(
+                &artifacts,
+                &repositories,
+                &projections,
+                &events,
+                ReleaseReason::Admin,
+            );
+            let curator_released = seed_released_artifact(
+                &artifacts,
+                &repositories,
+                &projections,
+                &events,
+                ReleaseReason::Curator,
+            );
+            // Already terminal on the other axis-independent ground: the
+            // state row forbids it regardless of any release on the
+            // stream.
+            let already_rejected =
+                seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Rejected);
+            projections.insert(projection(
+                PolicyScope::Repository(artifacts.get(already_rejected).unwrap().repository_id),
+                SeverityThreshold::High,
+            ));
+
+            for artifact_id in [admin_released, curator_released, already_rejected] {
+                uc.record_scan_result(
+                    artifact_id,
+                    "trivy".into(),
+                    one_critical_finding(),
+                    ScanAssessment::Analysed,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let records = captured.lock().unwrap();
+        let debug_lines: Vec<&String> = records
+            .iter()
+            .filter(|(lvl, _)| *lvl == tracing::Level::DEBUG)
+            .map(|(_, msg)| msg)
+            .collect();
+
+        let protected: Vec<&&String> = debug_lines
+            .iter()
+            .filter(|msg| msg.contains("an explicit operator release outweighs it"))
+            .collect();
+        assert_eq!(
+            protected.len(),
+            2,
+            "both operator-released artifacts must log the protection line; saw {debug_lines:?}"
+        );
+        assert!(
+            protected
+                .iter()
+                .any(|msg| msg.contains("released_by=admin")),
+            "the protection line must name the authority that released it; saw {protected:?}"
+        );
+        assert!(
+            protected
+                .iter()
+                .any(|msg| msg.contains("released_by=curator")),
+            "the protection line must name the authority that released it; saw {protected:?}"
+        );
+
+        let terminal: Vec<&&String> = debug_lines
+            .iter()
+            .filter(|msg| msg.contains("re-scan of already-terminal artifact"))
+            .collect();
+        assert_eq!(
+            terminal.len(),
+            1,
+            "the already-Rejected artifact must log the already-terminal line, and the \
+             protected ones must NOT; saw {debug_lines:?}"
+        );
+        assert!(
+            !terminal[0].contains("released_by="),
+            "the already-terminal line carries no release attribution — there is no \
+             operator decision in play; saw {:?}",
+            terminal[0]
+        );
     }
 
     /// AUDIT-info-1: `admin_release` success info-log carries `user_id`,
