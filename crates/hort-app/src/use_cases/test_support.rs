@@ -23,7 +23,9 @@ use hort_domain::entities::mutable_ref::{MutableRef, RefTarget};
 use hort_domain::entities::repository::{
     IndexMode, PrefetchPolicy, ReplicationPriority, Repository, RepositoryFormat, RepositoryType,
 };
-use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
+use hort_domain::entities::scan_policy::{
+    ExclusionProjection, ScanPolicyProjection, SeverityThreshold,
+};
 use hort_domain::entities::user::{AuthProvider, User};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{
@@ -2372,6 +2374,29 @@ impl MockEventStore {
             .insert(stream_id.to_string(), events);
     }
 
+    /// The events currently seeded for `stream_id`, read off the state
+    /// map rather than through [`EventStore::read_stream`] — the same
+    /// rationale as [`StreamTail::current_expected_version`]: the probe
+    /// consumes no one-shot injection and does not move the read
+    /// counter, so a test asserting "this path observed the stream
+    /// exactly once" stays meaningful while the harness looks at the
+    /// stream behind its back.
+    ///
+    /// Paired with [`Self::set_stream`] by a harness that has to make a
+    /// batch this mock recorded through [`Self::appended_batches`]
+    /// visible to a LATER read — `append` records batches without
+    /// folding them into this map, so "the scan committed, then the
+    /// sweep read the stream" is a sequence a test has to settle
+    /// explicitly.
+    pub fn stream_snapshot(&self, stream_id: &StreamId) -> Vec<PersistedEvent> {
+        self.streams
+            .lock()
+            .unwrap()
+            .get(&stream_id.to_string())
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Arm a one-shot stream replacement: the NEXT `read_stream` of
     /// `stream_id` serves the CURRENT content, then `events` replaces it
     /// so every subsequent read sees the new state. Models a concurrent
@@ -2454,6 +2479,25 @@ impl EventStore for MockEventStore {
         }
         if let Some(err) = self.fail_next_append.lock().unwrap().take() {
             return Box::pin(async move { Err(err) });
+        }
+        // This double round-trips: `read_stream` serves what `append`
+        // accepted, so what a test seeds here is what production code
+        // reads back and decides on. It therefore has to refuse exactly
+        // what the production adapter refuses — `validate_and_serialize`
+        // calls `validate()` on every event of every batch, so an event
+        // this accepts and the adapter would not is an event no producer
+        // in the system can write, and a test standing on one proves a
+        // behaviour production cannot show.
+        //
+        // That is not hypothetical: the authority-derivation corpus held
+        // `ScanCompleted` events whose `finding_count` disagreed with
+        // their severity summary, which `validate()` rejects, and the
+        // two release paths appeared to agree because the fixture made
+        // them agree.
+        for to_append in &batch.events {
+            if let Err(e) = to_append.event.validate() {
+                return Box::pin(async move { Err(e) });
+            }
         }
         let count = batch.events.len() as u64;
         self.appended.lock().unwrap().push(batch);
@@ -3997,6 +4041,40 @@ pub fn sample_artifact(status: QuarantineStatus) -> Artifact {
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
+}
+
+/// The finding-free severity summary — every tier zero. The only shape
+/// whose finding count is 0, and the one a clean `ScanCompleted`
+/// carries.
+pub fn no_findings() -> SeveritySummary {
+    SeveritySummary {
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+        negligible: 0,
+    }
+}
+
+/// `count` findings, all of them in `tier`.
+///
+/// Shared by every fixture that builds a `ScanCompleted`, because the
+/// tier is the fact those fixtures have to be able to state: against a
+/// `Critical` threshold, `High`/`Medium` findings are **present and
+/// permitted** while `Critical` ones **block**, and the two cases
+/// differ in nothing else. A fixture that takes only a count cannot
+/// express the production case where the scanner found things and the
+/// verdict let them through — which is exactly the case the release
+/// gate's two paths once disagreed about.
+pub fn findings_in_tier(count: u32, tier: SeverityThreshold) -> SeveritySummary {
+    let mut summary = no_findings();
+    match tier {
+        SeverityThreshold::Critical => summary.critical = count,
+        SeverityThreshold::High => summary.high = count,
+        SeverityThreshold::Medium => summary.medium = count,
+        SeverityThreshold::Low => summary.low = count,
+    }
+    summary
 }
 
 pub fn sample_repository() -> Repository {

@@ -172,10 +172,17 @@ pub fn classify(event: QuarantineEvent, state: QuarantineStatus) -> Cell {
             Quarantined => Allowed(&[Quarantined]),
             Released | Rejected | ScanIndeterminate => Forbidden,
         },
+        // `Released` is admissible with an extra conjunct the method
+        // enforces (the row's `required_triggers`): the prior release
+        // must have been automatic. An explicit Admin/Curator release
+        // outweighs a later scan verdict and is refused there, not here
+        // — the same shape `RepairProvenanceMisrejection` uses for its
+        // two stream-derived conjuncts.
         QuarantineEvent::RejectFromScan => match state {
             NoneSt => Allowed(&[Rejected]),
             Quarantined => Allowed(&[Rejected]),
-            Released | Rejected | ScanIndeterminate => Forbidden,
+            Released => Allowed(&[Rejected]),
+            Rejected | ScanIndeterminate => Forbidden,
         },
         QuarantineEvent::RejectFromRetroactiveCuration => match state {
             Quarantined => Allowed(&[Rejected]),
@@ -302,6 +309,17 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         required_triggers: &[],
     },
     QuarantineTransitionRow {
+        event: QuarantineEvent::RejectFromScan,
+        from: QuarantineStatus::Released,
+        to: &[QuarantineStatus::Rejected],
+        required_triggers: &[
+            "ReleaseOrigin::permits_scan_reblock() — the latest ArtifactReleased on the \
+             artifact's stream must be Timer or PolicyReEvaluation (an automatic release, \
+             which no operator reviewed); an explicit Admin or Curator release outweighs \
+             every later scan verdict and is refused without mutating",
+        ],
+    },
+    QuarantineTransitionRow {
         event: QuarantineEvent::RejectFromRetroactiveCuration,
         from: QuarantineStatus::Quarantined,
         to: &[QuarantineStatus::Rejected],
@@ -386,8 +404,8 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         from: QuarantineStatus::Quarantined,
         to: &[QuarantineStatus::Released],
         required_triggers: &[
-            "authorized only for (Timer, ScanSucceeded|ScanWaived|ScanRecorded) with \
-             provenance cleared/not-required, (Admin, AdminOverride), or \
+            "authorized only for (Timer, ScanSucceeded|ScanCleared|ScanWaived|ScanRecorded) \
+             with provenance cleared/not-required, (Admin, AdminOverride), or \
              (PolicyReEvaluation, PolicyReEvaluation) — every other (reason, authz) \
              pair is denied at the authorization step, independent of source state",
         ],
@@ -397,8 +415,8 @@ pub const QUARANTINE_TRANSITIONS: &[QuarantineTransitionRow] = &[
         from: QuarantineStatus::ScanIndeterminate,
         to: &[QuarantineStatus::Released],
         required_triggers: &[
-            "authorized only for (Timer, ScanSucceeded|ScanWaived|ScanRecorded) with \
-             provenance cleared/not-required, (Admin, AdminOverride), or \
+            "authorized only for (Timer, ScanSucceeded|ScanCleared|ScanWaived|ScanRecorded) \
+             with provenance cleared/not-required, (Admin, AdminOverride), or \
              (PolicyReEvaluation, PolicyReEvaluation) — every other (reason, authz) \
              pair is denied at the authorization step, independent of source state",
         ],

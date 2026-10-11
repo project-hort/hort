@@ -558,7 +558,7 @@ impl ArtifactReleased {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReleaseReason {
     /// Quarantine period expired (background sweep).
     Timer,

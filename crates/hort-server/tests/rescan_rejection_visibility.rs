@@ -44,11 +44,15 @@
 //! # Pre-state choice — `None` vs `Released` vs `Quarantined`
 //!
 //! `Artifact::reject_from_scan` rejects from `{Quarantined, None}`
-//! only (`reject_from_scan_from_released_fails` and
-//! `reject_from_scan_from_rejected_fails` pin this invariant in
-//! `hort-domain`). `Released → Rejected` requires
-//! `reject_from_retroactive_curation`, not `record_scan_result`.
-//! Of the two reachable pre-states:
+//! unconditionally, and from `Released` only when the prior release
+//! was automatic (`ReleaseOrigin::permits_scan_reblock` — an explicit
+//! Admin/Curator release outweighs a later scan verdict;
+//! `reject_from_scan_refuses_an_admin_released_artifact` and
+//! `reject_from_scan_from_rejected_fails` pin both halves in
+//! `hort-domain`). `Released` is therefore not a *stable* pre-state for
+//! this smoke — whether it transitions depends on a stream fact the
+//! smoke would have to seed. Of the pre-states that need no such
+//! seeding:
 //!
 //! - `Quarantined` is filtered by `NonServableStatusFilter` already
 //!   in the BEFORE state — the "before" assertion would fail.

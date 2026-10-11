@@ -2525,7 +2525,7 @@ mod tests {
     // Cascade tests against the real partial unique indexes
     // (`jobs_prefetch_unique` + `jobs_prefetch_dependencies_unique`)
     // and the retention sweep predicate. Carries `#[serial(hort_pg_db)]`
-    // per ADR 0019.
+    // per CLAUDE.md's parallel-safety contract.
     // -----------------------------------------------------------------
 
     use hort_domain::ports::jobs_repository::IdempotentEnqueueRow as IER;
@@ -2895,8 +2895,8 @@ mod tests {
     // -----------------------------------------------------------------
     // Generic (`other kind`) retention sweep — the horizon for every
     // `jobs.kind` the two kind-specific sweeps do not reach. Carries
-    // `#[serial(hort_pg_db)]` per ADR 0019; note that the per-test
-    // database `maybe_pool()` creates is NOT isolation from
+    // `#[serial(hort_pg_db)]` per CLAUDE.md's parallel-safety contract; note
+    // that the per-test database `maybe_pool()` creates is NOT isolation from
     // cluster-global work, which is what the serial key covers.
     // -----------------------------------------------------------------
 
@@ -3394,9 +3394,9 @@ mod tests {
 
     // -----------------------------------------------------------------
     // `record_run_completion` + `last_completed_at_by_kind` round-trip.
-    // Carries `#[serial(hort_pg_db)]` per ADR 0019 (the suite runs in
-    // parallel against one shared backend). Silently skips if
-    // `DATABASE_URL` is unset (expected locally).
+    // Carries `#[serial(hort_pg_db)]` per CLAUDE.md's parallel-safety
+    // contract (the suite runs in parallel against one shared backend).
+    // Silently skips if `DATABASE_URL` is unset (expected locally).
     // -----------------------------------------------------------------
 
     /// `record_run_completion` inserts a terminal `completed` row whose

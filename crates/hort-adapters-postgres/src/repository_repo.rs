@@ -683,9 +683,9 @@ mod tests {
     //
     // The `index_mode` column round-trips end-to-end through
     // `save_managed → find_by_key` for both variants. `#[serial(hort_pg_db)]`
-    // per ADR 0019 — every `maybe_pool()` caller serializes on the
-    // crate-wide key to avoid the parallel-DB identity-shift flake the
-    // project memory pins (`project_v2_db_tests_need_fresh_db`).
+    // per CLAUDE.md's parallel-safety contract — every `maybe_pool()` caller
+    // serializes on the crate-wide key to avoid the parallel-DB identity-shift
+    // flake the project memory pins (`project_v2_db_tests_need_fresh_db`).
 
     async fn maybe_pool() -> Option<PgPool> {
         let url = env::var("DATABASE_URL").ok()?;

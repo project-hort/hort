@@ -18,6 +18,7 @@ digraph ArtifactQuarantineLifecycle {
     "none" -> "quarantined" [label="quarantine"];
     "none" -> "rejected" [label="reject_from_scan"];
     "quarantined" -> "rejected" [label="reject_from_scan"];
+    "released" -> "rejected" [label="reject_from_scan"];
     "quarantined" -> "rejected" [label="reject_from_retroactive_curation"];
     "released" -> "rejected" [label="reject_from_retroactive_curation"];
     "quarantined" -> "rejected" [label="reject_from_scan_policy_retroactive"];

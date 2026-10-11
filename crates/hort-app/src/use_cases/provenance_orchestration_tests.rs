@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
+use hort_domain::entities::artifact::{Artifact, QuarantineStatus, ReleaseOrigin};
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::entities::scan_policy::{
     NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SignerIdentityPattern,
@@ -2106,7 +2106,10 @@ impl ProvenancePort for InterleavingProvenancePort {
                 .get(self.artifact_id)
                 .expect("artifact seeded before verify_artifact was called");
             concurrent
-                .reject_from_scan("critical severity finding".into())
+                .reject_from_scan(
+                    "critical severity finding".into(),
+                    ReleaseOrigin::NeverReleased,
+                )
                 .expect("Quarantined -> Rejected is a valid domain transition");
             self.artifacts.insert(concurrent);
 

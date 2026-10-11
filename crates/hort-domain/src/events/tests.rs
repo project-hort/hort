@@ -2009,19 +2009,19 @@ fn ingest_source_clone_eq_serde() {
 }
 
 #[test]
-fn release_reason_clone_eq_serde() {
+fn release_reason_copy_eq_serde() {
     // Note: this is a fixed-array literal — adding a new `ReleaseReason`
     // variant does NOT compile-force inclusion here. `Curator` was the
     // most recent addition; if a future variant is added, append it below
-    // so the Clone/Eq/Serde round-trip is exercised for every reason.
+    // so the Copy/Eq/Serde round-trip is exercised for every reason.
     for reason in [
         ReleaseReason::Timer,
         ReleaseReason::Admin,
         ReleaseReason::PolicyReEvaluation,
         ReleaseReason::Curator,
     ] {
-        let cloned = reason.clone();
-        assert_eq!(reason, cloned);
+        let copied = reason;
+        assert_eq!(reason, copied);
         let json = serde_json::to_string(&reason).unwrap();
         let back: ReleaseReason = serde_json::from_str(&json).unwrap();
         assert_eq!(reason, back);

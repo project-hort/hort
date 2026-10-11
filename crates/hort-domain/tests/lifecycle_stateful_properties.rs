@@ -5,11 +5,11 @@
 //! (window elapse, release, re-evaluate) actions are replayed against a
 //! real [`Artifact`], cross-checked against the declared
 //! [`quarantine_transitions::QUARANTINE_TRANSITIONS`] table (backlog 090)
-//! as the reference model for transition *legality*, and against four
+//! as the reference model for transition *legality*, and against five
 //! invariants the table alone cannot express (it only encodes per-event
 //! source-state legality, not the release-authorization matrix, the
-//! re-evaluation eligibility formula, or any liveness/idempotency
-//! property):
+//! re-evaluation eligibility formula, the scan-re-block partition, or
+//! any liveness/idempotency property):
 //!
 //! (a) **Anti-stranding liveness** — every artifact that reaches a
 //!     terminal-or-resolvable condition (a clean-scan-equivalent release
@@ -22,17 +22,27 @@
 //!     `CurationRetroactive`, or an unknown `None`) is asserted to
 //!     PERMANENTLY fail `re_evaluate` — that is correct fail-closed
 //!     behaviour (ADR 0041 invariant #6(a)), not a stranding bug.
-//! (b) **Five-authority release predicate (ADR 0007)** — see
+//! (b) **The release predicate's allow-row set (ADR 0007)** — see
 //!     `release_predicate_exhaustive_authority_matrix` below: an exhaustive
 //!     (not sampled) sweep of every `(ReleaseReason, ReleaseAuthorization,
 //!     ProvenanceClearance, QuarantineStatus)` tuple against the real
-//!     `Artifact::release`, asserting `Ok` iff the tuple is one of the five
-//!     documented allow-rows with the provenance AND-precondition satisfied
-//!     on the `Timer` arm. Exhaustive enumeration is used here (not
-//!     `proptest` sampling) because the input space is small (4×5×3×5=300)
+//!     `Artifact::release`, asserting `Ok` iff the tuple is one of the
+//!     seven documented allow-rows with the provenance AND-precondition
+//!     satisfied on the `Timer` arm (four scan-axis timer authorities plus
+//!     the Admin / PolicyReEvaluation / Curator rows). Exhaustive
+//!     enumeration is used here (not
+//!     `proptest` sampling) because the input space is small (4×7×3×5=420)
 //!     and finite — exhaustive coverage is strictly stronger than a random
 //!     sample of it; the *stateful*, unbounded-length-sequence invariants
 //!     (a), (c), (d) are where `proptest`'s random search earns its keep.
+//!
+//!     The sweep is only exhaustive over the authority axis if
+//!     `ALL_RELEASE_AUTHORIZATIONS` lists every variant, and that array is
+//!     hand-written — `ScanRecorded` was missing from it from the day that
+//!     authority shipped, which is why its `(Timer, ScanRecorded)` allow-row
+//!     went unswept and the oracle's wildcard `_ => false` never had to
+//!     answer for it. `authority_ordinal` now pins the array against the
+//!     enum at compile time (see `all_release_authorizations_lists_every_variant`).
 //! (c) **`Rejected -> Released` only through the ADR 0041 `re_evaluate`
 //!     exception, with its EXACT eligibility** — checked live at every step
 //!     of the random walk (never a blanket "no Rejected->Released" ban,
@@ -51,6 +61,19 @@
 //!     `RejectFromScanPolicyRetroactive`, `CascadeProvenanceClearance`, a
 //!     `Verified`/held `CompleteProvenance` arm) — it must never progress
 //!     the state machine a second time.
+//! (e) **`reject_from_scan`'s `Released` behaviour IS
+//!     `ReleaseOrigin::permits_scan_reblock`, with no second copy of the
+//!     rule** — checked live at every `RejectScan` step from a
+//!     `Released` source state, as an IFF in both directions. This is a
+//!     DRIFT guard, not a statement of the partition: it compares the
+//!     method against the predicate, so it stays green if the predicate
+//!     itself is rewritten (which is correct — the partition's *content*
+//!     is pinned by `release_origin_partitions_automatic_from_explicit`
+//!     and the per-reason acceptance tests in `hort-domain` /
+//!     `hort-app`). What it catches is the method growing its own,
+//!     divergent notion of which releases are protected — the conjunct
+//!     the declared table documents as `RejectFromScan`'s
+//!     `required_triggers` and does not itself execute.
 //!
 //! ## Determinism (no wall-clock, no random-seed flake)
 //!
@@ -88,7 +111,7 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use hort_domain::entities::artifact::{
     is_scan_clearable, Artifact, CurationClearance, ProvenanceClearance, QuarantineStatus,
-    ReleaseAuthorization,
+    ReleaseAuthorization, ReleaseOrigin,
 };
 use hort_domain::entities::quarantine_transitions::{self, QuarantineEvent};
 use hort_domain::entities::scan_policy::{ProvenanceMode, SeverityThreshold};
@@ -190,6 +213,13 @@ struct Aux {
     window_open: bool,
     curation_blocked: bool,
     provenance_verified: bool,
+    /// Who last released the artifact — the fact the application layer
+    /// resolves from the stream's latest `ArtifactReleased` and
+    /// `Artifact::reject_from_scan` applies to a `Released` source
+    /// state. Updated by the walk loop from the REAL outcome of each
+    /// release action, so a `RejectScan` that follows an admin release
+    /// sees `Released(Admin)` exactly as the orchestration would.
+    release_origin: ReleaseOrigin,
 }
 
 impl Aux {
@@ -199,6 +229,7 @@ impl Aux {
             window_open: false,
             curation_blocked: false,
             provenance_verified: false,
+            release_origin: ReleaseOrigin::NeverReleased,
         }
     }
 
@@ -327,7 +358,9 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
     match action {
         Action::Ingest => artifact.quarantine(base_time()).is_ok(),
         Action::CleanScan => artifact.record_clean_scan().is_ok(),
-        Action::RejectScan => artifact.reject_from_scan("scan finding".into()).is_ok(),
+        Action::RejectScan => artifact
+            .reject_from_scan("scan finding".into(), aux.release_origin)
+            .is_ok(),
         Action::RejectRetroCuration => artifact
             .reject_from_retroactive_curation(rule_id(), "curation hit".into())
             .is_ok(),
@@ -505,6 +538,27 @@ fn run_walk(actions: &[Action]) {
             );
         }
 
+        // --- invariant (e): reject_from_scan's Released behaviour IS
+        //     ReleaseOrigin::permits_scan_reblock ---
+        // An IFF in both directions, so the method cannot grow its own
+        // notion of which releases are protected — neither a narrower
+        // one (an automatic release left permanently un-blockable) nor a
+        // wider one (an operator release undone by a scan verdict).
+        // A drift guard against the predicate, not a statement of the
+        // partition: see the module header's (e). Asked of the origin in
+        // effect when the call fired, which is what `before_aux` holds.
+        if matches!(action, Action::RejectScan) && before_status == QuarantineStatus::Released {
+            assert_eq!(
+                after_status == QuarantineStatus::Rejected,
+                before_aux.release_origin.permits_scan_reblock(),
+                "reject_from_scan on a Released artifact with origin {} left it \
+                 {after_status:?}; the origin's partition says \
+                 permits_scan_reblock={}",
+                before_aux.release_origin,
+                before_aux.release_origin.permits_scan_reblock()
+            );
+        }
+
         // --- update aux from the REAL outcome ---
         if ok {
             match action {
@@ -515,6 +569,27 @@ fn run_walk(actions: &[Action]) {
                 Action::ProvenanceVerify => aux.provenance_verified = true,
                 Action::ProvenanceReject => aux.provenance_verified = false,
                 Action::CascadeClearance => aux.provenance_verified = true,
+                // Every path that appends an `ArtifactReleased` records
+                // the reason it carried, so the next `RejectScan` reads
+                // the same origin the orchestration would resolve from
+                // the stream.
+                Action::ReleaseAdmin => {
+                    aux.release_origin = ReleaseOrigin::Released(ReleaseReason::Admin);
+                }
+                Action::ReleaseCuratorWaiver => {
+                    aux.release_origin = ReleaseOrigin::Released(ReleaseReason::Curator);
+                }
+                Action::ReleasePolicyReEval => {
+                    aux.release_origin = ReleaseOrigin::Released(ReleaseReason::PolicyReEvaluation);
+                }
+                Action::ReleaseTimer { .. } => {
+                    aux.release_origin = ReleaseOrigin::Released(ReleaseReason::Timer);
+                }
+                Action::ReEvaluate if after_status == QuarantineStatus::Released => {
+                    // The ADR 0041 exception's release arm appends an
+                    // `ArtifactReleased{PolicyReEvaluation}`.
+                    aux.release_origin = ReleaseOrigin::Released(ReleaseReason::PolicyReEvaluation);
+                }
                 Action::ReEvaluate if after_status == QuarantineStatus::Quarantined => {
                     // Re-quarantine preserves the original (still-open) window.
                 }
@@ -667,7 +742,7 @@ fn stateful_lifecycle_walk_invariants() {
 }
 
 // ---------------------------------------------------------------------------
-// Invariant (b): the five-authority release predicate (ADR 0007) —
+// Invariant (b): the release predicate's allow-row set (ADR 0007) —
 // exhaustive over the full finite argument space of `Artifact::release`.
 // ---------------------------------------------------------------------------
 
@@ -680,11 +755,57 @@ const ALL_RELEASE_REASONS: &[ReleaseReason] = &[
 
 const ALL_RELEASE_AUTHORIZATIONS: &[ReleaseAuthorization] = &[
     ReleaseAuthorization::ScanSucceeded,
+    ReleaseAuthorization::ScanCleared,
     ReleaseAuthorization::ScanWaived,
+    ReleaseAuthorization::ScanRecorded,
     ReleaseAuthorization::AdminOverride,
     ReleaseAuthorization::PolicyReEvaluation,
     ReleaseAuthorization::CuratorWaiver,
 ];
+
+/// A distinct index per authority, via a match with **no wildcard arm**:
+/// a new `ReleaseAuthorization` does not compile until it is given one.
+///
+/// This exists because the sweep's exhaustiveness over the authority axis
+/// rests on a hand-written array, and an array cannot be checked by the
+/// compiler. `ScanRecorded` was absent from it for the whole life of that
+/// authority — the sweep silently never exercised `(Timer, ScanRecorded)`,
+/// and because the oracle below denies by default, adding it later would
+/// have been a *failing* test rather than a quietly widened one.
+/// `all_release_authorizations_lists_every_variant` closes that: the
+/// compiler forces a row here, and the test forces the array to carry it.
+fn authority_ordinal(authz: ReleaseAuthorization) -> usize {
+    match authz {
+        ReleaseAuthorization::ScanSucceeded => 0,
+        ReleaseAuthorization::ScanCleared => 1,
+        ReleaseAuthorization::ScanWaived => 2,
+        ReleaseAuthorization::ScanRecorded => 3,
+        ReleaseAuthorization::AdminOverride => 4,
+        ReleaseAuthorization::PolicyReEvaluation => 5,
+        ReleaseAuthorization::CuratorWaiver => 6,
+    }
+}
+
+/// `ALL_RELEASE_AUTHORIZATIONS` carries every authority exactly once, so
+/// the matrix sweep below is genuinely exhaustive over that axis.
+#[test]
+fn all_release_authorizations_lists_every_variant() {
+    const COUNT: usize = 7;
+    let mut seen = [0usize; COUNT];
+    for &authz in ALL_RELEASE_AUTHORIZATIONS {
+        seen[authority_ordinal(authz)] += 1;
+    }
+    assert_eq!(
+        ALL_RELEASE_AUTHORIZATIONS.len(),
+        COUNT,
+        "the sweep's authority axis must list every ReleaseAuthorization \
+         (and no duplicates); `authority_ordinal` is the compiler-checked census"
+    );
+    assert!(
+        seen.iter().all(|n| *n == 1),
+        "each authority exactly once, got per-ordinal counts {seen:?}"
+    );
+}
 
 const ALL_PROVENANCE_CLEARANCES: &[ProvenanceClearance] = &[
     ProvenanceClearance::NotRequired,
@@ -700,9 +821,13 @@ const ALL_QUARANTINE_STATUSES: &[QuarantineStatus] = &[
     QuarantineStatus::ScanIndeterminate,
 ];
 
-/// The exact five-row allow predicate documented in ADR 0007 / this
+/// The exact seven-row allow predicate documented in ADR 0007 / this
 /// module's header, independent of `Artifact::release`'s implementation —
 /// the oracle the exhaustive sweep checks the real method against.
+///
+/// The trailing `_ => false` is the deny-by-default statement itself, not
+/// a gap: it is what makes a *new* authority denied here until someone
+/// writes its row, so the sweep fails loudly rather than widening.
 fn expected_release_ok(
     reason: &ReleaseReason,
     authz: ReleaseAuthorization,
@@ -725,9 +850,15 @@ fn expected_release_ok(
         provenance,
         ProvenanceClearance::NotRequired | ProvenanceClearance::Cleared
     );
-    match (reason.clone(), authz) {
+    match (reason, authz) {
+        // The four scan-axis timer authorities, all carrying the same
+        // provenance AND-precondition: the scan found nothing /
+        // the verdict permitted what it found / the operator waived
+        // scanning / the operator declared the verdict non-gating.
         (ReleaseReason::Timer, ReleaseAuthorization::ScanSucceeded)
-        | (ReleaseReason::Timer, ReleaseAuthorization::ScanWaived) => provenance_clears_timer,
+        | (ReleaseReason::Timer, ReleaseAuthorization::ScanCleared)
+        | (ReleaseReason::Timer, ReleaseAuthorization::ScanWaived)
+        | (ReleaseReason::Timer, ReleaseAuthorization::ScanRecorded) => provenance_clears_timer,
         (ReleaseReason::Admin, ReleaseAuthorization::AdminOverride) => true,
         (ReleaseReason::PolicyReEvaluation, ReleaseAuthorization::PolicyReEvaluation) => true,
         (ReleaseReason::Curator, ReleaseAuthorization::CuratorWaiver) => true,
@@ -746,12 +877,12 @@ fn release_predicate_exhaustive_authority_matrix() {
                     let mut artifact = fresh_artifact();
                     artifact.quarantine_status = from;
                     let expected = expected_release_ok(reason, authz, provenance, from);
-                    let actual = artifact.release(reason.clone(), authz, provenance).is_ok();
+                    let actual = artifact.release(*reason, authz, provenance).is_ok();
                     assert_eq!(
                         actual, expected,
                         "Artifact::release({reason:?}, {authz:?}, {provenance:?}) from \
-                         {from:?}: expected Ok={expected} (ADR 0007 five-authority \
-                         predicate), got Ok={actual}"
+                         {from:?}: expected Ok={expected} (ADR 0007 fail-closed \
+                         release predicate), got Ok={actual}"
                     );
                     if expected {
                         assert_eq!(artifact.quarantine_status, QuarantineStatus::Released);
@@ -765,7 +896,7 @@ fn release_predicate_exhaustive_authority_matrix() {
             }
         }
     }
-    assert_eq!(cases, 4 * 5 * 3 * 5);
+    assert_eq!(cases, 4 * 7 * 3 * 5);
 }
 
 // ---------------------------------------------------------------------------
@@ -889,7 +1020,7 @@ fn release_never_accepts_rejected_source_state() {
             for &provenance in ALL_PROVENANCE_CLEARANCES {
                 let mut artifact = fresh_artifact();
                 artifact.quarantine_status = QuarantineStatus::Rejected;
-                let result = artifact.release(reason.clone(), authz, provenance);
+                let result = artifact.release(*reason, authz, provenance);
                 assert!(
                     result.is_err(),
                     "release({reason:?}, {authz:?}, {provenance:?}) accepted a Rejected \

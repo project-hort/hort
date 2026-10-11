@@ -109,7 +109,7 @@ accepted?*
 | ADR | Decision |
 |---|---|
 | [0017](0017-metrics-catalog-canonical.md) | The metrics catalog is canonical |
-| [0019](0019-db-test-serial-isolation.md) | DB-backed tests share one database and must serialize |
+| [0019](0019-db-test-serial-isolation.md) | **Retired 2026-10-11** — DB-test serialization lives in `CLAUDE.md` → *Test Coverage Tiers* (the ADR had gone stale on both scope and enforcement); stub kept so citations resolve |
 | [0022](0022-pre-1.0-edit-existing-migrations.md) | Pre-1.0, edit existing migrations in place |
 | [0023](0023-implementation-discipline-objectively-better.md) | The design wins by default; deviations require an "objectively better" case |
 | [0024](0024-architect-skill-as-enforcement-index.md) | The architect skill is the enforcement index for these ADRs |
