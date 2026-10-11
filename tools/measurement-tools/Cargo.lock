@@ -813,7 +813,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hort-app"
-version = "0.14.2-dev"
+version = "0.14.1-dev"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -849,7 +849,7 @@ dependencies = [
 
 [[package]]
 name = "hort-config"
-version = "0.14.2-dev"
+version = "0.14.1-dev"
 dependencies = [
  "chrono",
  "hort-domain",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "hort-domain"
-version = "0.14.2-dev"
+version = "0.14.1-dev"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats"
-version = "0.14.2-dev"
+version = "0.14.1-dev"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2025,9 +2025,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.151"
+version = "1.0.152"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+checksum = "1741ab7a6cc54a03a89b5d563ed60075c277d9e3cfa73ad0c1f23f23974703c6"
 dependencies = [
  "itoa",
  "memchr",
