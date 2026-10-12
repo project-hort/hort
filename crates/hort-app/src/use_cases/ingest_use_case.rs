@@ -210,6 +210,24 @@ struct VerificationContext {
     sha1_handle: Option<Sha1DigestHandle>,
 }
 
+impl VerificationContext {
+    /// Whether this request declared an upstream-published digest whose
+    /// comparison lives in the post-`storage.put` arms
+    /// ([`IngestUseCase::verify_sha512_upstream`] /
+    /// [`IngestUseCase::verify_sha1_upstream`]) rather than in the
+    /// declared-SHA-256 decision.
+    ///
+    /// The SHA-256 arms leave both handles `None` and are verified by the
+    /// `declared_sha256` machinery — which a same-path dedup decision
+    /// performs itself, because a dedup hit *is* `existing.sha256_checksum
+    /// == declared` and that stored value is the CAS hash of the stored
+    /// bytes. A handle-bearing arm has no such shortcut: its digest only
+    /// exists once the bytes have flowed through the hashing wrapper.
+    fn has_pending_upstream_digest(&self) -> bool {
+        self.sha512_handle.is_some() || self.sha1_handle.is_some()
+    }
+}
+
 /// Lowercase-hex-encode a byte slice. Used for SHA-512 digest values
 /// emitted onto domain events and into Conflict messages — both must
 /// match the lowercase-hex convention enforced by
@@ -2484,6 +2502,50 @@ impl IngestUseCase {
         Ok(repo)
     }
 
+    /// Build the success tuple for a same-path dedup hit — the **single
+    /// construction site** of a deduplicated `ingest_inner` success, and
+    /// the reason a dedup hit can no longer report a verification it did
+    /// not perform.
+    ///
+    /// A dedup hit returns `Ok` to a caller that declared an
+    /// upstream-published checksum, and `ingest_with_verification` ticks
+    /// `hort_upstream_checksum_total{result=verified}` on that `Ok`. ADR
+    /// 0006 admits no operator opt-out and no "already verified once, by
+    /// someone else" clause: the bytes in CAS were verified against
+    /// whatever digest the FIRST ingest declared, which says nothing about
+    /// the algorithm or value THIS request declared. So the comparison
+    /// runs here, on the dedup path, before the success exists.
+    ///
+    /// It is free. Both arms read a digest the `Sha512HashingRead` /
+    /// `Sha1HashingRead` wrapper already accumulated while `storage.put`
+    /// drained the request's own stream — `finalize()` plus a hex encode,
+    /// no CAS read and no second pass over the bytes. The `put_hash` the
+    /// arms take for their rollback guard is `existing.sha256_checksum`,
+    /// which on a hit is by definition the hash just computed; the guard
+    /// (`find_by_checksum`) therefore finds the existing row and skips the
+    /// delete, so a refusal here never removes the blob a live row is
+    /// serving.
+    ///
+    /// Calling this from a point where the stream has NOT been drained
+    /// compares against the digest of the empty input and refuses a
+    /// legitimate ingest — loudly, and fail-closed. That asymmetry is
+    /// deliberate: the hazard a dedup short-circuit creates is a *success*
+    /// that compared nothing, and routing every such success through here
+    /// makes that unreachable.
+    async fn dedup_ok(
+        &self,
+        existing: Artifact,
+        repo_key: &str,
+        verification: Option<&VerificationContext>,
+    ) -> Result<IngestInnerOk, IngestInnerError> {
+        let stored_hash = existing.sha256_checksum.clone();
+        self.verify_sha512_upstream(verification, &stored_hash, repo_key)
+            .await?;
+        self.verify_sha1_upstream(verification, &stored_hash, repo_key)
+            .await?;
+        Ok((existing, true, repo_key.to_string(), Uuid::new_v4()))
+    }
+
     /// Step 3: look up any existing artifact at the same logical path
     /// BEFORE writing bytes. When the caller supplies `declared_sha256`,
     /// this short-circuits both the dedup and conflict decisions with zero
@@ -2497,11 +2559,25 @@ impl IngestUseCase {
     /// Returns `ControlFlow::Break` with `ingest_inner`'s full success
     /// tuple on a declared-hash dedup hit, `ControlFlow::Continue` with the
     /// looked-up (possibly `None`) existing artifact otherwise.
+    ///
+    /// Nothing has been read at this point, so a request that ALSO
+    /// declared a handle-bearing upstream digest (SHA-512 / SHA-1) cannot
+    /// have it compared here: the handle has seen zero bytes, and
+    /// finalising it would yield the digest of the EMPTY input rather than
+    /// of the stored content. Such a request therefore does not get the
+    /// short-circuit — it falls through to the normal path, which drains
+    /// the stream and reaches the comparison in
+    /// [`Self::put_and_check_post_dedup`]. The declared SHA-256 needs no
+    /// such treatment: the hit *is* `existing.sha256_checksum ==
+    /// declared`, and that stored value is the CAS hash of the stored
+    /// bytes, so the comparison this request asked for has been performed
+    /// against the bytes it asked about.
     async fn find_existing_and_check_declared_dedup(
         &self,
         repository_id: Uuid,
         coords: &ArtifactCoords,
         declared_sha256: Option<&ContentHash>,
+        verification: Option<&VerificationContext>,
         repo_key: &str,
     ) -> Result<ControlFlow<IngestInnerOk, Option<Artifact>>, IngestInnerError> {
         let existing = self
@@ -2518,16 +2594,22 @@ impl IngestUseCase {
 
         if let (Some(existing), Some(declared)) = (existing.as_ref(), declared_sha256) {
             if existing.sha256_checksum == *declared {
+                if verification.is_some_and(VerificationContext::has_pending_upstream_digest) {
+                    // An upstream digest is declared and uncomparable
+                    // here. Decline the short-circuit rather than return a
+                    // success that claims it: the fall-through pays one
+                    // `storage.put` of bytes the request is already
+                    // streaming, and the comparison then runs for free.
+                    return Ok(ControlFlow::Continue(Some(existing.clone())));
+                }
+                let early_ok = self
+                    .dedup_ok(existing.clone(), repo_key, verification)
+                    .await?;
                 tracing::debug!(
                     artifact_id = %existing.id,
                     "deduplicated via declared hash"
                 );
-                return Ok(ControlFlow::Break((
-                    existing.clone(),
-                    true,
-                    repo_key.to_string(),
-                    Uuid::new_v4(),
-                )));
+                return Ok(ControlFlow::Break(early_ok));
             }
             return Err((
                 InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
@@ -2546,11 +2628,17 @@ impl IngestUseCase {
     /// error explicitly so metric classification can distinguish storage
     /// failures from domain errors.
     ///
-    /// Step 5: post-put duplicate check by path — only reached when the
-    /// caller supplied no `declared_sha256` (or when `declared_sha256` was
-    /// set but [`Self::find_existing_and_check_declared_dedup`] found no
-    /// existing row to compare against). Behaviour unchanged from the
-    /// original flow.
+    /// Step 5: post-put duplicate check by path — reached when the caller
+    /// supplied no `declared_sha256`, when `declared_sha256` was set but
+    /// [`Self::find_existing_and_check_declared_dedup`] found no existing
+    /// row to compare against, and when that function declined to claim a
+    /// hit because an upstream-published digest was still uncompared.
+    ///
+    /// The dedup hit is claimed through [`Self::dedup_ok`], which runs the
+    /// request's upstream comparison: `storage.put` above has drained the
+    /// stream through the `Sha512HashingRead` / `Sha1HashingRead` wrapper,
+    /// so the digest already exists and the comparison costs one
+    /// `finalize()` — the dedup hit still performs no CAS read.
     ///
     /// Returns `ControlFlow::Break` with `ingest_inner`'s full success
     /// tuple on a post-put dedup hit, `ControlFlow::Continue` with the
@@ -2560,6 +2648,7 @@ impl IngestUseCase {
         stream: Box<dyn AsyncRead + Send + Unpin>,
         existing: Option<Artifact>,
         coords_path: &str,
+        verification: Option<&VerificationContext>,
         repo_key: &str,
     ) -> Result<ControlFlow<IngestInnerOk, PutResult>, IngestInnerError> {
         let put_result = self.storage.put(stream).await.map_err(|e| {
@@ -2572,16 +2661,14 @@ impl IngestUseCase {
 
         if let Some(existing) = existing {
             if existing.sha256_checksum == put_result.hash {
-                tracing::debug!(
-                    artifact_id = %existing.id,
-                    "deduplicated"
-                );
-                return Ok(ControlFlow::Break((
-                    existing,
-                    true,
-                    repo_key.to_string(),
-                    Uuid::new_v4(),
-                )));
+                // Log the dedup AFTER the comparison clears: a refused
+                // hit is not a deduplication, and a log line that says it
+                // was would be the same false claim in the trace that
+                // this path no longer makes in its return value.
+                let artifact_id = existing.id;
+                let early_ok = self.dedup_ok(existing, repo_key, verification).await?;
+                tracing::debug!(artifact_id = %artifact_id, "deduplicated");
+                return Ok(ControlFlow::Break(early_ok));
             }
             return Err((
                 InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
@@ -3704,6 +3791,7 @@ impl IngestUseCase {
                 repository_id,
                 &coords,
                 declared_sha256.as_ref(),
+                verification.as_ref(),
                 &repo_key,
             )
             .await?
@@ -3713,7 +3801,13 @@ impl IngestUseCase {
         };
 
         let put_result = match self
-            .put_and_check_post_dedup(stream, existing, &coords.path, &repo_key)
+            .put_and_check_post_dedup(
+                stream,
+                existing,
+                &coords.path,
+                verification.as_ref(),
+                &repo_key,
+            )
             .await?
         {
             ControlFlow::Break(early_ok) => return Ok(early_ok),
@@ -13140,6 +13234,459 @@ mod tests {
                 page.total, 0,
                 "no artifact row may be present after mismatch"
             );
+        });
+    }
+    // ---- A dedup hit may claim only the comparisons it ran (ADR 0006) ----
+    //
+    // The post-put dedup short-circuit in `put_and_check_post_dedup`
+    // returns `ingest_inner`'s success tuple BEFORE the
+    // upstream-published comparison arms run, and
+    // `ingest_with_verification` then ticks
+    // `hort_upstream_checksum_total{result=verified}` on that success.
+    // On the npm-SRI / Maven-floor arms (`declared_sha256: None`, a
+    // SHA-512 / SHA-1 digest handle on the `VerificationContext`) nothing
+    // had been compared for THIS request: the bytes in CAS were verified
+    // against whatever digest the FIRST ingest declared. ADR 0006 has no
+    // "already verified once, by someone else" clause, so the comparison
+    // runs on the dedup path too. It is free there — `storage.put` has
+    // already drained the hashing wrapper, so `finalize()` reads a digest
+    // that is already computed and no blob is re-read.
+
+    /// A second ingest at the same path declaring an upstream SHA-512
+    /// that does NOT match the stored bytes must be refused — the dedup
+    /// hit cannot inherit the first ingest's verification. The blob is
+    /// NOT rolled back: the existing row references it, so
+    /// `rollback_unreferenced_cas`'s `find_by_checksum` guard holds and
+    /// deleting would corrupt the row that is serving those bytes.
+    #[test]
+    fn dedup_hit_refuses_mismatched_upstream_sha512() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let bad_sha512_hex = "0".repeat(128);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            // First ingest plants the row and the bytes at this path.
+            let first = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("first ingest must succeed")
+                .artifact;
+
+            let upstream_checksum =
+                UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, bad_sha512_hex.clone())
+                    .unwrap();
+            let verified_req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let err = uc
+                .ingest_verified(verified_req, &[], content_stream(content), &test_handler())
+                .await
+                .expect_err(
+                    "a dedup hit whose declared upstream SHA-512 disagrees with the \
+                     stored bytes must be refused, not reported as verified",
+                );
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Conflict(_))),
+                "expected Conflict, got {err:?}"
+            );
+
+            // The refusal is audited on the repository stream, exactly as
+            // a fresh-ingest mismatch is.
+            let batches = events.appended_batches();
+            let mismatch_events: Vec<_> = batches
+                .iter()
+                .filter(|b| b.stream_id.category == StreamCategory::Repository)
+                .flat_map(|b| b.events.iter())
+                .filter_map(|e| match &e.event {
+                    DomainEvent::ChecksumMismatch(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                mismatch_events.len(),
+                1,
+                "exactly one ChecksumMismatch must land on the repository stream"
+            );
+            let mm = &mismatch_events[0];
+            assert_eq!(mm.algorithm, HashAlgorithm::Sha512);
+            assert_eq!(mm.upstream_value, bad_sha512_hex);
+            assert_eq!(
+                mm.computed_value,
+                sha512_of(content),
+                "computed_value is the digest of the bytes that actually flowed, \
+                 recovered from the hashing wrapper `storage.put` drained"
+            );
+
+            // The existing row survives: a dedup-path refusal must never
+            // delete the blob the live row is serving.
+            assert_eq!(
+                storage.delete_call_count(),
+                0,
+                "the blob is referenced by the existing row — rollback must be skipped"
+            );
+            let row = artifacts
+                .find_by_id(first.id)
+                .await
+                .expect("the existing artifact row must survive the refusal");
+            assert_eq!(row.sha256_checksum, first.sha256_checksum);
+        });
+    }
+
+    /// A second ingest at the same path declaring an upstream SHA-512
+    /// that DOES match the stored bytes still dedups — and does so
+    /// without re-reading the blob. `storage.get` is never called: the
+    /// digest the comparison needs was computed while `storage.put`
+    /// drained the request's own stream, so closing the gap costs one
+    /// `finalize()` and no CAS read.
+    #[test]
+    fn dedup_hit_accepts_matching_upstream_sha512_without_reading_the_blob() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let sha512_hex = sha512_of(content);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let first = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("first ingest must succeed")
+                .artifact;
+            let gets_after_first = storage.get_call_count();
+
+            let upstream_checksum =
+                UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, sha512_hex.clone()).unwrap();
+            let verified_req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let second = uc
+                .ingest_verified(verified_req, &[], content_stream(content), &test_handler())
+                .await
+                .expect("a dedup hit whose upstream SHA-512 agrees must succeed")
+                .artifact;
+
+            assert_eq!(
+                second.id, first.id,
+                "the dedup hit must still return the existing row"
+            );
+            assert_eq!(
+                storage.get_call_count(),
+                gets_after_first,
+                "the comparison must not re-read the blob — the digest was already \
+                 computed by the hashing wrapper that `storage.put` drained"
+            );
+        });
+    }
+
+    /// A second ingest declaring NO upstream digest keeps today's
+    /// behaviour: the comparison arms are inert, the dedup hit returns
+    /// the existing row, and no CAS read is added. This is the
+    /// assertion that stops the fix quietly taxing every dedup hit.
+    #[test]
+    fn dedup_hit_without_an_upstream_digest_stays_free() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            let first = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("first ingest must succeed")
+                .artifact;
+            let gets_after_first = storage.get_call_count();
+            let deletes_after_first = storage.delete_call_count();
+
+            let second = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("an unverified dedup hit must keep succeeding")
+                .artifact;
+
+            assert_eq!(second.id, first.id);
+            assert_eq!(
+                storage.get_call_count(),
+                gets_after_first,
+                "a dedup hit with nothing to compare must add no CAS read"
+            );
+            assert_eq!(
+                storage.delete_call_count(),
+                deletes_after_first,
+                "a dedup hit with nothing to compare must roll nothing back"
+            );
+        });
+    }
+    /// The SHA-1 floor sibling (ADR 0033, Maven `.sha1` sidecar): a
+    /// second ingest at the same path declaring an upstream SHA-1 that
+    /// does NOT match the stored bytes is refused too. The floor is the
+    /// weaker digest, which is exactly why a dedup hit must not be
+    /// allowed to skip it — a format that cannot verify cannot proxy, and
+    /// "someone else verified these bytes once" is not a verification of
+    /// what THIS request declared.
+    #[test]
+    fn dedup_hit_refuses_mismatched_upstream_sha1() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let bad_sha1_hex = "0".repeat(40);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+
+            uc.ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .expect("first ingest must succeed");
+
+            let upstream_checksum =
+                UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, bad_sha1_hex.clone()).unwrap();
+            let verified_req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let err = uc
+                .ingest_verified(verified_req, &[], content_stream(content), &test_handler())
+                .await
+                .expect_err("a dedup hit with a mismatched SHA-1 floor must be refused");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Conflict(_))),
+                "expected Conflict, got {err:?}"
+            );
+
+            let batches = events.appended_batches();
+            let mismatch: Vec<_> = batches
+                .iter()
+                .filter(|b| b.stream_id.category == StreamCategory::Repository)
+                .flat_map(|b| b.events.iter())
+                .filter_map(|e| match &e.event {
+                    DomainEvent::ChecksumMismatch(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(mismatch.len(), 1);
+            assert_eq!(mismatch[0].algorithm, HashAlgorithm::Sha1);
+            assert_eq!(mismatch[0].computed_value, sha1_of(content));
+            assert_eq!(
+                storage.delete_call_count(),
+                0,
+                "the blob is referenced by the existing row — rollback must be skipped"
+            );
+        });
+    }
+
+    /// The declared-SHA-256 short-circuit stays free: a `ProtocolNative`
+    /// dedup hit returns the existing row without a `storage.put` at all.
+    /// Closing the upstream-digest gap must not cost this path the
+    /// zero-I/O property it exists for — the digest it declared IS the
+    /// CAS hash, and the dedup decision compared it against the stored
+    /// row's own CAS hash.
+    #[test]
+    fn protocol_native_dedup_hit_still_short_circuits_before_put() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let hash_hex = sha256_of(content);
+        let upstream_digest: ContentHash = hash_hex.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+            let existing = insert_existing_artifact(&artifacts, repo_id, &hash_hex);
+
+            let verified_req = VerifiedIngestRequest::ProtocolNative {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: serde_json::Value::Null,
+                upstream_digest,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let outcome = uc
+                .ingest_verified(verified_req, &[], content_stream(content), &test_handler())
+                .await
+                .expect("a declared-hash dedup hit must succeed");
+
+            assert_eq!(outcome.artifact.id, existing.id);
+            assert_eq!(
+                storage.put_call_count(),
+                0,
+                "the declared-hash short-circuit must stay free of storage I/O"
+            );
+            assert_eq!(storage.get_call_count(), 0, "and free of CAS reads");
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "a dedup hit mints nothing"
+            );
+        });
+    }
+
+    /// The pre-`storage.put` short-circuit is declined — not taken and
+    /// not compared — while a handle-bearing upstream digest is still
+    /// uncompared. No production caller pairs `declared_sha256` with a
+    /// SHA-512 / SHA-1 handle today (the three `VerificationContext`
+    /// construction sites make them mutually exclusive), so this drives
+    /// `find_existing_and_check_declared_dedup` directly: the guard is
+    /// what keeps a future caller that pairs them from inheriting a
+    /// silent skip.
+    ///
+    /// Declining is the only sound answer here. Taking the short-circuit
+    /// would report a verification nothing performed; running the
+    /// comparison would finalise a handle that has seen zero bytes and
+    /// refuse a legitimate ingest against the digest of the empty input.
+    #[test]
+    fn declared_hash_dedup_declines_while_an_upstream_digest_is_uncompared() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let hash_hex = sha256_of(content);
+        let declared: ContentHash = hash_hex.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, _lifecycle, storage, repos) = make_use_case();
+            repos.insert(repo);
+            let existing = insert_existing_artifact(&artifacts, repo_id, &hash_hex);
+
+            // A digest handle in exactly the state a pre-put dedup
+            // decision finds it in: constructed, boxed nowhere, fed
+            // nothing.
+            let wrapper = Sha512HashingRead::new(tokio::io::empty());
+            let verification = VerificationContext {
+                algorithm: HashAlgorithm::Sha512,
+                upstream_value: sha512_of(content),
+                sha512_handle: Some(wrapper.digest_handle()),
+                sha1_handle: None,
+            };
+
+            let flow = uc
+                .find_existing_and_check_declared_dedup(
+                    repo_id,
+                    &sample_coords(),
+                    Some(&declared),
+                    Some(&verification),
+                    "repo-key",
+                )
+                .await;
+            // `InnerIngestError` carries no `Debug`, so match rather
+            // than `expect`. An error here is the OTHER failure mode this
+            // guard exists to prevent: the comparison ran against a
+            // handle that has absorbed no bytes — i.e. against the digest
+            // of the EMPTY input — and refused a legitimate ingest.
+            let Ok(flow) = flow else {
+                panic!(
+                    "declining must not be an error: a refusal here means the upstream \
+                     comparison ran against the digest of the empty input and rejected \
+                     an ingest whose bytes were never read"
+                )
+            };
+
+            match flow {
+                ControlFlow::Continue(carried) => assert_eq!(
+                    carried
+                        .expect("the existing row is carried into the normal path")
+                        .id,
+                    existing.id,
+                    "the declined hit must hand the existing row forward so the \
+                     post-put comparison still sees it"
+                ),
+                ControlFlow::Break(_) => panic!(
+                    "the short-circuit must be declined while an upstream digest is \
+                     uncompared — this is the success that would claim a verification \
+                     nothing performed"
+                ),
+            }
+            assert_eq!(
+                storage.put_call_count(),
+                0,
+                "declining is a decision, not I/O — the caller does the put"
+            );
+        });
+    }
+
+    /// Control for the test above: with the SAME existing row and the
+    /// SAME declared hash, a `VerificationContext` carrying no handle
+    /// (the SHA-256 arms, whose digest the dedup decision already
+    /// compared) DOES take the short-circuit. Without this the guard
+    /// above could be satisfied by declining everything, and the
+    /// zero-I/O dedup path would be gone.
+    #[test]
+    fn declared_hash_dedup_takes_the_short_circuit_when_nothing_is_left_to_compare() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let hash_hex = sha256_of(content);
+        let declared: ContentHash = hash_hex.parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _events, _lifecycle, _storage, repos) = make_use_case();
+            repos.insert(repo);
+            let existing = insert_existing_artifact(&artifacts, repo_id, &hash_hex);
+
+            let verification = VerificationContext {
+                algorithm: HashAlgorithm::Sha256,
+                upstream_value: hash_hex.clone(),
+                sha512_handle: None,
+                sha1_handle: None,
+            };
+
+            let flow = uc
+                .find_existing_and_check_declared_dedup(
+                    repo_id,
+                    &sample_coords(),
+                    Some(&declared),
+                    Some(&verification),
+                    "repo-key",
+                )
+                .await;
+            let Ok(flow) = flow else {
+                panic!("the lookup must succeed")
+            };
+
+            match flow {
+                ControlFlow::Break((artifact, was_duplicate, repo_key, _)) => {
+                    assert_eq!(artifact.id, existing.id);
+                    assert!(was_duplicate);
+                    assert_eq!(repo_key, "repo-key");
+                }
+                ControlFlow::Continue(_) => panic!(
+                    "a SHA-256-arm dedup hit has nothing left to compare and must keep \
+                     its zero-I/O short-circuit"
+                ),
+            }
         });
     }
 

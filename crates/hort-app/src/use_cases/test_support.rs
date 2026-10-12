@@ -6024,6 +6024,12 @@ pub struct MockUpstreamProxy {
     metadata: Mutex<HashMap<(String, String), Vec<u8>>>,
     /// One-shot failure for the next `fetch_metadata` call.
     next_metadata_error: Mutex<Option<DomainError>>,
+    /// Total `fetch_metadata` calls, counted whether or not a fixture
+    /// matched. Lets a test assert that a consumer actually went to the
+    /// upstream rather than answering from one of its own caches — the
+    /// only observation that distinguishes "the cache entry is gone"
+    /// from "something else served the same bytes".
+    metadata_calls: AtomicUsize,
     /// Artifact-fetch fixtures keyed by (path_prefix, path). The
     /// stored body is wrapped in a single-chunk BlobStream on read.
     artifacts: Mutex<HashMap<(String, String), MockArtifactEntry>>,
@@ -6066,6 +6072,7 @@ impl MockUpstreamProxy {
             next_manifest_error: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
             next_metadata_error: Mutex::new(None),
+            metadata_calls: AtomicUsize::new(0),
             artifacts: Mutex::new(HashMap::new()),
             next_artifact_error: Mutex::new(None),
             referrers: Mutex::new(HashMap::new()),
@@ -6090,6 +6097,13 @@ impl MockUpstreamProxy {
     /// Seed a one-shot failure on the next `fetch_metadata` call.
     pub fn fail_next_metadata_with(&self, err: DomainError) {
         *self.next_metadata_error.lock().unwrap() = Some(err);
+    }
+
+    /// Total `fetch_metadata` calls so far, fixture-match or not. Use it
+    /// to assert a consumer actually reached the upstream rather than
+    /// answering from one of its own caches.
+    pub fn metadata_calls(&self) -> usize {
+        self.metadata_calls.load(Ordering::SeqCst)
     }
 
     /// Seed an artifact-stream fixture keyed by `(path_prefix, path)`.
@@ -6383,6 +6397,7 @@ impl UpstreamProxy for MockUpstreamProxy {
         // `MetadataFetchOutcome` shape. Tests calling
         // `metadata_body_bytes` against the outcome get the same bytes
         // back and the tempfile is cleaned up after.
+        self.metadata_calls.fetch_add(1, Ordering::SeqCst);
         let injected = self.next_metadata_error.lock().unwrap().take();
         let key = (mapping.path_prefix, path);
         let entry = self.metadata.lock().unwrap().get(&key).cloned();
