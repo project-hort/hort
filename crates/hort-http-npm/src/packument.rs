@@ -219,6 +219,96 @@ fn url_encode_npm_name(name: &str) -> String {
     out
 }
 
+/// The evictable-store key of the cached packument **projection** for
+/// `(mapping, package)` — the single construction site for the
+/// `npm_packument_proj:` keyspace row.
+///
+/// `fetch_raw_with_cache` writes it and
+/// [`evict_packument`] drops it; both go through this function so the
+/// writer and the evictor cannot disagree about which row holds a given
+/// package's document. Takes the protocol-form name and encodes it
+/// internally, so no caller can mis-encode the package segment.
+fn projection_cache_key(mapping_id: uuid::Uuid, pkg_name: &str) -> String {
+    format!(
+        "npm_packument_proj:{mapping_id}:{}",
+        url_encode_npm_name(pkg_name)
+    )
+}
+
+/// The upstream registry path of `pkg_name`'s packument — the single
+/// construction site, so the path we fetch and the path the dedup key
+/// is built from cannot drift apart.
+fn upstream_packument_path(pkg_name: &str) -> String {
+    format!("/{}", url_encode_npm_name(pkg_name))
+}
+
+/// The [`PullDedup`] window key of the packument metadata fetch for
+/// `(repo, package)` — the single construction site, for the same
+/// writer/evictor-agreement reason as [`projection_cache_key`].
+///
+/// A completed leader leaves a terminal `SucceededMetadata` record under
+/// this key, and the dedup serves that record to every later caller in
+/// the window — so the window is a second place the same document lives,
+/// and [`evict_packument`] has to reach it too.
+fn packument_dedup_key(repo_id: uuid::Uuid, pkg_name: &str) -> DedupKey {
+    DedupKey::metadata("npm", repo_id, &upstream_packument_path(pkg_name))
+}
+
+/// Drop every evictable copy of `pkg_name`'s packument for this
+/// `(repo, mapping)`, so the next reader resolves the package from
+/// upstream instead of from what we already hold.
+///
+/// There are **two** such copies, and leaving either one behind keeps
+/// the document answerable:
+///
+/// 1. the projection cache row ([`projection_cache_key`]) — up to
+///    [`NPM_PACKUMENT_STALE_TTL`] old, served outright inside
+///    [`NPM_PACKUMENT_FRESH_TTL`];
+/// 2. the pull-dedup window's terminal record
+///    ([`packument_dedup_key`]) — a completed leader's
+///    `SucceededMetadata` is handed to every later caller for
+///    `PullDedupConfig::leader_lock_ttl` with no upstream call, and
+///    `fetch_raw_with_cache` writes the projection it receives straight
+///    back into the cache row. Dropping (1) alone therefore only
+///    survives until the next reader re-populates it from (2) with the
+///    same bytes.
+///
+/// Both drops are best-effort and idempotent: an already-absent row is
+/// success, and an infrastructure failure is warned and swallowed
+/// because the caller's own outcome does not depend on it. Dropping the
+/// dedup record can release a still-running leader's cluster lock, which
+/// at worst costs a duplicate upstream fetch — the same fail-open
+/// trade-off the dedup already takes everywhere, and a re-fetch is the
+/// point here.
+pub(crate) async fn evict_packument(
+    cache: &dyn EphemeralStore,
+    pull_dedup: &PullDedup,
+    repo_id: uuid::Uuid,
+    mapping_id: uuid::Uuid,
+    pkg_name: &str,
+) {
+    let key = projection_cache_key(mapping_id, pkg_name);
+    if let Err(e) = cache.delete(&key).await {
+        tracing::warn!(
+            error = %e,
+            pkg = pkg_name,
+            "npm packument projection cache eviction failed (non-fatal); a reader \
+             inside the fresh window can still be served the evicted document"
+        );
+    }
+    if let Err(e) = pull_dedup
+        .forget(&packument_dedup_key(repo_id, pkg_name))
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            pkg = pkg_name,
+            "npm packument pull-dedup window eviction failed (non-fatal); a reader \
+             inside the leader-lock window can still be served the evicted document"
+        );
+    }
+}
+
 /// Pull-through fetch of the upstream packument as a streamed
 /// **projection**, with `EphemeralStore`-backed caching of the
 /// projection and the raw body streamed into the
@@ -311,7 +401,7 @@ pub async fn fetch_raw_with_cache(
     // has new code read a legacy `npm_packument_raw:` entry (its payload
     // is the raw body, not a `serde_json(NpmProjection)` — `decode` would
     // treat it as a miss anyway, but a fresh prefix is cleaner).
-    let key = format!("npm_packument_proj:{}:{}", mapping.id, encoded);
+    let key = projection_cache_key(mapping.id, pkg_name);
     // The raw body's home is the logical-keyed mirror (separate keyspace
     // from artifact CAS). The `encoded` package segment matches the
     // Redis cache key's segment so prefetch / serve / tarball-pull all
@@ -356,8 +446,8 @@ pub async fn fetch_raw_with_cache(
     // returns the SERIALIZED projection bytes so followers receive the
     // small projection (not the multi-MB raw body) — keeping the dedup
     // window's payload bounded by the projection size.
-    let upstream_path = format!("/{encoded}");
-    let dedup_key = DedupKey::metadata("npm", repo.id, &upstream_path);
+    let upstream_path = upstream_packument_path(pkg_name);
+    let dedup_key = packument_dedup_key(repo.id, pkg_name);
     let mapping_for_closure = mapping.clone();
     let upstream_path_for_closure = upstream_path.clone();
     let mkey_for_closure = mkey.clone();
@@ -714,7 +804,105 @@ mod tests {
     // (the npm / cargo / pypi copies were byte-identical).
     use hort_http_core::test_support::{build_mock_ctx, read_mirror, MockPorts};
 
+    use hort_domain::error::DomainResult;
+
     use super::*;
+
+    /// An `EphemeralStore` whose every operation fails. Drives
+    /// [`evict_packument`]'s two best-effort arms: the eviction of a
+    /// disproved packument is part of a refusal that has already been
+    /// decided, so a cache that cannot be reached must not turn it into
+    /// a different outcome.
+    struct UnreachableEphemeralStore;
+
+    impl UnreachableEphemeralStore {
+        fn err<T>() -> DomainResult<T> {
+            Err(DomainError::Invariant("ephemeral store unreachable".into()))
+        }
+    }
+
+    impl EphemeralStore for UnreachableEphemeralStore {
+        fn get(
+            &self,
+            _key: &str,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Option<Bytes>>> {
+            Box::pin(async { Self::err() })
+        }
+        fn put(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Self::err() })
+        }
+        fn put_if_absent(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<bool>> {
+            Box::pin(async { Self::err() })
+        }
+        fn compare_and_swap(
+            &self,
+            _key: &str,
+            _expected_version: u64,
+            _new_value: Bytes,
+            _ttl: Duration,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<Option<u64>>> {
+            Box::pin(async { Self::err() })
+        }
+        fn delete(&self, _key: &str) -> hort_domain::ports::BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Self::err() })
+        }
+        fn extend_ttl(
+            &self,
+            _key: &str,
+            _ttl: Duration,
+        ) -> hort_domain::ports::BoxFuture<'_, DomainResult<()>> {
+            Box::pin(async { Self::err() })
+        }
+    }
+
+    /// Both eviction legs failing is logged and swallowed — the refusal
+    /// the eviction belongs to stands either way, and an unreachable
+    /// cache must not change the caller's outcome.
+    #[tokio::test]
+    async fn evict_packument_tolerates_an_unreachable_store_on_both_legs() {
+        let store: Arc<dyn EphemeralStore> = Arc::new(UnreachableEphemeralStore);
+        let dedup = PullDedup::new(
+            store.clone(),
+            hort_app::pull_dedup::PullDedupConfig::defaults(),
+        );
+        evict_packument(
+            store.as_ref(),
+            &dedup,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "@types/node",
+        )
+        .await;
+    }
+
+    /// The projection-cache key and the pull-dedup key are built from
+    /// the protocol-form name and encode it themselves, so an evictor
+    /// handed `@types/node` addresses the same rows the writer wrote
+    /// for `@types/node` — the scoped form is where a hand-rolled
+    /// second copy of either key would diverge.
+    #[test]
+    fn eviction_keys_encode_the_scoped_name_the_way_the_writer_does() {
+        let mapping_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        assert_eq!(
+            projection_cache_key(mapping_id, "@types/node"),
+            format!("npm_packument_proj:{mapping_id}:@types%2fnode")
+        );
+        assert_eq!(
+            packument_dedup_key(repo_id, "@types/node").serialised_for_test(),
+            format!("pulldedup:meta:npm:{repo_id}:/@types%2fnode")
+        );
+    }
 
     fn sample_projection() -> NpmProjection {
         NpmProjection {

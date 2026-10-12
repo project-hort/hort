@@ -177,10 +177,10 @@ pub(crate) async fn try_upstream_maven_pull(
     //    a mismatch — the security primitive against upstream tampering
     //    (ADR 0006). Coalesce the fetch + ingest so N parallel callers for
     //    the same artifact produce ≤ 1 upstream fetch + ≤ 1 CAS write. The
-    //    dedup key is the verified upstream digest (pre-known per ADR 0006),
-    //    so different repos pointing at the same upstream share one window.
-    let dedup_alg = algorithm_token(algorithm);
-    let blob_dedup_key = DedupKey::blob_by_hash(dedup_alg, upstream_checksum.hex());
+    //    key is the verified upstream digest when that digest can name
+    //    content across origins, and a per-repo one otherwise — see
+    //    `blob_dedup_key`.
+    let blob_dedup_key = blob_dedup_key(algorithm, &upstream_checksum, repo.id, artifact_path);
     let blob_proxy = ctx
         .upstream_proxy
         .for_format(&crate::UPSTREAM_PROXY_FORMAT)
@@ -484,6 +484,47 @@ async fn fetch_sidecar_body(
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Choose the coalescing key for the artifact-body leg, from the algorithm
+/// whichever sidecar won.
+///
+/// [`DedupKey::blob_by_hash`] is cross-repository AND cross-format: every
+/// caller declaring the same `(algorithm, hex)` joins ONE window, and the
+/// followers adopt the leader's bytes without fetching or verifying them. That
+/// reach is sound only for a digest that can *name* content —
+/// [`HashAlgorithm::may_name_content_across_origins`]. Maven is the one
+/// pull-through whose algorithm is not a compile-time constant: the sidecar
+/// negotiation legitimately resolves to the `.sha1` floor (ADR 0033), which
+/// verifies a transfer and is never an identity. Keyed by hash, a SHA-1
+/// collision pair would be enough to have one upstream's bytes coalesced under
+/// another's identity and registered into the follower's repository as
+/// verified content.
+///
+/// So the floor coalesces under the narrower [`DedupKey::blob_by_url`] —
+/// per-format and per-repository, so it can never carry another origin's
+/// bytes. Coalescing is kept wherever it is sound: a `.sha512`- or
+/// `.sha256`-verified pull keeps its full cross-origin reach and the `"_any"`
+/// metric sentinel with it.
+///
+/// The per-repo key is built from the repo-relative Maven path rather than a
+/// composed absolute URL, mirroring the sidecar leg's [`DedupKey::metadata`]
+/// key in `fetch_sidecar_body`: the path maps 1:1 onto the resolved mapping's
+/// upstream layout, and Maven resolves exactly one mapping per repository, so
+/// `(repo_id, path)` already identifies one upstream file. Composing the URL
+/// here would mean a second, divergent copy of the upstream adapter's
+/// `compose_url` inside a format crate.
+fn blob_dedup_key(
+    algorithm: HashAlgorithm,
+    upstream_checksum: &UpstreamPublishedChecksum,
+    repo_id: Uuid,
+    artifact_path: &str,
+) -> DedupKey {
+    if algorithm.may_name_content_across_origins() {
+        DedupKey::blob_by_hash(algorithm_token(algorithm), upstream_checksum.hex())
+    } else {
+        DedupKey::blob_by_url("maven", repo_id, artifact_path)
+    }
+}
+
 /// The lowercase metric/dedup token for a [`HashAlgorithm`].
 fn algorithm_token(algorithm: HashAlgorithm) -> &'static str {
     match algorithm {
@@ -618,13 +659,19 @@ mod tests {
     }
 
     fn seed_mapping(mocks: &MockPorts, repo_id: Uuid) -> Uuid {
+        seed_mapping_at(mocks, repo_id, "https://repo1.maven.org/maven2")
+    }
+
+    /// `seed_mapping` with the upstream named explicitly, for the tests that
+    /// need two repositories pointing at two DIFFERENT origins.
+    fn seed_mapping_at(mocks: &MockPorts, repo_id: Uuid, upstream_url: &str) -> Uuid {
         let id = Uuid::new_v4();
         let now = Utc::now();
         mocks.upstream_resolver.insert(RepositoryUpstreamMapping {
             id,
             repository_id: repo_id,
             path_prefix: "".into(),
-            upstream_url: "https://repo1.maven.org/maven2".into(),
+            upstream_url: upstream_url.into(),
             upstream_name_prefix: None,
             upstream_auth: UpstreamAuth::Anonymous,
             secret_ref: None,
@@ -965,6 +1012,195 @@ mod tests {
                 .await
                 .expect("trailing-filename sidecar must verify");
         assert_eq!(artifact.sha256_checksum.as_ref(), sha256_hex(&body));
+    }
+
+    // ---- Cross-origin identity: the SHA-1 floor must not coalesce ----------
+    //
+    // `DedupKey::blob_by_hash` is cross-repository AND cross-format: the
+    // follower adopts the leader's `ContentHash` without fetching or
+    // verifying anything itself. Keyed on the `.sha1` floor (ADR 0033) that
+    // turns a SHA-1 collision into "another upstream's bytes under my own
+    // identity", so a floor-verified pull keys per-repository instead
+    // (`HashAlgorithm::may_name_content_across_origins`).
+    //
+    // The fixture is the attack, not a hypothetical: two repositories point
+    // at two different origins, hold two different byte streams, and their
+    // `.sha1` sidecars declare the SAME hex. The second pull must do its own
+    // verified fetch (and so detect that ITS bytes do not match the declared
+    // digest) rather than inherit the first's bytes.
+
+    #[tokio::test]
+    async fn sha1_floor_does_not_coalesce_across_upstream_origins() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+
+        let repo_a = proxy_maven_repo("maven-origin-a");
+        let repo_b = proxy_maven_repo("maven-origin-b");
+        mocks.repositories.insert(repo_a.clone());
+        mocks.repositories.insert(repo_b.clone());
+        seed_mapping_at(&mocks, repo_a.id, "https://origin-a.example/maven2");
+        seed_mapping_at(&mocks, repo_b.id, "https://origin-b.example/maven2");
+
+        let path_a = ARTIFACT_PATH;
+        let path_b = "org/other/bar/2.0/bar-2.0.jar";
+        let body_a = b"origin A's jar body".to_vec();
+        let body_b = b"origin B's DIFFERENT jar body".to_vec();
+        let claimed_sha1 = sha1_hex(&body_a);
+
+        // Only `.sha1` is published on either side — the floor is the
+        // verifying digest for both pulls.
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{path_a}.sha1"),
+            claimed_sha1.clone().into_bytes(),
+        );
+        mocks
+            .upstream_proxy
+            .insert_artifact("", path_a, body_a.clone());
+        // Origin B declares origin A's SHA-1 over its own, different bytes —
+        // what a collision pair buys an attacker.
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{path_b}.sha1"),
+            claimed_sha1.into_bytes(),
+        );
+        mocks
+            .upstream_proxy
+            .insert_artifact("", path_b, body_b.clone());
+
+        // Pull A first: it is the leader and leaves a terminal dedup record.
+        let artifact_a = try_upstream_maven_pull(&ctx, &repo_a, &coords_for(path_a), path_a)
+            .await
+            .expect("the sha1 floor must still verify and ingest");
+        assert_eq!(artifact_a.sha256_checksum.as_ref(), sha256_hex(&body_a));
+
+        // Pull B must NOT join A's window. It fetches its own bytes, rehashes
+        // them against the declared SHA-1, and finds the mismatch.
+        let err = try_upstream_maven_pull(&ctx, &repo_b, &coords_for(path_b), path_b)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, UpstreamPullError::ChecksumMismatch),
+            "a floor-verified pull must verify its OWN bytes, not inherit another origin's; got {err:?}"
+        );
+
+        // And origin A's content never reached repository B under B's coords.
+        let leaked = ctx
+            .artifact_use_case
+            .find_in_repo_by_hash(repo_b.id, &artifact_a.sha256_checksum)
+            .await
+            .expect("artifact lookup must succeed");
+        assert!(
+            leaked.is_none(),
+            "origin A's bytes must not be registered in repository B"
+        );
+    }
+
+    // ---- …and the strong path keeps its cross-origin reach -----------------
+    //
+    // The counterpart assertion: narrowing the floor must not have deleted
+    // dedup. Two repositories at two different origins declaring the SAME
+    // `.sha256` still share one window — and the proof is that repository B's
+    // artifact body is NEVER seeded, so B can only succeed by adopting the
+    // leader's already-verified content hash. Without coalescing, B's own
+    // `fetch_artifact` would 404 into `NotFoundUpstream`.
+
+    #[tokio::test]
+    async fn sha256_still_coalesces_across_upstream_origins() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+
+        let repo_a = proxy_maven_repo("maven-origin-a");
+        let repo_b = proxy_maven_repo("maven-origin-b");
+        mocks.repositories.insert(repo_a.clone());
+        mocks.repositories.insert(repo_b.clone());
+        seed_mapping_at(&mocks, repo_a.id, "https://origin-a.example/maven2");
+        seed_mapping_at(&mocks, repo_b.id, "https://origin-b.example/maven2");
+
+        let path_a = ARTIFACT_PATH;
+        let path_b = "org/other/bar/2.0/bar-2.0.jar";
+        let body = b"the very same jar body, published to both origins".to_vec();
+        let shared_sha256 = sha256_hex(&body);
+
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{path_a}.sha256"),
+            shared_sha256.clone().into_bytes(),
+        );
+        mocks
+            .upstream_proxy
+            .insert_artifact("", path_a, body.clone());
+        // B publishes the same strong digest and NO artifact body: the only
+        // way this pull can succeed is by coalescing onto A's window.
+        mocks.upstream_proxy.insert_metadata(
+            "",
+            &format!("{path_b}.sha256"),
+            shared_sha256.clone().into_bytes(),
+        );
+
+        let artifact_a = try_upstream_maven_pull(&ctx, &repo_a, &coords_for(path_a), path_a)
+            .await
+            .expect("sha256 sidecar must verify + ingest");
+        assert_eq!(artifact_a.sha256_checksum.as_ref(), shared_sha256);
+
+        let artifact_b = try_upstream_maven_pull(&ctx, &repo_b, &coords_for(path_b), path_b)
+            .await
+            .expect("a strong digest must still coalesce across origins");
+        // B's own per-repo row, carrying B's coords and the shared content.
+        assert_eq!(artifact_b.repository_id, repo_b.id);
+        assert_eq!(artifact_b.name, "org.other:bar");
+        assert_eq!(artifact_b.version.as_deref(), Some("2.0"));
+        assert_eq!(artifact_b.sha256_checksum.as_ref(), shared_sha256);
+    }
+
+    // ---- The key shapes the two paths produce ------------------------------
+
+    #[test]
+    fn blob_dedup_key_uses_the_cross_format_sentinel_only_for_strong_digests() {
+        let repo_id = Uuid::new_v4();
+        let sha1 = UpstreamPublishedChecksum::new(HashAlgorithm::Sha1, "a".repeat(40)).unwrap();
+        let sha256 = UpstreamPublishedChecksum::new(HashAlgorithm::Sha256, "b".repeat(64)).unwrap();
+        let sha512 =
+            UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, "c".repeat(128)).unwrap();
+
+        // Strong digests keep the cross-repository, cross-format reach and
+        // the `"_any"` metric sentinel that advertises it.
+        for strong in [&sha256, &sha512] {
+            let key = blob_dedup_key(strong.algorithm(), strong, repo_id, ARTIFACT_PATH);
+            assert_eq!(
+                key.format_label(),
+                "_any",
+                "a strong digest must keep the cross-format window"
+            );
+        }
+
+        // The floor is per-format and per-repository instead.
+        let floor_key = blob_dedup_key(HashAlgorithm::Sha1, &sha1, repo_id, ARTIFACT_PATH);
+        assert_eq!(floor_key.format_label(), "maven");
+        assert_ne!(
+            floor_key,
+            blob_dedup_key(HashAlgorithm::Sha1, &sha1, Uuid::new_v4(), ARTIFACT_PATH),
+            "the floor key must differ per repository"
+        );
+        assert_ne!(
+            floor_key,
+            blob_dedup_key(
+                HashAlgorithm::Sha1,
+                &sha1,
+                repo_id,
+                "org/other/bar/2.0/bar-2.0.jar"
+            ),
+            "the floor key must differ per upstream file"
+        );
+        // Two repositories declaring the same SHA-1 hex share NOTHING, where
+        // two declaring the same SHA-256 hex share everything.
+        assert_eq!(
+            blob_dedup_key(HashAlgorithm::Sha256, &sha256, repo_id, ARTIFACT_PATH),
+            blob_dedup_key(
+                HashAlgorithm::Sha256,
+                &sha256,
+                Uuid::new_v4(),
+                "org/other/bar/2.0/bar-2.0.jar"
+            ),
+        );
     }
 
     // ---- Wire mapping -------------------------------------------------------

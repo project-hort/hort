@@ -321,6 +321,35 @@ impl DedupKey {
     /// the natural dedup boundary because two callers of any shape
     /// asking for the same bytes can share the result. The metric
     /// `format` label is the literal `"_any"` sentinel.
+    ///
+    /// # Precondition — `algorithm` must be strong enough to NAME content
+    ///
+    /// That cross-everything reach is the whole point of this key and also
+    /// its only precondition. Two callers that declare the same
+    /// `(algorithm, hex_digest)` share ONE window: the leader fetches, and
+    /// every follower adopts the leader's `ContentHash` without fetching,
+    /// verifying or comparing anything itself. The key is therefore an
+    /// equality claim between byte streams nobody compared — sound only for
+    /// a digest that can serve as a cross-origin identity, i.e. one for
+    /// which
+    /// [`HashAlgorithm::may_name_content_across_origins`](hort_domain::types::checksum::HashAlgorithm::may_name_content_across_origins)
+    /// is `true`.
+    ///
+    /// A caller passing a **literal** `"sha256"` / `"sha512"` satisfies this
+    /// by construction. A caller passing a **variable** algorithm — one
+    /// resolved from whatever an upstream happened to publish, such as
+    /// Maven's `.sha512` → `.sha256` → `.sha1` sidecar negotiation (ADR
+    /// 0033) — MUST ask the predicate first and fall back to
+    /// [`Self::blob_by_url`] when it says no. A SHA-1 digest keyed here
+    /// would let anyone holding a SHA-1 collision pair have one upstream's
+    /// bytes coalesced under another's identity, and the follower would then
+    /// register them into its own repository as verified content.
+    ///
+    /// The precondition is prose rather than a type because the `&str` pair
+    /// is deliberately loose: npm passes its whole `dist.integrity` SRI
+    /// string (`sha512-<base64>`) as `hex_digest`, and OCI passes a digest
+    /// recovered from a descriptor, so there is no single validated
+    /// `(algorithm, digest)` domain value every caller already holds.
     pub fn blob_by_hash(algorithm: &str, hex_digest: &str) -> Self {
         let serialised = format!("pulldedup:blob_by_hash:{algorithm}:{hex_digest}");
         Self {
@@ -678,6 +707,39 @@ impl PullDedup {
             config,
             replica_id,
         }
+    }
+
+    /// Drop the Layer-B record for `key`, so the next caller elects a
+    /// fresh leader and re-runs the fetch instead of being handed what
+    /// the last one found.
+    ///
+    /// The window's record is not only a lock: a completed leader leaves
+    /// a terminal `Succeeded*` record behind for `leader_lock_ttl`, and
+    /// every caller arriving inside that window is served it as a
+    /// follower hit with no upstream call. That makes the record a
+    /// *cache of the leader's answer* — so a caller that has since
+    /// **disproved** that answer (upstream bytes that refuted the
+    /// checksum the fetched document declared — ADR 0006) must drop the
+    /// record, or the next caller inherits the disproved answer.
+    ///
+    /// Idempotent, exactly like [`EphemeralStore::delete`]: an absent
+    /// record is `Ok(())`. The error is returned rather than swallowed so
+    /// the caller decides what a failed drop costs it; because the window
+    /// is an optimisation and never a correctness guarantee, a caller
+    /// whose own outcome is already settled should log and carry on.
+    ///
+    /// Only Layer B is touched. The Layer-A entry is a per-process
+    /// in-flight broadcast handle that a completed leader has already
+    /// released, and its `Weak` cannot outlive the leader — there is no
+    /// answer cached there to disprove. Dropping the Layer-B record
+    /// while a leader is still running releases that leader's cluster
+    /// lock, so a concurrent caller may elect and fetch in parallel;
+    /// that is the same fail-open outcome
+    /// [`Self::run_as_leader_layer_b_down`] already accepts, and a
+    /// duplicate re-fetch is the intended direction for the only caller
+    /// that needs this.
+    pub async fn forget(&self, key: &DedupKey) -> DomainResult<()> {
+        self.ephemeral.delete(&key.serialised).await
     }
 
     /// Coalesce a metadata fetch. The closure runs at most once per
@@ -2344,6 +2406,70 @@ mod tests {
         });
         assert_eq!(counter_for(&snap, "negative_cache_hit"), 1);
         assert_eq!(counter_for(&snap, "leader_started"), 0);
+    }
+
+    /// `forget` drops the terminal record a completed leader left, so
+    /// the next caller elects and re-runs the closure instead of being
+    /// handed the previous answer. Without it the second caller is a
+    /// Layer-B follower hit for `leader_lock_ttl` and the closure never
+    /// runs again — which is exactly how a document whose checksum has
+    /// been refuted stays answerable.
+    #[tokio::test]
+    async fn forget_drops_a_terminal_success_so_the_next_caller_re_runs_the_fetch() {
+        let store: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+        let dd = PullDedup::new(store.clone(), PullDedupConfig::defaults());
+        let key = DedupKey::metadata("npm", uuid::Uuid::nil(), "/express");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let run = |n: u8| {
+            let cc = calls.clone();
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok(Bytes::from(vec![n]))
+            }
+        };
+
+        let first = dd.coalesce_metadata(key.clone(), || run(1)).await.unwrap();
+        assert_eq!(first, Bytes::from(vec![1u8]));
+        assert!(
+            store
+                .get(key.serialised_for_test())
+                .await
+                .unwrap()
+                .is_some(),
+            "a completed leader leaves a terminal record behind"
+        );
+
+        // Control: without a `forget` the next caller is served the
+        // leader's answer and the closure does not run.
+        let cached = dd.coalesce_metadata(key.clone(), || run(2)).await.unwrap();
+        assert_eq!(cached, Bytes::from(vec![1u8]), "follower hit on the record");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "closure ran once so far");
+
+        dd.forget(&key).await.unwrap();
+        assert!(
+            store
+                .get(key.serialised_for_test())
+                .await
+                .unwrap()
+                .is_none(),
+            "forget must remove the Layer-B record"
+        );
+
+        let refetched = dd.coalesce_metadata(key.clone(), || run(3)).await.unwrap();
+        assert_eq!(refetched, Bytes::from(vec![3u8]), "re-ran the fetch");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Idempotent like `EphemeralStore::delete`: forgetting a window
+    /// nobody opened is success, so a caller need not first establish
+    /// whether a record exists.
+    #[tokio::test]
+    async fn forget_on_an_absent_record_is_ok() {
+        let store: Arc<dyn EphemeralStore> = Arc::new(InMemoryEphemeralStore::new());
+        let dd = PullDedup::new(store, PullDedupConfig::defaults());
+        let key = DedupKey::metadata("npm", uuid::Uuid::nil(), "/never-fetched");
+        dd.forget(&key).await.unwrap();
     }
 
     #[test]

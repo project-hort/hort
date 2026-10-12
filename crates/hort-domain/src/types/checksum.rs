@@ -24,8 +24,12 @@ pub enum HashAlgorithm {
     /// catches transport corruption and casual tampering only, with TLS
     /// (system trust store + `HORT_EXTRA_CA_BUNDLE`) as the real
     /// transport-integrity control. See ADR 0033 (SHA-1 transfer-
-    /// verification floor). This invariant is a doc/review contract — there
-    /// is no consumer in this module to enforce it.
+    /// verification floor). The *identity* half of that invariant now has a
+    /// consumer in this module —
+    /// [`HashAlgorithm::may_name_content_across_origins`] returns `false`
+    /// here, and every key that coalesces two origins' fetches under one
+    /// digest is built only through it. The CAS-key half stays a type-level
+    /// fact: `ContentHash` carries no `HashAlgorithm` to get wrong.
     Sha1,
     Sha256,
     Sha512,
@@ -38,6 +42,43 @@ impl HashAlgorithm {
             HashAlgorithm::Sha1 => 40,
             HashAlgorithm::Sha256 => 64,
             HashAlgorithm::Sha512 => 128,
+        }
+    }
+
+    /// May a digest of this algorithm **name** content — stand as the
+    /// identity under which two independently-fetched byte streams are
+    /// treated as the same bytes? `Sha256` / `Sha512`: yes. `Sha1`: no.
+    ///
+    /// Verifying a transfer and naming content are two different acts
+    /// facing two different adversaries, and ADR 0033 (SHA-1
+    /// transfer-verification floor) authorises only the first.
+    ///
+    /// - **Verifying** asks *"are these the bytes this upstream told me to
+    ///   expect?"* — a one-sided comparison against a digest fetched over
+    ///   the same TLS channel as the bytes. Authoring a colliding pair buys
+    ///   an attacker nothing here: whoever controls the response controls
+    ///   the sidecar too, so digest strength is not the control that stops
+    ///   them (ADR 0033's threat model spells this out). SHA-1 survives
+    ///   this act, which is why the Maven `.sha1` sidecar floor stands.
+    /// - **Naming** asks *"are these the same bytes some **other** origin
+    ///   already fetched?"* — an equality claim between two streams that
+    ///   nobody compared byte-for-byte. One freely-chosen collision pair is
+    ///   then enough to get one origin's bytes served under another
+    ///   origin's identity. SHA-1 is collision-broken (SHAttered, 2017) and
+    ///   fails this act.
+    ///
+    /// So a weak digest may gate an ingest and must not key a cross-origin
+    /// cache, dedup window or equality test. A caller holding a *variable*
+    /// algorithm asks this before reaching for such a key, and falls back
+    /// to a per-origin key when the answer is `false`.
+    ///
+    /// Exhaustive and wildcard-free on purpose: a fourth algorithm has to
+    /// be classified here by hand — a compile error until it is — rather
+    /// than admitted by a `_ => true` nobody reads.
+    pub fn may_name_content_across_origins(self) -> bool {
+        match self {
+            HashAlgorithm::Sha1 => false,
+            HashAlgorithm::Sha256 | HashAlgorithm::Sha512 => true,
         }
     }
 }
@@ -147,6 +188,42 @@ mod tests {
         // Both usable after move-by-copy.
         assert_eq!(a, HashAlgorithm::Sha256);
         assert_eq!(b, HashAlgorithm::Sha256);
+    }
+
+    #[test]
+    fn sha1_may_not_name_content_across_origins() {
+        // ADR 0033 permits SHA-1 to verify a transfer. It does NOT permit
+        // SHA-1 to be the identity two origins' fetches are coalesced
+        // under: one freely-chosen collision pair would hand the holder
+        // another upstream's bytes under its own name.
+        assert!(
+            !HashAlgorithm::Sha1.may_name_content_across_origins(),
+            "SHA-1 is a transfer-verification floor, never a cross-origin identity"
+        );
+    }
+
+    #[test]
+    fn strong_digests_may_name_content_across_origins() {
+        assert!(HashAlgorithm::Sha256.may_name_content_across_origins());
+        assert!(HashAlgorithm::Sha512.may_name_content_across_origins());
+    }
+
+    #[test]
+    fn may_name_content_across_origins_is_total_over_every_algorithm() {
+        // Every variant has an answer, and exactly one of them is `false`.
+        // A fourth algorithm fails to compile inside the predicate before it
+        // can reach this assertion, which is the point of the wildcard-free
+        // match; this pins the current classification so a future variant
+        // cannot be slipped in as a silent `true`.
+        let refused: Vec<HashAlgorithm> = [
+            HashAlgorithm::Sha1,
+            HashAlgorithm::Sha256,
+            HashAlgorithm::Sha512,
+        ]
+        .into_iter()
+        .filter(|a| !a.may_name_content_across_origins())
+        .collect();
+        assert_eq!(refused, vec![HashAlgorithm::Sha1]);
     }
 
     #[test]
