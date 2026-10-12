@@ -203,7 +203,7 @@ pub fn parse_scan_policy(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<ScanPolicySpec>, ParseError> {
-    let env: Envelope<ScanPolicySpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<ScanPolicySpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::ScanPolicy {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

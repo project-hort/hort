@@ -89,6 +89,13 @@ impl ScopeSpec {
 
 #[cfg(test)]
 mod tests {
+    //! Every parse here goes through `crate::yaml::from_slice` — the same
+    //! call path and the same options an operator's boot uses — because
+    //! two of these tests assert that a document is *rejected*. A
+    //! strictness claim is only worth what the parse behind it is: run
+    //! against a bare deserialiser at its own defaults, "an unknown field
+    //! in the mapping form fails" would be a statement about a parse
+    //! configuration no deployed tree has.
     use super::*;
 
     #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -99,14 +106,14 @@ mod tests {
     #[test]
     fn parses_global_string_form() {
         let yaml = "scope: global\n";
-        let w: Wrap = serde_yaml_ng::from_str(yaml).unwrap();
+        let w: Wrap = crate::yaml::from_slice(yaml.as_bytes()).unwrap();
         assert_eq!(w.scope, ScopeSpec::Global);
     }
 
     #[test]
     fn parses_repository_mapping_form() {
         let yaml = "scope:\n  repository: npm-public\n";
-        let w: Wrap = serde_yaml_ng::from_str(yaml).unwrap();
+        let w: Wrap = crate::yaml::from_slice(yaml.as_bytes()).unwrap();
         assert_eq!(
             w.scope,
             ScopeSpec::Repository(RepositoryScope {
@@ -121,11 +128,11 @@ mod tests {
         // custom messages and surfaces a bare "did not match any
         // variant" error. The structural property we pin is that the
         // unknown form is rejected at all — operator-friendly
-        // diagnostics for the bare-string case live one level up
-        // (the parent kind module surfaces the surrounding context
-        // when serde_yaml_ng wraps the error with the field path).
+        // diagnostics for the bare-string case live one level up (the
+        // parent kind module surfaces the surrounding context, and the
+        // parser appends the line and column of the offending node).
         let yaml = "scope: cluster\n";
-        assert!(serde_yaml_ng::from_str::<Wrap>(yaml).is_err());
+        assert!(crate::yaml::from_slice::<Wrap>(yaml.as_bytes()).is_err());
     }
 
     #[test]
@@ -134,7 +141,7 @@ mod tests {
         // mapping form fail loudly rather than silently producing an
         // invalid scope.
         let yaml = "scope:\n  repo: npm-public\n";
-        assert!(serde_yaml_ng::from_str::<Wrap>(yaml).is_err());
+        assert!(crate::yaml::from_slice::<Wrap>(yaml.as_bytes()).is_err());
     }
 
     #[test]
@@ -142,9 +149,9 @@ mod tests {
         let original = Wrap {
             scope: ScopeSpec::Global,
         };
-        let yaml = serde_yaml_ng::to_string(&original).unwrap();
+        let yaml = serde_saphyr::to_string(&original).unwrap();
         assert!(yaml.contains("global"));
-        let back: Wrap = serde_yaml_ng::from_str(&yaml).unwrap();
+        let back: Wrap = crate::yaml::from_slice(yaml.as_bytes()).unwrap();
         assert_eq!(original, back);
     }
 
@@ -155,8 +162,8 @@ mod tests {
                 repository: "pypi-public".into(),
             }),
         };
-        let yaml = serde_yaml_ng::to_string(&original).unwrap();
-        let back: Wrap = serde_yaml_ng::from_str(&yaml).unwrap();
+        let yaml = serde_saphyr::to_string(&original).unwrap();
+        let back: Wrap = crate::yaml::from_slice(yaml.as_bytes()).unwrap();
         assert_eq!(original, back);
     }
 

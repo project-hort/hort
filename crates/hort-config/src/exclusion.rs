@@ -67,7 +67,7 @@ pub struct ExclusionSpec {
 
 /// Parse one `Exclusion` envelope.
 pub fn parse_exclusion(_path: &Path, bytes: &[u8]) -> Result<Envelope<ExclusionSpec>, ParseError> {
-    let env: Envelope<ExclusionSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<ExclusionSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::Exclusion {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

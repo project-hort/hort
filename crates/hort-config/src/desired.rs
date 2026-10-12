@@ -539,8 +539,10 @@ enum ParsedFile {
 }
 
 fn parse_one_file(path: &std::path::Path, bytes: &[u8]) -> Result<ParsedFile, ParseError> {
-    // Peek at the raw YAML to decide which parser to invoke.
-    let raw: serde_yaml_ng::Value = serde_yaml_ng::from_slice(bytes)?;
+    // Peek at the raw YAML to decide which parser to invoke. Untyped
+    // because the envelope's `spec` shape is exactly what is not known
+    // yet; `serde_json::Value` is the crate's one untyped target.
+    let raw: serde_json::Value = crate::yaml::from_slice(bytes)?;
     let kind = raw.get("kind").and_then(|v| v.as_str());
     if let Some(kind_str) = kind {
         match kind_str {
@@ -2054,10 +2056,10 @@ spec: {}
         let mut state = DesiredState::default();
         state
             .repositories
-            .push(serde_yaml_ng::from_slice(&repo_yaml("ok", "hosted", None)).unwrap());
+            .push(crate::yaml::from_slice(&repo_yaml("ok", "hosted", None)).unwrap());
         state
             .claim_mappings
-            .push(serde_yaml_ng::from_slice(&cm_yaml("admins", "g", "admin")).unwrap());
+            .push(crate::yaml::from_slice(&cm_yaml("admins", "g", "admin")).unwrap());
         let err = state
             .validate_against(&CurrentSnapshot::default(), &env(EnvAuthProvider::Disabled))
             .unwrap_err();

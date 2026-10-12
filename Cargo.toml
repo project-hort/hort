@@ -290,11 +290,40 @@ serde_json = "1.0"
 # cursor. Workspace-pinned so hort-domain (pure signature-material extraction)
 # and hort-app (orchestration) resolve one version.
 base64 = "0.23"
-# YAML — active community fork of the archived `serde_yaml`. Swapped
-# `serde_yml` → `serde_yaml_ng` to drop the transitive `libyml` advisories
-# RUSTSEC-2025-0067 / RUSTSEC-2025-0068. Promoted to workspace level so
-# the `hort-config` crate shares a single resolved version.
-serde_yaml_ng = "0.10"
+# The one YAML parser in the workspace. Pure Rust, no C transliteration, actively
+# maintained. Default features only (`serialize` + `deserialize`): the
+# `figment` / `figment2` / `validator` / `garde` / `miette` integrations are
+# deliberately off — hort validates its envelopes itself, and a second
+# validation framework in the control path is surface rather than help, so
+# the graph gains no crate that is not needed to deserialise.
+#
+# It replaced a parser that bound the c2rust machine translation of libyaml
+# named by RUSTSEC-2024-0449 — archived upstream, no fixed version. Do not
+# bring that component back under any name. A swap to a *rename* of the same
+# transliteration turns the advisory gates green (a new crate name carries no
+# advisory yet) while putting the abandoned code back in the control path,
+# which is the opposite of the point: the requirement is that the component
+# is absent from the graph, not that the gate is quiet.
+#
+# `hort-config/src/yaml.rs` is the single call path for a **gitops envelope**
+# parse and the only place an `Options` value is built for one; the parser's
+# defaults are not this tree's semantics, and that file says which ones had
+# to be pinned back and why. Two test-only guards parse *deployment* YAML
+# (`hort-app`'s `publish_chain_is_gated`, `hort-config`'s
+# `deploy_schedule_parity`) and build their own options for that different
+# language — neither is an envelope parse and neither may be taken as
+# precedent for a second envelope-parse options value.
+#
+# The requirement names the **maintained 1.x line**, not the `0.0.29` that
+# `kube-client` already pulls in transitively. `kube-client` requires
+# `^0.0.29`, which cargo's semver rules can never unify with 1.x, so the lock
+# carries both versions and `cargo deny` reports a `multiple-versions` warning
+# — that warning is the honest record of the situation and is deliberately NOT
+# silenced with a `deny.toml` `skip` entry. Replacing an unmaintained parser
+# with a pre-1.0 version 29 releases behind the fix stream would undo the
+# point: fixes land on 1.x. "Already in the graph" is availability, not
+# suitability.
+serde-saphyr = "1.3.0"
 
 # Authentication
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }

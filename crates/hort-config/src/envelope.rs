@@ -295,8 +295,8 @@ mod tests {
         }
         for v in [ApiVersion::V1, ApiVersion::V1Beta1] {
             let w = Wrap { v };
-            let yaml = serde_yaml_ng::to_string(&w).unwrap();
-            let back: Wrap = serde_yaml_ng::from_str(&yaml).unwrap();
+            let yaml = serde_saphyr::to_string(&w).unwrap();
+            let back: Wrap = serde_saphyr::from_str(&yaml).unwrap();
             assert_eq!(w, back);
         }
     }

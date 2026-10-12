@@ -139,10 +139,10 @@ hort-formats           = { workspace = true }
 
 anyhow                       = { workspace = true }
 axum                         = { workspace = true }
-# Note: `serde` and `serde_yaml_ng` were dropped from this crate
-# alongside the legacy
-# `HORT_GROUP_MAPPINGS_PATH` loader. YAML parsing now lives entirely in
-# `hort-config`; hort-server only orchestrates the boot apply.
+# Note: YAML parsing was dropped from this crate alongside the legacy
+# `HORT_GROUP_MAPPINGS_PATH` loader. It now lives entirely in
+# `hort-config`; hort-server only orchestrates the boot apply. (`serde`
+# itself came back further down, for the embedded contractions manifest.)
 sqlx                         = { workspace = true }
 # The `enqueue-quarantine-release-sweep` subcommand
 # constructs an empty `serde_json::Value` to pass to

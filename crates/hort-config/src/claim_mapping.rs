@@ -63,7 +63,7 @@ pub fn parse_claim_mapping(
     path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<ClaimMappingSpec>, ParseError> {
-    let env: Envelope<ClaimMappingSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<ClaimMappingSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::ClaimMapping {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),
@@ -88,12 +88,16 @@ pub fn parse_claim_mapping(
     Ok(env)
 }
 
-/// Build a `serde_yaml_ng::Error` that carries a custom message via the
-/// YAML scanner's "custom" branch. Lets us reuse `ParseError::Yaml` for
-/// both shape failures (deserialize) and content failures (empty
-/// fields) without inventing two more `ParseError` variants for what is
+/// Build a `serde_saphyr::Error` that carries a custom message via
+/// serde's "custom" branch. Lets us reuse `ParseError::Yaml` for both
+/// shape failures (deserialize) and content failures (empty fields)
+/// without inventing two more `ParseError` variants for what is
 /// essentially the same operator-facing error category.
-fn yaml_invariant(_path: &Path, message: &str) -> serde_yaml_ng::Error {
+///
+/// The message is fixed text naming a field, so it carries no source
+/// location and reproduces nothing an operator wrote — which is the
+/// property the gitops parse keeps for every rendered error.
+fn yaml_invariant(_path: &Path, message: &str) -> serde_saphyr::Error {
     serde::de::Error::custom(message)
 }
 
