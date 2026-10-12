@@ -196,7 +196,7 @@ pub fn parse_permission_grant(
     _path: &std::path::Path,
     bytes: &[u8],
 ) -> Result<Envelope<PermissionGrantSpec>, ParseError> {
-    let env: Envelope<PermissionGrantSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<PermissionGrantSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::PermissionGrant {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

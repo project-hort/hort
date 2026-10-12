@@ -250,24 +250,27 @@ fn name_regex_matches(name: &str) -> bool {
 pub fn parse_repository(path: &Path, bytes: &[u8]) -> Result<Envelope<RepositorySpec>, ParseError> {
     // Step 1: forbidden-field scan. Only `credentials:` is rejected;
     // the `secretRef` inline field was removed (see Step 3 note below).
-    let raw: serde_yaml_ng::Value = serde_yaml_ng::from_slice(bytes)?;
-    if let Some(spec) = raw.get("spec").and_then(|v| v.as_mapping()) {
-        if let Some(proxy) = spec.get(serde_yaml_ng::Value::String("proxy".into())) {
-            if let Some(map) = proxy.as_mapping() {
-                if map
-                    .get(serde_yaml_ng::Value::String("credentials".into()))
-                    .is_some()
-                {
-                    return Err(ParseError::CredentialsFieldForbidden {
-                        field: "credentials",
-                    });
-                }
+    // Read untyped: the scan has to see a key the typed envelope would
+    // reject, so it cannot go through `RepositorySpec`. `serde_json::Value`
+    // is the untyped target because this crate already deserialises one
+    // spec field into it, so there is a single untyped value type here
+    // rather than two. Presence is the test, not the value — a
+    // `credentials:` with nothing after it is still an operator writing
+    // the forbidden field, and reading its contents is exactly what this
+    // scan exists to avoid.
+    let raw: serde_json::Value = crate::yaml::from_slice(bytes)?;
+    if let Some(spec) = raw.get("spec").and_then(|v| v.as_object()) {
+        if let Some(map) = spec.get("proxy").and_then(|v| v.as_object()) {
+            if map.contains_key("credentials") {
+                return Err(ParseError::CredentialsFieldForbidden {
+                    field: "credentials",
+                });
             }
         }
     }
 
     // Step 2: strict deserialize into the typed envelope.
-    let mut env: Envelope<RepositorySpec> = serde_yaml_ng::from_slice(bytes)?;
+    let mut env: Envelope<RepositorySpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::ArtifactRepository {
         // The dispatch in `DesiredState::parse_files` routes by `kind`
         // first, so this branch only fires when a single-
@@ -934,7 +937,7 @@ mod tests {
   bogus_field: 42
 ";
         let err = parse_repository(&p(), yaml(body).as_bytes()).unwrap_err();
-        // serde_yaml_ng's deny_unknown_fields surfaces under Yaml, not
+        // A `deny_unknown_fields` rejection surfaces under `Yaml`, not
         // a custom variant. The message must name the offending field
         // so the operator can locate it.
         let rendered = err.to_string();
@@ -963,6 +966,61 @@ mod tests {
             ParseError::CredentialsFieldForbidden { field } => assert_eq!(field, "credentials"),
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    /// The pre-scan tests for the key's **presence**, not for a value
+    /// under it: `credentials:` with nothing after it is still an
+    /// operator putting the forbidden field in the file, and it must be
+    /// refused by the same dedicated error rather than falling through
+    /// to `ProxySpec`'s generic unknown-field rejection. Reading the
+    /// value is the one thing this scan must not do, so an empty value
+    /// is the case that proves it does not have to.
+    #[test]
+    fn proxy_credentials_is_forbidden_even_with_no_value_under_it() {
+        let body = "
+  name: x
+  format: npm
+  type: proxy
+  storage: { backend: filesystem, path: /x }
+  proxy:
+    upstreamUrl: https://example.com
+    credentials:
+  isPublic: true
+  replicationPriority: immediate
+";
+        let err = parse_repository(&p(), yaml(body).as_bytes()).unwrap_err();
+        match err {
+            ParseError::CredentialsFieldForbidden { field } => assert_eq!(field, "credentials"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A non-mapping `proxy` must not make the pre-scan itself fail: the
+    /// scan has nothing to look inside, so the typed parse is what
+    /// reports the shape error. Pinned because the scan reads an untyped
+    /// document, where a wrong-shaped node is a value it has to step
+    /// over rather than an error it owns.
+    #[test]
+    fn a_non_mapping_proxy_is_reported_by_the_typed_parse_not_the_pre_scan() {
+        let body = "
+  name: x
+  format: npm
+  type: proxy
+  storage: { backend: filesystem, path: /x }
+  proxy: nope
+  isPublic: true
+  replicationPriority: immediate
+";
+        let err = parse_repository(&p(), yaml(body).as_bytes()).unwrap_err();
+        assert!(
+            matches!(err, ParseError::Yaml(_)),
+            "a shape error belongs to the typed parse: {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("expected mapping start"),
+            "the message must say the node was not a mapping: {rendered}"
+        );
     }
 
     /// The inline `proxy.secretRef` field was removed because it was

@@ -221,7 +221,7 @@ pub fn parse_upstream_mapping(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<UpstreamMappingSpec>, ParseError> {
-    let env: Envelope<UpstreamMappingSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<UpstreamMappingSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::UpstreamMapping {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),
@@ -948,8 +948,7 @@ mod tests {
             pinned_cert_sha256: None,
             allowed_realm_hosts: Vec::new(),
         };
-        let yaml_out =
-            serde_yaml_ng::to_string(&spec).expect("default spec must serialise to YAML");
+        let yaml_out = serde_saphyr::to_string(&spec).expect("default spec must serialise to YAML");
         assert!(
             !yaml_out.contains("trustUpstreamPublishTime"),
             "default `false` must skip-serialize; got:\n{yaml_out}"
@@ -961,7 +960,7 @@ mod tests {
             ..spec
         };
         let yaml_out_true =
-            serde_yaml_ng::to_string(&spec_true).expect("opted-in spec must serialise to YAML");
+            serde_saphyr::to_string(&spec_true).expect("opted-in spec must serialise to YAML");
         assert!(
             yaml_out_true.contains("trustUpstreamPublishTime"),
             "opt-in `true` must serialise; got:\n{yaml_out_true}"
@@ -1519,7 +1518,7 @@ spec:
         let body = realm_hosts_yaml("bearer_challenge", &[], false);
         let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
         assert!(env.spec.allowed_realm_hosts.is_empty());
-        let out = serde_yaml_ng::to_string(&env.spec).expect("spec serialises");
+        let out = serde_saphyr::to_string(&env.spec).expect("spec serialises");
         assert!(
             !out.contains("allowedRealmHosts"),
             "the empty default must skip-serialize; got:\n{out}"
@@ -1528,7 +1527,7 @@ spec:
         // …and a non-empty list does round-trip.
         let body = realm_hosts_yaml("bearer_challenge", &["auth.docker.io"], false);
         let env = parse_upstream_mapping(&p(), yaml("u", &body).as_bytes()).unwrap();
-        let out = serde_yaml_ng::to_string(&env.spec).expect("spec serialises");
+        let out = serde_saphyr::to_string(&env.spec).expect("spec serialises");
         assert!(out.contains("allowedRealmHosts"), "got:\n{out}");
         assert!(out.contains("auth.docker.io"), "got:\n{out}");
     }

@@ -61,6 +61,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 /// Chart CronJobs with **no** systemd counterpart, each with the reason
 /// it has none. This is not an allow-list of "known drift": an entry here
 /// asserts a design decision, and the test fails if the entry goes stale
@@ -143,15 +145,34 @@ struct Timer {
     exec_subcommand: Option<String>,
 }
 
+/// The YAML this guard reads is an **Ansible role's defaults**, not a
+/// gitops envelope, so it deliberately does not go through
+/// `hort-config`'s own parse: that call path is private to the crate and
+/// its options encode decisions about operator-authored envelopes that
+/// have no bearing on a deployment file.
+///
+/// `emit_comments: false` is the one setting that is not the
+/// deserialiser's default, and it is here for robustness rather than
+/// semantics. Comment *text* is not part of the data model either way —
+/// the deserialiser never hands it to `serde_json::Value`. But with
+/// emission on, a run of more than 32 consecutive comment lines before a
+/// collection's first entry breaches a buffered-comment budget and fails
+/// the parse; this file is heavily commented and the `# (Helm: …)`
+/// pairing notes are expected to grow. A comment block tipping over that
+/// budget would fail the guard with a parse error about comments, which
+/// reads as nothing at all like "a scheduled task lost its pairing".
+fn parse_deployment_yaml(text: &str) -> Result<Value, serde_saphyr::Error> {
+    serde_saphyr::from_str_with_options(text, serde_saphyr::options! { emit_comments: false })
+}
+
 fn ansible_timers() -> Vec<Timer> {
     let path = workspace_root().join("deploy/ansible/roles/hort_timers/defaults/main.yml");
     let text = std::fs::read_to_string(&path).expect("read hort_timers defaults");
-    let doc: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&text).expect("hort_timers defaults parse as YAML");
+    let doc = parse_deployment_yaml(&text).expect("hort_timers defaults parse as YAML");
 
     let tasks = doc
         .get("hort_timers_tasks")
-        .and_then(serde_yaml_ng::Value::as_sequence)
+        .and_then(Value::as_array)
         .unwrap_or_else(|| {
             panic!(
                 "`hort_timers_tasks` must be a sequence in {}",
@@ -164,17 +185,17 @@ fn ansible_timers() -> Vec<Timer> {
         .map(|task| {
             let kind = task
                 .get("kind")
-                .and_then(serde_yaml_ng::Value::as_str)
+                .and_then(Value::as_str)
                 .unwrap_or_else(|| panic!("every hort_timers_tasks entry needs a `kind`: {task:?}"))
                 .to_string();
             let exec_path = task
                 .get("path")
-                .and_then(serde_yaml_ng::Value::as_str)
+                .and_then(Value::as_str)
                 .unwrap_or_else(|| panic!("`{kind}` needs a `path` (dsn-direct | admin-task)"))
                 .to_string();
             let exec_subcommand = task
                 .get("exec_subcommand")
-                .and_then(serde_yaml_ng::Value::as_str)
+                .and_then(Value::as_str)
                 .map(str::to_string);
 
             let slug = match exec_path.as_str() {

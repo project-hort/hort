@@ -140,4 +140,9 @@ toml = { workspace = true }
 # worse bet of the two, since `needs:` may be a flow or a block sequence and an
 # `if:` may be a folded block scalar. Already a workspace dependency
 # (`hort-config`), so this adds no package to `Cargo.lock`.
-serde_yaml_ng = { workspace = true }
+#
+# A workflow is not a gitops envelope: the guard builds its own options value
+# rather than borrowing `hort-config`'s, which is private to that crate and
+# encodes decisions about an operator-authored envelope that have no bearing
+# here. See the guard's own note on `emit_comments`.
+serde-saphyr = { workspace = true }

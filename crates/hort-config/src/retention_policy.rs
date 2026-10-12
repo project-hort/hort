@@ -190,11 +190,13 @@ pub struct RetentionPolicySpec {
     /// [`PolicyPredicate`](hort_domain::retention::PolicyPredicate) by
     /// `validate_retention_policy` / the apply use case via
     /// [`predicate_from_value`]. Carrying it as `Value` (rather than
-    /// the typed enum) is deliberate: `serde_yaml_ng` represents Rust
-    /// externally-tagged enums with `!Variant` YAML tags, which is NOT
-    /// the JSON-shaped machine-envelope contract the operator writes;
-    /// going via JSON preserves the JSON form and surfaces a malformed
-    /// value as a typed validation error naming the policy.
+    /// the typed enum) is deliberate: the operator contract is the
+    /// JSON-shaped machine envelope, and binding the field to the Rust
+    /// enum would make whatever the YAML layer does with an
+    /// externally-tagged enum — historically a `!Variant` tag — the wire
+    /// form instead. Going via JSON preserves the JSON form regardless of
+    /// the YAML layer underneath and surfaces a malformed value as a typed
+    /// validation error naming the policy.
     pub predicate: serde_json::Value,
     /// Which artifacts the policy applies to — [`RetentionScopeSpec`]
     /// in its JSON shape (e.g. `scope: AllRepos`,
@@ -210,7 +212,7 @@ pub fn parse_retention_policy(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<RetentionPolicySpec>, ParseError> {
-    let env: Envelope<RetentionPolicySpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<RetentionPolicySpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::RetentionPolicy {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),

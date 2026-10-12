@@ -20,7 +20,7 @@ pub enum ParseError {
     Io(#[from] std::io::Error),
 
     #[error("yaml parse error: {0}")]
-    Yaml(#[from] serde_yaml_ng::Error),
+    Yaml(#[from] serde_saphyr::Error),
 
     #[error(
         "unsupported apiVersion `{got}` — accepts `project-hort.de/v1` (current) and \

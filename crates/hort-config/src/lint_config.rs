@@ -179,7 +179,7 @@ pub fn parse_lint_config(
     _path: &Path,
     bytes: &[u8],
 ) -> Result<Envelope<PermissionGrantLintConfigSpec>, ParseError> {
-    let env: Envelope<PermissionGrantLintConfigSpec> = serde_yaml_ng::from_slice(bytes)?;
+    let env: Envelope<PermissionGrantLintConfigSpec> = crate::yaml::from_slice(bytes)?;
     if env.kind != Kind::PermissionGrantLintConfig {
         return Err(ParseError::UnknownKind {
             got: env.kind.to_string(),
@@ -360,7 +360,7 @@ mod tests {
 
         // Round-trip: serialize the parsed envelope back to YAML and
         // re-parse — the full shape must survive intact.
-        let serialized = serde_yaml_ng::to_string(&env).unwrap();
+        let serialized = serde_saphyr::to_string(&env).unwrap();
         let reparsed = parse_lint_config(&p(), serialized.as_bytes()).unwrap();
         assert_eq!(reparsed, env);
     }

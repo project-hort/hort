@@ -221,6 +221,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The gitops YAML parser is `serde-saphyr`, and an operator's file means what
+  it meant** (#347). The control path's envelope parse ran on a crate binding
+  `unsafe-libyaml`, an unmaintained C transliteration carrying
+  RUSTSEC-2024-0449 with no fixed version. It now runs on `serde-saphyr`, pure
+  Rust and maintained. Every parse in `hort-config` goes through one call path
+  with one options value, so the gitops parse has a single definition rather
+  than one per call site.
+
+  **The swap was configured to preserve semantics, not to take the opportunity
+  to change them.** Strict booleans (only `true` / `false` resolve to a
+  boolean, so `requireApproval: no` is still refused), merge keys as ordinary
+  keys (`<<` is still an unknown field to a strict spec and still ignored by a
+  spec struct without one), and no source echo in a rendered parse error are
+  all pinned deliberately. A duplicate mapping key is refused, which the
+  previous parser only did for keys naming a declared struct field — see
+  *Security* below.
+
+  **Operator impact.** Four behaviours differ, and a tree that parsed before
+  parses now unless it relies on one of them:
+
+  - **`quotaBytes: 1_000` now parses as `1000`.** A digit separator in an
+    integer field used to fail the boot. There is no option that restores the
+    rejection; the field is typed and the value is the one the grouping spells.
+  - **Numeric scalars in an untyped position are now YAML-resolved.** The only
+    such position is `ScanPolicy`'s `spec.licensePolicy`, a free-form map:
+    `1_000` there becomes the number `1000` and `0755` becomes the float `755`,
+    where both used to stay text. A YAML 1.1 boolean word there is
+    **unaffected** — a bare `yes` stays the string `"yes"`, because strict
+    booleans reach untyped positions too. Bounded today by the apply-time
+    rejection of any `licensePolicy` richer than `null` / `{}`.
+  - **One anchor backing 100 or more aliases is now rejected**, by a default
+    alias-to-anchor budget the previous parser had no equivalent of (99 aliases
+    on one anchor still parse). No checked-in gitops envelope uses an anchor at
+    all. A tree that leans on a single heavily-reused anchor must spell the
+    repeated value out or split it across anchors.
+  - **Parse-error text changed.** A rejection now carries `at line N, column M`
+    and no longer carries the serde field path (`spec.proxy: unknown field …`
+    reads `unknown field \`usernme\`, expected one of … at line 13, column 5`),
+    and a type mismatch names only the expected type rather than the value
+    received (`invalid i64`, not `invalid type: string "notanumber"`). The
+    offending field is still named in both. Log matching on the old field-path
+    prefix needs updating; matching on the field name does not.
+
 - **One authority owns the manual release: the curator** (#345). Releasing a
   held artifact by hand used to be two surfaces for one transition — an
   admin-gated `POST /api/v1/admin/quarantine/<id>/release` with
@@ -1403,6 +1446,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what kept them from drifting apart again.
 
 ### Security
+
+- **A repeated key in a `ServiceAccount`'s `claims` map no longer applies
+  silently** (#347). `FederatedIdentitySpec.claims` is the exact-match
+  condition under which a JWT may assume a service account (ADR 0018), and it
+  is a map rather than a struct — so serde's duplicate-field rejection did not
+  reach it and the YAML layer decided. The previous parser kept the **last**
+  value and said nothing: an envelope reading
+  `project_path: trusted/group` on one line and
+  `project_path: attacker/group` on the next applied the second, with the
+  discarded entry visible nowhere in parse, validate or the apply diff. The
+  gitops parse now refuses a duplicate mapping key outright, wherever it
+  appears.
+
+  **Operator impact.** A tree carrying such a duplicate — in `claims` or in
+  any other mapping — stops booting with
+  `duplicate mapping key: <key> … at line N, column M` instead of applying one
+  of the two values. That is the intended direction for this field: a trust
+  policy that is not the one the file reads as must fail, not resolve. Audit
+  any generated or templated `ServiceAccount` envelope before upgrading; a
+  repeated key that was being tolerated is now a boot failure.
 
 - **An upstream credential is bound to its mapping's own origin** (#343). On
   the artifact path the request URL is not always the operator's: `npm`'s

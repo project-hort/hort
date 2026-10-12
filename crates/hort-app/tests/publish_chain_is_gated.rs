@@ -183,7 +183,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde_yaml_ng::Value;
+use serde_json::Value;
 
 /// The two workflows this guard is about. `ci.yml`, `e2e.yml` and
 /// `build-binaries.yml` are read only as `uses:` callees, for classification.
@@ -302,15 +302,39 @@ fn load_jobs(file: &str) -> BTreeMap<String, Value> {
     let path = workflows_dir().join(file);
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("{} must be readable: {err}", path.display()));
-    let doc: Value = serde_yaml_ng::from_str(&text)
+    let doc = parse_workflow(&text)
         .unwrap_or_else(|err| panic!("{} must parse as YAML: {err}", path.display()));
     let jobs = doc
         .get("jobs")
-        .and_then(Value::as_mapping)
+        .and_then(Value::as_object)
         .unwrap_or_else(|| panic!("{} must declare a `jobs:` mapping", path.display()));
     jobs.iter()
-        .filter_map(|(key, value)| key.as_str().map(|k| (k.to_owned(), value.clone())))
+        .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+/// Deserialise one workflow into an untyped document.
+///
+/// A GitHub workflow is **not** a gitops envelope, so this does not reach
+/// for `hort-config`'s parse: that call path is private to the crate and
+/// its options encode decisions about an operator-authored envelope which
+/// have no bearing on a file in `.github/workflows/`.
+///
+/// `emit_comments: false` is the one setting that is not the
+/// deserialiser's default, and it is load-bearing here rather than
+/// cosmetic: with emission on, a run of more than 32 consecutive comment
+/// lines before a collection's first entry breaches a buffered-comment
+/// budget and fails the parse. `release.yml` carries exactly that — a
+/// 38-line rationale block between `jobs:` and its first job — and the
+/// guard's own contract is that `classification reads no YAML comments`,
+/// so not capturing comment text is what this guard wants in any case.
+///
+/// The failure mode this avoids is the one that matters for a fail-closed
+/// guard: `load_jobs` panics on a parse error, so a comment block growing
+/// past the budget would abort the guard with a message about comments
+/// rather than letting it answer the question it exists to answer.
+fn parse_workflow(text: &str) -> Result<Value, serde_saphyr::Error> {
+    serde_saphyr::from_str_with_options(text, serde_saphyr::options! { emit_comments: false })
 }
 
 /// A named job, or a legible abort. A counter-assertion is supposed to fail
@@ -505,7 +529,7 @@ fn job_if(job: &Value) -> Option<String> {
 fn declared_needs(job: &Value) -> Vec<String> {
     match job.get("needs") {
         Some(Value::String(one)) => vec![one.clone()],
-        Some(Value::Sequence(many)) => many
+        Some(Value::Array(many)) => many
             .iter()
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect(),
@@ -578,29 +602,35 @@ fn requires_ref_effective(jobs: &BTreeMap<String, Value>, name: &str) -> bool {
 /// collapsed so a marker cannot hide behind alignment.
 fn flatten_scalars(value: &Value, out: &mut String) {
     match value {
-        Value::Mapping(map) => {
+        Value::Object(map) => {
             for (key, val) in map {
-                flatten_scalars(key, out);
+                push_scalar_lines(key, out);
                 flatten_scalars(val, out);
             }
         }
-        Value::Sequence(seq) => {
+        Value::Array(seq) => {
             for item in seq {
                 flatten_scalars(item, out);
             }
         }
-        Value::Tagged(tagged) => flatten_scalars(&tagged.value, out),
-        Value::String(s) => {
-            for line in s.lines() {
-                out.push_str(&line.split_whitespace().collect::<Vec<_>>().join(" "));
-                out.push('\n');
-            }
-        }
+        Value::String(s) => push_scalar_lines(s, out),
         Value::Null => {}
+        // Numbers and booleans: no marker is spelled as one, but they are
+        // emitted rather than dropped so a `run:` whose whole body is a
+        // scalar cannot vanish from the classified text.
         other => {
-            out.push_str(&serde_yaml_ng::to_string(other).unwrap_or_default());
+            out.push_str(&other.to_string());
             out.push('\n');
         }
+    }
+}
+
+/// One scalar, one line per source line, horizontal runs collapsed so a
+/// marker cannot hide behind alignment.
+fn push_scalar_lines(text: &str, out: &mut String) {
+    for line in text.lines() {
+        out.push_str(&line.split_whitespace().collect::<Vec<_>>().join(" "));
+        out.push('\n');
     }
 }
 
@@ -617,18 +647,17 @@ fn local_callee(job: &Value) -> Option<String> {
 /// The literal `with:` inputs a caller passes, scalars only.
 fn caller_inputs(job: &Value) -> BTreeMap<String, String> {
     job.get("with")
-        .and_then(Value::as_mapping)
+        .and_then(Value::as_object)
         .map(|map| {
             map.iter()
-                .filter_map(|(k, v)| {
-                    let key = k.as_str()?.to_owned();
+                .filter_map(|(key, v)| {
                     let val = match v {
                         Value::String(s) => s.clone(),
                         Value::Bool(b) => b.to_string(),
                         Value::Number(n) => n.to_string(),
                         _ => return None,
                     };
-                    Some((key, val))
+                    Some((key.clone(), val))
                 })
                 .collect()
         })
@@ -986,7 +1015,7 @@ fn masking_a_literal_preserves_byte_offsets() {
 
 #[test]
 fn effective_needs_keeps_every_declared_edge_without_a_status_function() {
-    let job: Value = serde_yaml_ng::from_str(
+    let job: Value = parse_workflow(
         "needs: [e2e-gate, ci-gate]\nif: ${{ startsWith(github.ref, 'refs/tags/v') }}\n",
     )
     .expect("fixture parses");
@@ -998,7 +1027,7 @@ fn effective_needs_drops_the_edge_an_always_voids() {
     // The shape a guard that walked declared edges would have called gated:
     // `sbom` is in `needs:`, `always()` voids it, and the `if:` never tests
     // it. Decorative, and this is where the guard says so.
-    let job: Value = serde_yaml_ng::from_str(
+    let job: Value = parse_workflow(
         "needs: [build-binaries, sbom]\nif: |\n  always() &&\n  needs.build-binaries.result == 'success'\n",
     )
     .expect("fixture parses");
@@ -1007,7 +1036,7 @@ fn effective_needs_drops_the_edge_an_always_voids() {
 
 #[test]
 fn effective_needs_credits_a_tested_edge_even_under_always() {
-    let job: Value = serde_yaml_ng::from_str(
+    let job: Value = parse_workflow(
         "needs: [e2e-gate, ci-gate]\nif: |\n  always() &&\n  needs.e2e-gate.result == 'success' &&\n  needs.ci-gate.result == 'success'\n",
     )
     .expect("fixture parses");
@@ -1016,7 +1045,7 @@ fn effective_needs_credits_a_tested_edge_even_under_always() {
 
 #[test]
 fn effective_needs_does_not_credit_a_disjoined_result_test() {
-    let job: Value = serde_yaml_ng::from_str(
+    let job: Value = parse_workflow(
         "needs: [ci-gate]\nif: |\n  always() &&\n  (needs.ci-gate.result == 'success' || github.event_name == 'workflow_dispatch')\n",
     )
     .expect("fixture parses");
@@ -1026,9 +1055,8 @@ fn effective_needs_does_not_credit_a_disjoined_result_test() {
 #[test]
 fn a_cancelled_or_failure_condition_voids_the_implicit_gating_too() {
     for condition in ["${{ !cancelled() }}", "${{ failure() }}"] {
-        let job: Value =
-            serde_yaml_ng::from_str(&format!("needs: [ci-gate]\nif: \"{condition}\"\n"))
-                .expect("fixture parses");
+        let job: Value = parse_workflow(&format!("needs: [ci-gate]\nif: \"{condition}\"\n"))
+            .expect("fixture parses");
         assert!(
             effective_needs(&job).is_empty(),
             "{condition} overrides skip-on-failed-need just as always() does"
@@ -1115,7 +1143,7 @@ fn a_marker_does_not_fire_on_a_mention_of_the_mechanism() {
 
 #[test]
 fn classification_reads_no_yaml_comments() {
-    let job: Value = serde_yaml_ng::from_str(
+    let job: Value = parse_workflow(
         "# This job used to run `cosign sign --yes` and `helm push .`\nsteps:\n  - run: echo ok\n",
     )
     .expect("fixture parses");
