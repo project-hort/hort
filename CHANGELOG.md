@@ -1447,6 +1447,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **An OCI manifest is served only while every artifact in its closure is**
+  (#342). The manifest read path gated on the manifest's **own**
+  `quarantine_status` and then served the body; its constituents were never
+  consulted. Measured on the pushes that opened the issue: five manifests
+  answered `200` while a referenced layer answered `404 BLOB_UNKNOWN` — which
+  containerd surfaces as `failed to pull and unpack … not found` *after* it has
+  committed to the pull, and which cost twelve HelmRelease attempts at a
+  15-minute timeout each with nothing on the wire distinguishing "this layer was
+  rejected" from "this registry is broken". Hort already held the rule
+  everywhere else: the shared index pipeline drops a terminally-held version
+  under both index modes, so npm, PyPI, Cargo and Maven never advertise one. The
+  OCI paths were the only place that did not.
+
+  A **terminal** status (`Rejected` / `ScanIndeterminate` —
+  `QuarantineStatus::is_terminal`, the same predicate the manifest write path
+  refuses a push on) anywhere in a manifest's closure now withholds the
+  manifest, on `GET` and `HEAD` alike and for every caller. The closure is
+  **transitive**: an index over a child whose layers are terminal is withheld
+  too, because answering `200` and then failing at the child is the same
+  contradiction one level up.
+
+  **A hold is not a verdict and absence is not a hold.** A `Quarantined`
+  constituent changes nothing — the client's own blob fetch answers it with the
+  deadline — and a constituent that is simply **not ingested** changes nothing
+  either, which is the ordinary state of every cold pull-through manifest. Only
+  a present catalog row in a terminal state withdraws the manifest.
+
+  **The refusal names the offending constituent**: its digest, and for a
+  rejection its axis, in the same `403 DENIED` envelope the manifest's own
+  rejection uses (a `ScanIndeterminate` constituent answers `503` with no
+  `Retry-After`, as that state does for itself). The digest is the signal that
+  identified the cause in the original incident — identical across repeated
+  pulls of one manifest, different across manifests — and a server-side line
+  carries the same three facts (which manifest, which constituent, which
+  verdict) for the operator.
+
+  **Operator impact, and it is not small.** The rule applies to the whole
+  existing inventory from the first request after upgrade; there is no
+  migration step and no backfill. Measured against the dogfood instance,
+  **8,845 signature manifests stop being deliverable** — caused by six
+  terminally rejected `{}` config blobs rather than by the ~2.5k rejected
+  payloads — so a signature check against that instance's **existing**
+  signatures fails. **New** signatures are unaffected (the forward path that
+  created that population is closed and no payload has been terminally rejected
+  since 2026-08-15), and **image pulls** are unaffected, because a signature
+  manifest hangs off its subject as a referrer and is not in the closure a pull
+  walks. This window is accepted deliberately and indefinitely: the affected
+  population is discarded, not repaired, and no repair instrument ships.
+
+  The Referrers API still reports such a signature as present while a fetch of
+  it fails — from outside that reads like a registry fault rather than a
+  withheld artifact. That asymmetry is the price of refusing an immutable
+  document rather than editing it; it is recorded in ADR 0043's 2026-10-13
+  amendment and is why the server-side log line is not optional.
+
+  Decisions: [ADR 0062](docs/adr/0062-never-advertise-what-you-will-not-serve.md)
+  is the rule; [ADR 0043](docs/adr/0043-oci-image-index-support.md) carries
+  the OCI read-path amendment.
+
 - **A repeated key in a `ServiceAccount`'s `claims` map no longer applies
   silently** (#347). `FederatedIdentitySpec.claims` is the exact-match
   condition under which a JWT may assume a service account (ADR 0018), and it

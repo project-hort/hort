@@ -50,14 +50,6 @@ struct DownloadAuditGate {
     events: Arc<EventStorePublisher>,
 }
 
-/// Read granularity for [`ArtifactUseCase::read_content_for_projection`].
-/// 64 KiB is the same chunk the worker-side bounded CAS re-read uses —
-/// large enough that the syscall count stays negligible for the
-/// kilobyte-scale documents this path reads, small enough that the
-/// over-ceiling check trips before the buffer grows far past the
-/// caller's limit.
-const PROJECTION_READ_CHUNK_BYTES: usize = 64 * 1024;
-
 /// Application use case for artifact read, download, and delete operations.
 pub struct ArtifactUseCase {
     artifacts: Arc<dyn ArtifactRepository>,
@@ -1211,31 +1203,12 @@ impl ArtifactUseCase {
         content_hash: &ContentHash,
         max_bytes: usize,
     ) -> AppResult<Vec<u8>> {
-        let mut stream = self
-            .storage
-            .get(content_hash)
-            .await
-            .map_err(|e| AppError::Storage(e.to_string()))?;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; PROJECTION_READ_CHUNK_BYTES];
-        loop {
-            let n = stream.read(&mut chunk).await.map_err(|e| {
-                AppError::Storage(format!(
-                    "projection re-read of CAS blob {content_hash} failed mid-stream: {e}"
-                ))
-            })?;
-            if n == 0 {
-                break;
-            }
-            if buf.len() + n > max_bytes {
-                return Err(AppError::Domain(DomainError::Validation(format!(
-                    "CAS blob {content_hash} content exceeds the {max_bytes}-byte projection \
-                     re-read ceiling; refusing to buffer it"
-                ))));
-            }
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        Ok(buf)
+        crate::use_cases::cas_bounded_read::read_cas_bounded(
+            &*self.storage,
+            content_hash,
+            max_bytes,
+        )
+        .await
     }
 
     /// Visible variant of [`Self::list_by_raw_name_limited`]. Resolves
@@ -2890,7 +2863,7 @@ mod tests {
     /// accumulated whole, not just its first chunk.
     #[tokio::test]
     async fn read_content_for_projection_accumulates_across_chunks() {
-        let content = vec![b'x'; PROJECTION_READ_CHUNK_BYTES * 2 + 7];
+        let content = vec![b'x'; crate::use_cases::cas_bounded_read::READ_CHUNK_BYTES * 2 + 7];
         let (uc, _, hash) = projection_harness(QuarantineStatus::None, content.clone());
         let bytes = uc
             .read_content_for_projection(&hash, content.len())
@@ -2917,11 +2890,21 @@ mod tests {
         );
     }
 
-    /// A hash CAS does not hold surfaces as a `Storage` error rather than
-    /// empty bytes. The caller derives a projection from what comes back,
-    /// so "nothing is there" and "the document is empty" must not look the
+    /// A hash CAS does not hold surfaces as an error rather than empty
+    /// bytes. The caller derives a projection from what comes back, so
+    /// "nothing is there" and "the document is empty" must not look the
     /// same — the follower that reads here would otherwise claim no
     /// membership edges and report nothing wrong.
+    ///
+    /// The error is the port's own `NotFound`, passed through rather than
+    /// flattened into a `Storage` string, and that distinction is
+    /// load-bearing for a *different* caller: the manifest-closure walk
+    /// has to tell "this child is not local yet" — the ordinary state of
+    /// every cold pull-through — apart from "the backend failed", and
+    /// those two deserve opposite answers. See
+    /// [`cas_bounded_read`](crate::use_cases::cas_bounded_read). Nothing
+    /// about this method's own contract changes: an absent blob still
+    /// never resolves.
     #[tokio::test]
     async fn read_content_for_projection_propagates_an_absent_cas_blob() {
         let (uc, _, _) = projection_harness(QuarantineStatus::None, b"unused".to_vec());
@@ -2931,8 +2914,14 @@ mod tests {
             .await
             .expect_err("a hash CAS does not hold must not resolve");
         assert!(
-            matches!(err, AppError::Storage(_)),
-            "expected a Storage error, got: {err}"
+            matches!(
+                err,
+                AppError::Domain(DomainError::NotFound {
+                    entity: "content",
+                    ..
+                })
+            ),
+            "expected the port's content NotFound, got: {err}"
         );
     }
 
@@ -2954,9 +2943,18 @@ mod tests {
             .read_content_for_projection(&hash, 1024)
             .await
             .expect_err("a CAS open failure must surface");
+        // What this pins is that an open failure does not resolve. The
+        // mock's injectable `get` failure is the port's `NotFound`, which
+        // is also the shape a genuinely absent object takes, so this test
+        // and the one above agree on the vocabulary. The other arm — a
+        // failure that is not absence stays an infrastructure error — is
+        // asserted where it is implemented
+        // (`cas_bounded_read::a_mid_stream_failure_is_an_infrastructure_error_not_an_absence`),
+        // on the mid-stream path, because that is the non-`NotFound`
+        // failure a port double can reach from here.
         assert!(
-            matches!(err, AppError::Storage(_)),
-            "expected a Storage error, got: {err}"
+            matches!(err, AppError::Domain(DomainError::NotFound { .. })),
+            "expected an open failure to surface, got: {err}"
         );
     }
 

@@ -36,6 +36,11 @@ pub mod artifact_repo;
 pub mod authority_lifecycle;
 pub(crate) mod blob_lock;
 pub mod claim_mapping_repo;
+// The constituent-deliverability read behind ADR 0062 on the OCI paths:
+// one statement that turns a manifest's closure into the strongest
+// terminal verdict inside it, with the terminal vocabulary bound from
+// `QuarantineStatus::is_terminal` rather than written into the SQL.
+pub mod constituent_status;
 // Transient write-contention (serialization failure / deadlock): the
 // sqlstate classifier and the bounded whole-transaction retry over it.
 // Crate-internal by design — the Postgres vocabulary it speaks must not

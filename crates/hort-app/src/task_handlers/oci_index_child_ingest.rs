@@ -264,7 +264,14 @@ pub(crate) const CHILD_INGEST_ROOT_DEPTH: u32 = 0;
 /// Nothing is lost at the cap either — a child that is not eagerly ingested
 /// still reaches the repository through the lazy pull path with its own full
 /// quarantine window.
-const MAX_CHILD_INGEST_DEPTH: u32 = 4;
+///
+/// `pub(crate)` because the read path bounds the **same** tree with it:
+/// [`ManifestDeliverabilityUseCase`](crate::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase)
+/// walks a manifest's closure to answer whether every artifact in it is
+/// still deliverable, and a walk that reached deeper than the ingest ever
+/// does would be asking about children this registry declines to fetch.
+/// One bound, two walkers.
+pub(crate) const MAX_CHILD_INGEST_DEPTH: u32 = 4;
 
 /// The `Accept` list sent on the child-manifest fetch: both OCI and Docker
 /// single-image manifest and index media types, so an upstream that content-

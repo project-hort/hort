@@ -26,6 +26,7 @@ use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUse
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
 use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
+use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_token_exchange_use_case::OciTokenExchangeUseCase;
 use hort_app::use_cases::pat_cache::PatCache;
@@ -408,6 +409,18 @@ pub struct AppContext {
     /// use case rather than the `pub(crate)` `artifacts` port (ADR 0008)
     /// — and why the resolution is not per event.
     pub event_visibility_use_case: Arc<EventVisibilityUseCase>,
+    /// "Is every artifact in this manifest's closure still deliverable?"
+    /// — ADR 0062's constituent half, for the OCI manifest read paths.
+    ///
+    /// The format crate holds the **use case**, not the ports behind it,
+    /// and both halves of that matter here (ADR 0008). The answer needs
+    /// the manifest's own CAS bytes — `ctx.storage` is `pub(crate)` — and
+    /// a catalog read the artifact ports do not expose as one statement;
+    /// resolving either from `hort-http-oci` would reach past the use
+    /// case. Keeping the walk here also keeps it single-sourced: `GET`
+    /// and `HEAD` cannot drift, and a second format that ever serves an
+    /// immutable multi-part document resolves it the same way.
+    pub manifest_deliverability_use_case: Arc<ManifestDeliverabilityUseCase>,
     /// Curator decision authority over quarantined
     /// / non-terminal artifacts. The inbound HTTP adapter
     /// (`handlers/admin/curation/`) calls
@@ -960,6 +973,8 @@ pub struct AppContextParts {
     pub subscription_use_case: Arc<SubscriptionUseCase>,
     /// See [`AppContext::event_visibility_use_case`].
     pub event_visibility_use_case: Arc<EventVisibilityUseCase>,
+    /// See [`AppContext::manifest_deliverability_use_case`].
+    pub manifest_deliverability_use_case: Arc<ManifestDeliverabilityUseCase>,
 
     /// See [`AppContext::curation_use_case`].
     pub curation_use_case: Arc<CurationUseCase>,
@@ -1089,6 +1104,7 @@ impl AppContext {
             rbac_resolve_use_case: parts.rbac_resolve_use_case,
             subscription_use_case: parts.subscription_use_case,
             event_visibility_use_case: parts.event_visibility_use_case,
+            manifest_deliverability_use_case: parts.manifest_deliverability_use_case,
             curation_use_case: parts.curation_use_case,
             provenance_misrejection_repair_use_case: parts.provenance_misrejection_repair_use_case,
             policy_use_case: parts.policy_use_case,
