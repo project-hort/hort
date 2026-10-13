@@ -1,5 +1,14 @@
 # 292 — The rejected signature constituents get an exit
 
+> **WITHDRAWN 2026-10-13 — not implemented, and deliberately so.** The human's
+> decision: the population lives only in the dogfood instance, which carries
+> dev builds and tests, so it is discarded rather than repaired — *"weg damit…
+> dafür bauen wir doch jetzt keine Sonderlösungen"*. No bulk run, no admin
+> endpoint, no dry-run instrument. Item 294 loses its dependency on this unit
+> and its rollout sequencing with it. The measurement below is kept because it
+> is the reason the question was asked and the record of what the decision
+> knowingly gives up; nothing here is to be implemented.
+
 **Issue:** #342 · **Branch:** `agent/342-referenced-blob-deliverability`
 **Governing decisions:** ADR 0039's 2026-09-12 amendment (D1, D6) and
 ADR 0041 invariant #6(a) — a scan re-judgement must never clear a provenance

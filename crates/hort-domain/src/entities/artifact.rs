@@ -149,6 +149,29 @@ impl QuarantineStatus {
             Self::None | Self::Quarantined | Self::Released => false,
         }
     }
+
+    /// Every variant, so a caller that must reason about the **whole**
+    /// vocabulary derives its set from one place instead of re-typing a
+    /// list that a sixth variant would silently leave short.
+    ///
+    /// The motivating consumer is a persisted terminal-status set: a
+    /// query that selects "the statuses [`Self::is_terminal`] calls
+    /// terminal" by spelling them out is a second definition of the
+    /// predicate, and a new terminal variant leaves it narrower than the
+    /// predicate with nothing failing. Filtering this constant through
+    /// the predicate cannot go narrow.
+    ///
+    /// `all_lists_every_variant` pins the pairing: the match there is
+    /// wildcard-free, so a sixth variant is a compile error, and the
+    /// length assertion beside it fails until the variant joins this
+    /// constant.
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::Quarantined,
+        Self::Released,
+        Self::Rejected,
+        Self::ScanIndeterminate,
+    ];
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,6 +2272,47 @@ mod tests {
         assert!(!QuarantineStatus::None.is_terminal());
         assert!(!QuarantineStatus::Released.is_terminal());
         assert!(!QuarantineStatus::Quarantined.is_terminal());
+    }
+
+    /// [`QuarantineStatus::ALL`] is the whole vocabulary, and both
+    /// halves of this test are load-bearing: the wildcard-free `match`
+    /// makes a sixth variant a compile error here, and the length
+    /// assertion makes it a *failure* until that variant also joins the
+    /// constant. Without the second half a new variant could compile
+    /// (the match would need a new arm, which the author adds) while
+    /// `ALL` stayed five long, and every set derived from it — the
+    /// persisted terminal-status set among them — would be silently
+    /// short.
+    #[test]
+    fn all_lists_every_variant() {
+        for status in QuarantineStatus::ALL {
+            match status {
+                QuarantineStatus::None
+                | QuarantineStatus::Quarantined
+                | QuarantineStatus::Released
+                | QuarantineStatus::Rejected
+                | QuarantineStatus::ScanIndeterminate => {}
+            }
+        }
+        assert_eq!(
+            QuarantineStatus::ALL.len(),
+            5,
+            "a new QuarantineStatus variant must join ALL, or every set derived from it \
+             (the terminal-status set a deliverability query binds included) stays narrower \
+             than the vocabulary"
+        );
+        // No duplicates: a repeated variant would make a derived set
+        // name the same status twice and could mask a missing one.
+        for status in QuarantineStatus::ALL {
+            assert_eq!(
+                QuarantineStatus::ALL
+                    .iter()
+                    .filter(|candidate| **candidate == status)
+                    .count(),
+                1,
+                "{status} appears more than once in ALL"
+            );
+        }
     }
 
     #[test]

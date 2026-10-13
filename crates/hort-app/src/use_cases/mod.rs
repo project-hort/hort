@@ -3,6 +3,12 @@ pub mod apply_config_use_case;
 pub mod artifact_group_use_case;
 pub mod artifact_use_case;
 pub mod authenticate_use_case;
+// The one bounded CAS read for the paths that re-derive a projection
+// from a stored document's bytes (the OCI follower's membership claims,
+// the manifest-closure deliverability walk). See the module doc for why
+// the ceiling refuses rather than truncates and why absence keeps its
+// `NotFound` shape.
+pub(crate) mod cas_bounded_read;
 pub mod cas_scrub_use_case;
 pub mod content_reference;
 // Curator decisions: `waive` + `block` (single-artifact and
@@ -69,6 +75,10 @@ pub mod ingest_use_case;
 // enqueue orchestration; the HTTP adapter is a thin wrapper that
 // extracts the principal + path and maps `AppError` → `ApiError`.
 pub mod manual_rescan_use_case;
+// "Is every artifact in this manifest's closure still deliverable?" —
+// ADR 0062's constituent half for the OCI read paths. One resolution,
+// derived from the manifest's own bytes, asked of the catalog once.
+pub mod manifest_deliverability;
 pub mod multi_hash;
 // The facade the OCI inbound-HTTP crate calls to queue eager ingest of
 // an image index's declared children. `AppContext::jobs` is `pub(crate)`

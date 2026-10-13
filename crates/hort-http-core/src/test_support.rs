@@ -65,6 +65,7 @@ use hort_app::use_cases::virtual_resolution::VirtualResolutionUseCase;
 // Wired into the mock `AppContext` so the `hort-http-discovery` handler
 // tests can drive `POST /api/v1/repositories/:repo_key/prefetch` through
 // the shared harness.
+use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
 use hort_app::use_cases::self_service_prefetch_use_case::SelfServicePrefetchUseCase;
 use hort_app::use_cases::subscription_use_case::{SubscriptionUseCase, SubscriptionUseCaseConfig};
@@ -72,10 +73,10 @@ use hort_app::use_cases::task_use_case::TaskUseCase;
 use hort_app::use_cases::test_support::{
     MockApiTokenRepository, MockArtifactGroupLifecyclePort, MockArtifactGroupRepository,
     MockArtifactLifecycle, MockArtifactMetadataRepository, MockArtifactRepository,
-    MockClaimMappingRepository, MockContentReferenceIndex, MockCurationRuleRepository,
-    MockEventRepositoryResolver, MockEventStore, MockJobsRepository, MockPermissionGrantRepository,
-    MockPolicyProjectionRepository, MockRefLifecyclePort, MockRefRegistryPort,
-    MockRepoSecurityScoreRepository, MockRepositoryRepository,
+    MockClaimMappingRepository, MockConstituentStatusReader, MockContentReferenceIndex,
+    MockCurationRuleRepository, MockEventRepositoryResolver, MockEventStore, MockJobsRepository,
+    MockPermissionGrantRepository, MockPolicyProjectionRepository, MockRefLifecyclePort,
+    MockRefRegistryPort, MockRepoSecurityScoreRepository, MockRepositoryRepository,
     MockRepositoryUpstreamMappingRepository, MockStatefulUploadStagingPort, MockStoragePort,
     MockUpstreamMetadataPort, MockUpstreamProxy, MockUpstreamResolver, MockUserRepository,
 };
@@ -687,6 +688,13 @@ impl MetadataMirrorStore for MockMetadataMirror {
 /// the mock are visible to handlers driven through the context.
 pub struct MockPorts {
     pub artifacts: Arc<MockArtifactRepository>,
+    /// The constituent-deliverability reader wired into
+    /// [`AppContext::manifest_deliverability_use_case`]. Serves from
+    /// [`Self::artifacts`], so the ordinary way to drive it is to seed a
+    /// constituent row; this handle is for the fail-closed arm, where a
+    /// test arms the read to error via
+    /// [`MockConstituentStatusReader::fail_next`].
+    pub constituent_status: Arc<MockConstituentStatusReader>,
     pub repositories: Arc<MockRepositoryRepository>,
     pub storage: Arc<MockStoragePort>,
     pub events: Arc<MockEventStore>,
@@ -1457,6 +1465,19 @@ pub fn build_mock_ctx_with_label_flag(
         event_repository_resolver.clone(),
     ));
 
+    // The manifest-deliverability resolution, over the SAME seeded
+    // `MockStoragePort` / `MockArtifactRepository` the rest of the
+    // harness uses: a test that stores a manifest body and seeds its
+    // layers' statuses has already told the gate everything it needs,
+    // and the harness cannot drift into a state where the artifact store
+    // and the gate disagree. A constituent with no seeded row is absent,
+    // which is how the cold-pull-through arm is reachable from a test.
+    let constituent_status = Arc::new(MockConstituentStatusReader::new(artifacts.clone()));
+    let manifest_deliverability_use_case = Arc::new(ManifestDeliverabilityUseCase::new(
+        storage.clone(),
+        constituent_status.clone(),
+    ));
+
     // `CurationUseCase` wired
     // with the same ports the production composition root threads
     // (events, artifacts, lifecycle, policy projections). The three
@@ -1606,6 +1627,8 @@ pub fn build_mock_ctx_with_label_flag(
         subscription_use_case,
         event_visibility_use_case,
         // See field doc.
+        manifest_deliverability_use_case,
+        // See field doc.
         curation_use_case,
         provenance_misrejection_repair_use_case,
         // See field doc.
@@ -1735,6 +1758,7 @@ pub fn build_mock_ctx_with_label_flag(
 
     let mocks = MockPorts {
         artifacts,
+        constituent_status,
         repositories,
         storage,
         events,
@@ -1877,6 +1901,7 @@ fn rebuild(base: &Arc<AppContext>, mutate: impl FnOnce(&mut AppContext)) -> Arc<
         // rather than mutating in place.
         subscription_use_case: base.subscription_use_case.clone(),
         event_visibility_use_case: base.event_visibility_use_case.clone(),
+        manifest_deliverability_use_case: base.manifest_deliverability_use_case.clone(),
         // Carry forward the same
         // `Arc<CurationUseCase>`. The curation surface is admin-only
         // (gated by `CurateOrAdminPrincipal`) and does NOT consume

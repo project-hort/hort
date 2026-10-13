@@ -50,18 +50,36 @@ one resolution, every caller through it, fail-closed, pinned by a guard.
 1. **Lift the constituent's answer to the manifest — do not flatten it.** The
    manifest handler already has all three answer shapes for its *own* state;
    the rule picks the arm the constituent's state would take:
-   - a `Rejected` constituent ⇒ `MANIFEST_UNKNOWN` (404), the hidden-404 that
-     keeps the reason opaque;
+   - a `Rejected` constituent ⇒ `403 DENIED` with `{subject, axis}`, where
+     `subject` is the **constituent's** digest and not the client's reference.
+
+     **Corrected 2026-10-13.** This arm read "`MANIFEST_UNKNOWN` (404), the
+     hidden-404 that keeps the reason opaque", which contradicted
+     determination 3 in this same document and described a posture that no
+     longer exists on this route: unit 295 retired the manifest route's
+     `404 MANIFEST_UNKNOWN` precisely because it was byte-identical to "no such
+     thing", and replaced it with `OciError::ArtifactRejected` → `403 DENIED` +
+     `{subject, axis}`. "In 295's answer shape" can only mean the envelope 295
+     actually ships. The `subject` field is also what tells the two refusals
+     apart: the manifest's own names the client's reference, a constituent's
+     names a different digest;
    - a `ScanIndeterminate` constituent ⇒ `check_scan_indeterminate()` (503, no
      `Retry-After`), because that hold is not a statement that the content does
      not exist.
    Reuse 293's single terminal predicate for the class and the existing
    helpers for the envelopes; no new error variants.
-2. **One statement, and never a hash fan-out.** Resolve it with a single SQL
-   statement that joins the edge rows for this source to `artifacts` within the
-   same repository and returns the strongest hold found, as a domain-level
-   class — not artifact rows. Do **not** enumerate edges and then look up
-   statuses by hash list: a pooled `= ANY($1::…[])` lookup flips to a generic
+2. **One statement, and never a hash fan-out.** Resolve the **statuses** with a
+   single SQL statement over the closure the caller already holds, returning the
+   strongest hold found as a domain-level class — not artifact rows.
+
+   **Corrected 2026-10-13.** This paragraph said to join "the edge rows for this
+   source" — the membership-projection read determination 2 forbids, which is
+   where an implementer looks for the query shape. The closure comes from the
+   manifest's **bytes** (determination 2, settled); this statement answers only
+   how those constituents stand. The same revision withdrew the out-of-scope
+   bullet that carried the same contradiction; this sentence was missed and is
+   corrected now. Do **not** enumerate edges and then look up statuses by hash
+   list: a pooled `= ANY($1::…[])` lookup flips to a generic
    plan at the sixth execution and degrades to a per-row scan (measured
    elsewhere in this codebase at 64.2 s against 1.7 s). Pin the query shape in
    the adapter test the way `find_by_sources_and_kind`'s contract does ("MUST
@@ -120,13 +138,28 @@ Each repository's signature manifests share one rejected `{}` config row, so
 the config blob alone is enough; the ~2.5k with an additionally rejected
 payload are a subset, not an extension.
 
-**291 and 292 shipping in the same release is not sufficient**, because 292's
-repair is an operator-invoked, dry-run-by-default one-shot: between the deploy
-and the repair run, this rule would 404 the whole signature inventory. So this
-unit's code must reach production only **after** the repair has run and
-reported zero remaining rows. That is a release-sequencing decision for the
-human (two merges on this issue, or an accepted window) — it is recorded on
-#342 and must be read before implementation.
+**Settled 2026-10-13 (human decision): item 292 is withdrawn and this
+sequencing requirement is void.** The earlier text said this unit's code must
+reach production only after 292's repair run reported zero remaining rows,
+because between deploy and repair the rule would 404 the whole signature
+inventory. That was written for the case where the inventory had to survive. It
+does not: the figures above come from the dogfood instance, which carries dev
+builds and tests, and the decision was *"weg damit … dafür bauen wir doch jetzt
+keine Sonderlösungen"*. So there is no repair run and no window to sequence
+around — the second of the two options the earlier text named, an **accepted
+window**, is the one chosen, and it is accepted indefinitely rather than for a
+gap between two deploys.
+
+The measurement stays in this item because it is the price, and whoever reads
+this unit later should see what was knowingly spent: **8,845** signature
+manifests stop being deliverable in that instance, caused by six rejected `{}`
+config rows rather than by the ~2.5k rejected payloads. A signature check
+against the instance's **existing** signatures fails; **new** signatures do
+not, because item 291 closed the forward path and no payload has been
+terminally rejected since 2026-08-15; and **image pulls** are unaffected,
+because a signature manifest hangs off its subject as a referrer and is not in
+the closure a pull walks. **Do not build a migration, a backfill or a repair
+instrument for this population** — that is the thing the decision refused.
 
 ## Four determinations this unit inherits from the decision
 
@@ -159,6 +192,28 @@ code; each one is a place where the obvious implementation is the wrong one.
    subordinate (human decision, 2026-10-10); do not reintroduce a projection
    read as an optimisation without reopening ADR 0062.
 
+   **What this costs, and why the acceptance's "exactly one SQL statement" is
+   not in tension with it (clarified 2026-10-13).** That criterion constrains
+   **SQL**, not CAS reads. Resolving the closure from bytes means reading
+   bytes: for an image manifest the config and layer digests are in the
+   manifest a GET already holds, so there is nothing further to read; for an
+   **index**, each child's own closure lives in that child's bytes, so a
+   transitive answer reads those from the CAS. Gather every digest that way
+   first, then ask the catalog **once** for their statuses — one statement,
+   anti-join shaped, no `= ANY` over a hash list (a pooled `= ANY($1::array)`
+   degrades to a per-row scan at the sixth execution, measured at 64.2 s
+   against 1.7 s). So: CAS reads to learn *what* the constituents are, one SQL
+   to learn *how they stand*.
+
+   Note what the amendment to ADR 0043 at `:277` ("Membership edges commit with
+   the artifact that claims them", 2026-10-07) does **not** change here. It
+   makes an edge atomic with its claiming artifact and built only from a
+   complete resolution — so the projection is no longer the lagging thing
+   determination 2's objection described — and the 2026-10-10 decision was
+   nevertheless taken with that amendment already in place. It therefore stands
+   as decided. Do not re-open it by citing the amendment; if the measured cost
+   of the byte reads is the problem, report the measurement.
+
 3. **Name the offending constituent in the refusal — item 295 makes that
    allowed.** Today a failing pull names the offending **blob** digest, and
    that digest identified the cause in the incident behind this issue:
@@ -167,10 +222,18 @@ code; each one is a place where the obvious implementation is the wrong one.
    concealed 404 would delete that signal for everyone who cannot read hort's
    logs, and a shared base layer would then make N unrelated images fail with
    nothing in common. Since 295 establishes that whoever may read the artifact
-   may learn why it is withheld, this refusal carries the same three facts —
-   axis, policy, and the **constituent's** digest — in 295's answer shape, and
-   the server-side log line stays mandatory alongside it. A silent refusal is
-   not acceptable for this unit.
+   may learn why it is withheld, this refusal carries the facts 295's envelope
+   carries — the axis and the **constituent's** digest as `subject` — and the
+   server-side log line stays mandatory alongside it. A silent refusal is not
+   acceptable for this unit.
+
+   **Corrected 2026-10-13: "policy" is struck.** This read "the same three
+   facts — axis, policy, and the constituent's digest", but policy is the one
+   fact 295's envelope deliberately excludes: a `RejectionReason` carries none,
+   and resolving the repository's effective policy would mean a new read on a
+   fail-closed answer plus a disclosure of operator configuration. Asking for
+   it here asked for a field the decision this determination defers to
+   forbids.
 
 4. **Decide whether a manifest with a terminal constituent should be minted at
    all — the PUT leaves that open on purpose.** Item 293 refuses the push
@@ -195,18 +258,24 @@ code; each one is a place where the obvious implementation is the wrong one.
 - Write-time propagation at `ArtifactRejected`. It was weighed and rejected
   with the read-time decision: it needs a new transition and an inventory
   migration.
-- Walking past the depth cap the index-child ingest already enforces, and any
-  attempt to resolve the closure from manifest **bytes** per request rather
-  than from the membership projection — see determination 2 for the authority
-  question that decides which of those two the rule reads.
+- Walking past the depth cap the index-child ingest already enforces.
+
+  **Withdrawn 2026-10-13 — the second half of this bullet contradicted
+  determination 2 and is gone.** It read "and any attempt to resolve the
+  closure from manifest **bytes** per request rather than from the membership
+  projection", then deferred to determination 2 for which of the two to read —
+  but determination 2 settles it the other way and is marked settled by a dated
+  decision. It is a leftover from the revision in which the projection was the
+  plan. The authority is the bytes; see the clarification under determination 2.
 - Any cache or memoisation of the resolution. If the single statement turns out
   to be too expensive, that is a measurement to report, not a cache to add.
 
 ## Acceptance
 
-- A manifest with a `Rejected` layer answers 404 `MANIFEST_UNKNOWN`; with a
-  `ScanIndeterminate` layer, 503 without `Retry-After`; with a `Quarantined`
-  layer, exactly what it answers today. One test per arm, plus the terminal
+- A manifest with a `Rejected` layer answers `403 DENIED` naming the
+  constituent's digest as `subject` plus its axis (corrected 2026-10-13, see
+  §1); with a `ScanIndeterminate` layer, 503 without `Retry-After`; with a
+  `Quarantined` layer, exactly what it answers today. One test per arm, plus the terminal
   **config** blob case — that is the shape the production population has.
 - A pull-through manifest whose constituents are **not ingested** still answers
   200. Show it red when absence is treated as a hold; that inversion would

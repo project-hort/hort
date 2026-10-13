@@ -73,6 +73,7 @@ use hort_app::use_cases::discovery_use_case::DiscoveryUseCase;
 // with the I/O-bearing orchestration (the pure
 // planner stays untouched).
 use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
+use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
@@ -2805,6 +2806,19 @@ pub async fn build_app_context(
         ),
     )));
 
+    // ADR 0062's constituent half for the OCI manifest read paths:
+    // "is every artifact in this manifest's closure still deliverable?".
+    // The closure is derived from the manifest's own CAS bytes (ADR 0039 —
+    // edges nominate, the bytes decide), and the catalog is then asked
+    // once, through a single statement whose terminal-status set is bound
+    // from `QuarantineStatus::is_terminal` rather than written into SQL.
+    let manifest_deliverability_use_case = Arc::new(ManifestDeliverabilityUseCase::new(
+        storage.clone(),
+        Arc::new(
+            hort_adapters_postgres::constituent_status::PgConstituentStatusReader::new(db.clone()),
+        ),
+    ));
+
     // Boot-time unsafe-config gauges for the two webhook-safety
     // operator opt-ins — see `emit_webhook_unsafe_config_gauges`.
     emit_webhook_unsafe_config_gauges(&notify_config);
@@ -3072,6 +3086,9 @@ pub async fn build_app_context(
         // routes.
         subscription_use_case,
         event_visibility_use_case,
+        // The OCI manifest read paths' constituent gate; `hort-http-oci`
+        // calls it from `serve` for GET and HEAD alike.
+        manifest_deliverability_use_case,
         // Curator decision authority over quarantined /
         // non-terminal artifacts; HTTP decision handlers mount under
         // `/api/v1/admin/curation/...`.

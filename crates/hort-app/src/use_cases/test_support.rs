@@ -43,6 +43,9 @@ use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
+use hort_domain::ports::constituent_status::{
+    terminal_statuses_by_refusal_precedence, ConstituentStatusReader, TerminalConstituent,
+};
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
 use hort_domain::ports::curation_queue_repository::{
     CurationQueueEntry, CurationQueueFilter, CurationQueueRepository,
@@ -369,6 +372,26 @@ impl MockArtifactRepository {
     /// than "insert this artifact".
     pub fn seed_artifact(&self, artifact: Artifact) {
         self.insert(artifact);
+    }
+
+    /// The status of `hash` inside `repo` as a **deliverability** read
+    /// sees it: repository-scoped and `deleted_at`-filtered, which is
+    /// what the Postgres constituent statement does and what every live
+    /// `ArtifactRepository` read does.
+    ///
+    /// Deliberately narrower than this mock's own
+    /// `find_by_repo_and_checksum`, which does not filter retirement.
+    /// [`MockConstituentStatusReader`] serves from here so a test cannot
+    /// prove a manifest withheld by a row no read path can see.
+    pub fn live_status_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Option<QuarantineStatus> {
+        self.artifacts
+            .lock()
+            .unwrap()
+            .values()
+            .find(|a| {
+                a.repository_id == repo && a.sha256_checksum == *hash && a.deleted_at.is_none()
+            })
+            .map(|a| a.quarantine_status)
     }
 
     /// Seed a synthetic `(name, version, status)`
@@ -5117,6 +5140,90 @@ impl EventRepositoryResolver for MockEventRepositoryResolver {
                 artifact_groups: groups,
             })
         })
+    }
+}
+
+/// [`ConstituentStatusReader`] over the harness's own seeded artifact
+/// rows.
+///
+/// Deliberately **not** a second seedable map, for the same reason
+/// [`MockEventRepositoryResolver`] is not: a test that seeds a
+/// constituent has already told the deliverability resolution what state
+/// that constituent is in, so the harness cannot drift into a state
+/// where the artifact store and the gate disagree. A hash with no seeded
+/// row is absent from the answer — which is what makes the
+/// "absence is not a hold" arm testable without a knob.
+///
+/// The three decisions it mirrors from the Postgres statement, because a
+/// double that answered them differently would let a handler test stand
+/// on behaviour production does not have:
+///
+/// - **repository scope** and **retirement** — served through
+///   [`MockArtifactRepository::live_status_in_repo`];
+/// - **which statuses are terminal** — filtered through
+///   `QuarantineStatus::is_terminal`, never a written-out list;
+/// - **which verdict wins, and which constituent is named** — the
+///   domain's refusal precedence first, then the caller's own closure
+///   ordering, so `HEAD` and `GET` name the same constituent.
+pub struct MockConstituentStatusReader {
+    artifacts: Arc<MockArtifactRepository>,
+    /// FIFO of injected errors. Each call pops the front and returns it
+    /// verbatim, so a test can drive a consumer's fail-closed arm.
+    errors: Mutex<std::collections::VecDeque<DomainError>>,
+    calls: AtomicUsize,
+}
+
+impl MockConstituentStatusReader {
+    #[must_use]
+    pub fn new(artifacts: Arc<MockArtifactRepository>) -> Self {
+        Self {
+            artifacts,
+            errors: Mutex::new(std::collections::VecDeque::new()),
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Arm the next resolution call to fail with `err`. Queued, so a
+    /// test can arm several consecutive failures.
+    pub fn fail_next(&self, err: DomainError) {
+        self.errors.lock().unwrap().push_back(err);
+    }
+
+    /// How many times the reader was asked — the handle for the
+    /// "one lookup, not one per constituent" assertion.
+    pub fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+}
+
+impl ConstituentStatusReader for MockConstituentStatusReader {
+    fn strongest_terminal_constituent<'a>(
+        &'a self,
+        repository_id: Uuid,
+        constituents: &'a [ContentHash],
+    ) -> BoxFut<'a, DomainResult<Option<TerminalConstituent>>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(err) = self.errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
+        // Rank by the domain's refusal precedence, then by the caller's
+        // closure position — the statement's `ORDER BY t.precedence,
+        // w.position`.
+        let precedence = terminal_statuses_by_refusal_precedence();
+        let answer = constituents
+            .iter()
+            .enumerate()
+            .filter_map(|(position, hash)| {
+                let status = self.artifacts.live_status_in_repo(repository_id, hash)?;
+                let rank = precedence.iter().position(|s| *s == status)?;
+                Some((rank, position, hash.clone(), status))
+            })
+            .min_by_key(|(rank, position, _, _)| (*rank, *position))
+            .map(|(_, _, content_hash, status)| TerminalConstituent {
+                content_hash,
+                status,
+            });
+        Box::pin(async move { Ok(answer) })
     }
 }
 

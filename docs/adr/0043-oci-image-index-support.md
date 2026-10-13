@@ -338,6 +338,96 @@ it — the port module documentation in `content_reference_index.rs` — rather
 than in a format-specific decision record. The two backfill handlers remain
 the only production writers after a commit, which is their entire purpose.
 
+### A manifest is deliverable only while its constituents are (issue #342, amended 2026-10-13)
+
+*Authorised by the human's confirmation on issue #342; the rule itself is
+[ADR 0062](0062-never-advertise-what-you-will-not-serve.md), and this is where
+its OCI read-path half meets the per-child argument above.*
+
+**The decision.** A manifest or image index is served only while **every
+artifact in its closure** carries a non-terminal status. A `Rejected` or
+`ScanIndeterminate` constituent — config blob, layer blob, child manifest, or
+anything inside a child's own closure — withholds the document. This narrows
+the load-bearing argument above exactly as ADR 0062 states: the per-leaf answer
+stays correct for a **held** child, whose `503` *is* "not yet", and stops being
+correct for a **terminal** one, where "never" is already known at the moment the
+document is served.
+
+**Three properties, none of which name a call site** (the note two sections up
+applies to this amendment too):
+
+1. **The closure is derived from the document's bytes, never from the
+   `content_references` edges.** Edges *nominate*; the bytes decide — the same
+   authority ordering [ADR 0039](0039-keyed-provenance-verification.md) §11's
+   provenance cascade walks, and for the same reason: the edge projection is
+   repairable rather than guaranteed, which is why
+   `oci-membership-edge-backfill` exists. This is settled by human decision
+   (2026-10-10) **with the 2026-10-07 amendment above already in place**: that
+   amendment makes an edge atomic with its claiming artifact, so the projection
+   is no longer the lagging thing the objection described, and the decision was
+   nevertheless taken for the bytes. It is not reopened by citing the
+   amendment; if the measured cost of the byte reads is the problem, that is a
+   measurement to bring.
+2. **The question is transitive, and bounded by the ingest's own depth cap.**
+   One hop would be an arbitrary cut: an index over a child whose layers are
+   terminal would answer `200` and then fail at the child, which is the same
+   contradiction one level up. The walk reuses `MAX_CHILD_INGEST_DEPTH` —
+   walking deeper than the eager child ingest ever fetches would be asking
+   about documents this registry declines to pull — plus a total expansion
+   budget, because the depth bound alone does not bound the walk: the breadth
+   cap is 1024 per level.
+3. **Absence is not a hold, and this half is as load-bearing as the rule.** A
+   constituent with no catalog row is *not local yet* — the ordinary state of
+   every cold pull-through manifest, whose references are registered by digest
+   with no existence check (see the unknown-blob posture in the 2026-10-07
+   amendment). Only a **present** row in a terminal state changes the answer.
+   Inverting this would refuse every cold pull-through in the registry.
+
+**Failing to resolve the question refuses.** The document's own bytes being
+unreadable or unparseable, or its closure outgrowing the expansion budget,
+leaves hort unable to say what it binds, and
+[ADR 0007](0007-fail-closed-quarantine-release-predicate.md) says what to
+answer then. A *child's* bytes being unreadable is bounded instead: the child
+is still judged on its own catalog row and only its descendants go unasked,
+because the alternative would turn every cold index into a refusal.
+
+**No write-authorized exemption.** [ADR 0039](0039-keyed-provenance-verification.md)
+§10 / [ADR 0055](0055-write-authorized-hold-read-generalised.md) let a
+write-granted principal read a *held* manifest so a subject can be signed. That
+does not extend here and the reason is not procedural: a terminal constituent
+will not become deliverable by the pusher completing their workflow, so there is
+no push-then-sign payoff to protect. The write path's refusal of a terminal
+reference means a current push cannot create this shape in the first place.
+
+**The refusal names the offending constituent.** It carries the constituent's
+digest and — for a `Rejected` one — its rejection axis, in the same envelope the
+manifest's *own* refusal uses (`403 DENIED`, the subject and axis shape ADR 0055
+admits for a caller the read gate let through). This is deliberate rather than
+incidental: in the incident behind this rule the blob digest was what identified
+the cause — identical across repeated pulls of one manifest, different across
+manifests, which is how a shared base layer was ruled out — and a concealed
+refusal would delete that signal for everyone who cannot read hort's logs. A
+server-side line carries the same three facts (which document, which
+constituent, which verdict) and is not optional.
+
+**The Referrers asymmetry, stated so it is not left inferable.** `GET
+/v2/<name>/referrers/<digest>` keeps reporting a signature manifest as present
+while a fetch of that manifest now fails. From outside, that reads like a
+registry fault rather than a withheld artifact, and it is the price of refusing
+an immutable document rather than editing it. The Referrers answer is
+**deliberately out of scope** for this amendment — not overlooked, and not
+blessed either: ADR 0062's consequences say a resolution surface that does not
+hold the rule is a defect against that record, so closing it is enforcement
+work someone may schedule, with its own decision about what an unlistable
+referrer does to a signing client. Until then the server-side line above is
+what tells an operator which of the two they are looking at.
+
+**Deliberately unchanged:** `Quarantined` constituents (a hold means "not yet",
+and the client's own blob fetch already answers it with the deadline), the
+per-artifact fail-closed release predicate (ADR 0007), the provenance cascade
+(ADR 0039 §11), the unknown-blob posture on the write path, and every answer a
+manifest gives about its **own** status.
+
 ## Consequences
 
 - **`content_references` is now the proper many-to-many.** The four existing
