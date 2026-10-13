@@ -375,6 +375,49 @@ pub fn manifest_blob_refs(manifest_json: &[u8]) -> DomainResult<Vec<ManifestBlob
     Ok(config_ref.chain(layer_refs).collect())
 }
 
+/// Minimal projection for [`manifest_subject_digest`] — only the
+/// `subject` descriptor. A distinct type from [`OciManifestBlobRefs`]
+/// and [`OciManifest`] for the same reason they are distinct from each
+/// other: widening one projection must not perturb the parsers the other
+/// helpers share. `serde` ignores every other manifest field.
+#[derive(Deserialize)]
+struct OciManifestSubject {
+    #[serde(default)]
+    subject: Option<OciBlobDescriptor>,
+}
+
+/// Returns the CAS content hash the manifest's **`subject` descriptor**
+/// names — the artifact an OCI referrer (a cosign signature manifest, an
+/// SBOM, an attestation) declares itself to be *about*.
+///
+/// This is the referrer's own statement of what it covers, read from the
+/// referrer's bytes. It is therefore usable where the `oci_subject`
+/// `content_references` row is not: that row is a mutable projection
+/// derived from this very field at push time, so it can be stale or
+/// absent, while the bytes are the thing the pusher's digest commits to.
+/// The field is still only a *claim* — it says which artifact a signature
+/// purports to cover, never that the signature verifies — so a caller
+/// that acts on it must verify the referrer's bundle against that
+/// subject's preimage.
+///
+/// `sha256`-only: a `subject.digest` using another algorithm or malformed
+/// hex yields `Ok(None)`, mirroring [`manifest_blob_digests`] and
+/// [`index_child_digests`]. A manifest with no `subject` key, a `subject`
+/// with no `digest`, or a `null` subject likewise yields `Ok(None)` — a
+/// plain image manifest and an index both do. Malformed / non-object JSON
+/// is [`DomainError::Validation`] — the same error shape
+/// [`sigstore_bundle_layers`] produces.
+pub fn manifest_subject_digest(manifest_json: &[u8]) -> DomainResult<Option<ContentHash>> {
+    let manifest: OciManifestSubject = serde_json::from_slice(manifest_json)
+        .map_err(|e| DomainError::Validation(format!("not a valid OCI manifest: {e}")))?;
+
+    Ok(manifest
+        .subject
+        .as_ref()
+        .and_then(|d| d.digest.as_deref())
+        .and_then(parse_sha256_digest))
+}
+
 /// Minimal OCI image-index projection — only the `manifests[]` child
 /// descriptor array the index helpers read. A distinct type from
 /// [`OciManifest`] (which reads `config`/`layers`): an index carries neither,
@@ -1199,6 +1242,85 @@ mod tests {
     #[test]
     fn index_child_digests_non_object_json_is_validation_error() {
         let err = index_child_digests(b"[1, 2, 3]").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    // ----------------------------------------------------------------
+    // manifest_subject_digest (the referrer's own claim about what it
+    // covers — ADR 0039 D8's membership walk reads it from the bytes)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn manifest_subject_digest_returns_the_subject_descriptor_hash() {
+        let hex = hex64('d');
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha256:{hex}"),
+                "size": 528
+            },
+            "layers": [
+                { "mediaType": SIGSTORE_BUNDLE_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) }
+            ]
+        }));
+        let got = manifest_subject_digest(&m).expect("valid manifest");
+        assert_eq!(got.as_ref().map(AsRef::as_ref), Some(hex.as_str()));
+    }
+
+    #[test]
+    fn manifest_subject_digest_absent_subject_is_none() {
+        // A plain image manifest and an image index both carry no
+        // `subject` — the legacy cosign tag-scheme `.sig` too.
+        let image = manifest(&serde_json::json!({
+            "config": { "digest": format!("sha256:{}", hex64('c')) },
+            "layers": [ { "digest": format!("sha256:{}", hex64('a')) } ]
+        }));
+        assert_eq!(manifest_subject_digest(&image).expect("valid"), None);
+        let index = manifest(&serde_json::json!({
+            "mediaType": OCI_IMAGE_INDEX_MEDIA_TYPE,
+            "manifests": [ { "digest": format!("sha256:{}", hex64('b')) } ]
+        }));
+        assert_eq!(manifest_subject_digest(&index).expect("valid"), None);
+        assert_eq!(manifest_subject_digest(b"{}").expect("valid"), None);
+    }
+
+    #[test]
+    fn manifest_subject_digest_null_subject_is_none() {
+        let m = manifest(&serde_json::json!({ "subject": serde_json::Value::Null }));
+        assert_eq!(manifest_subject_digest(&m).expect("valid"), None);
+    }
+
+    #[test]
+    fn manifest_subject_digest_subject_without_digest_is_none() {
+        let m = manifest(&serde_json::json!({
+            "subject": { "mediaType": "application/vnd.oci.image.manifest.v1+json", "size": 7 }
+        }));
+        assert_eq!(manifest_subject_digest(&m).expect("valid"), None);
+    }
+
+    #[test]
+    fn manifest_subject_digest_non_sha256_or_malformed_hex_is_none() {
+        let other_algo = manifest(&serde_json::json!({
+            "subject": { "digest": format!("sha512:{}", hex64('e')) }
+        }));
+        assert_eq!(manifest_subject_digest(&other_algo).expect("valid"), None);
+        let short_hex = manifest(&serde_json::json!({
+            "subject": { "digest": "sha256:dead" }
+        }));
+        assert_eq!(manifest_subject_digest(&short_hex).expect("valid"), None);
+        let not_hex = manifest(&serde_json::json!({
+            "subject": { "digest": format!("sha256:{}", std::iter::repeat_n('z', 64).collect::<String>()) }
+        }));
+        assert_eq!(manifest_subject_digest(&not_hex).expect("valid"), None);
+    }
+
+    #[test]
+    fn manifest_subject_digest_malformed_json_is_validation_error() {
+        let err = manifest_subject_digest(b"not json at all").unwrap_err();
+        assert!(matches!(err, DomainError::Validation(_)));
+        let err = manifest_subject_digest(b"[1, 2, 3]").unwrap_err();
         assert!(matches!(err, DomainError::Validation(_)));
     }
 }

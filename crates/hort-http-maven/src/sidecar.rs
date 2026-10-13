@@ -24,13 +24,15 @@
 //!
 //! A sidecar GET resolves the **same target artifact** as the file GET
 //! ([`ArtifactUseCase::find_visible_by_path`] on the base path) and
-//! applies the **same status gate**: `Quarantined` → 503 + `Retry-After`;
-//! `Rejected` / `ScanIndeterminate` → 403; only `Released` / `None` serve
-//! the digest. A sidecar therefore reveals no more than the file's own
-//! status response already does — it does **not** leak the digest (or mere
-//! existence beyond the file's own 503) of a held version. The gate runs
-//! *before* any CAS read or cache lookup, so a held artifact's digest is
-//! never computed.
+//! applies the **same status gate** — literally the same function, so the
+//! two answers cannot drift: `Quarantined` → 503, carrying `Retry-After`
+//! only for a hold the clock resolves; `Rejected` → 403 naming the
+//! rejection axis; `ScanIndeterminate` → 403; only `Released` / `None`
+//! serve the digest. A sidecar therefore reveals no more than the file's
+//! own status response already does — it does **not** leak the digest (or
+//! mere existence beyond the file's own 503) of a held version. The gate
+//! runs *before* any CAS read or cache lookup, so a held artifact's digest
+//! is never computed.
 
 use std::sync::Arc;
 use std::time::Duration;

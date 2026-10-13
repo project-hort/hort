@@ -312,11 +312,42 @@ impl MockArtifactRepository {
     /// Every write reaches the map through here, including
     /// `MockArtifactLifecycle`'s `commit_transition*`, so this is the only
     /// place the clear has to happen.
+    ///
+    /// The third non-column field, `rejection_reason`, is cleared on the
+    /// **read** side instead — see [`Self::projected`] for why the two
+    /// sit on opposite sides of the map.
     pub fn insert(&self, artifact: Artifact) {
         let mut row = artifact;
         row.quarantine_deadline = None;
         row.provenance_hold_indefinite = false;
         self.artifacts.lock().unwrap().insert(row.id, row);
+    }
+
+    /// Hand `artifact` out of a **read** method the way the real
+    /// projection load does, clearing `rejection_reason`.
+    ///
+    /// The structured rejection axis is not a column on the `artifacts`
+    /// projection — it lives on the artifact's `ArtifactRejected` event —
+    /// so `hort-adapters-postgres`'s one `row -> Artifact` mapper reads
+    /// `rejection_reason: None` as a constant. A mock that handed the
+    /// seeded entity back verbatim would therefore serve a state **no
+    /// producer in the system can write**, and a test standing on it
+    /// would prove a behaviour production cannot show: the axis would
+    /// appear on a read path that never derived it, and a consumer that
+    /// stopped deriving it from the stream would still look correct here.
+    ///
+    /// The clear belongs on the read side rather than in [`Self::insert`]
+    /// — unlike the transient hold pair, which is cleared on write — so a
+    /// fixture can still seed the field and assert on what a write path
+    /// stored (`Self::get` / `Self::snapshot_all` are the harness's own
+    /// view of the map, not the port). Production draws the same line in
+    /// the same place: the column does not exist, so the value is lost at
+    /// the load, and a caller that needs the axis re-derives it from the
+    /// stream.
+    fn projected(artifact: &Artifact) -> Artifact {
+        let mut row = artifact.clone();
+        row.rejection_reason = None;
+        row
     }
 
     /// The repository a seeded artifact belongs to, by identity — the
@@ -452,7 +483,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .lock()
             .unwrap()
             .get(&id)
-            .cloned()
+            .map(Self::projected)
             .ok_or_else(|| DomainError::NotFound {
                 entity: "Artifact",
                 id: id.to_string(),
@@ -468,7 +499,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .find(|a| a.sha256_checksum.as_ref() == sha)
-            .cloned();
+            .map(Self::projected);
         Box::pin(async move { Ok(result) })
     }
 
@@ -492,7 +523,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .find(|a| a.repository_id == repository_id && a.sha256_checksum.as_ref() == sha)
-            .cloned();
+            .map(Self::projected);
         Box::pin(async move { Ok(result) })
     }
 
@@ -529,7 +560,7 @@ impl ArtifactRepository for MockArtifactRepository {
         let mut items: Vec<Artifact> = all
             .values()
             .filter(|a| a.repository_id == repository_id)
-            .cloned()
+            .map(Self::projected)
             .collect();
         items.sort_by(|a, b| a.name.cmp(&b.name));
         let total = items.len() as u64;
@@ -580,7 +611,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .find(|a| a.repository_id == repository_id && a.path == path)
-            .cloned();
+            .map(Self::projected);
         Box::pin(async move { Ok(result) })
     }
 
@@ -621,7 +652,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .filter(|a| a.repository_id == repository_id && a.name == normalized_name)
-            .cloned()
+            .map(Self::projected)
             .collect();
         items.sort_by(|a, b| a.version.cmp(&b.version));
         let total = items.len() as u64;
@@ -645,7 +676,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .filter(|a| a.repository_id == repository_id && a.name_as_published == raw_name)
-            .cloned()
+            .map(Self::projected)
             .collect();
         items.sort_by(|a, b| a.version.cmp(&b.version));
         let total = items.len() as u64;
@@ -699,7 +730,7 @@ impl ArtifactRepository for MockArtifactRepository {
                         QuarantineStatus::Quarantined | QuarantineStatus::Released
                     )
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         // Mock truncates at the same `LIMIT_LIST_MAX_ITEMS` cap as
         // production so use-case tests behave identically. The over-fetch
@@ -747,7 +778,7 @@ impl ArtifactRepository for MockArtifactRepository {
                         None => true,
                     }
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         let cap = hort_domain::types::LIMIT_LIST_MAX_ITEMS as usize;
         Box::pin(async move { Ok(LimitedList::from_overfetch(items, cap)) })
@@ -791,7 +822,7 @@ impl ArtifactRepository for MockArtifactRepository {
                     None => true,
                 }
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         // Stable order so the offset/limit window is deterministic across
         // pages — the adapter does not guarantee order, but a stable order
@@ -953,7 +984,7 @@ impl ArtifactRepository for MockArtifactRepository {
                     // Keyset cursor — mirrors the adapter's `id > $after`.
                     && after.is_none_or(|cursor| a.id > cursor)
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         // Stable order for test assertions — sort by id so repeated
         // invocations on the same seeded state return the same prefix.
@@ -1001,7 +1032,7 @@ impl ArtifactRepository for MockArtifactRepository {
                     // Keyset cursor — mirrors the adapter's `id > $after`.
                     && after.is_none_or(|cursor| a.id > cursor)
             })
-            .cloned()
+            .map(Self::projected)
             .collect();
         items.sort_by_key(|a| a.id);
         items.truncate(limit as usize);
@@ -9098,6 +9129,200 @@ mod tests {
             }
         }
         assert_ne!(unkeyed[0], unkeyed[1]);
+    }
+
+    /// The **other half** of the pair the test below mirrors, read off
+    /// the adapter's source: `hort-adapters-postgres`'s one
+    /// `row -> Artifact` conversion still reads the axis as the constant
+    /// `None`.
+    ///
+    /// The double mirrors a constant, and a constant can be changed. If
+    /// the axis is ever denormalised onto the `artifacts` projection, the
+    /// mapper starts carrying a real value and the clear below becomes
+    /// the divergence instead of the mirror — so the pair is pinned from
+    /// both ends rather than one. A source scan because this crate
+    /// cannot depend on an adapter (ADR 0008): the dependency runs the
+    /// other way, and that is the layering, not an inconvenience.
+    #[test]
+    fn the_projection_load_the_double_mirrors_still_reads_the_axis_as_none() {
+        let mapper = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("CARGO_MANIFEST_DIR resolves under crates/hort-app")
+            .join("hort-adapters-postgres/src/mappers.rs");
+        let src = std::fs::read_to_string(&mapper)
+            .unwrap_or_else(|e| panic!("the row mapper must be readable at {mapper:?}: {e}"));
+        assert!(
+            src.contains("impl TryFrom<ArtifactRow> for Artifact"),
+            "the scanned conversion was renamed or moved; re-point this assertion \
+             before trusting it"
+        );
+        assert!(
+            src.contains("rejection_reason: None,"),
+            "the row mapper no longer loads the rejection axis as `None` — \
+             `MockArtifactRepository::projected` mirrors that constant and now \
+             diverges from it"
+        );
+    }
+
+    /// `MockArtifactRepository`'s reads mirror the projection load:
+    /// every artifact-returning port method hands the entity back with
+    /// `rejection_reason` cleared, whatever the fixture seeded.
+    ///
+    /// The mirrored contract is
+    /// `crates/hort-adapters-postgres/src/mappers.rs`'s one
+    /// `row -> Artifact` conversion, which reads `rejection_reason: None`
+    /// as a **constant** because the structured axis is not a column on
+    /// the `artifacts` projection — it lives on the artifact's
+    /// `ArtifactRejected` event. So the only `Rejected` artifact any
+    /// producer in the system can hand a reader is one with the axis
+    /// unset, and a double that served the seeded value would let a test
+    /// stand on a state production cannot reach: the axis would appear on
+    /// a read path that never derived it, and a consumer that stopped
+    /// deriving it from the stream would still look correct.
+    ///
+    /// Every read method is asserted rather than one, because the clear
+    /// is per-method — the divergence comes back one method at a time.
+    #[tokio::test]
+    async fn mock_artifact_repository_reads_clear_the_rejection_axis() {
+        use hort_domain::events::RejectionReason;
+
+        let repo_id = Uuid::new_v4();
+        let policy_id = Uuid::new_v4();
+        let mut seeded = sample_artifact(QuarantineStatus::Rejected);
+        seeded.repository_id = repo_id;
+        seeded.path = "manifests/sha256:abc".into();
+        assert!(
+            seeded.rejection_reason.is_some(),
+            "the fixture must seed an axis, or this test proves nothing: \
+             `sample_artifact` deliberately populates it (the ADR 0041 \
+             re-evaluation fixtures need a seeded reason) and the clear \
+             belongs at the repository boundary, where Postgres does it"
+        );
+        let id = seeded.id;
+        let sha = seeded.sha256_checksum.clone();
+        let repo = MockArtifactRepository::new();
+        repo.insert(seeded.clone());
+        repo.seed_rejected_for_policy(policy_id, vec![repo_id]);
+
+        let mut reads: Vec<(&str, Vec<Artifact>)> = Vec::new();
+        reads.push(("find_by_id", vec![repo.find_by_id(id).await.unwrap()]));
+        reads.push((
+            "find_by_checksum",
+            repo.find_by_checksum(&sha)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect(),
+        ));
+        reads.push((
+            "find_by_repo_and_checksum",
+            repo.find_by_repo_and_checksum(repo_id, &sha)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect(),
+        ));
+        reads.push((
+            "find_by_path",
+            repo.find_by_path(repo_id, &seeded.path)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect(),
+        ));
+        let page = || PageRequest {
+            offset: 0,
+            limit: 10,
+        };
+        reads.push((
+            "list_by_repository",
+            repo.list_by_repository(repo_id, page())
+                .await
+                .unwrap()
+                .items,
+        ));
+        reads.push((
+            "find_by_name_in_repo",
+            repo.find_by_name_in_repo(repo_id, &seeded.name, page())
+                .await
+                .unwrap()
+                .items,
+        ));
+        reads.push((
+            "find_by_name_as_published",
+            repo.find_by_name_as_published(repo_id, &seeded.name_as_published, page())
+                .await
+                .unwrap()
+                .items,
+        ));
+        reads.push((
+            "list_rejected_for_policy",
+            repo.list_rejected_for_policy(policy_id)
+                .await
+                .unwrap()
+                .items,
+        ));
+        reads.push((
+            "find_oci_image_manifests_without_kind",
+            repo.find_oci_image_manifests_without_kind("oci_config", 10, None, None)
+                .await
+                .unwrap(),
+        ));
+
+        for (method, rows) in &reads {
+            assert!(
+                !rows.is_empty(),
+                "{method} returned nothing — the assertion below would be vacuous"
+            );
+            for row in rows {
+                assert_eq!(
+                    row.rejection_reason, None,
+                    "{method} must hand the axis back cleared, like \
+                     `hort-adapters-postgres`'s row mapper does"
+                );
+            }
+        }
+
+        // The seeded value is still in the map: the clear is a property
+        // of the port's reads, not of the write, so a fixture can still
+        // assert what a write path stored.
+        assert_eq!(
+            repo.get(id).unwrap().rejection_reason,
+            Some(RejectionReason::Scanner)
+        );
+
+        // The two `Quarantined`/`Released`-scoped reads need a row in
+        // one of those statuses; the same clear applies there.
+        let mut active = sample_artifact(QuarantineStatus::Rejected);
+        active.repository_id = repo_id;
+        active.quarantine_status = QuarantineStatus::Quarantined;
+        active.path = "pkg/2.0.0/pkg.tar.gz".into();
+        repo.insert(active);
+        repo.seed_active_for_policy(policy_id, vec![repo_id]);
+        for row in repo.list_active_for_repo(repo_id).await.unwrap().items {
+            assert_eq!(row.rejection_reason, None, "list_active_for_repo");
+        }
+        for row in repo
+            .list_active_for_policy(policy_id, page())
+            .await
+            .unwrap()
+            .items
+        {
+            assert_eq!(row.rejection_reason, None, "list_active_for_policy");
+        }
+
+        let mut wheel = sample_artifact(QuarantineStatus::Rejected);
+        wheel.repository_id = repo_id;
+        wheel.path = "pkg-1.0.0-py3-none-any.whl".into();
+        repo.insert(wheel);
+        let wheels = repo
+            .find_pypi_wheels_without_kind("wheel_metadata", 10, None, None)
+            .await
+            .unwrap();
+        assert!(!wheels.is_empty(), "find_pypi_wheels_without_kind");
+        for row in wheels {
+            assert_eq!(row.rejection_reason, None, "find_pypi_wheels_without_kind");
+        }
     }
 }
 

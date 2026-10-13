@@ -97,7 +97,7 @@ impl TaskHandler for ProvenanceVerifyHandler {
                     // `no_attestation` case. Closed taxonomy:
                     // `verified` / `rejected:<reason>` /
                     // `no_attestation` / `held_pending_signature` /
-                    // `skipped:<why>`.
+                    // `cleared:signature_material` / `skipped:<why>`.
                     let result = result_summary_label(&outcome);
                     // A single `debug!` on the silent path is the most that
                     // is allowed — NO per-`no_attestation` `info!` (firehose
@@ -131,8 +131,8 @@ impl TaskHandler for ProvenanceVerifyHandler {
 /// Map a [`ProvenanceRunOutcome`] to the compact `result_summary` label
 /// written on the job row. The closed
 /// taxonomy is `verified` / `rejected:<reason>` / `no_attestation` /
-/// `held_pending_signature` / `held_pending_subject` / `skipped:<why>` /
-/// `requeued:<why>`;
+/// `held_pending_signature` / `held_pending_subject` /
+/// `cleared:signature_material` / `skipped:<why>` / `requeued:<why>`;
 /// `<reason>` reuses the metrics-catalog wire string so the
 /// `result_summary` trail and the `hort_provenance_reject_total{reason}`
 /// series agree. Pure — testable without the use case.
@@ -147,6 +147,9 @@ fn result_summary_label(outcome: &ProvenanceRunOutcome) -> String {
         ProvenanceRunOutcome::SkippedOff => "skipped:off".to_string(),
         ProvenanceRunOutcome::SkippedNoVerifier => "skipped:no_verifier".to_string(),
         ProvenanceRunOutcome::SkippedAlreadyCleared => "skipped:already_cleared".to_string(),
+        ProvenanceRunOutcome::ClearedAsSignatureMaterial => {
+            "cleared:signature_material".to_string()
+        }
         ProvenanceRunOutcome::RequeuedNoAnchor => "requeued:no_anchor".to_string(),
         ProvenanceRunOutcome::Applied { verdict, .. } => match verdict {
             ProvenanceVerdictSummary::Verified => "verified".to_string(),

@@ -904,6 +904,52 @@ job rather than renaming the parameter — one meaning per knob is the durable
 fix, and ADR 0029's hard-rename machinery is not needed for a field whose
 documented meaning is the one that survives.
 
+### D8 — signature material is not on the provenance axis, and that includes its bytes
+
+*(Amendment 2026-10-12.)* Nothing signs a signature. A cosign signature
+manifest's own constituents — the `{}` config blob and the signature
+payload layer — can never acquire an attestation of their own, so neither
+end of the §11 cascade can ever fire for them. Under `Required` they are
+held by D1 and, by D4, held **indefinitely**: a hold no future evidence
+can end. D4 reserves terminality for positive disproof; an unending hold
+is terminality reached by another route. This is the one population for
+which the missing evidence is **structural** rather than merely late, and
+D8 is scoped to exactly that.
+
+§8 already decided that signature material is not runnable content, and
+exempted the signature **manifest** on the push path. The exemption stops
+there only because the manifest's layers arrive through the blob upload,
+where there is no manifest to classify. D8 carries the decision §8 already
+made to the bytes it was always about.
+
+**The authority is the verifier's verdict, not the pusher's declaration.**
+A constituent is cleared when the verifier accepts the bundle of the
+signature manifest that names it, over the subject that manifest points
+at — so the clearance is the §11 cascade with one more membership rule,
+not an exemption. An artifact row is unique per
+`(repository, blobs/sha256:<hex>)` and is therefore shared by every image
+in that repository; a clearance keyed on a declaration a writer controls
+would serve an unsigned layer to every consumer of the repository — the
+surface §8's purity requirement deliberately keeps closed on the scan
+axis. Resolving the verification at the point of use costs nothing that
+has to be remembered, and it reaches the artifacts already held, whose
+verdicts predate this decision.
+
+**What this does not change.** The signature requirement for **subjects**
+is untouched — a subject under `Required` still holds until it is
+verified. The scan axis is untouched: a signature constituent is scanned
+exactly as before. And this is **not** a fourth shape predicate on the
+`NoAttestation × Required` arm. D3 deleted
+`window_open || is_referenced_descendant || is_constituent` because all
+three are shapes of *"the evidence has not arrived yet"*, and D1 made the
+verdict shape-independent. D8 is a statement about **applicability**, and
+it is resolved where the verifier already is rather than threaded back
+into `complete_provenance`.
+
+**Stated plainly, what this buys.** A third party can fetch the signature
+material of the content hort serves. Under `Required` the registry demands
+a signature that, until now, it would let nobody else check.
+
 ### What this amendment does not change
 
 - **The release gate.** `ProvenanceClearance` still resolves `Cleared` iff a

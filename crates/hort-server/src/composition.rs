@@ -2863,11 +2863,14 @@ pub async fn build_app_context(
         // `Retry-After` is the configured observation window rather than
         // the bare anchor.
         .with_policy_projections(policy_projections.clone())
-        // ADR 0039 D5: lets the same hydration answer whether an
-        // already-expired hold is waiting on a signature, so the OCI 503
-        // sites can drop a `Retry-After` that would otherwise advertise
-        // a retry schedule the hold does not have.
-        .with_provenance_clearance_events(event_store.clone()),
+        // The artifact's own stream, for the transient read-path fields
+        // no `row -> Artifact` load can carry: whether an
+        // already-expired hold is waiting on a signature (ADR 0039 D5),
+        // so the content-route 503 sites can drop a `Retry-After` that would
+        // otherwise advertise a retry schedule the hold does not have;
+        // and the axis a `Rejected` artifact was rejected on, which
+        // lives only on its `ArtifactRejected` event.
+        .with_artifact_stream_events(event_store.clone()),
     );
 
     // `CurationUseCase` backing the

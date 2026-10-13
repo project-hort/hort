@@ -178,6 +178,36 @@ ever runs. See
 [mint-operator-tokens-without-idp.md](architecture/how-to/mint-operator-tokens-without-idp.md)
 and [ADR 0013](adr/0013-idp-authoritative-cli-sessions.md).
 
+### Signature constituent
+
+The blobs a **signature manifest** itself references — for cosign/Sigstore
+that is the `{}` config blob and the signature payload. A signature
+constituent can never acquire an attestation of its own, because nothing
+signs a signature, so it is not on the provenance axis.
+
+Under `provenance_mode: required` it is cleared instead by **the signature
+that verified its subject**: at its own `provenance-verify`, an inbound
+`content_references` row nominates a candidate parent, that parent's bytes
+must be a pure signature manifest whose config/layer set contains this
+digest, and the verifier must accept that manifest's bundle over the
+subject the manifest's own `subject` descriptor names. On success the
+constituent receives a real cascaded `ProvenanceVerified` whose
+`cascaded_from` is the **signature manifest**. The authority is the
+verifier's verdict, never the pusher's declaration — a blob has one
+artifact row per `(repository, blobs/sha256:<hex>)`, so a clearance keyed
+on a declaration would serve an unsigned layer to every consumer of the
+repository. Every failure direction (unreadable or unparseable parent, a
+parent that is not a pure signature manifest, a digest the parent's bytes
+do not bind, no `subject` descriptor — the legacy tag-scheme `.sig` shape
+— an unreadable subject preimage, a bundle the verifier does not accept, a
+verifier error, or no candidate parent) leaves exactly the hold the
+artifact already had.
+
+Distinct from the constituents of the signed *subject* (an image's config
+and layers), which inherit their subject's clearance through the two
+trigger ends of the §11 cascade. See
+[ADR 0039](adr/0039-keyed-provenance-verification.md) §8, §11 and D8.
+
 ### Staging
 
 hort's test environment. It deploys from published artifacts only:
@@ -185,6 +215,29 @@ hort's test environment. It deploys from published artifacts only:
 merges, since `develop` publishes no image or chart. It is not gated on a
 `main` cut, but it is gated on the next (on-demand) alpha. See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D3.
+
+### Terminal (quarantine status)
+
+Said of an artifact whose lifecycle has concluded against delivery:
+`Rejected` (a verdict was rendered against the bytes) and
+`ScanIndeterminate` (ADR 0007's fail-closed terminal scan failure). The
+exit from either is a deliberate act — an admin override, a policy loosen
+that re-judges the stored findings, a re-scan — never the passage of time.
+`Quarantined` is the contrast and is **not** terminal, even when its hold
+has no self-resolving deadline (an artifact awaiting a signature): its
+evaluation is still outstanding. The distinction decides whether a
+referenced blob counts as present on a manifest PUT and whether a manifest
+stays deliverable. **Absence** is a third thing again: content with no
+catalog row is "not local yet" — the ordinary state of a cold pull-through
+reference — not a concluded lifecycle.
+
+The one definition in code is
+`hort_domain::entities::artifact::QuarantineStatus::is_terminal`, whose
+rustdoc carries the derivation; it is deliberately status-only, so it never
+consults the transient `provenance_hold_indefinite` flag. See
+[ADR 0007](adr/0007-fail-closed-quarantine-release-predicate.md),
+[ADR 0039](adr/0039-keyed-provenance-verification.md) §10 and
+[ADR 0043](adr/0043-oci-image-index-support.md).
 
 ### UAT
 

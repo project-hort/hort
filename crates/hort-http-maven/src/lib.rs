@@ -45,10 +45,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use chrono::Utc;
 
 use hort_app::use_cases::repository_access::AccessLevel;
-use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{Repository, RepositoryFormat, RepositoryType};
 use hort_domain::events::ApiActor;
@@ -497,57 +495,24 @@ async fn resolve_unresolved_snapshot(
     Ok(MavenFormatHandler.resolve_mutable_version(artifact_path, &available_refs)?)
 }
 
-/// Surface the per-artifact status gate as the non-servable HTTP response
-/// (`Quarantined` → 503 + `Retry-After`; `Rejected` → 403;
-/// `ScanIndeterminate` → 403), or `None` when the artifact is servable
-/// (`Released` / `None`). Shared by the file GET ([`render_file_response`])
-/// and the checksum-sidecar GET ([`sidecar::serve_sidecar`]) so a sidecar
-/// inherits its target file's exact status response (design §11) — a
+/// Surface the per-artifact status gate as the non-servable HTTP
+/// response, or `None` when the artifact is servable. The answer itself
+/// is [`hort_http_core::artifact_gate::non_servable_response`], the one
+/// definition the content routes share; what this wrapper adds is the
+/// Maven-specific invariant that makes it worth a name here.
+///
+/// That invariant: the file GET ([`render_file_response`]) and the
+/// checksum-sidecar GET ([`sidecar::serve_sidecar`]) resolve the same
+/// target artifact and must reach the **same** answer (design §11) — a
 /// quarantined file and its sidecar both 503, a rejected file and its
-/// sidecar both 403, and the digest of a held version is never computed.
+/// sidecar both 403. Routing both through one call is what guarantees
+/// it, and it is why the gate runs *before* any CAS read or cache
+/// lookup: the digest of a held version is never computed, so the
+/// sidecar reveals nothing the file's own status response does not.
 pub(crate) fn non_servable_response(
     artifact: &hort_domain::entities::artifact::Artifact,
 ) -> Option<Response> {
-    match artifact.quarantine_status {
-        QuarantineStatus::Quarantined => {
-            // The use-case layer hydrates the transient computed
-            // `quarantine_deadline` (ADR 0007); the format crate never
-            // computes it. 503 + Retry-After — NEVER 409 (proxies cache it).
-            let retry_after = artifact
-                .quarantine_deadline
-                .map(|deadline| {
-                    let secs = (deadline - Utc::now()).num_seconds().max(1);
-                    secs.to_string()
-                })
-                .unwrap_or_else(|| "3600".to_string());
-            Some(
-                Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header("Retry-After", retry_after)
-                    .body(Body::from(
-                        serde_json::json!({"error": "artifact is quarantined"}).to_string(),
-                    ))
-                    .unwrap(),
-            )
-        }
-        QuarantineStatus::Rejected => Some(
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact is rejected"}).to_string(),
-                ))
-                .unwrap(),
-        ),
-        QuarantineStatus::ScanIndeterminate => Some(
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact scan is indeterminate"}).to_string(),
-                ))
-                .unwrap(),
-        ),
-        QuarantineStatus::None | QuarantineStatus::Released => None,
-    }
+    hort_http_core::artifact_gate::non_servable_response(artifact)
 }
 
 /// Render the final file HTTP response: surface the quarantine gate via

@@ -78,6 +78,79 @@ impl FromStr for QuarantineStatus {
     }
 }
 
+impl QuarantineStatus {
+    /// Is this state **terminal** — has the artifact's lifecycle concluded
+    /// against delivery, with nothing outstanding that the passage of time
+    /// resolves?
+    ///
+    /// True for exactly [`Rejected`](Self::Rejected) (a verdict was
+    /// rendered against the bytes) and
+    /// [`ScanIndeterminate`](Self::ScanIndeterminate) (ADR 0007's
+    /// fail-closed terminal scan failure). "Terminal is terminal" for
+    /// exactly these two is this codebase's own phrase — see
+    /// [`Artifact::cascade_provenance_clearance`] and
+    /// [`ScanIndeterminate`](Self::ScanIndeterminate)'s own doc — and the
+    /// index pipeline states the same line in prose for its filters
+    /// (`hort_app::use_cases::index_filters` module docs). This is that
+    /// statement's domain-level form; the exit from either state is a
+    /// deliberate act (admin override, a policy loosen that re-judges the
+    /// stored findings, a re-scan), never elapsed time.
+    ///
+    /// Exhaustive with no wildcard arm, so a sixth [`QuarantineStatus`]
+    /// variant is a compile error here rather than a silent "not
+    /// terminal".
+    ///
+    /// Distinct from the similarly-named
+    /// [`has_terminal_rejection_event`], which asks about an event set
+    /// rather than a status: that is D6's structural pairing ("a
+    /// `Rejected` status must have an `ArtifactRejected` behind it"),
+    /// whereas this is the projected status alone.
+    ///
+    /// # `Quarantined` is not terminal, and an indefinite hold does not
+    /// change that
+    ///
+    /// The predicate is **status-only**: it does not consult
+    /// [`Artifact::provenance_hold_indefinite`] or
+    /// [`Artifact::quarantine_deadline`], and widening it to do so would
+    /// invert a decision rather than tighten one. Under
+    /// `provenance_mode: required` a subject is held `Quarantined` until
+    /// its signature arrives, and ADR 0039 §10 exists precisely so that
+    /// held subject can be read and signed — a hold with no
+    /// self-resolving deadline is an evaluation still outstanding
+    /// (ADR 0039 D2: fail-closed is not the same as terminal), not a
+    /// concluded one.
+    ///
+    /// # Absent is not terminal
+    ///
+    /// This answers about a status, which means a **catalog row exists**.
+    /// Content with no row at all is "not local yet" — the ordinary state
+    /// of every cold pull-through reference — and is a different answer
+    /// from any state here. A caller that folds absence into this
+    /// predicate's `true` arm breaks every cold pull-through; absence is
+    /// the caller's own case to handle.
+    ///
+    /// # Where the status comes from
+    ///
+    /// Read it from the **content's own catalog row** — the artifact the
+    /// caller already holds — never from the `content_references` edge
+    /// projection. ADR 0039 already settles that: edges *nominate* and the
+    /// bytes decide, and the projection is repairable rather than
+    /// guaranteed (`oci_membership_edge_backfill` exists for rows minted
+    /// before the write path carried their edges).
+    ///
+    /// Read correctness outranks read cost here by an explicit human
+    /// decision (2026-10-10): technically correct, stable and unambiguous
+    /// before read performance. A later change that reintroduces a
+    /// projection read as an optimisation is arguing against that written
+    /// decision, not filling a gap in it.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Self::Rejected | Self::ScanIndeterminate => true,
+            Self::None | Self::Quarantined | Self::Released => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Artifact
 // ---------------------------------------------------------------------------
@@ -2167,6 +2240,32 @@ mod tests {
         let a = QuarantineStatus::Released;
         let b = a;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn terminal_is_exactly_rejected_and_scan_indeterminate() {
+        assert!(QuarantineStatus::Rejected.is_terminal());
+        assert!(QuarantineStatus::ScanIndeterminate.is_terminal());
+        assert!(!QuarantineStatus::None.is_terminal());
+        assert!(!QuarantineStatus::Released.is_terminal());
+        assert!(!QuarantineStatus::Quarantined.is_terminal());
+    }
+
+    #[test]
+    fn a_hold_with_no_self_resolving_deadline_is_still_not_terminal() {
+        // The provenance hold-until-signed state (ADR 0039 D4): held
+        // `Quarantined`, no deadline, `provenance_hold_indefinite` set.
+        // The predicate is status-only, so it must answer the same as
+        // any other hold — ADR 0039 §10 depends on that subject staying
+        // readable long enough to be signed.
+        let mut a = sample_artifact();
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_deadline = None;
+        a.provenance_hold_indefinite = true;
+        assert!(
+            !a.quarantine_status.is_terminal(),
+            "an indefinite provenance hold is an outstanding evaluation, not a verdict"
+        );
     }
 
     // -- Artifact -----------------------------------------------------------

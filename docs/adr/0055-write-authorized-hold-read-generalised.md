@@ -50,18 +50,35 @@ Three qualifiers carry the whole security argument, and none is decorative:
 
    Resolvability is gated by this qualifier; diagnosability is not. *Why* a
    version cannot be resolved is information, not access, and every byte
-   route is free to say so to any caller holding `Read`. npm, Maven and
-   Cargo do: `503 … quarantined` + `Retry-After` for the timed hold, `403 …
-   rejected` / `403 … scan is indeterminate` for the terminal verdicts
-   (`crates/hort-http-npm/src/lib.rs`, `crates/hort-http-maven/src/lib.rs`,
-   `crates/hort-http-cargo/src/lib.rs`). OCI's `Rejected` and PyPI's
-   `.metadata` route take the opposite, format-specific anti-enumeration
-   choice instead — `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN`
-   (`crates/hort-http-oci/src/{manifests,blobs}.rs`) or a plain 404
-   (`crates/hort-http-pypi/src/metadata_endpoint.rs`), collapsing the
-   verdict into the same answer as "does not exist". Both choices satisfy
-   this qualifier: it constrains what the resolution document resolves to,
-   not whether the refusal names its reason.
+   route is free to say so to any caller holding `Read`. All four non-OCI
+   download routes do: `503 … quarantined` + `Retry-After` for the timed
+   hold, `403 … rejected` / `403 … scan is indeterminate` for the terminal
+   verdicts (`crates/hort-http-npm/src/lib.rs`,
+   `crates/hort-http-maven/src/lib.rs`,
+   `crates/hort-http-cargo/src/lib.rs`, and
+   `crates/hort-http-pypi/src/lib.rs` — PyPI's download route answers 403
+   alongside the other three). OCI's blob and manifest routes
+   answer the terminal verdict the same way and additionally name the
+   rejection axis (`403 DENIED` with `{subject, axis}`,
+   `crates/hort-http-oci/src/{manifests,blobs}.rs`); they previously took
+   the opposite, format-specific anti-enumeration choice —
+   `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN`, byte-identical to "does not
+   exist" — which is the posture the 2026-10-12 clarification below
+   retired. **PyPI's PEP 658 `.metadata` route moved off that posture on
+   2026-10-13**: it answered a plain 404 for both terminal verdicts and
+   now refuses through the same
+   `hort_http_core::artifact_gate::non_servable_response` the four
+   download routes refuse through
+   (`crates/hort-http-pypi/src/metadata_endpoint.rs`), so a wheel's
+   metadata answers whatever the wheel answers, for every status — its
+   caller was already admitted by the read gate and the simple index it
+   came through had already disclosed the wheel, so the 404 concealed
+   nothing but the verdict. The route keeps a 404 for the one thing that
+   answer states truthfully: a wheel with no cached METADATA row, which
+   is an absence rather than a verdict. Either choice satisfies this
+   qualifier — it constrains what the resolution document resolves to,
+   not whether the refusal names its reason — but no route takes the
+   concealing one any more.
 
    **Clarified 2026-09-17 — npm's packument enumerates withheld versions;
    the rule did not change.** `hort.held[]` names every withheld version and
@@ -76,6 +93,17 @@ Three qualifiers carry the whole security argument, and none is decorative:
    front" — still the narrow reading, not the wide one rejected on #254
    (answering every hold and verdict alike with a plain `404`, which would
    replace "we withhold this" with "this does not exist").
+
+   **Clarified 2026-10-12 — the audience is the read gate, not a grant.**
+   "Any caller holding `Read`" reads as a grant check, and on a public
+   repository there is none: the read gate admits an anonymous caller, so
+   the set entitled to a reason is *whoever could read the artifact if it
+   were not withheld* — the same set the byte route would have served. The
+   qualifier is unchanged; what this states is **who the diagnosis is
+   for**. A reason is therefore owed to an anonymous caller on a public
+   repository exactly as to a `Read` holder on a private one, and it is
+   owed to nobody the read gate itself would refuse: a withheld artifact's
+   reason is not a way around a repository's read authority.
 
 ## Context
 

@@ -74,7 +74,7 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
-use hort_domain::events::ApiActor;
+use hort_domain::events::{ApiActor, RejectionReason};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::types::ContentHash;
 use hort_formats::oci::OciFormatHandler;
@@ -320,8 +320,51 @@ pub(super) async fn serve(
             // through to serve the manifest (HEAD and GET alike).
         }
         QuarantineStatus::Rejected => {
-            return OciError::ManifestUnknown {
-                reference: reference.to_string(),
+            // Same decision as the blob arm: a caller the read gate
+            // admitted would have received the manifest itself, so the
+            // reason it is withheld reveals strictly less (ADR 0055's
+            // 2026-10-12 clarification). The `MANIFEST_UNKNOWN` 404 this
+            // replaces was byte-identical to "no such tag", which cost
+            // the reporter days of distinguishing a blocked image from a
+            // broken registry. A caller the gate refuses never reaches
+            // here — step 1's repository challenge / `NAME_UNKNOWN`
+            // (ADR 0021 / 0045) is unchanged.
+            //
+            // Resolvability is NOT what changes. The manifest still never
+            // resolves to bytes, for anyone, publisher included — the
+            // write-authorized hold-read exemption (ADR 0039 §10) covers
+            // `Quarantined` and stops there, which is why this arm sits
+            // outside it. What the write-granted caller gains is the
+            // diagnosis, which they are owed for the same reason every
+            // admitted reader is: they certainly pass the read gate.
+            //
+            // The axis is a plain field — derived by `ArtifactUseCase`
+            // from the artifact's own `ArtifactRejected` event during the
+            // load, because the `artifacts` projection carries no such
+            // column and a format crate must not read a stream (ADR
+            // 0008).
+            let axis = artifact
+                .rejection_reason
+                .as_ref()
+                .map(RejectionReason::wire_kind);
+            if axis.is_none() {
+                // Refuse naming the subject and no axis: never an
+                // `unknown` token, which would make an inconsistency look
+                // like a verdict. `Rejected` with no rejection on the
+                // record is the illegal state ADR 0039 D6 names — the
+                // status is a projection, the stream is the record — and
+                // the use-case layer distinguishes "read the stream, no
+                // `ArtifactRejected` there" (`error!`) from "could not
+                // read it" (`warn!`) in its own log.
+                tracing::error!(
+                    artifact_id = %artifact.id,
+                    reference = %reference,
+                    "refusing a Rejected manifest with no rejection axis to report"
+                );
+            }
+            return OciError::ArtifactRejected {
+                subject: reference.to_string(),
+                axis,
             }
             .into_response();
         }
@@ -1751,6 +1794,13 @@ fn upstream_pull_failure_response(
     reference: &str,
 ) -> Response {
     match outcome {
+        // `CurationBlocked` keeps the 404 even though a locally-held
+        // `Rejected` manifest answers `403 DENIED` + its axis. The
+        // asymmetry is deliberate and the two callers differ: a rule
+        // blocking a pull-through fetch refuses a manifest this registry
+        // never admitted, so there is no verdict of its own to report,
+        // and a cryptic 403 mid-`docker pull` is the worse answer for
+        // that client.
         UpstreamManifestPullOutcome::NotConfigured
         | UpstreamManifestPullOutcome::UpstreamNotFound
         | UpstreamManifestPullOutcome::CurationBlocked => OciError::ManifestUnknown {
@@ -1812,8 +1862,10 @@ mod tests {
     use uuid::Uuid;
 
     use hort_app::use_cases::test_support::{
-        sample_artifact, sample_repository, MockArtifactMetadataRepository, MockArtifactRepository,
-        MockRefRegistryPort, MockRepositoryRepository, MockStoragePort,
+        persisted_artifact_rejected, sample_artifact, sample_repository,
+        MockArtifactMetadataRepository, MockArtifactRepository, MockEventStore,
+        MockPolicyProjectionRepository, MockRefRegistryPort, MockRepositoryRepository,
+        MockStoragePort,
     };
     use hort_domain::entities::artifact::{ArtifactMetadata, QuarantineStatus};
     use hort_domain::entities::mutable_ref::MutableRef;
@@ -1841,6 +1893,19 @@ mod tests {
         storage: Arc<MockStoragePort>,
         refs: Arc<MockRefRegistryPort>,
         metadata: Arc<MockArtifactMetadataRepository>,
+        /// Policy projections, for a test whose subject is the
+        /// *advertised* observation window: the harness's global seed
+        /// carries `quarantine_duration_secs = 0`, so a repo-scoped seed
+        /// through `test_authz::quarantining_policy_with_window` is what
+        /// puts a real window on the wire.
+        policy_projections: Arc<MockPolicyProjectionRepository>,
+        /// The artifact's own event stream — where a `Rejected` row's
+        /// rejection axis actually lives. `MockArtifactRepository` clears
+        /// `Artifact::rejection_reason` on read exactly as Postgres's one
+        /// `row -> Artifact` mapper does, so an axis test seeds an
+        /// `ArtifactRejected` here and the use-case hydration recovers
+        /// it; setting the field on a fixture entity proves nothing.
+        events: Arc<MockEventStore>,
     }
 
     fn harness() -> Harness {
@@ -1853,6 +1918,8 @@ mod tests {
             storage: mocks.storage,
             refs: mocks.refs,
             metadata: mocks.artifact_metadata,
+            policy_projections: mocks.policy_projections,
+            events: mocks.events,
         }
     }
 
@@ -2443,6 +2510,7 @@ mod tests {
 
     #[test]
     fn quarantined_manifest_returns_503_with_retry_after() {
+        const WINDOW_SECS: i64 = 48 * 3600;
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
@@ -2463,6 +2531,18 @@ mod tests {
                 None,
                 QuarantineStatus::Quarantined,
             );
+            // The window this test asserts has to be seeded. The harness's
+            // permissive GLOBAL policy carries
+            // `quarantine_duration_secs = 0`, which resolves the computed
+            // deadline onto the row's anchor and clamps `Retry-After` to
+            // the useless `1`. A repo-scoped policy shadows the global for
+            // this repository only (`resolve_active_policy_for_repo`'s
+            // `repo_scoped.or(global)` precedence).
+            h.policy_projections
+                .insert(crate::test_authz::quarantining_policy_with_window(
+                    repo_id,
+                    WINDOW_SECS,
+                ));
             // Anonymous read of a held manifest. Route through an
             // RBAC-ENABLED context (not the admit-everything mock default)
             // so the anonymous caller genuinely lacks `Write` — otherwise
@@ -2496,16 +2576,18 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let retry_after = retry_after.expect("Retry-After header missing");
         let secs: i64 = retry_after.parse().unwrap();
-        // Issue #76: the harness wires no active scan policy, so
+        // The header reports the window the matched policy configures:
         // `ArtifactUseCase::hydrate_quarantine_deadline` resolves
-        // `anchor + DefaultPolicy::quarantine_duration_secs()` (24h) —
-        // a real, multi-hour observation window, not the pre-#76 bare-
-        // anchor clamp-to-1s. Allow a little slack for clock drift /
-        // test execution time between seeding and the response.
-        let default_secs = hort_domain::policy::DefaultPolicy::quarantine_duration_secs();
+        // `anchor + resolved-policy-duration`. The bound is what makes the
+        // assertion worth having — the two plausible wrong answers both
+        // sit outside it: the bare-anchor clamp-to-1s (what a
+        // `quarantine_duration_secs = 0` policy produces, and what this
+        // path answered before a real window was resolved) and the
+        // deadline-unknown 3600 fallback. Allow a little slack for clock
+        // drift / test execution time between seeding and the response.
         assert!(
-            (default_secs - 5..=default_secs).contains(&secs),
-            "Retry-After out of expected range: {secs} (expected close to {default_secs})"
+            (WINDOW_SECS - 5..=WINDOW_SECS).contains(&secs),
+            "Retry-After out of expected range: {secs} (expected close to {WINDOW_SECS})"
         );
         // Assert body shape so a regression to TOOMANYREQUESTS /
         // mis-aligned status+code pair would be caught.
@@ -2530,44 +2612,6 @@ mod tests {
     // use case and the header is exactly what the unit tests in
     // `quarantine.rs` cannot see.
 
-    /// Seed a repo-scoped `provenance_mode: Required` policy. Repo-scoped
-    /// shadows the harness's permissive global seed
-    /// (`resolve_active_policy_for_repo` precedence), so the global stays
-    /// in place for every other test in this file.
-    fn seed_required_policy(
-        projections: &hort_app::use_cases::test_support::MockPolicyProjectionRepository,
-        repo_id: Uuid,
-        quarantine_duration_secs: i64,
-    ) {
-        use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-            SeverityThreshold,
-        };
-        use hort_domain::events::PolicyScope;
-        let now = Utc::now();
-        projections.insert(ScanPolicyProjection {
-            policy_id: Uuid::new_v4(),
-            name: "required-provenance".to_string(),
-            scope: PolicyScope::Repository(repo_id),
-            severity_threshold: SeverityThreshold::Critical,
-            quarantine_duration_secs,
-            require_approval: false,
-            provenance_mode: ProvenanceMode::Required,
-            provenance_backends: vec!["cosign".to_string()],
-            provenance_identities: Vec::new(),
-            max_artifact_age_secs: None,
-            license_policy: serde_json::Value::Null,
-            archived: false,
-            scan_backends: vec!["trivy".to_string()],
-            rescan_interval_hours: 24,
-            negligible_action: NegligibleAction::Ignore,
-            enforcement: ScanEnforcement::Reject,
-            stream_version: 0,
-            created_at: now,
-            updated_at: now,
-        });
-    }
-
     /// Drive an anonymous read of an unsigned `Required` manifest whose
     /// anchor is `anchor_age_secs` old under a `window_secs` window, and
     /// return `(status, Retry-After)` for the requested verb.
@@ -2587,7 +2631,7 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             mocks.repositories.insert(repo);
-            seed_required_policy(&mocks.policy_projections, repo_id, window_secs);
+            seed_required_provenance_policy(&mocks.policy_projections, repo_id, window_secs);
             seed_manifest(
                 &mocks.artifacts,
                 &mocks.storage,
@@ -2684,7 +2728,9 @@ mod tests {
 
     // RBAC-enabled ctx builders + the capability-token principal shape
     // are shared with the blob suite via `crate::test_authz`.
-    use crate::test_authz::{pull_scoped_cap_principal, user_grant_ctx, write_grant_ctx};
+    use crate::test_authz::{
+        pull_scoped_cap_principal, seed_required_provenance_policy, user_grant_ctx, write_grant_ctx,
+    };
 
     /// A `CallerPrincipal` carrying exactly `claim`.
     fn principal_with_claim(claim: &str) -> CallerPrincipal {
@@ -3002,24 +3048,39 @@ mod tests {
         }
     }
 
-    /// Rejected stays terminal for the capability shape too: a
-    /// write-granted pull-scoped cap principal's GET of a `Rejected`
-    /// manifest is still hidden as 404 (`MANIFEST_UNKNOWN`).
-    #[test]
-    fn rejected_manifest_pull_scoped_cap_write_grant_still_hidden_as_404() {
-        use hort_domain::entities::rbac::Permission;
+    /// Seed a `Rejected` manifest and `GET` it, returning
+    /// `(status, body)`.
+    ///
+    /// `axis` seeds the artifact's **stream** with an `ArtifactRejected`
+    /// carrying that reason; `None` seeds an empty stream, which is the
+    /// ADR 0039 D6 illegal state. The fixture entity's
+    /// `rejection_reason` is never set — `MockArtifactRepository` clears
+    /// it on read exactly as `hort-adapters-postgres`'s one
+    /// `row -> Artifact` mapper does, so only `ArtifactUseCase`'s
+    /// hydration can put it back.
+    ///
+    /// `ctx_for` builds the context from the harness: the three callers
+    /// below are the RBAC-disabled default, a write-granted claims
+    /// principal, and a write-granted pull-scoped capability principal.
+    /// Each wraps its result in `with_provenance_hold_hydration` so the
+    /// axis is recovered for a production reason rather than left unset
+    /// for a harness one.
+    fn rejected_manifest_response(
+        axis: Option<RejectionReason>,
+        ctx_for: impl FnOnce(&Harness) -> Arc<AppContext>,
+        principal: Option<CallerPrincipal>,
+    ) -> (StatusCode, Vec<u8>) {
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
             use sha2::Digest;
             hex::encode(sha2::Sha256::digest(&content))
         };
-        let uid = Uuid::from_u128(0xCA11);
-        let status = run(async {
+        run(async move {
             let h = harness();
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            seed_manifest(
+            let (artifact_id, _) = seed_manifest(
                 &h.artifacts,
                 &h.storage,
                 &h.metadata,
@@ -3029,100 +3090,12 @@ mod tests {
                 None,
                 QuarantineStatus::Rejected,
             );
-            let ctx = user_grant_ctx(
-                &h.ctx,
-                h.repositories.clone(),
-                uid,
-                &[Permission::Read, Permission::Write],
+            h.events.set_stream(
+                &hort_domain::events::StreamId::artifact(artifact_id),
+                axis.map(|reason| vec![persisted_artifact_rejected(artifact_id, reason, 1)])
+                    .unwrap_or_default(),
             );
-            let principal = pull_scoped_cap_principal(uid);
-            serve(
-                ctx,
-                "myrepo",
-                "library/nginx",
-                &format!("sha256:{hex}"),
-                &HeaderMap::new(),
-                /* head = */ false,
-                Some(&principal),
-            )
-            .await
-            .status()
-        });
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "the hold exemption covers Quarantined only — Rejected stays hidden \
-             regardless of grants or cap shape"
-        );
-    }
-
-    #[test]
-    fn rejected_manifest_is_hidden_as_404() {
-        let content = br#"{"schemaVersion":2}"#.to_vec();
-        let hex = {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(&content))
-        };
-        let (status, body) = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            seed_manifest(
-                &h.artifacts,
-                &h.storage,
-                &h.metadata,
-                repo_id,
-                &hex,
-                &content,
-                None,
-                QuarantineStatus::Rejected,
-            );
-            let router = manifest_router(h.ctx);
-            let uri = format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}");
-            let resp = router
-                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            let status = resp.status();
-            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            (status, body)
-        });
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
-    }
-
-    /// Security scope guard, RBAC-enabled mirror of the test above: the
-    /// hold-read exemption is `Quarantined`-only, so even a WRITE-authorized
-    /// caller's GET of a `Rejected` manifest stays hidden as 404
-    /// (`MANIFEST_UNKNOWN`) — a Write grant never resurrects a rejected
-    /// manifest. Pins the property under the same `write_grant_ctx` harness
-    /// the Quarantined suite uses, not just the RBAC-disabled ctx.
-    #[test]
-    fn rejected_manifest_write_authorized_get_still_hidden_as_404() {
-        let content = br#"{"schemaVersion":2}"#.to_vec();
-        let hex = {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(&content))
-        };
-        let (status, body) = run(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            seed_manifest(
-                &h.artifacts,
-                &h.storage,
-                &h.metadata,
-                repo_id,
-                &hex,
-                &content,
-                None,
-                QuarantineStatus::Rejected,
-            );
-            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
-            let principal = principal_with_claim("ci-pusher");
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&ctx_for(&h));
             let resp = serve(
                 ctx,
                 "myrepo",
@@ -3130,21 +3103,228 @@ mod tests {
                 &format!("sha256:{hex}"),
                 &HeaderMap::new(),
                 /* head = */ false,
-                Some(&principal),
+                principal.as_ref(),
+            )
+            .await;
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        })
+    }
+
+    /// Rewritten from the concealment pin
+    /// (`rejected_manifest_pull_scoped_cap_write_grant_still_hidden_as_404`).
+    ///
+    /// Both halves of that pin now have to be stated, because only one of
+    /// them moved. **Resolvability is unchanged**: the ADR 0039 §10
+    /// hold-read exemption covers `Quarantined` and stops there, so a
+    /// write-granted pull-scoped capability principal gets no manifest
+    /// body out of a `Rejected` row — no grant and no cap shape
+    /// resurrects a rejected manifest. **Diagnosability is what changes**:
+    /// a caller holding granted `Write` certainly passes the read gate,
+    /// so the reason is owed to them exactly as to any other admitted
+    /// reader (ADR 0055's 2026-10-12 clarification). Hence `403 DENIED` +
+    /// axis rather than the old `404 MANIFEST_UNKNOWN`, and still not
+    /// `200`.
+    #[test]
+    fn rejected_manifest_pull_scoped_cap_write_grant_is_403_with_the_axis_never_the_body() {
+        use hort_domain::entities::rbac::Permission;
+        let uid = Uuid::from_u128(0xCA11);
+        let (status, body) = rejected_manifest_response(
+            Some(RejectionReason::Curator {
+                curator_id: Uuid::from_u128(0xC0FFEE),
+            }),
+            |h| {
+                user_grant_ctx(
+                    &h.ctx,
+                    h.repositories.clone(),
+                    uid,
+                    &[Permission::Read, Permission::Write],
+                )
+            },
+            Some(pull_scoped_cap_principal(uid)),
+        );
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a Rejected manifest is never served, whatever the grants or cap shape — \
+             but the caller is told why rather than told it does not exist"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "curator");
+        // The curator's identity is not published: the axis says a human
+        // decided, not which human.
+        let text = String::from_utf8(body).unwrap();
+        assert!(
+            !text.contains(&Uuid::from_u128(0xC0FFEE).to_string()),
+            "the curator uuid must never reach the wire: {text}"
+        );
+    }
+
+    /// Rewritten from the concealment pin
+    /// (`rejected_manifest_is_hidden_as_404`, which asserted the `404
+    /// MANIFEST_UNKNOWN` envelope byte-identical to "no such tag").
+    ///
+    /// What it pins now: an anonymous caller on a repository the read
+    /// gate admits — the case ADR 0055's clarification turns on, since a
+    /// public repository has no grant to hold — is told `403 DENIED` with
+    /// the axis and the reference. The reason reveals strictly less than
+    /// the manifest itself would have.
+    #[test]
+    fn rejected_manifest_is_403_denied_naming_the_axis_to_an_anonymous_reader() {
+        let (status, body) = rejected_manifest_response(
+            Some(RejectionReason::Provenance),
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["message"], "artifact is rejected");
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "provenance");
+        assert!(
+            parsed["errors"][0]["detail"]["subject"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:"),
+            "the subject echoes the client's own reference: {parsed}"
+        );
+    }
+
+    /// **Every** `RejectionReason` variant reaches the manifest refusal
+    /// as its own `wire_kind()` token, iterated off
+    /// [`RejectionReason::ALL_KIND_SAMPLES`] rather than a hand-written
+    /// list, and no body carries a uuid or a CVE identifier. The uuid
+    /// half is only meaningful because the corpus includes the two
+    /// payload-carrying variants (`Curator`, `CurationRetroactive`): a
+    /// body built from the payload rather than the discriminator would
+    /// leak there and nowhere else.
+    #[test]
+    fn every_rejection_reason_variant_reaches_the_manifest_refusal_as_its_wire_kind() {
+        assert_eq!(
+            RejectionReason::ALL_KIND_SAMPLES.len(),
+            7,
+            "the corpus is the vocabulary; a drop to zero would make this loop vacuous"
+        );
+        let uuid_shaped = regex::Regex::new(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        )
+        .unwrap();
+        for sample in RejectionReason::ALL_KIND_SAMPLES {
+            let (status, body) = rejected_manifest_response(
+                Some(sample.clone()),
+                |h| h.ctx.clone(),
+                /* anonymous */ None,
+            );
+            assert_eq!(status, StatusCode::FORBIDDEN, "{sample:?}");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                parsed["errors"][0]["detail"]["axis"],
+                sample.wire_kind(),
+                "axis for {sample:?} must be its wire_kind()"
+            );
+            let text = String::from_utf8(body).unwrap();
+            assert!(
+                !uuid_shaped.is_match(&text),
+                "refusal body for {sample:?} carries a uuid: {text}"
+            );
+            assert!(
+                !text.contains("CVE-"),
+                "refusal body for {sample:?} carries a CVE identifier: {text}"
+            );
+        }
+    }
+
+    /// ADR 0039 D6's illegal state on the manifest route: the projection
+    /// says `Rejected` and the stream carries no `ArtifactRejected`. The
+    /// caller is refused and told which reference, with no axis field and
+    /// no invented `unknown` token; the operator is told at `error`
+    /// level, because the status has no record behind it.
+    #[test]
+    fn rejected_manifest_with_no_axis_on_the_stream_is_403_with_no_axis_field() {
+        let (status, body) =
+            rejected_manifest_response(None, |h| h.ctx.clone(), /* anonymous */ None);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert!(
+            parsed["errors"][0]["detail"]["subject"].is_string(),
+            "the subject is owed regardless: {parsed}"
+        );
+        assert!(
+            parsed["errors"][0]["detail"].get("axis").is_none(),
+            "an unrecoverable axis emits no axis field: {parsed}"
+        );
+    }
+
+    /// The counterpart that makes the posture change worth anything: a
+    /// manifest that genuinely is not here still answers `404
+    /// MANIFEST_UNKNOWN`. Only asserting both proves the two cases are
+    /// now distinguishable, which is the defect — before this they were
+    /// byte-identical.
+    #[test]
+    fn a_genuinely_absent_manifest_still_answers_404_and_is_distinguishable() {
+        let (rejected_status, _) = rejected_manifest_response(
+            Some(RejectionReason::Scanner),
+            |h| h.ctx.clone(),
+            /* anonymous */ None,
+        );
+        let (absent_status, absent_body) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let resp = serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{}", "11".repeat(32)),
+                &HeaderMap::new(),
+                /* head = */ false,
+                /* anonymous */ None,
             )
             .await;
             let status = resp.status();
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             (status, body)
         });
+        assert_eq!(absent_status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_slice(&absent_body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
+        assert_ne!(
+            absent_status, rejected_status,
+            "a withheld manifest and an absent manifest must no longer share one answer"
+        );
+    }
+
+    /// Rewritten from the concealment pin
+    /// (`rejected_manifest_write_authorized_get_still_hidden_as_404`),
+    /// the RBAC-enabled claims-principal mirror of the capability case
+    /// above. Same two halves, and the same split: the ADR 0039 §10
+    /// hold-read exemption is `Quarantined`-only, so a `Write` grant
+    /// still buys no manifest body out of a `Rejected` row —
+    /// resolvability does not move. What the write-granted caller gains
+    /// is the diagnosis, owed to them because they certainly pass the
+    /// read gate, which is the only predicate the reason keys on.
+    #[test]
+    fn rejected_manifest_write_authorized_get_is_403_with_the_axis_never_the_body() {
+        let (status, body) = rejected_manifest_response(
+            Some(RejectionReason::ScanPolicyRetroactive),
+            |h| write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher"),
+            Some(principal_with_claim("ci-pusher")),
+        );
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "a write-authorized GET of a Rejected manifest must stay hidden — \
+            StatusCode::FORBIDDEN,
+            "a write-authorized GET of a Rejected manifest must still never serve it — \
              the hold-read exemption covers Quarantined only"
         );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_UNKNOWN");
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["axis"], "scan_policy_retroactive",
+            "a write-granted caller is told the axis too: {parsed}"
+        );
     }
 
     // ---------------- ScanIndeterminate (issue #92) ----------------

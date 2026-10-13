@@ -35,7 +35,9 @@
 //!    `manifests[*].digest` (child **manifest** references). Resolve
 //!    each referenced blob / child through
 //!    [`ArtifactRepository::find_by_checksum`]; enforce
-//!    `artifact.repository_id == repo` (cross-repo isolation).
+//!    `artifact.repository_id == repo` (cross-repo isolation) and that
+//!    the resolved row's quarantine status is not terminal (a row the
+//!    blob read would refuse is not a satisfied reference).
 //! 5. Build the manifest's content-reference claim set from the resolved
 //!    references — one [`ContentReferenceClaim`] per `oci_config` /
 //!    `oci_layer` / `oci_index_member` edge, plus the `oci_subject`
@@ -45,11 +47,14 @@
 //!    resolved, so an edge can never name a blob this repository does
 //!    not hold.
 //! 6. Ingest the manifest bytes, carrying the claim set.
-//! 7. Any missing blob / child now returns 400 `MANIFEST_BLOB_UNKNOWN`
-//!    with a `detail.blobs` array. Deliberately answered **after** the
-//!    mint: the manifest artifact stays committed so the client's
-//!    retry-after-pushing-blobs path is idempotent; the group is NOT
-//!    created, and the manifest carries no membership claims.
+//! 7. Any blob / child that does not resolve to a **deliverable**
+//!    same-repo row — absent, foreign-repo, or present but in a terminal
+//!    quarantine state — returns 400 `MANIFEST_BLOB_UNKNOWN` with a
+//!    `detail.blobs` array. Deliberately answered **after** the mint: the
+//!    manifest artifact stays committed so the client's
+//!    retry-after-pushing-blobs path is idempotent (a terminal reference
+//!    is the case no retry fixes); the group is NOT created, and the
+//!    manifest carries no membership claims.
 //! 8. Attach the primary `manifest` member to the group, plus (single-
 //!    image only) config + layers, via
 //!    [`ArtifactGroupUseCase::add_member`]. Shared per-request
@@ -756,12 +761,14 @@ struct ResolvedReferenceSet {
 /// Resolve each referenced blob / child manifest. Cross-repo isolation: a
 /// hash that exists in a foreign repo counts as missing — the blob must
 /// live in the same repo as the manifest (mount it across explicitly via
-/// `POST /v2/.../blobs/uploads/?mount=...&from=...`). For an index the
-/// children are resolved for **existence only** — a missing child is
-/// `MANIFEST_BLOB_UNKNOWN`, exactly like a missing layer (clients push the
-/// platform manifests before the index). A single-image manifest has a
-/// resolved `config`; an index carries none — the config is required only
-/// on the single-image path.
+/// `POST /v2/.../blobs/uploads/?mount=...&from=...`). A hash whose
+/// same-repo row is in a terminal state counts as missing too — see
+/// [`resolve_referenced_blobs`]. For an index the children are resolved
+/// for **existence only** — a missing child is `MANIFEST_BLOB_UNKNOWN`,
+/// exactly like a missing layer (clients push the platform manifests
+/// before the index). A single-image manifest has a resolved `config`; an
+/// index carries none — the config is required only on the single-image
+/// path.
 ///
 /// `Err` is reserved for the two failures that must abort before anything
 /// is minted: an infrastructure error from the lookup, and the defensive
@@ -788,15 +795,37 @@ async fn resolve_and_check_referenced_blobs(
             })?;
 
     if !missing.is_empty() {
-        // The manifest artifact stays committed so a client retry after
-        // pushing the missing blobs reconciles cleanly. We do NOT create
-        // the group on this path, and the mint carries no membership
-        // claims — an edge must never name a blob the repository lacks.
+        // The manifest artifact stays committed, and what that buys the
+        // client depends on WHY the reference did not resolve — the two
+        // cases this list folds together:
+        //
+        // - **No row for the digest.** A retry after pushing the blob
+        //   reconciles cleanly; that is the case this path was built for
+        //   and the common one (a client pushing out of order, or an
+        //   index landing ahead of its platform children).
+        // - **A row in a terminal state** (`Rejected` /
+        //   `ScanIndeterminate`). No retry can help: the row already
+        //   exists, so re-pushing those bytes deduplicates onto it and
+        //   leaves the status untouched. Leaving the hold needs a
+        //   deliberate act on the blob — admin override, curator waiver,
+        //   a re-scan — or different content.
+        //
+        // Both answer the same envelope on purpose. It is not an opaque
+        // one — `detail.blobs` names every unresolvable digest, so the
+        // publisher knows exactly which references to act on; what it
+        // does not say is which of the two causes applied, and that
+        // costs them nothing because their next move is the same for
+        // both (upload or cross-mount the blob, at which point a
+        // terminal row surfaces on its own). The cause is in the log
+        // line in `resolve_referenced_blobs`, which names the digest and
+        // the status. Either way we do NOT create the group on this path, and
+        // the mint carries no membership claims — an edge must never name
+        // a blob the repository cannot deliver.
         tracing::info!(
             manifest_digest = %manifest_digest,
             missing = ?missing,
-            "manifest referenced unknown blobs; group attachment and membership claims \
-             deferred until client retry"
+            "manifest referenced unresolvable blobs; group attachment and membership claims \
+             withheld (absent blobs reconcile on client retry; a terminal blob does not)"
         );
         return Ok(ResolvedReferences::Missing(missing));
     }
@@ -1279,13 +1308,17 @@ async fn put_manifest_dispatch_inner(
     let manifest_event_id = ingest_outcome.ingested_event_id;
     let manifest_digest = hashes.computed_hash.clone();
 
-    // The unknown-blob answer lands HERE — after the mint — and that is the
-    // unchanged contract, not an oversight: a manifest referencing blobs the
-    // client has not pushed yet stays committed so the retry-after-pushing
-    // path is idempotent. What the reorder above changed is only that such a
-    // manifest now also carries no membership claims, which is what the
-    // post-ingest insert loop this replaced already left behind on this path
-    // (its gate returned before the first insert).
+    // The unresolvable-reference answer lands HERE — after the mint — and
+    // that is the unchanged contract, not an oversight: a manifest
+    // referencing blobs the client has not pushed yet stays committed so the
+    // retry-after-pushing path is idempotent. For a reference that resolved
+    // to a TERMINAL row the mint is still committed but buys the client
+    // nothing — that blob's row already exists, so no re-push changes the
+    // answer (see `resolve_and_check_referenced_blobs` for both cases). What
+    // the reorder above changed is only that such a manifest now also
+    // carries no membership claims, which is what the post-ingest insert
+    // loop this replaced already left behind on this path (its gate returned
+    // before the first insert).
     let (config_artifact, layer_artifacts) = match resolved {
         ResolvedReferences::Complete(set) => (set.config_artifact, set.layer_artifacts),
         ResolvedReferences::Missing(blobs) => {
@@ -1759,6 +1792,27 @@ fn parse_blob_digest(raw: &str) -> Result<ContentHash, serde_json::Value> {
 /// target repo at the port boundary — the right row is the only
 /// candidate and there is no ordering hazard from cross-repo rows
 /// sharing the same SHA-256.
+///
+/// **A row is not enough: the row's status decides too.** A reference
+/// resolving to an artifact in a terminal state
+/// ([`QuarantineStatus::is_terminal`](hort_domain::entities::artifact::QuarantineStatus::is_terminal)
+/// — `Rejected` / `ScanIndeterminate`) counts as **not present** and joins
+/// `missing`, because the blob GET refuses that very row (404
+/// `BLOB_UNKNOWN` for `Rejected`, 503 for `ScanIndeterminate` —
+/// `blobs.rs`, the exhaustive status match). Accepting the manifest over
+/// it is how a push reports success and the subsequent pull answers `not
+/// found` on a layer. The status arrives with the row
+/// `find_in_repo_by_hash` already returns, so this costs no extra port
+/// call and no extra I/O.
+///
+/// `Quarantined` still resolves as present — including a hold with no
+/// self-resolving deadline. Hort quarantines at ingest and the manifest
+/// PUT follows seconds later, so a hold-sensitive check would refuse
+/// essentially every push; and under `provenance_mode: required` the
+/// subject is held until its signature arrives, which ADR 0039 §10
+/// exists to let the signer read and sign. Hence the status-only
+/// predicate: see its rustdoc for why widening it to the hydrated
+/// `provenance_hold_indefinite` flag would break sign-after-push.
 async fn resolve_referenced_blobs(
     ctx: &AppContext,
     repo: Uuid,
@@ -1781,6 +1835,35 @@ async fn resolve_referenced_blobs(
             }
         };
         match hit {
+            // A row in a terminal state is not a satisfied reference:
+            // the blob GET refuses this exact row, so admitting it here
+            // mints a manifest the registry cannot deliver. It joins the
+            // same `missing` list as an absent row — one code path, one
+            // `MANIFEST_BLOB_UNKNOWN` envelope, and the client is not
+            // told which of the two the reference was.
+            //
+            // Folding the two together is sound here on its own terms,
+            // and does not depend on how the blob GET answers. The caller
+            // on this path is a **publisher**, and
+            // `MANIFEST_BLOB_UNKNOWN`'s `detail.blobs` already names the
+            // offending digest — so nobody is left searching, which is
+            // the harm a collapsed answer would otherwise do. Their next
+            // action is the same for both causes: upload or cross-mount
+            // that blob, and if it is terminally blocked the upload is
+            // what surfaces that. The diagnosis of WHICH cause is this
+            // log line, which is why it carries the digest AND the
+            // status: without the status an operator has to compare
+            // event timestamps to learn why the push was refused.
+            Some(a) if a.quarantine_status.is_terminal() => {
+                tracing::warn!(
+                    digest = %r.digest_raw,
+                    status = %a.quarantine_status,
+                    role = ?r.role,
+                    "manifest references a terminally-blocked artifact; counted as missing \
+                     (the blob read would refuse this row)"
+                );
+                missing.push(r.digest_raw.clone());
+            }
             // The use case already enforces `repository_id == repo`
             // at the port boundary; no post-filter needed. Clients
             // cross-mount explicitly via
@@ -2024,21 +2107,19 @@ fn created_manifest_response(
 mod tests {
     use super::*;
 
-    use std::sync::Mutex;
-
     use axum::body::to_bytes;
     use axum::http::Request as HttpRequest;
     use chrono::Utc;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use tower::ServiceExt;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::Registry;
+
+    use crate::test_tracing::{capture_tracing, events_at};
 
     use hort_app::use_cases::test_support::{
         sample_artifact, sample_repository, GroupCommitInjection, MockArtifactGroupLifecyclePort,
         MockArtifactGroupRepository, MockArtifactLifecycle, MockArtifactRepository,
-        MockContentReferenceIndex, MockEventStore, MockRefLifecyclePort, MockRefRegistryPort,
-        MockRepositoryRepository, MockStoragePort,
+        MockContentReferenceIndex, MockEventStore, MockPolicyProjectionRepository,
+        MockRefLifecyclePort, MockRefRegistryPort, MockRepositoryRepository, MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::artifact_group::ArtifactGroup;
@@ -2066,6 +2147,9 @@ mod tests {
         artifact_groups: Arc<MockArtifactGroupRepository>,
         group_lifecycle: Arc<MockArtifactGroupLifecyclePort>,
         content_references: Arc<MockContentReferenceIndex>,
+        // Only the provenance-hold fixture seeds a policy; every other
+        // test runs on the harness's permissive global seed.
+        policy_projections: Arc<MockPolicyProjectionRepository>,
         // Observe which ingest path ran via `lifecycle.scan_enqueues()`:
         // a normal / mixed / non-bundle manifest routes via `ingest_verified`,
         // which enqueues a scan ATOMICALLY with the transition (the seeded
@@ -2090,6 +2174,7 @@ mod tests {
             artifact_groups: mocks.artifact_groups,
             group_lifecycle: mocks.artifact_group_lifecycle,
             content_references: mocks.content_references,
+            policy_projections: mocks.policy_projections,
             lifecycle: mocks.lifecycle,
             events: mocks.events,
         }
@@ -2147,13 +2232,58 @@ mod tests {
         repo_id: Uuid,
         content: &[u8],
     ) -> ContentHash {
+        seed_blob_with_status(artifacts, storage, repo_id, content, QuarantineStatus::None)
+    }
+
+    /// [`seed_blob`] with an explicit quarantine status, for the
+    /// reference-resolution cases that turn on the row's state rather
+    /// than its existence.
+    fn seed_blob_with_status(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        content: &[u8],
+        status: QuarantineStatus,
+    ) -> ContentHash {
         let hex = hex::encode(Sha256::digest(content));
         let hash: ContentHash = hex.parse().unwrap();
-        let mut a = sample_artifact(QuarantineStatus::None);
+        let mut a = sample_artifact(status);
         a.repository_id = repo_id;
         a.path = format!("blobs/sha256:{hex}");
         a.sha256_checksum = hash.clone();
         a.size_bytes = content.len() as i64;
+        artifacts.insert(a);
+        storage.insert_content(hash.clone(), content.to_vec());
+        hash
+    }
+
+    /// Seed a blob in the `provenance_mode: required` hold-until-signed
+    /// shape (ADR 0039 D4): `Quarantined`, with the observation-window
+    /// **anchor** aged well past any window the caller's policy sets.
+    ///
+    /// The transient pair is NOT stamped here, deliberately: the schema
+    /// stores only the anchor and
+    /// `ArtifactUseCase::hydrate_quarantine_deadline` recomputes
+    /// `quarantine_deadline` / `provenance_hold_indefinite` on every
+    /// read, so a stamped value would be overwritten and reading it back
+    /// would prove nothing. What makes the hold indefinite is this aged
+    /// anchor plus a `Required` policy plus no `ProvenanceVerified` on
+    /// the artifact's stream — see
+    /// `put_with_indefinitely_held_layer_still_succeeds`.
+    fn seed_indefinitely_held_blob(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        content: &[u8],
+    ) -> ContentHash {
+        let hex = hex::encode(Sha256::digest(content));
+        let hash: ContentHash = hex.parse().unwrap();
+        let mut a = sample_artifact(QuarantineStatus::Quarantined);
+        a.repository_id = repo_id;
+        a.path = format!("blobs/sha256:{hex}");
+        a.sha256_checksum = hash.clone();
+        a.size_bytes = content.len() as i64;
+        a.quarantine_window_start = Some(Utc::now() - chrono::Duration::seconds(3600));
         artifacts.insert(a);
         storage.insert_content(hash.clone(), content.to_vec());
         hash
@@ -2592,86 +2722,6 @@ mod tests {
     // from `add_member` is logged at `error!` with rich context, not
     // silently folded into an unlogged 500.
 
-    /// Custom tracing layer that captures emitted events into a shared
-    /// vector. Mirrors the identical pattern in
-    /// `crates/hort-http-pypi/src/upstream_pull.rs` (and the cargo / npm
-    /// siblings) — see that module for the detailed rationale on
-    /// `Interest::sometimes()`, per-callsite caching, and the
-    /// global-passthrough seeding.
-    #[derive(Clone, Default)]
-    struct CapturingLayer {
-        records: Arc<Mutex<Vec<(tracing::Level, String)>>>,
-    }
-
-    impl<S> tracing_subscriber::Layer<S> for CapturingLayer
-    where
-        S: tracing::Subscriber,
-    {
-        fn register_callsite(
-            &self,
-            _meta: &'static tracing::Metadata<'static>,
-        ) -> tracing::subscriber::Interest {
-            tracing::subscriber::Interest::sometimes()
-        }
-
-        fn enabled(
-            &self,
-            _meta: &tracing::Metadata<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) -> bool {
-            true
-        }
-
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut visitor = MessageVisitor::default();
-            event.record(&mut visitor);
-            self.records
-                .lock()
-                .unwrap()
-                .push((*event.metadata().level(), visitor.combined));
-        }
-    }
-
-    #[derive(Default)]
-    struct MessageVisitor {
-        combined: String,
-    }
-    impl tracing::field::Visit for MessageVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.combined
-                .push_str(&format!("{}={:?} ", field.name(), value));
-        }
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.combined
-                .push_str(&format!("{}={} ", field.name(), value));
-        }
-    }
-
-    /// Serialises tests that install per-thread tracing subscribers.
-    /// `tracing` caches per-callsite `Interest` globally; installing one
-    /// subscriber on thread A while thread B fires the same callsite
-    /// races. The mutex eliminates the race without touching global state.
-    static TRACING_TEST_MUTEX: Mutex<()> = Mutex::new(());
-
-    /// Install a global passthrough subscriber (once per process) so the
-    /// per-callsite cache is seeded with `Interest::sometimes()` rather
-    /// than `Never`. Without this, a no-op subscriber installed by any
-    /// earlier test can cache `Never` for our callsites and prevent the
-    /// per-thread `set_default` subscriber from ever seeing those events.
-    fn install_global_passthrough_subscriber() {
-        use std::sync::OnceLock;
-        static INSTALLED: OnceLock<()> = OnceLock::new();
-        INSTALLED.get_or_init(|| {
-            let global_layer = CapturingLayer::default();
-            let global_subscriber = Registry::default().with(global_layer);
-            let _ = tracing::subscriber::set_global_default(global_subscriber);
-        });
-    }
-
     /// #73 step 1 acceptance: a genuine (non-idempotent) `Conflict` from
     /// `add_member`'s manifest-attach call is logged at `error!` with
     /// the manifest digest, repo key, stage, and the full `DomainError`
@@ -2681,46 +2731,37 @@ mod tests {
     /// changed is that the failure is now legible from the logs.
     #[test]
     fn divergent_add_member_conflict_is_logged_at_error_not_swallowed() {
-        install_global_passthrough_subscriber();
-        let _serial = TRACING_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let layer = CapturingLayer::default();
-        let captured = layer.records.clone();
-        let subscriber = Registry::default().with(layer);
-        let _guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let status = rt.block_on(async {
-            let h = harness();
-            let repo = oci_repo("myrepo");
-            let repo_id = repo.id;
-            h.repositories.insert(repo);
-            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
-            let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
-            let body = build_manifest_json(&config_hash, &[layer_hash]);
-
-            // Force the FIRST add_member call (the "manifest" primary
-            // attach) to observe a genuine divergence — mirrors the
-            // real `commit_member_added` "primary role mismatch" /
-            // "already belongs with a different role" Conflict shapes,
-            // neither of which is idempotent-collapsible (see the
-            // `group_attach_manifest` call site's own comment).
-            h.group_lifecycle.inject(GroupCommitInjection::Conflict {
-                reason: "primary role mismatch: existing `config`, requested `manifest`".into(),
-            });
-
-            let router = router().with_state(h.ctx.clone());
-            let resp = router
-                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
-                .await
+        let (status, records) = capture_tracing(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .unwrap();
-            resp.status()
+            rt.block_on(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+                let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+                let body = build_manifest_json(&config_hash, &[layer_hash]);
+
+                // Force the FIRST add_member call (the "manifest" primary
+                // attach) to observe a genuine divergence — mirrors the
+                // real `commit_member_added` "primary role mismatch" /
+                // "already belongs with a different role" Conflict shapes,
+                // neither of which is idempotent-collapsible (see the
+                // `group_attach_manifest` call site's own comment).
+                h.group_lifecycle.inject(GroupCommitInjection::Conflict {
+                    reason: "primary role mismatch: existing `config`, requested `manifest`".into(),
+                });
+
+                let router = router().with_state(h.ctx.clone());
+                let resp = router
+                    .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                    .await
+                    .unwrap();
+                resp.status()
+            })
         });
 
         assert_eq!(
@@ -2729,23 +2770,21 @@ mod tests {
             "no wire-behaviour change: a genuine Conflict is still a 500"
         );
 
-        let records = captured.lock().unwrap();
-        let error_event = records
+        let errors = events_at(
+            &records,
+            tracing::Level::ERROR,
+            "hort_http_oci::manifests_write",
+        );
+        let error_event = errors
             .iter()
-            .find(|(lvl, msg)| {
-                *lvl == tracing::Level::ERROR
-                    && msg.contains("group-attach failed")
-                    && msg.contains("genuine error")
+            .find(|e| {
+                e.fields.contains("group-attach failed") && e.fields.contains("genuine error")
             })
-            .map(|(_, msg)| msg.clone());
+            .map(|e| e.fields.clone());
         assert!(
             error_event.is_some(),
             "expected an ERROR-level log naming the group-attach failure as genuine; \
-             captured records: {:?}",
-            records
-                .iter()
-                .map(|(l, m)| format!("{l:?}: {m}"))
-                .collect::<Vec<_>>()
+             captured records: {records:?}"
         );
         let msg = error_event.unwrap();
         assert!(
@@ -2760,9 +2799,13 @@ mod tests {
         // failure — confirms the old silent-warn path is gone, not just
         // supplemented.
         assert!(
-            !records.iter().any(
-                |(lvl, msg)| *lvl == tracing::Level::WARN && msg.contains("partial attachment")
-            ),
+            !events_at(
+                &records,
+                tracing::Level::WARN,
+                "hort_http_oci::manifests_write"
+            )
+            .iter()
+            .any(|e| e.fields.contains("partial attachment")),
             "the old warn!-level 'partial attachment' message must be fully replaced, not \
              merely supplemented"
         );
@@ -3901,6 +3944,376 @@ mod tests {
             StatusCode::CREATED,
             "manifest PUT must succeed when its blobs are present in the target repo, \
              regardless of foreign-repo rows sharing the same SHA-256: body = {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    // -------------------- PUT — terminal reference --------------------
+    //
+    // A referenced blob / child whose same-repo row exists but is in a
+    // terminal quarantine state (`Rejected` / `ScanIndeterminate`) is not
+    // a satisfied reference: the blob GET refuses that exact row (404
+    // `BLOB_UNKNOWN` / 503), so accepting the manifest is how a push
+    // reports success and the pull then answers `not found` on a layer.
+    // Such a reference joins the same `missing` list an absent row does —
+    // one envelope, same opacity, same post-mint answer.
+
+    /// Which reference of the pushed document carries the seeded status.
+    #[derive(Clone, Copy, Debug)]
+    enum SeededRole {
+        Config,
+        Layer,
+        IndexChild,
+    }
+
+    /// Outcome of a push whose `role` reference resolves to a row in the
+    /// seeded status: the response status + body, the number of group
+    /// commits, and whether the pushed document itself was committed.
+    struct PushOutcome {
+        status: StatusCode,
+        body: Vec<u8>,
+        group_calls: usize,
+        document_committed: bool,
+    }
+
+    /// Push a document one of whose references resolves to an existing
+    /// same-repo row in `status`. Every other reference is seeded
+    /// `QuarantineStatus::None` (plainly deliverable), so the only thing
+    /// under test is the seeded row's state.
+    fn push_with_referenced_status(role: SeededRole, status: QuarantineStatus) -> PushOutcome {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+
+            let (body, content_type) = match role {
+                SeededRole::Config => {
+                    let config = seed_blob_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        b"config-bytes",
+                        status,
+                    );
+                    let layer = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
+                    (
+                        build_manifest_json(&config, &[layer]),
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                }
+                SeededRole::Layer => {
+                    let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+                    let layer = seed_blob_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        b"layer-bytes",
+                        status,
+                    );
+                    (
+                        build_manifest_json(&config, &[layer]),
+                        "application/vnd.oci.image.manifest.v1+json",
+                    )
+                }
+                SeededRole::IndexChild => {
+                    let present = seed_blob(&h.artifacts, &h.storage, repo_id, b"present-child");
+                    let seeded = seed_blob_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        b"seeded-child",
+                        status,
+                    );
+                    (
+                        build_index_json(
+                            &[present, seeded],
+                            "application/vnd.oci.image.index.v1+json",
+                        ),
+                        "application/vnd.oci.image.index.v1+json",
+                    )
+                }
+            };
+            let document_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router
+                .oneshot(put_index_request(uri, body, content_type))
+                .await
+                .unwrap();
+            let status_code = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let document_committed = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{document_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            PushOutcome {
+                status: status_code,
+                body,
+                group_calls: h.group_lifecycle.commit_call_count(),
+                document_committed,
+            }
+        })
+    }
+
+    /// The whole refusal shape for a terminal reference: 400
+    /// `MANIFEST_BLOB_UNKNOWN`, exactly one digest echoed in
+    /// `detail.blobs`, no "why" anywhere in the envelope (the client is
+    /// never told the reference was terminal — the diagnosis is the
+    /// server-side log line), the document still committed, and no group.
+    fn assert_terminal_reference_refusal(out: &PushOutcome, case: &str) {
+        assert_eq!(
+            out.status,
+            StatusCode::BAD_REQUEST,
+            "{case}: a terminal reference must refuse the push: body = {}",
+            String::from_utf8_lossy(&out.body)
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(
+            parsed["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN",
+            "{case}: must reuse the existing missing-reference envelope"
+        );
+        let blobs = parsed["errors"][0]["detail"]["blobs"].as_array().unwrap();
+        assert_eq!(
+            blobs.len(),
+            1,
+            "{case}: exactly the one unresolvable reference is echoed"
+        );
+        assert!(
+            blobs[0].as_str().unwrap().starts_with("sha256:"),
+            "{case}: blobs detail must echo the raw sha256:<hex> shape"
+        );
+        let wire = String::from_utf8_lossy(&out.body).to_lowercase();
+        for leak in ["reject", "indeterminate", "quarantin", "terminal"] {
+            assert!(
+                !wire.contains(leak),
+                "{case}: the envelope must not disclose WHY the reference failed \
+                 (found {leak:?} in {wire})"
+            );
+        }
+        assert!(
+            out.document_committed,
+            "{case}: the post-mint answer is unchanged — the document stays committed"
+        );
+        assert_eq!(
+            out.group_calls, 0,
+            "{case}: no group attachment on the unresolvable-reference path"
+        );
+    }
+
+    #[test]
+    fn put_with_rejected_layer_returns_400_manifest_blob_unknown() {
+        let out = push_with_referenced_status(SeededRole::Layer, QuarantineStatus::Rejected);
+        assert_terminal_reference_refusal(&out, "rejected layer");
+    }
+
+    #[test]
+    fn put_with_scan_indeterminate_layer_returns_400_manifest_blob_unknown() {
+        let out =
+            push_with_referenced_status(SeededRole::Layer, QuarantineStatus::ScanIndeterminate);
+        assert_terminal_reference_refusal(&out, "scan-indeterminate layer");
+    }
+
+    /// The config blob is caught too, not only a layer — it is resolved
+    /// through the same loop and the pull reads it through the same blob
+    /// handler.
+    #[test]
+    fn put_with_rejected_config_returns_400_manifest_blob_unknown() {
+        let out = push_with_referenced_status(SeededRole::Config, QuarantineStatus::Rejected);
+        assert_terminal_reference_refusal(&out, "rejected config");
+    }
+
+    #[test]
+    fn put_with_scan_indeterminate_config_returns_400_manifest_blob_unknown() {
+        let out =
+            push_with_referenced_status(SeededRole::Config, QuarantineStatus::ScanIndeterminate);
+        assert_terminal_reference_refusal(&out, "scan-indeterminate config");
+    }
+
+    /// An index child is caught too. It is resolved for existence only
+    /// (never attached as a group member), which is exactly why the
+    /// status read has to happen in the resolution loop rather than in
+    /// the attachment step.
+    #[test]
+    fn put_image_index_with_rejected_child_returns_400_manifest_blob_unknown() {
+        let out = push_with_referenced_status(SeededRole::IndexChild, QuarantineStatus::Rejected);
+        assert_terminal_reference_refusal(&out, "rejected index child");
+    }
+
+    #[test]
+    fn put_image_index_with_scan_indeterminate_child_returns_400_manifest_blob_unknown() {
+        let out = push_with_referenced_status(
+            SeededRole::IndexChild,
+            QuarantineStatus::ScanIndeterminate,
+        );
+        assert_terminal_reference_refusal(&out, "scan-indeterminate index child");
+    }
+
+    /// `Quarantined` is NOT terminal and must keep resolving as present.
+    /// Hort quarantines at ingest and the manifest PUT follows seconds
+    /// later, so a hold-sensitive reference check would refuse
+    /// essentially every push.
+    #[test]
+    fn put_with_quarantined_layer_still_succeeds() {
+        for role in [SeededRole::Layer, SeededRole::Config] {
+            let out = push_with_referenced_status(role, QuarantineStatus::Quarantined);
+            assert_eq!(
+                out.status,
+                StatusCode::CREATED,
+                "a held ({role:?}) reference is an outstanding evaluation, not a verdict: \
+                 body = {}",
+                String::from_utf8_lossy(&out.body)
+            );
+        }
+    }
+
+    /// Item 7's named case: **absence is not a hold.** A referenced blob
+    /// with no catalog row at all is "not local yet" — the ordinary state
+    /// of a cold pull-through reference — and must keep answering exactly
+    /// as it did before the status read existed: 400
+    /// `MANIFEST_BLOB_UNKNOWN`, the document committed so the retry after
+    /// pushing the blob reconciles, no group. This is the one place where
+    /// the fail-closed reflex gives the wrong answer; folding absence into
+    /// the terminal arm would break every cold pull-through.
+    #[test]
+    fn a_referenced_blob_with_no_row_is_not_local_yet_not_terminal() {
+        let (status, body, group_calls, manifest_committed, row_absent) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            // Never seeded in ANY state — no row, so there is no status
+            // for the terminality predicate to read.
+            let absent_hex = hex::encode(Sha256::digest(b"never-pushed-layer"));
+            let absent: ContentHash = absent_hex.parse().unwrap();
+            let body = build_manifest_json(&config, std::slice::from_ref(&absent));
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            let router = router().with_state(h.ctx.clone());
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+            let status = resp.status();
+            let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let manifest_committed = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .await
+                .unwrap()
+                .is_some();
+            let row_absent = h
+                .artifacts
+                .find_by_repo_and_checksum(repo_id, &absent)
+                .await
+                .unwrap()
+                .is_none();
+            (
+                status,
+                rbody,
+                h.group_lifecycle.commit_call_count(),
+                manifest_committed,
+                row_absent,
+            )
+        });
+        assert!(
+            row_absent,
+            "fixture integrity: the reference under test must have no catalog row"
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["blobs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            manifest_committed,
+            "an absent reference is the retry case: the manifest must stay committed so the \
+             client's push-the-blob-then-retry path reconciles"
+        );
+        assert_eq!(group_calls, 0);
+    }
+
+    /// A layer held with **no self-resolving deadline** — the
+    /// `provenance_mode: required` hold-until-signed state (ADR 0039 D4)
+    /// — still pushes.
+    ///
+    /// This is the regression the status-only predicate exists to
+    /// prevent. ADR 0039 §10 exists so a held subject can be read and
+    /// signed; a client re-pushing that manifest after the observation
+    /// window elapsed would be refused if the reference check keyed on
+    /// `provenance_hold_indefinite`, which breaks sign-after-push. Widen
+    /// `QuarantineStatus::is_terminal`'s call site to consult that
+    /// hydrated flag and this test goes red — that inversion is what it
+    /// is here to catch.
+    ///
+    /// The hold is built through the real read path, not stamped on the
+    /// row: `hydrate_quarantine_deadline` recomputes the transient pair
+    /// on every read, so the fixture needs a `Required` policy, an anchor
+    /// already past the window, no `ProvenanceVerified` on the stream,
+    /// and the opt-in hydration wiring.
+    #[test]
+    fn put_with_indefinitely_held_layer_still_succeeds() {
+        let (status, body, hold_indefinite) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            crate::test_authz::seed_required_provenance_policy(
+                &h.policy_projections,
+                repo_id,
+                /* window */ 1,
+            );
+
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let layer = seed_indefinitely_held_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                b"held-until-signed-layer",
+            );
+            let body = build_manifest_json(&config, std::slice::from_ref(&layer));
+
+            // Opt the read-path hydration into the real policy +
+            // clearance resolution, so the layer the handler resolves
+            // genuinely carries `provenance_hold_indefinite = true`
+            // rather than the mapper's `false` default.
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            // Fixture integrity: assert the flag the predicate must NOT
+            // consult is actually set on the row the handler will see. A
+            // harness that quietly hydrates `false` would make this test
+            // pass for the wrong reason.
+            let hold_indefinite = ctx
+                .artifact_use_case
+                .find_in_repo_by_hash(repo_id, &layer)
+                .await
+                .unwrap()
+                .expect("seeded layer")
+                .provenance_hold_indefinite;
+
+            let router = router().with_state(ctx);
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+            let status = resp.status();
+            let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, rbody, hold_indefinite)
+        });
+        assert!(
+            hold_indefinite,
+            "fixture integrity: the layer must hydrate as an indefinite provenance hold, \
+             otherwise this test cannot catch a predicate that consults the flag"
+        );
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a hold with no self-resolving deadline is still an outstanding evaluation; \
+             refusing it here breaks ADR 0039 §10 sign-after-push: body = {}",
             String::from_utf8_lossy(&body)
         );
     }

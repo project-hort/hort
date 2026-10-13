@@ -13,9 +13,12 @@
 //!   applies only to wheels (PEP 658 §"Specification").
 //! - **wheel path with hosted/staging/virtual repo** → delegate to
 //!   [`WheelMetadataUseCase::serve`]. Returns 200 + bytes +
-//!   `Content-Digest` on success; 404 on Rejected /
-//!   ScanIndeterminate / un-backfilled / invisible / missing
-//!   (anti-enumeration); 503 + `Retry-After` on Quarantined.
+//!   `Content-Digest` on success; 404 on un-backfilled / invisible /
+//!   missing (anti-enumeration); and, for a non-servable parent wheel,
+//!   whatever
+//!   [`hort_http_core::artifact_gate::non_servable_response`] answers —
+//!   the same function the wheel-download route answers through, so the
+//!   two cannot diverge for a status.
 //! - **wheel path with proxy repo** → strategy-2 dispatch:
 //!   1. Call [`WheelMetadataUseCase::serve`] (the hosted path). On
 //!      success — wheel was already in CAS AND the `wheel_metadata`
@@ -93,20 +96,20 @@
 
 use std::sync::Arc;
 
-use axum::body::Body;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use chrono::Utc;
 
 use hort_app::error::AppError;
 use hort_app::use_cases::wheel_metadata_use_case::{MetadataBlob, WheelMetadataServeOutcome};
+use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::RepositoryType;
 use hort_domain::error::DomainError;
 use hort_domain::types::ContentHash;
+use hort_http_core::artifact_gate::non_servable_response;
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
@@ -206,12 +209,7 @@ pub(crate) async fn serve_pep658_metadata(
         .await
         .map_err(ApiError::from)?;
 
-    match outcome {
-        WheelMetadataServeOutcome::Available(blob) => Ok(build_metadata_response(blob)),
-        WheelMetadataServeOutcome::Quarantined {
-            quarantine_deadline,
-        } => Ok(build_quarantined_response(quarantine_deadline)),
-    }
+    Ok(render_outcome(outcome))
 }
 
 /// Strategy-2 proxy cache-miss dispatch for the PEP 658 `.metadata`
@@ -222,10 +220,12 @@ pub(crate) async fn serve_pep658_metadata(
 /// 1. Try the hosted-style serve via [`WheelMetadataUseCase::serve`].
 ///    Cache hit (wheel in CAS + ContentReference present, ingest hook
 ///    ran during a previous pull-through) → render the response and return.
-/// 2. On `NotFound { entity: "Artifact" }`, disambiguate "wheel not
-///    in CAS" (real cache miss) vs "wheel in CAS but no
-///    ContentReference row" (legacy wheel or the ingest hook
-///    saw `extract_wheel_metadata_bytes` return `None`):
+/// 2. On `NotFound { entity: "Artifact" }` — which a non-servable
+///    parent wheel no longer produces, so the two remaining causes are
+///    the ones below — disambiguate "wheel not in CAS" (real cache
+///    miss) vs "wheel in CAS but no ContentReference row" (legacy wheel
+///    or the ingest hook saw `extract_wheel_metadata_bytes` return
+///    `None`):
 ///    - `find_visible_by_path` returns `Ok(artifact)` → 404, do NOT
 ///      pull. Operator runs the backfill task.
 ///    - `find_visible_by_path` returns `NotFound { entity:
@@ -275,14 +275,13 @@ async fn serve_proxy_with_pull_fallback(
         .await
     {
         Ok((_repo, _artifact)) => {
-            // Wheel IS in CAS — the missing-ContentReference branch.
-            // Quarantined / Rejected / ScanIndeterminate also fall
-            // here (the use case maps them onto NotFound), and the
-            // first-attempt outcome for Quarantined would already
-            // have been `Quarantined` — so by elimination this arm
-            // is the legacy-no-metadata-row case (or Rejected /
-            // ScanIndeterminate which we collapse to 404 anyway per
-            // all collapse to 404).
+            // Wheel IS in CAS, and it is servable: a non-servable status
+            // never reaches here, because the first attempt answered it
+            // as `NonServable` rather than as an `Artifact` `NotFound`.
+            // So this arm is the one remaining way a servable wheel has
+            // no metadata to give — no `wheel_metadata` ContentReference
+            // row — and it is a 404 on its own merits rather than by
+            // elimination: "no such metadata", not a withheld verdict.
             tracing::debug!(
                 "proxy .metadata 404 — wheel in CAS but no wheel_metadata row \
                  (legacy ingest or extract returned None); \
@@ -406,16 +405,52 @@ async fn serve_virtual_pep658_metadata(
 }
 
 /// Render a [`WheelMetadataServeOutcome`] into a wire response. Shared
-/// between the hosted-path serve and the strategy-2 proxy re-serve so
-/// the `Content-Digest` / `Content-Length` / `Retry-After` discipline
-/// stays identical between the two.
+/// by the hosted-path serve, the strategy-2 proxy re-serve and the
+/// virtual member serve, so the `Content-Digest` / `Content-Length`
+/// discipline — and the refusal a non-servable parent wheel gets — stay
+/// identical across all three.
+///
+/// The refusal is not built here. [`non_servable_response`] is the one
+/// definition the wheel-download route answers through
+/// (`crate::render_pypi_file_response`), and `.metadata` answering
+/// through the same function is what makes "a wheel's metadata answers
+/// whatever the wheel answers" a property of the code rather than of two
+/// transcriptions agreeing. It is also why this file holds no
+/// `Retry-After` arithmetic: ADR 0039 D5 (a hold with no self-resolving
+/// deadline advertises no deadline) lives in that function, and the copy
+/// that used to live here never had it.
 fn render_outcome(outcome: WheelMetadataServeOutcome) -> Response {
     match outcome {
         WheelMetadataServeOutcome::Available(blob) => build_metadata_response(blob),
-        WheelMetadataServeOutcome::Quarantined {
-            quarantine_deadline,
-        } => build_quarantined_response(quarantine_deadline),
+        WheelMetadataServeOutcome::NonServable(artifact) => non_servable_response(&artifact)
+            .unwrap_or_else(|| withheld_without_a_refusal(&artifact)),
     }
+}
+
+/// The answer for a wheel the use case withheld but the shared status
+/// gate would serve.
+///
+/// Unreachable as the two stand: the use case yields `NonServable` for
+/// exactly the three statuses [`non_servable_response`] answers, and both
+/// matches are exhaustive over `QuarantineStatus` with no wildcard arm,
+/// so a status added tomorrow is a compile error in both rather than a
+/// fall-through here. If they ever disagree there are no bytes in hand
+/// either way, so the client gets the answer this route already gives
+/// when it holds none — and the operator gets the line, because a
+/// withholding whose refusal cannot be built is a defect in this file
+/// and not a verdict about the wheel.
+fn withheld_without_a_refusal(artifact: &Artifact) -> Response {
+    tracing::error!(
+        artifact_id = %artifact.id,
+        status = %artifact.quarantine_status,
+        "wheel_metadata withheld a wheel the shared status gate serves; \
+         answering no-such-metadata"
+    );
+    ApiError::from(AppError::Domain(DomainError::NotFound {
+        entity: "Artifact",
+        id: format!("{}.metadata", artifact.path),
+    }))
+    .into_response()
 }
 
 /// Build the 200 response from a [`MetadataBlob`]. Mirrors the
@@ -438,25 +473,6 @@ fn build_metadata_response(blob: MetadataBlob) -> Response {
         )
         .body(body)
         .expect("static-shape headers + streamed body always builds")
-}
-
-/// Build the 503 response for a quarantined parent wheel. Mirrors the
-/// wheel-download handler's `Retry-After` shape exactly — including
-/// the fall-back to a 1-hour string when no deadline is hydrated.
-fn build_quarantined_response(quarantine_deadline: Option<chrono::DateTime<Utc>>) -> Response {
-    let retry_after = quarantine_deadline
-        .map(|deadline| {
-            let secs = (deadline - Utc::now()).num_seconds().max(1);
-            secs.to_string()
-        })
-        .unwrap_or_else(|| "3600".to_string());
-    Response::builder()
-        .status(StatusCode::SERVICE_UNAVAILABLE)
-        .header("Retry-After", retry_after)
-        .body(Body::from(
-            serde_json::json!({"error": "artifact is quarantined"}).to_string(),
-        ))
-        .expect("static-shape quarantined response always builds")
 }
 
 /// Format a [`ContentHash`] into an RFC 9530 `Content-Digest` header
@@ -549,6 +565,33 @@ mod tests {
         let raw = BASE64_STANDARD.decode(inner).expect("valid base64");
         let round_trip_hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(round_trip_hex, hex);
+    }
+
+    /// The contradiction arm: a `NonServable` outcome whose artifact the
+    /// shared gate would serve.
+    ///
+    /// Unreachable through the route — the use case yields `NonServable`
+    /// for exactly the statuses the gate answers — so it is reached here
+    /// by handing `render_outcome` the state the use case cannot produce.
+    /// What it must not do is serve anything or panic: there are no bytes
+    /// in hand, so the client gets this route's own "no such metadata",
+    /// and the operator gets the `error!` line that says the two
+    /// exhaustive matches disagreed.
+    #[tokio::test]
+    async fn a_withheld_wheel_the_gate_would_serve_answers_no_such_metadata() {
+        for status in [
+            hort_domain::entities::artifact::QuarantineStatus::None,
+            hort_domain::entities::artifact::QuarantineStatus::Released,
+        ] {
+            let artifact = hort_app::use_cases::test_support::sample_artifact(status);
+            let response =
+                render_outcome(WheelMetadataServeOutcome::NonServable(Box::new(artifact)));
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{status:?} must answer no-such-metadata, never bytes"
+            );
+        }
     }
 
     /// Sanity check: every byte position in the hex string maps to the

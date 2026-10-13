@@ -184,6 +184,17 @@ pub enum ProvenanceRunOutcome {
         event_appended: bool,
         verdict: ProvenanceVerdictSummary,
     },
+    /// The artifact is the **signature material of a subject the
+    /// verifier accepts** (ADR 0039 D8): the folded verdict was
+    /// `NoAttestation` under `Required`, and a signature manifest that
+    /// binds this artifact's digest had its bundle verified against the
+    /// subject it names. A cascaded `ProvenanceVerified` was committed —
+    /// so no hold was applied and no `NoAttestation` verdict reached
+    /// `complete_provenance`. Distinct from
+    /// [`Self::Applied`]`{verdict: Verified}` because this artifact holds
+    /// no direct verification of its own: the authority is another
+    /// artifact's signature, recorded in the event's `cascaded_from`.
+    ClearedAsSignatureMaterial,
     /// Defense-in-depth bounded requeue (issue #90): a `NoAttestation`
     /// verdict under `Required` on a `None`-status, anchor-less,
     /// recently-ingested artifact. No verdict was applied — no event, no
@@ -619,6 +630,49 @@ impl ProvenanceOrchestrationUseCase {
             .dispatch_and_fold(&applicable, &subject, &bundles, &requirements, mode)
             .await;
 
+        // ADR 0039 D8 — signature material is not on the provenance axis,
+        // and that includes its bytes. Nothing signs a signature, so the
+        // `{}` config blob and the payload layer of a cosign signature
+        // manifest can never acquire an attestation of their own and
+        // neither end of the §11 cascade can ever fire for them: under
+        // `Required` D1 holds them and D4 holds them indefinitely, which
+        // is the terminality D4 reserves for positive disproof reached by
+        // another route. Resolved HERE, in the window between the folded
+        // verdict and the hold, because the question is one of
+        // applicability and everything it needs — the applicable
+        // verifiers, the CAS, the content-reference index, the resolved
+        // signer patterns — is already in scope. This is NOT a fourth
+        // shape predicate on the `NoAttestation` × `Required` arm (D3
+        // deleted those): the verdict stays shape-independent, and what
+        // decides the clearance is another artifact's VERIFIED signature,
+        // not this artifact's shape.
+        if mode == ProvenanceMode::Required
+            && matches!(
+                verdict.outcome,
+                hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
+            )
+        {
+            if let Some(cleared) = self
+                .cascade
+                .resolve_signature_material_clearance(&artifact, &applicable, &requirements)
+                .await
+            {
+                // The constituent now carries a real cascaded
+                // `ProvenanceVerified` whose `cascaded_from` names the
+                // signature manifest, so the release gate's provenance
+                // leg (`provenance_clearance_from`: any
+                // `ProvenanceVerified` on the stream) reads `Cleared`
+                // without a second code path. Labelled with the verifier
+                // that accepted the signature manifest's bundle.
+                crate::metrics::emit_provenance_verify(
+                    &cleared.backend,
+                    mode,
+                    crate::metrics::ProvenanceVerifyResult::ClearedSignatureMaterial,
+                );
+                return Ok(ProvenanceRunOutcome::ClearedAsSignatureMaterial);
+            }
+        }
+
         // Label the metric with the backend that DECIDED the folded verdict
         // (ADR 0039 §6), not `applicable[0]`. The dead-defensive empty case (no
         // verifier ran — impossible since `applicable` is non-empty) falls back
@@ -733,36 +787,16 @@ impl ProvenanceOrchestrationUseCase {
                 .await?;
             let manifest_bytes = self.cascade.read_bounded(&source.sha256_checksum).await?;
 
-            // Parse the referrer manifest and keep only the Sigstore-bundle
-            // layer blobs (the pure `sigstore_bundle_layers` helper). A referrer that
-            // carries no Sigstore-bundle layer (a non-cosign referrer — SBOM,
-            // an attestation of another predicate, an ordinary manifest)
-            // contributes nothing — skipped, not errored.
-            let blob_hashes = hort_domain::oci::sigstore_bundle_layers(&manifest_bytes)?;
-            for blob_hash in blob_hashes {
-                // The bundle blob digest IS its CAS content hash. A blob
-                // referenced by the manifest but absent from CAS surfaces as
-                // a `read_bounded` error → the existing fetch-failure path
-                // (mode-dependent), never a panic.
-                let bundle_bytes = self.cascade.read_bounded(&blob_hash).await?;
-                bundles.push(build_bundle(bundle_bytes));
-            }
-
-            // Keyed (ADR 0039 §8): collect any legacy cosign `simplesigning`
-            // signatures on the same referrer. Each yields a SIGNED bundle —
-            // `bytes` = the simplesigning payload-layer blob, `signature` = the
-            // base64 `dev.cosignproject.cosign/signature` annotation decoded. An
-            // undecodable annotation can never be a valid signature → skipped
-            // (under `Required`, no valid bundle folds to `NoAttestation`, which
-            // holds).
-            let sig_layers = hort_domain::oci::simplesigning_signature_layers(&manifest_bytes)?;
-            for sig in sig_layers {
-                let payload_bytes = self.cascade.read_bounded(&sig.payload_layer).await?;
-                let Some(sig_bytes) = decode_simplesigning_signature(&sig.signature) else {
-                    continue;
-                };
-                bundles.push(AttestationBundle::new_signed(payload_bytes, sig_bytes));
-            }
+            // Both carriage shapes — keyless Sigstore v0.3 bundle layers and
+            // keyed cosign `simplesigning` layers — come from the one
+            // extraction in `ProvenanceCascade::referrer_bundles`, which the
+            // D8 signature-material walk also uses. A referrer that carries
+            // neither (a non-cosign referrer — SBOM, an attestation of
+            // another predicate, an ordinary manifest) contributes nothing:
+            // skipped, not errored. A bundle blob the manifest references but
+            // CAS does not hold surfaces as an `Err` → the existing
+            // fetch-failure path (mode-dependent), never a panic.
+            bundles.extend(self.cascade.referrer_bundles(&manifest_bytes).await?);
         }
         Ok(bundles)
     }
@@ -1464,43 +1498,6 @@ impl ProvenanceOrchestrationUseCase {
 /// helper is intentionally not exported.
 fn parse_sha256_digest(digest: &str) -> Option<ContentHash> {
     digest.strip_prefix("sha256:")?.parse().ok()
-}
-
-/// Decode a base64 `dev.cosignproject.cosign/signature` annotation into raw
-/// signature bytes (ADR 0039 §8). cosign emits standard-alphabet base64. A
-/// malformed annotation yields `None` — the carriage skips it; it can never be
-/// a valid signature, and under `Required` the absence of any valid bundle
-/// folds to `NoAttestation`, which holds.
-fn decode_simplesigning_signature(annotation: &str) -> Option<Vec<u8>> {
-    use base64::Engine as _;
-    base64::engine::general_purpose::STANDARD
-        .decode(annotation.trim())
-        .ok()
-}
-
-/// Wrap a Sigstore v0.3 bundle blob as the right [`AttestationBundle`] shape so
-/// the two verifiers self-select (ADR 0039 §6/§8):
-///
-/// - a **cosign v3 keyed** bundle (a v0.3 bundle whose `verificationMaterial`
-///   is a bare `publicKey`, no Fulcio cert) → `new_signed(bytes, raw DSSE sig)`,
-///   so the keyed `cosign-key` verifier claims it (its loop requires
-///   `signature.is_some()`) and the Sigstore verifier skips it. The keyed
-///   verifier re-derives the DSSE PAE + subject digest from `bytes`; the
-///   `signature` half both flips the routing gate and carries the raw sig it
-///   verifies.
-/// - a **keyless** bundle (Fulcio cert chain), or any bundle the keyed
-///   extractor does not claim / cannot parse → `new(bytes)` (`signature =
-///   None`), routed to the Sigstore verifier unchanged (byte-for-byte the prior
-///   behaviour).
-fn build_bundle(bytes: Vec<u8>) -> AttestationBundle {
-    match hort_domain::provenance_bundle::extract_keyed_dsse_signature(&bytes) {
-        Ok(Some(material)) => AttestationBundle::new_signed(bytes, material.signature),
-        // Keyless, or not a keyed DSSE bundle, or unparseable-as-keyed: the
-        // Sigstore verifier's (a truly malformed bundle folds to
-        // BundleMalformed there). Never route a non-keyed bundle to the keyed
-        // verifier.
-        Ok(None) | Err(_) => AttestationBundle::new(bytes),
-    }
 }
 
 /// Fold two verdicts to one (the multi-verifier fold rule). `Rejected`

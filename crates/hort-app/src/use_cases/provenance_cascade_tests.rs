@@ -17,11 +17,12 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, DomainEvent, PersistedEvent, StreamId};
+use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
-use hort_domain::ports::provenance::SignerIdentity;
+use hort_domain::ports::provenance::{ProvenanceVerdict, SignerIdentity};
 use hort_domain::types::ContentHash;
 
-use super::ProvenanceCascade;
+use super::{build_bundle, decode_simplesigning_signature, ProvenanceCascade};
 use crate::use_cases::test_support::{
     sample_artifact, MockArtifactLifecycle, MockArtifactRepository, MockContentReferenceIndex,
     MockEventStore, MockStoragePort,
@@ -772,4 +773,934 @@ async fn a_late_joining_blob_clears_from_a_signed_single_image_manifest() {
         .await
         .expect("a signed single-image manifest clears its own blobs");
     assert_eq!(cleared.subject, manifest_hash);
+}
+
+// ---------------------------------------------------------------------------
+// Bundle carriage — the two shapes `referrer_bundles` reads off a referrer
+// manifest, and the wrapping that lets the keyed and keyless verifiers
+// self-select. These moved here with the functions they pin, when the
+// per-referrer extraction became shared between the verify path's bundle
+// fetch and the D8 signature-material walk.
+// ---------------------------------------------------------------------------
+
+/// `decode_simplesigning_signature` (ADR 0039 §8): standard base64 → raw bytes;
+/// whitespace trimmed; non-base64 → `None` (the carriage skips it).
+#[test]
+fn decode_simplesigning_signature_decodes_b64_and_rejects_garbage() {
+    use base64::Engine as _;
+    let raw: &[u8] = b"\x30\x45\x02\x21\x00sigbytes";
+    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
+    assert_eq!(decode_simplesigning_signature(&b64).as_deref(), Some(raw));
+    assert_eq!(
+        decode_simplesigning_signature(&format!("  {b64}\n")).as_deref(),
+        Some(raw),
+        "annotation whitespace is trimmed"
+    );
+    assert_eq!(decode_simplesigning_signature("!!!not base64!!!"), None);
+}
+
+/// A minimal keyed cosign v3 Sigstore v0.3 bundle (bare `publicKey`, DSSE
+/// envelope over an in-toto Statement binding `digest_hex`), signed opaquely.
+fn keyed_v03_bundle_json(digest_hex: &str, sig_bytes: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+    let eng = base64::engine::general_purpose::STANDARD;
+    let statement = serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [ { "digest": { "sha256": digest_hex }, "annotations": {} } ],
+        "predicateType": "https://sigstore.dev/cosign/sign/v1"
+    })
+    .to_string();
+    serde_json::json!({
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": { "publicKey": { "hint": "abc" } },
+        "dsseEnvelope": {
+            "payload": eng.encode(statement.as_bytes()),
+            "payloadType": "application/vnd.in-toto+json",
+            "signatures": [ { "sig": eng.encode(sig_bytes) } ]
+        }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// `build_bundle` (ADR 0039 §8): a cosign v3 keyed v0.3 bundle is wrapped
+/// `new_signed` (the keyed verifier's) carrying the raw DSSE signature, so the
+/// two verifiers self-select by signature-presence.
+#[test]
+fn build_bundle_wraps_keyed_v03_as_signed_with_the_dsse_signature() {
+    let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let raw_sig = vec![0x30, 0x44, 0x02, 0x20, 0xde, 0xad];
+    let bundle_json = keyed_v03_bundle_json(digest, &raw_sig);
+    let bundle = build_bundle(bundle_json.clone());
+    assert_eq!(
+        bundle.signature.as_deref(),
+        Some(raw_sig.as_slice()),
+        "a keyed v0.3 bundle carries its raw DSSE signature so the keyed verifier claims it"
+    );
+    assert_eq!(bundle.bytes, bundle_json, "bytes stay the full bundle blob");
+}
+
+/// A keyless (Fulcio-cert) v0.3 bundle is wrapped `new` (`signature == None`)
+/// — the Sigstore verifier's, byte-for-byte the prior behaviour.
+#[test]
+fn build_bundle_wraps_keyless_cert_bundle_as_unsigned() {
+    let keyless = br#"{
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": { "certificate": { "rawBytes": "AAAA" } },
+        "dsseEnvelope": {
+            "payload": "eyJzdWJqZWN0IjpbeyJkaWdlc3QiOnsic2hhMjU2IjoiYWEifX1dfQ==",
+            "payloadType": "application/vnd.in-toto+json",
+            "signatures": [ { "sig": "AAAA" } ]
+        }
+    }"#
+    .to_vec();
+    let bundle = build_bundle(keyless.clone());
+    assert_eq!(
+        bundle.signature, None,
+        "a keyless bundle stays unsigned (the Sigstore verifier's)"
+    );
+    assert_eq!(bundle.bytes, keyless);
+}
+
+/// A bundle the keyed extractor cannot claim (not a bundle at all, or a
+/// keyed-shaped bundle with undecodable DSSE material) is wrapped `new` — the
+/// Sigstore verifier folds a truly malformed one to BundleMalformed; a
+/// non-keyed one is simply its shape. Never routed to the keyed verifier.
+#[test]
+fn build_bundle_wraps_unclaimable_bytes_as_unsigned() {
+    // Not a bundle object at all.
+    let b1 = build_bundle(b"not a bundle".to_vec());
+    assert_eq!(b1.signature, None);
+    // Keyed-shaped but the DSSE payload is not valid base64 → extractor errs →
+    // routed unsigned (never keyed).
+    let malformed_keyed = br#"{"verificationMaterial":{"publicKey":{"hint":"x"}},"dsseEnvelope":{"payload":"!!nob64!!","payloadType":"application/vnd.in-toto+json","signatures":[{"sig":"AA=="}]}}"#.to_vec();
+    let b2 = build_bundle(malformed_keyed);
+    assert_eq!(
+        b2.signature, None,
+        "an unparseable-as-keyed bundle is not routed to the keyed verifier"
+    );
+}
+
+// ===========================================================================
+// Signature-material end (ADR 0039 D8) — the constituents of the signature
+// that verified a subject.
+//
+// Every arm but the acceptances leaves exactly today's hold: the artifact
+// keeps the `NoAttestation` × `Required` hold it already had, and nothing is
+// committed. The decoy arm is the security proof — a manifest that passes
+// §8's purity classifiers and names an ordinary layer must clear nothing,
+// because a blob has ONE row and ONE status per repository, so a clearance
+// resolved from a pusher's declaration would serve an unsigned layer to every
+// consumer of that repository.
+// ===========================================================================
+
+/// A verifier whose verdict is keyed on the **subject digest** it is
+/// handed, which is what separates a real signature manifest from a decoy:
+/// both are handed to the same port, and only the subject whose signature
+/// this verifier actually holds is accepted.
+struct SubjectKeyedVerifier {
+    /// Subject content hashes this verifier accepts (`Verified`).
+    accepts: Vec<ContentHash>,
+    /// Behaviour for every other subject.
+    otherwise: UnacceptedAs,
+    /// `(subject hex, bundle count)` per `verify` call, in order.
+    calls: std::sync::Mutex<Vec<(String, usize)>>,
+}
+
+/// What [`SubjectKeyedVerifier`] answers for a subject it does not accept.
+#[derive(Clone, Copy)]
+enum UnacceptedAs {
+    /// "nothing here signed this" — the shape a real verifier produces for
+    /// a bundle that does not bind the subject.
+    NoAttestation,
+    /// A positive disproof — present but invalid.
+    Rejected,
+    /// An adapter / infra fault.
+    Error,
+}
+
+impl SubjectKeyedVerifier {
+    fn accepting(subject: &ContentHash) -> Arc<Self> {
+        Arc::new(Self {
+            accepts: vec![subject.clone()],
+            otherwise: UnacceptedAs::NoAttestation,
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn answering(otherwise: UnacceptedAs) -> Arc<Self> {
+        Arc::new(Self {
+            accepts: Vec::new(),
+            otherwise,
+            calls: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn calls(&self) -> Vec<(String, usize)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl hort_domain::ports::provenance::ProvenancePort for SubjectKeyedVerifier {
+    fn name(&self) -> &str {
+        "cosign"
+    }
+
+    fn applies_to(&self, format: &str) -> bool {
+        format == "oci"
+    }
+
+    fn verify<'a>(
+        &'a self,
+        subject: &'a hort_domain::ports::provenance::ProvenanceSubject<'a>,
+        bundles: &'a [hort_domain::ports::provenance::AttestationBundle],
+        _policy: &'a hort_domain::ports::provenance::ProvenanceRequirements<'a>,
+    ) -> hort_domain::ports::BoxFuture<'a, hort_domain::error::DomainResult<ProvenanceVerdict>>
+    {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((subject.content_hash.as_ref().to_owned(), bundles.len()));
+        let accepted = self.accepts.iter().any(|h| h == subject.content_hash);
+        let otherwise = self.otherwise;
+        Box::pin(async move {
+            if accepted {
+                return Ok(ProvenanceVerdict::verified(
+                    signer(),
+                    Some("https://sigstore.dev/cosign/sign/v1".to_string()),
+                ));
+            }
+            match otherwise {
+                UnacceptedAs::NoAttestation => Ok(ProvenanceVerdict::no_attestation()),
+                UnacceptedAs::Rejected => Ok(ProvenanceVerdict::rejected(
+                    hort_domain::ports::provenance::ProvenanceRejectReason::UntrustedIdentity,
+                )),
+                UnacceptedAs::Error => Err(DomainError::Invariant("verifier infra fault".into())),
+            }
+        })
+    }
+
+    fn health_check(
+        &self,
+    ) -> hort_domain::ports::BoxFuture<'_, hort_domain::error::DomainResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A cosign **signature manifest** body: the `{}` config blob, one layer
+/// of signature material, and (when `subject` is `Some`) the `subject`
+/// descriptor the Referrers flow carries. `layer_media_type` selects the
+/// carriage — keyless Sigstore v0.3 bundle or keyed `simplesigning`.
+fn signature_manifest_body(
+    subject: Option<&ContentHash>,
+    config: &ContentHash,
+    layer: &ContentHash,
+    layer_media_type: &str,
+    layer_annotations: &serde_json::Value,
+) -> Vec<u8> {
+    let mut body = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        // The referrers-flow `artifactType` mirrors the carriage, as cosign
+        // writes it — so the keyed shape is NOT also read as a keyless bundle
+        // through `sigstore_bundle_layers`' artifactType fallback.
+        "artifactType": layer_media_type,
+        "config": {
+            "mediaType": "application/vnd.oci.empty.v1+json",
+            "digest": format!("sha256:{config}"),
+            "size": 2,
+        },
+        "layers": [{
+            "mediaType": layer_media_type,
+            "digest": format!("sha256:{layer}"),
+            "size": 512,
+            "annotations": layer_annotations.clone(),
+        }],
+    });
+    if let Some(s) = subject {
+        body["subject"] = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": format!("sha256:{s}"),
+            "size": 528,
+        });
+    }
+    serde_json::to_vec(&body).expect("signature manifest json")
+}
+
+/// The keyless shape, which is what `cosign sign` produces today.
+fn keyless_signature_manifest_body(
+    subject: Option<&ContentHash>,
+    config: &ContentHash,
+    bundle_layer: &ContentHash,
+) -> Vec<u8> {
+    signature_manifest_body(
+        subject,
+        config,
+        bundle_layer,
+        hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+        &serde_json::json!({}),
+    )
+}
+
+/// The whole keyless scenario, seeded: a verified-able subject image, a
+/// signature manifest over it carrying one bundle layer, the `{}` config
+/// blob and the payload layer as held blob rows, and the `oci_config` /
+/// `oci_layer` edges the manifest PUT commits.
+struct SignatureScene {
+    subject_hash: ContentHash,
+    manifest_hash: ContentHash,
+    config: Artifact,
+    bundle_layer: Artifact,
+}
+
+impl Fixture {
+    /// Seed the keyless scene. `subject_in_manifest` controls whether the
+    /// signature manifest declares its `subject` descriptor at all (a
+    /// legacy tag-scheme `.sig` declares none).
+    async fn seed_signature_scene(&self, subject_in_manifest: bool) -> SignatureScene {
+        let (subject_hash, manifest_hash) = (hexhash('1'), hexhash('2'));
+        let (config_hash, bundle_hash) = (hexhash('3'), hexhash('4'));
+
+        // The subject image: its bytes are what the verifier is handed.
+        self.seed_artifact(&subject_hash, QuarantineStatus::Quarantined);
+        self.seed_bytes(&subject_hash, image_manifest_body(&hexhash('a'), &[]));
+
+        // The signature manifest — status `None`, never provenance-verified
+        // (ADR 0039 §8's narrow signature ingest), which is exactly why
+        // neither of the other two cascade ends can reach its constituents.
+        let manifest_bytes = keyless_signature_manifest_body(
+            subject_in_manifest.then_some(&subject_hash),
+            &config_hash,
+            &bundle_hash,
+        );
+        let manifest = self.seed_artifact(&manifest_hash, QuarantineStatus::None);
+        self.seed_bytes(&manifest_hash, manifest_bytes);
+
+        // The bundle blob lives at its own content hash (= the layer digest).
+        self.seed_bytes(&bundle_hash, b"the-sigstore-bundle-json".to_vec());
+
+        // The two constituents, held, with the edges the PUT committed.
+        let config = self.seed_artifact(&config_hash, QuarantineStatus::Quarantined);
+        let bundle_layer = self.seed_artifact(&bundle_hash, QuarantineStatus::Quarantined);
+        self.seed_edge(manifest.id, &config_hash, "oci_config")
+            .await;
+        self.seed_edge(manifest.id, &bundle_hash, "oci_layer").await;
+
+        SignatureScene {
+            subject_hash,
+            manifest_hash,
+            config,
+            bundle_layer,
+        }
+    }
+
+    /// Run the D8 resolution with `verifiers`, no allowed-identity
+    /// patterns (the verifier mocks here do not consult them).
+    async fn resolve_signature_material(
+        &self,
+        artifact: &Artifact,
+        verifiers: &[&Arc<dyn hort_domain::ports::provenance::ProvenancePort>],
+    ) -> Option<super::SignatureMaterialClearance> {
+        let requirements = hort_domain::ports::provenance::ProvenanceRequirements {
+            allowed_identities: &[],
+        };
+        self.cascade
+            .resolve_signature_material_clearance(artifact, verifiers, &requirements)
+            .await
+    }
+}
+
+/// Collapse `Arc<SubjectKeyedVerifier>` into the borrowed port slice the
+/// resolution takes, matching how `verify_artifact` builds `applicable`.
+fn ports(
+    v: &Arc<SubjectKeyedVerifier>,
+) -> Vec<Arc<dyn hort_domain::ports::provenance::ProvenancePort>> {
+    vec![v.clone() as Arc<dyn hort_domain::ports::provenance::ProvenancePort>]
+}
+
+// ---------------------------------------------------------------------------
+// The acceptances.
+// ---------------------------------------------------------------------------
+
+/// The headline case: the signature **payload layer** of a manifest whose
+/// bundle verifies the subject it names is cleared, with the signature
+/// manifest as the recorded authority.
+#[tokio::test]
+async fn a_signature_payload_layer_clears_from_the_signature_that_verified_its_subject() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+
+    let cleared = f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .expect("the payload layer clears");
+
+    assert_eq!(cleared.signature_manifest, scene.manifest_hash);
+    assert_eq!(cleared.subject, scene.subject_hash);
+    assert_eq!(cleared.backend, "cosign");
+
+    let committed = f.committed();
+    assert_eq!(committed.len(), 1, "exactly one clearance appended");
+    assert_eq!(committed[0].0, scene.bundle_layer.id);
+    assert_eq!(
+        committed[0].1.cascaded_from.as_ref(),
+        Some(&scene.manifest_hash),
+        "attribution names the signature manifest whose bytes bind this digest, \
+         not the subject it verified and not the nominating edge",
+    );
+    assert_eq!(
+        committed[0].1.predicate_type.as_deref(),
+        Some("https://sigstore.dev/cosign/sign/v1"),
+        "the accepted signature's signer + predicate ride the clearance",
+    );
+
+    // The verifier was asked about the SUBJECT, over the manifest's one
+    // bundle — not about the constituent, which can never be signed.
+    assert_eq!(
+        verifier.calls(),
+        vec![(scene.subject_hash.as_ref().to_owned(), 1)],
+    );
+}
+
+/// The `{}` config blob clears on the same authority — it is in the
+/// manifest's config+layers set, and it is the row shared by every cosign
+/// signature in the repository.
+#[tokio::test]
+async fn the_empty_config_blob_of_a_signature_manifest_clears_too() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+
+    let cleared = f
+        .resolve_signature_material(&scene.config, &owned.iter().collect::<Vec<_>>())
+        .await
+        .expect("the config blob clears");
+
+    assert_eq!(cleared.signature_manifest, scene.manifest_hash);
+    let committed = f.committed();
+    assert_eq!(committed.len(), 1);
+    assert_eq!(committed[0].0, scene.config.id);
+    assert_eq!(
+        committed[0].1.cascaded_from.as_ref(),
+        Some(&scene.manifest_hash)
+    );
+}
+
+/// The keyed `simplesigning` carriage reaches the same clearance: the
+/// payload layer is read as the bundle and the detached signature comes
+/// off the layer annotation.
+#[tokio::test]
+async fn the_keyed_simplesigning_carriage_clears_its_payload_layer() {
+    use base64::Engine as _;
+    let f = Fixture::new();
+    let (subject_hash, manifest_hash) = (hexhash('1'), hexhash('2'));
+    let (config_hash, payload_hash) = (hexhash('3'), hexhash('4'));
+
+    f.seed_artifact(&subject_hash, QuarantineStatus::Quarantined);
+    f.seed_bytes(&subject_hash, image_manifest_body(&hexhash('a'), &[]));
+
+    let sig_b64 = base64::engine::general_purpose::STANDARD.encode(b"\x30\x45raw-sig");
+    let manifest_bytes = signature_manifest_body(
+        Some(&subject_hash),
+        &config_hash,
+        &payload_hash,
+        hort_domain::oci::COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+        &serde_json::json!({ hort_domain::oci::COSIGN_SIGNATURE_ANNOTATION: sig_b64 }),
+    );
+    let manifest = f.seed_artifact(&manifest_hash, QuarantineStatus::None);
+    f.seed_bytes(&manifest_hash, manifest_bytes);
+    f.seed_bytes(&payload_hash, b"{\"critical\":{}}".to_vec());
+
+    let payload = f.seed_artifact(&payload_hash, QuarantineStatus::Quarantined);
+    f.seed_edge(manifest.id, &payload_hash, "oci_layer").await;
+
+    let verifier = SubjectKeyedVerifier::accepting(&subject_hash);
+    let owned = ports(&verifier);
+    let cleared = f
+        .resolve_signature_material(&payload, &owned.iter().collect::<Vec<_>>())
+        .await
+        .expect("the keyed payload layer clears");
+
+    assert_eq!(cleared.signature_manifest, manifest_hash);
+    assert_eq!(
+        verifier.calls(),
+        vec![(subject_hash.as_ref().to_owned(), 1)],
+        "the keyed carriage yields exactly one signed bundle",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The decoy — this rule's security proof.
+// ---------------------------------------------------------------------------
+
+/// **The decoy.** A manifest that passes §8's purity classifiers, declares
+/// a subject, and names an ORDINARY layer as its constituent — but whose
+/// bundle does not verify that subject. The layer stays held.
+///
+/// A blob has one artifact row and one quarantine status per hort
+/// repository (`blobs/sha256:<hex>`, unique on `(repository_id, path)`,
+/// with no OCI name component), so clearing it clears it for every image
+/// in the repository. If the declaration were the authority, this push
+/// would serve an unsigned layer to every consumer of that repository.
+/// Delete the verification step from
+/// `try_clear_from_signature_manifest` and this test is the one that
+/// fails.
+#[tokio::test]
+async fn a_signature_shaped_manifest_whose_bundle_does_not_verify_clears_nothing() {
+    let f = Fixture::new();
+    let (subject_hash, manifest_hash) = (hexhash('1'), hexhash('2'));
+    let (config_hash, victim_hash) = (hexhash('3'), hexhash('5'));
+
+    // A real image the attacker does not have a signature for.
+    f.seed_artifact(&subject_hash, QuarantineStatus::Quarantined);
+    f.seed_bytes(&subject_hash, image_manifest_body(&hexhash('a'), &[]));
+
+    // A pure-signature-shaped manifest naming the victim layer as its
+    // "bundle" layer — every layer carries the bundle media type, so both
+    // §8 purity classifiers accept it.
+    let manifest_bytes =
+        keyless_signature_manifest_body(Some(&subject_hash), &config_hash, &victim_hash);
+    let manifest = f.seed_artifact(&manifest_hash, QuarantineStatus::None);
+    f.seed_bytes(&manifest_hash, manifest_bytes);
+
+    // The victim: an ordinary layer, present in CAS, held under Required.
+    let victim = f.seed_artifact(&victim_hash, QuarantineStatus::Quarantined);
+    f.seed_bytes(&victim_hash, b"malware.tar.gz".to_vec());
+    f.seed_edge(manifest.id, &victim_hash, "oci_layer").await;
+
+    // The verifier holds no signature for this subject — the only honest
+    // answer a real one can give for a bundle that does not bind it.
+    let verifier = SubjectKeyedVerifier::answering(UnacceptedAs::NoAttestation);
+    let owned = ports(&verifier);
+
+    assert!(
+        f.resolve_signature_material(&victim, &owned.iter().collect::<Vec<_>>())
+            .await
+            .is_none(),
+        "a manifest SHAPED like a signature clears nothing; only a verified \
+         signature does",
+    );
+    assert!(f.committed().is_empty(), "the victim layer stays held");
+    assert_eq!(
+        verifier.calls().len(),
+        1,
+        "the verification really ran — the refusal is the verdict, not a \
+         short-circuit before it",
+    );
+}
+
+/// The same decoy with the verifier answering a positive disproof instead
+/// of "unsigned": still no clearance, and still no retraction — the
+/// artifact keeps exactly the hold it had.
+#[tokio::test]
+async fn a_bundle_the_verifier_rejects_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    let verifier = SubjectKeyedVerifier::answering(UnacceptedAs::Rejected);
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed arms — one per failure direction.
+// ---------------------------------------------------------------------------
+
+/// A verifier infra fault is "no clearance", never a clearance and never a
+/// rejection.
+#[tokio::test]
+async fn a_verifier_error_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    let verifier = SubjectKeyedVerifier::answering(UnacceptedAs::Error);
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+}
+
+/// A candidate whose CAS bytes cannot be read: no purity decision is
+/// possible, so no clearance.
+#[tokio::test]
+async fn a_candidate_whose_cas_bytes_are_unreadable_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    f.storage.fail_get_persistent(scene.manifest_hash.clone());
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+    assert!(
+        verifier.calls().is_empty(),
+        "nothing is verified when the candidate cannot be classified",
+    );
+}
+
+/// A candidate whose bytes do not parse as a manifest at all.
+#[tokio::test]
+async fn an_unparseable_candidate_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    f.seed_bytes(&scene.manifest_hash, b"not json at all".to_vec());
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+}
+
+/// A candidate that is NOT a pure signature manifest — an ordinary image
+/// manifest, and the mixed manifest §8's purity requirement exists to
+/// refuse (one bundle layer plus one runnable `tar+gzip` layer).
+#[tokio::test]
+async fn a_candidate_that_is_not_a_pure_signature_manifest_clears_nothing() {
+    for manifest_bytes in [
+        // An ordinary image manifest binding the same blob.
+        image_manifest_body(&hexhash('3'), &[&hexhash('4')]),
+        // Mixed: a bundle layer AND a runnable layer. Not pure.
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "subject": { "digest": format!("sha256:{}", hexhash('1')) },
+            "config": { "digest": format!("sha256:{}", hexhash('3')) },
+            "layers": [
+                { "mediaType": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+                  "digest": format!("sha256:{}", hexhash('4')) },
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                  "digest": format!("sha256:{}", hexhash('6')) },
+            ],
+        }))
+        .expect("json"),
+    ] {
+        let f = Fixture::new();
+        let scene = f.seed_signature_scene(true).await;
+        f.seed_bytes(&scene.manifest_hash, manifest_bytes);
+        let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+        let owned = ports(&verifier);
+
+        assert!(f
+            .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+            .await
+            .is_none());
+        assert!(f.committed().is_empty());
+    }
+}
+
+/// **Projection is not authority**, carried to this rule: the edge
+/// nominates a real, verifiable signature manifest, but that manifest's
+/// bytes do not bind this artifact's digest. The edge alone clears
+/// nothing.
+#[tokio::test]
+async fn a_candidate_whose_bytes_do_not_bind_the_digest_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+
+    // A stranger blob with a (stale / hand-written) edge from the very same
+    // signature manifest, whose config+layers set does not contain it.
+    let stranger = f.seed_artifact(&hexhash('7'), QuarantineStatus::Quarantined);
+    f.seed_edge(
+        f.artifacts
+            .find_by_repo_and_checksum(f.repository_id, &scene.manifest_hash)
+            .await
+            .expect("lookup")
+            .expect("the manifest row")
+            .id,
+        &hexhash('7'),
+        "oci_layer",
+    )
+    .await;
+
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+    assert!(f
+        .resolve_signature_material(&stranger, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+}
+
+/// A candidate declaring no `subject` descriptor — the legacy cosign
+/// tag-scheme `.sig`, whose subject binding lives in the tag name. There
+/// is nothing in the bytes to verify against, so nothing clears.
+#[tokio::test]
+async fn a_candidate_with_no_subject_descriptor_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(false).await;
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+    assert!(
+        verifier.calls().is_empty(),
+        "no subject resolves, so no verification is attempted",
+    );
+}
+
+/// A candidate whose declared subject's preimage is not in CAS: the
+/// verifier cannot be handed the bytes its verdict is about.
+#[tokio::test]
+async fn a_subject_preimage_that_cannot_be_read_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    f.storage.fail_get_persistent(scene.subject_hash.clone());
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+    assert!(verifier.calls().is_empty());
+}
+
+/// A candidate whose bundle blob the manifest references but CAS does not
+/// hold: no bundle material, no clearance.
+#[tokio::test]
+async fn a_candidate_whose_bundle_blob_is_missing_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    f.storage
+        .fail_get_persistent(scene.bundle_layer.sha256_checksum.clone());
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+}
+
+/// A pure `simplesigning` candidate whose layer carries no signature
+/// annotation: the carriage yields no bundle at all, so there is nothing
+/// to verify.
+#[tokio::test]
+async fn a_simplesigning_candidate_with_no_signature_annotation_clears_nothing() {
+    let f = Fixture::new();
+    let (subject_hash, manifest_hash) = (hexhash('1'), hexhash('2'));
+    let (config_hash, payload_hash) = (hexhash('3'), hexhash('4'));
+
+    f.seed_artifact(&subject_hash, QuarantineStatus::Quarantined);
+    f.seed_bytes(&subject_hash, image_manifest_body(&hexhash('a'), &[]));
+    let manifest_bytes = signature_manifest_body(
+        Some(&subject_hash),
+        &config_hash,
+        &payload_hash,
+        hort_domain::oci::COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+        &serde_json::json!({}),
+    );
+    let manifest = f.seed_artifact(&manifest_hash, QuarantineStatus::None);
+    f.seed_bytes(&manifest_hash, manifest_bytes);
+    f.seed_bytes(&payload_hash, b"{}".to_vec());
+    let payload = f.seed_artifact(&payload_hash, QuarantineStatus::Quarantined);
+    f.seed_edge(manifest.id, &payload_hash, "oci_layer").await;
+
+    let verifier = SubjectKeyedVerifier::accepting(&subject_hash);
+    let owned = ports(&verifier);
+    assert!(f
+        .resolve_signature_material(&payload, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+    assert!(verifier.calls().is_empty());
+}
+
+/// No candidate parent at all — an ordinary blob nobody references. The
+/// negative case of the whole rule.
+#[tokio::test]
+async fn an_artifact_with_no_candidate_parent_clears_nothing() {
+    let f = Fixture::new();
+    let orphan = f.seed_artifact(&hexhash('8'), QuarantineStatus::Quarantined);
+    let verifier = SubjectKeyedVerifier::accepting(&hexhash('1'));
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&orphan, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+    assert!(verifier.calls().is_empty());
+}
+
+/// An empty verifier set (a composition-root mis-registration) clears
+/// nothing — fail-closed, like every other direction.
+#[tokio::test]
+async fn no_applicable_verifier_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &[])
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+}
+
+/// A candidate in another repository clears nothing — a clearance never
+/// crosses a repo boundary, because the blob row it would clear is
+/// repo-scoped.
+#[tokio::test]
+async fn a_candidate_in_another_repository_clears_nothing() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    // Re-home the signature manifest into a foreign repository.
+    let mut manifest = f
+        .artifacts
+        .find_by_repo_and_checksum(f.repository_id, &scene.manifest_hash)
+        .await
+        .expect("lookup")
+        .expect("the manifest row");
+    manifest.repository_id = Uuid::new_v4();
+    f.artifacts.insert(manifest);
+
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+    assert!(f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+}
+
+/// A constituent that is not held takes no clearance — the domain guard on
+/// [`Artifact::cascade_provenance_clearance`] refuses every non-held
+/// state, so a terminally rejected signature payload stays rejected (that
+/// population is a separate decision) and a released one needs nothing.
+#[tokio::test]
+async fn a_constituent_that_is_not_held_takes_no_clearance() {
+    for status in [
+        QuarantineStatus::Rejected,
+        QuarantineStatus::Released,
+        QuarantineStatus::None,
+    ] {
+        let f = Fixture::new();
+        let scene = f.seed_signature_scene(true).await;
+        let mut layer = scene.bundle_layer.clone();
+        layer.quarantine_status = status;
+        f.artifacts.insert(layer.clone());
+
+        let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+        let owned = ports(&verifier);
+        assert!(
+            f.resolve_signature_material(&layer, &owned.iter().collect::<Vec<_>>())
+                .await
+                .is_none(),
+            "status {status} must take no clearance",
+        );
+        assert!(f.committed().is_empty());
+    }
+}
+
+/// A candidate that declares ITSELF as its subject is circular authority,
+/// and one that declares the artifact under resolution as its subject is
+/// the direct verification the caller already ran and found unsigned.
+/// Neither may stand in for a second artifact's signature.
+#[tokio::test]
+async fn a_self_referential_subject_clears_nothing() {
+    for subject_is_the_constituent in [true, false] {
+        let f = Fixture::new();
+        let (manifest_hash, config_hash, layer_hash) = (hexhash('2'), hexhash('3'), hexhash('4'));
+        let subject = if subject_is_the_constituent {
+            layer_hash.clone()
+        } else {
+            manifest_hash.clone()
+        };
+        let manifest_bytes =
+            keyless_signature_manifest_body(Some(&subject), &config_hash, &layer_hash);
+        let manifest = f.seed_artifact(&manifest_hash, QuarantineStatus::None);
+        f.seed_bytes(&manifest_hash, manifest_bytes);
+        f.seed_bytes(&layer_hash, b"bundle".to_vec());
+        let layer = f.seed_artifact(&layer_hash, QuarantineStatus::Quarantined);
+        f.seed_edge(manifest.id, &layer_hash, "oci_layer").await;
+
+        let verifier = SubjectKeyedVerifier::accepting(&subject);
+        let owned = ports(&verifier);
+        assert!(f
+            .resolve_signature_material(&layer, &owned.iter().collect::<Vec<_>>())
+            .await
+            .is_none());
+        assert!(f.committed().is_empty());
+        assert!(verifier.calls().is_empty());
+    }
+}
+
+/// An artifact's own refcount row (`primary_content`, targeting its own
+/// hash) is never a clearance source — a self-clear would be circular.
+#[tokio::test]
+async fn an_artifacts_own_refcount_row_is_not_a_signature_material_source() {
+    let f = Fixture::new();
+    let hash = hexhash('4');
+    let blob = f.seed_artifact(&hash, QuarantineStatus::Quarantined);
+    f.seed_edge(blob.id, &hash, "primary_content").await;
+    let verifier = SubjectKeyedVerifier::accepting(&hexhash('1'));
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&blob, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
+}
+
+/// One unresolvable candidate does not abort the walk: the next edge still
+/// clears. (The first edge names an artifact id with no row.)
+#[tokio::test]
+async fn an_unresolvable_signature_material_candidate_is_skipped_and_the_walk_continues() {
+    let f = Fixture::new();
+    let scene = f.seed_signature_scene(true).await;
+    // A dangling edge, inserted first so it is walked first.
+    f.seed_edge(
+        Uuid::new_v4(),
+        &scene.bundle_layer.sha256_checksum,
+        "oci_layer",
+    )
+    .await;
+
+    let verifier = SubjectKeyedVerifier::accepting(&scene.subject_hash);
+    let owned = ports(&verifier);
+    let cleared = f
+        .resolve_signature_material(&scene.bundle_layer, &owned.iter().collect::<Vec<_>>())
+        .await;
+    assert!(
+        cleared.is_some(),
+        "a dangling edge is warned about and skipped, not fatal"
+    );
+}
+
+/// An edge read failure leaves the artifact exactly as held as it was.
+#[tokio::test]
+async fn a_signature_material_edge_read_failure_leaves_the_artifact_held() {
+    let f = Fixture::new();
+    let blob = f.seed_artifact(&hexhash('4'), QuarantineStatus::Quarantined);
+    f.refs
+        .fail_next_find_by_target(DomainError::Invariant("pg down".into()));
+    let verifier = SubjectKeyedVerifier::accepting(&hexhash('1'));
+    let owned = ports(&verifier);
+
+    assert!(f
+        .resolve_signature_material(&blob, &owned.iter().collect::<Vec<_>>())
+        .await
+        .is_none());
+    assert!(f.committed().is_empty());
 }

@@ -50,7 +50,7 @@ use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
-use hort_domain::events::ApiActor;
+use hort_domain::events::{ApiActor, RejectionReason};
 use hort_domain::types::{ByteRange, ContentHash};
 use hort_formats::oci::OciFormatHandler;
 
@@ -203,7 +203,7 @@ pub(super) fn parse_range_header(value: &str, size: u64) -> Result<ByteRange, Ra
 /// artifact, this function returns the still-`Quarantined` (or now-
 /// `Rejected`) artifact and the caller's existing `check_quarantine` /
 /// `Rejected` handling runs exactly as it does today — a 503 (or the
-/// hidden-404 for Rejected), never a served blob. The wait can only ever
+/// `403 DENIED` for Rejected), never a served blob. The wait can only ever
 /// turn a would-be 503 into a 200 that a client's OWN retry-after-503
 /// loop would eventually have received anyway; it can never turn a
 /// would-be 503 into an incorrectly-served blob.
@@ -221,33 +221,32 @@ pub(super) fn parse_range_header(value: &str, size: u64) -> Result<ByteRange, Ra
 /// turnaround (observed ~1-5s), not an operator-configured hold.
 ///
 /// The elapsed check is [`QuarantineUseCase::is_window_elapsed`], NOT a
-/// direct read of `artifact.quarantine_deadline` as hydrated by
-/// `ArtifactUseCase::find_visible_by_path`. Since issue #76 item 2/2,
-/// that hydration DOES resolve the real matched-policy duration (via
-/// the same `resolve_active_policy_for_repo` +
+/// direct read of `artifact.quarantine_deadline`. Every load path now
+/// hydrates that field from the real matched-policy duration (via the
+/// same `resolve_active_policy_for_repo` +
 /// `effective_quarantine_deadline` computation `is_window_elapsed`
-/// uses) — it is no longer the bare-anchor approximation this comment
-/// used to warn about. The two signals can still diverge, though:
-/// `quarantine_deadline` is a transient, non-persisted field that ONLY
-/// `find_visible_by_path` / `find_visible_by_id` populate at hydration
-/// time. The `artifact` reaching this function comes from
-/// `ArtifactUseCase::get_by_id` inside this same function's own poll
-/// loop below (see "Await mechanism") — `get_by_id` never hydrates the
-/// field, so it would read as `None` (or a stale value from
-/// whenever/if the artifact was last hydrated) rather than the live
-/// answer. `QuarantineUseCase::is_window_elapsed` resolves the real
-/// matched-policy duration fresh, on every call, regardless of how the
-/// artifact reached this function (the same computation the
-/// `record_scan_result` inline fast-path and the `release_expired`
-/// sweep use), so a still-running hold correctly reads as NOT elapsed
-/// and this function returns immediately without waiting.
+/// uses), including the `ArtifactUseCase::get_by_id` re-read in this
+/// function's own poll loop below (see "Await mechanism"), so the field
+/// is no longer the `None` this comment used to warn about. What it is
+/// instead is an answer **as of the load**: a transient field carries
+/// the deadline the policy implied when the row was read, and a policy
+/// edit between that read and this decision moves the real one.
+/// `is_window_elapsed` resolves the duration fresh, on every call,
+/// regardless of how the artifact reached this function (the same
+/// computation the `record_scan_result` inline fast-path and the
+/// `release_expired` sweep use), so the wait decision is made against
+/// the live window and a still-running hold correctly reads as NOT
+/// elapsed — this function returns immediately without waiting.
 ///
 /// # Await mechanism: poll, not subscribe
 ///
 /// Polls [`hort_app::use_cases::artifact_use_case::ArtifactUseCase::get_by_id`]
-/// (a plain, authz-free row read — `artifact` was already resolved
-/// through the visibility-checked path above) on a fixed short interval
-/// rather than subscribing to the notification broadcast
+/// (an authz-free read — `artifact` was already resolved through the
+/// visibility-checked path above — hydrated exactly as that read was, so
+/// the row this function returns carries its deadline, its ADR 0039 D5
+/// hold flag and, for a rejection observed inside the wait, the axis the
+/// refusal names) on a fixed short interval rather than subscribing to
+/// the notification broadcast
 /// (`EventStorePublisher::subscribe`). The broadcast is best-effort
 /// (`HORT_NOTIFICATIONS_ENABLED`-gated, and a lagged/full-capacity
 /// receiver silently drops sends) — coupling this hot read path's
@@ -256,7 +255,12 @@ pub(super) fn parse_range_header(value: &str, size: u64) -> Result<ByteRange, Ra
 /// `AppContext` for a narrow win. A cold pull-through miss is rare (by
 /// definition, only the first request for a given blob); polling at
 /// [`RELEASE_WAIT_POLL_INTERVAL`] up to the bound costs at most a
-/// handful of cheap row reads.
+/// handful of cheap reads. "Cheap" is, per poll, the row read plus the
+/// hydration's own cost on a still-held row — one policy resolution, and
+/// one bounded stream read when the elapsed hold sits under
+/// `provenance_mode: Required`. The loop returns on the first terminal
+/// status it observes, so that cost accrues only while the artifact is
+/// genuinely still held, which is the case that ends in a 503 anyway.
 async fn maybe_bounded_await_release(ctx: &Arc<AppContext>, artifact: Artifact) -> Artifact {
     let bound_secs = ctx.oci_pullthrough_release_wait_secs;
     if bound_secs == 0 || !matches!(artifact.quarantine_status, QuarantineStatus::Quarantined) {
@@ -480,6 +484,19 @@ pub(super) async fn serve(
                     // miss — critically NOT the retryable 502
                     // `UpstreamUnavailable` maps to, which containerd
                     // would sit on forever with no `ErrImagePull`.
+                    //
+                    // So a curation rule produces TWO different answers
+                    // in this handler, deliberately: a locally-held
+                    // artifact a rule condemned answers `403 DENIED` +
+                    // `curator` in the status match below, while an
+                    // upstream blob a rule blocks answers this 404. The
+                    // two callers are not in the same situation — the
+                    // first is asking about an artifact this registry
+                    // holds a verdict on, the second about one it never
+                    // admitted, and there is nothing to diagnose about a
+                    // blob that was never ingested. Keeping this 404 is
+                    // also what keeps a cache-miss `docker pull` from
+                    // dying on a cryptic mid-pull 403.
                     return OciError::BlobUnknown {
                         digest: format!("sha256:{}", hash.as_ref()),
                     }
@@ -592,8 +609,9 @@ pub(super) async fn serve(
     //    done in the handler rather than deferred to
     //    ArtifactUseCase::download: transparent-proxy compatibility +
     //    avoiding the CAS round-trip for a blob that won't be served.
-    //    Rejected stays inline because the hidden-404 envelope is
-    //    format-specific (`BLOB_UNKNOWN`).
+    //    Rejected stays inline because the subject its refusal names
+    //    is route-specific (a blob digest here, a client reference on
+    //    the manifest route), so each handler builds its own envelope.
     // Exhaustive match (issue #92) — no wildcard arm, so a future
     // `QuarantineStatus` variant is a compile error here, not a
     // fall-through 500/200. `None` / `Released` continue to the happy
@@ -610,8 +628,55 @@ pub(super) async fn serve(
             // `head`); a GET still cannot reach here with the flag set.
         }
         QuarantineStatus::Rejected => {
-            return OciError::BlobUnknown {
-                digest: format!("sha256:{}", hash.as_ref()),
+            // A caller who got this far passed the repository read gate,
+            // so the bytes themselves would have been served to them if
+            // the artifact were not withheld. Telling them WHY it is
+            // withheld reveals strictly less than the artifact would have
+            // (ADR 0055's 2026-10-12 clarification), and the alternative
+            // — the `BLOB_UNKNOWN` 404 that is byte-identical to "no such
+            // blob" — removes the one fact that ends the search. A caller
+            // the gate does NOT admit never reaches this arm: the
+            // repository challenge / `NAME_UNKNOWN` of ADR 0021 / 0045
+            // fires in step 2 above, unchanged.
+            //
+            // The axis is a plain field here. `ArtifactUseCase` derives
+            // it from the artifact's own `ArtifactRejected` event during
+            // the load (the `artifacts` projection has no such column),
+            // so the format crate reads a field and never a stream
+            // (ADR 0008).
+            let axis = artifact
+                .rejection_reason
+                .as_ref()
+                .map(RejectionReason::wire_kind);
+            if axis.is_none() {
+                // The answer stays a refusal naming the subject — a
+                // caller is never handed a reason that does not exist,
+                // and never an `unknown` token, which would dress an
+                // inconsistency up as a verdict. The operator is told,
+                // because `Rejected` with no rejection on the record is
+                // an illegal state (ADR 0039 D6: the status is a
+                // projection, the stream is the record).
+                //
+                // Two causes reach here and the use-case layer tells them
+                // apart in its own log: it logs `error!` when it read the
+                // stream and found no `ArtifactRejected`, and `warn!`
+                // when the read itself failed or the port was unwired.
+                // That holds however the row arrived, including through
+                // the bounded-await poll loop's `get_by_id` re-read
+                // above, which hydrates like every other load path — so
+                // a status that flipped to `Rejected` inside the wait
+                // reaches this arm carrying its axis, and an axis-less
+                // row here always has a line upstream naming which of
+                // the two causes produced it.
+                tracing::error!(
+                    artifact_id = %artifact.id,
+                    digest = %format!("sha256:{}", hash.as_ref()),
+                    "refusing a Rejected blob with no rejection axis to report"
+                );
+            }
+            return OciError::ArtifactRejected {
+                subject: format!("sha256:{}", hash.as_ref()),
+                axis,
             }
             .into_response();
         }
@@ -1388,8 +1453,8 @@ mod tests {
     }
 
     use hort_app::use_cases::test_support::{
-        sample_artifact, sample_repository, MockArtifactRepository, MockRepositoryRepository,
-        MockStoragePort,
+        persisted_artifact_rejected, sample_artifact, sample_repository, MockArtifactRepository,
+        MockEventStore, MockRepositoryRepository, MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
@@ -1397,6 +1462,8 @@ mod tests {
 
     use hort_http_core::context::AppContext;
     use hort_http_core::test_support::{build_mock_ctx, with_provenance_hold_hydration};
+
+    use crate::test_tracing::{capture_tracing, events_at, CapturedEvent};
 
     // -- Fixtures -----------------------------------------------------------
 
@@ -1420,6 +1487,13 @@ mod tests {
         artifacts: Arc<MockArtifactRepository>,
         repositories: Arc<MockRepositoryRepository>,
         storage: Arc<MockStoragePort>,
+        /// The artifact's own event stream — where a `Rejected` row's
+        /// rejection axis actually lives. `MockArtifactRepository` clears
+        /// `Artifact::rejection_reason` on read exactly as Postgres's one
+        /// `row -> Artifact` mapper does, so an axis test seeds an
+        /// `ArtifactRejected` here and the use-case hydration recovers
+        /// it; setting the field on a fixture entity proves nothing.
+        events: Arc<MockEventStore>,
     }
 
     fn harness() -> Harness {
@@ -1430,6 +1504,7 @@ mod tests {
             artifacts: mocks.artifacts,
             repositories: mocks.repositories,
             storage: mocks.storage,
+            events: mocks.events,
         }
     }
 
@@ -2009,6 +2084,271 @@ mod tests {
         );
     }
 
+    // -- the fourth load path: a rejection observed INSIDE the bound ------
+
+    /// Drive the shape an operator actually meets: a cold pull-through
+    /// blob held `Quarantined` with an ALREADY-ELAPSED window whose own
+    /// scan **rejects** it a few hundred ms into the bounded await. The
+    /// loop observes the terminal status through
+    /// `ArtifactUseCase::get_by_id` and hands that row to the refusal
+    /// gate, so this is the only blob path on which the axis a 403 names
+    /// is resolved by the poll loop's re-read rather than by the
+    /// visibility-checked read at the top of `serve`.
+    ///
+    /// Returns the response alongside every `tracing` event the request
+    /// emitted — the false `error!` is half of what the probe measured,
+    /// so a status-and-body assertion alone cannot settle it.
+    ///
+    /// `axis` is what the scan's `ArtifactRejected` carries; `None` seeds
+    /// no rejection at all, which is ADR 0039 D6's illegal state. The
+    /// simulated pipeline appends to the stream **before** flipping the
+    /// projection, because the real one commits both in one transaction:
+    /// flipping first would open a window in which a poll legitimately
+    /// sees `Rejected` over an empty stream and reports D6, which is the
+    /// other test's subject rather than this one's.
+    fn rejected_inside_the_bound(
+        axis: Option<RejectionReason>,
+    ) -> ((StatusCode, Vec<u8>), Vec<CapturedEvent>) {
+        let content = b"rejected mid-wait".to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        capture_tracing(|| {
+            run(async {
+                let h = harness();
+                // Both halves of the wiring matter: the bound makes the
+                // poll loop reachable, and the hydration opt-in gives the
+                // use case the ports it derives the axis with (see
+                // `with_provenance_hold_hydration`'s own doc).
+                let ctx = with_provenance_hold_hydration(&with_oci_pullthrough_release_wait_secs(
+                    &h.ctx, 5,
+                ));
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let artifact_id = seed_blob_with_deadline(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &hex,
+                    &content,
+                    QuarantineStatus::Quarantined,
+                    Utc::now() - chrono::Duration::seconds(1),
+                );
+
+                let artifacts = h.artifacts.clone();
+                let events = h.events.clone();
+                let spawn_hex = hex.clone();
+                let spawn_size = content.len() as i64;
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    events.set_stream(
+                        &hort_domain::events::StreamId::artifact(artifact_id),
+                        axis.map(|reason| {
+                            vec![persisted_artifact_rejected(artifact_id, reason, 1)]
+                        })
+                        .unwrap_or_default(),
+                    );
+                    // `MockArtifactRepository::insert` overwrites by id
+                    // and clears the transient fields on the way in,
+                    // mirroring a real row update: the axis can only come
+                    // back off the stream above.
+                    let mut rejected = sample_artifact(QuarantineStatus::Rejected);
+                    rejected.id = artifact_id;
+                    rejected.repository_id = repo_id;
+                    rejected.path = format!("blobs/sha256:{spawn_hex}");
+                    rejected.sha256_checksum = spawn_hex.parse().unwrap();
+                    rejected.size_bytes = spawn_size;
+                    artifacts.insert(rejected);
+                });
+
+                let router = blob_router(ctx);
+                let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
+                let resp = router
+                    .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+                (status, body)
+            })
+        })
+    }
+
+    /// A blob rejected inside the bound answers `403 DENIED` **with** the
+    /// axis its stream carries, and nothing in the request logs at
+    /// `error!`.
+    ///
+    /// Both halves were wrong before the fourth load path hydrated: the
+    /// refusal reached the client axis-less although the stream said
+    /// `scanner`, and the ADR 0039 D6 `error!` fired as a false alarm on
+    /// an artifact with nothing whatsoever wrong with its record — which
+    /// is the failure mode that makes a D6 line worthless, since it then
+    /// fires on every healthy rejection and buries the one real
+    /// violation.
+    ///
+    /// This is the likeliest way an operator meets a rejected blob at
+    /// all: `HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS` defaults to 10, so
+    /// a layer blocked mid-`docker pull` on a pull-through repository
+    /// takes exactly this path with no configuration at all.
+    #[test]
+    fn get_blob_rejected_inside_the_bound_names_the_axis_and_raises_no_false_alarm() {
+        let ((status, body), records) = rejected_inside_the_bound(Some(RejectionReason::Scanner));
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["message"], "artifact is rejected");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["axis"], "scanner",
+            "the rejection observed inside the wait must reach the wire with its axis: {parsed}"
+        );
+        // Both emitters, named: the handler's own "no axis to report"
+        // line and the use case's D6 line. Asserting per-target rather
+        // than "no ERROR anywhere" keeps the claim about these two
+        // callsites — the capture filters nothing.
+        for target in [
+            "hort_http_oci::blobs",
+            "hort_app::use_cases::artifact_use_case",
+        ] {
+            assert!(
+                events_at(&records, tracing::Level::ERROR, target).is_empty(),
+                "a healthy rejection must not log at error! ({target}): {records:#?}"
+            );
+        }
+    }
+
+    /// The detector is extended, not silenced: the same path, with a
+    /// `Rejected` projection and **no** `ArtifactRejected` behind it,
+    /// still reports ADR 0039 D6's illegal state — at `error!`, from both
+    /// the use case that looked and the handler that could not name an
+    /// axis — and still refuses, naming the subject and inventing no
+    /// `unknown` token.
+    ///
+    /// Before the fourth load path hydrated, this case and the healthy
+    /// one above were indistinguishable here: neither carried an axis and
+    /// both fired the handler's line.
+    #[test]
+    fn get_blob_rejected_inside_the_bound_with_no_rejection_on_the_stream_still_reports_d6() {
+        let ((status, body), records) = rejected_inside_the_bound(None);
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert!(
+            parsed["errors"][0]["detail"]["subject"].is_string(),
+            "the subject is owed regardless: {parsed}"
+        );
+        assert!(
+            parsed["errors"][0]["detail"].get("axis").is_none(),
+            "an unrecoverable axis emits no axis field: {parsed}"
+        );
+
+        let use_case_errors = events_at(
+            &records,
+            tracing::Level::ERROR,
+            "hort_app::use_cases::artifact_use_case",
+        );
+        assert!(
+            use_case_errors
+                .iter()
+                .any(|e| e.fields.contains("carries no ArtifactRejected")),
+            "the use case read the stream and must report the illegal state: {records:#?}"
+        );
+        assert!(
+            events_at(&records, tracing::Level::ERROR, "hort_http_oci::blobs")
+                .iter()
+                .any(|e| e.fields.contains("no rejection axis to report")),
+            "the refusing handler must say it had no axis: {records:#?}"
+        );
+        // Not a `warn!`: the read happened. Collapsing the two would make
+        // the D6 line unreadable — "could not look" and "looked, and the
+        // record is not there" are different operator actions.
+        assert!(
+            events_at(
+                &records,
+                tracing::Level::WARN,
+                "hort_app::use_cases::artifact_use_case"
+            )
+            .is_empty(),
+            "a read that succeeded must not also warn: {records:#?}"
+        );
+    }
+
+    /// The hold half of the same gap. A blob whose window has elapsed and
+    /// whose scan does NOT land inside the bound is handed back by the
+    /// loop and 503s — and that 503's `Retry-After` is now computed from
+    /// the artifact's own window instead of the flat "deadline unknown"
+    /// hour an unhydrated row fell through to.
+    ///
+    /// The computed value is 1: an elapsed window is in the past, and
+    /// `check_quarantine` clamps a past deadline to one second. For this
+    /// hold that is the honest answer — what it waits on is the
+    /// artifact's own scan verdict, which does arrive. The hold that
+    /// waits on an external event instead advertises no deadline at all
+    /// (ADR 0039 D5), asserted by
+    /// `get_blob_required_pending_elapsed_window_returns_503_without_consuming_bound`.
+    /// What the bound asserts here is that the header is *derived*: a
+    /// flat hour on a window that has already elapsed is the one value
+    /// that cannot be right, and it is what this path used to answer.
+    #[test]
+    fn get_blob_elapsed_window_bound_fallback_503_reports_the_hydrated_window() {
+        let content = b"scanning".to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+
+        let (status, retry_after) = run(async {
+            let h = harness();
+            let ctx =
+                with_provenance_hold_hydration(&with_oci_pullthrough_release_wait_secs(&h.ctx, 1));
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            // No background task: the scan never completes, so the bound
+            // is exhausted and the loop returns its own last re-read.
+            seed_blob_with_deadline(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                &content,
+                QuarantineStatus::Quarantined,
+                Utc::now() - chrono::Duration::seconds(1),
+            );
+            let router = blob_router(ctx);
+            let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_string());
+            (status, retry_after)
+        });
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let secs: i64 = retry_after
+            .expect("a timed hold keeps its Retry-After")
+            .parse()
+            .unwrap();
+        assert_eq!(
+            secs, 1,
+            "the elapsed window clamps to 1; anything else means the row reaching \
+             `check_quarantine` carried no deadline"
+        );
+        assert_ne!(
+            secs, 3600,
+            "3600 is the deadline-unknown fallback — an anchored hold must never reach it"
+        );
+    }
+
     // RBAC-enabled ctx builders + the capability-token principal shape
     // are shared with the manifest suite via `crate::test_authz`.
     use crate::test_authz::{pull_scoped_cap_principal, user_grant_ctx, write_grant_ctx};
@@ -2227,22 +2567,31 @@ mod tests {
         );
     }
 
-    // -- Rejected hides the blob -------------------------------------------
+    // -- Rejected names its axis -------------------------------------------
 
-    #[test]
-    fn get_blob_rejected_returns_404_blob_unknown() {
+    /// Drive a `GET` of a `Rejected` blob and return `(status, body)`.
+    ///
+    /// `axis` seeds the artifact's **stream** with an `ArtifactRejected`
+    /// carrying that reason; `None` seeds an empty stream, which is the
+    /// ADR 0039 D6 illegal state (a `Rejected` projection with no
+    /// rejection on the record). Either way the fixture entity's
+    /// `rejection_reason` is never set: `MockArtifactRepository` clears it
+    /// on read exactly as `hort-adapters-postgres`'s one `row -> Artifact`
+    /// mapper does, so only `ArtifactUseCase`'s hydration can put it back
+    /// — which is what makes these tests about the production derivation
+    /// rather than about the fixture.
+    fn rejected_blob_response(axis: Option<RejectionReason>) -> (StatusCode, Vec<u8>) {
         let content = b"bad".to_vec();
         let hex = {
             use sha2::Digest;
             hex::encode(sha2::Sha256::digest(&content))
         };
-
-        let (status, body) = run(async {
+        run(async move {
             let h = harness();
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            seed_blob(
+            let artifact_id = seed_blob(
                 &h.artifacts,
                 &h.storage,
                 repo_id,
@@ -2250,7 +2599,17 @@ mod tests {
                 &content,
                 QuarantineStatus::Rejected,
             );
-            let router = blob_router(h.ctx);
+            h.events.set_stream(
+                &hort_domain::events::StreamId::artifact(artifact_id),
+                axis.map(|reason| vec![persisted_artifact_rejected(artifact_id, reason, 1)])
+                    .unwrap_or_default(),
+            );
+            // Opt into the read-path hydration: without the event-store
+            // handle wired the axis cannot be recovered and the handler
+            // would answer the axis-less form for a harness reason rather
+            // than a production one.
+            let ctx = with_provenance_hold_hydration(&h.ctx);
+            let router = blob_router(ctx);
             let uri = format!("/v2/myrepo/nginx/blobs/sha256:{hex}");
             let resp = router
                 .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
@@ -2259,10 +2618,137 @@ mod tests {
             let status = resp.status();
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             (status, body)
-        });
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        })
+    }
+
+    /// Rewritten from the concealment pin
+    /// (`get_blob_rejected_returns_404_blob_unknown`, which asserted the
+    /// 404 `BLOB_UNKNOWN` envelope byte-identical to "no such blob").
+    ///
+    /// What it pins now: a caller the repository read gate admitted is
+    /// told **that** the blob is withheld and **why** — `403` with the
+    /// spec code `DENIED`, the digest, and the rejection axis. The 404
+    /// was indistinguishable from a genuine miss, which is the signal the
+    /// reporter spent days reconstructing (ADR 0055's 2026-10-12
+    /// clarification). What has NOT changed is resolvability: the blob
+    /// still never yields bytes.
+    #[test]
+    fn get_blob_rejected_is_403_denied_naming_the_axis() {
+        let (status, body) = rejected_blob_response(Some(RejectionReason::Scanner));
+        assert_eq!(status, StatusCode::FORBIDDEN);
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["message"], "artifact is rejected");
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["subject"],
+            format!("sha256:{}", {
+                use sha2::Digest;
+                hex::encode(sha2::Sha256::digest(b"bad"))
+            })
+        );
+    }
+
+    /// **Every** `RejectionReason` variant reaches the wire as its own
+    /// `wire_kind()` token, iterated off
+    /// [`RejectionReason::ALL_KIND_SAMPLES`] rather than a hand-written
+    /// list — so a variant added tomorrow is covered here the moment it
+    /// joins that constant, and cannot reach a client undecided.
+    #[test]
+    fn every_rejection_reason_variant_reaches_the_blob_refusal_as_its_wire_kind() {
+        assert_eq!(
+            RejectionReason::ALL_KIND_SAMPLES.len(),
+            7,
+            "the corpus is the vocabulary; a drop to zero would make this loop vacuous"
+        );
+        for sample in RejectionReason::ALL_KIND_SAMPLES {
+            let (status, body) = rejected_blob_response(Some(sample.clone()));
+            assert_eq!(status, StatusCode::FORBIDDEN, "{sample:?}");
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                parsed["errors"][0]["detail"]["axis"],
+                sample.wire_kind(),
+                "axis for {sample:?} must be its wire_kind()"
+            );
+        }
+    }
+
+    /// The refusal is a diagnosis of an artifact, not a disclosure about
+    /// a person, a rule, or a weakness. Asserted over every variant,
+    /// which is what makes it meaningful: `Curator { curator_id }` and
+    /// `CurationRetroactive { rule_id }` are the two that carry a uuid,
+    /// so a body built from the payload rather than the discriminator
+    /// would leak here and nowhere else.
+    #[test]
+    fn no_blob_refusal_body_carries_a_uuid_or_a_cve_identifier() {
+        let uuid_shaped = regex::Regex::new(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        )
+        .unwrap();
+        for sample in RejectionReason::ALL_KIND_SAMPLES {
+            let (_, body) = rejected_blob_response(Some(sample.clone()));
+            let text = String::from_utf8(body).unwrap();
+            assert!(
+                !uuid_shaped.is_match(&text),
+                "refusal body for {sample:?} carries a uuid: {text}"
+            );
+            assert!(
+                !text.contains("CVE-"),
+                "refusal body for {sample:?} carries a CVE identifier: {text}"
+            );
+        }
+    }
+
+    /// ADR 0039 D6's illegal state: the projection says `Rejected` and no
+    /// `ArtifactRejected` stands behind it on the stream. The caller is
+    /// still refused and still told which blob — but no axis field is
+    /// emitted and no `unknown` token is invented, because a token would
+    /// make an inconsistency read as a verdict. The operator is told
+    /// instead, at `error` level.
+    #[test]
+    fn rejected_blob_with_no_axis_on_the_stream_is_403_with_no_axis_field() {
+        let (status, body) = rejected_blob_response(None);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert!(
+            parsed["errors"][0]["detail"]["subject"].is_string(),
+            "the subject is owed regardless: {parsed}"
+        );
+        assert!(
+            parsed["errors"][0]["detail"].get("axis").is_none(),
+            "an unrecoverable axis emits no axis field: {parsed}"
+        );
+    }
+
+    /// The counterpart that makes the posture change worth anything: a
+    /// blob that genuinely is not here still answers `404 BLOB_UNKNOWN`.
+    /// Only asserting both proves the two cases are now distinguishable —
+    /// which is the whole defect, since before this they were byte-
+    /// identical.
+    #[test]
+    fn a_genuinely_absent_blob_still_answers_404_and_is_distinguishable() {
+        let (rejected_status, _) = rejected_blob_response(Some(RejectionReason::Scanner));
+        let (absent_status, absent_body) = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("myrepo"));
+            let router = blob_router(with_provenance_hold_hydration(&h.ctx));
+            let uri = format!("/v2/myrepo/nginx/blobs/sha256:{}", valid_hex());
+            let resp = router
+                .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, body)
+        });
+        assert_eq!(absent_status, StatusCode::NOT_FOUND);
+        let parsed: serde_json::Value = serde_json::from_slice(&absent_body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+        assert_ne!(
+            absent_status, rejected_status,
+            "a withheld blob and an absent blob must no longer share one answer"
+        );
     }
 
     // -- ScanIndeterminate (issue #92) -------------------------------------
@@ -4333,38 +4819,15 @@ mod tests {
 
     /// [`quarantining_policy`] with the observation window as a parameter,
     /// for a test whose assertion is about the window's length rather than
-    /// about the hold existing.
+    /// about the hold existing. One definition, shared with the manifest
+    /// read suite through `crate::test_authz` — the two suites assert about
+    /// the same advertised window and must not drift into seeding
+    /// materially different policies while claiming the same state.
     fn quarantining_policy_with_window(
         repo_id: Uuid,
         window_secs: i64,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
-        use hort_domain::entities::scan_policy::{
-            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-            SeverityThreshold,
-        };
-        use hort_domain::events::PolicyScope;
-        let now = Utc::now();
-        ScanPolicyProjection {
-            policy_id: Uuid::new_v4(),
-            name: format!("quarantining-{window_secs}s-{repo_id}"),
-            scope: PolicyScope::Repository(repo_id),
-            severity_threshold: SeverityThreshold::Critical,
-            quarantine_duration_secs: window_secs,
-            require_approval: false,
-            provenance_mode: ProvenanceMode::Off,
-            provenance_backends: Vec::new(),
-            provenance_identities: Vec::new(),
-            max_artifact_age_secs: None,
-            license_policy: serde_json::Value::Null,
-            archived: false,
-            scan_backends: vec!["trivy".to_string()],
-            rescan_interval_hours: 24,
-            negligible_action: NegligibleAction::Ignore,
-            enforcement: ScanEnforcement::Reject,
-            stream_version: 0,
-            created_at: now,
-            updated_at: now,
-        }
+        crate::test_authz::quarantining_policy_with_window(repo_id, window_secs)
     }
 
     /// Issue #107 Item 3 pin (c) — the OCI cross-repo pull-dedup
@@ -4788,10 +5251,7 @@ mod tests {
     /// suite's `seed_stream_scanned_and_provenance_verified` fixture; only
     /// the provenance leg matters to the guard, so no `ScanCompleted` is
     /// needed here.
-    fn seed_provenance_verified(
-        events: &Arc<hort_app::use_cases::test_support::MockEventStore>,
-        artifact_id: Uuid,
-    ) {
+    fn seed_provenance_verified(events: &Arc<MockEventStore>, artifact_id: Uuid) {
         use hort_domain::events::{DomainEvent, PersistedEvent, ProvenanceVerified, StreamId};
         use hort_domain::ports::provenance::SignerIdentity;
 
@@ -4830,6 +5290,22 @@ mod tests {
     /// suppressed for exactly this case. Asserted by wall-clock against a
     /// deliberately large bound: a wrongly-awaited request would take
     /// clearly longer than the assertion threshold.
+    ///
+    /// The response also carries **no** `Retry-After` (ADR 0039 D5): what
+    /// this hold waits on is a signature, not the clock, so any header
+    /// would tell a well-behaved client to come back forever. That half
+    /// needs the hydration opt-in — the flag is a hydrated field — which
+    /// is why the context below wires it.
+    ///
+    /// Which read hydrated the row is worth being precise about: this
+    /// population is routed *around* the poll loop by the guard above, so
+    /// the row answered from is `find_visible_by_path`'s. The loop's own
+    /// re-read resolves the same flag since `ArtifactUseCase::get_by_id`
+    /// hydrates (pinned in `hort-app` by
+    /// `get_by_id_marks_an_unsigned_required_hold_past_its_window_as_indefinite`),
+    /// which is what keeps the answer D5-shaped on the fail-safe path
+    /// where the guard's own clearance read failed and the wait ran
+    /// anyway.
     #[test]
     fn get_blob_required_pending_elapsed_window_returns_503_without_consuming_bound() {
         let content = b"scanning".to_vec();
@@ -4838,10 +5314,12 @@ mod tests {
             hex::encode(sha2::Sha256::digest(&content))
         };
 
-        let (status, elapsed) = run(async {
+        let (status, elapsed, retry_after) = run(async {
             let handle = PrometheusBuilder::new().build_recorder().handle();
             let (base_ctx, mocks) = build_mock_ctx(handle);
-            let ctx = with_oci_pullthrough_release_wait_secs(&base_ctx, 30);
+            let ctx = with_provenance_hold_hydration(&with_oci_pullthrough_release_wait_secs(
+                &base_ctx, 30,
+            ));
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             mocks.repositories.insert(repo);
@@ -4868,13 +5346,22 @@ mod tests {
                 .await
                 .unwrap();
             let status = resp.status();
-            (status, started.elapsed())
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .map(|v| v.to_str().unwrap().to_string());
+            (status, started.elapsed(), retry_after)
         });
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             elapsed < Duration::from_secs(2),
             "request took {elapsed:?} against a 30s bound; the provenance guard \
              must skip the await entirely, not burn (any part of) the bound"
+        );
+        assert_eq!(
+            retry_after, None,
+            "an unsigned hold past its window has no self-resolving deadline — \
+             no Retry-After (ADR 0039 D5)"
         );
     }
 

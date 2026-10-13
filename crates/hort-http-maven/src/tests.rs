@@ -23,7 +23,11 @@ use hort_domain::entities::repository::{Repository, RepositoryFormat, Repository
 use hort_domain::events::DomainEvent;
 use hort_domain::ports::artifact_group_repository::ArtifactGroupRepository;
 use hort_domain::ports::ephemeral_store::EphemeralStore;
-use hort_http_core::test_support::{build_mock_ctx, with_repository_access, MockPorts};
+use hort_http_core::test_support::{
+    assert_axis_is_the_wire_kind_for_every_variant, assert_axis_less_refusal_emits_no_axis_field,
+    assert_refusal_leaks_no_uuid_or_cve, build_mock_ctx, seed_indefinite_hold_policy,
+    seed_timed_hold_policy, with_provenance_hold_hydration, with_repository_access, MockPorts,
+};
 
 use super::*;
 
@@ -497,6 +501,208 @@ async fn rejected_file_get_returns_403() {
     let router = router(ctx);
     let (st, _) = get(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.jar").await;
     assert_eq!(st, StatusCode::FORBIDDEN);
+}
+
+// -- the status gate: the axis, and the hold with no deadline ------------
+//
+// These drive the real file route, not the gate function, which is the
+// point: the axis and the indefinite-hold flag are hydrated by the
+// use-case layer during the load, so a test that hands the gate a
+// hand-built artifact proves only that the gate reads two fields. The
+// question here is whether Maven's own download path arrives at the gate
+// carrying them.
+
+/// Seed a `Rejected` jar whose stream carries `axis` (or, for `None`,
+/// carries nothing at all — the ADR 0039 D6 illegal state), pull it, and
+/// return the refusal.
+///
+/// The fixture entity's `rejection_reason` is deliberately never set:
+/// `MockArtifactRepository` clears it on read exactly as the one
+/// `row -> Artifact` mapper in `hort-adapters-postgres` does, so only
+/// `ArtifactUseCase`'s hydration can put it back — which is what makes
+/// this about the production derivation and not about the fixture.
+///
+/// `sidecar` chooses which of the two routes design §11 ties together is
+/// driven: the file itself, or its `.sha1` checksum sidecar.
+async fn rejected_jar_response(
+    axis: Option<hort_domain::events::RejectionReason>,
+    sidecar: bool,
+) -> (StatusCode, serde_json::Value) {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    let repo = insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let artifact = insert_file(
+        &mocks,
+        repo.id,
+        "com.example:foo",
+        "1.0",
+        "com/example/foo/1.0/foo-1.0.jar",
+        b"x",
+        QuarantineStatus::Rejected,
+    );
+    mocks.events.set_stream(
+        &hort_domain::events::StreamId::artifact(artifact.id),
+        axis.map(|reason| {
+            vec![
+                hort_app::use_cases::test_support::persisted_artifact_rejected(
+                    artifact.id,
+                    reason,
+                    1,
+                ),
+            ]
+        })
+        .unwrap_or_default(),
+    );
+    // Opt into the read-path hydration: without the event-store handle
+    // wired the axis cannot be recovered and the route would answer the
+    // axis-less form for a harness reason rather than a production one.
+    let router = router(with_provenance_hold_hydration(&ctx));
+    let path = if sidecar {
+        "/maven/mvn/com/example/foo/1.0/foo-1.0.jar.sha1"
+    } else {
+        "/maven/mvn/com/example/foo/1.0/foo-1.0.jar"
+    };
+    let (status, body) = get(&router, path).await;
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// The file route's refusal, for the shared contract assertions.
+async fn rejected_jar_file(
+    axis: Option<hort_domain::events::RejectionReason>,
+) -> (StatusCode, serde_json::Value) {
+    rejected_jar_response(axis, false).await
+}
+
+/// **Every** `RejectionReason` variant reaches a Maven client as its own
+/// `wire_kind()` token, iterated off `ALL_KIND_SAMPLES` rather than a
+/// hand-written list — so a variant added tomorrow is covered the moment
+/// it joins that constant, and cannot reach a client undecided.
+#[tokio::test]
+async fn rejected_file_get_403_names_the_axis_for_every_variant() {
+    assert_axis_is_the_wire_kind_for_every_variant(rejected_jar_file).await;
+}
+
+/// The refusal is a diagnosis of an artifact, not a disclosure about a
+/// person, a rule, or a weakness. Asserted over every variant, which is
+/// what makes it meaningful: `Curator { curator_id }` and
+/// `CurationRetroactive { rule_id }` are the two that carry a uuid, so a
+/// body built from the payload rather than the discriminator would leak
+/// here and nowhere else.
+#[tokio::test]
+async fn rejected_file_get_403_leaks_no_uuid_and_no_cve_identifier() {
+    assert_refusal_leaks_no_uuid_or_cve(rejected_jar_file).await;
+}
+
+/// ADR 0039 D6's illegal state: the projection says `Rejected` and no
+/// `ArtifactRejected` stands behind it on the stream. The caller is still
+/// refused — but no axis field is emitted and no `unknown` token is
+/// invented, because a token would make an inconsistency read as a
+/// verdict.
+#[tokio::test]
+async fn rejected_file_get_without_an_axis_on_the_stream_names_none() {
+    assert_axis_less_refusal_emits_no_axis_field(rejected_jar_file).await;
+}
+
+/// Design §11's inheritance, now that the refusal carries a reason: a
+/// checksum sidecar's answer must still be its target file's, **body
+/// included**. An axis the file named and the sidecar did not would be
+/// the first place the two routes diverged, and the one a build tool
+/// chasing a failed dependency would see.
+#[tokio::test]
+async fn sidecar_of_rejected_file_inherits_the_axis_the_file_names() {
+    use hort_domain::events::RejectionReason;
+    for sample in RejectionReason::ALL_KIND_SAMPLES {
+        let file = rejected_jar_response(Some(sample.clone()), false).await;
+        let sidecar = rejected_jar_response(Some(sample.clone()), true).await;
+        assert_eq!(
+            sidecar, file,
+            "sidecar must inherit the file's answer for {sample:?}"
+        );
+        assert_eq!(file.1["axis"], sample.wire_kind());
+    }
+}
+
+/// ADR 0039 D5 — a quarantined jar still waiting on a signature after its
+/// observation window elapsed has no deadline to advertise: what it waits
+/// for is an external event, not the clock. Before this, Maven answered
+/// `Retry-After: 1` on every pull of such a jar, forever.
+#[tokio::test]
+async fn indefinite_hold_file_get_is_503_with_no_retry_after() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    let repo = insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    seed_indefinite_hold_policy(&mocks.policy_projections, repo.id);
+    // No `ProvenanceVerified` seeded on the artifact's stream, so the
+    // read-path clearance stays `Pending` under `Required`.
+    insert_file(
+        &mocks,
+        repo.id,
+        "com.example:foo",
+        "1.0",
+        "com/example/foo/1.0/foo-1.0.jar",
+        b"x",
+        QuarantineStatus::Quarantined,
+    );
+    let router = router(with_provenance_hold_hydration(&ctx));
+
+    let res = router
+        .oneshot(
+            Request::get("/maven/mvn/com/example/foo/1.0/foo-1.0.jar")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        res.headers().get("Retry-After").is_none(),
+        "an unsigned hold past its window has no self-resolving deadline"
+    );
+    let body = to_bytes(res.into_body(), 4096).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // Same body as the time-bounded hold: which hold this is stays opaque
+    // to the client.
+    assert_eq!(parsed["error"], "artifact is quarantined");
+}
+
+/// The converse, on the same wiring: a hold still inside its window has a
+/// real deadline, so its `Retry-After` is correct and useful and must
+/// survive.
+#[tokio::test]
+async fn hold_inside_its_window_file_get_keeps_its_retry_after() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    let repo = insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    seed_timed_hold_policy(&mocks.policy_projections, repo.id);
+    insert_file(
+        &mocks,
+        repo.id,
+        "com.example:foo",
+        "1.0",
+        "com/example/foo/1.0/foo-1.0.jar",
+        b"x",
+        QuarantineStatus::Quarantined,
+    );
+    let router = router(with_provenance_hold_hydration(&ctx));
+
+    let res = router
+        .oneshot(
+            Request::get("/maven/mvn/com/example/foo/1.0/foo-1.0.jar")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let secs: i64 = res
+        .headers()
+        .get("Retry-After")
+        .expect("an in-window hold keeps its computed Retry-After")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (1..=3600).contains(&secs),
+        "retry-after out of range: {secs}"
+    );
 }
 
 #[tokio::test]

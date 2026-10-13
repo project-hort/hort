@@ -14,9 +14,10 @@
 //!
 //! ## What these helpers do NOT do
 //!
-//! - Neither handles the `Rejected` case. Rejected artifacts are
-//!   mapped to format-specific hidden-404 envelopes (`BLOB_UNKNOWN` /
-//!   `MANIFEST_UNKNOWN`); the caller decides which one to emit.
+//! - Neither handles the `Rejected` case. That arm answers `403`
+//!   `DENIED` naming the rejection axis, and the subject it names is
+//!   route-specific (a blob digest, a manifest reference), so each
+//!   caller builds its own `OciError::ArtifactRejected`.
 //! - Neither handles `None` / `Released`. Those arms fall through to
 //!   the happy path in the caller's own match; there is nothing for
 //!   this module to build.
@@ -34,12 +35,13 @@ use super::error::OciError;
 ///
 /// This is a "the deadline is genuinely unknown" constant, not a guess at
 /// the window, and it is unrelated to any configured
-/// `quarantineDuration`. Every path that resolves an artifact for a read
-/// now hydrates the deadline
+/// `quarantineDuration`. **Every** path that resolves an artifact for a
+/// read hydrates the deadline — the three visibility-checked loaders
 /// (`ArtifactUseCase::find_visible_by_path` / `find_visible_by_id` /
-/// `find_in_repo_by_hash`), and both `IngestUseCase` mint paths stamp it
-/// from the window they just derived, so the two states that still reach
-/// this constant are narrow:
+/// `find_in_repo_by_hash`) and `get_by_id`, which `blobs.rs`'s
+/// bounded-await poll loop re-reads through and whose row it returns when
+/// the bound is exhausted — and both `IngestUseCase` mint paths stamp it
+/// from the window they just derived. So one state reaches this constant:
 ///
 /// - a `Quarantined` row carrying **no** `quarantine_window_start`. The
 ///   schema permits it (the column is nullable and no CHECK ties it to
@@ -48,13 +50,29 @@ use super::error::OciError;
 ///   outside the release sweep's candidacy filter
 ///   (`quarantine_window_start IS NOT NULL`), so "unknown" is the honest
 ///   answer rather than a computed one.
-/// - `blobs.rs`'s bounded-await poll loop, which re-reads through
-///   `ArtifactUseCase::get_by_id` — a deliberately plain row read that
-///   does not hydrate — and returns that row when the bound is exhausted.
-///   Only reachable for a window that has ALREADY elapsed, which is the
-///   state whose honest computed header is the useless `Retry-After: 1`
-///   the clamp below produces; the two belong to one fix, not to this
-///   constant.
+///
+/// An anchored hold whose window has ALREADY elapsed — the state the poll
+/// loop's fallback is reachable in — therefore does not land here any
+/// more. It answers from its own window: the past-deadline clamp below
+/// when the hold still resolves itself with the passage of time (the
+/// artifact's own scan verdict is what is outstanding), and no header at
+/// all when it does not, because `provenance_hold_indefinite` is hydrated
+/// on that path too (ADR 0039 D5).
+///
+/// On the OCI blob route that last clause is narrower than it sounds,
+/// and worth not over-reading. The population it describes — an
+/// elapsed window under `provenance_mode: Required` with the gate still
+/// `Pending` — is exactly what `blobs.rs::maybe_bounded_await_release`'s
+/// provenance-blocked guard detects via
+/// `QuarantineUseCase::release_blocked_on_provenance`, and that guard
+/// returns **before** the poll loop. So for that population the row the
+/// refusal answers from is `find_visible_by_path`'s, hydrated on the way
+/// in, and the loop never runs. What `get_by_id`'s hydration closes here
+/// is the guard's **fail-safe** path: the guard treats a clearance-read
+/// error as "not blocked" so it can never introduce a new hold, the wait
+/// then runs against an artifact that will not be released inside the
+/// bound, and the row it hands back at exhaustion is the one that has to
+/// carry the flag. The manifest route has no such loop at all.
 const DEFAULT_QUARANTINE_RETRY_AFTER_SECS: i64 = 3600;
 
 /// Build the `Quarantined` 503 response and emit the

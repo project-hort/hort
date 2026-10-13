@@ -33,7 +33,9 @@ use crate::metrics::{
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_hold::resolve_transient_hold;
+use crate::use_cases::read_artifact_stream;
 use crate::use_cases::repository_access::{AccessLevel, RepositoryAccessUseCase};
+use crate::use_cases::scan_history::last_rejection_reason;
 
 /// Opt-in download-audit gate.
 ///
@@ -97,16 +99,36 @@ pub struct ArtifactUseCase {
     /// [`Self::with_policy_projections`], so that warning is a
     /// test-harness signal, never a deployed one.
     policy_projections: Option<Arc<dyn PolicyProjectionRepository>>,
-    /// Read-only event-store handle consumed by
-    /// [`Self::hydrate_quarantine_deadline`] to resolve the provenance
-    /// side of the release gate for an already-expired hold (ADR 0039's
-    /// 2026-09-12 amendment, D5). Same optional-builder shape as
-    /// [`Self::policy_projections`]: `None` leaves
-    /// [`Artifact::provenance_hold_indefinite`] `false`, i.e. the
-    /// pre-amendment behaviour (every hold advertises a computed
-    /// `Retry-After`). The production composition root always wires it
-    /// via [`Self::with_provenance_clearance_events`].
-    provenance_clearance_events: Option<Arc<dyn EventStore>>,
+    /// Read-only event-store handle for **the artifact's own stream**,
+    /// consumed by [`Self::hydrate_quarantine_deadline`] to resolve the
+    /// transient read-path fields that are derived from it rather than
+    /// stored on the `artifacts` projection. Two consumers today, both
+    /// reading the same stream of the same artifact for the same kind of
+    /// field:
+    ///
+    /// - [`Artifact::provenance_hold_indefinite`] — whether an
+    ///   already-expired hold is waiting on a signature rather than on
+    ///   the clock (ADR 0039 D5); and
+    /// - [`Artifact::rejection_reason`] — the axis a `Rejected` artifact
+    ///   was rejected on, which no `row -> Artifact` load can carry
+    ///   (`hort-adapters-postgres`'s mapper yields `None`
+    ///   unconditionally) and which the format crates must not read a
+    ///   stream for themselves (ADR 0008).
+    ///
+    /// One handle rather than one per consumer: the type is a plain
+    /// [`EventStore`] and a second field would wire the identical handle
+    /// twice and let the two drift.
+    ///
+    /// Same optional-builder shape as [`Self::policy_projections`]:
+    /// `None` leaves both fields at their load-time defaults —
+    /// `provenance_hold_indefinite` stays `false` (the pre-amendment
+    /// behaviour: every hold advertises a computed `Retry-After`) and
+    /// `rejection_reason` stays unset, which
+    /// [`Self::hydrate_rejection_reason`] warns about because an unwired
+    /// port is not an answer about the stream. The production
+    /// composition root always wires it via
+    /// [`Self::with_artifact_stream_events`].
+    artifact_stream_events: Option<Arc<dyn EventStore>>,
 }
 
 impl ArtifactUseCase {
@@ -125,17 +147,20 @@ impl ArtifactUseCase {
             artifact_metadata: None,
             audit_events: None,
             policy_projections: None,
-            provenance_clearance_events: None,
+            artifact_stream_events: None,
         }
     }
 
-    /// Wire the read-only [`EventStore`] handle consumed by
-    /// [`Self::hydrate_quarantine_deadline`] to decide whether an
-    /// already-expired hold is waiting on a signature (ADR 0039 D5). See
-    /// [`Self::with_repository_access`] for the optional-field rationale.
+    /// Wire the read-only [`EventStore`] handle
+    /// [`Self::hydrate_quarantine_deadline`] reads the artifact's own
+    /// stream through — the provenance side of an expired hold (ADR 0039
+    /// D5) and the rejection axis of a `Rejected` artifact. See
+    /// [`Self::artifact_stream_events`] for why both consumers share one
+    /// handle, and [`Self::with_repository_access`] for the
+    /// optional-field rationale.
     #[must_use]
-    pub fn with_provenance_clearance_events(mut self, events: Arc<dyn EventStore>) -> Self {
-        self.provenance_clearance_events = Some(events);
+    pub fn with_artifact_stream_events(mut self, events: Arc<dyn EventStore>) -> Self {
+        self.artifact_stream_events = Some(events);
         self
     }
 
@@ -210,10 +235,39 @@ impl ArtifactUseCase {
         format.unwrap_or(values::FORMAT_UNKNOWN).to_string()
     }
 
-    /// Get an artifact by ID.
+    /// Load an artifact by id with its transient read-path fields
+    /// resolved — the quarantine deadline, the ADR 0039 D5
+    /// "no self-resolving deadline" flag, and a `Rejected` row's
+    /// rejection axis.
+    ///
+    /// All three of those are resolved by
+    /// [`Self::hydrate_quarantine_deadline`], the one hydration point
+    /// [`Self::find_visible_by_path`] / [`Self::find_visible_by_id`] /
+    /// [`Self::find_in_repo_by_hash`] also take, so a consumer cannot
+    /// tell from the row which load path produced it. That is the
+    /// load-bearing property, not a tidiness one: `hort-http-oci`'s
+    /// bounded-await poll loop (`maybe_bounded_await_release`) refreshes
+    /// a visibility-checked row through this method and feeds the result
+    /// into the same handler gate, so an unhydrated return here would
+    /// make the OCI refusal of a blob rejected *inside* the wait answer
+    /// without its axis — and fire the D6 `error!` as a false alarm on a
+    /// perfectly healthy rejection.
+    ///
+    /// **Authorization is the caller's.** This is the one loader that
+    /// checks no repository visibility: its production caller re-reads a
+    /// row it already resolved through `find_visible_by_path`. A
+    /// request-supplied id belongs in [`Self::find_visible_by_id`].
+    ///
+    /// Costs exactly what the hydration costs: nothing beyond the row
+    /// read for a status that is neither `Quarantined` nor `Rejected`;
+    /// one policy resolution for a held row, plus one bounded stream read
+    /// once that hold's window has elapsed under
+    /// `provenance_mode: Required`; one bounded stream read for a
+    /// `Rejected` row. A caller polling in a loop pays that per poll.
     #[tracing::instrument(skip(self))]
     pub async fn get_by_id(&self, id: Uuid) -> AppResult<Artifact> {
-        Ok(self.artifacts.find_by_id(id).await?)
+        let artifact = self.artifacts.find_by_id(id).await?;
+        self.hydrate_quarantine_deadline(artifact).await
     }
 
     /// Find an artifact by SHA-256 checksum.
@@ -724,6 +778,9 @@ impl ArtifactUseCase {
         else {
             artifact.quarantine_deadline = None;
             artifact.provenance_hold_indefinite = false;
+            if artifact.quarantine_status == QuarantineStatus::Rejected {
+                self.hydrate_rejection_reason(&mut artifact).await;
+            }
             return Ok(artifact);
         };
 
@@ -735,12 +792,104 @@ impl ArtifactUseCase {
             anchor,
             duration,
             policy.map(|p| p.provenance_mode).unwrap_or_default(),
-            self.provenance_clearance_events.as_deref(),
+            self.artifact_stream_events.as_deref(),
         )
         .await?;
         artifact.quarantine_deadline = Some(hold.deadline);
         artifact.provenance_hold_indefinite = hold.hold_indefinite;
         Ok(artifact)
+    }
+
+    /// Hydrate the transient [`Artifact::rejection_reason`] — the axis a
+    /// `Rejected` artifact was rejected on — from the artifact's own
+    /// event stream.
+    ///
+    /// The axis is not a column: `hort-adapters-postgres`'s one
+    /// `row -> Artifact` mapper yields `rejection_reason: None`
+    /// unconditionally, so every freshly-loaded row arrives here without
+    /// it, and the only record of the axis is the `ArtifactRejected`
+    /// event on the stream. A format crate cannot read that stream for
+    /// itself (ADR 0008), which is why the answer is resolved here, at
+    /// the one read-path hydration point, for every format's load path at
+    /// once. The derivation is
+    /// [`scan_history::last_rejection_reason`](crate::use_cases::scan_history::last_rejection_reason)
+    /// — the single definition every re-deriving caller shares, so a
+    /// read-path answer cannot drift from the one the ADR 0041
+    /// re-evaluation gate decides on.
+    ///
+    /// **`Rejected` only, and deliberately.** A `None` / `Released` read
+    /// pays nothing: this is not called at all. A `Quarantined` read has
+    /// no use for an axis — it has not been rejected — and
+    /// `ScanIndeterminate` is not a `RejectionReason` at all. The cost of
+    /// the one bounded stream read therefore lands exactly where the
+    /// answer is consumed, on a path that is already refusing rather than
+    /// serving bytes.
+    ///
+    /// **A failed look never becomes a refusal's failure.** The caller is
+    /// about to refuse a download; replacing that refusal with a `500`
+    /// because the reason could not be recovered would answer a blocked
+    /// pull with a worse guessing game than the missing axis. So every
+    /// outcome below leaves the artifact servable-as-refused and returns
+    /// nothing, and the three are told apart **in the log**:
+    ///
+    /// - the stream carries an `ArtifactRejected` — the axis is set, no
+    ///   log line;
+    /// - the read succeeded and the stream carries **no**
+    ///   `ArtifactRejected` — `error!`, because that is the illegal state
+    ///   ADR 0039 D6 names (a `Rejected` projection with no rejection on
+    ///   the record cannot be audited or re-derived). This branch is a
+    ///   correct detector of it only because the read actually happened:
+    ///   an un-hydrated `None` says nothing about the stream, so a
+    ///   consumer keying on the field alone would fire on every healthy
+    ///   rejection and bury the one real violation;
+    /// - the read failed, or the stream breached the event cap
+    ///   ([`read_artifact_stream`](crate::use_cases::read_artifact_stream)
+    ///   refuses a prefix it cannot prove reached the tail) — `warn!`
+    ///   naming the failure. Not `error!`: nothing is known to be wrong
+    ///   with the artifact, only that the axis could not be looked up,
+    ///   and collapsing the two would make the D6 line meaningless.
+    ///
+    /// An unwired [`Self::artifact_stream_events`] is a fourth state and
+    /// warns for the same reason [`Self::resolve_quarantine_window`]'s
+    /// unwired arm does: the production composition root always wires the
+    /// port, so the line cannot fire in a deployed binary — it fires in a
+    /// test whose harness left the port out, which is exactly the reader
+    /// who would otherwise read a missing axis as a statement about the
+    /// stream.
+    async fn hydrate_rejection_reason(&self, artifact: &mut Artifact) {
+        let Some(events) = self.artifact_stream_events.as_deref() else {
+            tracing::warn!(
+                artifact_id = %artifact.id,
+                "ArtifactUseCase has no EventStore wired; a Rejected artifact's \
+                 rejection axis cannot be recovered from its stream and the read \
+                 path hands it out unset. Call \
+                 `ArtifactUseCase::with_artifact_stream_events` when building it"
+            );
+            return;
+        };
+        let stream_id = StreamId::artifact(artifact.id);
+        match read_artifact_stream(events, &stream_id).await {
+            Ok(stream) => match last_rejection_reason(&stream) {
+                Some(reason) => artifact.rejection_reason = Some(reason),
+                // ADR 0039 D6: the status is a projection, the stream is
+                // the record. A Rejected row with no ArtifactRejected
+                // behind it is an illegal state, and this is the only
+                // place in the system positioned to notice it on a read.
+                None => tracing::error!(
+                    artifact_id = %artifact.id,
+                    "artifact is Rejected but its event stream carries no \
+                     ArtifactRejected: the status has no record behind it, so the \
+                     rejection cannot be audited or re-derived (ADR 0039 D6)"
+                ),
+            },
+            Err(err) => tracing::warn!(
+                artifact_id = %artifact.id,
+                error = %err,
+                "could not read a Rejected artifact's event stream; the rejection \
+                 axis is handed out unset. Nothing is known to be wrong with the \
+                 artifact itself — only that the axis could not be looked up"
+            ),
+        }
     }
 
     /// Resolve the active scan policy for `repository_id` together with
@@ -2864,10 +3013,12 @@ mod visibility_extension_tests {
     use crate::rbac::RbacEvaluator;
     use crate::use_cases::repository_access::{AccessLevel, RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{
-        sample_artifact, sample_repository, MockArtifactMetadataRepository, MockArtifactRepository,
-        MockEventStore, MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
+        dummy_persisted_event, persisted_artifact_rejected, sample_artifact, sample_repository,
+        MockArtifactMetadataRepository, MockArtifactRepository, MockEventStore,
+        MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
         StubFormatHandler, VALID_SHA256,
     };
+    use crate::use_cases::STREAM_EVENT_CAP;
 
     // -- helpers -----------------------------------------------------------
 
@@ -3414,13 +3565,19 @@ mod visibility_extension_tests {
     }
 
     /// Seed one `Quarantined` artifact whose anchor is `anchor_age_secs`
-    /// old under a `window_secs` window and hydrate it. `verified`
-    /// controls whether a `ProvenanceVerified` sits on its stream.
-    async fn hydrated_required_hold(
+    /// old under a `window_secs` `Required`-provenance window, and return
+    /// it with the use case built around it. `verified` controls whether a
+    /// `ProvenanceVerified` sits on its stream.
+    ///
+    /// Returns the pair rather than a hydrated artifact so a test can pick
+    /// the load path: the ADR 0039 D5 flag is resolved by the one
+    /// hydration point, so every loader must report it identically and a
+    /// fixture that picked the loader for the test could not say so.
+    fn required_hold_use_case(
         window_secs: i64,
         anchor_age_secs: i64,
         verified: bool,
-    ) -> Artifact {
+    ) -> (ArtifactUseCase, Artifact) {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let storage = Arc::new(MockStoragePort::new());
         let repos = Arc::new(MockRepositoryRepository::new());
@@ -3471,7 +3628,18 @@ mod visibility_extension_tests {
 
         let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
             .with_policy_projections(policies)
-            .with_provenance_clearance_events(events);
+            .with_artifact_stream_events(events);
+        (uc, a)
+    }
+
+    /// [`required_hold_use_case`]'s artifact as the visibility-checked
+    /// read path hands it out.
+    async fn hydrated_required_hold(
+        window_secs: i64,
+        anchor_age_secs: i64,
+        verified: bool,
+    ) -> Artifact {
+        let (uc, a) = required_hold_use_case(window_secs, anchor_age_secs, verified);
         uc.find_visible_by_id(a.id, None).await.unwrap().1
     }
 
@@ -3486,6 +3654,54 @@ mod visibility_extension_tests {
         // the flag is derived from, and dropping it would change what
         // every other consumer reads.
         assert!(got.quarantine_deadline.is_some());
+    }
+
+    /// The same hold reached through `get_by_id` — the authz-free loader
+    /// the OCI bounded-await poll loop refreshes through, and the row that
+    /// loop hands back when its bound is exhausted. The D5 answer has to
+    /// be the same one the visibility-checked read gives, because the
+    /// handler gate it feeds is the same gate: a `false` here would
+    /// advertise `Retry-After` on a hold that resolves on a signature
+    /// rather than on the clock.
+    #[tokio::test]
+    async fn get_by_id_marks_an_unsigned_required_hold_past_its_window_as_indefinite() {
+        let (uc, a) = required_hold_use_case(1, 60, false);
+        let got = uc.get_by_id(a.id).await.unwrap();
+
+        assert!(got.provenance_hold_indefinite);
+        // The deadline rides along, exactly as on the other three paths —
+        // it is the elapsed-ness the flag is derived from, and a consumer
+        // reading one without the other would see a hold with no window.
+        assert!(got.quarantine_deadline.is_some());
+    }
+
+    /// The four load paths are one contract, asserted over **one**
+    /// fixture: the same artifact, read both ways, agrees field for field.
+    ///
+    /// Two separate fixtures could not say this — the deadline is derived
+    /// from the row's own anchor, so comparing across fixtures compares
+    /// two different instants and the assertion would hold for a loader
+    /// that resolved nothing. Reading the same row twice is what makes
+    /// `quarantine_deadline` an equality rather than an `is_some`.
+    #[tokio::test]
+    async fn get_by_id_resolves_the_same_transient_fields_as_the_visible_loader() {
+        let (uc, a) = required_hold_use_case(1, 60, false);
+
+        let authz_free = uc.get_by_id(a.id).await.unwrap();
+        let visibility_checked = uc.find_visible_by_id(a.id, None).await.unwrap().1;
+
+        assert_eq!(
+            authz_free.quarantine_deadline,
+            visibility_checked.quarantine_deadline
+        );
+        assert_eq!(
+            authz_free.provenance_hold_indefinite,
+            visibility_checked.provenance_hold_indefinite
+        );
+        assert_eq!(
+            authz_free.rejection_reason,
+            visibility_checked.rejection_reason
+        );
     }
 
     /// Still inside its window: the deadline is real and the hold is not
@@ -3528,7 +3744,7 @@ mod visibility_extension_tests {
 
         let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
             .with_policy_projections(policies)
-            .with_provenance_clearance_events(events.clone());
+            .with_artifact_stream_events(events.clone());
         let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
 
         assert!(!got.provenance_hold_indefinite);
@@ -3560,7 +3776,7 @@ mod visibility_extension_tests {
         a.quarantine_window_start = Some(Utc::now() - chrono::Duration::seconds(60));
         artifacts.insert(a.clone());
 
-        // No .with_provenance_clearance_events(..) — deliberately unwired.
+        // No .with_artifact_stream_events(..) — deliberately unwired.
         let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
             .with_policy_projections(policies);
         let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
@@ -3591,11 +3807,465 @@ mod visibility_extension_tests {
 
         let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
             .with_policy_projections(policies)
-            .with_provenance_clearance_events(events.clone());
+            .with_artifact_stream_events(events.clone());
         let (_, got) = uc.find_visible_by_id(a.id, None).await.unwrap();
 
         assert!(!got.provenance_hold_indefinite);
         assert_eq!(events.read_stream_call_count(), 0);
+    }
+
+    // -- rejection_reason (the read path's rejection axis) -----------------
+
+    /// The captured lines at `level` that this module emitted.
+    ///
+    /// The capture layer filters nothing, so selecting by `target` is
+    /// what keeps an assertion about *this* hydration's logging from
+    /// passing (or failing) on a line some other module wrote — the
+    /// unwired `policy_projections` warning in
+    /// `resolve_quarantine_window` sits one call away from every case
+    /// below.
+    fn our_lines(
+        captured: &[crate::use_cases::test_support::tracing_capture::CapturedEvent],
+        level: tracing::Level,
+    ) -> Vec<crate::use_cases::test_support::tracing_capture::CapturedEvent> {
+        captured
+            .iter()
+            .filter(|e| {
+                e.level == level
+                    && e.target
+                        .starts_with("hort_app::use_cases::artifact_use_case")
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Seed one `Rejected` artifact under the public repo `alpha` and
+    /// build the use case around it. The artifact's stream starts empty;
+    /// each test seeds through the returned handle.
+    ///
+    /// The seeded entity deliberately carries
+    /// `rejection_reason: Some(Scanner)` while every test below seeds a
+    /// **`Curator`** rejection on the stream. The two differ so an
+    /// assertion on `Curator` can only be satisfied by the stream: the
+    /// repository read clears the entity's value (mirroring the
+    /// projection load, which has no such column), and a hydration that
+    /// read the row instead would answer `Scanner`.
+    fn rejected_axis_fixture(
+        wire_events: bool,
+    ) -> (ArtifactUseCase, Artifact, Arc<MockEventStore>) {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let events = Arc::new(MockEventStore::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Rejected;
+        a.rejection_reason = Some(hort_domain::events::RejectionReason::Scanner);
+        artifacts.insert(a.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        let uc = if wire_events {
+            uc.with_artifact_stream_events(events.clone())
+        } else {
+            uc
+        };
+        (uc, a, events)
+    }
+
+    /// A `Rejected` artifact's stream, carrying a terminal
+    /// `ArtifactRejected` on `reason` behind one unrelated event.
+    fn rejected_stream(
+        artifact_id: Uuid,
+        reason: hort_domain::events::RejectionReason,
+    ) -> Vec<hort_domain::events::PersistedEvent> {
+        let stream_id = StreamId::artifact(artifact_id);
+        vec![
+            dummy_persisted_event(&stream_id, artifact_id, 0),
+            persisted_artifact_rejected(artifact_id, reason, 1),
+        ]
+    }
+
+    fn curator_rejection() -> hort_domain::events::RejectionReason {
+        hort_domain::events::RejectionReason::Curator {
+            curator_id: Uuid::new_v4(),
+        }
+    }
+
+    /// The unit's point: a `Rejected` artifact comes off the read path
+    /// carrying the axis it was rejected on, derived from its own
+    /// `ArtifactRejected` event through the one shared definition
+    /// (`scan_history::last_rejection_reason`).
+    ///
+    /// Asserting `Curator` — not the `Scanner` the seeded row carried —
+    /// is what pins the *stream* as the source.
+    #[tokio::test]
+    async fn rejected_read_hydrates_the_axis_from_the_stream() {
+        let (uc, a, events) = rejected_axis_fixture(true);
+        let reason = curator_rejection();
+        events.set_stream(
+            &StreamId::artifact(a.id),
+            rejected_stream(a.id, reason.clone()),
+        );
+
+        let (_, got) = uc
+            .find_visible_by_path("alpha", &a.path, None)
+            .await
+            .unwrap();
+
+        assert_eq!(got.rejection_reason, Some(reason));
+        assert_eq!(
+            events.read_stream_call_count(),
+            1,
+            "one bounded stream read per refusal, not two"
+        );
+    }
+
+    /// All **four** load paths a format crate reaches a stored artifact
+    /// through hydrate the axis, because all four go through the one
+    /// hydration point. The five formats' download routes bottom out in
+    /// these: path lookup, id lookup, the post-coalesce repo-scoped hash
+    /// recovery read every pull-through tail takes — and the authz-free
+    /// `get_by_id`, which the OCI bounded-await poll loop refreshes a
+    /// held blob through and whose row reaches the refusal gate when the
+    /// bound is exhausted.
+    ///
+    /// The fourth is the one an operator is most likely to meet: a layer
+    /// blocked mid-`docker pull` on a pull-through repository, rejected
+    /// by its own scan inside the wait.
+    #[tokio::test]
+    async fn every_rejected_load_path_hydrates_the_axis() {
+        let (uc, a, events) = rejected_axis_fixture(true);
+        let reason = curator_rejection();
+        events.set_stream(
+            &StreamId::artifact(a.id),
+            rejected_stream(a.id, reason.clone()),
+        );
+
+        let by_path = uc
+            .find_visible_by_path("alpha", &a.path, None)
+            .await
+            .unwrap()
+            .1;
+        let by_id = uc.find_visible_by_id(a.id, None).await.unwrap().1;
+        let by_hash = uc
+            .find_in_repo_by_hash(a.repository_id, &a.sha256_checksum)
+            .await
+            .unwrap()
+            .expect("the seeded row is in this repo");
+        let plain_by_id = uc.get_by_id(a.id).await.unwrap();
+
+        for (label, got) in [
+            ("find_visible_by_path", by_path),
+            ("find_visible_by_id", by_id),
+            ("find_in_repo_by_hash", by_hash),
+            ("get_by_id", plain_by_id),
+        ] {
+            assert_eq!(got.rejection_reason, Some(reason.clone()), "{label}");
+        }
+    }
+
+    /// The unit's own acceptance, stated on its own: a `Rejected`
+    /// artifact read through `get_by_id` carries the axis it was rejected
+    /// on, and the answer comes from the **stream**.
+    ///
+    /// `rejected_axis_fixture` seeds the row with `Scanner` and this test
+    /// asserts `Curator`, so only the stream can satisfy it: the
+    /// repository read clears the entity's field exactly as the Postgres
+    /// `row -> Artifact` mapper does (there is no such column), and a
+    /// loader that answered from the row would say `Scanner`.
+    #[tokio::test]
+    async fn get_by_id_rejected_hydrates_the_axis_from_the_stream() {
+        let (uc, a, events) = rejected_axis_fixture(true);
+        let reason = curator_rejection();
+        events.set_stream(
+            &StreamId::artifact(a.id),
+            rejected_stream(a.id, reason.clone()),
+        );
+
+        let got = uc.get_by_id(a.id).await.unwrap();
+
+        assert_eq!(got.rejection_reason, Some(reason));
+        assert_eq!(
+            events.read_stream_call_count(),
+            1,
+            "one bounded stream read per refusal, not two"
+        );
+    }
+
+    /// ADR 0039 D6: a `Rejected` projection whose stream carries no
+    /// `ArtifactRejected` is an illegal state, and this hydration is the
+    /// first place a read can notice it. The refusal still refuses — the
+    /// call returns `Ok` with the axis unset — and the line is `error!`.
+    ///
+    /// This branch is a correct D6 detector only because the read
+    /// happened: before the hydration, every healthy rejection also
+    /// carried `None`.
+    ///
+    /// Driven through the visibility-checked loader **and** through
+    /// `get_by_id` in one capture: extending the hydration's reach to the
+    /// fourth load path has to extend the detector with it, not silence
+    /// it there. Each read fires its own line, so the count is the
+    /// assertion — a path that reported the illegal state as a healthy
+    /// rejection would leave one behind.
+    #[test]
+    fn rejected_read_with_no_rejection_on_the_stream_logs_the_d6_illegal_state() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let (got, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (uc, a, events) = rejected_axis_fixture(true);
+                let stream_id = StreamId::artifact(a.id);
+                // A stream with history but no rejection on it.
+                events.set_stream(&stream_id, vec![dummy_persisted_event(&stream_id, a.id, 0)]);
+                let by_path = uc
+                    .find_visible_by_path("alpha", &a.path, None)
+                    .await
+                    .unwrap()
+                    .1;
+                let plain_by_id = uc.get_by_id(a.id).await.unwrap();
+                (by_path, plain_by_id)
+            })
+        });
+
+        assert_eq!(got.0.rejection_reason, None);
+        assert_eq!(got.1.rejection_reason, None);
+        let lines = our_lines(&captured, tracing::Level::ERROR);
+        assert_eq!(
+            lines.len(),
+            2,
+            "both load paths must report the illegal state: {captured:#?}"
+        );
+        for line in &lines {
+            assert!(
+                line.message().contains("carries no ArtifactRejected"),
+                "the error must name what is missing: {line:#?}"
+            );
+        }
+        assert!(
+            our_lines(&captured, tracing::Level::WARN).is_empty(),
+            "a read that succeeded must not also warn — the two None cases have to \
+             stay distinguishable in the log: {captured:#?}"
+        );
+    }
+
+    /// A healthy rejection logs nothing at all — in particular not the
+    /// D6 `error!`, which is what makes that line a usable signal for a
+    /// consumer rather than noise on every refusal.
+    #[test]
+    fn a_hydrated_axis_logs_neither_the_d6_error_nor_a_warning() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let (got, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (uc, a, events) = rejected_axis_fixture(true);
+                events.set_stream(
+                    &StreamId::artifact(a.id),
+                    rejected_stream(a.id, curator_rejection()),
+                );
+                uc.find_visible_by_path("alpha", &a.path, None)
+                    .await
+                    .unwrap()
+                    .1
+            })
+        });
+
+        assert!(got.rejection_reason.is_some());
+        assert!(
+            our_lines(&captured, tracing::Level::ERROR).is_empty()
+                && our_lines(&captured, tracing::Level::WARN).is_empty(),
+            "a recovered axis is the silent case: {captured:#?}"
+        );
+    }
+
+    /// A failed stream read degrades: the axis stays unset, the caller
+    /// still gets its artifact (a refusal must still refuse rather than
+    /// turning into a `500`), and the line is `warn!` — NOT the D6
+    /// `error!`, because nothing is known about the stream.
+    #[test]
+    fn rejected_read_with_a_failing_stream_read_warns_and_still_answers() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let (got, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (uc, a, events) = rejected_axis_fixture(true);
+                events.set_stream(
+                    &StreamId::artifact(a.id),
+                    rejected_stream(a.id, curator_rejection()),
+                );
+                events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+                uc.find_visible_by_path("alpha", &a.path, None)
+                    .await
+                    .expect("a stream-read failure must not fail the read path")
+                    .1
+            })
+        });
+
+        assert_eq!(got.rejection_reason, None);
+        let line = our_lines(&captured, tracing::Level::WARN)
+            .pop()
+            .unwrap_or_else(|| panic!("expected the read-failure warning; got {captured:#?}"));
+        assert!(
+            line.field("error")
+                .is_some_and(|e| e.contains("event store down")),
+            "the warning must name the read failure: {line:#?}"
+        );
+        assert!(
+            our_lines(&captured, tracing::Level::ERROR).is_empty(),
+            "a read that could not happen is not a D6 violation: {captured:#?}"
+        );
+    }
+
+    /// An over-cap stream is the same degradation: `read_artifact_stream`
+    /// refuses a prefix it cannot prove reached the tail (`Invariant`),
+    /// so the axis stays unset and warns rather than answering from the
+    /// oldest events — where the latest rejection is not necessarily in
+    /// view.
+    #[test]
+    fn rejected_read_over_the_event_cap_warns_rather_than_reading_a_prefix() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let (got, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (uc, a, events) = rejected_axis_fixture(true);
+                let stream_id = StreamId::artifact(a.id);
+                let mut stream: Vec<hort_domain::events::PersistedEvent> = (0..=STREAM_EVENT_CAP)
+                    .map(|pos| dummy_persisted_event(&stream_id, a.id, pos))
+                    .collect();
+                // The rejection is on the stream, and past the cap: an
+                // answer from the readable prefix would be a guess.
+                stream.push(persisted_artifact_rejected(
+                    a.id,
+                    curator_rejection(),
+                    STREAM_EVENT_CAP + 1,
+                ));
+                events.set_stream(&stream_id, stream);
+                uc.find_visible_by_path("alpha", &a.path, None)
+                    .await
+                    .expect("an over-cap stream must not fail the read path")
+                    .1
+            })
+        });
+
+        assert_eq!(got.rejection_reason, None);
+        assert_eq!(
+            our_lines(&captured, tracing::Level::WARN).len(),
+            1,
+            "the over-cap refusal is a could-not-look, so it warns: {captured:#?}"
+        );
+        assert!(our_lines(&captured, tracing::Level::ERROR).is_empty());
+    }
+
+    /// The event-store handle unwired (a test-harness state; the
+    /// production composition root always wires it): the axis stays
+    /// unset and the line warns, because an unwired port is not an
+    /// answer about the stream either.
+    #[test]
+    fn rejected_read_without_the_events_port_warns_and_leaves_the_axis_unset() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let (got, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (uc, a, _events) = rejected_axis_fixture(false);
+                uc.find_visible_by_path("alpha", &a.path, None)
+                    .await
+                    .unwrap()
+                    .1
+            })
+        });
+
+        assert_eq!(got.rejection_reason, None);
+        let line = our_lines(&captured, tracing::Level::WARN)
+            .into_iter()
+            .find(|l| l.message().contains("with_artifact_stream_events"))
+            .unwrap_or_else(|| panic!("expected the unwired-port warning; got {captured:#?}"));
+        assert!(line.field("artifact_id").is_some());
+        assert!(
+            our_lines(&captured, tracing::Level::ERROR).is_empty(),
+            "an unwired port is not a D6 violation: {captured:#?}"
+        );
+    }
+
+    /// D3, measured: `Rejected` is the only status that pays the axis
+    /// read. The `None` / `Released` hot path and a `Quarantined` read
+    /// (which has no use for an axis) make zero stream reads, so the one
+    /// bounded read lands exactly where the answer is consumed — on a
+    /// path that is already refusing rather than serving bytes.
+    #[tokio::test]
+    async fn only_a_rejected_read_pays_the_axis_stream_read() {
+        for status in [
+            QuarantineStatus::None,
+            QuarantineStatus::Released,
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::ScanIndeterminate,
+            QuarantineStatus::Rejected,
+        ] {
+            let artifacts = Arc::new(MockArtifactRepository::new());
+            let storage = Arc::new(MockStoragePort::new());
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let metadata = Arc::new(MockArtifactMetadataRepository::new());
+            let events = Arc::new(MockEventStore::new());
+            let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+            let repo = public_repo("alpha");
+            let repo_id = repo.id;
+            repos.insert(repo);
+
+            let mut a = artifact_in_repo(repo_id, "pkg/1.0.0/pkg.tar.gz", VALID_SHA256);
+            a.quarantine_status = status;
+            // An anchor on every row, so the `Quarantined` case takes
+            // the full hold resolution rather than the no-anchor
+            // shortcut — the mode it resolves to is the default
+            // `VerifyIfPresent`, which needs no stream either.
+            a.quarantine_window_start = Some(Utc::now() - chrono::Duration::days(1));
+            artifacts.insert(a.clone());
+
+            let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+                .with_policy_projections(policies.clone())
+                .with_artifact_stream_events(events.clone());
+            uc.find_visible_by_id(a.id, None).await.unwrap();
+
+            let expected = usize::from(status == QuarantineStatus::Rejected);
+            assert_eq!(
+                events.read_stream_call_count(),
+                expected,
+                "{status} must make {expected} stream read(s) on the read path"
+            );
+            // The axis read rides the early-return branch, which still
+            // runs *before* the window resolution — so a refusal pays no
+            // policy-port call either, and the one status that does is
+            // the one that needs a deadline.
+            let policy_calls = usize::from(status == QuarantineStatus::Quarantined);
+            assert_eq!(
+                policies.list_active_call_count(),
+                policy_calls,
+                "{status} must make {policy_calls} policy-port call(s)"
+            );
+        }
     }
 
     #[tokio::test]

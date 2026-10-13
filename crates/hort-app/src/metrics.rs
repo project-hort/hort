@@ -2150,6 +2150,20 @@ pub enum ProvenanceVerifyResult {
     /// `rejected`, which is why it carries its own label rather than
     /// folding into the window-open hold.
     HeldPendingSubject,
+    /// A `Required`-mode artifact that is the **signature material of a
+    /// subject the verifier accepts** (ADR 0039 D8): the folded verdict
+    /// was `NoAttestation`, and a signature manifest binding this
+    /// artifact's digest had its bundle verified against the subject it
+    /// names, so a cascaded `ProvenanceVerified` was committed instead of
+    /// a hold. Separable from `verified` because the artifact carries no
+    /// direct verification of its own — the authority is another
+    /// artifact's signature — and separable from `held_pending_subject`
+    /// because that subject has now arrived and been checked. A
+    /// `Required` scope publishing cosign signatures shows a steady low
+    /// rate here (two rows per signature: the `{}` config blob and the
+    /// payload layer); a zero rate on such a scope means the signature
+    /// payloads are stranding instead.
+    ClearedSignatureMaterial,
     /// `NoAttestation`×`Required` with a `None` `quarantine_window_start`
     /// on a `None`-status, recently-ingested artifact (issue #90
     /// defense-in-depth): no terminal verdict is applied — the task
@@ -2170,6 +2184,7 @@ impl ProvenanceVerifyResult {
             Self::NoAttestation => "no_attestation",
             Self::HeldPendingSignature => "held_pending_signature",
             Self::HeldPendingSubject => "held_pending_subject",
+            Self::ClearedSignatureMaterial => "cleared_signature_material",
             Self::RequeuedNoAnchor => "requeued_no_anchor",
         }
     }
