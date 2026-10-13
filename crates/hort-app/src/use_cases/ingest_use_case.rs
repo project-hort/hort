@@ -4639,12 +4639,14 @@ impl IngestUseCase {
                 // observation blob is not a laundering bypass. `Released`
                 // and the (structurally unreachable here) `None` also
                 // proceed unchanged.
-                Ok(Some(a))
-                    if matches!(
-                        a.quarantine_status,
-                        QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate
-                    ) =>
-                {
+                //
+                // "Terminally blocked" is read through
+                // `QuarantineStatus::is_terminal` rather than re-matched
+                // here: the class has one wildcard-free definition in the
+                // domain, so a future sixth variant forces a decision
+                // there instead of silently joining the mountable side at
+                // each site that re-spells it.
+                Ok(Some(a)) if a.quarantine_status.is_terminal() => {
                     tracing::info!(
                         source_repository_id = %src,
                         hash = %existing_hash,

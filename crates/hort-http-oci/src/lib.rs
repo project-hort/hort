@@ -63,6 +63,11 @@ pub(crate) mod tail;
 // suites in `manifests` and `blobs`.
 #[cfg(test)]
 pub(crate) mod test_authz;
+// Shared test-only `tracing` capture harness for the handler suites whose
+// invariant is a log line (`manifests_write`'s genuine-Conflict `error!`,
+// `blobs`'s ADR 0039 D6 illegal-state `error!`).
+#[cfg(test)]
+pub(crate) mod test_tracing;
 pub mod upload_session;
 pub mod uploads;
 // Distribution-Spec `/v2/auth` token-exchange handler + the

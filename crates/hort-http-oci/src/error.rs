@@ -137,6 +137,46 @@ pub enum OciError {
     /// here (issue #92). Code is `UNAVAILABLE` — the same spec-extension
     /// as `Quarantined`; no new OCI error code.
     ScanIndeterminate,
+    /// 403 — the artifact exists, the caller passed the repository read
+    /// gate, and it is **`Rejected`**: a terminal verdict was reached
+    /// against it and it will never be served. `subject` is the digest
+    /// (blob) or client reference (manifest) the caller asked for, and
+    /// `axis` is which kind of verdict condemned it —
+    /// `RejectionReason::wire_kind()`'s operator-facing token, the one
+    /// vocabulary the curation queue and the `?reason=` filter already
+    /// speak.
+    ///
+    /// Code is `DENIED`, shared with [`Self::Denied`] exactly as
+    /// [`Self::ScanIndeterminate`] shares `UNAVAILABLE` with
+    /// [`Self::Quarantined`] — the spec defines no code for an
+    /// artifact-state refusal and `DENIED` carries the closest
+    /// semantics. A **separate variant** rather than a reuse of
+    /// `Denied`, because the two are different refusals: `Denied` means
+    /// *you may not access this repository* and carries
+    /// `{ repository, actions }`, while this one is about one artifact
+    /// the caller is entitled to read. Collapsing them would make
+    /// repository-authorization denial and artifact-state denial
+    /// indistinguishable in logs, in metrics, and in every test
+    /// asserting on the code.
+    ///
+    /// `axis` is `None` only for the illegal state ADR 0039 D6 names — a
+    /// `Rejected` projection with no `ArtifactRejected` on the stream
+    /// behind it. The body then carries the subject and no axis field at
+    /// all: there is no `unknown` token, because a token would dress an
+    /// inconsistency up as a verdict.
+    ///
+    /// What the body deliberately does NOT carry: no policy (a
+    /// `RejectionReason` holds none, and resolving the repository's
+    /// effective policy here would mean a new read on a fail-closed
+    /// answer plus a disclosure of operator configuration), no
+    /// `curator_id` and no `rule_id` (an actor and a rule are not a
+    /// diagnosis of an artifact), and no findings or CVE identifiers.
+    /// Axis plus subject is what ends the consumer's search; the next
+    /// action — ask the operator — is the same either way.
+    ArtifactRejected {
+        subject: String,
+        axis: Option<&'static str>,
+    },
     /// 503 — a transient server-side contention hold. The OCI
     /// three-phase blob-upload `initiate` returns this when the
     /// per-`(repo, principal)` session-cap reconcile CAS loop exhausted
@@ -278,6 +318,7 @@ impl OciError {
             Self::ManifestNotAcceptable { .. } => "MANIFEST_UNKNOWN",
             Self::Quarantined { .. } => "UNAVAILABLE",
             Self::ScanIndeterminate => "UNAVAILABLE",
+            Self::ArtifactRejected { .. } => "DENIED",
             Self::Unavailable { .. } => "UNAVAILABLE",
             Self::Internal => "INTERNAL",
             Self::BlobUploadUnknown { .. } => "BLOB_UPLOAD_UNKNOWN",
@@ -312,6 +353,7 @@ impl OciError {
             Self::ManifestNotAcceptable { .. } => StatusCode::NOT_ACCEPTABLE,
             Self::Quarantined { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::ScanIndeterminate => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ArtifactRejected { .. } => StatusCode::FORBIDDEN,
             Self::Unavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
             Self::BlobUploadUnknown { .. } => StatusCode::NOT_FOUND,
@@ -343,6 +385,12 @@ impl OciError {
             Self::ManifestNotAcceptable { .. } => "manifest media type not acceptable".to_string(),
             Self::Quarantined { .. } => "artifact is quarantined".to_string(),
             Self::ScanIndeterminate => "artifact scan result is indeterminate".to_string(),
+            // Fixed literal, matching the `{"error": "artifact is
+            // rejected"}` wording the four non-OCI download routes send
+            // for the same state, so an operator reading two client logs
+            // side by side sees one answer. The axis is structured data
+            // under `detail`, not prose spliced into the message.
+            Self::ArtifactRejected { .. } => "artifact is rejected".to_string(),
             Self::Unavailable { .. } => "service temporarily unavailable".to_string(),
             Self::Internal => "internal error".to_string(),
             Self::BlobUploadUnknown { .. } => "blob upload session unknown".to_string(),
@@ -403,6 +451,14 @@ impl OciError {
             // deadline (see the variant doc). `null` on the wire, same
             // shape as `Unsupported` / `Internal`.
             Self::ScanIndeterminate => None,
+            // Subject always; `axis` only when it is known. An absent
+            // axis omits the key rather than emitting a null or a
+            // placeholder, so a client cannot read "the server does not
+            // know why" as a reason of its own.
+            Self::ArtifactRejected { subject, axis } => Some(match axis {
+                Some(axis) => serde_json::json!({ "subject": subject, "axis": axis }),
+                None => serde_json::json!({ "subject": subject }),
+            }),
             Self::Unavailable {
                 retry_after_seconds,
             } => Some(serde_json::json!({
@@ -851,6 +907,85 @@ mod tests {
             "artifact scan result is indeterminate"
         );
         assert!(parsed["errors"][0]["detail"].is_null());
+    }
+
+    #[tokio::test]
+    async fn artifact_rejected_is_403_denied_with_subject_and_axis_detail() {
+        let (status, body) = body_of(OciError::ArtifactRejected {
+            subject: "sha256:abc".into(),
+            axis: Some("scanner"),
+        })
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["message"], "artifact is rejected");
+        assert_eq!(parsed["errors"][0]["detail"]["subject"], "sha256:abc");
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+    }
+
+    /// The axis-less form: the ADR 0039 D6 illegal state, where the
+    /// projection says `Rejected` and no `ArtifactRejected` stands behind
+    /// it. The key is **absent**, not null and not an `unknown` token — a
+    /// token would dress the inconsistency up as a verdict and a client
+    /// would key on it.
+    #[tokio::test]
+    async fn artifact_rejected_without_axis_omits_the_axis_key_entirely() {
+        let (status, body) = body_of(OciError::ArtifactRejected {
+            subject: "sha256:abc".into(),
+            axis: None,
+        })
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(parsed["errors"][0]["detail"]["subject"], "sha256:abc");
+        assert!(
+            parsed["errors"][0]["detail"].get("axis").is_none(),
+            "an unknown axis omits the key: {body}"
+        );
+    }
+
+    /// The two `DENIED` emitters stay told apart by their `detail` shape.
+    /// Sharing the code is deliberate (the spec defines none for an
+    /// artifact-state refusal), so the detail is the only wire-level
+    /// discriminator a client or a log reader has.
+    #[tokio::test]
+    async fn artifact_rejected_and_repository_denied_share_the_code_not_the_detail() {
+        let (_, rejected) = body_of(OciError::ArtifactRejected {
+            subject: "sha256:abc".into(),
+            axis: Some("curator"),
+        })
+        .await;
+        let (_, denied) = body_of(OciError::Denied {
+            repository: "myrepo".into(),
+            actions: vec!["pull".into()],
+        })
+        .await;
+        let rejected: serde_json::Value = serde_json::from_str(&rejected).unwrap();
+        let denied: serde_json::Value = serde_json::from_str(&denied).unwrap();
+        assert_eq!(rejected["errors"][0]["code"], denied["errors"][0]["code"]);
+        assert!(rejected["errors"][0]["detail"].get("repository").is_none());
+        assert!(denied["errors"][0]["detail"].get("axis").is_none());
+        assert_ne!(
+            rejected["errors"][0]["message"],
+            denied["errors"][0]["message"],
+            "a repository-authorization denial and an artifact-state denial must not              read identically"
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_rejected_carries_no_retry_after() {
+        // A terminal verdict has nothing to come back for.
+        let response = OciError::ArtifactRejected {
+            subject: "sha256:abc".into(),
+            axis: Some("provenance"),
+        }
+        .into_response();
+        assert!(
+            response.headers().get("Retry-After").is_none(),
+            "a terminal rejection must never advertise a retry"
+        );
     }
 
     #[tokio::test]

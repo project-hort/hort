@@ -15,10 +15,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
-use chrono::Utc;
-
 use hort_app::use_cases::repository_access::AccessLevel;
-use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{RepositoryFormat, RepositoryType};
 use hort_domain::events::ApiActor;
@@ -59,6 +56,7 @@ pub(crate) mod serve;
 // streaming HTML parser).
 pub(crate) mod html_projection;
 
+use hort_http_core::artifact_gate::non_servable_response;
 use hort_http_core::authz::write::{reject_write_to_virtual, resolve_actor_user_id};
 use hort_http_core::body::{stream_blob, DEFAULT_STREAM_CAPACITY};
 use hort_http_core::context::AppContext;
@@ -681,9 +679,10 @@ async fn download(
     render_pypi_file_response(&ctx, artifact, actor).await
 }
 
-/// Render the final file HTTP response for a resolved artifact: surface the
-/// quarantine gate (`Quarantined` → 503 + `Retry-After`,
-/// `Rejected` / `ScanIndeterminate` → 403) or stream the bytes from CAS.
+/// Render the final file HTTP response for a resolved artifact: surface
+/// the per-artifact status gate
+/// ([`hort_http_core::artifact_gate::non_servable_response`] — the one
+/// definition the content routes share) or stream the bytes from CAS.
 ///
 /// Shared by the hosted/proxy direct path and the virtual aggregation path
 /// (ADR 0031) so the gate render + streaming live in exactly one place; the
@@ -693,49 +692,8 @@ async fn render_pypi_file_response(
     artifact: hort_domain::entities::artifact::Artifact,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
-    // Check quarantine status directly for correct HTTP response codes.
-    match artifact.quarantine_status {
-        QuarantineStatus::Quarantined => {
-            // The use-case layer hydrates the transient computed
-            // `quarantine_deadline`; the format crate never computes it
-            // (it cannot resolve a `ScanPolicy`).
-            let retry_after = artifact
-                .quarantine_deadline
-                .map(|deadline| {
-                    let secs = (deadline - Utc::now()).num_seconds().max(1);
-                    secs.to_string()
-                })
-                .unwrap_or_else(|| "3600".to_string());
-
-            return Ok(Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .header("Retry-After", retry_after)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact is quarantined"}).to_string(),
-                ))
-                .unwrap());
-        }
-        QuarantineStatus::Rejected => {
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact is rejected"}).to_string(),
-                ))
-                .unwrap());
-        }
-        // Terminal scan failure (scanner could not decide). Fail-closed:
-        // a terminal block like `Rejected`, not a timed hold (no
-        // Retry-After). The Artifactory proxy 503 mapping for this state
-        // is deferred — this is the native-handler path.
-        QuarantineStatus::ScanIndeterminate => {
-            return Ok(Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from(
-                    serde_json::json!({"error": "artifact scan is indeterminate"}).to_string(),
-                ))
-                .unwrap());
-        }
-        QuarantineStatus::None | QuarantineStatus::Released => {}
+    if let Some(blocked) = non_servable_response(&artifact) {
+        return Ok(blocked);
     }
 
     // Thread the resolved principal for opt-in download-audit attribution.
@@ -1021,6 +979,7 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
+    use chrono::Utc;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -1034,7 +993,12 @@ mod tests {
     use super::*;
     use hort_http_core::authz::write::emit_authz_metric;
     use hort_http_core::context::{AppContext, AuthContext};
-    use hort_http_core::test_support::build_mock_ctx_with_label_flag;
+    use hort_http_core::test_support::{
+        assert_axis_is_the_wire_kind_for_every_variant,
+        assert_axis_less_refusal_emits_no_axis_field, assert_refusal_leaks_no_uuid_or_cve,
+        build_mock_ctx_with_label_flag, seed_indefinite_hold_policy, seed_timed_hold_policy,
+        with_provenance_hold_hydration,
+    };
 
     struct TestHarness {
         ctx: Arc<AppContext>,
@@ -1058,8 +1022,14 @@ mod tests {
         /// Event-store handle for the verified-direct-upload tests. The
         /// mismatch path asserts a single `ChecksumMismatch` on the repository
         /// stream and that no `ChecksumVerified` / `ArtifactIngested` event
-        /// fires anywhere.
+        /// fires anywhere. The status-gate tests reuse it to seed an
+        /// artifact's own stream, which is where the rejection axis and
+        /// the indefinite-hold flag are derived from.
         events: Arc<hort_app::use_cases::test_support::MockEventStore>,
+        /// Scan-policy seed handle for the status-gate tests — the
+        /// observation window and the provenance mode decide which of
+        /// the two holds a quarantined artifact is in.
+        policy_projections: Arc<hort_app::use_cases::test_support::MockPolicyProjectionRepository>,
     }
 
     /// Build an AppContext wired to in-memory mocks.
@@ -1086,6 +1056,7 @@ mod tests {
             content_references: mocks.content_references,
             lifecycle: mocks.lifecycle,
             events: mocks.events,
+            policy_projections: mocks.policy_projections,
         }
     }
 
@@ -1294,6 +1265,180 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    // -- the status gate: the axis, and the hold with no deadline ---------
+    //
+    // These drive the real file route, not the gate function, which is
+    // the point: the axis and the indefinite-hold flag are hydrated by
+    // the use-case layer during the load, so a test that hands the gate a
+    // hand-built artifact proves only that the gate reads two fields. The
+    // question here is whether PyPI's own download path arrives at the
+    // gate carrying them.
+
+    /// Seed a `Rejected` sdist whose stream carries `axis` (or, for
+    /// `None`, carries nothing at all — the ADR 0039 D6 illegal state),
+    /// pull it, and return the refusal.
+    ///
+    /// The fixture entity's `rejection_reason` is deliberately never set:
+    /// `MockArtifactRepository` clears it on read exactly as the one
+    /// `row -> Artifact` mapper in `hort-adapters-postgres` does, so only
+    /// `ArtifactUseCase`'s hydration can put it back — which is what
+    /// makes this about the production derivation and not about the
+    /// fixture.
+    async fn rejected_file_response(
+        axis: Option<hort_domain::events::RejectionReason>,
+    ) -> (StatusCode, serde_json::Value) {
+        let h = harness();
+        let repo = insert_repo(&h, "pypi-test");
+        let artifact = insert_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "pkg-1.0.tar.gz",
+            QuarantineStatus::Rejected,
+        );
+        h.events.set_stream(
+            &hort_domain::events::StreamId::artifact(artifact.id),
+            axis.map(|reason| {
+                vec![
+                    hort_app::use_cases::test_support::persisted_artifact_rejected(
+                        artifact.id,
+                        reason,
+                        1,
+                    ),
+                ]
+            })
+            .unwrap_or_default(),
+        );
+        // Opt into the read-path hydration: without the event-store
+        // handle wired the axis cannot be recovered and the route would
+        // answer the axis-less form for a harness reason rather than a
+        // production one.
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+        let res = router
+            .oneshot(
+                Request::get("/pypi/pypi-test/simple/pkg/pkg-1.0.tar.gz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// **Every** `RejectionReason` variant reaches a pip client as its
+    /// own `wire_kind()` token, iterated off `ALL_KIND_SAMPLES` rather
+    /// than a hand-written list — so a variant added tomorrow is covered
+    /// the moment it joins that constant, and cannot reach a client
+    /// undecided.
+    #[tokio::test]
+    async fn download_rejected_403_names_the_axis_for_every_variant() {
+        assert_axis_is_the_wire_kind_for_every_variant(rejected_file_response).await;
+    }
+
+    /// The refusal is a diagnosis of an artifact, not a disclosure about
+    /// a person, a rule, or a weakness. Asserted over every variant,
+    /// which is what makes it meaningful: `Curator { curator_id }` and
+    /// `CurationRetroactive { rule_id }` are the two that carry a uuid,
+    /// so a body built from the payload rather than the discriminator
+    /// would leak here and nowhere else.
+    #[tokio::test]
+    async fn download_rejected_403_leaks_no_uuid_and_no_cve_identifier() {
+        assert_refusal_leaks_no_uuid_or_cve(rejected_file_response).await;
+    }
+
+    /// ADR 0039 D6's illegal state: the projection says `Rejected` and no
+    /// `ArtifactRejected` stands behind it on the stream. The caller is
+    /// still refused — but no axis field is emitted and no `unknown`
+    /// token is invented, because a token would make an inconsistency
+    /// read as a verdict.
+    #[tokio::test]
+    async fn download_rejected_without_an_axis_on_the_stream_names_none() {
+        assert_axis_less_refusal_emits_no_axis_field(rejected_file_response).await;
+    }
+
+    /// ADR 0039 D5 — a quarantined file still waiting on a signature
+    /// after its observation window elapsed has no deadline to advertise:
+    /// what it waits for is an external event, not the clock. Before
+    /// this, PyPI answered `Retry-After: 1` on every pull of such a file,
+    /// forever.
+    #[tokio::test]
+    async fn download_indefinite_hold_is_503_with_no_retry_after() {
+        let h = harness();
+        let repo = insert_repo(&h, "pypi-test");
+        seed_indefinite_hold_policy(&h.policy_projections, repo.id);
+        // No `ProvenanceVerified` seeded on the artifact's stream, so the
+        // read-path clearance stays `Pending` under `Required`.
+        insert_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "pkg-1.0.tar.gz",
+            QuarantineStatus::Quarantined,
+        );
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+
+        let res = router
+            .oneshot(
+                Request::get("/pypi/pypi-test/simple/pkg/pkg-1.0.tar.gz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            res.headers().get("Retry-After").is_none(),
+            "an unsigned hold past its window has no self-resolving deadline"
+        );
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Same body as the time-bounded hold: which hold this is stays
+        // opaque to the client.
+        assert_eq!(parsed["error"], "artifact is quarantined");
+    }
+
+    /// The converse, on the same wiring: a hold still inside its window
+    /// has a real deadline, so its `Retry-After` is correct and useful
+    /// and must survive.
+    #[tokio::test]
+    async fn download_hold_inside_its_window_keeps_its_retry_after() {
+        let h = harness();
+        let repo = insert_repo(&h, "pypi-test");
+        seed_timed_hold_policy(&h.policy_projections, repo.id);
+        insert_artifact(
+            &h,
+            repo.id,
+            "pkg",
+            "pkg-1.0.tar.gz",
+            QuarantineStatus::Quarantined,
+        );
+        let router = router(with_provenance_hold_hydration(&h.ctx));
+
+        let res = router
+            .oneshot(
+                Request::get("/pypi/pypi-test/simple/pkg/pkg-1.0.tar.gz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let secs: i64 = res
+            .headers()
+            .get("Retry-After")
+            .expect("an in-window hold keeps its computed Retry-After")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (1..=3600).contains(&secs),
+            "retry-after out of range: {secs}"
+        );
     }
 
     #[tokio::test]
@@ -3193,6 +3338,76 @@ mod tests {
                 assert!(
                     res.headers().get("Retry-After").is_some(),
                     "quarantined wheel .metadata on proxy MUST emit Retry-After"
+                );
+            }
+
+            /// Test 8 — a rejected wheel that DID ingest into a proxy
+            /// answers the verdict and pulls nothing.
+            ///
+            /// This arm used to reach the cache-miss disambiguation: the
+            /// use case flattened the rejection onto `Artifact NotFound`,
+            /// which is the same signal a real cache miss sends, so the
+            /// handler spent a second `find_visible_by_path` deciding
+            /// that the wheel it had just refused did in fact exist. Now
+            /// the first attempt answers, and the assertion that no
+            /// transition was committed is what proves the verdict never
+            /// became a reason to fetch from upstream.
+            #[tokio::test]
+            async fn proxy_metadata_rejected_wheel_returns_the_verdict_and_pulls_nothing() {
+                let (ctx, mocks) = build_mock_ctx(handle());
+                let repo = proxy_pypi_repo("pypi-mirror");
+                mocks.repositories.insert(repo.clone());
+                // Deliberately NO `seed_mapping`: if the pull branch
+                // fired it would answer from `map_upstream_pull_error`
+                // instead, which is a different envelope.
+
+                let metadata = b"Metadata-Version: 2.1\nName: example\nVersion: 1.0.0\n";
+                let mut artifact = sample_artifact(QuarantineStatus::Rejected);
+                artifact.repository_id = repo.id;
+                artifact.name = "example".into();
+                artifact.path = "simple/example/example-1.0.0-py3-none-any.whl".into();
+                mocks.artifacts.insert(artifact.clone());
+                let mut hasher = Sha256::new();
+                hasher.update(metadata);
+                let hex = hex::encode(hasher.finalize());
+                let hash: hort_domain::types::ContentHash = hex.parse().unwrap();
+                mocks
+                    .storage
+                    .insert_content(hash.clone(), metadata.to_vec());
+                mocks
+                    .content_references
+                    .insert(ContentReference {
+                        source_artifact_id: artifact.id,
+                        target_content_hash: hash,
+                        kind: "wheel_metadata".into(),
+                        metadata: serde_json::json!({}),
+                        repository_id: repo.id,
+                        recorded_at: Utc::now(),
+                    })
+                    .await
+                    .unwrap();
+                let lifecycle = mocks.lifecycle.clone();
+
+                let router = router_for(ctx);
+                let res = router
+                    .oneshot(
+                        Request::get(
+                            "/pypi/pypi-mirror/simple/example/\
+                             example-1.0.0-py3-none-any.whl.metadata",
+                        )
+                        .body(Body::empty())
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::FORBIDDEN);
+                let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+                let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(parsed["error"], "artifact is rejected");
+                assert!(
+                    lifecycle.committed_transitions().is_empty(),
+                    "a rejected wheel's .metadata MUST NOT trigger pull-through, got {:?}",
+                    lifecycle.committed_transitions()
                 );
             }
         }
@@ -5436,70 +5651,472 @@ mod tests {
         );
     }
 
-    /// Rejected parent wheel → 404 (NOT 403). Diverges from the
-    /// wheel-download handler's 403 mapping — the metadata surface must
-    /// hide the wheel's existence to deny partial enumeration (PEP 658
-    /// anti-enumeration invariant).
-    #[tokio::test]
-    async fn metadata_endpoint_rejected_wheel_returns_404_not_403() {
+    // -- `.metadata` answers what the wheel answers ------------------------
+    //
+    // The two routes serve the same artifact, so for every status that
+    // withholds it they owe the same answer. That is asserted below as
+    // ONE comparison driven over the statuses rather than as a pair of
+    // hand-written expectations per status: a pair is a place for the two
+    // routes to drift, because each half can be updated alone and both
+    // still pass. The absolute values the comparison is anchored against
+    // — which code, which header, which body — are pinned by the tests
+    // after it; without those, two routes agreeing on a wrong answer
+    // would satisfy the comparison.
+
+    /// The wheel one non-servable case is seeded as, and the URL pair it
+    /// is asked about.
+    const INVARIANT_WHEEL: &str = "example-1.0.0-py3-none-any.whl";
+    const INVARIANT_WHEEL_URL: &str =
+        "/pypi/pypi-test/simple/example/example-1.0.0-py3-none-any.whl";
+    const INVARIANT_METADATA_URL: &str =
+        "/pypi/pypi-test/simple/example/example-1.0.0-py3-none-any.whl.metadata";
+
+    /// Which quarantine hold a `Quarantined` case is seeded into. The two
+    /// differ on the wire by exactly one header, which is why both are in
+    /// the corpus: an equality that only ever saw the timed hold would
+    /// not notice one route keeping the `Retry-After` the other drops.
+    #[derive(Clone, Copy)]
+    enum InvariantHold {
+        /// `provenance_mode: Required` with a zero-length window — the
+        /// hold the clock cannot resolve, whose `503` advertises no
+        /// deadline (ADR 0039 D5).
+        Indefinite,
+        /// A one-hour window the freshly-quarantined artifact sits
+        /// inside, so its `Retry-After` is real and must survive.
+        Timed,
+    }
+
+    struct NonServableCase {
+        label: &'static str,
+        status: QuarantineStatus,
+        hold: Option<InvariantHold>,
+    }
+
+    /// Everything a client can observe about a refusal on one route.
+    type WireAnswer = (StatusCode, Option<String>, serde_json::Value);
+
+    /// Drain one response into the observable triple. A non-JSON body
+    /// (the 200 path, which no case here may reach) is carried through as
+    /// a string so a route that served the bytes fails the comparison
+    /// legibly instead of panicking in the parser.
+    async fn observe(router: Router, url: &str) -> WireAnswer {
+        let res = router
+            .oneshot(Request::get(url).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let retry_after = res
+            .headers()
+            .get("Retry-After")
+            .map(|v| v.to_str().unwrap().to_string());
+        let body = to_bytes(res.into_body(), 4 * 1024).await.unwrap();
+        let parsed = serde_json::from_slice(&body).unwrap_or_else(|_| {
+            serde_json::Value::String(String::from_utf8_lossy(&body).into_owned())
+        });
+        (status, retry_after, parsed)
+    }
+
+    /// Seed ONE wheel in ONE repository in the state `case` names, then
+    /// ask both routes that serve it about it.
+    ///
+    /// The wheel's own CAS bytes are seeded too, so the download route
+    /// could answer `200` if its gate ever stopped firing — which makes
+    /// a served body a comparison failure rather than a missing fixture.
+    async fn wheel_and_metadata_answers(case: &NonServableCase) -> (WireAnswer, WireAnswer) {
         let h = harness();
         let repo = insert_repo(&h, "pypi-test");
-        let _ = seed_wheel_with_cas_metadata(
+        match case.hold {
+            Some(InvariantHold::Indefinite) => {
+                seed_indefinite_hold_policy(&h.policy_projections, repo.id)
+            }
+            Some(InvariantHold::Timed) => seed_timed_hold_policy(&h.policy_projections, repo.id),
+            None => {}
+        }
+        let (artifact, _hex) = seed_wheel_with_cas_metadata(
             &h,
             repo.id,
             "example",
-            "example-1.0.0-py3-none-any.whl",
-            QuarantineStatus::Rejected,
+            INVARIANT_WHEEL,
+            case.status,
             b"Metadata-Version: 2.1\nName: example\n",
         )
         .await;
-        let router = router(h.ctx.clone());
-        let res = router
-            .oneshot(
-                Request::get(
-                    "/pypi/pypi-test/simple/example/\
-                     example-1.0.0-py3-none-any.whl.metadata",
-                )
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            res.status(),
-            StatusCode::NOT_FOUND,
-            "Rejected wheel .metadata MUST be 404 (anti-enumeration), not 403"
-        );
+        h.storage
+            .insert_content(artifact.sha256_checksum.clone(), b"wheel bytes".to_vec());
+        if case.status == QuarantineStatus::Rejected {
+            h.events.set_stream(
+                &hort_domain::events::StreamId::artifact(artifact.id),
+                vec![
+                    hort_app::use_cases::test_support::persisted_artifact_rejected(
+                        artifact.id,
+                        hort_domain::events::RejectionReason::Scanner,
+                        1,
+                    ),
+                ],
+            );
+        }
+        // The axis and the indefinite-hold flag are read-path
+        // hydrations; without this the refusals would differ for a
+        // harness reason rather than a production one.
+        let ctx = with_provenance_hold_hydration(&h.ctx);
+        let wheel = observe(router(ctx.clone()), INVARIANT_WHEEL_URL).await;
+        let metadata = observe(router(ctx), INVARIANT_METADATA_URL).await;
+        (wheel, metadata)
     }
 
-    /// Scan-indeterminate parent wheel → 404. Same rationale as rejected:
-    /// hide existence to deny enumeration.
+    /// **The invariant.** For every parent status that withholds a wheel,
+    /// `GET <wheel>.metadata` answers what `GET <wheel>` answers: same
+    /// code, same `Retry-After` presence, same body. Both routes refuse
+    /// through `hort_http_core::artifact_gate::non_servable_response`, so
+    /// this holds by construction — and fails the moment one of them
+    /// grows a second answer of its own.
+    ///
+    /// `Retry-After` is compared on presence rather than value: the two
+    /// requests are a moment apart and the seconds are computed from
+    /// `Utc::now()`, so the value legitimately differs by a second. The
+    /// presence is the thing D5 decides.
     #[tokio::test]
-    async fn metadata_endpoint_scan_indeterminate_wheel_returns_404() {
+    async fn metadata_route_answers_exactly_what_the_wheel_route_answers() {
+        let cases = [
+            NonServableCase {
+                label: "quarantined, inside its window",
+                status: QuarantineStatus::Quarantined,
+                hold: Some(InvariantHold::Timed),
+            },
+            NonServableCase {
+                label: "quarantined, waiting on a signature",
+                status: QuarantineStatus::Quarantined,
+                hold: Some(InvariantHold::Indefinite),
+            },
+            NonServableCase {
+                label: "rejected",
+                status: QuarantineStatus::Rejected,
+                hold: None,
+            },
+            NonServableCase {
+                label: "scan indeterminate",
+                status: QuarantineStatus::ScanIndeterminate,
+                hold: None,
+            },
+        ];
+
+        // Counter-assertion: the corpus is the whole withholding
+        // vocabulary, not three statuses someone remembered. The `match`
+        // has no wildcard arm, so a new `QuarantineStatus` is a compile
+        // error here and has to be classified before this can pass.
+        for status in [
+            QuarantineStatus::None,
+            QuarantineStatus::Released,
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::Rejected,
+            QuarantineStatus::ScanIndeterminate,
+        ] {
+            let withholds = match status {
+                QuarantineStatus::None | QuarantineStatus::Released => false,
+                QuarantineStatus::Quarantined
+                | QuarantineStatus::Rejected
+                | QuarantineStatus::ScanIndeterminate => true,
+            };
+            assert_eq!(
+                cases.iter().any(|c| c.status == status),
+                withholds,
+                "{status:?} belongs in the corpus iff it withholds the wheel"
+            );
+        }
+
+        for case in &cases {
+            let (wheel, metadata) = wheel_and_metadata_answers(case).await;
+            assert_eq!(
+                metadata.0, wheel.0,
+                "{}: .metadata answered {} where the wheel answered {}",
+                case.label, metadata.0, wheel.0
+            );
+            assert_eq!(
+                metadata.1.is_some(),
+                wheel.1.is_some(),
+                "{}: Retry-After presence differs — .metadata {:?}, wheel {:?}",
+                case.label,
+                metadata.1,
+                wheel.1
+            );
+            assert_eq!(
+                metadata.2, wheel.2,
+                "{}: refusal bodies differ — .metadata {}, wheel {}",
+                case.label, metadata.2, wheel.2
+            );
+            assert!(
+                wheel.0.is_client_error() || wheel.0.is_server_error(),
+                "{}: a withheld wheel must not be served ({})",
+                case.label,
+                wheel.0
+            );
+        }
+    }
+
+    /// **The reversal.** A rejected wheel's `.metadata` answers `403`
+    /// naming the axis — the same refusal the wheel download gives — and
+    /// no longer the `404` its predecessor,
+    /// `metadata_endpoint_rejected_wheel_returns_404_not_403`, pinned.
+    ///
+    /// That predecessor was right about its own caller: a `404` hid the
+    /// wheel's existence from someone who could not otherwise learn it.
+    /// No such caller reaches this arm. The repository read gate fires
+    /// first — `metadata_endpoint_anonymous_caller_on_private_repo_wheel_returns_404`
+    /// and the `anti_enumeration` group still pin that, untouched — so
+    /// whoever gets here was admitted, and the simple index they came
+    /// through already listed the wheel. The `404` concealed nothing but
+    /// the verdict, which is the one fact that ends a blocked
+    /// `pip install`'s search.
+    #[tokio::test]
+    async fn metadata_endpoint_rejected_wheel_returns_403_naming_the_axis() {
+        let (status, body) =
+            rejected_wheel_metadata_response(Some(hort_domain::events::RejectionReason::Scanner))
+                .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a rejected wheel's .metadata names the verdict: {body}"
+        );
+        assert_eq!(body["error"], "artifact is rejected");
+        assert_eq!(body["axis"], "scanner");
+    }
+
+    /// The same reversal for the other terminal verdict, whose
+    /// predecessor `metadata_endpoint_scan_indeterminate_wheel_returns_404`
+    /// pinned the `404` for the same caller and was right for the same
+    /// reason.
+    ///
+    /// The code asserted here is the one the four download routes answer
+    /// with, inherited rather than chosen: whether this state should be
+    /// `403` or `503` is an open cross-format question (OCI answers
+    /// `503`) with a recorded divergence, and answering through the
+    /// shared gate is what keeps this route from holding a third
+    /// position on it.
+    #[tokio::test]
+    async fn metadata_endpoint_scan_indeterminate_wheel_returns_the_terminal_refusal() {
         let h = harness();
         let repo = insert_repo(&h, "pypi-test");
         let _ = seed_wheel_with_cas_metadata(
             &h,
             repo.id,
             "example",
-            "example-1.0.0-py3-none-any.whl",
+            INVARIANT_WHEEL,
             QuarantineStatus::ScanIndeterminate,
             b"Metadata-Version: 2.1\nName: example\n",
         )
         .await;
-        let router = router(h.ctx.clone());
-        let res = router
-            .oneshot(
-                Request::get(
-                    "/pypi/pypi-test/simple/example/\
-                     example-1.0.0-py3-none-any.whl.metadata",
-                )
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
+        let (status, retry_after, body) =
+            observe(router(h.ctx.clone()), INVARIANT_METADATA_URL).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(retry_after, None, "a terminal verdict has no window");
+        assert_eq!(body["error"], "artifact scan is indeterminate");
+    }
+
+    /// Seed a `Rejected` wheel whose stream carries `axis` (or, for
+    /// `None`, carries nothing at all — the ADR 0039 D6 illegal state),
+    /// ask its `.metadata` URL, and return the refusal.
+    ///
+    /// The fixture entity's `rejection_reason` is deliberately never set:
+    /// `MockArtifactRepository` clears it on read exactly as the one
+    /// `row -> Artifact` mapper in `hort-adapters-postgres` does, so only
+    /// the use-case hydration can put it back — which is what makes this
+    /// about the production derivation and not about the fixture.
+    async fn rejected_wheel_metadata_response(
+        axis: Option<hort_domain::events::RejectionReason>,
+    ) -> (StatusCode, serde_json::Value) {
+        let h = harness();
+        let repo = insert_repo(&h, "pypi-test");
+        let (artifact, _hex) = seed_wheel_with_cas_metadata(
+            &h,
+            repo.id,
+            "example",
+            INVARIANT_WHEEL,
+            QuarantineStatus::Rejected,
+            b"Metadata-Version: 2.1\nName: example\n",
+        )
+        .await;
+        h.events.set_stream(
+            &hort_domain::events::StreamId::artifact(artifact.id),
+            axis.map(|reason| {
+                vec![
+                    hort_app::use_cases::test_support::persisted_artifact_rejected(
+                        artifact.id,
+                        reason,
+                        1,
+                    ),
+                ]
+            })
+            .unwrap_or_default(),
+        );
+        let (status, _retry_after, body) = observe(
+            router(with_provenance_hold_hydration(&h.ctx)),
+            INVARIANT_METADATA_URL,
+        )
+        .await;
+        (status, body)
+    }
+
+    /// **Every** `RejectionReason` variant reaches a PEP 658 client as
+    /// its own `wire_kind()` token, iterated off `ALL_KIND_SAMPLES`
+    /// rather than a hand-written list — so a variant added tomorrow is
+    /// covered the moment it joins that constant. The shared helper
+    /// carries the length counter-assertion that stops the loop going
+    /// vacuous.
+    #[tokio::test]
+    async fn metadata_endpoint_rejected_403_names_the_axis_for_every_variant() {
+        assert_axis_is_the_wire_kind_for_every_variant(rejected_wheel_metadata_response).await;
+    }
+
+    /// The refusal is a diagnosis of an artifact, not a disclosure about
+    /// a person, a rule, or a weakness. Asserted over every variant,
+    /// which is what makes it meaningful: `Curator { curator_id }` and
+    /// `CurationRetroactive { rule_id }` are the two that carry a uuid,
+    /// so a body built from the payload rather than the discriminator
+    /// would leak here and nowhere else.
+    #[tokio::test]
+    async fn metadata_endpoint_rejected_403_leaks_no_uuid_and_no_cve_identifier() {
+        assert_refusal_leaks_no_uuid_or_cve(rejected_wheel_metadata_response).await;
+    }
+
+    /// ADR 0039 D6's illegal state: the projection says `Rejected` and no
+    /// `ArtifactRejected` stands behind it on the stream. The caller is
+    /// still refused — but no axis field is emitted and no `unknown`
+    /// token is invented, because a token would make an inconsistency
+    /// read as a verdict. The operator is told instead, at `error` level,
+    /// from the one place that line is written
+    /// (`hort_http_core::artifact_gate`, where it is also asserted).
+    #[tokio::test]
+    async fn metadata_endpoint_rejected_without_an_axis_on_the_stream_names_none() {
+        assert_axis_less_refusal_emits_no_axis_field(rejected_wheel_metadata_response).await;
+    }
+
+    /// ADR 0039 D5 on this route: a quarantined wheel still waiting on a
+    /// signature after its observation window elapsed has no deadline to
+    /// advertise. This route's own copy of the header rule never had the
+    /// suppression, so it answered `Retry-After: 1` — the clamp's floor,
+    /// computed from a deadline already in the past — on every pull of
+    /// such a wheel, forever. Deleting that copy is what fixed it.
+    #[tokio::test]
+    async fn metadata_endpoint_indefinite_hold_is_503_with_no_retry_after() {
+        let h = harness();
+        let repo = insert_repo(&h, "pypi-test");
+        seed_indefinite_hold_policy(&h.policy_projections, repo.id);
+        // No `ProvenanceVerified` on the wheel's stream, so the read-path
+        // clearance stays `Pending` under `Required`.
+        let _ = seed_wheel_with_cas_metadata(
+            &h,
+            repo.id,
+            "example",
+            INVARIANT_WHEEL,
+            QuarantineStatus::Quarantined,
+            b"Metadata-Version: 2.1\nName: example\n",
+        )
+        .await;
+        let (status, retry_after, body) = observe(
+            router(with_provenance_hold_hydration(&h.ctx)),
+            INVARIANT_METADATA_URL,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            retry_after, None,
+            "an unsigned hold past its window has no self-resolving deadline"
+        );
+        // Same body as the time-bounded hold: which hold this is stays
+        // opaque to the client.
+        assert_eq!(body["error"], "artifact is quarantined");
+    }
+
+    /// The converse, on the same wiring: a hold still inside its window
+    /// has a real deadline, so its `Retry-After` is useful and must
+    /// survive. Without this, suppressing the header unconditionally
+    /// would pass the test above.
+    #[tokio::test]
+    async fn metadata_endpoint_hold_inside_its_window_keeps_its_retry_after() {
+        let h = harness();
+        let repo = insert_repo(&h, "pypi-test");
+        seed_timed_hold_policy(&h.policy_projections, repo.id);
+        let _ = seed_wheel_with_cas_metadata(
+            &h,
+            repo.id,
+            "example",
+            INVARIANT_WHEEL,
+            QuarantineStatus::Quarantined,
+            b"Metadata-Version: 2.1\nName: example\n",
+        )
+        .await;
+        let (status, retry_after, _body) = observe(
+            router(with_provenance_hold_hydration(&h.ctx)),
+            INVARIANT_METADATA_URL,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let secs: i64 = retry_after
+            .expect("an in-window hold keeps its computed Retry-After")
+            .parse()
             .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert!(
+            (1..=3600).contains(&secs),
+            "retry-after out of range: {secs}"
+        );
+    }
+
+    /// The distinction the reversal buys, asserted as a distinction: a
+    /// rejected wheel and a legacy wheel with no `wheel_metadata` row no
+    /// longer answer the same thing. One is a verdict about a wheel that
+    /// exists; the other is "there is no such metadata", which is what a
+    /// `404` means and the only thing it now means on this route.
+    ///
+    /// Both are asserted absolutely as well as against each other —
+    /// otherwise swapping the two answers would still pass.
+    #[tokio::test]
+    async fn metadata_endpoint_rejected_and_un_backfilled_wheels_are_distinguishable() {
+        let h = harness();
+        let repo = insert_repo(&h, "pypi-test");
+        let (rejected, _hex) = seed_wheel_with_cas_metadata(
+            &h,
+            repo.id,
+            "example",
+            INVARIANT_WHEEL,
+            QuarantineStatus::Rejected,
+            b"Metadata-Version: 2.1\nName: example\n",
+        )
+        .await;
+        h.events.set_stream(
+            &hort_domain::events::StreamId::artifact(rejected.id),
+            vec![
+                hort_app::use_cases::test_support::persisted_artifact_rejected(
+                    rejected.id,
+                    hort_domain::events::RejectionReason::Scanner,
+                    1,
+                ),
+            ],
+        );
+        // A servable wheel in the same repository with no
+        // `wheel_metadata` ContentReference row — the un-backfilled
+        // legacy shape.
+        let mut legacy = sample_artifact(QuarantineStatus::Released);
+        legacy.repository_id = repo.id;
+        legacy.name = "legacy".into();
+        legacy.path = "simple/legacy/legacy-1.0.0-py3-none-any.whl".into();
+        h.artifacts.insert(legacy);
+
+        let ctx = with_provenance_hold_hydration(&h.ctx);
+        let verdict = observe(router(ctx.clone()), INVARIANT_METADATA_URL).await;
+        let absent = observe(
+            router(ctx),
+            "/pypi/pypi-test/simple/legacy/legacy-1.0.0-py3-none-any.whl.metadata",
+        )
+        .await;
+
+        assert_eq!(verdict.0, StatusCode::FORBIDDEN);
+        assert_eq!(verdict.2["axis"], "scanner");
+        assert_eq!(absent.0, StatusCode::NOT_FOUND);
+        assert_ne!(
+            (verdict.0, &verdict.2),
+            (absent.0, &absent.2),
+            "a withheld wheel and an un-backfilled one must not answer alike"
+        );
     }
 
     /// Sdist `.tar.gz.metadata` → 404. PEP 658 applies only to wheels
@@ -6626,6 +7243,7 @@ mod tests {
                 content_references: h.content_references,
                 lifecycle: h.lifecycle,
                 events: h.events,
+                policy_projections: h.policy_projections,
             }
         }
 
@@ -6899,6 +7517,7 @@ mod tests {
                 content_references: h.content_references,
                 lifecycle: h.lifecycle,
                 events: h.events,
+                policy_projections: h.policy_projections,
             }
         }
 

@@ -36,7 +36,10 @@ use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
-use hort_domain::ports::provenance::SignerIdentity;
+use hort_domain::ports::provenance::{
+    AttestationBundle, ProvenanceOutcome, ProvenancePort, ProvenanceRequirements,
+    ProvenanceSubject, SignerIdentity,
+};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::ContentHash;
 
@@ -61,6 +64,24 @@ pub(crate) struct LateJoinerClearance {
     pub(crate) subject: ContentHash,
     /// The verifier backend recorded on the subject's clearance — the
     /// metric's only label.
+    pub(crate) backend: String,
+}
+
+/// A signature-material clearance that was committed (ADR 0039 D8):
+/// which signature manifest's bundle cleared the constituent, which
+/// subject that bundle verified, and under which verifier backend.
+/// Returned so the caller emits the metric + the run outcome once, at one
+/// site.
+pub(crate) struct SignatureMaterialClearance {
+    /// CAS hash of the **signature manifest** whose config/layer set
+    /// binds this constituent's digest. This is the authority recorded in
+    /// the committed event's `cascaded_from`.
+    pub(crate) signature_manifest: ContentHash,
+    /// CAS hash of the subject that manifest's bundle verified — the
+    /// verdict the clearance rests on.
+    pub(crate) subject: ContentHash,
+    /// The verifier backend that accepted the bundle — the metric's only
+    /// label.
     pub(crate) backend: String,
 }
 
@@ -315,6 +336,330 @@ impl ProvenanceCascade {
             return Ok(None);
         }
         Ok(Some((root_hash, root_clearance)))
+    }
+
+    // -----------------------------------------------------------------
+    // Signature-material end — the constituents of the signature that
+    // verified a subject (ADR 0039 D8)
+    // -----------------------------------------------------------------
+
+    /// Clear an artifact that is the **signature material of a subject
+    /// the verifier accepts** — the `{}` config blob and the signature
+    /// payload layer of a cosign signature manifest (ADR 0039 D8).
+    ///
+    /// Called from the provenance verify path's `NoAttestation` ×
+    /// `Required` window, before the hold is applied. Returns `Some(..)`
+    /// iff a cascaded `ProvenanceVerified` was committed; every failure
+    /// direction warns and leaves exactly the hold the caller already
+    /// had.
+    ///
+    /// # Why this rule exists at all
+    ///
+    /// Nothing signs a signature. A signature manifest's own config and
+    /// payload layers can never acquire an attestation of their own, so
+    /// neither the subject end nor the constituent end above can ever
+    /// fire for them: the signature manifest itself carries no
+    /// `ProvenanceVerified` (ADR 0039 §8 lands it through the narrow
+    /// signature ingest — status `None`, no scan, no provenance), so the
+    /// late-joiner walk finds no clearance to inherit. Under `Required`
+    /// they are therefore held by a hold no future evidence can end.
+    ///
+    /// # The authority chain, and why each link is where it is
+    ///
+    /// - Inbound `content_references` rows **nominate** candidate
+    ///   parents and are never authority — the same rule the rest of
+    ///   this module states. An edge may be stale, hand-written, or
+    ///   point at a manifest that does not bind this digest.
+    /// - The parent's **bytes** decide two things the edge cannot: that
+    ///   it is a pure signature manifest (the §8 purity classifiers, the
+    ///   same pair the push path exempts on) and that this artifact's
+    ///   digest is in its config+layers set.
+    /// - The parent's **subject** is read from the parent's bytes
+    ///   ([`hort_domain::oci::manifest_subject_digest`]), not from the
+    ///   `oci_subject` edge, so one projection cannot nominate both the
+    ///   parent and what the parent is taken to cover.
+    /// - The **verifier's verdict** over that subject's preimage is the
+    ///   authority. A success *is* the subject's verification, which is
+    ///   the strongest statement available here and is not forgeable.
+    ///
+    /// # Why a declaration may not be the authority
+    ///
+    /// An OCI blob has exactly one artifact row and one quarantine
+    /// status per hort repository: the path is
+    /// `blobs/sha256:<hex>` and the uniqueness is `(repository_id,
+    /// path)`, with no OCI name component. So whatever clears a blob
+    /// clears it for **every image in that repository**. A clearance
+    /// keyed on the pusher's declaration — "this manifest says it is a
+    /// signature, so its layers are signature material" — would let a
+    /// write-authed pusher push a manifest shaped like a signature that
+    /// names their own ordinary layer, and that layer would then serve
+    /// from a `Required` repository having never been signed. Requiring
+    /// the bundle to verify closes that: a manifest shaped like a
+    /// signature whose bundle does not verify its claimed subject yields
+    /// nothing.
+    ///
+    /// # Cost
+    ///
+    /// This runs for every `NoAttestation` × `Required` artifact, not
+    /// only for the signature constituents — the shape of the artifact
+    /// is deliberately not a gate (a `Required` hold is
+    /// shape-independent). For an ordinary layer the walk costs one edge
+    /// read plus, per candidate parent, one row load and one bounded CAS
+    /// read, and stops at the purity classifier before any crypto.
+    pub(crate) async fn resolve_signature_material_clearance(
+        &self,
+        artifact: &Artifact,
+        verifiers: &[&Arc<dyn ProvenancePort>],
+        requirements: &ProvenanceRequirements<'_>,
+    ) -> Option<SignatureMaterialClearance> {
+        // Fail-closed on a read error: no edges resolved ⇒ no clearance
+        // attempt ⇒ exactly the hold this artifact already has.
+        let refs = match self
+            .content_references
+            .find_by_target(
+                artifact.repository_id,
+                &artifact.sha256_checksum,
+                None, // UNFILTERED: kind is not authority; the bytes decide.
+            )
+            .await
+        {
+            Ok(refs) => refs,
+            Err(e) => {
+                tracing::warn!(
+                    artifact_id = %artifact.id,
+                    error = %e,
+                    "signature-material clearance: inbound content_references read failed — \
+                     no clearance attempted (artifact stays held)",
+                );
+                return None;
+            }
+        };
+
+        let mut visited: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        for reference in &refs {
+            // An artifact's own `primary_content` / `metadata_blob`
+            // refcount rows target its own hash; a self-clear would be
+            // circular authority.
+            if reference.source_artifact_id == artifact.id {
+                continue;
+            }
+            if !visited.insert(reference.source_artifact_id) {
+                continue;
+            }
+            match self
+                .try_clear_from_signature_manifest(
+                    artifact,
+                    reference.source_artifact_id,
+                    verifiers,
+                    requirements,
+                )
+                .await
+            {
+                Ok(Some(cleared)) => {
+                    tracing::info!(
+                        artifact_id = %artifact.id,
+                        constituent = %artifact.sha256_checksum,
+                        signature_manifest = %cleared.signature_manifest,
+                        subject = %cleared.subject,
+                        backend = %cleared.backend,
+                        "provenance: signature material cleared by the signature that \
+                         verified its subject",
+                    );
+                    return Some(cleared);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    artifact_id = %artifact.id,
+                    source_artifact_id = %reference.source_artifact_id,
+                    error = %e,
+                    "signature-material clearance: candidate signature manifest could not \
+                     be resolved — skipped",
+                ),
+            }
+        }
+        None
+    }
+
+    /// Attempt the signature-material clearance of `artifact` against ONE
+    /// candidate parent. `Ok(None)` is a deliberate skip (cross-repo, not
+    /// a pure signature manifest, membership miss, no resolvable subject,
+    /// no bundle, no accepting verifier, constituent not held); `Err` is
+    /// an infra / parse failure the caller warns on. Both leave the
+    /// artifact held.
+    async fn try_clear_from_signature_manifest(
+        &self,
+        artifact: &Artifact,
+        source_artifact_id: Uuid,
+        verifiers: &[&Arc<dyn ProvenancePort>],
+        requirements: &ProvenanceRequirements<'_>,
+    ) -> AppResult<Option<SignatureMaterialClearance>> {
+        let parent = self.artifacts.find_by_id(source_artifact_id).await?;
+
+        // Same-repository only, mirroring `cascade_one`'s repo-scoped
+        // constituent lookup: a clearance never crosses a repo boundary.
+        // `find_by_target` is already repo-scoped, so this is a
+        // belt-and-braces guard against a future widening of the port.
+        if parent.repository_id != artifact.repository_id {
+            return Ok(None);
+        }
+        // A parent that IS this artifact's content cannot be its own
+        // signature manifest; guard before the CAS read.
+        if parent.sha256_checksum == artifact.sha256_checksum {
+            return Ok(None);
+        }
+
+        let parent_bytes = self.read_bounded(&parent.sha256_checksum).await?;
+
+        // ADR 0039 §8's purity pair — the same predicates the manifest
+        // PUT path routes a signature manifest on. "Pure" means every
+        // layer is signature material, so an exempted manifest carries no
+        // runnable content. A parse failure propagates as `Err` (the
+        // caller warns): this walk is reached only from manifest-shaped
+        // candidates, so unparseable bytes here are worth seeing.
+        let is_signature_manifest = hort_domain::oci::is_pure_sigstore_bundle(&parent_bytes)?
+            || hort_domain::oci::is_pure_simplesigning(&parent_bytes)?;
+        if !is_signature_manifest {
+            return Ok(None);
+        }
+
+        // MEMBERSHIP: the candidate's own bytes must bind this artifact's
+        // digest — the config + layers walk, identical to the one both
+        // other ends use.
+        let digests = self.constituent_digests(&parent_bytes).await?;
+        if !digests.iter().any(|d| d == &artifact.sha256_checksum) {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                signature_manifest = %parent.sha256_checksum,
+                "signature-material clearance: digest not bound by the candidate signature \
+                 manifest's bytes — no clearance",
+            );
+            return Ok(None);
+        }
+
+        // The subject comes from the candidate's bytes. A legacy cosign
+        // tag-scheme `.sig` carries no `subject` descriptor (the binding
+        // is in the tag name), so it resolves to no subject and clears
+        // nothing.
+        let Some(subject_hash) = hort_domain::oci::manifest_subject_digest(&parent_bytes)? else {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                signature_manifest = %parent.sha256_checksum,
+                "signature-material clearance: candidate declares no subject descriptor — \
+                 no clearance",
+            );
+            return Ok(None);
+        };
+        // A subject that is this artifact, or the candidate itself, is
+        // not a second artifact's verification: the first is the direct
+        // verify the caller already ran and found unsigned, the second is
+        // circular. Either way, nothing here may stand in for it.
+        if subject_hash == artifact.sha256_checksum || subject_hash == parent.sha256_checksum {
+            return Ok(None);
+        }
+
+        let bundles = self.referrer_bundles(&parent_bytes).await?;
+        if bundles.is_empty() {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                signature_manifest = %parent.sha256_checksum,
+                "signature-material clearance: candidate carries no readable bundle — \
+                 no clearance",
+            );
+            return Ok(None);
+        }
+        let subject_bytes = self.read_bounded(&subject_hash).await?;
+
+        // `name` / `version` are the audit coordinates of the
+        // verification, not inputs to it — both verifiers bind the
+        // subject's digest and its preimage and consult neither. The
+        // candidate's own name is the honest value available from one
+        // row: cosign pushes a signature into the same OCI repository as
+        // the subject it signs, and no event on this path records the
+        // subject's coordinates (the committed event is the
+        // CONSTITUENT's, carrying its own).
+        let subject = ProvenanceSubject {
+            content_hash: &subject_hash,
+            payload: &subject_bytes,
+            name: &parent.name,
+            version: None,
+        };
+        let Some(accepted) =
+            first_accepting_verifier(verifiers, &subject, &bundles, requirements).await
+        else {
+            tracing::debug!(
+                artifact_id = %artifact.id,
+                signature_manifest = %parent.sha256_checksum,
+                subject = %subject_hash,
+                "signature-material clearance: no verifier accepted the candidate's bundle \
+                 over its claimed subject — no clearance",
+            );
+            return Ok(None);
+        };
+
+        // The authority recorded on the constituent's clearance is the
+        // SIGNATURE MANIFEST, not the subject: that manifest is what
+        // binds this artifact's digest, and `cascaded_from` has to name
+        // the bytes whose membership walk admitted it so an operator can
+        // re-derive the decision.
+        let committed = self
+            .cascade_one(
+                artifact.repository_id,
+                &parent.sha256_checksum,
+                &artifact.sha256_checksum,
+                &accepted.signer,
+                accepted.predicate_type.as_deref(),
+                &accepted.backend,
+            )
+            .await?;
+
+        Ok(committed.then(|| SignatureMaterialClearance {
+            signature_manifest: parent.sha256_checksum.clone(),
+            subject: subject_hash,
+            backend: accepted.backend,
+        }))
+    }
+
+    /// Every attestation bundle ONE referrer manifest carries, read from
+    /// CAS by layer digest (ADR 0039 §6/§8). Two carriage shapes:
+    ///
+    /// - keyless Sigstore v0.3 bundle layers
+    ///   ([`hort_domain::oci::sigstore_bundle_layers`]) — the layer blob
+    ///   IS the bundle, wrapped by [`build_bundle`] so the keyed and
+    ///   keyless verifiers self-select;
+    /// - keyed cosign `simplesigning` layers
+    ///   ([`hort_domain::oci::simplesigning_signature_layers`]) — the
+    ///   layer blob is the payload and the detached signature rides the
+    ///   layer annotation.
+    ///
+    /// A layer digest is its CAS content hash (both SHA-256 of the raw
+    /// bytes), so no artifact lookup is needed. A referrer carrying
+    /// neither shape yields an empty `Vec` — skipped, not an error. A
+    /// blob the manifest references but CAS does not hold is `Err`: the
+    /// caller decides (the verify path's mode-dependent fetch-failure
+    /// arm; the signature-material walk's warn-and-skip).
+    pub(crate) async fn referrer_bundles(
+        &self,
+        manifest_bytes: &[u8],
+    ) -> AppResult<Vec<AttestationBundle>> {
+        let mut bundles = Vec::new();
+
+        for blob_hash in hort_domain::oci::sigstore_bundle_layers(manifest_bytes)? {
+            let bundle_bytes = self.read_bounded(&blob_hash).await?;
+            bundles.push(build_bundle(bundle_bytes));
+        }
+
+        for sig in hort_domain::oci::simplesigning_signature_layers(manifest_bytes)? {
+            let payload_bytes = self.read_bounded(&sig.payload_layer).await?;
+            // An undecodable annotation can never be a valid signature →
+            // skipped (under `Required`, no valid bundle folds to
+            // `NoAttestation`, which holds).
+            let Some(sig_bytes) = decode_simplesigning_signature(&sig.signature) else {
+                continue;
+            };
+            bundles.push(AttestationBundle::new_signed(payload_bytes, sig_bytes));
+        }
+
+        Ok(bundles)
     }
 
     // -----------------------------------------------------------------
@@ -632,6 +977,109 @@ impl ProvenanceCascade {
             ))
         })?;
         Ok(buf)
+    }
+}
+
+/// What one verifier said when it accepted a bundle: the matched signer,
+/// the attestation predicate type, and the backend's own name. The three
+/// values [`ProvenanceCascade::cascade_one`] records on the cascaded
+/// `ProvenanceVerified`.
+struct AcceptedSignature {
+    signer: SignerIdentity,
+    predicate_type: Option<String>,
+    backend: String,
+}
+
+/// The first applicable verifier that **accepts** `bundles` over
+/// `subject`, or `None` if none does.
+///
+/// Deliberately not the orchestrator's `dispatch_and_fold`. That function
+/// resolves a verdict to *apply* to an artifact, so it has to rank
+/// rejections against each other and degrade a verifier's own error
+/// mode-dependently. Here the only question is acceptance: a `Rejected`,
+/// a `NoAttestation` and an errored verifier are the same answer — this
+/// candidate grants no clearance — and the artifact keeps exactly the
+/// hold it already had. Collapsing them is what makes the predicate
+/// fail-closed by construction rather than by careful ranking.
+async fn first_accepting_verifier(
+    verifiers: &[&Arc<dyn ProvenancePort>],
+    subject: &ProvenanceSubject<'_>,
+    bundles: &[AttestationBundle],
+    requirements: &ProvenanceRequirements<'_>,
+) -> Option<AcceptedSignature> {
+    for port in verifiers {
+        match port.verify(subject, bundles, requirements).await {
+            Ok(verdict) => match verdict.outcome {
+                ProvenanceOutcome::Verified {
+                    signer,
+                    predicate_type,
+                } => {
+                    return Some(AcceptedSignature {
+                        signer,
+                        predicate_type,
+                        backend: port.name().to_string(),
+                    })
+                }
+                ProvenanceOutcome::Rejected(_) | ProvenanceOutcome::NoAttestation => {}
+            },
+            Err(e) => tracing::warn!(
+                backend = port.name(),
+                subject = %subject.content_hash,
+                error = %e,
+                "signature-material clearance: verifier errored on the candidate's \
+                 bundle — treated as no clearance",
+            ),
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Bundle carriage — reading the attestation bundles OFF a referrer manifest
+// ---------------------------------------------------------------------------
+//
+// These live beside the cascade rather than in the orchestration file
+// because two callers now read bundles off a referrer manifest's bytes: the
+// verify path's own bundle fetch (walking INBOUND `oci_subject` rows to find
+// the referrers of the artifact under verification) and
+// `resolve_signature_material_clearance` (holding ONE candidate referrer
+// already). Both must agree on which layers carry signature material, or a
+// carriage shape added for one is silently invisible to the other.
+
+/// Decode a base64 `dev.cosignproject.cosign/signature` annotation into raw
+/// signature bytes (ADR 0039 §8). cosign emits standard-alphabet base64. A
+/// malformed annotation yields `None` — the carriage skips it; it can never be
+/// a valid signature, and under `Required` the absence of any valid bundle
+/// folds to `NoAttestation`, which holds.
+pub(crate) fn decode_simplesigning_signature(annotation: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(annotation.trim())
+        .ok()
+}
+
+/// Wrap a Sigstore v0.3 bundle blob as the right [`AttestationBundle`] shape so
+/// the two verifiers self-select (ADR 0039 §6/§8):
+///
+/// - a **cosign v3 keyed** bundle (a v0.3 bundle whose `verificationMaterial`
+///   is a bare `publicKey`, no Fulcio cert) → `new_signed(bytes, raw DSSE sig)`,
+///   so the keyed `cosign-key` verifier claims it (its loop requires
+///   `signature.is_some()`) and the Sigstore verifier skips it. The keyed
+///   verifier re-derives the DSSE PAE + subject digest from `bytes`; the
+///   `signature` half both flips the routing gate and carries the raw sig it
+///   verifies.
+/// - a **keyless** bundle (Fulcio cert chain), or any bundle the keyed
+///   extractor does not claim / cannot parse → `new(bytes)` (`signature =
+///   None`), routed to the Sigstore verifier unchanged (byte-for-byte the prior
+///   behaviour).
+pub(crate) fn build_bundle(bytes: Vec<u8>) -> AttestationBundle {
+    match hort_domain::provenance_bundle::extract_keyed_dsse_signature(&bytes) {
+        Ok(Some(material)) => AttestationBundle::new_signed(bytes, material.signature),
+        // Keyless, or not a keyed DSSE bundle, or unparseable-as-keyed: the
+        // Sigstore verifier's (a truly malformed bundle folds to
+        // BundleMalformed there). Never route a non-keyed bundle to the keyed
+        // verifier.
+        Ok(None) | Err(_) => AttestationBundle::new(bytes),
     }
 }
 

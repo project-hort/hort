@@ -3479,7 +3479,7 @@ that knows the per-ecosystem ingest count; `hort-app` only sees the aggregate
 
 | Metric | Type | Labels | Unit | Label values |
 |--------|------|--------|------|--------------|
-| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `held_pending_subject`, `requeued_no_anchor` |
+| `hort_provenance_verify_total` | counter | `backend`, `mode`, `result` | — | `result` ∈ `verified`, `rejected`, `no_attestation`, `held_pending_signature`, `held_pending_subject`, `cleared_signature_material`, `requeued_no_anchor` |
 | `hort_provenance_reject_total` | counter | `backend`, `reason` | — | `reason` ∈ `unsigned`, `untrusted_identity`, `rekor_not_found`, `cert_chain_invalid`, `bundle_malformed` |
 | `hort_provenance_late_joiner_cleared_total` | counter | `backend` | — | one increment per constituent that self-cleared against an already-verified subject at its own quarantine commit |
 
@@ -3490,6 +3490,20 @@ orchestration use case
 to this layer at the emission site). One increment per **applied
 provenance verdict**. Standing decisions: ADR 0027
 (`docs/adr/0027-artifact-provenance-verification.md`).
+
+**`result="cleared_signature_material"`** (ADR 0039 D8) is the one
+`hort_provenance_verify_total` value on which no verdict was applied to the
+artifact the job named: the folded verdict was `NoAttestation` under
+`Required`, and a signature manifest binding that artifact's digest had its
+bundle verified against the subject it names, so a cascaded
+`ProvenanceVerified` was committed instead of a hold. `backend` is the
+verifier that accepted the signature manifest's bundle. Separable from
+`verified` because the artifact carries no direct verification of its own,
+and from `held_pending_subject` because that subject has now arrived and
+been checked. A `Required` scope publishing cosign signatures shows a
+steady low rate here — two rows per signature, the `{}` config blob and the
+payload layer; a rate of zero on such a scope means the signature payloads
+are stranding instead (check for `Pending` clearances on blob rows).
 
 **`hort_provenance_late_joiner_cleared_total`** (ADR 0039 §11,
 late-joiner end). Emitted at exactly one layer —

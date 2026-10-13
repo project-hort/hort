@@ -94,6 +94,15 @@ at the index. The ADR 0007 fail-closed release predicate is satisfied **per
 artifact** — the index's own release still requires its own scan success /
 waiver (plus provenance clearance under `required`), exactly like any manifest.
 
+**Narrowed 2026-10-13 — for a terminal child only; the argument above stands
+for a held one ([ADR 0062](0062-never-advertise-what-you-will-not-serve.md)).**
+A held child's per-leaf `503` is exactly the "not yet" answer and nothing here
+changes for it, but where a child is `Rejected` / `ScanIndeterminate` the answer
+is already "never", so advertising the index invites a pull that cannot complete
+and such an index is not served — ADR 0062 holds that argument; the per-artifact
+fail-closed release predicate (ADR 0007) and the provenance cascade (ADR 0039
+§11) are untouched.
+
 **Provenance-cascade interaction (ADR 0039 §11).** The per-artifact model has
 one deliberate exception on the *provenance* axis: cosign signs only the index
 digest, so a child manifest or config/layer blob can never carry its own

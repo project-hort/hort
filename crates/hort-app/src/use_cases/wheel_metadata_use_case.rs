@@ -18,19 +18,16 @@
 //!    must be wire-indistinguishable from the actor's perspective.
 //! 2. **Per-artifact status filter.** The universal
 //!    `NonServableStatusFilter` shape — but applied at per-artifact
-//!    granularity here, not index-build granularity:
-//!    - [`QuarantineStatus::Quarantined`] →
-//!      [`WheelMetadataServeOutcome::Quarantined`] carrying the
-//!      hydrated `quarantine_deadline` so the HTTP layer can build a
-//!      503 + `Retry-After` matching the wheel download's shape.
-//!    - [`QuarantineStatus::Rejected`] /
-//!      [`QuarantineStatus::ScanIndeterminate`] →
-//!      `Err(NotFound { entity: "Artifact" })`. **Diverges from the
-//!      wheel-download handler's 403 mapping** — for `.metadata`, even
-//!      the existence of the rejected wheel must stay hidden (a 403
-//!      would leak: "the wheel exists but is blocked"; the metadata
-//!      contains declared deps + signature surface that an attacker
-//!      without download rights could otherwise enumerate).
+//!    granularity here, not index-build granularity. Every status that
+//!    withholds the wheel — [`QuarantineStatus::Quarantined`],
+//!    [`QuarantineStatus::Rejected`],
+//!    [`QuarantineStatus::ScanIndeterminate`] — yields
+//!    [`WheelMetadataServeOutcome::NonServable`] carrying the loaded
+//!    artifact, and the HTTP layer answers it through the same gate the
+//!    wheel-download route answers through. A `.metadata` request is a
+//!    request about the same artifact, so it gets the same answer: a
+//!    caller told `403 rejected` by the wheel and `404` by its metadata
+//!    learns only that the two routes were written on different days.
 //! 3. **ContentReference lookup** for the
 //!    `(repo_id, wheel_artifact_id, "wheel_metadata")` PK. Missing row
 //!    (legacy un-backfilled wheel, format-handler returned `None` at
@@ -63,10 +60,9 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use tokio::io::AsyncRead;
 
-use hort_domain::entities::artifact::QuarantineStatus;
+use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
@@ -99,31 +95,48 @@ pub struct MetadataBlob {
 
 /// Outcome of a `.metadata` serve.
 ///
-/// Three states the HTTP layer must distinguish to produce the correct
-/// wire shape:
+/// Two states, because there are only two answers a caller who reached
+/// this far can be owed:
 ///
 /// - [`Self::Available`] — 200 + bytes + headers.
-/// - [`Self::Quarantined`] — 503 + `Retry-After` (computed from the
-///   carried deadline). The use case does NOT compute the seconds string —
-///   that's HTTP-layer concern (the same shape the wheel-download handler
-///   uses today).
+/// - [`Self::NonServable`] — the parent wheel's own
+///   [`QuarantineStatus`] withholds it. The loaded [`Artifact`] rides
+///   along so the HTTP layer answers through the one gate the
+///   wheel-download route answers through
+///   (`hort_http_core::artifact_gate::non_servable_response`): a
+///   `.metadata` request is a request about that same artifact, and it
+///   is owed that same answer.
 ///
-/// The fourth state — `Rejected` / `ScanIndeterminate` / missing
-/// ContentReference / invisible repo — is signalled by
-/// `Err(AppError::Domain(DomainError::NotFound { … }))` from
-/// [`WheelMetadataUseCase::serve`], NOT by an additional outcome
-/// variant. Collapsing those onto one `NotFound` envelope is the
-/// anti-enumeration property the test matrix pins.
+/// **Carrying the artifact rather than a variant per status is what
+/// makes that structural.** The gate's match over [`QuarantineStatus`]
+/// has no wildcard arm, so the per-status shape of a refusal — which
+/// code, which headers, which body — has exactly one definition and a
+/// status added tomorrow is a compile error there. A variant per status
+/// here would be a second place to forget, and it would hand the HTTP
+/// layer strictly less than the artifact already carries: the hydrated
+/// `quarantine_deadline`, the `provenance_hold_indefinite` flag
+/// (ADR 0039 D5) and the rejection axis (ADR 0039 D6) are all on it by
+/// the time [`ArtifactUseCase::find_visible_by_path`] hands it over.
+///
+/// What is still an `Err(AppError::Domain(DomainError::NotFound { … }))`
+/// from [`WheelMetadataUseCase::serve`]: an invisible or missing
+/// repository (ADR 0021 / 0045 — that challenge fires before any status
+/// is read, and this outcome does not weaken it), a path that resolves
+/// to no artifact at all, and a wheel with no `wheel_metadata`
+/// ContentReference row. The last of those is genuinely "no such
+/// metadata" rather than a verdict, which is why it keeps the 404 the
+/// terminal verdicts no longer borrow.
 pub enum WheelMetadataServeOutcome {
     /// The CAS-resident `wheel_metadata` blob is available.
     Available(MetadataBlob),
-    /// The parent wheel is in [`QuarantineStatus::Quarantined`].
-    /// `quarantine_deadline` is the hydrated transient deadline; the
-    /// HTTP layer turns it into a `Retry-After` seconds value
-    /// matching the wheel-download handler's shape.
-    Quarantined {
-        quarantine_deadline: Option<DateTime<Utc>>,
-    },
+    /// The parent wheel's status withholds it — `Quarantined`,
+    /// `Rejected` or `ScanIndeterminate`. Carries the hydrated artifact
+    /// so the HTTP layer can put the shared status gate's question to it.
+    ///
+    /// Boxed because an `Artifact` is several hundred bytes against the
+    /// blob arm's handful, mirroring
+    /// `hort_http_pypi::VirtualMemberDownload::Found`.
+    NonServable(Box<Artifact>),
 }
 
 impl std::fmt::Debug for WheelMetadataServeOutcome {
@@ -134,12 +147,11 @@ impl std::fmt::Debug for WheelMetadataServeOutcome {
                 .field("content_hash", &blob.content_hash)
                 .field("size", &blob.size)
                 .finish_non_exhaustive(),
-            Self::Quarantined {
-                quarantine_deadline,
-            } => f
-                .debug_struct("Quarantined")
-                .field("quarantine_deadline", quarantine_deadline)
-                .finish(),
+            Self::NonServable(artifact) => f
+                .debug_struct("NonServable")
+                .field("artifact_id", &artifact.id)
+                .field("quarantine_status", &artifact.quarantine_status)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -206,45 +218,38 @@ impl WheelMetadataUseCase {
     ) -> AppResult<WheelMetadataServeOutcome> {
         // ---- (1) Visibility-gated artifact resolution ---------------
         // Anti-enumeration — denied / missing / invisible all
-        // collapse to a `NotFound` envelope inside this hop. The
-        // `find_visible_by_path` use case hydrates the transient
-        // `quarantine_deadline` so we can build the
-        // `Retry-After` below without resolving a `ScanPolicy`
-        // ourselves.
+        // collapse to a `NotFound` envelope inside this hop. It is also
+        // the one hop that hydrates the transient fields no `row ->
+        // Artifact` load can carry — the quarantine deadline, the
+        // indefinite-hold flag and the rejection axis — which is what
+        // lets the refusal below be built from the artifact alone,
+        // without this use case resolving a `ScanPolicy` or the format
+        // crate reading an event stream it may not reach (ADR 0008).
         let (repo, artifact) = self
             .artifacts
             .find_visible_by_path(repo_key, artifact_path, caller)
             .await?;
 
         // ---- (2) Per-artifact status filter -------------------------
+        // One arm for every status that withholds the wheel: the
+        // artifact goes back to the HTTP layer and the shared status gate
+        // decides what the caller is told, so this route cannot answer a
+        // status differently from the wheel-download route beside it.
+        // The match carries no wildcard arm, so a new `QuarantineStatus`
+        // is a compile error here rather than a silent withholding — or
+        // a silent serve — of a state nobody classified.
         match artifact.quarantine_status {
             QuarantineStatus::None | QuarantineStatus::Released => {}
-            QuarantineStatus::Quarantined => {
-                // 503-shaped — HTTP layer builds the Retry-After.
-                tracing::info!(
-                    artifact_id = %artifact.id,
-                    repository = %repo_key,
-                    "wheel_metadata serve rejected — parent wheel quarantined"
-                );
-                return Ok(WheelMetadataServeOutcome::Quarantined {
-                    quarantine_deadline: artifact.quarantine_deadline,
-                });
-            }
-            QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate => {
-                // **404, not 403** — anti-enumeration for the metadata
-                // surface; the wheel's existence stays hidden.
-                // Anti-enumeration log envelope on the use-case side;
-                // the handler emits no additional log.
+            QuarantineStatus::Quarantined
+            | QuarantineStatus::Rejected
+            | QuarantineStatus::ScanIndeterminate => {
                 tracing::info!(
                     artifact_id = %artifact.id,
                     repository = %repo_key,
                     status = %artifact.quarantine_status,
-                    "wheel_metadata serve denied — non-servable parent wheel collapses to NotFound"
+                    "wheel_metadata serve withheld — the parent wheel is not servable"
                 );
-                return Err(AppError::Domain(DomainError::NotFound {
-                    entity: "Artifact",
-                    id: format!("{repo_key}:{artifact_path}"),
-                }));
+                return Ok(WheelMetadataServeOutcome::NonServable(Box::new(artifact)));
             }
         }
 
@@ -310,8 +315,9 @@ mod tests {
     use crate::rbac::RbacEvaluator;
     use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{
-        sample_artifact, sample_repository, MockArtifactMetadataRepository, MockArtifactRepository,
-        MockContentReferenceIndex, MockRepositoryRepository, MockStoragePort,
+        persisted_artifact_rejected, sample_artifact, sample_repository,
+        MockArtifactMetadataRepository, MockArtifactRepository, MockContentReferenceIndex,
+        MockEventStore, MockRepositoryRepository, MockStoragePort,
     };
 
     /// SHA-256 of the constant test METADATA payload below; used as the
@@ -348,32 +354,55 @@ mod tests {
         repositories: Arc<MockRepositoryRepository>,
         storage: Arc<MockStoragePort>,
         content_references: Arc<MockContentReferenceIndex>,
+        /// The artifact's own event stream. Only wired by
+        /// [`build_harness_with_axis_hydration`]; the rejection axis is
+        /// derived from an `ArtifactRejected` event, so a test that wants
+        /// it seeds this handle.
+        events: Arc<MockEventStore>,
     }
 
     fn build_harness(access: RbacAccess) -> Harness {
+        build(access, false)
+    }
+
+    /// [`build_harness`] plus the artifact-stream port, so
+    /// `find_visible_by_path` can hydrate `Artifact::rejection_reason`
+    /// from the stream the way production does.
+    ///
+    /// Opt-in rather than default for the reason the unwired arm exists
+    /// at all: a harness that leaves the port out gets a `warn!` and a
+    /// `None` axis, and a test asserting on the axis has to be unable to
+    /// pass for that reason.
+    fn build_harness_with_axis_hydration(access: RbacAccess) -> Harness {
+        build(access, true)
+    }
+
+    fn build(access: RbacAccess, hydrate_axis: bool) -> Harness {
         let artifacts = Arc::new(MockArtifactRepository::new());
         let repositories = Arc::new(MockRepositoryRepository::new());
         let storage = Arc::new(MockStoragePort::new());
         let metadata = Arc::new(MockArtifactMetadataRepository::new());
         let content_references = Arc::new(MockContentReferenceIndex::new());
+        let events = Arc::new(MockEventStore::new());
 
         let access_uc = Arc::new(RepositoryAccessUseCase::new(
             repositories.clone(),
             access,
             true,
         ));
-        let artifact_uc = Arc::new(
-            ArtifactUseCase::new(
-                artifacts.clone(),
-                storage.clone(),
-                repositories.clone(),
-                true,
-            )
-            .with_repository_access(access_uc)
-            .with_artifact_metadata(metadata),
-        );
+        let mut artifact_uc = ArtifactUseCase::new(
+            artifacts.clone(),
+            storage.clone(),
+            repositories.clone(),
+            true,
+        )
+        .with_repository_access(access_uc)
+        .with_artifact_metadata(metadata);
+        if hydrate_axis {
+            artifact_uc = artifact_uc.with_artifact_stream_events(events.clone());
+        }
         let uc = WheelMetadataUseCase::new(
-            artifact_uc,
+            Arc::new(artifact_uc),
             content_references.clone() as Arc<dyn ContentReferenceIndex>,
             storage.clone(),
         );
@@ -383,6 +412,7 @@ mod tests {
             repositories,
             storage,
             content_references,
+            events,
         }
     }
 
@@ -447,6 +477,49 @@ mod tests {
         assert_eq!(buf, METADATA_BYTES);
     }
 
+    /// The `Debug` shape each arm renders: enough to identify the
+    /// outcome in a failing assertion or a log line, and deliberately
+    /// less than it carries. `finish_non_exhaustive` is doing work in
+    /// both arms — the blob's bytes and the artifact's every field
+    /// (path, name, checksums) have no business being formatted into a
+    /// log by an accidental `{outcome:?}`.
+    #[tokio::test]
+    async fn debug_identifies_each_outcome_without_dumping_what_it_carries() {
+        let h = build_harness(RbacAccess::Disabled);
+        let (_repo, path) = seed_wheel_with_metadata(
+            &h,
+            "pypi-test",
+            "example",
+            "example-1.0.0-py3-none-any.whl",
+            QuarantineStatus::None,
+        );
+        let available = format!("{:?}", h.uc.serve("pypi-test", &path, None).await.unwrap());
+        assert!(
+            available.starts_with("Available") && available.contains("content_hash"),
+            "unexpected Available debug: {available}"
+        );
+
+        let h = build_harness(RbacAccess::Disabled);
+        let (_repo, path) = seed_wheel_with_metadata(
+            &h,
+            "pypi-test",
+            "example",
+            "example-1.0.0-py3-none-any.whl",
+            QuarantineStatus::Rejected,
+        );
+        let withheld = format!("{:?}", h.uc.serve("pypi-test", &path, None).await.unwrap());
+        assert!(
+            withheld.starts_with("NonServable")
+                && withheld.contains("quarantine_status")
+                && withheld.contains(".."),
+            "unexpected NonServable debug: {withheld}"
+        );
+        assert!(
+            !withheld.contains("example-1.0.0-py3-none-any.whl"),
+            "the artifact's path has no business in a log line: {withheld}"
+        );
+    }
+
     // -- Anti-enumeration on private repo -------------------------
 
     #[tokio::test]
@@ -478,10 +551,29 @@ mod tests {
         );
     }
 
-    // -- Quarantined parent wheel → 503-shaped outcome -----------------
+    // -- a non-servable parent wheel reaches the HTTP layer ------------
 
+    /// Unwrap a `NonServable` outcome, or fail naming what came instead.
+    fn expect_non_servable(outcome: WheelMetadataServeOutcome) -> Artifact {
+        match outcome {
+            WheelMetadataServeOutcome::NonServable(artifact) => *artifact,
+            other => panic!("expected NonServable, got {other:?}"),
+        }
+    }
+
+    /// A quarantined parent wheel reaches the HTTP layer as the artifact
+    /// itself, carrying the hydrated deadline the `503`'s `Retry-After`
+    /// is computed from.
+    ///
+    /// The deadline is what the retired `Quarantined { quarantine_deadline }`
+    /// variant carried, and it is the smaller half of what the artifact
+    /// carries: `provenance_hold_indefinite` rides on the same value and
+    /// decides whether that `Retry-After` is emitted at all (ADR 0039
+    /// D5), which the variant had no room for. The hydration of both
+    /// fields on this load path is pinned by `ArtifactUseCase`'s own
+    /// `find_visible_by_path` tests.
     #[tokio::test]
-    async fn serve_quarantined_wheel_returns_quarantined_outcome_with_deadline() {
+    async fn serve_quarantined_wheel_hands_back_the_artifact_with_its_deadline() {
         let h = build_harness(RbacAccess::Disabled);
         let (_repo, path) = seed_wheel_with_metadata(
             &h,
@@ -491,29 +583,32 @@ mod tests {
             QuarantineStatus::Quarantined,
         );
 
-        let outcome = h.uc.serve("pypi-test", &path, None).await.unwrap();
-        match outcome {
-            WheelMetadataServeOutcome::Quarantined {
-                quarantine_deadline,
-            } => {
-                // Hydration filled in the deadline from
-                // `quarantine_window_start` (deadline hydration).
-                assert!(
-                    quarantine_deadline.is_some(),
-                    "deadline should be hydrated for quarantined artifact"
-                );
-            }
-            WheelMetadataServeOutcome::Available(_) => {
-                panic!("quarantined wheel must NOT yield Available outcome")
-            }
-        }
+        let artifact = expect_non_servable(h.uc.serve("pypi-test", &path, None).await.unwrap());
+        assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+        assert!(
+            artifact.quarantine_deadline.is_some(),
+            "deadline should be hydrated for quarantined artifact"
+        );
     }
 
-    // -- Rejected wheel → 404 (NOT 403) --------------------------------
-
+    /// **The reversal.** A rejected wheel's `.metadata` no longer
+    /// disappears into an `Artifact NotFound`: the artifact goes back to
+    /// the HTTP layer, which refuses it through the same gate the wheel
+    /// download refuses it through — a `403` naming the axis.
+    ///
+    /// Its predecessor, `serve_rejected_wheel_returns_notfound_not_forbidden`,
+    /// asserted the opposite and was right for the caller it had in
+    /// mind: a `404` here hid the wheel's existence from someone who
+    /// could not otherwise learn it. That caller does not arrive at this
+    /// arm. The repository challenge fires first (ADR 0021 / 0045, and
+    /// `serve_anonymous_on_private_repo_returns_notfound` still pins
+    /// it), so whoever reaches here was already admitted by the read
+    /// gate — and the simple index they came through listed the wheel.
+    /// The 404 therefore concealed nothing but the verdict, which is the
+    /// one fact that ends their search (ADR 0055, read-gate audience).
     #[tokio::test]
-    async fn serve_rejected_wheel_returns_notfound_not_forbidden() {
-        let h = build_harness(RbacAccess::Disabled);
+    async fn serve_rejected_wheel_hands_back_the_artifact_with_its_axis() {
+        let h = build_harness_with_axis_hydration(RbacAccess::Disabled);
         let (_repo, path) = seed_wheel_with_metadata(
             &h,
             "pypi-test",
@@ -521,27 +616,42 @@ mod tests {
             "example-1.0.0-py3-none-any.whl",
             QuarantineStatus::Rejected,
         );
+        // The axis lives on the artifact's stream, not in a column: the
+        // repository mock clears `rejection_reason` on read exactly as
+        // the one `row -> Artifact` mapper does, so seeding the fixture
+        // entity would prove nothing. Only the hydration can put it back.
+        let seeded = h.artifacts.snapshot_all().pop().expect("the seeded wheel");
+        h.events.set_stream(
+            &hort_domain::events::StreamId::artifact(seeded.id),
+            vec![persisted_artifact_rejected(
+                seeded.id,
+                hort_domain::events::RejectionReason::Scanner,
+                1,
+            )],
+        );
 
-        let err =
-            h.uc.serve("pypi-test", &path, None)
-                .await
-                .expect_err("rejected wheel must deny");
-        assert!(
-            matches!(
-                err,
-                AppError::Domain(DomainError::NotFound {
-                    entity: "Artifact",
-                    ..
-                })
-            ),
-            "rejected wheel `.metadata` must return Artifact NotFound for anti-enumeration, got {err:?}"
+        let artifact = expect_non_servable(h.uc.serve("pypi-test", &path, None).await.unwrap());
+        assert_eq!(artifact.quarantine_status, QuarantineStatus::Rejected);
+        assert_eq!(
+            artifact.rejection_reason,
+            Some(hort_domain::events::RejectionReason::Scanner),
+            "the axis must reach the HTTP layer; a refusal that cannot name it \
+             is the ADR 0039 D6 illegal state, not a healthy rejection"
         );
     }
 
-    // -- ScanIndeterminate wheel → 404 (NOT 403) -----------------------
-
+    /// The same reversal for the other terminal verdict, and for the same
+    /// reason. Its predecessor, `serve_scan_indeterminate_wheel_returns_notfound`,
+    /// pinned the `404` and was right for the same caller the rejected
+    /// test's predecessor was right for.
+    ///
+    /// Note what this test does **not** assert: a status code. Whether
+    /// `ScanIndeterminate` answers `403` or `503` is an open cross-format
+    /// question with a recorded divergence, and answering through the
+    /// shared gate is what lets this route hold no position on it — now,
+    /// or after it is settled.
     #[tokio::test]
-    async fn serve_scan_indeterminate_wheel_returns_notfound() {
+    async fn serve_scan_indeterminate_wheel_hands_back_the_artifact() {
         let h = build_harness(RbacAccess::Disabled);
         let (_repo, path) = seed_wheel_with_metadata(
             &h,
@@ -551,19 +661,10 @@ mod tests {
             QuarantineStatus::ScanIndeterminate,
         );
 
-        let err =
-            h.uc.serve("pypi-test", &path, None)
-                .await
-                .expect_err("scan-indeterminate wheel must deny");
-        assert!(
-            matches!(
-                err,
-                AppError::Domain(DomainError::NotFound {
-                    entity: "Artifact",
-                    ..
-                })
-            ),
-            "scan-indeterminate `.metadata` must return NotFound, got {err:?}"
+        let artifact = expect_non_servable(h.uc.serve("pypi-test", &path, None).await.unwrap());
+        assert_eq!(
+            artifact.quarantine_status,
+            QuarantineStatus::ScanIndeterminate
         );
     }
 

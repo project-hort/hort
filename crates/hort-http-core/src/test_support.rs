@@ -881,6 +881,204 @@ pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectio
     });
 }
 
+/// Does `text` contain something uuid-shaped (`8-4-4-4-12` hex)?
+///
+/// Hand-rolled rather than a `regex` dependency, and defined once rather
+/// than per format, because the four content-route suites each need the
+/// same answer and a per-crate copy of a security assertion is how the
+/// assertion comes to differ per crate. Pinned in both directions by
+/// `uuid_shape_tests` in this file, which is what a hand-rolled scanner
+/// owes the reader of a *negative* assertion: a scan that never matches
+/// is silently green forever.
+fn uuid_shaped(text: &str) -> bool {
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let bytes = text.as_bytes();
+    (0..bytes.len()).any(|start| {
+        let mut at = start;
+        for (group, len) in GROUPS.iter().enumerate() {
+            if group > 0 {
+                if bytes.get(at) != Some(&b'-') {
+                    return false;
+                }
+                at += 1;
+            }
+            if at + len > bytes.len() || !bytes[at..at + len].iter().all(u8::is_ascii_hexdigit) {
+                return false;
+            }
+            at += len;
+        }
+        true
+    })
+}
+
+/// Drive a format's own rejection-refusal fetcher over the **whole**
+/// `RejectionReason` vocabulary and assert each variant reaches the wire
+/// as its own `wire_kind()` token.
+///
+/// `refuse` takes the axis to seed on the artifact's event stream and
+/// returns that format's `(status, parsed body)`. Everything
+/// format-specific — which harness, which insert helper, which URL —
+/// stays in the caller; what is shared is the contract, which is
+/// precisely the part that must not differ between formats.
+///
+/// Iterating [`RejectionReason::ALL_KIND_SAMPLES`] rather than a
+/// hand-written list is what makes a variant added tomorrow covered the
+/// moment it joins that constant; the length assertion is what stops the
+/// loop going vacuous if the corpus is ever emptied.
+pub async fn assert_axis_is_the_wire_kind_for_every_variant<F, Fut>(refuse: F)
+where
+    F: Fn(Option<hort_domain::events::RejectionReason>) -> Fut,
+    Fut: std::future::Future<Output = (axum::http::StatusCode, serde_json::Value)>,
+{
+    use hort_domain::events::RejectionReason;
+    assert_eq!(
+        RejectionReason::ALL_KIND_SAMPLES.len(),
+        7,
+        "the corpus is the vocabulary; a drop to zero would make this loop vacuous"
+    );
+    for sample in RejectionReason::ALL_KIND_SAMPLES {
+        let (status, body) = refuse(Some(sample.clone())).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{sample:?}");
+        assert_eq!(body["error"], "artifact is rejected", "{sample:?}");
+        assert_eq!(
+            body["axis"],
+            sample.wire_kind(),
+            "axis for {sample:?} must be its wire_kind()"
+        );
+    }
+}
+
+/// The refusal is a diagnosis of an artifact, not a disclosure about a
+/// person, a rule, or a weakness.
+///
+/// Asserted over every variant, which is what makes it meaningful:
+/// `Curator { curator_id }` and `CurationRetroactive { rule_id }` are the
+/// two that carry a uuid, so a body built from the payload rather than
+/// the discriminator would leak here and nowhere else.
+pub async fn assert_refusal_leaks_no_uuid_or_cve<F, Fut>(refuse: F)
+where
+    F: Fn(Option<hort_domain::events::RejectionReason>) -> Fut,
+    Fut: std::future::Future<Output = (axum::http::StatusCode, serde_json::Value)>,
+{
+    use hort_domain::events::RejectionReason;
+    for sample in RejectionReason::ALL_KIND_SAMPLES {
+        let (_, body) = refuse(Some(sample.clone())).await;
+        let text = body.to_string();
+        assert!(
+            !uuid_shaped(&text),
+            "refusal body for {sample:?} carries a uuid: {text}"
+        );
+        assert!(
+            !text.contains("CVE-"),
+            "refusal body for {sample:?} carries a CVE identifier: {text}"
+        );
+    }
+}
+
+/// ADR 0039 D6's illegal state: the projection says `Rejected` and no
+/// `ArtifactRejected` stands behind it on the stream.
+///
+/// The caller is still refused — but no axis field is emitted and no
+/// `unknown` token is invented, because a token would make an
+/// inconsistency read as a verdict and clients would key on it.
+pub async fn assert_axis_less_refusal_emits_no_axis_field<F, Fut>(refuse: F)
+where
+    F: Fn(Option<hort_domain::events::RejectionReason>) -> Fut,
+    Fut: std::future::Future<Output = (axum::http::StatusCode, serde_json::Value)>,
+{
+    let (status, body) = refuse(None).await;
+    assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "artifact is rejected");
+    assert!(
+        body.get("axis").is_none(),
+        "an unrecoverable axis emits no axis field: {body}"
+    );
+}
+
+/// A repo-scoped `ScanPolicyProjection` for the two quarantine-hold
+/// shapes the content-route tests need, overriding the permissive global
+/// seed above for `repo_id`.
+///
+/// The hold an artifact ends up in is a product of three things, and a
+/// test that wants a specific one has to set all three: the policy's
+/// window, the policy's provenance mode, and whether the artifact's
+/// stream carries a `ProvenanceVerified`. This builder owns the first
+/// two; the third is the caller's (an empty stream is `Pending`).
+///
+/// Shared rather than re-typed per format because all four content-route
+/// suites need the same two policies to reach the same two holds, and a
+/// per-crate copy is how the hold rule itself came to differ per format
+/// in the first place.
+fn repo_scoped_hold_policy(
+    repo_id: Uuid,
+    name: &str,
+    quarantine_duration_secs: i64,
+    provenance_mode: hort_domain::entities::scan_policy::ProvenanceMode,
+) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
+    use chrono::Utc;
+    use hort_domain::entities::scan_policy::{
+        NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+    };
+    use hort_domain::events::PolicyScope;
+    let now = Utc::now();
+    ScanPolicyProjection {
+        policy_id: Uuid::new_v4(),
+        name: format!("{name}-{repo_id}"),
+        scope: PolicyScope::Repository(repo_id),
+        severity_threshold: SeverityThreshold::Critical,
+        quarantine_duration_secs,
+        require_approval: false,
+        provenance_mode,
+        provenance_backends: vec!["cosign".to_string()],
+        provenance_identities: Vec::new(),
+        max_artifact_age_secs: None,
+        license_policy: serde_json::Value::Null,
+        archived: false,
+        scan_backends: vec!["trivy".to_string()],
+        rescan_interval_hours: 24,
+        negligible_action: NegligibleAction::Ignore,
+        enforcement: ScanEnforcement::Reject,
+        stream_version: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// Seed the policy that puts a quarantined artifact in `repo_id` into a
+/// hold **the clock cannot resolve**: `provenance_mode: Required` with a
+/// zero-length observation window, so the window reads as elapsed and
+/// the read-path clearance is `Pending` for as long as the artifact's
+/// stream carries no `ProvenanceVerified`. What such an artifact waits
+/// for is a signature, an external event, which is why ADR 0039 D5 says
+/// its `503` advertises no `Retry-After`.
+///
+/// Requires the caller to wire [`with_provenance_hold_hydration`]: the
+/// flag is derived from the artifact's stream, and an unwired event-store
+/// handle leaves it `false` with a `warn!`.
+pub fn seed_indefinite_hold_policy(projections: &MockPolicyProjectionRepository, repo_id: Uuid) {
+    use hort_domain::entities::scan_policy::ProvenanceMode;
+    projections.insert(repo_scoped_hold_policy(
+        repo_id,
+        "indefinite-hold",
+        0,
+        ProvenanceMode::Required,
+    ));
+}
+
+/// Seed the converse: a one-hour observation window, so a freshly
+/// quarantined artifact in `repo_id` sits **inside** it. The hold
+/// resolves itself with the passage of time, so its `503` carries a real
+/// `Retry-After` and must keep it.
+pub fn seed_timed_hold_policy(projections: &MockPolicyProjectionRepository, repo_id: Uuid) {
+    use hort_domain::entities::scan_policy::ProvenanceMode;
+    projections.insert(repo_scoped_hold_policy(
+        repo_id,
+        "timed-hold",
+        3600,
+        ProvenanceMode::VerifyIfPresent,
+    ));
+}
+
 /// Build a fully-wired disabled-auth [`AppContext`] backed by in-memory
 /// mocks, with `include_repository_label = true`.
 ///
@@ -1969,8 +2167,26 @@ pub fn with_trust_config(base: &Arc<AppContext>, new_trust_config: TrustConfig) 
 /// The returned context's `artifact_use_case` is rebuilt to consume
 /// the new access use case via
 /// [`ArtifactUseCase::with_repository_access`] so
-/// `find_visible_*` calls observe the same RBAC state. The
-/// `artifact_metadata` wiring is preserved.
+/// `find_visible_*` calls observe the same RBAC state.
+///
+/// **The rebuild re-wires every optional port the use case takes, not
+/// just the access policy.** It composes the identical chain
+/// [`with_provenance_hold_hydration`] does — `artifact_metadata`, the
+/// policy projections and the artifact-stream event-store handle — all
+/// read off the same [`AppContext`] fields, so the two helpers compose in
+/// **either order** and neither silently discards what the other wired.
+///
+/// That matters because a rebuild cannot read back what the previous
+/// `ArtifactUseCase` was holding: the builder's fields are private and
+/// there is no getter. A chain that wired only the access policy
+/// therefore did not "preserve the rest", it dropped it — calling this
+/// helper after [`with_provenance_hold_hydration`] left the context
+/// without the event-store handle, and the read-path fields derived from
+/// the artifact's own stream (`Artifact::provenance_hold_indefinite`,
+/// `Artifact::rejection_reason`) came back unset with a `warn!`. An
+/// authz-shaped test about a withheld artifact needs both helpers at
+/// once, and a documented call order is a footgun a reader has to
+/// remember rather than a property the harness holds.
 pub fn with_repository_access(
     base: &Arc<AppContext>,
     new_access: Arc<RepositoryAccessUseCase>,
@@ -1985,7 +2201,9 @@ pub fn with_repository_access(
                 ctx.include_repository_label,
             )
             .with_repository_access(new_access.clone())
-            .with_artifact_metadata(ctx.artifact_metadata.clone()),
+            .with_artifact_metadata(ctx.artifact_metadata.clone())
+            .with_policy_projections(ctx.policy_projections.clone())
+            .with_artifact_stream_events(ctx.event_store.clone()),
         );
         // Keep the content-reference use case in
         // sync with the new access policy. The OCI anonymous-on-private
@@ -2096,11 +2314,18 @@ pub fn with_repositories(
 }
 
 /// Rebuild `artifact_use_case` with the two ports
-/// [`ArtifactUseCase::hydrate_quarantine_deadline`] needs to resolve an
-/// ADR 0039 D5 hold on the read path: the live policy projections (the
+/// [`ArtifactUseCase::hydrate_quarantine_deadline`] needs to resolve its
+/// stream-derived read-path fields: the live policy projections (the
 /// window duration **and** `provenance_mode`) and a read-only event-store
-/// handle (the `ProvenanceVerified` lookup behind
-/// `Artifact::provenance_hold_indefinite`).
+/// handle for the artifact's own stream.
+///
+/// That handle serves both of them, so this helper is also what a test
+/// about a **`Rejected`** artifact's `Artifact::rejection_reason` opts
+/// into — the axis is derived from the artifact's `ArtifactRejected`
+/// event, so such a test seeds the stream (`persisted_artifact_rejected`)
+/// and wires it here. The ADR 0039 D5 half is
+/// `Artifact::provenance_hold_indefinite`: whether an already-expired
+/// hold waits on a `ProvenanceVerified` rather than on the clock.
 ///
 /// Deliberately opt-in rather than part of the default mock build. The
 /// harness seeds a permissive global policy with
@@ -2121,8 +2346,20 @@ pub fn with_provenance_hold_hydration(base: &Arc<AppContext>) -> Arc<AppContext>
             .with_repository_access(ctx.repository_access_use_case.clone())
             .with_artifact_metadata(ctx.artifact_metadata.clone())
             .with_policy_projections(ctx.policy_projections.clone())
-            .with_provenance_clearance_events(ctx.event_store.clone()),
+            .with_artifact_stream_events(ctx.event_store.clone()),
         );
+        // The wheel-metadata use case composes an `ArtifactUseCase` by
+        // value-held `Arc`, so it keeps whichever one it was built with:
+        // without this rebuild a PEP 658 `.metadata` test that opts into
+        // the hydration would still load through the un-hydrated use
+        // case and see no axis and no indefinite-hold flag — a refusal
+        // that looks right for a harness reason. Same rebuild, and the
+        // same reason, as `with_repository_access` above.
+        ctx.wheel_metadata_use_case = Arc::new(WheelMetadataUseCase::new(
+            ctx.artifact_use_case.clone(),
+            ctx.content_references.clone(),
+            ctx.storage.clone(),
+        ));
     })
 }
 
@@ -2375,5 +2612,171 @@ mod pull_dedup_wiring_tests {
         let handle = PrometheusBuilder::new().build_recorder().handle();
         let (ctx, _mocks) = build_mock_ctx(handle);
         let _: &Arc<dyn MetadataMirrorStore> = &ctx.metadata_mirror;
+    }
+}
+
+#[cfg(test)]
+mod artifact_use_case_composition_tests {
+    //! The `with_*` helpers that rebuild
+    //! [`AppContext::artifact_use_case`] must compose in **any order**.
+    //!
+    //! A rebuild cannot read back the optional ports the previous
+    //! `ArtifactUseCase` was holding — the builder's fields are private —
+    //! so each helper re-wires the whole chain off the [`AppContext`]
+    //! fields. A helper that re-wired only its own concern would drop the
+    //! others, and the symptom is silent: the read-path fields derived
+    //! from the artifact's own event stream come back unset and the
+    //! refusal that was supposed to name them says nothing. These tests
+    //! drive the real hydration through both call orders so the property
+    //! is measured rather than documented.
+
+    use super::*;
+    use hort_app::use_cases::test_support::{
+        persisted_artifact_rejected, sample_artifact, sample_repository,
+    };
+    use hort_domain::entities::artifact::QuarantineStatus;
+    use hort_domain::events::{RejectionReason, StreamId};
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    /// Seed a `Rejected` artifact plus the `ArtifactRejected` event the
+    /// axis is derived from, and hand back the `(repo_key, path)` a
+    /// `find_visible_by_path` needs.
+    ///
+    /// The axis is seeded on the **stream**, never on the fixture entity:
+    /// `MockArtifactRepository`'s reads clear `Artifact::rejection_reason`
+    /// exactly as `hort-adapters-postgres`'s one `row -> Artifact` mapper
+    /// does, so a field set here would be gone before the use case saw
+    /// it. Only the hydration can put it back, which is what makes this
+    /// test about the composition rather than about the fixture.
+    fn seed_rejected(mocks: &MockPorts) -> (String, String) {
+        let repo = sample_repository();
+        let repo_key = repo.key.clone();
+        let repo_id = repo.id;
+        mocks.repositories.insert(repo);
+
+        let mut artifact = sample_artifact(QuarantineStatus::Rejected);
+        artifact.repository_id = repo_id;
+        artifact.path = "composed/axis".to_string();
+        artifact.rejection_reason = None;
+        let artifact_id = artifact.id;
+        let path = artifact.path.clone();
+        mocks.artifacts.insert(artifact);
+
+        mocks.events.set_stream(
+            &StreamId::artifact(artifact_id),
+            vec![persisted_artifact_rejected(
+                artifact_id,
+                RejectionReason::Provenance,
+                1,
+            )],
+        );
+        (repo_key, path)
+    }
+
+    /// `with_repository_access` after `with_provenance_hold_hydration`:
+    /// the order that used to discard the event-store handle, because the
+    /// access helper rebuilt the use case and re-wired only the access
+    /// policy.
+    #[tokio::test]
+    async fn repository_access_after_hold_hydration_still_hydrates_the_axis() {
+        let handle = PrometheusBuilder::new().build_recorder().handle();
+        let (base, mocks) = build_mock_ctx(handle);
+        let (repo_key, path) = seed_rejected(&mocks);
+
+        let ctx = with_provenance_hold_hydration(&base);
+        let ctx = with_repository_access(&ctx, ctx.repository_access_use_case.clone());
+
+        let (_repo, artifact) = ctx
+            .artifact_use_case
+            .find_visible_by_path(&repo_key, &path, None)
+            .await
+            .expect("seeded artifact resolves");
+        assert_eq!(
+            artifact.rejection_reason,
+            Some(RejectionReason::Provenance),
+            "with_repository_access must carry the artifact-stream event-store handle \
+             forward, or the rejection axis it was wired for comes back unset"
+        );
+    }
+
+    /// The reverse order, which always worked — asserted so the pair
+    /// pins order-independence rather than just the broken direction.
+    #[tokio::test]
+    async fn hold_hydration_after_repository_access_still_hydrates_the_axis() {
+        let handle = PrometheusBuilder::new().build_recorder().handle();
+        let (base, mocks) = build_mock_ctx(handle);
+        let (repo_key, path) = seed_rejected(&mocks);
+
+        let ctx = with_repository_access(&base, base.repository_access_use_case.clone());
+        let ctx = with_provenance_hold_hydration(&ctx);
+
+        let (_repo, artifact) = ctx
+            .artifact_use_case
+            .find_visible_by_path(&repo_key, &path, None)
+            .await
+            .expect("seeded artifact resolves");
+        assert_eq!(
+            artifact.rejection_reason,
+            Some(RejectionReason::Provenance),
+            "hold hydration applied last must hydrate the rejection axis"
+        );
+    }
+
+    /// `with_repository_access` **alone** hydrates too: it wires the
+    /// chain off the context rather than relying on a prior
+    /// `with_provenance_hold_hydration`. This is what makes the helper
+    /// composable in any order instead of merely non-destructive in one.
+    #[tokio::test]
+    async fn repository_access_alone_hydrates_the_axis() {
+        let handle = PrometheusBuilder::new().build_recorder().handle();
+        let (base, mocks) = build_mock_ctx(handle);
+        let (repo_key, path) = seed_rejected(&mocks);
+
+        let ctx = with_repository_access(&base, base.repository_access_use_case.clone());
+
+        let (_repo, artifact) = ctx
+            .artifact_use_case
+            .find_visible_by_path(&repo_key, &path, None)
+            .await
+            .expect("seeded artifact resolves");
+        assert_eq!(
+            artifact.rejection_reason,
+            Some(RejectionReason::Provenance),
+            "with_repository_access wires the artifact-stream handle from the context, \
+             so it hydrates without a prior with_provenance_hold_hydration"
+        );
+    }
+}
+
+#[cfg(test)]
+mod uuid_shape_tests {
+    use super::uuid_shaped;
+
+    /// A hand-rolled shape scan owes the reader both halves: that it
+    /// finds a uuid wherever one is, and that it does not call
+    /// something else one. The second half is the load-bearing one —
+    /// the refusal assertion it serves is a *negative* one, so a
+    /// scanner that never matches is silently green forever.
+    #[test]
+    fn the_uuid_shape_scan_sees_a_uuid_and_only_a_uuid() {
+        let nil = "00000000-0000-0000-0000-000000000000";
+        for carrier in [
+            nil.to_string(),
+            format!("{{\"curator_id\":\"{nil}\"}}"),
+            format!("prefix {} suffix", "9f8a7b6c-1D2E-3f40-A5b6-c7d8e9f0a1b2"),
+        ] {
+            assert!(uuid_shaped(&carrier), "missed a uuid in {carrier}");
+        }
+        for clean in [
+            "",
+            "{\"error\":\"artifact is rejected\",\"axis\":\"curation_retroactive\"}",
+            // Near-miss groupings and a sha256 digest, all of which a
+            // sloppier scan would claim as a uuid.
+            "0000000-0000-0000-0000-0000000000000",
+            "deadbeef-dead-beef-dead-beefdeadbee",
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ] {
+            assert!(!uuid_shaped(clean), "false uuid match in {clean}");
+        }
     }
 }

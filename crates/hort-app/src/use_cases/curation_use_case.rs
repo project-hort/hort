@@ -2044,13 +2044,15 @@ mod tests {
     /// `DomainError::InvalidState` (409, ADR 0025) — never `Invariant`
     /// (500).
     ///
-    /// This is also the fail-closed shape of the hydration itself: the
-    /// mock repository hands back the entity exactly as it was inserted,
-    /// `rejection_reason` included, where the Postgres mapper would hand
-    /// back `None`. If this method stopped re-deriving the reason from the
-    /// stream, the fixture's entity-level `Some(Scanner)` would release
-    /// here — so the test pins the derivation against the *stream*, not
-    /// against whatever the row happened to carry.
+    /// This is also the fail-closed shape of the hydration itself. The
+    /// axis reaches this method from the stream and from nowhere else:
+    /// `rejection_reason` is not a column on the `artifacts` projection,
+    /// so both the Postgres mapper and `MockArtifactRepository`'s reads
+    /// hand the entity back with it cleared, whatever a fixture seeded.
+    /// A reason-less stream therefore cannot be talked out of its 409 by
+    /// the row — and the positive direction is pinned next door by
+    /// `assert_waive_overrides`, whose success is only reachable through
+    /// the stream-derived axis.
     #[tokio::test]
     async fn waive_from_rejected_without_a_terminal_event_is_invalid_state_not_invariant() {
         let (uc, artifacts, events, lifecycle) = make_use_case();
@@ -2102,6 +2104,12 @@ mod tests {
     /// the curator and carries the attribution the application layer
     /// populates, and the saved entity carries **no** stale rejection
     /// reason.
+    ///
+    /// The axis these overrides turn on comes from the seeded
+    /// `ArtifactRejected` and can come from nowhere else: the repository
+    /// read clears `rejection_reason` exactly as the projection load
+    /// does, so a stop to the stream derivation turns every one of these
+    /// into the reason-less 409 above.
     async fn assert_waive_overrides(reason: RejectionReason) {
         let (uc, artifacts, events, lifecycle) = make_use_case();
         let artifact_id = seed_rejected_on_axis(&artifacts, &events, reason.clone());

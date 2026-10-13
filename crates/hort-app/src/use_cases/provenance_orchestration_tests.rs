@@ -332,104 +332,6 @@ fn seed_bundle(f: &Fixture, bundle_bytes: &[u8]) {
     let _ = seed_manifest_and_bundle(f, bundle_bytes);
 }
 
-/// `decode_simplesigning_signature` (ADR 0039 §8): standard base64 → raw bytes;
-/// whitespace trimmed; non-base64 → `None` (the carriage skips it).
-#[test]
-fn decode_simplesigning_signature_decodes_b64_and_rejects_garbage() {
-    use base64::Engine as _;
-    let raw: &[u8] = b"\x30\x45\x02\x21\x00sigbytes";
-    let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-    assert_eq!(decode_simplesigning_signature(&b64).as_deref(), Some(raw));
-    assert_eq!(
-        decode_simplesigning_signature(&format!("  {b64}\n")).as_deref(),
-        Some(raw),
-        "annotation whitespace is trimmed"
-    );
-    assert_eq!(decode_simplesigning_signature("!!!not base64!!!"), None);
-}
-
-/// A minimal keyed cosign v3 Sigstore v0.3 bundle (bare `publicKey`, DSSE
-/// envelope over an in-toto Statement binding `digest_hex`), signed opaquely.
-fn keyed_v03_bundle_json(digest_hex: &str, sig_bytes: &[u8]) -> Vec<u8> {
-    use base64::Engine as _;
-    let eng = base64::engine::general_purpose::STANDARD;
-    let statement = serde_json::json!({
-        "_type": "https://in-toto.io/Statement/v1",
-        "subject": [ { "digest": { "sha256": digest_hex }, "annotations": {} } ],
-        "predicateType": "https://sigstore.dev/cosign/sign/v1"
-    })
-    .to_string();
-    serde_json::json!({
-        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
-        "verificationMaterial": { "publicKey": { "hint": "abc" } },
-        "dsseEnvelope": {
-            "payload": eng.encode(statement.as_bytes()),
-            "payloadType": "application/vnd.in-toto+json",
-            "signatures": [ { "sig": eng.encode(sig_bytes) } ]
-        }
-    })
-    .to_string()
-    .into_bytes()
-}
-
-/// `build_bundle` (ADR 0039 §8): a cosign v3 keyed v0.3 bundle is wrapped
-/// `new_signed` (the keyed verifier's) carrying the raw DSSE signature, so the
-/// two verifiers self-select by signature-presence.
-#[test]
-fn build_bundle_wraps_keyed_v03_as_signed_with_the_dsse_signature() {
-    let digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let raw_sig = vec![0x30, 0x44, 0x02, 0x20, 0xde, 0xad];
-    let bundle_json = keyed_v03_bundle_json(digest, &raw_sig);
-    let bundle = build_bundle(bundle_json.clone());
-    assert_eq!(
-        bundle.signature.as_deref(),
-        Some(raw_sig.as_slice()),
-        "a keyed v0.3 bundle carries its raw DSSE signature so the keyed verifier claims it"
-    );
-    assert_eq!(bundle.bytes, bundle_json, "bytes stay the full bundle blob");
-}
-
-/// A keyless (Fulcio-cert) v0.3 bundle is wrapped `new` (`signature == None`)
-/// — the Sigstore verifier's, byte-for-byte the prior behaviour.
-#[test]
-fn build_bundle_wraps_keyless_cert_bundle_as_unsigned() {
-    let keyless = br#"{
-        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
-        "verificationMaterial": { "certificate": { "rawBytes": "AAAA" } },
-        "dsseEnvelope": {
-            "payload": "eyJzdWJqZWN0IjpbeyJkaWdlc3QiOnsic2hhMjU2IjoiYWEifX1dfQ==",
-            "payloadType": "application/vnd.in-toto+json",
-            "signatures": [ { "sig": "AAAA" } ]
-        }
-    }"#
-    .to_vec();
-    let bundle = build_bundle(keyless.clone());
-    assert_eq!(
-        bundle.signature, None,
-        "a keyless bundle stays unsigned (the Sigstore verifier's)"
-    );
-    assert_eq!(bundle.bytes, keyless);
-}
-
-/// A bundle the keyed extractor cannot claim (not a bundle at all, or a
-/// keyed-shaped bundle with undecodable DSSE material) is wrapped `new` — the
-/// Sigstore verifier folds a truly malformed one to BundleMalformed; a
-/// non-keyed one is simply its shape. Never routed to the keyed verifier.
-#[test]
-fn build_bundle_wraps_unclaimable_bytes_as_unsigned() {
-    // Not a bundle object at all.
-    let b1 = build_bundle(b"not a bundle".to_vec());
-    assert_eq!(b1.signature, None);
-    // Keyed-shaped but the DSSE payload is not valid base64 → extractor errs →
-    // routed unsigned (never keyed).
-    let malformed_keyed = br#"{"verificationMaterial":{"publicKey":{"hint":"x"}},"dsseEnvelope":{"payload":"!!nob64!!","payloadType":"application/vnd.in-toto+json","signatures":[{"sig":"AA=="}]}}"#.to_vec();
-    let b2 = build_bundle(malformed_keyed);
-    assert_eq!(
-        b2.signature, None,
-        "an unparseable-as-keyed bundle is not routed to the keyed verifier"
-    );
-}
-
 // ===========================================================================
 // (Off) — provenance inert; no verifier runs.
 // ===========================================================================
@@ -941,11 +843,18 @@ fn age_artifact_past_a_one_second_window(f: &Fixture, elapsed_secs: i64) {
 /// scan (the ADR 0007 release authority) plus, when `provenance_verified`,
 /// the `ProvenanceVerified` the release gate resolves `Cleared` from.
 async fn timer_release_is_granted(f: &Fixture, provenance_verified: bool) -> bool {
-    let stream_id = StreamId::artifact(f.artifact_id);
     let mut stream = vec![persisted_scan_completed(f.artifact_id, 0, 0)];
     if provenance_verified {
         stream.push(persisted_verified(f.artifact_id, None));
     }
+    timer_release_is_granted_over(f, stream).await
+}
+
+/// [`timer_release_is_granted`] over a caller-supplied stream, so a test
+/// can put the `ProvenanceVerified` the run ACTUALLY committed in front of
+/// the gate instead of a hand-built stand-in.
+async fn timer_release_is_granted_over(f: &Fixture, stream: Vec<PersistedEvent>) -> bool {
+    let stream_id = StreamId::artifact(f.artifact_id);
     f.events.set_stream(&stream_id, stream);
 
     let quarantine_uc = QuarantineUseCase::new(
@@ -5939,4 +5848,457 @@ async fn cascade_over_cap_index_cascades_nothing_subject_still_clears() {
         "an over-cap index is refused by the parser — cascade to nothing, never truncation"
     );
     assert!(cascaded_events(&f).is_empty());
+}
+
+// ===========================================================================
+// ADR 0039 D8 — signature material is cleared by the signature that verified
+// its subject, END TO END through `verify_artifact` and then through the
+// release sweep's own gate.
+//
+// Field evidence this reproduces: across the six production repositories
+// running `provenance_mode: required`, not one signature payload was
+// released — the Referrers API answered 200, the signature manifest
+// answered 200, and its payload answered 503 with every byte present in
+// CAS. The payload's own verify finds no bundle (nothing signs a
+// signature), so under `Required` D1 held it and D4 held it indefinitely.
+// ===========================================================================
+
+/// A verifier that accepts a bundle only over ONE registered subject
+/// digest — the shape that separates a real signature manifest from a
+/// manifest merely *shaped* like one. Both are handed to this same port
+/// with a bundle in hand; only the subject it actually holds a signature
+/// for is accepted.
+struct SubjectKeyedPort {
+    accepts: ContentHash,
+}
+
+impl SubjectKeyedPort {
+    fn accepting(accepts: ContentHash) -> Vec<Arc<dyn ProvenancePort>> {
+        vec![Arc::new(Self { accepts }) as Arc<dyn ProvenancePort>]
+    }
+}
+
+impl ProvenancePort for SubjectKeyedPort {
+    fn name(&self) -> &str {
+        "cosign"
+    }
+    fn applies_to(&self, format: &str) -> bool {
+        format == "oci"
+    }
+    fn verify<'a>(
+        &'a self,
+        subject: &'a ProvenanceSubject<'a>,
+        bundles: &'a [AttestationBundle],
+        _policy: &'a ProvenanceRequirements<'a>,
+    ) -> BoxFuture<'a, DomainResult<ProvenanceVerdict>> {
+        let accepted = !bundles.is_empty() && subject.content_hash == &self.accepts;
+        Box::pin(async move {
+            Ok(if accepted {
+                ProvenanceVerdict::verified(sample_identity(), None)
+            } else {
+                ProvenanceVerdict::no_attestation()
+            })
+        })
+    }
+    fn health_check(&self) -> BoxFuture<'_, DomainResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// The signed image's CAS bytes — a fixed constant so a test can compute
+/// the subject digest its verifier must be keyed on BEFORE the fixture
+/// (and therefore the port set) is built.
+const SUBJECT_IMAGE_BYTES: &[u8] =
+    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
+
+fn subject_image_hash() -> ContentHash {
+    hex::encode(sha2::Sha256::digest(SUBJECT_IMAGE_BYTES))
+        .parse()
+        .expect("valid sha256")
+}
+
+/// Seed one held artifact with `hash` as its CAS identity, plus its bytes.
+fn seed_held_blob(
+    f: &Fixture,
+    hash: &ContentHash,
+    bytes: Vec<u8>,
+    status: QuarantineStatus,
+) -> Uuid {
+    let mut artifact: Artifact = sample_artifact(status);
+    artifact.repository_id = f.repository_id;
+    artifact.sha256_checksum = hash.clone();
+    let id = artifact.id;
+    f.artifacts.insert(artifact);
+    f.storage.insert_content(hash.clone(), bytes);
+    id
+}
+
+/// What a seeded cosign-signature scene is made of, by CAS hash.
+struct SignatureScene {
+    /// The signature manifest itself (status `None`, never
+    /// provenance-verified — ADR 0039 §8's narrow signature ingest, which
+    /// is exactly why neither existing cascade end can reach its own
+    /// constituents).
+    manifest: ContentHash,
+    /// The `{}` config blob row, held.
+    config: ContentHash,
+}
+
+/// Seed a cosign signature scene around the FIXTURE ARTIFACT, which plays
+/// the signature manifest's **payload layer** — the row production holds.
+///
+/// Deliberately NOT an `oci_subject` row on the fixture artifact: a
+/// signature payload is nobody's subject, so its own bundle fetch finds
+/// nothing and the folded verdict is `NoAttestation`. The only edges are
+/// the `oci_config` / `oci_layer` membership claims the manifest PUT
+/// commits.
+async fn seed_signature_manifest_over(f: &Fixture, declares_subject: bool) -> SignatureScene {
+    let subject = subject_image_hash();
+    seed_held_blob(
+        f,
+        &subject,
+        SUBJECT_IMAGE_BYTES.to_vec(),
+        QuarantineStatus::Quarantined,
+    );
+
+    // The `{}` config blob — the second held row per signature, and the
+    // row every cosign signature in the repository shares.
+    let config_bytes = b"{}".to_vec();
+    let config: ContentHash = hex::encode(sha2::Sha256::digest(&config_bytes))
+        .parse()
+        .expect("valid sha256");
+    seed_held_blob(f, &config, config_bytes, QuarantineStatus::Quarantined);
+
+    let mut body = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "artifactType": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+        "config": {
+            "mediaType": "application/vnd.oci.empty.v1+json",
+            "digest": format!("sha256:{config}"),
+            "size": 2,
+        },
+        "layers": [{
+            "mediaType": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+            "digest": format!("sha256:{}", f.content_hash),
+            "size": 512,
+        }],
+    });
+    if declares_subject {
+        body["subject"] = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": format!("sha256:{subject}"),
+            "size": 528,
+        });
+    }
+    let manifest_bytes = serde_json::to_vec(&body).expect("signature manifest json");
+    let manifest: ContentHash = hex::encode(sha2::Sha256::digest(&manifest_bytes))
+        .parse()
+        .expect("valid sha256");
+    let manifest_id = seed_held_blob(f, &manifest, manifest_bytes, QuarantineStatus::None);
+
+    for (target, kind) in [
+        (f.content_hash.clone(), "oci_layer"),
+        (config.clone(), "oci_config"),
+    ] {
+        f.content_references
+            .insert(ContentReference {
+                source_artifact_id: manifest_id,
+                target_content_hash: target,
+                kind: kind.to_string(),
+                metadata: serde_json::Value::Null,
+                repository_id: f.repository_id,
+                recorded_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("seed membership edge");
+    }
+
+    SignatureScene { manifest, config }
+}
+
+/// A `Required` fixture whose artifact carries `payload` as its CAS bytes
+/// and whose single verifier accepts `accepts` as a subject, aged past a
+/// closed one-second observation window (the measured production shape).
+fn signature_material_fixture(payload: &[u8], accepts: ContentHash) -> Fixture {
+    let f = build_with_payload(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::Required),
+        vec![sample_pattern()],
+        SubjectKeyedPort::accepting(accepts),
+        payload,
+    );
+    age_artifact_past_a_one_second_window(&f, 2);
+    f
+}
+
+/// The `PersistedEvent` the run ACTUALLY committed, so the release gate is
+/// asked about that event rather than a hand-built stand-in.
+fn as_persisted(
+    artifact_id: Uuid,
+    event: hort_domain::events::ProvenanceVerified,
+) -> PersistedEvent {
+    PersistedEvent {
+        event_id: Uuid::new_v4(),
+        stream_id: StreamId::artifact(artifact_id),
+        stream_position: 1,
+        global_position: 1,
+        event: DomainEvent::ProvenanceVerified(event),
+        correlation_id: Uuid::new_v4(),
+        causation_id: None,
+        actor: cascade_system_actor(),
+        event_version: 1,
+        stored_at: chrono::Utc::now(),
+    }
+}
+
+/// **The acceptance.** The signature payload layer of a manifest whose
+/// bundle verifies its subject clears at verify time, and the artifact
+/// then releases through the release sweep's own gate — on the scan axis
+/// alone, with no change to `release_clearance.rs`.
+#[tokio::test]
+async fn a_signature_payload_clears_and_then_releases_through_the_sweep() {
+    let f = signature_material_fixture(b"the-sigstore-bundle-json-blob", subject_image_hash());
+    let scene = seed_signature_manifest_over(&f, true).await;
+
+    // Before the rule fires: held, and the sweep refuses it. This is the
+    // measured production state — every byte present, 503 to a pull.
+    assert!(!timer_release_is_granted(&f, false).await);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::ClearedAsSignatureMaterial,
+        "no hold was applied: the signature that verified the subject cleared \
+         its own bytes",
+    );
+
+    // The clearance is legible: a real `ProvenanceVerified` naming the
+    // signature manifest, not the subject and not the nominating edge.
+    let cascaded = cascaded_events(&f);
+    assert_eq!(cascaded.len(), 1);
+    assert_eq!(cascaded[0].0, f.artifact_id);
+    assert_eq!(cascaded[0].1.cascaded_from.as_ref(), Some(&scene.manifest));
+    assert_eq!(cascaded[0].1.backend, "cosign");
+
+    // THE REAL GATE, over the event the run actually committed.
+    assert!(
+        timer_release_is_granted_over(
+            &f,
+            vec![
+                persisted_scan_completed(f.artifact_id, 0, 0),
+                as_persisted(f.artifact_id, cascaded[0].1.clone()),
+            ],
+        )
+        .await,
+        "the cascaded clearance releases the payload through the single place \
+         the provenance leg of the release gate is computed",
+    );
+}
+
+/// The `{}` config blob clears on the same authority — the second of the
+/// two rows every cosign signature leaves held, and the one shared by
+/// every signature in the repository.
+#[tokio::test]
+async fn the_empty_config_blob_of_a_signature_manifest_clears_too() {
+    // The fixture artifact IS the `{}` config blob; the manifest's config
+    // descriptor names it and its layer is a separate bundle blob.
+    let f = signature_material_fixture(b"{}", subject_image_hash());
+    let subject = subject_image_hash();
+    seed_held_blob(
+        &f,
+        &subject,
+        SUBJECT_IMAGE_BYTES.to_vec(),
+        QuarantineStatus::Quarantined,
+    );
+    let bundle_bytes = b"the-sigstore-bundle".to_vec();
+    let bundle_hash: ContentHash = hex::encode(sha2::Sha256::digest(&bundle_bytes))
+        .parse()
+        .expect("valid sha256");
+    f.storage.insert_content(bundle_hash.clone(), bundle_bytes);
+
+    let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "artifactType": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+        "subject": { "digest": format!("sha256:{subject}"), "size": 528 },
+        "config": {
+            "mediaType": "application/vnd.oci.empty.v1+json",
+            "digest": format!("sha256:{}", f.content_hash),
+            "size": 2,
+        },
+        "layers": [{
+            "mediaType": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+            "digest": format!("sha256:{bundle_hash}"),
+            "size": 512,
+        }],
+    }))
+    .expect("json");
+    let manifest: ContentHash = hex::encode(sha2::Sha256::digest(&manifest_bytes))
+        .parse()
+        .expect("valid sha256");
+    let manifest_id = seed_held_blob(&f, &manifest, manifest_bytes, QuarantineStatus::None);
+    f.content_references
+        .insert(ContentReference {
+            source_artifact_id: manifest_id,
+            target_content_hash: f.content_hash.clone(),
+            kind: "oci_config".to_string(),
+            metadata: serde_json::Value::Null,
+            repository_id: f.repository_id,
+            recorded_at: chrono::Utc::now(),
+        })
+        .await
+        .expect("seed config edge");
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(outcome, ProvenanceRunOutcome::ClearedAsSignatureMaterial);
+    let cascaded = cascaded_events(&f);
+    assert_eq!(cascaded.len(), 1);
+    assert_eq!(cascaded[0].1.cascaded_from.as_ref(), Some(&manifest));
+}
+
+/// **The decoy — this rule's security proof, end to end.** A manifest that
+/// passes §8's purity classifiers and declares a subject, naming the
+/// artifact under verification as its "bundle" layer, but whose bundle
+/// does not verify that subject. The artifact keeps exactly the hold it
+/// would have had, and so does the `{}` config blob the decoy also names.
+///
+/// A blob has one artifact row and one quarantine status per hort
+/// repository (`blobs/sha256:<hex>`, unique on `(repository_id, path)`,
+/// no OCI name component), so a clearance resolved from the pusher's
+/// declaration would serve this layer to every consumer of the
+/// repository.
+#[tokio::test]
+async fn a_decoy_signature_manifest_leaves_its_named_layer_held() {
+    // The verifier holds a signature for SOMETHING ELSE — the only honest
+    // answer for a bundle that does not bind the declared subject.
+    let f = signature_material_fixture(b"malware.tar.gz", hexhash('e'));
+    let scene = seed_signature_manifest_over(&f, true).await;
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSignature,
+        },
+        "a manifest SHAPED like a signature clears nothing — the hold stands",
+    );
+    assert!(
+        cascaded_events(&f).is_empty(),
+        "nothing was cleared, so nothing can be served"
+    );
+    assert!(
+        !timer_release_is_granted(&f, false).await,
+        "and the sweep still refuses it"
+    );
+    let config_row = f
+        .artifacts
+        .find_by_repo_and_checksum(f.repository_id, &scene.config)
+        .await
+        .expect("lookup")
+        .expect("the config row");
+    assert_eq!(config_row.quarantine_status, QuarantineStatus::Quarantined);
+}
+
+/// The negative case: an ordinary image layer under `Required` with no
+/// signature anywhere still holds. The D8 window must not widen the
+/// `NoAttestation` × `Required` arm for artifacts nothing signed.
+#[tokio::test]
+async fn an_ordinary_layer_with_no_signature_anywhere_still_holds() {
+    let f = build_constituent(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::Required),
+        SubjectKeyedPort::accepting(hexhash('e')),
+    );
+    age_artifact_past_a_one_second_window(&f, 2);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSubject,
+        },
+    );
+    assert!(cascaded_events(&f).is_empty());
+    assert!(!timer_release_is_granted(&f, false).await);
+}
+
+/// A legacy cosign tag-scheme `.sig` declares no `subject` descriptor —
+/// the binding lives in the `sha256-<hex>.sig` tag name, not in the bytes.
+/// There is nothing in the manifest to verify against, so the hold stands:
+/// fail-closed, and a stated limit of resolving the subject from bytes.
+#[tokio::test]
+async fn a_signature_manifest_declaring_no_subject_leaves_its_payload_held() {
+    let f = signature_material_fixture(b"the-sigstore-bundle-json-blob", subject_image_hash());
+    let _scene = seed_signature_manifest_over(&f, false).await;
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::HeldPendingSignature,
+        },
+    );
+    assert!(cascaded_events(&f).is_empty());
+}
+
+/// `VerifyIfPresent` never reaches the D8 window: with no provenance gate
+/// on a constituent there is nothing to clear, so the allowed-unsigned
+/// no-op stands and no event is committed.
+#[tokio::test]
+async fn verify_if_present_does_not_resolve_signature_material() {
+    let f = build_with_payload(
+        RepositoryFormat::Oci,
+        Some(ProvenanceMode::VerifyIfPresent),
+        vec![sample_pattern()],
+        SubjectKeyedPort::accepting(subject_image_hash()),
+        b"the-sigstore-bundle-json-blob",
+    );
+    let _scene = seed_signature_manifest_over(&f, true).await;
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::Applied {
+            event_appended: false,
+            verdict: ProvenanceVerdictSummary::NoAttestation,
+        },
+    );
+    assert!(cascaded_events(&f).is_empty());
+}
+
+/// The run outcome ticks its own metric value, once, labelled with the
+/// verifier that accepted the signature manifest's bundle — so the
+/// population this rule releases is countable and separable from both
+/// `verified` and `held_pending_subject`.
+#[test]
+fn a_signature_material_clearance_ticks_its_own_metric() {
+    let snap = crate::metrics::capture_metrics(|| {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let f = signature_material_fixture(
+                    b"the-sigstore-bundle-json-blob",
+                    subject_image_hash(),
+                );
+                let _scene = seed_signature_manifest_over(&f, true).await;
+                let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+                assert_eq!(outcome, ProvenanceRunOutcome::ClearedAsSignatureMaterial);
+            });
+    });
+
+    let ticks: Vec<String> = snap
+        .into_vec()
+        .into_iter()
+        .map(|(key, _, _, _)| format!("{key:?}"))
+        .filter(|k| k.contains("hort_provenance_verify_total"))
+        .collect();
+    assert_eq!(ticks.len(), 1, "exactly one verify tick: {ticks:?}");
+    assert!(
+        ticks[0].contains("cleared_signature_material") && ticks[0].contains("cosign"),
+        "the tick names the new result value and the accepting backend: {ticks:?}",
+    );
 }

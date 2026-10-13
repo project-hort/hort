@@ -4284,9 +4284,14 @@ mod tests {
             // the future-window branch override `quarantine_window_start`
             // (see `*_window_in_future` cases below).
             //
-            // Scan-rejected by default — the re-eval pass's eligibility
-            // guard (ADR 0041 invariant #6) admits only `Scanner`. Tests
-            // exercising the non-scan ineligibility path override this.
+            // Scan-rejected by default, to state what the fixture is.
+            // The value is NOT what the pass's eligibility guard (ADR
+            // 0041 invariant #6, `Scanner` only) reads: the axis is not
+            // a column on the `artifacts` projection, so the repository
+            // read clears it and the pass re-derives it from the
+            // artifact's `ArtifactRejected` event. A test that means the
+            // guard to see an axis seeds it on the stream
+            // (`seed_rejected_with_scan` and friends).
             rejection_reason: Some(RejectionReason::Scanner),
             quarantine_window_start: Some(Utc::now() - chrono::Duration::hours(25)),
             quarantine_deadline: None,
