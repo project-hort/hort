@@ -159,7 +159,7 @@ the result instead.
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
 | rustls-native-certs | 0.8.5 | MIT | https://github.com/rustls/rustls-native-certs |
-| rustls | 0.23.45 | MIT | https://github.com/rustls/rustls |
+| rustls | 0.23.46 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
 | parking_lot | 0.12.5 | MIT | https://github.com/Amanieu/parking_lot |
@@ -8193,7 +8193,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls 0.23.45 — MIT
+### rustls 0.23.46 — MIT
 
 Repository: https://github.com/rustls/rustls
 
