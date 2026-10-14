@@ -158,7 +158,7 @@ the result instead.
 | serde_urlencoded | 0.7.1 | MIT | https://github.com/nox/serde_urlencoded |
 | utf8parse | 0.2.2 | MIT | https://github.com/alacritty/vte |
 | hyper-rustls | 0.27.9 | MIT | https://github.com/rustls/hyper-rustls |
-| rustls-native-certs | 0.8.4 | MIT | https://github.com/rustls/rustls-native-certs |
+| rustls-native-certs | 0.8.5 | MIT | https://github.com/rustls/rustls-native-certs |
 | rustls | 0.23.45 | MIT | https://github.com/rustls/rustls |
 | httpdate | 1.0.3 | MIT | https://github.com/pyfisch/httpdate |
 | lock_api | 0.4.14 | MIT | https://github.com/Amanieu/parking_lot |
@@ -409,7 +409,7 @@ the result instead.
 | windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
 | tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
 | tokio-util | 0.7.20 | MIT | https://github.com/tokio-rs/tokio |
-| tokio | 1.53.2 | MIT | https://github.com/tokio-rs/tokio |
+| tokio | 1.53.3 | MIT | https://github.com/tokio-rs/tokio |
 | simd-adler32 | 0.3.9 | MIT | https://github.com/mcountryman/simd-adler32 |
 | miniz_oxide | 0.9.1 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
 | miniz_oxide | 0.9.1 | MIT | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
@@ -8160,7 +8160,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls-native-certs 0.8.4 — MIT
+### rustls-native-certs 0.8.5 — MIT
 
 Repository: https://github.com/rustls/rustls-native-certs
 
@@ -15796,7 +15796,7 @@ SOFTWARE.
 
 ```
 
-### tokio 1.53.2 — MIT
+### tokio 1.53.3 — MIT
 
 Repository: https://github.com/tokio-rs/tokio
 
