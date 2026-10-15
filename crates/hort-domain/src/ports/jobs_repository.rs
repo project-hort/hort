@@ -52,6 +52,32 @@ pub enum EnqueueOutcome {
     Duplicate { existing_job_id: Uuid },
 }
 
+/// What a compensating delete observed — the outcome of
+/// [`JobsRepository::delete_job`].
+///
+/// The variants name what the statement saw, not a cause inferred from it:
+/// a `DELETE ... WHERE id = $1 AND status = 'pending'` that matches no row
+/// cannot distinguish "a worker claimed it" from "the row is gone", so no
+/// variant promises either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompensatingDelete {
+    /// The row was still `pending` and is gone: the insert is rolled back,
+    /// and with it the single-flight idempotency key the row carried.
+    RolledBack,
+    /// The row was no longer `pending` when the delete reached it, so
+    /// nothing was deleted and the row survives.
+    ///
+    /// In practice this means a worker claimed the row inside the
+    /// event-store append window and is executing it: `pending -> running`
+    /// is the only transition a row this young can make, because every
+    /// other `jobs` delete in the system is horizon-gated on a terminal
+    /// status (see `delete_terminal_*_rows_older_than`) and no production
+    /// path removes a non-terminal row. The task is therefore executing
+    /// with no `TaskInvoked` audit event, and the row has to be reconciled
+    /// by hand — purging it does not undo what it did.
+    NoLongerPending,
+}
+
 /// Lifecycle status of a row in the `jobs` table.
 ///
 /// Mirrors the SQL CHECK constraint
@@ -748,11 +774,28 @@ pub trait JobsRepository: Send + Sync {
         Box::pin(async { Err(DomainError::Invariant("not implemented".into())) })
     }
 
-    /// Delete a `jobs` row by `id`. Used as a compensating action by
+    /// Delete the `jobs` row `job_id` **only while it is still
+    /// `pending`**. Used as a compensating action by
     /// `TaskUseCase::enqueue` when the event-store append fails after a
     /// successful insert (best-effort rollback — not a true two-phase
-    /// commit). Returns `Ok(())` if the row was deleted or did not exist;
-    /// returns an error only for unexpected infrastructure failures.
+    /// commit).
+    ///
+    /// The status predicate is the predicate of the purpose: what this
+    /// method may remove is the row the same call just inserted
+    /// ([`JobsRepository::enqueue_task`] inserts `status = 'pending'`) and
+    /// that nobody has claimed yet. A claim flips `pending -> running` and
+    /// starts executing the task, and the row carries the durable
+    /// single-flight idempotency key (ADR 0028) — so deleting a claimed
+    /// row would both strand an un-audited execution and free the key for
+    /// a second authorised invoke to run the same destructive task again.
+    /// An implementation that deletes a row in any other status is a
+    /// defect, not a liberal reading of "rollback".
+    ///
+    /// Returns [`CompensatingDelete::RolledBack`] when the row was deleted
+    /// and [`CompensatingDelete::NoLongerPending`] when the statement
+    /// matched nothing. The latter is a real outcome the caller MUST make
+    /// operator-visible, not a silent success; an `Err` means an
+    /// unexpected infrastructure failure.
     ///
     /// **Rollback-only.** Do not call from any path other than
     /// compensating-delete sequences. This method deliberately does NOT
@@ -761,7 +804,7 @@ pub trait JobsRepository: Send + Sync {
     ///
     /// **Default implementation:** returns
     /// `Err(DomainError::Invariant("not implemented"))`.
-    fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<()>> {
+    fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<CompensatingDelete>> {
         let _ = job_id;
         Box::pin(async { Err(DomainError::Invariant("not implemented".into())) })
     }
@@ -1595,6 +1638,20 @@ mod tests {
         assert_eq!(enq.clone(), enq);
         assert_eq!(dup.clone(), dup);
         assert_ne!(enq, dup);
+    }
+
+    /// `CompensatingDelete` derives `Copy + PartialEq + Eq + Debug` so the
+    /// use case can match on it without moving it and a test can equate an
+    /// observed outcome against an expectation.
+    #[test]
+    fn compensating_delete_copy_and_eq() {
+        let rolled = CompensatingDelete::RolledBack;
+        let stale = CompensatingDelete::NoLongerPending;
+        // `Copy`: `rolled` is still usable after being read by value.
+        let copied = rolled;
+        assert_eq!(copied, rolled);
+        assert_ne!(rolled, stale);
+        assert_eq!(format!("{stale:?}"), "NoLongerPending");
     }
 
     /// `JobsRepository::delete_job` default impl returns `Err(Invariant)`.

@@ -282,8 +282,16 @@ pub struct FederationSource {
     /// denies `jti_required`-equivalent.
     pub iat: Option<i64>,
     /// Raw `exp` NumericDate
-    /// seconds. Always present (the validator enforced `exp`). Part of
-    /// the `ReplayKey::Composite` fallback.
+    /// seconds. Always present (the validator enforced `exp`). Two
+    /// consumers: part of the `ReplayKey::Composite` fallback, and —
+    /// on BOTH key shapes — the anti-replay seen-set row's TTL
+    /// horizon, because how long this JWT can still be presented is
+    /// the only horizon that keeps the seen-set's promise (the minted
+    /// bearer's capped lifetime is a different, shorter window and
+    /// would have the prune forget the JWT while it is still
+    /// redeemable). A value that is not a representable
+    /// `DateTime<Utc>` denies the exchange fail-closed — no token row,
+    /// no event.
     pub exp: i64,
     /// The resolved
     /// `OidcIssuer.require_jti` flag, threaded from the handler (which
@@ -1057,24 +1065,53 @@ impl ApiTokenUseCase {
         //      claim. Runs ONLY on the federation path
         //      (`federation_source.is_some()`); the rotation reconciler
         //      and every other system-mint caller set it to `None` and
-        //      skip the guard entirely. Placed AFTER expiry resolution
-        //      (the seen-set row reuses the resolved token
-        //      `expires_at = min(jwt_remaining, fed_max)`) and BEFORE
-        //      `tokens.insert` + the `ApiTokenIssued` append, so a
-        //      replay or a guard outage produces ZERO side effects (no
-        //      token row, no event — "no partial side effects on deny").
+        //      skip the guard entirely. Placed BEFORE `tokens.insert` +
+        //      the `ApiTokenIssued` append — that half of the ordering
+        //      is load-bearing: a replay, a guard outage or an
+        //      underivable TTL horizon produces ZERO side effects (no
+        //      token row, no event — "no partial side effects on
+        //      deny"). It also sits after expiry resolution, but no
+        //      longer draws anything from it: the seen-set horizon is
+        //      the source JWT's own `exp`, not the minted bearer's.
         if let Some(fs) = request.federation_source.as_ref() {
-            // The seen-set TTL horizon is exactly the resolved token
-            // expiry. The system-mint path always resolves a
-            // bounded `expires_at` (the unbounded path is closed for
-            // federation), so a `None` here is an invariant violation,
-            // not a "never expires" seen-set row.
-            let seen_expires_at = token.expires_at.ok_or_else(|| {
-                ApiTokenError::Infrastructure(DomainError::Invariant(
-                    "federation mint resolved an unbounded expiry — \
-                     replay seen-set TTL is not derivable"
-                        .to_string(),
-                ))
+            // The seen-set row's TTL horizon is the **source JWT's own
+            // `exp`** — how long that signed JWT can still be
+            // presented — and NOT the minted bearer's `expires_at`.
+            // The row exists to answer "has this JWT been exchanged
+            // before?", and the TTL prune is
+            // `DELETE … WHERE expires_at < now()`, so the row has to
+            // outlast its subject: a horizon of
+            // `min(jwt_remaining, federation_max)` drops the row while
+            // the same signed JWT is still presentable — 23 h early
+            // for a 24 h CI identity against the 1 h bearer cap — and
+            // the next presentation of it is no longer a replay. The
+            // price is one row per distinct exchange per JWT lifetime
+            // instead of per bearer lifetime: finite, measured, and
+            // exactly what a seen-set must retain to keep its promise.
+            //
+            // This SUPERSEDES the `public.jwt_replay_seen.expires_at`
+            // column note in
+            // `migrations/011_gitops_machine_identity.sql`
+            // ("TTL horizon = `min(jwt_remaining, federation_max)`"),
+            // which cannot be corrected where it stands: an applied
+            // migration is never edited in place — `sqlx::migrate!`
+            // rejects the altered checksum and every existing
+            // deployment would fail at boot. The live rule is here.
+            //
+            // `fs.exp` is a NumericDate in seconds and always present
+            // (the validator enforced `exp`), but an `i64` that is not
+            // a representable `DateTime<Utc>` yields no horizon at
+            // all. That is fail-CLOSED, in the same shape as every
+            // other deny on this path: the exchange is denied, the
+            // guard is not consulted, no token row, no event. Never a
+            // clamp or a default — a horizon we invented would record
+            // a claim the prune could remove early.
+            let seen_expires_at = DateTime::<Utc>::from_timestamp(fs.exp, 0).ok_or_else(|| {
+                ApiTokenError::Infrastructure(DomainError::Invariant(format!(
+                    "federation source jwt exp ({}) is not a representable Utc \
+                     timestamp — replay seen-set TTL horizon is not derivable",
+                    fs.exp
+                )))
             })?;
 
             // Replay-key selection → either a ReplayKey or the
@@ -4492,8 +4529,10 @@ mod tests {
     }
 
     /// A federation system-mint request carrying a `jti` (the common
-    /// case → `ReplayKey::Jti`). `expires_in_seconds` is bounded so the
-    /// seen-set TTL is derivable.
+    /// case → `ReplayKey::Jti`). `expires_in_seconds` is the minted
+    /// bearer's lifetime, as the handler resolves it; the seen-set
+    /// TTL horizon is a separate value and comes from
+    /// `federation_source.exp`.
     fn make_request_federation_jti(jti: &str) -> IssueTokenRequest {
         IssueTokenRequest {
             name: "ci-pusher".into(),
@@ -4556,7 +4595,7 @@ mod tests {
             "guard consulted exactly once before mint"
         );
         // The claim used a Jti key scoped to the resolved issuer name,
-        // and the TTL is the resolved token expiry (min(jwt, fed_max)).
+        // and the TTL horizon is the source JWT's own `exp`.
         let (key, ttl) = guard_first.calls()[0].clone();
         assert_eq!(
             key,
@@ -4566,9 +4605,9 @@ mod tests {
             }
         );
         assert_eq!(
-            Some(ttl),
-            issued.expires_at,
-            "seen-set TTL must equal the resolved token expiry"
+            ttl,
+            DateTime::<Utc>::from_timestamp(1_700_000_900, 0).unwrap(),
+            "seen-set TTL must be the source JWT's exp"
         );
 
         // -- second presentation: guard says Replayed → DENY, no side effects --
@@ -4597,6 +4636,98 @@ mod tests {
         assert_eq!(guard_replay.call_count(), 1);
         // sanity: the first path DID append exactly one event
         assert_eq!(events.appended_batches().len(), 1);
+    }
+
+    /// Kills the wrong predicate: the seen-set row's TTL horizon is the
+    /// **source JWT's** `exp`, never the minted bearer's expiry. The
+    /// shape under test is the one the handler actually produces for a
+    /// 24 h CI identity — the bearer clamped to the 1 h federation cap
+    /// while the source `exp` stays 24 h out. On the bearer's horizon
+    /// the prune's `expires_at < now()` would delete the row 23 h
+    /// before that same signed JWT stops being presentable, and the
+    /// next presentation would mint again.
+    #[tokio::test]
+    async fn federation_seen_set_ttl_is_source_jwt_exp_not_bearer_cap() {
+        let guard = MockReplayGuard::new(Ok(ReplayClaim::FirstSeen));
+        let (uc, tokens, users, _events) = make_uc_with_guard(guard.clone());
+        users.insert(user(true));
+
+        let jwt_exp = Utc::now() + Duration::hours(24);
+        let mut req = make_request_federation_jti("jti-24h-identity");
+        // What the handler resolves: min(1h, jwt_remaining) = 1h.
+        req.expires_in_seconds = Some(3600);
+        if let Some(fs) = req.federation_source.as_mut() {
+            fs.exp = jwt_exp.timestamp();
+        }
+
+        let issued = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), req)
+            .await
+            .expect("first presentation must mint");
+        assert_eq!(tokens.inserts().len(), 1);
+
+        let (_key, ttl) = guard.calls()[0].clone();
+        assert_eq!(
+            ttl,
+            DateTime::<Utc>::from_timestamp(jwt_exp.timestamp(), 0).unwrap(),
+            "the seen-set horizon must be the source JWT's own exp"
+        );
+        let bearer_expiry = issued.expires_at.expect("the bearer expiry is bounded");
+        assert!(
+            ttl > bearer_expiry,
+            "the seen-set row must outlive the bearer it was minted beside \
+             (horizon {ttl}, bearer {bearer_expiry})"
+        );
+        let slack = (ttl - bearer_expiry).num_seconds();
+        assert!(
+            slack > 22 * 3600,
+            "a 24h JWT against the 1h bearer cap must leave ~23h of seen-set \
+             horizon beyond the bearer, got {slack}s"
+        );
+    }
+
+    /// Fail-CLOSED conversion: a source `exp` that is not a
+    /// representable `DateTime<Utc>` yields no TTL horizon, so the
+    /// exchange is denied with **no token row and no event** — and the
+    /// guard is never consulted, because a claim can only be recorded
+    /// under a horizon we actually know. Not a clamp, not a default.
+    #[tokio::test]
+    async fn federation_unrepresentable_source_exp_fails_closed() {
+        let guard = MockReplayGuard::new(Ok(ReplayClaim::FirstSeen));
+        let (uc, tokens, users, events) = make_uc_with_guard(guard.clone());
+        users.insert(user(true));
+        let mut req = make_request_federation_jti("jti-unrepresentable-exp");
+        if let Some(fs) = req.federation_source.as_mut() {
+            fs.exp = i64::MAX;
+        }
+
+        let err = uc
+            .issue_for_service_account_system(Uuid::from_u128(0xACE), req)
+            .await
+            .expect_err("an unrepresentable exp must deny, never mint");
+
+        match &err {
+            ApiTokenError::Infrastructure(DomainError::Invariant(msg)) => {
+                assert!(
+                    msg.contains("not a representable Utc timestamp"),
+                    "the deny must name the underivable TTL horizon, got {msg:?}"
+                );
+            }
+            other => panic!("expected an underivable-TTL invariant deny, got {other:?}"),
+        }
+        assert!(
+            tokens.inserts().is_empty(),
+            "FAIL-CLOSED: an underivable TTL horizon must NOT persist a token row"
+        );
+        assert!(
+            events.appended_batches().is_empty(),
+            "FAIL-CLOSED: an underivable TTL horizon must NOT append an event"
+        );
+        assert_eq!(
+            guard.call_count(),
+            0,
+            "nothing may be claimed under an unknown horizon"
+        );
     }
 
     /// Fail-CLOSED regression: the guard

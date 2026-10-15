@@ -108,6 +108,45 @@ pub enum DomainError {
     /// renders a fixed message, never the inner cause.
     #[error("upstream metadata invalid")]
     UpstreamMetadataInvalid,
+
+    /// Several exclusions on one scan policy carry the CVE the caller
+    /// named, and the request did not say which of them to act on.
+    ///
+    /// An exclusion's identity is its `exclusion_id`; a CVE identifies a
+    /// *set* of them, because a policy may hold one row per
+    /// `package_pattern` for the same CVE. Choosing a row out of that set
+    /// by anything other than its identity lets the read model's ordering
+    /// decide which suppression ends, and leaves the rest unreachable
+    /// through the same route — so the ambiguity is reported to the only
+    /// party that can resolve it rather than guessed.
+    ///
+    /// Carries the `candidates` so the caller can repeat the request
+    /// naming one: the wire layer renders them as structured members, and
+    /// a caller must never have to recover an identifier by parsing an
+    /// error sentence. Maps to **409 Conflict** at the HTTP boundary (the
+    /// resource's state is incompatible with the transition as
+    /// requested) — distinct from [`Self::Conflict`], which this codebase
+    /// reserves for event-store optimistic-concurrency version
+    /// conflicts, and from [`Self::Invariant`], which is a server fault.
+    /// See ADR 0025.
+    #[error("{} exclusions match {cve_id}; name one by exclusion_id", candidates.len())]
+    AmbiguousExclusion {
+        cve_id: String,
+        candidates: Vec<ExclusionCandidate>,
+    },
+}
+
+/// One candidate row in a [`DomainError::AmbiguousExclusion`]: the
+/// identity the caller must name for the request to succeed, plus the
+/// only field that tells two exclusions for the same CVE apart.
+///
+/// Deliberately not the whole exclusion row — a caller resolving the
+/// ambiguity needs the identity and the discriminator, and nothing else
+/// on the row (its reason, its scope, its author) helps them choose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExclusionCandidate {
+    pub exclusion_id: uuid::Uuid,
+    pub package_pattern: Option<String>,
 }
 
 /// Fetch-class discriminator for
@@ -226,6 +265,58 @@ mod tests {
     fn upstream_metadata_invalid_display_carries_no_cause() {
         let err = DomainError::UpstreamMetadataInvalid;
         assert_eq!(err.to_string(), "upstream metadata invalid");
+    }
+
+    #[test]
+    fn ambiguous_exclusion_display_counts_the_candidates_and_names_the_cve() {
+        let err = DomainError::AmbiguousExclusion {
+            cve_id: "CVE-2026-0001".into(),
+            candidates: vec![
+                ExclusionCandidate {
+                    exclusion_id: uuid::Uuid::nil(),
+                    package_pattern: None,
+                },
+                ExclusionCandidate {
+                    exclusion_id: uuid::Uuid::nil(),
+                    package_pattern: Some("pkg:npm/left-pad@*".into()),
+                },
+            ],
+        };
+        assert_eq!(
+            err.to_string(),
+            "2 exclusions match CVE-2026-0001; name one by exclusion_id"
+        );
+    }
+
+    #[test]
+    fn ambiguous_exclusion_clone_preserves_its_candidates() {
+        // The candidates are the actionable part of this variant — a
+        // caller repeats the request naming one of them — so a clone
+        // that dropped or reordered them would hand the wire layer a
+        // body that cannot resolve the ambiguity it reports.
+        let pattern_id = uuid::Uuid::new_v4();
+        let err = DomainError::AmbiguousExclusion {
+            cve_id: "CVE-2026-0002".into(),
+            candidates: vec![ExclusionCandidate {
+                exclusion_id: pattern_id,
+                package_pattern: Some("pkg:pypi/requests@*".into()),
+            }],
+        };
+        let cloned = err.clone();
+        assert_eq!(err.to_string(), cloned.to_string());
+        match cloned {
+            DomainError::AmbiguousExclusion { cve_id, candidates } => {
+                assert_eq!(cve_id, "CVE-2026-0002");
+                assert_eq!(
+                    candidates,
+                    vec![ExclusionCandidate {
+                        exclusion_id: pattern_id,
+                        package_pattern: Some("pkg:pypi/requests@*".into()),
+                    }]
+                );
+            }
+            other => panic!("clone must preserve the variant, got {other:?}"),
+        }
     }
 
     #[test]

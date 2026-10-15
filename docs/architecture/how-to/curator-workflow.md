@@ -308,6 +308,30 @@ hort-cli curation unexclude-finding \
                     in certain build configurations; reinstating block"
 ```
 
+**When one CVE names several exclusions.** A policy can hold more than one
+exclusion for the same CVE — they differ by `package_pattern`, and the gitops
+envelope's uniqueness rule is `(cve_id, package_pattern)`. A CVE therefore
+names a *set*, and the row's identity is its `exclusion_id`. When the set has
+more than one member, `unexclude-finding` does not guess: the server answers
+`409` listing the candidates and nothing is removed. Repeat the command with
+the one you mean:
+
+```sh
+hort-cli curation unexclude-finding \
+  --policy <policy_id> \
+  --cve CVE-2024-XXXX \
+  --exclusion-id <exclusion_id> \
+  --justification "..."
+```
+
+The command prints one `--exclusion-id` line per candidate, each with that
+row's `package_pattern` (or `no package_pattern`), so the remedy is
+copy-pasteable. `--exclusion-id` **narrows within** the CVE in the path — an
+id belonging to a different CVE on the same policy is refused, not obeyed.
+`exclude-finding` also prints the new `exclusion_id` when it creates a row.
+When the CVE names exactly one exclusion the flag is unnecessary and the
+invocation above without it is unchanged.
+
 **Events emitted:**
 
 ```text
@@ -686,6 +710,7 @@ hort-cli curation block versions \
   --justification <text>
 hort-cli curation exclude-finding   --policy <id> --cve <id> --justification <text>
 hort-cli curation unexclude-finding --policy <id> --cve <id> --justification <text>
+#   add --exclusion-id <id> when one CVE names several exclusions (the 409 lists them)
 
 # Read surfaces
 hort-cli curation queue \

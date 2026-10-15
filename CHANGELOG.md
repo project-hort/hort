@@ -492,6 +492,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A compensating delete removes only the job row it inserted** (#349). When
+  the `TaskInvoked` audit append failed after a successful insert,
+  `TaskUseCase::enqueue` rolled the insert back with `DELETE FROM jobs WHERE
+  id = $1` — no status predicate. A worker that claimed the row inside that
+  window is executing the task, and the delete removed it anyway **together
+  with its durable single-flight idempotency key** (ADR 0028), so a second
+  authorised invoke inserted afresh under the same key and two executions of a
+  destructive task could run with no `TaskInvoked` for the first.
+
+  The statement is now scoped to a still-`pending` row, and "matched nothing"
+  is a named outcome rather than a silent success: the port answers
+  `CompensatingDelete::NoLongerPending` and the caller reports it on the same
+  operator-visible path as a failed delete, with a message that distinguishes
+  the two. The recovery guidance moved with it — an orphaned row can be
+  `pending` (purging it undoes the enqueue) or `running` (purging it undoes
+  nothing; the execution has to be reconciled from its own side effects), and
+  four doc sites that told an operator to search only for `status='pending'`
+  now say both.
+
+- **An exclusion is removed by its identity, not by its CVE** (#349). A scan
+  policy can hold several exclusions for one CVE that differ only in
+  `package_pattern` — the gitops envelope's uniqueness rule is `(cve_id,
+  package_pattern)` — but `DELETE /api/v1/admin/policies/{id}/exclusions/{cve}`
+  picked the first projection row carrying that CVE. The read model's ordering
+  decided which suppression ended, and the remaining rows were unreachable
+  through the route: a CVE an operator meant to re-arm could stay suppressed
+  with no way to withdraw it.
+
+  A CVE matching exactly one exclusion behaves as before. A CVE matching
+  several is now answered with `409` carrying the candidates as **structured
+  members** — each `exclusion_id` with its `package_pattern` — and the optional
+  `exclusion_id` in the request body selects among them. An `exclusion_id`
+  that belongs to a different CVE on the same policy is refused rather than
+  obeyed, so the body never becomes a second way to say which row dies.
+  `hort-cli curation unexclude-finding` gained the matching `--exclusion-id`
+  and prints one ready-to-paste flag line per candidate; a request body without
+  the field is byte-identical to the one it sent before.
+
 - **An artifact whose findings the policy did not block is released** (#344).
   `ScanCompleted` carrying a non-empty finding list set `rejected` terminally,
   whatever the `PolicyEvaluated` verdict recorded beside it said — so a
@@ -1446,6 +1484,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what kept them from drifting apart again.
 
 ### Security
+
+- **The anti-replay seen-set remembers a federated JWT for as long as that JWT
+  can be presented** (#349). The `jwt_replay_seen` row's TTL horizon was the
+  *minted bearer's* resolved expiry — `min(jwt_remaining,
+  FEDERATION_MAX_LIFETIME_SECS)`, so at most one hour — while the source JWT
+  it guards against commonly lives far longer. The hourly `replay-seen-prune`
+  then deleted the row on that horizon, and the same intercepted, still-valid
+  JWT minted a second bearer: for a 24-hour CI identity the guard forgot it 23
+  hours early. The surface has no network backstop, and the auth catalog names
+  anti-replay as the *sole* control on it.
+
+  The horizon is now the presented JWT's own `exp`, a value already in hand at
+  the claim, so the prune can only remove a row once the JWT it records can no
+  longer be presented at all. A JWT whose `exp` is not a representable
+  timestamp yields no horizon and is denied fail-closed — guard never
+  consulted, no token row, no event, never a clamped or defaulted horizon.
+
+  **Operator-visible consequence on upgrade:** `jwt_replay_seen` holds roughly
+  `JWT_lifetime / 1 h` times as many rows at steady state (≈24× for 24-hour CI
+  identities). That is the quantity an anti-replay set must retain to keep its
+  promise, and the prune's per-run work is unchanged — the same number of rows
+  reach their horizon per tick; only the resident set is deeper. The hourly
+  cadence needs no adjustment.
 
 - **An OCI manifest is served only while every artifact in its closure is**
   (#342). The manifest read path gated on the manifest's **own**

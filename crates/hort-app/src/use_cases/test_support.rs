@@ -61,7 +61,7 @@ use hort_domain::ports::event_store::{
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership, MetadataStrategy};
 use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims, OidcValidationError};
 use hort_domain::ports::jobs_repository::{
-    JobRow, JobsRepository, ListJobsFilter, ListJobsPage, ScanJob,
+    CompensatingDelete, JobRow, JobsRepository, ListJobsFilter, ListJobsPage, ScanJob,
 };
 use hort_domain::ports::kubernetes_secret_writer::{
     KubernetesSecretWriter, ManagedSecret, ManagedSecretSpec,
@@ -6980,6 +6980,12 @@ impl ScanFindingsRepository for MockScanFindingsRepository {
 ///   per call, each time recording the call).
 /// - `list_jobs` returns a seeded `Vec<JobRow>`.
 /// - `get_job` returns a seeded `HashMap<Uuid, JobRow>`.
+/// - `delete_job` records the id and always reports
+///   [`CompensatingDelete::RolledBack`]. It is deliberately not seedable:
+///   the claimed-row outcome changes what the *use case* logs, not what a
+///   handler returns, and it is pinned there over the use case's own
+///   doubles (`use_cases::task_use_case`). A handler test that needs the
+///   distinction should assert it at that layer instead.
 ///
 /// All other `JobsRepository` methods delegate to the trait defaults
 /// (which return `Err(Invariant)`) to keep the mock minimal.
@@ -7558,9 +7564,9 @@ impl JobsRepository for MockJobsRepository {
         }
     }
 
-    fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<()>> {
+    fn delete_job<'a>(&'a self, job_id: Uuid) -> BoxFuture<'a, DomainResult<CompensatingDelete>> {
         self.delete_calls.lock().unwrap().push(job_id);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(CompensatingDelete::RolledBack) })
     }
 
     fn list_jobs<'a>(
@@ -7887,7 +7893,10 @@ impl OidcIssuerRepository for MockOidcIssuerRepository {
 /// constructors drive the deny paths.
 pub struct MockReplayGuardPort {
     outcome: Mutex<Result<ReplayClaim, ReplayGuardError>>,
-    calls: Mutex<usize>,
+    /// Every observed `claim` TTL horizon, in call order. One field
+    /// rather than a counter beside a log so the count and the recorded
+    /// horizons cannot drift apart; `call_count` reads its length.
+    claims: Mutex<Vec<DateTime<Utc>>>,
 }
 
 impl Default for MockReplayGuardPort {
@@ -7901,26 +7910,32 @@ impl MockReplayGuardPort {
     pub fn first_seen() -> Self {
         Self {
             outcome: Mutex::new(Ok(ReplayClaim::FirstSeen)),
-            calls: Mutex::new(0),
+            claims: Mutex::new(Vec::new()),
         }
     }
     /// Guard reports a replay.
     pub fn replayed() -> Self {
         Self {
             outcome: Mutex::new(Ok(ReplayClaim::Replayed)),
-            calls: Mutex::new(0),
+            claims: Mutex::new(Vec::new()),
         }
     }
     /// Guard is unreachable — drives the fail-CLOSED path.
     pub fn unavailable() -> Self {
         Self {
             outcome: Mutex::new(Err(ReplayGuardError::Unavailable("mock outage".into()))),
-            calls: Mutex::new(0),
+            claims: Mutex::new(Vec::new()),
         }
     }
     /// Number of `claim` calls observed.
     pub fn call_count(&self) -> usize {
-        *self.calls.lock().unwrap()
+        self.claims.lock().unwrap().len()
+    }
+    /// The TTL horizon each `claim` was called with, in call order —
+    /// the seen-set row's own expiry, which a test asserts against the
+    /// source JWT's `exp` (never the minted bearer's lifetime).
+    pub fn claimed_expiries(&self) -> Vec<DateTime<Utc>> {
+        self.claims.lock().unwrap().clone()
     }
 }
 
@@ -7928,9 +7943,9 @@ impl ReplayGuardPort for MockReplayGuardPort {
     fn claim<'a>(
         &'a self,
         _key: &'a ReplayKey,
-        _expires_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
     ) -> BoxFuture<'a, Result<ReplayClaim, ReplayGuardError>> {
-        *self.calls.lock().unwrap() += 1;
+        self.claims.lock().unwrap().push(expires_at);
         let out = self.outcome.lock().unwrap().clone();
         Box::pin(async move { out })
     }
