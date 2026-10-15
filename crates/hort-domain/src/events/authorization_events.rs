@@ -920,13 +920,24 @@ impl TaskInvoked {
 ///
 /// 1. *Compensating-delete path in `TaskUseCase::enqueue`* — if the
 ///    `jobs` INSERT succeeds but the `TaskInvoked` event-store append
-///    fails, and the compensating `delete_job` also fails, the system is
-///    in a temporarily inconsistent state. No
+///    fails, and the compensating `delete_job` does not roll the row back,
+///    the system is in a temporarily inconsistent state. No
 ///    `TaskFailed` is actually emitted on this path (the event store is
 ///    unavailable); `tracing::error!` is written instead and the caller
-///    returns an error. Operators can identify orphaned rows by looking
-///    for `status='pending'` jobs with no corresponding `TaskInvoked`
-///    event on the authorization stream.
+///    returns an error. An orphaned row is a row with no corresponding
+///    `TaskInvoked` event on the authorization stream, and it can be in
+///    **either** of two states — both have to be searched:
+///    - `status='pending'` — the compensating delete itself failed
+///      (infrastructure error). The row is unclaimed; it idles until a
+///      worker picks it up, and purging it undoes the enqueue.
+///    - `status='running'` (or already terminal) — a worker claimed the
+///      row before the compensating delete reached it, so the delete
+///      matched nothing and reported
+///      [`CompensatingDelete`](super::super::ports::jobs_repository::CompensatingDelete)
+///      `::NoLongerPending`. The task is executing, or has executed,
+///      with no audit event:
+///      purging the row does not undo what it did, and the execution has
+///      to be reconciled from the task's own side effects.
 ///
 /// 2. *Worker terminal-failure path* — the
 ///    worker dispatcher emits `TaskFailed` when a `TaskHandler` returns

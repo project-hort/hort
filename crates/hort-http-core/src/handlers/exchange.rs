@@ -4448,6 +4448,112 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         });
     }
 
+    /// The bearer cap and the seen-set horizon are two DIFFERENT
+    /// horizons. On the exact request the test above pins to a ≤1 h
+    /// bearer, the anti-replay row is claimed at the source JWT's own
+    /// 24 h `exp`: the row the prune (`expires_at < now()`) may remove
+    /// outlives the JWT it guards against. Taking the bearer's horizon
+    /// instead would drop the row 23 h early and the same signed JWT
+    /// would mint again.
+    #[test]
+    fn federation_seen_set_horizon_is_jwt_exp_while_bearer_stays_capped() {
+        rt().block_on(async {
+            let guard =
+                Arc::new(hort_app::use_cases::test_support::MockReplayGuardPort::first_seen());
+            let (router, validator, sas, mocks) = build_federation_router_with_guard(guard.clone());
+            let sa = sample_sa();
+            seed_sa_user(&mocks, &sa);
+            sas.insert(sa.clone());
+            // Same fixture as the 1h-cap test: exp = now + 24h.
+            validator.register_token("ok-jwt", sample_validated_claims(24 * 3600));
+            let jwt_horizon = Utc::now() + chrono::Duration::seconds(24 * 3600);
+            let resp = post_form(router, federation_form("ok-jwt")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let v = body_json(resp).await;
+            let expires_in = v["expires_in"].as_u64().unwrap();
+            assert!(
+                expires_in <= 3600,
+                "the minted bearer stays capped at the 1h federation max, got {expires_in}"
+            );
+
+            let claimed = guard.claimed_expiries();
+            assert_eq!(claimed.len(), 1, "exactly one claim per exchange attempt");
+            let horizon = claimed[0];
+            assert!(
+                (horizon - jwt_horizon).num_seconds().abs() <= 5,
+                "the seen-set horizon must be the JWT's own exp (~{jwt_horizon}), \
+                 got {horizon}"
+            );
+            let unprunable_for = (horizon - Utc::now()).num_seconds();
+            assert!(
+                unprunable_for > 23 * 3600,
+                "the row must stay unprunable for ~24h (as long as the JWT is \
+                 presentable), got {unprunable_for}s"
+            );
+        });
+    }
+
+    /// Fail-CLOSED at the HTTP boundary: a JWT whose `exp` is not a
+    /// representable `DateTime<Utc>` gives the seen-set no TTL horizon,
+    /// so the exchange is denied — no bearer in the body, no
+    /// `api_tokens` row, no event, and the guard never claimed
+    /// anything. It rides the generic mint-failure taxonomy
+    /// (`500 server_error` / `result=mint_failed`): the claims are
+    /// malformed in a way the validator should have rejected, not a
+    /// replay the control detected.
+    #[test]
+    fn federation_unrepresentable_exp_fails_closed_no_mint() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let guard =
+                    Arc::new(hort_app::use_cases::test_support::MockReplayGuardPort::first_seen());
+                let (router, validator, sas, mocks) =
+                    build_federation_router_with_guard(guard.clone());
+                let sa = sample_sa();
+                seed_sa_user(&mocks, &sa);
+                sas.insert(sa);
+                let mut claims = sample_validated_claims(600);
+                claims.exp_raw = i64::MAX;
+                validator.register_token("bad-exp-jwt", claims);
+                let resp = post_form(router, federation_form("bad-exp-jwt")).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "an underivable seen-set horizon must deny, never mint"
+                );
+                let v = body_json(resp).await;
+                assert_eq!(v["error"], "server_error");
+                assert!(
+                    v.get("access_token").is_none(),
+                    "fail-closed response must carry NO token"
+                );
+                assert!(
+                    mocks.api_tokens.inserted().is_empty(),
+                    "FAIL-CLOSED: no api_tokens row may be persisted, got {:?}",
+                    mocks.api_tokens.inserted()
+                );
+                assert!(
+                    mocks.events.appended_batches().is_empty(),
+                    "FAIL-CLOSED: no event may be appended"
+                );
+                assert_eq!(
+                    guard.call_count(),
+                    0,
+                    "nothing may be claimed under an unknown horizon"
+                );
+            });
+        });
+        assert_eq!(
+            counter_value_kind_result(
+                &snap,
+                metrics::COUNTER,
+                "federated_jwt",
+                metrics::RESULT_MINT_FAILED
+            ),
+            1,
+        );
+    }
+
     /// Pins that ApiTokenIssued carries the three federation-attribution
     /// fields. The payload propagation is the federation-audit contract;
     /// an empty / wrong value would silently break correlation against

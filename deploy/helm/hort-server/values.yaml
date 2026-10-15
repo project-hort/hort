@@ -2007,8 +2007,15 @@ scheduledTasks:
   replaySeenPrune:
     executionPath: admin-task
     enabled: true
-    # Default cadence — hourly (the table grows by one row per distinct
-    # federated exchange per hour, so an hourly prune keeps it bounded).
+    # Default cadence — hourly. Sizing: a seen-set row's TTL horizon is
+    # the source JWT's own `exp` — the window the anti-replay set has to
+    # remember, since a row that is pruned before its JWT stops being
+    # presentable re-permits the replay it recorded. So the table holds
+    # one row per distinct federated exchange per *JWT lifetime*, not
+    # per hour: with 24-hour CI identities that is roughly 24x an hourly
+    # horizon. Finite and measured, and exactly the quantity the control
+    # must retain — an hourly prune still bounds the table, it just
+    # drains a steady state one JWT lifetime deep rather than one hour.
     # The
     # 5-minute Idempotency-Key window floor (see section header)
     # applies here too.

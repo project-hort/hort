@@ -128,6 +128,44 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
 
+        // Several exclusions on the policy carry the CVE the caller named
+        // and the request did not say which one, so the ambiguity is
+        // reported instead of resolved by the read model's ordering. The
+        // candidates ride the body as structured members — each with the
+        // `exclusion_id` that makes the retried request succeed — for the
+        // same reason `managedBy` and `bytes_read` above do: the caller's
+        // next move depends on a value, and recovering a value by
+        // string-matching an error sentence is what those arms exist to
+        // avoid. The row's other fields stay off the wire; `exclusion_id`
+        // identifies the row and `package_pattern` is what tells two rows
+        // for one CVE apart, and nothing else helps the caller choose.
+        //
+        // ADR 0025 governs the status: a caller-reachable state the
+        // requested transition is incompatible with is a 409, never a 500.
+        // Early-return so the members don't fall through to the generic
+        // `{"error": message}` tail at the bottom.
+        if let AppError::Domain(DomainError::AmbiguousExclusion { cve_id, candidates }) = &self.0 {
+            let body = serde_json::json!({
+                "error": format!(
+                    "multiple exclusions match {cve_id}; name one with exclusion_id"
+                ),
+                "cve_id": cve_id,
+                "candidates": candidates
+                    .iter()
+                    .map(|c| serde_json::json!({
+                        "exclusion_id": c.exclusion_id,
+                        "package_pattern": c.package_pattern,
+                    }))
+                    .collect::<Vec<_>>(),
+            });
+            return (
+                StatusCode::CONFLICT,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body.to_string(),
+            )
+                .into_response();
+        }
+
         // Storage-layer write contention that outlived the adapter's own
         // bounded retry. The request was valid, nothing was applied, and the
         // same request is expected to succeed shortly — so it earns a 503
@@ -284,6 +322,25 @@ impl IntoResponse for ApiError {
                         "UpstreamMetadataInvalid must be caught by the early-return"
                     );
                     (StatusCode::BAD_GATEWAY, domain_err.to_string())
+                }
+                // Caught by the structured-body early-return at the top
+                // of this function. Match arm exists so the inner match
+                // stays exhaustive — fail loudly if a future edit drops
+                // the early return without updating both sites, because
+                // the generic tail would render the candidates as a
+                // sentence and the caller could no longer read the
+                // `exclusion_id` out of the body. Mirrors
+                // `UpstreamBodyTooLarge`'s pattern. The fallback status
+                // stays 409 so even the unreachable path cannot
+                // reclassify a caller-resolvable ambiguity as a server
+                // fault; `domain_err.to_string()` carries only the CVE
+                // the caller supplied and a count.
+                DomainError::AmbiguousExclusion { .. } => {
+                    debug_assert!(
+                        false,
+                        "AmbiguousExclusion must be caught by the structured-body early-return"
+                    );
+                    (StatusCode::CONFLICT, domain_err.to_string())
                 }
             },
             AppError::Repository(_) | AppError::Storage(_) | AppError::EventStore(_) => (
@@ -913,5 +970,108 @@ mod tests {
         // envelope shape exactly — the generic `error` message is the
         // ONLY member, no upstream-derived fields.
         assert_eq!(v.as_object().unwrap().len(), 1);
+    }
+
+    // -- AmbiguousExclusion → 409 with the candidates as members
+    //
+    // The caller's next request needs an `exclusion_id` out of this
+    // body. Rendering the candidates into the message would make every
+    // caller write a parser for a sentence — the same cost the
+    // `managedBy` and `bytes_read` arms above exist to avoid.
+
+    fn ambiguous_exclusion_response(
+        candidates: Vec<hort_domain::error::ExclusionCandidate>,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let resp = ApiError(AppError::Domain(DomainError::AmbiguousExclusion {
+                cve_id: "CVE-2026-0001".into(),
+                candidates,
+            }))
+            .into_response();
+            let status = resp.status();
+            let headers = resp.headers().clone();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, headers, body)
+        })
+    }
+
+    #[test]
+    fn ambiguous_exclusion_is_409_with_the_candidates_as_members() {
+        let patterned = uuid::Uuid::new_v4();
+        let unpatterned = uuid::Uuid::new_v4();
+        let (status, headers, body) = ambiguous_exclusion_response(vec![
+            hort_domain::error::ExclusionCandidate {
+                exclusion_id: patterned,
+                package_pattern: Some("pkg:npm/left-pad@*".into()),
+            },
+            hort_domain::error::ExclusionCandidate {
+                exclusion_id: unpatterned,
+                package_pattern: None,
+            },
+        ]);
+        // ADR 0025: a caller-reachable state the requested transition is
+        // incompatible with. Not a 500 — the server is fine; not a 400 —
+        // the request is well-formed.
+        assert_eq!(status, StatusCode::CONFLICT);
+        let ct = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("Content-Type must be present");
+        assert_eq!(ct.to_str().unwrap(), "application/json");
+
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["cve_id"], "CVE-2026-0001");
+        assert_eq!(v["candidates"][0]["exclusion_id"], patterned.to_string());
+        assert_eq!(v["candidates"][0]["package_pattern"], "pkg:npm/left-pad@*");
+        assert_eq!(v["candidates"][1]["exclusion_id"], unpatterned.to_string());
+        // `null`, not an absent member: "this row carries no pattern" is
+        // itself how the caller tells it from its sibling.
+        assert!(v["candidates"][1]["package_pattern"].is_null());
+        assert!(
+            v["candidates"][1]
+                .as_object()
+                .unwrap()
+                .contains_key("package_pattern"),
+            "the discriminator must be present on every candidate: {v}",
+        );
+    }
+
+    #[test]
+    fn ambiguous_exclusion_keeps_the_identities_out_of_the_message() {
+        // The structured-body early-return must short-circuit before the
+        // generic `{"error": message}` tail. Pin that the ids are
+        // reachable ONLY as members, so a future refactor that collapses
+        // the early-return (leaving the `debug_assert!` arm's
+        // `domain_err.to_string()`) fails here rather than silently
+        // handing callers a sentence to parse.
+        let id = uuid::Uuid::new_v4();
+        let (_, _, body) = ambiguous_exclusion_response(vec![
+            hort_domain::error::ExclusionCandidate {
+                exclusion_id: id,
+                package_pattern: None,
+            },
+            hort_domain::error::ExclusionCandidate {
+                exclusion_id: uuid::Uuid::new_v4(),
+                package_pattern: Some("pkg:pypi/requests@*".into()),
+            },
+        ]);
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let message = v["error"].as_str().expect("error must be a string member");
+        assert!(
+            !message.contains(&id.to_string()),
+            "an identity in the message is an identity a caller has to parse: {message}",
+        );
+        assert!(
+            message.contains("CVE-2026-0001") && message.contains("exclusion_id"),
+            "the message must still say what is ambiguous and what resolves it: {message}",
+        );
+        assert_eq!(
+            v["candidates"].as_array().map(Vec::len),
+            Some(2),
+            "every candidate must be offered: {v}",
+        );
     }
 }
